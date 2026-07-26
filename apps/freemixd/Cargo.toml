@@ -1,0 +1,70 @@
+[package]
+name = "freemixd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+macos-program-surface = ["native-media", "dep:winit"]
+native-media = [
+    "dep:fm-audio",
+    "dep:fm-codec-ffmpeg",
+    "dep:fm-codec-image",
+    "dep:fm-color",
+    "dep:fm-compositor",
+    "dep:fm-frame",
+    "dep:fm-gpu",
+    "dep:fm-io-api",
+    "dep:fm-io-macos",
+    "dep:fm-observability",
+    "dep:fm-scheduler",
+    "dep:fm-sim",
+    "fm-color/native-wgpu",
+    "fm-compositor/native-wgpu",
+    "fm-gpu/native-wgpu",
+]
+
+[dependencies]
+fm-audio = { path = "../../crates/media/fm-audio", optional = true }
+fm-auth = { path = "../../crates/services/fm-auth" }
+fm-clock = { path = "../../crates/media/fm-clock" }
+fm-codec-ffmpeg = { path = "../../crates/io/fm-codec-ffmpeg", optional = true }
+fm-codec-image = { path = "../../crates/io/fm-codec-image", optional = true }
+fm-color = { path = "../../crates/gpu/fm-color", optional = true }
+fm-command = { path = "../../crates/foundation/fm-command" }
+fm-compositor = { path = "../../crates/gpu/fm-compositor", optional = true }
+fm-control = { path = "../../crates/services/fm-control" }
+fm-engine = { path = "../../crates/services/fm-engine" }
+fm-frame = { path = "../../crates/media/fm-frame", optional = true }
+fm-gpu = { path = "../../crates/gpu/fm-gpu", optional = true }
+fm-observability = { path = "../../crates/services/fm-observability", optional = true }
+fm-scheduler = { path = "../../crates/media/fm-scheduler", optional = true }
+fm-sim = { path = "../../crates/media/fm-sim", optional = true }
+fm-model = { path = "../../crates/foundation/fm-model" }
+fm-persistence = { path = "../../crates/services/fm-persistence" }
+fm-protocol = { path = "../../crates/foundation/fm-protocol" }
+fm-server = { path = "../../crates/services/fm-server" }
+fm-switcher = { path = "../../crates/features/fm-switcher" }
+fm-types = { path = "../../crates/foundation/fm-types" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+fm-io-api = { path = "../../crates/io/fm-io-api", optional = true }
+fm-io-macos = { path = "../../crates/io/fm-io-macos", optional = true }
+winit = { version = "0.30.13", optional = true, features = ["rwh_06"] }
+
+[target.'cfg(unix)'.dependencies]
+signal-hook = "0.3.18"
+
+[target.'cfg(windows)'.dependencies]
+ctrlc = "3.4.7"
+
+[dev-dependencies]
+fm-client = { path = "../../crates/services/fm-client" }
+half = "2.7.1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+tempfile = "3.20"
+
+[lints]
+workspace = true

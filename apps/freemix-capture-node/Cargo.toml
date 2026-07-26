@@ -1,0 +1,16 @@
+[package]
+name = "freemix-capture-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fm-frame = { path = "../../crates/media/fm-frame" }
+fm-io-api = { path = "../../crates/io/fm-io-api" }
+fm-io-macos = { path = "../../crates/io/fm-io-macos" }
+fm-protocol = { path = "../../crates/foundation/fm-protocol" }
+fm-types = { path = "../../crates/foundation/fm-types" }
+
+[lints]
+workspace = true

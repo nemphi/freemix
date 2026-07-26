@@ -1,0 +1,22 @@
+[package]
+name = "freemix-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fm-clock = { path = "../../crates/media/fm-clock" }
+fm-client = { path = "../../crates/services/fm-client" }
+fm-command = { path = "../../crates/foundation/fm-command" }
+fm-engine = { path = "../../crates/services/fm-engine" }
+fm-model = { path = "../../crates/foundation/fm-model" }
+fm-persistence = { path = "../../crates/services/fm-persistence" }
+fm-protocol = { path = "../../crates/foundation/fm-protocol" }
+fm-sim = { path = "../../crates/media/fm-sim" }
+fm-switcher = { path = "../../crates/features/fm-switcher" }
+fm-types = { path = "../../crates/foundation/fm-types" }
+fm-video = { path = "../../crates/media/fm-video" }
+
+[lints]
+workspace = true

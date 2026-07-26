@@ -1,0 +1,12 @@
+[package]
+name = "fm-virtual-set"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fm-types = { path = "../../foundation/fm-types" }
+
+[lints]
+workspace = true

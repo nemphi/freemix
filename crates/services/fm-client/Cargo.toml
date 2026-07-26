@@ -1,0 +1,19 @@
+[package]
+name = "fm-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+std-tcp = []
+
+[dependencies]
+fm-command = { path = "../../foundation/fm-command" }
+fm-protocol = { path = "../../foundation/fm-protocol" }
+fm-types = { path = "../../foundation/fm-types" }
+fm-ui-model = { path = "../../ui/fm-ui-model" }
+
+[lints]
+workspace = true

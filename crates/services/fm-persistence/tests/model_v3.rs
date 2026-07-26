@@ -1,0 +1,378 @@
+use std::{
+    fs,
+    num::NonZeroU128,
+    path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
+};
+
+use fm_model::{
+    AudioBus, BusSend, Input, InputKind, Layer, MainMix, Output, Project, ProjectSettings,
+    RestartPolicy, Scene, SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef,
+    StartupPolicy,
+};
+use fm_persistence::{ProjectPosition, ProjectStore, RuntimeRouting, StoreError, StoredProject};
+use fm_types::{
+    AudioFormat, BusId, Channel, ChannelLayout, ChromaLocation, ColorMetadata, ColorPrimaries,
+    FrameRate, InputId, MatrixCoefficients, OutputId, PixelFormat, ProjectId, SampleFormat,
+    SampleRate, ScanMode, SceneId, SignalRange, TransferFunction, VideoDimensions, VideoFormat,
+};
+
+static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+struct TestDirectory(PathBuf);
+
+impl TestDirectory {
+    fn new(name: &str) -> Self {
+        let sequence = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "fm-persistence-v3-{}-{sequence}-{name}",
+            std::process::id()
+        ));
+        fs::create_dir(&path).unwrap();
+        Self(path)
+    }
+
+    fn store(&self, name: &str) -> ProjectStore {
+        ProjectStore::new(self.0.join(format!("{name}.freemix"))).unwrap()
+    }
+}
+
+impl Drop for TestDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn nz(value: u128) -> NonZeroU128 {
+    NonZeroU128::new(value).unwrap()
+}
+fn project_id(value: u128) -> ProjectId {
+    ProjectId::new(nz(value))
+}
+fn input_id(value: u128) -> InputId {
+    InputId::new(nz(value))
+}
+fn scene_id(value: u128) -> SceneId {
+    SceneId::new(nz(value))
+}
+fn bus_id(value: u128) -> BusId {
+    BusId::new(nz(value))
+}
+fn output_id(value: u128) -> OutputId {
+    OutputId::new(nz(value))
+}
+
+fn rich_settings() -> ProjectSettings {
+    let frame_rate = FrameRate::new(24_000, 1_001).unwrap();
+    ProjectSettings {
+        frame_rate,
+        video: VideoFormat {
+            dimensions: VideoDimensions::new(3_840, 2_160).unwrap(),
+            frame_rate,
+            pixel_format: PixelFormat::P010,
+            scan: ScanMode::InterlacedTopFieldFirst,
+            color: ColorMetadata {
+                primaries: ColorPrimaries::Bt2020,
+                transfer: TransferFunction::Pq,
+                matrix: MatrixCoefficients::Bt2020NonConstant,
+                range: SignalRange::Full,
+                chroma_location: ChromaLocation::TopLeft,
+            },
+        },
+        audio: AudioFormat {
+            sample_rate: SampleRate::new(96_000).unwrap(),
+            sample_format: SampleFormat::I24,
+            channels: ChannelLayout::new(vec![
+                Channel::Left,
+                Channel::Right,
+                Channel::Center,
+                Channel::LeftSurround,
+                Channel::RightSurround,
+            ])
+            .unwrap(),
+        },
+    }
+}
+
+fn rich_inputs(high: u128) -> [Input; 6] {
+    [
+        Input {
+            id: input_id(high),
+            name: "Color".into(),
+            kind: InputKind::Color,
+            required_capabilities: vec!["gpu.color.fill".into()],
+        },
+        Input {
+            id: input_id(high + 1),
+            name: "Media".into(),
+            kind: InputKind::Media {
+                asset_uri: "asset://opening.mov".into(),
+            },
+            required_capabilities: vec!["codec.video.hevc".into()],
+        },
+        Input {
+            id: input_id(high + 2),
+            name: "Device".into(),
+            kind: InputKind::Device {
+                stable_key: "decklink:1".into(),
+            },
+            required_capabilities: vec!["capture.device.sdi".into()],
+        },
+        Input {
+            id: input_id(high + 3),
+            name: "Network".into(),
+            kind: InputKind::Network {
+                endpoint: "srt://example.test:9000".into(),
+            },
+            required_capabilities: vec!["network.input.srt".into()],
+        },
+        Input {
+            id: input_id(high + 4),
+            name: "Solid silence".into(),
+            kind: InputKind::Simulated(SimulatedInput::new(
+                SimulatedVideo::Solid(SolidColor::new(1, 2, 3, 4)),
+                SimulatedAudio::Silence,
+            )),
+            required_capabilities: Vec::new(),
+        },
+        Input {
+            id: input_id(high + 5),
+            name: "Bars tone".into(),
+            kind: InputKind::Simulated(SimulatedInput::new(
+                SimulatedVideo::Bars,
+                SimulatedAudio::Sine {
+                    frequency_hz: 1_234,
+                },
+            )),
+            required_capabilities: Vec::new(),
+        },
+    ]
+}
+
+fn rich_project() -> Project {
+    let high = u128::from(u64::MAX) + 101;
+    let mut project = Project::new(
+        project_id(u128::MAX - 1),
+        "Rich production",
+        rich_settings(),
+    )
+    .with_main_mix(MainMix::new(input_id(high), input_id(high + 1)))
+    .with_restart_policy(RestartPolicy::OnFailure { max_attempts: 7 });
+    for input in rich_inputs(high) {
+        project.add_input(input);
+    }
+
+    project.add_scene(Scene {
+        id: scene_id(high + 10),
+        name: "Base".into(),
+        layers: vec![Layer {
+            name: "Camera".into(),
+            source: SourceRef::Input(input_id(high + 2)),
+            enabled: true,
+        }],
+    });
+    project.add_scene(Scene {
+        id: scene_id(high + 11),
+        name: "Composite".into(),
+        layers: vec![
+            Layer {
+                name: "Base scene".into(),
+                source: SourceRef::Scene(scene_id(high + 10)),
+                enabled: true,
+            },
+            Layer {
+                name: "Overlay".into(),
+                source: SourceRef::Input(input_id(high + 4)),
+                enabled: false,
+            },
+        ],
+    });
+    project.add_audio_bus(AudioBus {
+        id: bus_id(high + 20),
+        name: "Program".into(),
+        sends: vec![BusSend {
+            destination: bus_id(high + 21),
+        }],
+    });
+    project.add_audio_bus(AudioBus {
+        id: bus_id(high + 21),
+        name: "Monitor".into(),
+        sends: Vec::new(),
+    });
+    project.add_output(Output {
+        id: output_id(high + 30),
+        name: "Primary".into(),
+        video_source: scene_id(high + 11),
+        audio_source: bus_id(high + 20),
+        startup: StartupPolicy::ReconcileDesiredState,
+        required_capabilities: vec!["output.network.srt".into()],
+    });
+    project
+}
+
+fn stored_rich_project() -> StoredProject {
+    let high = u128::from(u64::MAX) + 101;
+    StoredProject::from_project(
+        rich_project(),
+        RuntimeRouting {
+            desired_program_id: Some(input_id(high)),
+            realized_program_id: Some(input_id(high + 1)),
+            desired_preview_id: Some(input_id(high + 1)),
+            realized_preview_id: Some(input_id(high)),
+        },
+        ProjectPosition {
+            revision: 8,
+            state_epoch: 3,
+            event_sequence: 13,
+            frames_rendered: 800,
+            runtime_generation: 2,
+            clock_time_nanos: 99_000,
+        },
+        Vec::new(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn complete_project_round_trip_preserves_formats_graph_capabilities_and_u128_ids() {
+    let temp = TestDirectory::new("rich-round-trip");
+    let store = temp.store("show");
+    let expected = stored_rich_project();
+
+    store.save(&expected).unwrap();
+    let loaded = store.load().unwrap();
+
+    assert_eq!(loaded, expected);
+    assert_eq!(loaded.project().id().get().get(), u128::MAX - 1);
+    assert_eq!(
+        loaded.project().inputs()[4].kind,
+        expected.project().inputs()[4].kind
+    );
+    assert_eq!(
+        loaded.project().inputs()[5].kind,
+        expected.project().inputs()[5].kind
+    );
+    assert_eq!(loaded.project().settings(), &rich_settings());
+    assert_eq!(loaded.runtime_routing(), expected.runtime_routing());
+}
+
+#[test]
+fn display_p3_bt709_round_trips_in_schema_v3() {
+    let temp = TestDirectory::new("bt709-transfer");
+    let store = temp.store("show");
+    let mut settings = rich_settings();
+    settings.video.color.primaries = ColorPrimaries::DisplayP3;
+    settings.video.color.transfer = TransferFunction::Bt709;
+    let expected = StoredProject::from_project(
+        Project::new(project_id(77), "BT.709 transfer", settings),
+        RuntimeRouting::default(),
+        ProjectPosition::default(),
+        Vec::new(),
+    )
+    .unwrap();
+
+    store.save(&expected).unwrap();
+    let loaded = store.load().unwrap();
+
+    assert_eq!(
+        loaded.project().settings().video.color.transfer,
+        TransferFunction::Bt709
+    );
+    assert_eq!(
+        loaded.project().settings().video.color.primaries,
+        ColorPrimaries::DisplayP3
+    );
+}
+
+#[test]
+fn v3_encoding_is_deterministic_for_the_complete_model() {
+    let temp = TestDirectory::new("deterministic-rich");
+    let first = temp.store("first");
+    let second = temp.store("second");
+    let project = stored_rich_project();
+    first.save(&project).unwrap();
+    second.save(&project).unwrap();
+    assert_eq!(
+        fs::read(first.manifest_path()).unwrap(),
+        fs::read(second.manifest_path()).unwrap()
+    );
+}
+
+#[test]
+fn malformed_enum_format_and_reference_are_rejected() {
+    let temp = TestDirectory::new("malformed-domain");
+    let store = temp.store("show");
+    store.save(&stored_rich_project()).unwrap();
+    let valid = fs::read_to_string(store.manifest_path()).unwrap();
+
+    fs::write(
+        store.manifest_path(),
+        valid.replacen("\"p010\"", "\"future_pixel\"", 1),
+    )
+    .unwrap();
+    assert!(matches!(
+        store.load(),
+        Err(StoreError::MalformedManifest { .. })
+    ));
+
+    fs::write(
+        store.manifest_path(),
+        valid.replacen("\"width\": 3840", "\"width\": 0", 1),
+    )
+    .unwrap();
+    assert!(matches!(
+        store.load(),
+        Err(StoreError::MalformedManifest { .. })
+    ));
+
+    let missing_scene = u128::from(u64::MAX) + 999;
+    let current_scene = u128::from(u64::MAX) + 112;
+    fs::write(
+        store.manifest_path(),
+        valid.replacen(
+            &format!("\"video_source\": {current_scene}"),
+            &format!("\"video_source\": {missing_scene}"),
+            1,
+        ),
+    )
+    .unwrap();
+    assert!(matches!(store.load(), Err(StoreError::Validation(_))));
+}
+
+#[test]
+fn golden_v2_manifest_migrates_with_cli_defaults_and_main_mix() {
+    let temp = TestDirectory::new("v2-migration");
+    let store = temp.store("show");
+    fs::create_dir_all(store.root()).unwrap();
+    fs::write(
+        store.manifest_path(),
+        include_str!("fixtures/schema-v2.json"),
+    )
+    .unwrap();
+
+    let report = store.migrate_v2().unwrap();
+    let migrated = store.load().unwrap();
+
+    assert_eq!((report.from_schema(), report.to_schema()), (2, 3));
+    assert_eq!(
+        migrated.project().settings().frame_rate,
+        FrameRate::new(60_000, 1_001).unwrap()
+    );
+    assert_eq!(migrated.project().inputs().len(), 2);
+    assert!(
+        migrated
+            .project()
+            .inputs()
+            .iter()
+            .all(|input| matches!(input.kind, InputKind::Simulated(_)))
+    );
+    assert_eq!(
+        migrated.project().main_mix(),
+        Some(MainMix::new(input_id(1), input_id(2)))
+    );
+    assert_eq!(
+        migrated.runtime_routing().realized_program_id,
+        Some(input_id(2))
+    );
+    assert_eq!(migrated.position().frames_rendered, 300);
+}

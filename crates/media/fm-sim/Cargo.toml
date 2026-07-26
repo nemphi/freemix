@@ -1,0 +1,16 @@
+[package]
+name = "fm-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fm-audio = { path = "../fm-audio" }
+fm-frame = { path = "../fm-frame" }
+fm-switcher = { path = "../../features/fm-switcher" }
+fm-types = { path = "../../foundation/fm-types" }
+fm-video = { path = "../fm-video" }
+
+[lints]
+workspace = true

@@ -1,0 +1,13 @@
+[package]
+name = "fm-social"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fm-data = { path = "../fm-data" }
+fm-titles = { path = "../fm-titles" }
+
+[lints]
+workspace = true

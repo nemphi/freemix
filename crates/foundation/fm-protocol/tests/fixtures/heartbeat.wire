@@ -1,0 +1,1 @@
+heartbeat	engine_id=engine-a	project_id=project-9	state_epoch=7	log_id=log-a	sequence=88	sent_at_ms=1720000000000	applied=1	applied_engine_id=engine-a	applied_project_id=project-9	applied_state_epoch=7	applied_log_id=log-a	applied_revision=1842

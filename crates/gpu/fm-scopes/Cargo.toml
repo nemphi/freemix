@@ -1,0 +1,13 @@
+[package]
+name = "fm-scopes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fm-color = { path = "../fm-color" }
+fm-video = { path = "../../media/fm-video" }
+
+[lints]
+workspace = true

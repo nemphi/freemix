@@ -1,0 +1,4970 @@
+use std::{
+    cell::RefCell,
+    collections::VecDeque,
+    convert::Infallible,
+    error::Error,
+    fmt,
+    io::{Read, Write},
+    net::{SocketAddr, TcpListener, TcpStream},
+    num::NonZeroU128,
+    path::{Path, PathBuf},
+    process::ExitCode,
+    rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+    },
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+#[cfg(feature = "native-media")]
+use std::fs::{self, File, OpenOptions};
+#[cfg(feature = "native-media")]
+use std::num::NonZeroU32;
+#[cfg(all(feature = "native-media", target_os = "macos"))]
+use std::{collections::BTreeMap, num::NonZeroUsize};
+
+use fm_auth::{Policy, Principal, Role as AuthRole, SessionId, UserId};
+use fm_clock::{ClockDomainId, ClockTime};
+use fm_command::{
+    AcceptedReceipt, CommandId, CommandReceipt, EventSequence, IdempotencyKey, RejectedReceipt,
+    Rejection, RejectionCode, Revision, RuntimeGeneration, StateEpoch,
+};
+use fm_control::{
+    CommandSubmission, ControlLimits, ControlService, PrepareSubmitOutcome, ResumeDecision,
+};
+use fm_engine::{Engine, EngineAcceptance, EngineRestoreState, EngineSnapshot, ShowState};
+use fm_model::MainMix;
+use fm_persistence::{
+    IdempotencyReceipt, ProjectPosition, ProjectStore, ProjectValidationError, ReceiptOutcome,
+    RuntimeRouting, StoreError, StoredProject,
+};
+use fm_protocol::{
+    CapabilityReportSummary, ClientHello, CommandMessage, CommandPayload, CommandResult,
+    ErrorMessage, EventCursor, HandshakeOutcome as ProtocolHandshakeOutcome, HandshakeRequest,
+    HandshakeResponse, HeartbeatMessage, LineDecoder, ProtocolVersion, ResumeCursor,
+    RuntimeEventMessage, ServerHello, ServerIdentity, StructuredError, WireMessage,
+    choose_handshake_outcome, encode_line,
+};
+use fm_server::{
+    AuthenticationMode, ControlPlane, HandshakeError, Heartbeat, InitialSync, Server, ServerConfig,
+    ServerMode, Session, SessionError, SyncPayload,
+};
+use fm_switcher::SwitcherState;
+use fm_types::{InputId, ProjectId};
+use freemixd::ReadinessRecord;
+
+#[cfg(feature = "macos-program-surface")]
+mod program_surface;
+
+#[cfg(feature = "native-media")]
+use fm_codec_ffmpeg::{
+    Adapter, Config as FfmpegConfig, StreamSelector, ToolAvailability,
+    record::{
+        CleanupStatus, EnqueueRejection, OutputFinalization, PairedFrame, RecordConfig,
+        RecordFormat, Recorder, RecorderState, StopOutcome,
+    },
+};
+#[cfg(feature = "native-media")]
+use fm_codec_image::{StillDecodeLimits, decode_still, sniff_still_format};
+#[cfg(feature = "native-media")]
+use fm_frame::{
+    AudioBlock, ClockDomainId as MediaClockDomainId, MediaTimestamp, MediaTiming,
+    NormalizedDuration, NormalizedTimestamp, OriginalTimestamp, SequenceNumber,
+};
+#[cfg(all(feature = "macos-program-surface", target_os = "macos"))]
+use fm_gpu::NativeSurface;
+#[cfg(feature = "native-media")]
+use fm_gpu::{NativeBackend, NativeContext, NativeTexture};
+#[cfg(all(feature = "native-media", target_os = "macos"))]
+use fm_io_api::{
+    EndpointHealthState, LifecycleState, MediaSource, MediaTransfer, MemoryDomain,
+    OpenOptions as IoOpenOptions, SignalLossPolicy,
+};
+#[cfg(all(feature = "native-media", target_os = "macos"))]
+use fm_io_macos::{CameraVideoSource, MacosCameraAdapter};
+#[cfg(feature = "native-media")]
+use fm_model::{InputKind, SimulatedAudio, SimulatedVideo};
+#[cfg(feature = "native-media")]
+use fm_observability::{Metric, MetricStore};
+#[cfg(feature = "native-media")]
+use fm_scheduler::{FrameNumber, FramePacer};
+#[cfg(feature = "native-media")]
+use fm_sim::{Rgba8, SimulatedVideoSource, SourcePattern};
+#[cfg(feature = "native-media")]
+use freemixd::native_media::{
+    NativeAudioLimits, NativeMasterError, NativeMasterRuntime, NativeMediaRuntime,
+    NativeProgramReadback, NativeResolvedSource, NativeSourceLimits, NativeSourceRenderError,
+};
+
+const DEFAULT_LISTEN: &str = "127.0.0.1:0";
+const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 0);
+const CAPABILITIES_DIGEST: &str = "phase1-simulated";
+const NATIVE_MEDIA_CAPABILITIES_DIGEST: &str =
+    "native-media-bounded-video-audio-master-camera-telemetry-v5";
+const FULLSCREEN_PROGRAM_CAPABILITIES_DIGEST: &str =
+    "native-media-bounded-video-audio-master-camera-fullscreen-sdr-telemetry-v3";
+const PROGRAM_RECORDER_CAPABILITIES_DIGEST: &str =
+    "native-media-bounded-video-audio-master-camera-record-program-telemetry-v3";
+const FULLSCREEN_PROGRAM_RECORDER_CAPABILITIES_DIGEST: &str =
+    "native-media-bounded-video-audio-master-camera-fullscreen-sdr-record-program-telemetry-v3";
+
+type AppResult<T> = Result<T, Box<dyn Error>>;
+type SharedControl = Rc<RefCell<ControlService<Policy>>>;
+
+const NATIVE_IO_POLL_INTERVAL: Duration = Duration::from_millis(5);
+#[cfg(all(feature = "native-media", target_os = "macos"))]
+const CAMERA_INITIAL_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
+const NATIVE_CLIENT_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
+#[cfg(feature = "native-media")]
+const PROGRAM_RECORDER_STOP_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(feature = "native-media")]
+const PROGRAM_RECORDER_KILL_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(all(
+    feature = "native-media",
+    feature = "macos-program-surface",
+    target_os = "macos"
+))]
+const PROGRAM_CHECKPOINT_MARGIN: Duration = Duration::from_secs(5);
+
+#[derive(Clone)]
+struct ProcessShutdown {
+    requested: Arc<AtomicBool>,
+    diagnostic_deadline: Option<Instant>,
+}
+
+impl ProcessShutdown {
+    fn requested(&self) -> bool {
+        self.requested.load(AtomicOrdering::Acquire)
+            || self
+                .diagnostic_deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
+    fn set_diagnostic_deadline(&mut self, duration: Duration) -> AppResult<()> {
+        self.diagnostic_deadline = Some(
+            Instant::now()
+                .checked_add(duration)
+                .ok_or_else(|| AppFailure("diagnostic shutdown deadline overflow".into()))?,
+        );
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn register_process_shutdown() -> AppResult<ProcessShutdown> {
+    use signal_hook::consts::signal::{SIGINT, SIGTERM};
+
+    let requested = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(SIGINT, Arc::clone(&requested))?;
+    signal_hook::flag::register(SIGTERM, Arc::clone(&requested))?;
+    Ok(ProcessShutdown {
+        requested,
+        diagnostic_deadline: None,
+    })
+}
+
+#[cfg(windows)]
+fn register_process_shutdown() -> AppResult<ProcessShutdown> {
+    let requested = Arc::new(AtomicBool::new(false));
+    let handler_flag = Arc::clone(&requested);
+    ctrlc::set_handler(move || handler_flag.store(true, AtomicOrdering::Release))?;
+    Ok(ProcessShutdown {
+        requested,
+        diagnostic_deadline: None,
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn register_process_shutdown() -> AppResult<ProcessShutdown> {
+    Ok(ProcessShutdown {
+        requested: Arc::new(AtomicBool::new(false)),
+        diagnostic_deadline: None,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DaemonShutdownReason {
+    Once,
+    ProcessSignal,
+    ProgramSurface,
+}
+
+fn requested_daemon_shutdown(
+    native: Option<&NativeDaemon>,
+    process: Option<&ProcessShutdown>,
+) -> Option<DaemonShutdownReason> {
+    if process.is_some_and(ProcessShutdown::requested) {
+        Some(DaemonShutdownReason::ProcessSignal)
+    } else if native.is_some_and(NativeDaemon::shutdown_requested) {
+        Some(DaemonShutdownReason::ProgramSurface)
+    } else {
+        None
+    }
+}
+
+trait ProjectSaver {
+    fn save(&self, project: &StoredProject) -> AppResult<()>;
+}
+
+impl ProjectSaver for ProjectStore {
+    fn save(&self, project: &StoredProject) -> AppResult<()> {
+        ProjectStore::save(self, project).map_err(Into::into)
+    }
+}
+
+#[cfg(feature = "native-media")]
+struct NativeDaemon {
+    pacer: FramePacer,
+    pacer_start_offset: Duration,
+    origin: Instant,
+    latest_output: Option<NativeTexture>,
+    master: NativeMasterRuntime,
+    playback: freemixd::native_media::NativeSourcePlayback,
+    runtime: NativeMediaRuntime,
+    recorder: Option<NativeProgramRecorder>,
+    telemetry: NativeRuntimeTelemetry,
+    telemetry_emitted: bool,
+    #[cfg(target_os = "macos")]
+    cameras: NativeCameraInputs,
+    #[cfg(target_os = "macos")]
+    camera_telemetry_frozen: bool,
+    #[cfg(all(feature = "macos-program-surface", target_os = "macos"))]
+    program: Option<program_surface::ProgramPresentation>,
+}
+
+#[cfg(feature = "native-media")]
+struct NativeSourceResolution {
+    sources: Vec<NativeResolvedSource>,
+    #[cfg(target_os = "macos")]
+    cameras: NativeCameraInputs,
+}
+
+#[cfg(all(feature = "native-media", target_os = "macos"))]
+struct NativeCameraInput {
+    input: InputId,
+    source: CameraVideoSource,
+    ingested_frames: u64,
+}
+
+#[cfg(all(feature = "native-media", target_os = "macos"))]
+#[derive(Default)]
+struct NativeCameraInputs {
+    inputs: Vec<NativeCameraInput>,
+    telemetry_emitted: bool,
+}
+
+#[cfg(all(feature = "native-media", target_os = "macos"))]
+impl NativeCameraInputs {
+    fn poll_into(
+        &mut self,
+        runtime: &NativeMediaRuntime,
+        playback: &mut freemixd::native_media::NativeSourcePlayback,
+    ) -> AppResult<()> {
+        for camera in &mut self.inputs {
+            match camera.source.try_receive()? {
+                Some(MediaTransfer::Live(frame)) => {
+                    runtime.ingest_live_video_frame_blocking(playback, camera.input, frame)?;
+                    camera.ingested_frames = camera.ingested_frames.saturating_add(1);
+                }
+                Some(MediaTransfer::Fallback { .. }) => {
+                    return Err(AppFailure(format!(
+                        "camera input {} returned fallback media despite Stop policy",
+                        camera.input
+                    ))
+                    .into());
+                }
+                None => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn source_telemetry(&self) -> Vec<NativeCameraSourceTelemetry> {
+        let mut sources = self
+            .inputs
+            .iter()
+            .map(|camera| {
+                let telemetry = camera.source.telemetry();
+                NativeCameraSourceTelemetry {
+                    input: camera.input,
+                    lifecycle: camera.source.lifecycle(),
+                    health: camera.source.health().state,
+                    frames_received: telemetry.received,
+                    frames_ingested: camera.ingested_frames,
+                    native_dropped: telemetry.native_dropped,
+                    queue_dropped: telemetry.dropped,
+                    queue_depth: saturating_u64(telemetry.current),
+                    queue_peak_depth: saturating_u64(telemetry.peak),
+                }
+            })
+            .collect::<Vec<_>>();
+        sort_camera_source_telemetry(&mut sources);
+        sources
+    }
+
+    fn emit_source_telemetry(&mut self) -> Option<Vec<NativeCameraSourceTelemetry>> {
+        if self.telemetry_emitted {
+            return None;
+        }
+        let sources = self.source_telemetry();
+        for source in &sources {
+            eprintln!("{}", source.diagnostic());
+        }
+        self.telemetry_emitted = true;
+        Some(sources)
+    }
+
+    fn mark_initial_frames_ingested(&mut self) {
+        for camera in &mut self.inputs {
+            camera.ingested_frames = 1;
+        }
+    }
+
+    fn shutdown(&mut self) -> AppResult<()> {
+        let mut failure = None;
+        for camera in &mut self.inputs {
+            if camera.source.lifecycle() == LifecycleState::Running
+                && let Err(error) = camera.source.stop()
+            {
+                failure.get_or_insert_with(|| {
+                    format!("camera input {} stop failed: {error}", camera.input)
+                });
+            }
+            if matches!(
+                camera.source.lifecycle(),
+                LifecycleState::Open | LifecycleState::Lost
+            ) && let Err(error) = camera.source.close()
+            {
+                failure.get_or_insert_with(|| {
+                    format!("camera input {} close failed: {error}", camera.input)
+                });
+            }
+        }
+        failure.map_or(Ok(()), |detail| Err(AppFailure(detail).into()))
+    }
+}
+
+#[cfg(feature = "native-media")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct NativeCameraTelemetry {
+    configured_sources: u64,
+    frames_received: u64,
+    frames_ingested: u64,
+    native_dropped: u64,
+    queue_dropped: u64,
+    queue_depth: u64,
+    queue_peak_depth: u64,
+}
+
+#[cfg(all(feature = "native-media", target_os = "macos"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeCameraSourceTelemetry {
+    input: InputId,
+    lifecycle: LifecycleState,
+    health: EndpointHealthState,
+    frames_received: u64,
+    frames_ingested: u64,
+    native_dropped: u64,
+    queue_dropped: u64,
+    queue_depth: u64,
+    queue_peak_depth: u64,
+}
+
+#[cfg(all(feature = "native-media", target_os = "macos"))]
+impl NativeCameraSourceTelemetry {
+    fn diagnostic(self) -> String {
+        format!(
+            "FREEMIXD_CAMERA_SOURCE\tv=1\tclassification=diagnostic-not-certification\tinput_id={}\tsample_phase=pre_cleanup\tsample_lifecycle={}\thealth={}\tframes_received={}\tframes_ingested={}\tnative_dropped={}\tqueue_depth={}\tqueue_peak_depth={}\tqueue_dropped={}",
+            self.input,
+            lifecycle_label(self.lifecycle),
+            health_label(self.health),
+            self.frames_received,
+            self.frames_ingested,
+            self.native_dropped,
+            self.queue_depth,
+            self.queue_peak_depth,
+            self.queue_dropped,
+        )
+    }
+}
+
+#[cfg(all(feature = "native-media", target_os = "macos"))]
+fn aggregate_camera_telemetry(sources: &[NativeCameraSourceTelemetry]) -> NativeCameraTelemetry {
+    let mut aggregate = NativeCameraTelemetry {
+        configured_sources: saturating_u64(sources.len()),
+        ..NativeCameraTelemetry::default()
+    };
+    for source in sources {
+        aggregate.frames_received = aggregate
+            .frames_received
+            .saturating_add(source.frames_received);
+        aggregate.frames_ingested = aggregate
+            .frames_ingested
+            .saturating_add(source.frames_ingested);
+        aggregate.native_dropped = aggregate
+            .native_dropped
+            .saturating_add(source.native_dropped);
+        aggregate.queue_dropped = aggregate.queue_dropped.saturating_add(source.queue_dropped);
+        aggregate.queue_depth = aggregate.queue_depth.saturating_add(source.queue_depth);
+        aggregate.queue_peak_depth = aggregate
+            .queue_peak_depth
+            .saturating_add(source.queue_peak_depth);
+    }
+    aggregate
+}
+
+#[cfg(all(feature = "native-media", target_os = "macos"))]
+fn sort_camera_source_telemetry(sources: &mut [NativeCameraSourceTelemetry]) {
+    sources.sort_by_key(|source| source.input);
+}
+
+#[cfg(all(feature = "native-media", target_os = "macos"))]
+const fn lifecycle_label(state: LifecycleState) -> &'static str {
+    match state {
+        LifecycleState::Closed => "closed",
+        LifecycleState::Open => "open",
+        LifecycleState::Running => "running",
+        LifecycleState::Lost => "lost",
+        LifecycleState::Recovering => "recovering",
+    }
+}
+
+#[cfg(all(feature = "native-media", target_os = "macos"))]
+const fn health_label(state: EndpointHealthState) -> &'static str {
+    match state {
+        EndpointHealthState::Healthy => "healthy",
+        EndpointHealthState::Degraded => "degraded",
+        EndpointHealthState::SignalLost => "signal_lost",
+        EndpointHealthState::Failed => "failed",
+    }
+}
+
+#[cfg(all(feature = "native-media", target_os = "macos"))]
+impl Drop for NativeCameraInputs {
+    fn drop(&mut self) {
+        let _ = self.emit_source_telemetry();
+        let _ = self.shutdown();
+    }
+}
+
+#[cfg(feature = "native-media")]
+struct NativeRuntimeTelemetry {
+    origin: Instant,
+    gpu_adapter: String,
+    gpu_backend: NativeBackend,
+    metrics: MetricStore,
+    metric_errors: u64,
+    gpu_support: fm_gpu::NativeFullscreenTimingSupport,
+    gpu_pending_samples: u64,
+    gpu_dropped_samples: u64,
+    gpu_unavailable_samples: u64,
+    audio_retained_blocks: u64,
+    audio_peak_retained_blocks: u64,
+    audio_retained_samples: u64,
+    audio_peak_retained_samples: u64,
+    audio_sink_depth: u64,
+    audio_sink_peak_depth: u64,
+    audio_sink_dropped: u64,
+    camera: NativeCameraTelemetry,
+    recorder_configured: bool,
+    recorder_outstanding_pairs: u64,
+    recorder_peak_outstanding_pairs: u64,
+    recorder_retained_bytes: u64,
+    recorder_peak_retained_bytes: u64,
+}
+
+#[cfg(feature = "native-media")]
+impl NativeRuntimeTelemetry {
+    const RETAINED_SAMPLES: usize = 256;
+
+    fn new(origin: Instant, adapter: &fm_gpu::NativeAdapterInfo) -> Self {
+        Self {
+            origin,
+            gpu_adapter: adapter.name.clone(),
+            gpu_backend: adapter.backend,
+            metrics: MetricStore::new(Self::RETAINED_SAMPLES),
+            metric_errors: 0,
+            gpu_support: fm_gpu::NativeFullscreenTimingSupport::Unsupported,
+            gpu_pending_samples: 0,
+            gpu_dropped_samples: 0,
+            gpu_unavailable_samples: 0,
+            audio_retained_blocks: 0,
+            audio_peak_retained_blocks: 0,
+            audio_retained_samples: 0,
+            audio_peak_retained_samples: 0,
+            audio_sink_depth: 0,
+            audio_sink_peak_depth: 0,
+            audio_sink_dropped: 0,
+            camera: NativeCameraTelemetry::default(),
+            recorder_configured: false,
+            recorder_outstanding_pairs: 0,
+            recorder_peak_outstanding_pairs: 0,
+            recorder_retained_bytes: 0,
+            recorder_peak_retained_bytes: 0,
+        }
+    }
+
+    fn observe_host_lateness(&mut self, deadline: Instant, observed: Instant) {
+        let milliseconds = observed.saturating_duration_since(deadline).as_secs_f64() * 1_000.0;
+        let time = self.monotonic_millis();
+        let result =
+            self.metrics
+                .observe_histogram(Metric::LatencyMilliseconds, time, milliseconds);
+        self.record_metric_result(result);
+    }
+
+    fn observe_gpu(&mut self, context: &NativeContext) {
+        let telemetry = context.take_fullscreen_timing_telemetry();
+        self.gpu_support = telemetry.support;
+        self.gpu_pending_samples = saturating_u64(telemetry.pending_samples);
+        self.gpu_dropped_samples = telemetry.dropped_samples;
+        self.gpu_unavailable_samples = telemetry.unavailable_samples;
+        for sample in telemetry.completed_samples {
+            let milliseconds = sample.duration_nanoseconds() / 1_000_000.0;
+            let time = self.monotonic_millis();
+            let result =
+                self.metrics
+                    .observe_histogram(Metric::GpuTimeMilliseconds, time, milliseconds);
+            self.record_metric_result(result);
+        }
+    }
+
+    fn observe_audio(&mut self, master: &NativeMasterRuntime) {
+        self.audio_retained_blocks = saturating_u64(master.retained_blocks());
+        self.audio_peak_retained_blocks = self
+            .audio_peak_retained_blocks
+            .max(self.audio_retained_blocks);
+        self.audio_retained_samples = saturating_u64(master.retained_samples());
+        self.audio_peak_retained_samples = self
+            .audio_peak_retained_samples
+            .max(self.audio_retained_samples);
+        self.audio_sink_depth = saturating_u64(master.sink_len());
+        let sink = master.sink_telemetry();
+        self.audio_sink_peak_depth = saturating_u64(sink.high_watermark());
+        self.audio_sink_dropped = sink.dropped();
+    }
+
+    fn observe_recorder(&mut self, recorder: &NativeProgramRecorder) {
+        self.recorder_configured = true;
+        let telemetry = recorder.recorder.telemetry();
+        self.recorder_outstanding_pairs = saturating_u64(telemetry.outstanding_pairs);
+        self.recorder_peak_outstanding_pairs = self
+            .recorder_peak_outstanding_pairs
+            .max(self.recorder_outstanding_pairs);
+        self.recorder_retained_bytes = saturating_u64(telemetry.retained_bytes);
+        self.recorder_peak_retained_bytes = self
+            .recorder_peak_retained_bytes
+            .max(self.recorder_retained_bytes);
+    }
+
+    fn emit(&self, presentation: Option<fm_gpu::PresentationTelemetry>) {
+        eprintln!("{}", self.diagnostic(presentation));
+    }
+
+    fn diagnostic(&self, presentation: Option<fm_gpu::PresentationTelemetry>) -> String {
+        let host = self
+            .metrics
+            .series(Metric::LatencyMilliseconds)
+            .histogram_summary()
+            .expect("host lateness is a histogram");
+        let gpu = self
+            .metrics
+            .series(Metric::GpuTimeMilliseconds)
+            .histogram_summary()
+            .expect("GPU time is a histogram");
+        let presentation_active = presentation.is_some();
+        let presentation = presentation.unwrap_or_default();
+        format!(
+            "FREEMIXD_TELEMETRY\tv=3\thost_lateness_samples_total={}\thost_lateness_samples_retained={}\thost_lateness_metric_samples_dropped={}\thost_lateness_p50_ms={}\thost_lateness_p95_ms={}\thost_lateness_p99_ms={}\taudio_retained_blocks={}\taudio_observed_peak_retained_blocks={}\taudio_retained_samples={}\taudio_observed_peak_retained_samples={}\taudio_sink_depth={}\taudio_sink_peak_depth={}\taudio_sink_dropped={}\tcamera_configured_sources={}\tcamera_frames_received={}\tcamera_frames_ingested={}\tcamera_native_dropped={}\tcamera_queue_depth={}\tcamera_queue_peak_depth={}\tcamera_queue_dropped={}\tpresentation_active={}\tpresentation_pending_depth={}\tpresentation_peak_pending_depth={}\tpresentation_dropped={}\trecorder_configured={}\trecorder_outstanding_pairs={}\trecorder_observed_peak_outstanding_pairs={}\trecorder_retained_bytes={}\trecorder_observed_peak_retained_bytes={}\tgpu_backend={:?}\tgpu_adapter={}\tgpu_timing={:?}\tgpu_pass_samples_total={}\tgpu_pass_samples_retained={}\tgpu_pass_metric_samples_dropped={}\tgpu_pass_p50_ms={}\tgpu_pass_p95_ms={}\tgpu_pass_p99_ms={}\tgpu_samples_pending={}\tgpu_samples_dropped={}\tgpu_samples_unavailable={}\tmetric_errors={}\tmetric_samples_dropped={}",
+            host.count,
+            host.retained_samples,
+            host.dropped_samples,
+            metric_value(host.p50),
+            metric_value(host.p95),
+            metric_value(host.p99),
+            self.audio_retained_blocks,
+            self.audio_peak_retained_blocks,
+            self.audio_retained_samples,
+            self.audio_peak_retained_samples,
+            self.audio_sink_depth,
+            self.audio_sink_peak_depth,
+            self.audio_sink_dropped,
+            self.camera.configured_sources,
+            self.camera.frames_received,
+            self.camera.frames_ingested,
+            self.camera.native_dropped,
+            self.camera.queue_depth,
+            self.camera.queue_peak_depth,
+            self.camera.queue_dropped,
+            presentation_active,
+            presentation.pending_depth,
+            presentation.peak_pending_depth,
+            presentation.frames_dropped,
+            self.recorder_configured,
+            self.recorder_outstanding_pairs,
+            self.recorder_peak_outstanding_pairs,
+            self.recorder_retained_bytes,
+            self.recorder_peak_retained_bytes,
+            self.gpu_backend,
+            diagnostic_field(&self.gpu_adapter),
+            self.gpu_support,
+            gpu.count,
+            gpu.retained_samples,
+            gpu.dropped_samples,
+            metric_value(gpu.p50),
+            metric_value(gpu.p95),
+            metric_value(gpu.p99),
+            self.gpu_pending_samples,
+            self.gpu_dropped_samples,
+            self.gpu_unavailable_samples,
+            self.metric_errors,
+            self.metrics.dropped_samples(),
+        )
+    }
+
+    fn monotonic_millis(&self) -> u64 {
+        u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn record_metric_result(&mut self, result: Result<(), fm_observability::MetricError>) {
+        if result.is_err() {
+            self.metric_errors = self.metric_errors.saturating_add(1);
+        }
+    }
+}
+
+#[cfg(feature = "native-media")]
+fn saturating_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+#[cfg(feature = "native-media")]
+fn metric_value(value: Option<f64>) -> String {
+    value.map_or_else(|| "none".to_owned(), |value| format!("{value:.3}"))
+}
+
+#[cfg(feature = "native-media")]
+struct NativeProgramRecorder {
+    readback: NativeProgramReadback,
+    format: RecordFormat,
+    recorder: Recorder,
+    capture: RecorderCapturePolicy,
+    finalization_clean: Option<bool>,
+    startup_pair_timeout: Duration,
+}
+
+#[cfg(feature = "native-media")]
+#[derive(Default)]
+struct RecorderCapturePolicy {
+    first_failure: Option<String>,
+    app_capture_failure: bool,
+}
+
+#[cfg(feature = "native-media")]
+impl RecorderCapturePolicy {
+    fn active(&self) -> bool {
+        self.first_failure.is_none()
+    }
+
+    fn fail(&mut self, failure: String, app_capture_failure: bool) -> bool {
+        if self.first_failure.is_some() {
+            return false;
+        }
+        self.first_failure = Some(failure);
+        self.app_capture_failure = app_capture_failure;
+        true
+    }
+}
+
+#[cfg(feature = "native-media")]
+impl NativeProgramRecorder {
+    fn start(runtime: &NativeMediaRuntime, stored: &StoredProject, path: &Path) -> AppResult<Self> {
+        let settings = stored.project().settings();
+        let dimensions = settings.video.dimensions;
+        let format = RecordFormat::new(
+            dimensions.width(),
+            dimensions.height(),
+            settings.frame_rate,
+            settings.audio.sample_rate,
+            settings.audio.channels.clone(),
+            SequenceNumber::new(stored.position().frames_rendered),
+        )?;
+        let readback = runtime.create_program_readback_blocking(
+            NonZeroU32::new(dimensions.width()).expect("project width is nonzero"),
+            NonZeroU32::new(dimensions.height()).expect("project height is nonzero"),
+        )?;
+        let output = create_record_output(path)?;
+        let mut config = RecordConfig::new(format.clone());
+        config.limits.stop_timeout = PROGRAM_RECORDER_STOP_TIMEOUT;
+        config.limits.kill_timeout = PROGRAM_RECORDER_KILL_TIMEOUT;
+        let startup_pair_timeout = config
+            .limits
+            .connect_timeout
+            .checked_add(config.limits.no_progress_timeout)
+            .ok_or_else(|| AppFailure("Program recorder startup timeout overflow".into()))?;
+        let recorder = Recorder::start(output, config)?;
+        Ok(Self {
+            readback,
+            format,
+            recorder,
+            capture: RecorderCapturePolicy::default(),
+            finalization_clean: None,
+            startup_pair_timeout,
+        })
+    }
+
+    fn capture(
+        &mut self,
+        runtime: &NativeMediaRuntime,
+        program: &NativeTexture,
+        audio: AudioBlock,
+    ) {
+        if !self.capture.active() {
+            return;
+        }
+        let telemetry = self.recorder.telemetry();
+        if telemetry.state == RecorderState::Failed {
+            self.fail(format!("backend:{:?}", telemetry.failure), false);
+            return;
+        }
+        let sequence = audio.timing().sequence();
+        // This is the existing synchronous diagnostic readback path, not a
+        // nonblocking or zero-copy encoder bridge.
+        let readback = match runtime.readback_program_blocking(&mut self.readback, program) {
+            Ok(readback) => readback,
+            Err(error) => {
+                self.fail(format!("readback:{error}"), true);
+                return;
+            }
+        };
+        let Some(expected_stride) = readback.width.checked_mul(4) else {
+            self.fail("readback:stride_overflow".to_owned(), true);
+            return;
+        };
+        if readback.width != self.readback.width()
+            || readback.height != self.readback.height()
+            || readback.stride != expected_stride
+        {
+            self.fail("readback:invalid_tight_layout".to_owned(), true);
+            return;
+        }
+        let pair = match PairedFrame::new(&self.format, sequence, readback.rgba, audio) {
+            Ok(pair) => pair,
+            Err(error) => {
+                self.fail(format!("frame:{error}"), true);
+                return;
+            }
+        };
+        if let Err(error) = self.recorder.enqueue(pair) {
+            let app_capture_failure = !matches!(&error.reason, EnqueueRejection::Failed(_));
+            self.fail(format!("enqueue:{:?}", error.reason), app_capture_failure);
+        }
+    }
+
+    fn fail(&mut self, failure: String, app_capture_failure: bool) {
+        if self.capture.fail(failure, app_capture_failure) {
+            self.recorder.request_cancel();
+        }
+    }
+
+    fn startup_decision(&self) -> AppResult<StartupPairDecision> {
+        let telemetry = self.recorder.telemetry();
+        let decision = startup_pair_decision(
+            telemetry.state,
+            telemetry.completed_pairs,
+            telemetry.output_bytes,
+            telemetry.failure.is_some() || self.capture.first_failure.is_some(),
+        );
+        if decision != StartupPairDecision::Failed {
+            return Ok(decision);
+        }
+        let failure = self
+            .capture
+            .first_failure
+            .clone()
+            .or_else(|| telemetry.failure.map(|failure| format!("{failure:?}")))
+            .unwrap_or_else(|| "unknown".to_owned());
+        Err(AppFailure(format!(
+            "Program recorder failed before readiness: {}",
+            diagnostic_field(&failure)
+        ))
+        .into())
+    }
+
+    fn fail_startup_timeout(&mut self) -> Box<dyn Error> {
+        self.fail("startup:mux_readiness_timeout".to_owned(), false);
+        AppFailure("Program recorder mux output timed out before readiness".into()).into()
+    }
+
+    fn stop_and_report(&mut self) -> AppResult<()> {
+        if let Some(clean) = self.finalization_clean {
+            return if clean {
+                Ok(())
+            } else {
+                Err(AppFailure("Program recording did not finalize cleanly".into()).into())
+            };
+        }
+        let report = self.recorder.stop();
+        let app_capture_failure = self.capture.app_capture_failure;
+        let failure = self
+            .capture
+            .first_failure
+            .clone()
+            .or_else(|| {
+                report
+                    .telemetry
+                    .failure
+                    .as_ref()
+                    .map(|value| format!("{value:?}"))
+            })
+            .unwrap_or_else(|| "none".to_owned());
+        eprintln!(
+            "FREEMIXD_RECORDER\tv=1\tstate={:?}\toutcome={:?}\taccepted_pairs={}\tcompleted_pairs={}\toutput_bytes={}\toutput_finalization={:?}\tcleanup={:?}\tapp_capture_failure={}\tfailure={}",
+            report.telemetry.state,
+            report.outcome,
+            report.telemetry.accepted_pairs,
+            report.telemetry.completed_pairs,
+            report.telemetry.output_bytes,
+            report.output,
+            report.cleanup,
+            app_capture_failure,
+            diagnostic_field(&failure),
+        );
+        let complete = report.telemetry.state == RecorderState::Stopped
+            && report.outcome == StopOutcome::Clean
+            && report.output == OutputFinalization::Synced
+            && report.cleanup == CleanupStatus::Complete
+            && report.telemetry.accepted_pairs == report.telemetry.completed_pairs
+            && report.telemetry.failed_pairs == 0
+            && !app_capture_failure;
+        self.finalization_clean = Some(complete);
+        if complete {
+            Ok(())
+        } else {
+            Err(AppFailure("Program recording did not finalize cleanly".into()).into())
+        }
+    }
+}
+
+#[cfg(feature = "native-media")]
+impl Drop for NativeProgramRecorder {
+    fn drop(&mut self) {
+        let _ = self.stop_and_report();
+    }
+}
+
+#[cfg(feature = "native-media")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartupPairDecision {
+    Pending,
+    Ready,
+    Failed,
+}
+
+#[cfg(feature = "native-media")]
+fn startup_pair_decision(
+    state: RecorderState,
+    completed_pairs: u64,
+    output_bytes: u64,
+    failed: bool,
+) -> StartupPairDecision {
+    if failed || state == RecorderState::Failed {
+        StartupPairDecision::Failed
+    } else if completed_pairs > 0 && output_bytes > 0 {
+        StartupPairDecision::Ready
+    } else {
+        StartupPairDecision::Pending
+    }
+}
+
+#[cfg(feature = "native-media")]
+#[derive(Debug)]
+enum NativeRealizationError {
+    Video(NativeSourceRenderError),
+    Audio(NativeMasterError),
+}
+
+#[cfg(feature = "native-media")]
+impl fmt::Display for NativeRealizationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Video(error) => error.fmt(formatter),
+            Self::Audio(error) => error.fmt(formatter),
+        }
+    }
+}
+
+#[cfg(feature = "native-media")]
+impl Error for NativeRealizationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Video(error) => Some(error),
+            Self::Audio(error) => Some(error),
+        }
+    }
+}
+
+#[cfg(feature = "native-media")]
+impl NativeDaemon {
+    fn start(
+        store: &ProjectStore,
+        stored: &StoredProject,
+        camera_helper: Option<&Path>,
+    ) -> AppResult<Self> {
+        Self::start_with_optional_context(store, stored, None, camera_helper)
+    }
+
+    fn start_with_optional_context(
+        store: &ProjectStore,
+        stored: &StoredProject,
+        context: Option<NativeContext>,
+        camera_helper: Option<&Path>,
+    ) -> AppResult<Self> {
+        validate_native_audio_modes(stored)?;
+        let resolution = resolve_native_sources(store, stored, camera_helper)?;
+        let sources = resolution.sources;
+        let requires_ffmpeg = sources
+            .iter()
+            .any(|source| matches!(source, NativeResolvedSource::LocalVideo { .. }));
+        let adapter = requires_ffmpeg
+            .then(|| {
+                Adapter::new(FfmpegConfig {
+                    allowed_root: Some(store.assets_root()),
+                    ..FfmpegConfig::default()
+                })
+            })
+            .transpose()?;
+        if let Some(adapter) = &adapter {
+            let capabilities = adapter.capabilities();
+            if !matches!(capabilities.ffmpeg, ToolAvailability::Available { .. })
+                || !matches!(capabilities.ffprobe, ToolAvailability::Available { .. })
+            {
+                return Err(AppFailure(
+                    "native video playback requires available ffmpeg and ffprobe capabilities"
+                        .into(),
+                )
+                .into());
+            }
+        }
+
+        let master = NativeMasterRuntime::preflight_local_blocking(
+            adapter.as_ref(),
+            &sources,
+            stored.project().settings().audio.clone(),
+            stored.project().settings().frame_rate,
+            native_clock_domain(),
+            stored.position().frames_rendered,
+            NativeAudioLimits::default(),
+        )?;
+        let runtime = match context {
+            Some(context) => NativeMediaRuntime::from_context_blocking(context)?,
+            None => NativeMediaRuntime::new_blocking([platform_native_backend()])?,
+        };
+        let playback = runtime.preflight_resolved_source_playback_mixed_blocking(
+            adapter.as_ref(),
+            sources,
+            native_clock_domain(),
+            StreamSelector::Best,
+            NativeSourceLimits::default(),
+        )?;
+        let expected = stored.project().settings().video.dimensions;
+        if playback.registry().dimensions() != Some((expected.width(), expected.height())) {
+            return Err(AppFailure(format!(
+                "native media source dimensions must match project output {}x{}",
+                expected.width(),
+                expected.height()
+            ))
+            .into());
+        }
+        let pacer = FramePacer::restore(
+            stored.project().settings().frame_rate,
+            0,
+            FrameNumber::new(stored.position().frames_rendered),
+        )?;
+        let pacer_start_offset = host_deadline_offset(&pacer)?;
+        let origin = Instant::now();
+        let telemetry = NativeRuntimeTelemetry::new(origin, runtime.context().adapter_info());
+        Ok(Self {
+            pacer,
+            pacer_start_offset,
+            origin,
+            latest_output: None,
+            master,
+            playback,
+            runtime,
+            recorder: None,
+            telemetry,
+            telemetry_emitted: false,
+            #[cfg(target_os = "macos")]
+            cameras: {
+                let mut cameras = resolution.cameras;
+                cameras.mark_initial_frames_ingested();
+                cameras
+            },
+            #[cfg(target_os = "macos")]
+            camera_telemetry_frozen: false,
+            #[cfg(all(feature = "macos-program-surface", target_os = "macos"))]
+            program: None,
+        })
+    }
+
+    #[cfg(all(feature = "macos-program-surface", target_os = "macos"))]
+    fn start_with_program(
+        store: &ProjectStore,
+        stored: &StoredProject,
+        context: NativeContext,
+        surface: NativeSurface,
+        channels: program_surface::ProgramWorkerChannels,
+        camera_helper: Option<&Path>,
+    ) -> AppResult<Self> {
+        let mut native =
+            Self::start_with_optional_context(store, stored, Some(context), camera_helper)?;
+        native.program = Some(program_surface::ProgramPresentation::new(surface, channels));
+        Ok(native)
+    }
+
+    fn start_recorder(&mut self, stored: &StoredProject, path: &Path) -> AppResult<()> {
+        self.recorder = Some(NativeProgramRecorder::start(&self.runtime, stored, path)?);
+        Ok(())
+    }
+
+    fn prime_recorder(
+        &mut self,
+        control: &mut ControlService<Policy>,
+        server: &ServerIdentity,
+        shutdown: &ProcessShutdown,
+    ) -> AppResult<bool> {
+        if self.recorder.is_none() {
+            return Ok(true);
+        }
+        let startup_timeout = self
+            .recorder
+            .as_ref()
+            .expect("recorder was checked")
+            .startup_pair_timeout;
+        let deadline = Instant::now()
+            .checked_add(startup_timeout)
+            .ok_or_else(|| AppFailure("Program recorder startup deadline overflow".into()))?;
+        loop {
+            if requested_daemon_shutdown(Some(&*self), Some(shutdown)).is_some() {
+                return Ok(false);
+            }
+            match self
+                .recorder
+                .as_ref()
+                .expect("recorder was checked")
+                .startup_decision()?
+            {
+                StartupPairDecision::Ready => return Ok(true),
+                StartupPairDecision::Failed => unreachable!("failure is returned as an error"),
+                StartupPairDecision::Pending => {}
+            }
+            if Instant::now() >= deadline {
+                return Err(self
+                    .recorder
+                    .as_mut()
+                    .expect("recorder was checked")
+                    .fail_startup_timeout());
+            }
+            self.tick_if_due(control, server)?;
+            thread::sleep(NATIVE_IO_POLL_INTERVAL);
+        }
+    }
+
+    fn tick_if_due(
+        &mut self,
+        control: &mut ControlService<Policy>,
+        server: &ServerIdentity,
+    ) -> AppResult<()> {
+        #[cfg(all(feature = "macos-program-surface", target_os = "macos"))]
+        if let Some(program) = &mut self.program {
+            program
+                .service_control(self.runtime.context())
+                .map_err(|error| -> Box<dyn Error> { Box::new(AppFailure(error)) })?;
+        }
+        let covered = self.service_playback(control)?;
+        let host_deadline = self.next_deadline()?;
+        let now = Instant::now();
+        if now < host_deadline {
+            return Ok(());
+        }
+        if !covered {
+            return Ok(());
+        }
+        self.telemetry.observe_host_lateness(host_deadline, now);
+        self.realize_one(control, server)?;
+        Ok(())
+    }
+
+    fn wait_and_tick(
+        &mut self,
+        control: &mut ControlService<Policy>,
+        server: &ServerIdentity,
+        process_shutdown: Option<&ProcessShutdown>,
+    ) -> AppResult<Option<Vec<RuntimeEventMessage>>> {
+        let (host_deadline, observed) = loop {
+            if requested_daemon_shutdown(Some(&*self), process_shutdown).is_some() {
+                return Ok(None);
+            }
+            let covered = self.service_playback(control)?;
+            let host_deadline = self.next_deadline()?;
+            let now = Instant::now();
+            if covered && now >= host_deadline {
+                break (host_deadline, now);
+            }
+            let host_wait = host_deadline.saturating_duration_since(now);
+            thread::sleep(host_wait.min(NATIVE_IO_POLL_INTERVAL));
+        };
+        self.telemetry
+            .observe_host_lateness(host_deadline, observed);
+        self.realize_one(control, server).map(Some)
+    }
+
+    fn service_playback(&mut self, control: &ControlService<Policy>) -> AppResult<bool> {
+        #[cfg(target_os = "macos")]
+        self.cameras.poll_into(&self.runtime, &mut self.playback)?;
+        let audio_covered = self.master.service_next_frame()?;
+        let deadline = control.next_frame_deadline()?;
+        let video_covered = self
+            .runtime
+            .service_source_playback_blocking(&mut self.playback, deadline)
+            .map_err(Box::<dyn Error>::from)?;
+        Ok(audio_covered && video_covered)
+    }
+
+    fn realize_one(
+        &mut self,
+        control: &mut ControlService<Policy>,
+        server: &ServerIdentity,
+    ) -> AppResult<Vec<RuntimeEventMessage>> {
+        let runtime = &self.runtime;
+        let registry = self.playback.registry();
+        let master = &mut self.master;
+        let latest_output = &mut self.latest_output;
+        let mut audio = None;
+        let outcome = control.tick_with_realizer(server, |frame| {
+            let output = runtime
+                .render_frame_result_blocking(registry, frame)
+                .map_err(NativeRealizationError::Video)?;
+            let block = master
+                .render_frame_audio(frame)
+                .map_err(NativeRealizationError::Audio)?;
+            *latest_output = Some(output);
+            audio = Some(block);
+            Ok::<(), NativeRealizationError>(())
+        })?;
+        self.pacer.advance()?;
+        #[cfg(all(feature = "macos-program-surface", target_os = "macos"))]
+        if let (Some(program), Some(output)) = (&mut self.program, self.latest_output.as_ref()) {
+            program
+                .present_latest(self.runtime.context(), output)
+                .map_err(|error| -> Box<dyn Error> { Box::new(AppFailure(error)) })?;
+        }
+        if let (Some(recorder), Some(output), Some(audio)) =
+            (&mut self.recorder, self.latest_output.as_ref(), audio)
+        {
+            recorder.capture(&self.runtime, output, audio);
+        }
+        self.observe_native_telemetry();
+        Ok(outcome.runtime_events)
+    }
+
+    #[allow(clippy::unused_self)]
+    fn shutdown_requested(&self) -> bool {
+        #[cfg(all(feature = "macos-program-surface", target_os = "macos"))]
+        if let Some(program) = &self.program {
+            return program.shutdown_requested();
+        }
+        false
+    }
+
+    fn recorder_active(&self) -> bool {
+        self.recorder.is_some()
+    }
+
+    fn finalize_recorder(&mut self) -> AppResult<()> {
+        let Some(mut recorder) = self.recorder.take() else {
+            return Ok(());
+        };
+        let result = recorder.stop_and_report();
+        self.telemetry.observe_recorder(&recorder);
+        result
+    }
+
+    fn finalize_cameras(&mut self) -> AppResult<()> {
+        #[cfg(target_os = "macos")]
+        {
+            self.cameras.shutdown()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Ok(())
+        }
+    }
+
+    #[cfg(all(feature = "macos-program-surface", target_os = "macos"))]
+    fn program_telemetry(&self) -> Option<fm_gpu::PresentationTelemetry> {
+        self.program
+            .as_ref()
+            .map(program_surface::ProgramPresentation::telemetry)
+    }
+
+    fn observe_native_telemetry(&mut self) {
+        self.telemetry.observe_audio(&self.master);
+        #[cfg(target_os = "macos")]
+        if !self.camera_telemetry_frozen {
+            self.telemetry.camera = aggregate_camera_telemetry(&self.cameras.source_telemetry());
+        }
+        if let Some(recorder) = self.recorder.as_ref() {
+            self.telemetry.observe_recorder(recorder);
+        }
+        self.telemetry.observe_gpu(self.runtime.context());
+    }
+
+    fn emit_telemetry(&mut self) {
+        if self.telemetry_emitted {
+            return;
+        }
+        self.emit_camera_source_telemetry();
+        self.observe_native_telemetry();
+        #[cfg(all(feature = "macos-program-surface", target_os = "macos"))]
+        let presentation = self
+            .program
+            .as_mut()
+            .map(program_surface::ProgramPresentation::telemetry_for_shutdown);
+        #[cfg(not(all(feature = "macos-program-surface", target_os = "macos")))]
+        let presentation = None;
+        self.telemetry.emit(presentation);
+        self.telemetry_emitted = true;
+    }
+
+    fn emit_camera_source_telemetry(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            if self.camera_telemetry_frozen {
+                return;
+            }
+            if let Some(sources) = self.cameras.emit_source_telemetry() {
+                self.telemetry.camera = aggregate_camera_telemetry(&sources);
+            }
+            self.camera_telemetry_frozen = true;
+        }
+    }
+
+    fn next_deadline(&self) -> AppResult<Instant> {
+        let elapsed_offset = host_deadline_offset(&self.pacer)?
+            .checked_sub(self.pacer_start_offset)
+            .ok_or_else(|| {
+                AppFailure("native media pacer moved before its restored cursor".into())
+            })?;
+        self.origin.checked_add(elapsed_offset).ok_or_else(|| {
+            AppFailure("native media host deadline exceeds Instant range".into()).into()
+        })
+    }
+}
+
+#[cfg(feature = "native-media")]
+impl Drop for NativeDaemon {
+    fn drop(&mut self) {
+        let _ = self.finalize_recorder();
+        self.emit_camera_source_telemetry();
+        #[cfg(target_os = "macos")]
+        let _ = self.cameras.shutdown();
+        self.emit_telemetry();
+    }
+}
+
+#[cfg(feature = "native-media")]
+fn validate_native_audio_modes(stored: &StoredProject) -> AppResult<()> {
+    if let Some(input) = stored.project().inputs().iter().find(|input| {
+        matches!(
+            &input.kind,
+            InputKind::Simulated(fm_model::SimulatedInput {
+                audio: SimulatedAudio::Sine { .. },
+                ..
+            })
+        )
+    }) {
+        return Err(AppFailure(format!(
+            "native generator input {} requires unsupported simulated sine audio",
+            input.id
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "native-media"))]
+struct NativeDaemon;
+
+#[cfg(not(feature = "native-media"))]
+impl NativeDaemon {
+    fn start(
+        _store: &ProjectStore,
+        _stored: &StoredProject,
+        _camera_helper: Option<&Path>,
+    ) -> AppResult<Self> {
+        Err(AppFailure("native-media support was not compiled in".into()).into())
+    }
+
+    #[allow(clippy::unused_self)]
+    fn tick_if_due(
+        &mut self,
+        _control: &mut ControlService<Policy>,
+        _server: &ServerIdentity,
+    ) -> AppResult<()> {
+        Err(AppFailure("native-media support was not compiled in".into()).into())
+    }
+
+    #[allow(clippy::unused_self)]
+    fn wait_and_tick(
+        &mut self,
+        _control: &mut ControlService<Policy>,
+        _server: &ServerIdentity,
+        _process_shutdown: Option<&ProcessShutdown>,
+    ) -> AppResult<Option<Vec<RuntimeEventMessage>>> {
+        Err(AppFailure("native-media support was not compiled in".into()).into())
+    }
+
+    #[allow(clippy::unused_self)]
+    fn shutdown_requested(&self) -> bool {
+        false
+    }
+
+    #[allow(clippy::unused_self)]
+    fn start_recorder(&mut self, _stored: &StoredProject, _path: &Path) -> AppResult<()> {
+        Err(AppFailure("native-media support was not compiled in".into()).into())
+    }
+
+    #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
+    fn prime_recorder(
+        &mut self,
+        _control: &mut ControlService<Policy>,
+        _server: &ServerIdentity,
+        _shutdown: &ProcessShutdown,
+    ) -> AppResult<bool> {
+        Ok(true)
+    }
+
+    #[allow(clippy::unused_self)]
+    fn recorder_active(&self) -> bool {
+        false
+    }
+
+    #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
+    fn finalize_recorder(&mut self) -> AppResult<()> {
+        Ok(())
+    }
+
+    #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
+    fn finalize_cameras(&mut self) -> AppResult<()> {
+        Ok(())
+    }
+
+    #[allow(clippy::unused_self)]
+    fn emit_camera_source_telemetry(&mut self) {}
+
+    #[allow(clippy::unused_self)]
+    fn emit_telemetry(&mut self) {}
+}
+
+#[cfg(feature = "native-media")]
+fn resolve_native_sources(
+    store: &ProjectStore,
+    stored: &StoredProject,
+    camera_helper: Option<&Path>,
+) -> AppResult<NativeSourceResolution> {
+    let settings = stored.project().settings();
+    let mut sources = Vec::with_capacity(stored.project().inputs().len());
+    for input in stored.project().inputs() {
+        let source = match &input.kind {
+            InputKind::Media { asset_uri } => resolve_native_media_source(
+                store,
+                input.id,
+                asset_uri,
+                native_clock_domain(),
+                settings.video.dimensions,
+            ),
+            InputKind::Simulated(simulated) => {
+                let pattern = match simulated.video {
+                    SimulatedVideo::Bars => SourcePattern::Bars,
+                    SimulatedVideo::Solid(color) => SourcePattern::Solid(Rgba8::new(
+                        color.red,
+                        color.green,
+                        color.blue,
+                        color.alpha,
+                    )),
+                };
+                let dimensions = settings.video.dimensions;
+                let mut source = SimulatedVideoSource::new(
+                    dimensions.width(),
+                    dimensions.height(),
+                    settings.frame_rate,
+                    native_clock_domain(),
+                    pattern,
+                )
+                .map_err(|error| {
+                    AppFailure(format!(
+                        "native generator construction failed for input {}: {error}",
+                        input.id
+                    ))
+                })?;
+                let frame = source
+                    .next_frame()
+                    .map_err(|error| {
+                        AppFailure(format!(
+                            "native generator frame failed for input {}: {error}",
+                            input.id
+                        ))
+                    })?
+                    .ok_or_else(|| {
+                        AppFailure(format!(
+                            "native generator produced signal loss for input {}",
+                            input.id
+                        ))
+                    })?;
+                Ok(NativeResolvedSource::RetainedFrame {
+                    input: input.id,
+                    frame,
+                })
+            }
+            InputKind::Color => Err(AppFailure(format!(
+                "native color input {} has no configured RGBA value",
+                input.id
+            ))
+            .into()),
+            InputKind::Device { .. } => continue,
+            InputKind::Network { .. } => Err(AppFailure(format!(
+                "native network input {} is not supported by this playback mode",
+                input.id
+            ))
+            .into()),
+        }?;
+        sources.push(source);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let (mut device_sources, cameras) = resolve_macos_camera_sources(stored, camera_helper)?;
+        sources.append(&mut device_sources);
+        Ok(NativeSourceResolution { sources, cameras })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = camera_helper;
+        if let Some(input) = stored
+            .project()
+            .inputs()
+            .iter()
+            .find(|input| matches!(input.kind, InputKind::Device { .. }))
+        {
+            return Err(AppFailure(format!(
+                "native device input {} has no adapter on this platform",
+                input.id
+            ))
+            .into());
+        }
+        Ok(NativeSourceResolution { sources })
+    }
+}
+
+#[cfg(all(feature = "native-media", target_os = "macos"))]
+#[allow(clippy::too_many_lines)]
+fn resolve_macos_camera_sources(
+    stored: &StoredProject,
+    camera_helper: Option<&Path>,
+) -> AppResult<(Vec<NativeResolvedSource>, NativeCameraInputs)> {
+    let device_inputs = stored
+        .project()
+        .inputs()
+        .iter()
+        .filter_map(|input| match &input.kind {
+            InputKind::Device { stable_key } => Some((input.id, stable_key.as_str())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if device_inputs.is_empty() {
+        return Ok((Vec::new(), NativeCameraInputs::default()));
+    }
+    if device_inputs.len() > NativeSourceLimits::DEFAULT_MAX_MEDIA_INPUTS {
+        return Err(AppFailure(format!(
+            "camera input count {} exceeds native source limit {}",
+            device_inputs.len(),
+            NativeSourceLimits::DEFAULT_MAX_MEDIA_INPUTS
+        ))
+        .into());
+    }
+    let mut keys = std::collections::BTreeSet::new();
+    if let Some((input, key)) = device_inputs.iter().find(|(_, key)| !keys.insert(*key)) {
+        return Err(AppFailure(format!(
+            "camera input {input} duplicates stable key `{}`",
+            diagnostic_field(key)
+        ))
+        .into());
+    }
+
+    let adapter = match camera_helper {
+        Some(path) => MacosCameraAdapter::discover_with_helper(path)?,
+        None => MacosCameraAdapter::discover()?,
+    };
+    if !adapter.permission().is_granted() {
+        return Err(AppFailure(
+            "camera permission is not granted; use `freemix-capture-node cameras --request-permission` from an interactive desktop session"
+                .into(),
+        )
+        .into());
+    }
+    let frame_rate = stored.project().settings().frame_rate;
+    let dimensions = stored.project().settings().video.dimensions;
+    let mut cameras = NativeCameraInputs::default();
+    for (input, stable_key) in device_inputs {
+        let mut source = adapter.open_video_source_by_stable_key(stable_key)?;
+        let format = source
+            .exact_video_format_at_rate(dimensions.width(), dimensions.height(), frame_rate)
+            .ok_or_else(|| {
+                AppFailure(format!(
+                    "camera input {input} has no exact {}x{} at {}/{} fps BGRA mode",
+                    dimensions.width(),
+                    dimensions.height(),
+                    frame_rate.numerator(),
+                    frame_rate.denominator()
+                ))
+            })?;
+        let clock_domain = source
+            .descriptor()
+            .capabilities
+            .clocks
+            .first()
+            .ok_or_else(|| AppFailure(format!("camera input {input} has no advertised clock")))?
+            .domain;
+        source.open(IoOpenOptions {
+            format,
+            clock_domain,
+            memory_domain: MemoryDomain::Cpu,
+            queue_capacity: NonZeroUsize::MIN,
+            signal_loss: SignalLossPolicy::Stop,
+        })?;
+        cameras.inputs.push(NativeCameraInput {
+            input,
+            source,
+            ingested_frames: 0,
+        });
+    }
+
+    let start_results = thread::scope(|scope| -> AppResult<Vec<(InputId, Result<(), String>)>> {
+        let mut handles = Vec::with_capacity(cameras.inputs.len());
+        for camera in &mut cameras.inputs {
+            let input = camera.input;
+            handles.push(
+                thread::Builder::new()
+                    .name(format!("freemix-camera-start-{input}"))
+                    .spawn_scoped(scope, move || {
+                        (
+                            input,
+                            camera.source.start().map_err(|error| error.to_string()),
+                        )
+                    })?,
+            );
+        }
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .map_err(|_| AppFailure("camera startup worker panicked".into()).into())
+            })
+            .collect()
+    })?;
+    if let Some((input, Err(detail))) = start_results
+        .into_iter()
+        .find(|(_, result)| result.is_err())
+    {
+        return Err(AppFailure(format!("camera input {input} failed to start: {detail}")).into());
+    }
+
+    let deadline = Instant::now()
+        .checked_add(CAMERA_INITIAL_FRAME_TIMEOUT)
+        .ok_or_else(|| AppFailure("camera initial-frame deadline overflow".into()))?;
+    let mut initial_frames = BTreeMap::new();
+    while initial_frames.len() < cameras.inputs.len() {
+        for camera in &mut cameras.inputs {
+            if initial_frames.contains_key(&camera.input) {
+                continue;
+            }
+            match camera.source.try_receive()? {
+                Some(MediaTransfer::Live(frame)) => {
+                    initial_frames.insert(camera.input, frame);
+                }
+                Some(MediaTransfer::Fallback { .. }) => {
+                    return Err(AppFailure(format!(
+                        "camera input {} returned fallback media during startup",
+                        camera.input
+                    ))
+                    .into());
+                }
+                None => {}
+            }
+        }
+        if initial_frames.len() == cameras.inputs.len() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(AppFailure(format!(
+                "camera initial-frame acquisition timed out with {}/{} sources ready",
+                initial_frames.len(),
+                cameras.inputs.len()
+            ))
+            .into());
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    let sources = cameras
+        .inputs
+        .iter()
+        .map(|camera| NativeResolvedSource::LiveFrame {
+            input: camera.input,
+            frame: initial_frames
+                .remove(&camera.input)
+                .expect("all camera inputs produced an initial frame"),
+        })
+        .collect();
+    Ok((sources, cameras))
+}
+
+#[cfg(feature = "native-media")]
+fn resolve_native_media_source(
+    store: &ProjectStore,
+    input: InputId,
+    asset_uri: &str,
+    clock_domain: MediaClockDomainId,
+    output_dimensions: fm_types::VideoDimensions,
+) -> AppResult<NativeResolvedSource> {
+    let path = store.resolve_asset_uri(asset_uri).map_err(|error| {
+        AppFailure(format!(
+            "native media asset resolution failed for input {input}: {error}"
+        ))
+    })?;
+    let mut file = File::open(&path).map_err(|error| {
+        AppFailure(format!(
+            "native media read failed for input {input}: {:?}",
+            error.kind()
+        ))
+    })?;
+    let mut prefix = Vec::with_capacity(8);
+    Read::by_ref(&mut file)
+        .take(8)
+        .read_to_end(&mut prefix)
+        .map_err(|error| {
+            AppFailure(format!(
+                "native media read failed for input {input}: {:?}",
+                error.kind()
+            ))
+        })?;
+    if sniff_still_format(&prefix).is_err() {
+        return Ok(NativeResolvedSource::LocalVideo { input, path });
+    }
+
+    let limits = still_limits(output_dimensions)?;
+    let mut encoded = prefix;
+    let remaining = limits
+        .max_encoded_bytes
+        .saturating_add(1)
+        .saturating_sub(encoded.len());
+    file.take(u64::try_from(remaining).unwrap_or(u64::MAX))
+        .read_to_end(&mut encoded)
+        .map_err(|error| {
+            AppFailure(format!(
+                "native still read failed for input {input}: {:?}",
+                error.kind()
+            ))
+        })?;
+    let decoded =
+        decode_still(&encoded, retained_frame_timing(clock_domain)?, limits).map_err(|error| {
+            AppFailure(format!(
+                "native still decode failed for input {input}: {error}"
+            ))
+        })?;
+    Ok(NativeResolvedSource::RetainedFrame {
+        input,
+        frame: decoded.frame,
+    })
+}
+
+#[cfg(feature = "native-media")]
+fn still_limits(dimensions: fm_types::VideoDimensions) -> AppResult<StillDecodeLimits> {
+    let maximum_axis = dimensions.width().max(dimensions.height());
+    let decoded_bytes = usize::try_from(dimensions.width())
+        .ok()
+        .and_then(|width| width.checked_mul(4))
+        .and_then(|stride| {
+            stride.checked_mul(usize::try_from(dimensions.height()).unwrap_or(usize::MAX))
+        })
+        .ok_or_else(|| AppFailure("native still output dimensions overflow".into()))?;
+    Ok(StillDecodeLimits {
+        max_width: maximum_axis,
+        max_height: maximum_axis,
+        max_decoded_rgba_bytes: decoded_bytes,
+        ..StillDecodeLimits::default()
+    })
+}
+
+#[cfg(feature = "native-media")]
+fn retained_frame_timing(clock_domain: MediaClockDomainId) -> AppResult<MediaTiming> {
+    let time_base = fm_types::TimeBase::new(1, 1_000_000_000)
+        .map_err(|error| AppFailure(format!("native still time base is invalid: {error}")))?;
+    MediaTiming::new(
+        OriginalTimestamp::new(MediaTimestamp::new(0), time_base),
+        NormalizedTimestamp::from_nanos(0),
+        NormalizedDuration::from_nanos(1)
+            .map_err(|error| AppFailure(format!("native still duration is invalid: {error}")))?,
+        clock_domain,
+        SequenceNumber::new(0),
+    )
+    .map_err(|error| AppFailure(format!("native still timing is invalid: {error}")).into())
+}
+
+#[cfg(all(feature = "native-media", target_os = "macos"))]
+const fn platform_native_backend() -> NativeBackend {
+    NativeBackend::Metal
+}
+
+#[cfg(all(feature = "native-media", target_os = "windows"))]
+const fn platform_native_backend() -> NativeBackend {
+    NativeBackend::Dx12
+}
+
+#[cfg(all(feature = "native-media", target_os = "linux"))]
+const fn platform_native_backend() -> NativeBackend {
+    NativeBackend::Vulkan
+}
+
+#[cfg(feature = "native-media")]
+fn host_deadline_offset(pacer: &FramePacer) -> Result<Duration, fm_scheduler::PacingError> {
+    Ok(Duration::from_nanos(pacer.next_deadline()?.at_ns))
+}
+
+#[cfg(feature = "native-media")]
+fn native_clock_domain() -> MediaClockDomainId {
+    MediaClockDomainId::new(NonZeroU128::new(1).expect("one is nonzero"))
+}
+
+#[cfg(feature = "native-media")]
+fn create_record_output(path: &Path) -> AppResult<File> {
+    let file_name = path
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| AppFailure("recording output must name a final .mp4 file".into()))?;
+    if path.extension().and_then(|extension| extension.to_str()) != Some("mp4") {
+        return Err(
+            AppFailure("recording output must have the final extension `.mp4`".into()).into(),
+        );
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = fs::canonicalize(parent).map_err(|error| {
+        AppFailure(format!(
+            "recording output parent is not an existing canonical directory: {:?}",
+            error.kind()
+        ))
+    })?;
+    if !parent.is_dir() {
+        return Err(AppFailure(
+            "recording output parent is not an existing canonical directory".into(),
+        )
+        .into());
+    }
+    // `create_new` protects the final component. A hostile concurrent parent
+    // replacement needs a future platform file-capability API, not unsafe path walking here.
+    let output = parent.join(file_name);
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output)
+        .map_err(|error| {
+            AppFailure(format!(
+                "recording output cannot be created without overwrite: {:?}",
+                error.kind()
+            ))
+        })?;
+    sync_record_parent(&parent).map_err(|error| {
+        AppFailure(format!(
+            "recording output parent synchronization failed: {:?}",
+            error.kind()
+        ))
+    })?;
+    Ok(file)
+}
+
+#[cfg(all(feature = "native-media", unix))]
+fn sync_record_parent(parent: &Path) -> std::io::Result<()> {
+    File::open(parent)?.sync_all()
+}
+
+#[cfg(all(feature = "native-media", windows))]
+fn sync_record_parent(parent: &Path) -> std::io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(parent)?
+        .sync_all()
+}
+
+#[cfg(feature = "native-media")]
+fn diagnostic_field(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| match character {
+            '\t' | '\r' | '\n' => ' ',
+            character if character.is_control() => '?',
+            character => character,
+        })
+        .collect()
+}
+
+fn capabilities_digest(native: bool, fullscreen: bool, recorder: bool) -> &'static str {
+    match (native, fullscreen, recorder) {
+        (true, true, true) => FULLSCREEN_PROGRAM_RECORDER_CAPABILITIES_DIGEST,
+        (true, true, false) => FULLSCREEN_PROGRAM_CAPABILITIES_DIGEST,
+        (true, false, true) => PROGRAM_RECORDER_CAPABILITIES_DIGEST,
+        (true, false, false) => NATIVE_MEDIA_CAPABILITIES_DIGEST,
+        (false, _, _) => CAPABILITIES_DIGEST,
+    }
+}
+
+#[derive(Clone)]
+struct ControlHandle(SharedControl);
+
+impl ControlPlane for ControlHandle {
+    type Error = Infallible;
+
+    fn initial_sync(&self, cursor: Option<&EventCursor>) -> Result<InitialSync, Self::Error> {
+        let control = self.0.borrow();
+        let payload = match cursor {
+            Some(cursor) => match control.resume(cursor) {
+                ResumeDecision::Events(events) => SyncPayload::Resume(events),
+                ResumeDecision::Snapshot(record) => SyncPayload::Snapshot(record.snapshot),
+            },
+            None => SyncPayload::Snapshot(control.snapshot().snapshot.clone()),
+        };
+        let diagnostics = control.diagnostics();
+        Ok(InitialSync {
+            engine: diagnostics.engine,
+            current_revision: diagnostics.current_revision,
+            payload,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum Command {
+    Serve {
+        project: PathBuf,
+        listen: SocketAddr,
+        once: bool,
+        native_media: bool,
+        fullscreen_program: bool,
+        fullscreen_display: usize,
+        camera_helper: Option<PathBuf>,
+        record_program: Option<PathBuf>,
+        diagnostic_stop_after: Option<Duration>,
+    },
+    Help,
+    Version,
+}
+
+fn main() -> ExitCode {
+    let command = match parse_args(std::env::args().skip(1)) {
+        Ok(command) => command,
+        Err(error) => {
+            eprintln!("error: {error}");
+            eprintln!("run `freemixd help` for usage");
+            return ExitCode::from(2);
+        }
+    };
+    if let Err(error) = run(command) {
+        eprintln!("error: {error}");
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
+}
+
+#[allow(clippy::too_many_lines)]
+fn parse_args(arguments: impl IntoIterator<Item = String>) -> AppResult<Command> {
+    let mut arguments = arguments.into_iter();
+    let Some(command) = arguments.next() else {
+        return Err(AppFailure("a command is required".into()).into());
+    };
+    match command.as_str() {
+        "serve" => {
+            let project = arguments
+                .next()
+                .map(PathBuf::from)
+                .ok_or_else(|| AppFailure("missing project path".into()))?;
+            let mut listen = DEFAULT_LISTEN.parse()?;
+            let mut once = false;
+            let mut native_media = false;
+            let mut fullscreen_program = false;
+            let mut fullscreen_display = None;
+            let mut camera_helper = None;
+            let mut record_program = None;
+            let mut diagnostic_stop_after = None;
+            while let Some(option) = arguments.next() {
+                if let Some(value) = option.strip_prefix("--record-program=") {
+                    if record_program.is_some() {
+                        return Err(AppFailure("duplicate option `--record-program`".into()).into());
+                    }
+                    if value.is_empty() {
+                        return Err(AppFailure("missing value for --record-program".into()).into());
+                    }
+                    record_program = Some(PathBuf::from(value));
+                    continue;
+                }
+                if let Some(value) = option.strip_prefix("--camera-helper=") {
+                    if camera_helper.is_some() {
+                        return Err(AppFailure("duplicate option `--camera-helper`".into()).into());
+                    }
+                    if value.is_empty() {
+                        return Err(AppFailure("missing value for --camera-helper".into()).into());
+                    }
+                    camera_helper = Some(PathBuf::from(value));
+                    continue;
+                }
+                if let Some(value) = option.strip_prefix("--diagnostic-stop-after=") {
+                    if diagnostic_stop_after.is_some() {
+                        return Err(AppFailure(
+                            "duplicate option `--diagnostic-stop-after`".into(),
+                        )
+                        .into());
+                    }
+                    diagnostic_stop_after = Some(parse_diagnostic_duration(value)?);
+                    continue;
+                }
+                match option.as_str() {
+                    "--listen" => {
+                        listen = arguments
+                            .next()
+                            .ok_or_else(|| AppFailure("missing value for --listen".into()))?
+                            .parse()
+                            .map_err(|error| {
+                                AppFailure(format!("invalid listen address: {error}"))
+                            })?;
+                    }
+                    "--once" => once = true,
+                    "--native-media" if native_media => {
+                        return Err(AppFailure("duplicate option `--native-media`".into()).into());
+                    }
+                    "--native-media" => native_media = true,
+                    "--fullscreen-program" if fullscreen_program => {
+                        return Err(
+                            AppFailure("duplicate option `--fullscreen-program`".into()).into()
+                        );
+                    }
+                    "--fullscreen-program" => fullscreen_program = true,
+                    "--fullscreen-display" if fullscreen_display.is_some() => {
+                        return Err(
+                            AppFailure("duplicate option `--fullscreen-display`".into()).into()
+                        );
+                    }
+                    "--fullscreen-display" => {
+                        let value = arguments.next().ok_or_else(|| {
+                            AppFailure("missing value for --fullscreen-display".into())
+                        })?;
+                        fullscreen_display = Some(value.parse::<usize>().map_err(|_| {
+                            AppFailure(format!(
+                                "invalid fullscreen display index `{value}`; expected a zero-based non-negative integer"
+                            ))
+                        })?);
+                    }
+                    "--camera-helper" if camera_helper.is_some() => {
+                        return Err(AppFailure("duplicate option `--camera-helper`".into()).into());
+                    }
+                    "--camera-helper" => {
+                        let value = arguments
+                            .next()
+                            .filter(|value| !value.starts_with("--"))
+                            .ok_or_else(|| {
+                                AppFailure("missing value for --camera-helper".into())
+                            })?;
+                        camera_helper = Some(PathBuf::from(value));
+                    }
+                    "--record-program" if record_program.is_some() => {
+                        return Err(AppFailure("duplicate option `--record-program`".into()).into());
+                    }
+                    "--record-program" => {
+                        let value = arguments
+                            .next()
+                            .filter(|value| !value.starts_with("--"))
+                            .ok_or_else(|| {
+                                AppFailure("missing value for --record-program".into())
+                            })?;
+                        record_program = Some(PathBuf::from(value));
+                    }
+                    "--diagnostic-stop-after" if diagnostic_stop_after.is_some() => {
+                        return Err(AppFailure(
+                            "duplicate option `--diagnostic-stop-after`".into(),
+                        )
+                        .into());
+                    }
+                    "--diagnostic-stop-after" => {
+                        let value = arguments.next().ok_or_else(|| {
+                            AppFailure("missing value for --diagnostic-stop-after".into())
+                        })?;
+                        diagnostic_stop_after = Some(parse_diagnostic_duration(&value)?);
+                    }
+                    _ => return Err(AppFailure(format!("unknown option `{option}`")).into()),
+                }
+            }
+            if fullscreen_program && !native_media {
+                return Err(
+                    AppFailure("--fullscreen-program requires --native-media".into()).into(),
+                );
+            }
+            if fullscreen_display.is_some() && !fullscreen_program {
+                return Err(AppFailure(
+                    "--fullscreen-display requires --fullscreen-program".into(),
+                )
+                .into());
+            }
+            if record_program.is_some() && !native_media {
+                return Err(AppFailure("--record-program requires --native-media".into()).into());
+            }
+            if camera_helper.is_some() && !native_media {
+                return Err(AppFailure("--camera-helper requires --native-media".into()).into());
+            }
+            if diagnostic_stop_after.is_some() && !native_media {
+                return Err(
+                    AppFailure("--diagnostic-stop-after requires --native-media".into()).into(),
+                );
+            }
+            if diagnostic_stop_after.is_some() && once {
+                return Err(AppFailure(
+                    "--diagnostic-stop-after cannot be combined with --once".into(),
+                )
+                .into());
+            }
+            if diagnostic_stop_after.is_some() && fullscreen_program {
+                return Err(AppFailure(
+                    "--diagnostic-stop-after currently supports headless native mode only".into(),
+                )
+                .into());
+            }
+            Ok(Command::Serve {
+                project,
+                listen,
+                once,
+                native_media,
+                fullscreen_program,
+                fullscreen_display: fullscreen_display.unwrap_or(0),
+                camera_helper,
+                record_program,
+                diagnostic_stop_after,
+            })
+        }
+        "help" | "--help" | "-h" => {
+            reject_extra(arguments)?;
+            Ok(Command::Help)
+        }
+        "--version" | "version" => {
+            reject_extra(arguments)?;
+            Ok(Command::Version)
+        }
+        _ => Err(AppFailure(format!("unknown command `{command}`")).into()),
+    }
+}
+
+fn parse_diagnostic_duration(value: &str) -> AppResult<Duration> {
+    let (amount, unit) = if let Some(amount) = value.strip_suffix("ms") {
+        (amount, "ms")
+    } else if let Some(amount) = value.strip_suffix('s') {
+        (amount, "s")
+    } else if let Some(amount) = value.strip_suffix('m') {
+        (amount, "m")
+    } else if let Some(amount) = value.strip_suffix('h') {
+        (amount, "h")
+    } else {
+        return Err(AppFailure(format!(
+            "invalid diagnostic duration `{value}`; expected a positive integer followed by ms, s, m, or h"
+        ))
+        .into());
+    };
+    let amount = amount.parse::<u64>().map_err(|_| {
+        AppFailure(format!(
+            "invalid diagnostic duration `{value}`; expected a positive integer followed by ms, s, m, or h"
+        ))
+    })?;
+    if amount == 0 {
+        return Err(AppFailure("diagnostic duration must be nonzero".into()).into());
+    }
+    let duration = match unit {
+        "ms" => Duration::from_millis(amount),
+        "s" => Duration::from_secs(amount),
+        "m" => Duration::from_secs(
+            amount
+                .checked_mul(60)
+                .ok_or_else(|| AppFailure("diagnostic duration overflow".into()))?,
+        ),
+        "h" => Duration::from_secs(
+            amount
+                .checked_mul(3_600)
+                .ok_or_else(|| AppFailure("diagnostic duration overflow".into()))?,
+        ),
+        _ => unreachable!("duration units are matched above"),
+    };
+    if duration > Duration::from_hours(24) {
+        return Err(AppFailure("diagnostic duration cannot exceed 24h".into()).into());
+    }
+    Ok(duration)
+}
+
+fn reject_extra(mut arguments: impl Iterator<Item = String>) -> AppResult<()> {
+    if let Some(argument) = arguments.next() {
+        Err(AppFailure(format!("unexpected argument `{argument}`")).into())
+    } else {
+        Ok(())
+    }
+}
+
+fn run(command: Command) -> AppResult<()> {
+    match command {
+        Command::Serve {
+            project,
+            listen,
+            once,
+            native_media,
+            fullscreen_program,
+            fullscreen_display,
+            camera_helper,
+            record_program,
+            diagnostic_stop_after,
+        } => {
+            if fullscreen_program {
+                run_fullscreen_program(
+                    project,
+                    listen,
+                    once,
+                    fullscreen_display,
+                    camera_helper,
+                    record_program,
+                )
+            } else {
+                serve(
+                    &project,
+                    listen,
+                    once,
+                    native_media,
+                    camera_helper,
+                    record_program,
+                    diagnostic_stop_after,
+                )
+            }
+        }
+        Command::Help => {
+            print_help();
+            Ok(())
+        }
+        Command::Version => {
+            println!("freemixd {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+    }
+}
+
+#[cfg(all(feature = "macos-program-surface", target_os = "macos"))]
+fn run_fullscreen_program(
+    project: PathBuf,
+    listen: SocketAddr,
+    once: bool,
+    fullscreen_display: usize,
+    camera_helper: Option<PathBuf>,
+    record_program: Option<PathBuf>,
+) -> AppResult<()> {
+    program_surface::run(
+        project,
+        listen,
+        once,
+        fullscreen_display,
+        camera_helper,
+        record_program,
+    )
+}
+
+#[cfg(not(all(feature = "macos-program-surface", target_os = "macos")))]
+fn run_fullscreen_program(
+    _project: PathBuf,
+    _listen: SocketAddr,
+    _once: bool,
+    _fullscreen_display: usize,
+    _camera_helper: Option<PathBuf>,
+    _record_program: Option<PathBuf>,
+) -> AppResult<()> {
+    Err(AppFailure(
+        "--fullscreen-program requires a macOS build with feature `macos-program-surface`".into(),
+    )
+    .into())
+}
+
+enum NativeServeMode {
+    Disabled,
+    Headless {
+        camera_helper: Option<PathBuf>,
+    },
+    #[cfg(all(feature = "macos-program-surface", target_os = "macos"))]
+    Program(Box<ProgramServeSetup>),
+}
+
+#[cfg(all(feature = "macos-program-surface", target_os = "macos"))]
+struct ProgramServeSetup {
+    context: NativeContext,
+    surface: NativeSurface,
+    channels: program_surface::ProgramWorkerChannels,
+    camera_helper: Option<PathBuf>,
+}
+
+fn serve(
+    path: &Path,
+    listen: SocketAddr,
+    once: bool,
+    native_media: bool,
+    camera_helper: Option<PathBuf>,
+    record_program: Option<PathBuf>,
+    diagnostic_stop_after: Option<Duration>,
+) -> AppResult<()> {
+    serve_inner(
+        path,
+        listen,
+        once,
+        if native_media {
+            NativeServeMode::Headless { camera_helper }
+        } else {
+            NativeServeMode::Disabled
+        },
+        record_program,
+        diagnostic_stop_after,
+    )
+}
+
+#[cfg(all(feature = "macos-program-surface", target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
+fn serve_program_worker(
+    path: &Path,
+    listen: SocketAddr,
+    once: bool,
+    context: NativeContext,
+    surface: NativeSurface,
+    channels: program_surface::ProgramWorkerChannels,
+    camera_helper: Option<PathBuf>,
+    record_program: Option<PathBuf>,
+) -> AppResult<()> {
+    serve_inner(
+        path,
+        listen,
+        once,
+        NativeServeMode::Program(Box::new(ProgramServeSetup {
+            context,
+            surface,
+            channels,
+            camera_helper,
+        })),
+        record_program,
+        None,
+    )
+}
+
+#[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
+fn serve_inner(
+    path: &Path,
+    listen: SocketAddr,
+    once: bool,
+    mode: NativeServeMode,
+    record_program: Option<PathBuf>,
+    diagnostic_stop_after: Option<Duration>,
+) -> AppResult<()> {
+    if !listen.ip().is_loopback() {
+        return Err(AppFailure(format!(
+            "development mode requires a loopback listen address, got {}",
+            listen.ip()
+        ))
+        .into());
+    }
+
+    let store = ProjectStore::new(path)?;
+    let project = load_migrate_recover(&store)?;
+    let project_id = project.project().id();
+    let engine = restore_engine(&project)?;
+    let identity = format!("project-{project_id}");
+    let control = Rc::new(RefCell::new(ControlService::new(
+        engine,
+        Policy::development(),
+        identity.clone(),
+        format!("{identity}-log"),
+        ControlLimits::default(),
+    )));
+    #[cfg(all(feature = "macos-program-surface", target_os = "macos"))]
+    let fullscreen_active = matches!(&mode, NativeServeMode::Program(_));
+    let mut native = match mode {
+        NativeServeMode::Disabled => None,
+        NativeServeMode::Headless { camera_helper } => Some(NativeDaemon::start(
+            &store,
+            &project,
+            camera_helper.as_deref(),
+        )?),
+        #[cfg(all(feature = "macos-program-surface", target_os = "macos"))]
+        NativeServeMode::Program(setup) => {
+            let ProgramServeSetup {
+                context,
+                surface,
+                channels,
+                camera_helper,
+            } = *setup;
+            Some(NativeDaemon::start_with_program(
+                &store,
+                &project,
+                context,
+                surface,
+                channels,
+                camera_helper.as_deref(),
+            )?)
+        }
+    };
+    let mut process_shutdown = native
+        .as_ref()
+        .map(|_| register_process_shutdown())
+        .transpose()?;
+    let authority = control_server_identity(&control.borrow(), project_id);
+    let mut durable = project;
+    if let Some(path) = record_program {
+        native
+            .as_mut()
+            .ok_or_else(|| AppFailure("--record-program requires --native-media".into()))?
+            .start_recorder(&durable, &path)?;
+        let primed = native
+            .as_mut()
+            .expect("recording requires native state")
+            .prime_recorder(
+                &mut control.borrow_mut(),
+                &authority,
+                process_shutdown
+                    .as_ref()
+                    .expect("native state has a process shutdown signal"),
+            );
+        match primed {
+            Ok(true) => {}
+            Ok(false) => {
+                checkpoint_native(&control, &store, &mut durable)?;
+                native
+                    .as_mut()
+                    .expect("recording requires native state")
+                    .finalize_recorder()?;
+                return Ok(());
+            }
+            Err(error) => {
+                let _ = native
+                    .as_mut()
+                    .expect("recording requires native state")
+                    .finalize_recorder();
+                return Err(error);
+            }
+        }
+    }
+    #[cfg(not(all(feature = "macos-program-surface", target_os = "macos")))]
+    let fullscreen_active = false;
+    // The immutable handshake digest advertises successfully configured
+    // startup support. Late recorder health is reported by FREEMIXD_RECORDER.
+    let capabilities_digest = capabilities_digest(
+        native.is_some(),
+        fullscreen_active,
+        native.as_ref().is_some_and(NativeDaemon::recorder_active),
+    );
+    let config = ServerConfig::new(
+        ServerMode::Development,
+        AuthenticationMode::Development,
+        listen.ip(),
+        vec![PROTOCOL_VERSION],
+        capabilities_digest,
+    );
+    let mut server = Server::new(config, ControlHandle(Rc::clone(&control)))?;
+    server.mark_ready()?;
+
+    let principal = development_principal()?;
+    let listener = TcpListener::bind(listen)?;
+    listener.set_nonblocking(native.is_some())?;
+    let readiness = ReadinessRecord {
+        address: listener.local_addr()?,
+        project_id,
+    };
+    println!("{readiness}");
+    std::io::stdout().flush()?;
+    if let Some(duration) = diagnostic_stop_after {
+        process_shutdown
+            .as_mut()
+            .expect("diagnostic shutdown requires native state")
+            .set_diagnostic_deadline(duration)?;
+    }
+
+    let _shutdown_reason = loop {
+        if let Some(reason) = requested_daemon_shutdown(native.as_ref(), process_shutdown.as_ref())
+        {
+            break reason;
+        }
+        let stream = match listener.accept() {
+            Ok((stream, _)) => stream,
+            Err(error)
+                if native.is_some()
+                    && matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+            {
+                native
+                    .as_mut()
+                    .expect("native state was checked")
+                    .tick_if_due(&mut control.borrow_mut(), &authority)?;
+                thread::sleep(NATIVE_IO_POLL_INTERVAL);
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let result = handle_client(
+            stream,
+            &server,
+            &control,
+            &store,
+            &mut durable,
+            &principal,
+            &authority,
+            native.as_mut(),
+            process_shutdown.as_ref(),
+        );
+        if let Err(error) = result {
+            if let Some(reason) =
+                requested_daemon_shutdown(native.as_ref(), process_shutdown.as_ref())
+            {
+                break reason;
+            }
+            if !is_client_disconnect(error.as_ref()) {
+                return Err(error);
+            }
+        }
+        if let Some(reason) = requested_daemon_shutdown(native.as_ref(), process_shutdown.as_ref())
+        {
+            break reason;
+        }
+        if once {
+            break DaemonShutdownReason::Once;
+        }
+    };
+    if native.is_some() {
+        checkpoint_native(&control, &store, &mut durable)?;
+    }
+    #[cfg(all(feature = "macos-program-surface", target_os = "macos"))]
+    if fullscreen_active {
+        let frames_presented = native
+            .as_ref()
+            .and_then(NativeDaemon::program_telemetry)
+            .map(|telemetry| telemetry.frames_presented)
+            .unwrap_or_default();
+        eprintln!("FREEMIXD_PROGRAM\tv=1\tframes_presented={frames_presented}");
+    }
+    if let Some(native) = &mut native {
+        let recorder_result = native.finalize_recorder();
+        native.emit_camera_source_telemetry();
+        let camera_result = native.finalize_cameras();
+        native.emit_telemetry();
+        recorder_result?;
+        camera_result?;
+    }
+    Ok(())
+}
+
+fn checkpoint_native(
+    control: &SharedControl,
+    store: &ProjectStore,
+    durable: &mut StoredProject,
+) -> AppResult<()> {
+    let snapshot = control.borrow().idle_engine_snapshot()?;
+    *durable = stored_project_checkpoint(durable, &snapshot)?;
+    store.save(durable)?;
+    Ok(())
+}
+
+fn load_migrate_recover(store: &ProjectStore) -> AppResult<StoredProject> {
+    let project = match store.load() {
+        Ok(project) => project,
+        Err(StoreError::Validation(ProjectValidationError::UnsupportedSchema {
+            found, ..
+        })) => {
+            match found {
+                1 => store.migrate_v1()?,
+                2 => store.migrate_v2()?,
+                _ => {
+                    return Err(StoreError::Validation(
+                        ProjectValidationError::UnsupportedSchema {
+                            found,
+                            supported: fm_persistence::CURRENT_SCHEMA_VERSION,
+                        },
+                    )
+                    .into());
+                }
+            };
+            store.load()?
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if store.journal_path().try_exists()? {
+        let scan = store.recover_journal()?;
+        if !scan.batches().is_empty() {
+            return Err(AppFailure(
+                "project has unapplied journal batches that freemixd cannot safely interpret"
+                    .into(),
+            )
+            .into());
+        }
+    }
+    Ok(project)
+}
+
+fn restore_engine(project: &StoredProject) -> AppResult<Engine> {
+    let canonical = project.project();
+    let inputs = canonical
+        .inputs()
+        .iter()
+        .map(|input| input.id)
+        .collect::<Vec<_>>();
+    let main_mix = canonical
+        .main_mix()
+        .ok_or_else(|| AppFailure("project is missing desired main mix routing".into()))?;
+    let routing = project.runtime_routing();
+    let realized_program = required_routing(routing.realized_program_id, "realized program")?;
+    let realized_preview = required_routing(routing.realized_preview_id, "realized preview")?;
+    let show = ShowState::new(
+        canonical.name(),
+        inputs.clone(),
+        main_mix.desired_program,
+        main_mix.desired_preview,
+    )?;
+    let realized = SwitcherState::new(inputs, realized_program, realized_preview)?;
+    let position = project.position();
+    Ok(Engine::restore_persisted(
+        show,
+        realized,
+        canonical.settings().frame_rate,
+        clock_domain(),
+        EngineRestoreState {
+            state_epoch: StateEpoch::new(position.state_epoch),
+            revision: Revision::new(position.revision),
+            event_sequence: EventSequence::new(position.event_sequence),
+            runtime_generation: RuntimeGeneration::new(position.runtime_generation),
+            clock_time: ClockTime::from_nanos(position.clock_time_nanos),
+            frame_cursor: position.frames_rendered.into(),
+            receipts: project
+                .idempotency_receipts()
+                .iter()
+                .map(runtime_receipt)
+                .collect::<AppResult<Vec<_>>>()?,
+        },
+    )?)
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn handle_client(
+    stream: TcpStream,
+    server: &Server<ControlHandle>,
+    control: &SharedControl,
+    store: &ProjectStore,
+    durable: &mut StoredProject,
+    principal: &Principal,
+    authority: &ServerIdentity,
+    native: Option<&mut NativeDaemon>,
+    process_shutdown: Option<&ProcessShutdown>,
+) -> AppResult<()> {
+    stream.set_nodelay(true)?;
+    if native.is_some() {
+        stream.set_read_timeout(Some(NATIVE_IO_POLL_INTERVAL))?;
+        stream.set_write_timeout(Some(NATIVE_CLIENT_WRITE_TIMEOUT))?;
+    }
+    let mut writer = stream.try_clone()?;
+    let mut reader = MessageReader::new(stream);
+    let mut native = native;
+    let Some(first) = read_client_message(
+        &mut reader,
+        control,
+        authority,
+        &mut native,
+        process_shutdown,
+    )?
+    else {
+        return Ok(());
+    };
+    let (hello, wire_handshake) = match first {
+        WireMessage::ClientHello(hello) => (hello, WireHandshake::Legacy),
+        WireMessage::HandshakeRequest(request) => {
+            current_handshake(&request, control, durable.project().id())
+        }
+        _ => {
+            write_error(
+                &mut writer,
+                "handshake_required",
+                "first message must be client_hello or handshake_request",
+            )?;
+            return Ok(());
+        }
+    };
+
+    let handshake = match server.handshake(&hello, principal, now_millis()?) {
+        Ok(handshake) => handshake,
+        Err(error) => {
+            match wire_handshake {
+                WireHandshake::Legacy => {
+                    write_error(&mut writer, handshake_code(&error), &error.to_string())?;
+                }
+                WireHandshake::Current(_) => write_message(
+                    &mut writer,
+                    &WireMessage::HandshakeResponse(rejected_handshake_response(
+                        server,
+                        control,
+                        durable.project().id(),
+                        &hello,
+                        handshake_code(&error),
+                        &error.to_string(),
+                    )),
+                )?,
+            }
+            return Ok(());
+        }
+    };
+    let mut session = handshake.session;
+    let session_identity = server_identity(&handshake.server_hello, durable.project().id());
+    let response = match wire_handshake {
+        WireHandshake::Legacy => WireMessage::ServerHello(handshake.server_hello),
+        WireHandshake::Current(outcome) => WireMessage::HandshakeResponse(handshake_response(
+            &handshake.server_hello,
+            session_identity.clone(),
+            reconciled_handshake_outcome(outcome, &handshake.sync),
+        )),
+    };
+    write_session_message(&mut writer, &mut session, &response)?;
+    match handshake.sync {
+        SyncPayload::Snapshot(snapshot) => {
+            write_session_message(&mut writer, &mut session, &WireMessage::Snapshot(snapshot))?;
+        }
+        SyncPayload::Resume(events) => {
+            for event in events {
+                write_session_message(&mut writer, &mut session, &WireMessage::Event(event))?;
+            }
+        }
+    }
+
+    while let Some(message) = read_client_message(
+        &mut reader,
+        control,
+        authority,
+        &mut native,
+        process_shutdown,
+    )? {
+        match message {
+            WireMessage::Command(command) => process_command(
+                &mut writer,
+                &mut session,
+                control,
+                store,
+                durable,
+                principal,
+                &session_identity,
+                &command,
+                native.as_deref_mut(),
+                process_shutdown,
+            )?,
+            WireMessage::Heartbeat(heartbeat) => {
+                if let Err(message) =
+                    record_heartbeat(&mut session, control, &session_identity, &heartbeat)
+                {
+                    write_error(&mut writer, "invalid_heartbeat", &message)?;
+                }
+            }
+            _ => write_error(
+                &mut writer,
+                "unexpected_message",
+                "only command and heartbeat messages are accepted after the handshake",
+            )?,
+        }
+    }
+    Ok(())
+}
+
+fn read_client_message(
+    reader: &mut MessageReader,
+    control: &SharedControl,
+    server: &ServerIdentity,
+    native: &mut Option<&mut NativeDaemon>,
+    process_shutdown: Option<&ProcessShutdown>,
+) -> AppResult<Option<WireMessage>> {
+    if requested_daemon_shutdown(native.as_deref(), process_shutdown).is_some() {
+        return Ok(None);
+    }
+    if let Some(native) = native.as_deref_mut() {
+        reader.read_message_with_idle(|| {
+            if requested_daemon_shutdown(Some(&*native), process_shutdown).is_some() {
+                return Ok(false);
+            }
+            native.tick_if_due(&mut control.borrow_mut(), server)?;
+            Ok(true)
+        })
+    } else {
+        reader.read_message()
+    }
+}
+
+enum WireHandshake {
+    Legacy,
+    Current(ProtocolHandshakeOutcome),
+}
+
+fn reconciled_handshake_outcome(
+    outcome: ProtocolHandshakeOutcome,
+    sync: &SyncPayload,
+) -> ProtocolHandshakeOutcome {
+    if matches!(&outcome, ProtocolHandshakeOutcome::Resume { .. })
+        && matches!(sync, SyncPayload::Snapshot(_))
+    {
+        ProtocolHandshakeOutcome::Snapshot {
+            reason: fm_protocol::SnapshotReason::HistoryUnavailable,
+        }
+    } else {
+        outcome
+    }
+}
+
+fn current_handshake(
+    request: &HandshakeRequest,
+    control: &SharedControl,
+    project_id: ProjectId,
+) -> (ClientHello, WireHandshake) {
+    let diagnostics = control.borrow().diagnostics();
+    let server = ServerIdentity {
+        engine_id: diagnostics.engine.engine_id.clone(),
+        project_id: project_id.to_string(),
+        state_epoch: diagnostics.engine.state_epoch,
+        log_id: diagnostics.engine.log_id.clone(),
+    };
+    let available_from_revision = diagnostics
+        .oldest_retained_revision
+        .unwrap_or_else(|| diagnostics.current_revision.saturating_add(1));
+    let outcome = choose_handshake_outcome(
+        &server,
+        diagnostics.current_revision,
+        available_from_revision,
+        request.resume_cursor.as_ref(),
+    );
+    let cached_cursor = match &outcome {
+        ProtocolHandshakeOutcome::Resume { cursor } => Some(event_cursor(cursor)),
+        ProtocolHandshakeOutcome::Snapshot { .. } | ProtocolHandshakeOutcome::Rejected { .. } => {
+            None
+        }
+    };
+    (
+        ClientHello {
+            versions: request.versions.clone(),
+            build: request.build.clone(),
+            client_type: request.client_type,
+            desired_role: request.desired_role,
+            cached_cursor,
+        },
+        WireHandshake::Current(outcome),
+    )
+}
+
+fn handshake_response(
+    hello: &ServerHello,
+    server: ServerIdentity,
+    outcome: ProtocolHandshakeOutcome,
+) -> HandshakeResponse {
+    HandshakeResponse {
+        negotiated: hello.negotiated,
+        granted_role: hello.granted_role,
+        permissions: hello.permissions.clone(),
+        capabilities: CapabilityReportSummary {
+            digest: hello.capabilities_digest.clone(),
+            total: 0,
+            available: 0,
+            degraded: 0,
+            unavailable: 0,
+        },
+        server,
+        current_revision: hello.current_revision,
+        outcome,
+    }
+}
+
+fn rejected_handshake_response(
+    server: &Server<ControlHandle>,
+    control: &SharedControl,
+    project_id: ProjectId,
+    hello: &ClientHello,
+    code: &str,
+    message: &str,
+) -> HandshakeResponse {
+    let diagnostics = control.borrow().diagnostics();
+    HandshakeResponse {
+        negotiated: fm_protocol::negotiate_version(
+            &hello.versions,
+            &server.config().supported_versions,
+        )
+        .unwrap_or(PROTOCOL_VERSION),
+        granted_role: hello.desired_role,
+        permissions: Vec::new(),
+        capabilities: CapabilityReportSummary {
+            digest: server.config().capabilities_digest.clone(),
+            total: 0,
+            available: 0,
+            degraded: 0,
+            unavailable: 0,
+        },
+        server: ServerIdentity {
+            engine_id: diagnostics.engine.engine_id,
+            project_id: project_id.to_string(),
+            state_epoch: diagnostics.engine.state_epoch,
+            log_id: diagnostics.engine.log_id,
+        },
+        current_revision: diagnostics.current_revision,
+        outcome: ProtocolHandshakeOutcome::Rejected {
+            error: StructuredError {
+                code: code.into(),
+                message: message.into(),
+                fields: Vec::new(),
+                retryable: false,
+            },
+        },
+    }
+}
+
+fn server_identity(hello: &ServerHello, project_id: ProjectId) -> ServerIdentity {
+    ServerIdentity {
+        engine_id: hello.engine.engine_id.clone(),
+        project_id: project_id.to_string(),
+        state_epoch: hello.engine.state_epoch,
+        log_id: hello.engine.log_id.clone(),
+    }
+}
+
+fn control_server_identity(
+    control: &ControlService<Policy>,
+    project_id: ProjectId,
+) -> ServerIdentity {
+    let engine = control.diagnostics().engine;
+    ServerIdentity {
+        engine_id: engine.engine_id,
+        project_id: project_id.to_string(),
+        state_epoch: engine.state_epoch,
+        log_id: engine.log_id,
+    }
+}
+
+fn event_cursor(cursor: &ResumeCursor) -> EventCursor {
+    EventCursor {
+        engine: fm_protocol::EngineIdentity {
+            engine_id: cursor.server.engine_id.clone(),
+            state_epoch: cursor.server.state_epoch,
+            log_id: cursor.server.log_id.clone(),
+        },
+        revision: cursor.revision,
+    }
+}
+
+fn record_heartbeat(
+    session: &mut Session,
+    control: &SharedControl,
+    server: &ServerIdentity,
+    heartbeat: &HeartbeatMessage,
+) -> Result<(), String> {
+    if heartbeat.server != *server {
+        return Err("heartbeat server identity does not match the session".into());
+    }
+    let Some(cursor) = &heartbeat.last_applied else {
+        return Ok(());
+    };
+    if cursor.server != *server {
+        return Err("heartbeat cursor identity does not match the session".into());
+    }
+    if cursor.revision > control.borrow().diagnostics().current_revision {
+        return Err("heartbeat cursor is ahead of the server revision".into());
+    }
+    session
+        .record_heartbeat(
+            Heartbeat {
+                last_applied: event_cursor(cursor),
+                clock_sample_ms: heartbeat.sent_at_ms,
+            },
+            now_millis().map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_command(
+    writer: &mut TcpStream,
+    session: &mut Session,
+    control: &SharedControl,
+    store: &ProjectStore,
+    durable: &mut StoredProject,
+    principal: &Principal,
+    server: &ServerIdentity,
+    command: &CommandMessage,
+    native: Option<&mut NativeDaemon>,
+    process_shutdown: Option<&ProcessShutdown>,
+) -> AppResult<()> {
+    let encoded_bytes = encode_line(&WireMessage::Command(command.clone()))?.len();
+    let now = now_millis()?;
+    if let Err(error) = session.admit_command(command, encoded_bytes, now) {
+        let result = session_rejection(
+            command,
+            &error,
+            control.borrow().diagnostics().current_revision,
+        );
+        write_session_message(writer, session, &WireMessage::CommandResult(result))?;
+        return Ok(());
+    }
+
+    let execution = {
+        let mut control = control.borrow_mut();
+        if let Some(native) = native {
+            execute_durable_command_with_ticks(
+                &mut control,
+                store,
+                durable,
+                principal,
+                server,
+                command,
+                now,
+                |control, server| {
+                    native
+                        .wait_and_tick(control, server, process_shutdown)?
+                        .map_or_else(|| Ok(control.tick_for_shutdown(server)?.runtime_events), Ok)
+                },
+            )?
+        } else {
+            execute_durable_command(
+                &mut control,
+                store,
+                durable,
+                principal,
+                server,
+                command,
+                now,
+            )?
+        }
+    };
+    session.command_completed()?;
+    let DurableExecution {
+        submission,
+        runtime_events,
+    } = execution;
+
+    write_session_message(
+        writer,
+        session,
+        &WireMessage::CommandResult(submission.output.result),
+    )?;
+    for event in submission.output.events {
+        write_session_message(writer, session, &WireMessage::Event(event))?;
+    }
+    for event in runtime_events {
+        write_session_message(writer, session, &WireMessage::RuntimeEvent(event))?;
+    }
+    Ok(())
+}
+
+struct DurableExecution {
+    submission: CommandSubmission,
+    runtime_events: Vec<RuntimeEventMessage>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_durable_command(
+    control: &mut ControlService<Policy>,
+    store: &dyn ProjectSaver,
+    durable: &mut StoredProject,
+    principal: &Principal,
+    server: &ServerIdentity,
+    command: &CommandMessage,
+    now_millis: u64,
+) -> AppResult<DurableExecution> {
+    execute_durable_command_with_ticks(
+        control,
+        store,
+        durable,
+        principal,
+        server,
+        command,
+        now_millis,
+        |control, server| Ok(control.tick(server)?.runtime_events),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_durable_command_with_ticks(
+    control: &mut ControlService<Policy>,
+    store: &dyn ProjectSaver,
+    durable: &mut StoredProject,
+    principal: &Principal,
+    server: &ServerIdentity,
+    command: &CommandMessage,
+    now_millis: u64,
+    mut tick: impl FnMut(
+        &mut ControlService<Policy>,
+        &ServerIdentity,
+    ) -> AppResult<Vec<RuntimeEventMessage>>,
+) -> AppResult<DurableExecution> {
+    let preparation = control.prepare_submit(principal, command.clone(), now_millis)?;
+    let prepared = match preparation {
+        PrepareSubmitOutcome::Replayed(submission) => {
+            return Ok(DurableExecution {
+                submission,
+                runtime_events: Vec::new(),
+            });
+        }
+        PrepareSubmitOutcome::Prepared(prepared) => prepared,
+    };
+
+    let ticks = if prepared.submission().is_accepted() {
+        command_ticks(command)
+    } else {
+        0
+    };
+    let projected = prepared.project(u64::from(ticks))?;
+    let updated =
+        stored_project_from_snapshot(durable, &projected, command, &prepared.output().result)?;
+    store.save(&updated)?;
+
+    let submission = prepared.commit()?;
+    let mut runtime_events = Vec::new();
+    for _ in 0..ticks {
+        runtime_events.extend(tick(control, server)?);
+    }
+    *durable = updated;
+
+    Ok(DurableExecution {
+        submission,
+        runtime_events,
+    })
+}
+
+fn command_ticks(command: &CommandMessage) -> u32 {
+    match command.payload {
+        CommandPayload::Fade { duration_frames } => duration_frames,
+        CommandPayload::SelectPreview { .. } | CommandPayload::Cut => 1,
+    }
+}
+
+fn stored_project_from_snapshot(
+    durable: &StoredProject,
+    snapshot: &EngineSnapshot,
+    command: &CommandMessage,
+    result: &CommandResult,
+) -> AppResult<StoredProject> {
+    let mut receipts = snapshot
+        .receipts()
+        .iter()
+        .map(persisted_engine_receipt)
+        .collect::<Vec<_>>();
+
+    if !receipts
+        .iter()
+        .any(|receipt| receipt.key() == command.idempotency_key)
+    {
+        if !matches!(result, CommandResult::Rejected { code, .. } if code == "permission_denied") {
+            return Err(AppFailure(
+                "projected engine snapshot is missing the staged command receipt".into(),
+            )
+            .into());
+        }
+        receipts.push(persisted_result(command, result)?);
+    }
+
+    stored_project_with_receipts(durable, snapshot, receipts)
+}
+
+fn stored_project_checkpoint(
+    durable: &StoredProject,
+    snapshot: &EngineSnapshot,
+) -> AppResult<StoredProject> {
+    stored_project_with_receipts(
+        durable,
+        snapshot,
+        snapshot
+            .receipts()
+            .iter()
+            .map(persisted_engine_receipt)
+            .collect(),
+    )
+}
+
+fn stored_project_with_receipts(
+    durable: &StoredProject,
+    snapshot: &EngineSnapshot,
+    receipts: Vec<IdempotencyReceipt>,
+) -> AppResult<StoredProject> {
+    let show = snapshot.show();
+    let desired = show.desired_switcher();
+    let realized = snapshot.realized_switcher();
+    let mut project = durable.project().clone();
+    project.set_main_mix(MainMix::new(desired.program(), desired.preview()));
+    StoredProject::from_project(
+        project,
+        RuntimeRouting {
+            desired_program_id: Some(desired.program()),
+            realized_program_id: Some(realized.program()),
+            desired_preview_id: Some(desired.preview()),
+            realized_preview_id: Some(realized.preview()),
+        },
+        ProjectPosition {
+            revision: snapshot.revision().get(),
+            state_epoch: snapshot.state_epoch().get(),
+            event_sequence: snapshot.event_sequence().get(),
+            frames_rendered: snapshot.frames_rendered(),
+            runtime_generation: snapshot.runtime_generation().get(),
+            clock_time_nanos: snapshot.clock_time().as_nanos(),
+        },
+        receipts,
+    )
+    .map_err(Into::into)
+}
+
+fn persisted_engine_receipt(
+    (key, receipt): &(IdempotencyKey, CommandReceipt<EngineAcceptance>),
+) -> IdempotencyReceipt {
+    match receipt {
+        CommandReceipt::Accepted {
+            command_id,
+            acceptance,
+        } => IdempotencyReceipt::accepted(
+            key.as_str(),
+            command_id.as_str(),
+            acceptance.revision.get(),
+            acceptance.result.target_frame.get(),
+        ),
+        CommandReceipt::Rejected {
+            command_id,
+            rejection,
+        } => IdempotencyReceipt::rejected(
+            key.as_str(),
+            command_id.as_str(),
+            rejection.current_revision.get(),
+            rejection.rejection.code.as_str(),
+            &rejection.rejection.message,
+            rejection.rejection.retryable,
+        ),
+    }
+}
+
+fn persisted_result(
+    command: &CommandMessage,
+    result: &CommandResult,
+) -> AppResult<IdempotencyReceipt> {
+    match result {
+        CommandResult::Accepted {
+            id,
+            revision,
+            scheduled_frame: Some(frame),
+        } => Ok(IdempotencyReceipt::accepted(
+            &command.idempotency_key,
+            id,
+            *revision,
+            *frame,
+        )),
+        CommandResult::Accepted {
+            scheduled_frame: None,
+            ..
+        } => Err(AppFailure("accepted engine command has no scheduled frame".into()).into()),
+        CommandResult::Rejected {
+            id,
+            code,
+            message,
+            current_revision,
+            retryable,
+            ..
+        } => Ok(IdempotencyReceipt::rejected(
+            &command.idempotency_key,
+            id,
+            *current_revision,
+            code,
+            message,
+            *retryable,
+        )),
+    }
+}
+
+fn runtime_receipt(
+    receipt: &IdempotencyReceipt,
+) -> AppResult<(IdempotencyKey, CommandReceipt<EngineAcceptance>)> {
+    let command_id = CommandId::new(receipt.command_id());
+    let runtime = match receipt.outcome() {
+        ReceiptOutcome::Accepted {
+            revision,
+            target_frame,
+        } => CommandReceipt::Accepted {
+            command_id,
+            acceptance: AcceptedReceipt {
+                revision: Revision::new(*revision),
+                result: EngineAcceptance {
+                    target_frame: (*target_frame).into(),
+                },
+            },
+        },
+        ReceiptOutcome::Rejected {
+            current_revision,
+            code,
+            message,
+            retryable,
+        } => CommandReceipt::Rejected {
+            command_id,
+            rejection: RejectedReceipt {
+                rejection: Rejection::new(runtime_rejection_code(code)?, message)
+                    .retryable(*retryable),
+                current_revision: Revision::new(*current_revision),
+            },
+        },
+    };
+    Ok((IdempotencyKey::new(receipt.key()), runtime))
+}
+
+fn runtime_rejection_code(code: &str) -> AppResult<RejectionCode> {
+    match code {
+        "permission_denied" => Ok(RejectionCode::PermissionDenied),
+        "deadline_exceeded" => Ok(RejectionCode::DeadlineExceeded),
+        "revision_conflict" => Ok(RejectionCode::RevisionConflict),
+        "invalid_command" => Ok(RejectionCode::InvalidCommand),
+        "not_found" => Ok(RejectionCode::NotFound),
+        "conflict" => Ok(RejectionCode::Conflict),
+        "unavailable" => Ok(RejectionCode::Unavailable),
+        "resource_exhausted" => Ok(RejectionCode::ResourceExhausted),
+        "internal" => Ok(RejectionCode::Internal),
+        _ => Err(AppFailure(format!("project contains unknown rejection code `{code}`")).into()),
+    }
+}
+
+fn session_rejection(
+    command: &CommandMessage,
+    error: &SessionError,
+    current_revision: u64,
+) -> CommandResult {
+    let (code, retryable) = match error {
+        SessionError::Authorization(_) => ("permission_denied", false),
+        SessionError::ProtocolMismatch { .. } => ("protocol_mismatch", false),
+        SessionError::CommandTooLarge { .. }
+        | SessionError::TooManyInflightCommands
+        | SessionError::InboundRateLimited
+        | SessionError::OutboundRateLimited => ("resource_exhausted", true),
+        _ => ("session_error", false),
+    };
+    CommandResult::Rejected {
+        id: command.id.clone(),
+        code: code.into(),
+        message: error.to_string(),
+        fields: Vec::new(),
+        current_revision,
+        retryable,
+    }
+}
+
+fn write_session_message(
+    writer: &mut TcpStream,
+    session: &mut Session,
+    message: &WireMessage,
+) -> AppResult<()> {
+    let line = encode_line(message)?;
+    session.queue_outbound(line.len(), now_millis()?)?;
+    write_client_bytes(writer, line.as_bytes())?;
+    session.outbound_delivered()?;
+    Ok(())
+}
+
+fn write_error(writer: &mut TcpStream, code: &str, message: &str) -> AppResult<()> {
+    write_message(
+        writer,
+        &WireMessage::Error(ErrorMessage {
+            request_id: None,
+            current_revision: None,
+            error: StructuredError {
+                code: code.into(),
+                message: message.into(),
+                fields: Vec::new(),
+                retryable: false,
+            },
+        }),
+    )
+}
+
+fn write_message(writer: &mut TcpStream, message: &WireMessage) -> AppResult<()> {
+    let line = encode_line(message)?;
+    write_client_bytes(writer, line.as_bytes())?;
+    Ok(())
+}
+
+fn write_client_bytes(writer: &mut TcpStream, bytes: &[u8]) -> AppResult<()> {
+    writer.write_all(bytes).map_err(client_write_error)?;
+    writer.flush().map_err(client_write_error)?;
+    Ok(())
+}
+
+fn client_write_error(error: std::io::Error) -> Box<dyn Error> {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    ) {
+        Box::new(ClientWriteTimeout(error.kind()))
+    } else {
+        Box::new(error)
+    }
+}
+
+fn handshake_code(error: &HandshakeError<Infallible>) -> &'static str {
+    match error {
+        HandshakeError::IncompatibleVersion => "incompatible_version",
+        HandshakeError::NotReady(_) => "not_ready",
+        HandshakeError::DevelopmentPrincipalDenied | HandshakeError::RoleDenied(_) => {
+            "permission_denied"
+        }
+        HandshakeError::InvalidControlSync => "invalid_control_sync",
+        HandshakeError::Control(never) => match *never {},
+    }
+}
+
+struct MessageReader {
+    stream: TcpStream,
+    decoder: LineDecoder,
+    pending: VecDeque<WireMessage>,
+}
+
+impl MessageReader {
+    fn new(stream: TcpStream) -> Self {
+        Self {
+            stream,
+            decoder: LineDecoder::new(),
+            pending: VecDeque::new(),
+        }
+    }
+
+    fn read_message(&mut self) -> AppResult<Option<WireMessage>> {
+        self.read_message_with_idle(|| Ok(true))
+    }
+
+    fn read_message_with_idle(
+        &mut self,
+        mut idle: impl FnMut() -> AppResult<bool>,
+    ) -> AppResult<Option<WireMessage>> {
+        if let Some(message) = self.pending.pop_front() {
+            return Ok(Some(message));
+        }
+        let mut chunk = [0_u8; 8 * 1024];
+        loop {
+            let read = match self.stream.read(&mut chunk) {
+                Ok(read) => read,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    if !idle()? {
+                        return Ok(None);
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            if read == 0 {
+                let decoder = std::mem::replace(&mut self.decoder, LineDecoder::new());
+                decoder.finish()?;
+                return Ok(None);
+            }
+            self.pending.extend(self.decoder.push(&chunk[..read])?);
+            if let Some(message) = self.pending.pop_front() {
+                return Ok(Some(message));
+            }
+        }
+    }
+}
+
+fn is_client_disconnect(error: &(dyn Error + 'static)) -> bool {
+    if error.downcast_ref::<ClientWriteTimeout>().is_some() {
+        return true;
+    }
+    if let Some(error) = error.downcast_ref::<std::io::Error>() {
+        return matches!(
+            error.kind(),
+            std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::UnexpectedEof
+        );
+    }
+    error.source().is_some_and(is_client_disconnect)
+}
+
+fn development_principal() -> AppResult<Principal> {
+    Ok(Principal::development(
+        UserId::new("local-operator")?,
+        SessionId::new("local-session")?,
+        [AuthRole::Admin],
+    ))
+}
+
+fn clock_domain() -> ClockDomainId {
+    ClockDomainId::new(NonZeroU128::new(1).expect("one is nonzero"))
+}
+
+fn required_routing(value: Option<InputId>, field: &'static str) -> AppResult<InputId> {
+    value.ok_or_else(|| AppFailure(format!("project is missing {field} routing")).into())
+}
+
+fn now_millis() -> AppResult<u64> {
+    let millis = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+    u64::try_from(millis)
+        .map_err(|_| AppFailure("system time exceeds protocol range".into()).into())
+}
+
+fn print_help() {
+    println!(
+        "FreeMix headless production daemon\n\n\
+Usage:\n  freemixd serve <show.freemix> [--listen 127.0.0.1:0] [--once] [--native-media [--camera-helper PATH]] [--record-program output.mp4] [--diagnostic-stop-after 10m] [--fullscreen-program [--fullscreen-display 0]]\n  freemixd help\n  freemixd --version\n\n\
+Native media is opt-in; without it the daemon uses simulated frame realization.\n\
+--camera-helper overrides the developer AVFoundation helper path for exact macOS Device inputs; it never requests permission.\n\
+Program recording requires native media, an existing output parent, and a new final .mp4 file. Existing files are never overwritten.\n\
+Use --record-program=<path> when the output name begins with --. Recorder capability digests describe configured startup support; FREEMIXD_RECORDER reports runtime health.\n\
+macOS fullscreen display selection is a zero-based index ordered by physical position, then stable descriptive fields.\n\
+--diagnostic-stop-after schedules cooperative headless native shutdown after readiness; accepted units are ms, s, m, and h up to 24h.\n\
+Native mode continues across client disconnects; close the Program window or press Escape for bounded shutdown."
+    );
+}
+
+#[derive(Debug)]
+struct AppFailure(String);
+
+#[derive(Debug)]
+struct ClientWriteTimeout(std::io::ErrorKind);
+
+impl fmt::Display for ClientWriteTimeout {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "client write timed out: {:?}", self.0)
+    }
+}
+
+impl Error for ClientWriteTimeout {}
+
+impl fmt::Display for AppFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl Error for AppFailure {}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        cell::Cell,
+        fs,
+        panic::{AssertUnwindSafe, catch_unwind},
+        sync::mpsc::TryRecvError,
+    };
+
+    use fm_control::{LiveEvent, Subscription};
+    #[cfg(all(feature = "native-media", target_os = "macos"))]
+    use fm_io_macos::{CameraIdKind, deterministic_camera_id};
+    use fm_model::{
+        Input, InputKind, Project, ProjectSettings, SimulatedAudio, SimulatedInput, SimulatedVideo,
+        SolidColor,
+    };
+    use fm_types::{
+        AudioFormat, ChannelLayout, ColorMetadata, FrameRate, PixelFormat, SampleFormat,
+        SampleRate, ScanMode, VideoDimensions, VideoFormat,
+    };
+    #[cfg(feature = "native-media")]
+    use image::{ExtendedColorType, ImageEncoder, codecs::png::PngEncoder};
+
+    use super::*;
+
+    #[cfg(all(feature = "native-media", target_os = "macos"))]
+    fn camera_discovery(permission: u8) -> Vec<u8> {
+        let mut bytes = b"FMCAMD2\0".to_vec();
+        bytes.push(permission);
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        for value in ["fake-camera", "Fake Camera"] {
+            bytes.extend_from_slice(&u32::try_from(value.len()).unwrap().to_le_bytes());
+            bytes.extend_from_slice(value.as_bytes());
+        }
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.extend_from_slice(&30_000_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_001_u32.to_le_bytes());
+        bytes
+    }
+
+    #[cfg(all(feature = "native-media", target_os = "macos"))]
+    fn camera_frame() -> Vec<u8> {
+        let mut bytes = b"FMCAMF3\0".to_vec();
+        bytes.extend_from_slice(&62_u32.to_le_bytes());
+        bytes.extend_from_slice(&7_u64.to_le_bytes());
+        bytes.extend_from_slice(&2_u64.to_le_bytes());
+        bytes.extend_from_slice(&1_000_i64.to_le_bytes());
+        bytes.extend_from_slice(&1_000_i32.to_le_bytes());
+        bytes.extend_from_slice(&1_001_i64.to_le_bytes());
+        bytes.extend_from_slice(&30_000_i32.to_le_bytes());
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.extend_from_slice(&4_u32.to_le_bytes());
+        bytes.extend_from_slice(&4_u32.to_le_bytes());
+        bytes.extend_from_slice(&[1, 2]);
+        bytes.extend_from_slice(&[3, 5, 7, 255]);
+        bytes
+    }
+
+    #[cfg(all(feature = "native-media", target_os = "macos"))]
+    fn shell_octal(bytes: &[u8]) -> String {
+        use fmt::Write as _;
+
+        let mut output = String::new();
+        for byte in bytes {
+            write!(output, "\\{byte:03o}").unwrap();
+        }
+        output
+    }
+
+    #[cfg(all(feature = "native-media", target_os = "macos"))]
+    fn fake_camera_helper(directory: &Path, permission: u8) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let helper = directory.join("camera-helper.sh");
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  discover) printf '{}' ;;\n  capture) printf '%s\\n' \"$@\" > \"$0.capture\"; printf '%s' \"$$\" > \"$0.pid\"; printf '{}'; exec sleep 30 ;;\n  request-permission) touch \"$0.permission\"; exit 91 ;;\n  *) exit 90 ;;\nesac\n",
+            shell_octal(&camera_discovery(permission)),
+            shell_octal(&camera_frame()),
+        );
+        fs::write(&helper, script).unwrap();
+        let mut permissions = fs::metadata(&helper).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&helper, permissions).unwrap();
+        helper
+    }
+
+    #[cfg(all(feature = "native-media", target_os = "macos"))]
+    fn camera_test_project(stable_key: &str) -> StoredProject {
+        let frame_rate = FrameRate::new(30_000, 1_001).unwrap();
+        let mut project = Project::new(
+            ProjectId::new(NonZeroU128::new(43).unwrap()),
+            "Camera Unit Test",
+            ProjectSettings {
+                frame_rate,
+                video: VideoFormat {
+                    dimensions: VideoDimensions::new(1, 1).unwrap(),
+                    frame_rate,
+                    pixel_format: PixelFormat::Rgba8,
+                    scan: ScanMode::Progressive,
+                    color: ColorMetadata::default(),
+                },
+                audio: AudioFormat {
+                    sample_rate: SampleRate::new(48_000).unwrap(),
+                    sample_format: SampleFormat::F32,
+                    channels: ChannelLayout::stereo(),
+                },
+            },
+        );
+        project.add_input(Input {
+            id: test_input_id(1),
+            name: "Camera".into(),
+            kind: InputKind::Device {
+                stable_key: stable_key.into(),
+            },
+            required_capabilities: Vec::new(),
+        });
+        project.add_input(Input {
+            id: test_input_id(2),
+            name: "Bars".into(),
+            kind: InputKind::Simulated(SimulatedInput::new(
+                SimulatedVideo::Bars,
+                SimulatedAudio::Silence,
+            )),
+            required_capabilities: Vec::new(),
+        });
+        project.set_main_mix(MainMix::new(test_input_id(1), test_input_id(2)));
+        StoredProject::from_project(
+            project,
+            RuntimeRouting {
+                desired_program_id: Some(test_input_id(1)),
+                realized_program_id: Some(test_input_id(1)),
+                desired_preview_id: Some(test_input_id(2)),
+                realized_preview_id: Some(test_input_id(2)),
+            },
+            ProjectPosition::default(),
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
+    struct FailingSaver;
+
+    impl ProjectSaver for FailingSaver {
+        fn save(&self, _project: &StoredProject) -> AppResult<()> {
+            Err(AppFailure("injected save failure".into()).into())
+        }
+    }
+
+    struct ObservingSaver<'a> {
+        subscription: &'a Subscription,
+        saved: RefCell<Option<StoredProject>>,
+    }
+
+    impl ProjectSaver for ObservingSaver<'_> {
+        fn save(&self, project: &StoredProject) -> AppResult<()> {
+            assert_eq!(self.subscription.try_recv(), Err(TryRecvError::Empty));
+            self.saved.replace(Some(project.clone()));
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingSaver(Cell<u32>);
+
+    impl ProjectSaver for CountingSaver {
+        fn save(&self, _project: &StoredProject) -> AppResult<()> {
+            self.0.set(self.0.get() + 1);
+            Ok(())
+        }
+    }
+
+    struct CrashAfterSave<'a>(&'a ProjectStore);
+
+    impl ProjectSaver for CrashAfterSave<'_> {
+        fn save(&self, project: &StoredProject) -> AppResult<()> {
+            ProjectStore::save(self.0, project)?;
+            panic!("simulated crash after save");
+        }
+    }
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn parses_serve_options() {
+        assert_eq!(
+            parse_args(strings(&[
+                "serve",
+                "show.freemix",
+                "--listen",
+                "127.0.0.1:9123",
+                "--once",
+            ]))
+            .unwrap(),
+            Command::Serve {
+                project: "show.freemix".into(),
+                listen: "127.0.0.1:9123".parse().unwrap(),
+                once: true,
+                native_media: false,
+                fullscreen_program: false,
+                fullscreen_display: 0,
+                camera_helper: None,
+                record_program: None,
+                diagnostic_stop_after: None,
+            }
+        );
+    }
+
+    #[test]
+    fn default_serve_is_ephemeral_loopback() {
+        let command = parse_args(strings(&["serve", "show.freemix"])).unwrap();
+        assert!(matches!(
+            command,
+            Command::Serve { listen, once: false, native_media: false, .. }
+                if listen == DEFAULT_LISTEN.parse::<SocketAddr>().unwrap()
+        ));
+    }
+
+    #[test]
+    fn parses_native_media_as_an_opt_in() {
+        assert!(matches!(
+            parse_args(strings(&["serve", "show.freemix", "--native-media"])).unwrap(),
+            Command::Serve {
+                native_media: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_duplicate_native_media_option() {
+        let error = parse_args(strings(&[
+            "serve",
+            "show.freemix",
+            "--native-media",
+            "--native-media",
+        ]))
+        .unwrap_err();
+        assert_eq!(error.to_string(), "duplicate option `--native-media`");
+    }
+
+    #[test]
+    fn parses_camera_helper_only_with_native_media() {
+        for arguments in [
+            strings(&[
+                "serve",
+                "show.freemix",
+                "--native-media",
+                "--camera-helper",
+                "helper-bin",
+            ]),
+            strings(&[
+                "serve",
+                "show.freemix",
+                "--native-media",
+                "--camera-helper=helper-bin",
+            ]),
+        ] {
+            assert!(matches!(
+                parse_args(arguments).unwrap(),
+                Command::Serve {
+                    camera_helper: Some(path),
+                    ..
+                } if path == Path::new("helper-bin")
+            ));
+        }
+        assert_eq!(
+            parse_args(strings(&[
+                "serve",
+                "show.freemix",
+                "--camera-helper",
+                "helper-bin",
+            ]))
+            .unwrap_err()
+            .to_string(),
+            "--camera-helper requires --native-media"
+        );
+        for arguments in [
+            strings(&["serve", "show.freemix", "--native-media", "--camera-helper"]),
+            strings(&[
+                "serve",
+                "show.freemix",
+                "--native-media",
+                "--camera-helper=",
+            ]),
+        ] {
+            assert_eq!(
+                parse_args(arguments).unwrap_err().to_string(),
+                "missing value for --camera-helper"
+            );
+        }
+        assert_eq!(
+            parse_args(strings(&[
+                "serve",
+                "show.freemix",
+                "--native-media",
+                "--camera-helper=a",
+                "--camera-helper",
+                "b",
+            ]))
+            .unwrap_err()
+            .to_string(),
+            "duplicate option `--camera-helper`"
+        );
+    }
+
+    #[test]
+    fn parses_bounded_diagnostic_stop_duration() {
+        assert_eq!(
+            parse_diagnostic_duration("1500ms").unwrap(),
+            Duration::from_millis(1_500)
+        );
+        assert_eq!(
+            parse_diagnostic_duration("2s").unwrap(),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            parse_diagnostic_duration("3m").unwrap(),
+            Duration::from_mins(3)
+        );
+        assert_eq!(
+            parse_diagnostic_duration("24h").unwrap(),
+            Duration::from_hours(24)
+        );
+        assert!(matches!(
+            parse_args(strings(&[
+                "serve",
+                "show.freemix",
+                "--native-media",
+                "--diagnostic-stop-after=10m",
+            ]))
+            .unwrap(),
+            Command::Serve {
+                diagnostic_stop_after: Some(duration),
+                ..
+            } if duration == Duration::from_mins(10)
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_diagnostic_stop_options() {
+        for (arguments, expected) in [
+            (
+                strings(&["serve", "show.freemix", "--diagnostic-stop-after", "1s"]),
+                "--diagnostic-stop-after requires --native-media",
+            ),
+            (
+                strings(&[
+                    "serve",
+                    "show.freemix",
+                    "--native-media",
+                    "--once",
+                    "--diagnostic-stop-after",
+                    "1s",
+                ]),
+                "--diagnostic-stop-after cannot be combined with --once",
+            ),
+            (
+                strings(&[
+                    "serve",
+                    "show.freemix",
+                    "--native-media",
+                    "--fullscreen-program",
+                    "--diagnostic-stop-after",
+                    "1s",
+                ]),
+                "--diagnostic-stop-after currently supports headless native mode only",
+            ),
+            (
+                strings(&[
+                    "serve",
+                    "show.freemix",
+                    "--native-media",
+                    "--diagnostic-stop-after",
+                    "0s",
+                ]),
+                "diagnostic duration must be nonzero",
+            ),
+            (
+                strings(&[
+                    "serve",
+                    "show.freemix",
+                    "--native-media",
+                    "--diagnostic-stop-after",
+                    "25h",
+                ]),
+                "diagnostic duration cannot exceed 24h",
+            ),
+            (
+                strings(&[
+                    "serve",
+                    "show.freemix",
+                    "--native-media",
+                    "--diagnostic-stop-after",
+                    "1s",
+                    "--diagnostic-stop-after=2s",
+                ]),
+                "duplicate option `--diagnostic-stop-after`",
+            ),
+        ] {
+            assert_eq!(parse_args(arguments).unwrap_err().to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn parses_program_recording_with_once_and_fullscreen() {
+        assert!(matches!(
+            parse_args(strings(&[
+                "serve",
+                "show.freemix",
+                "--native-media",
+                "--fullscreen-program",
+                "--record-program",
+                "capture.mp4",
+                "--once",
+            ]))
+            .unwrap(),
+            Command::Serve {
+                once: true,
+                native_media: true,
+                fullscreen_program: true,
+                record_program: Some(path),
+                ..
+            } if path == Path::new("capture.mp4")
+        ));
+    }
+
+    #[test]
+    fn parses_equals_program_recording_with_option_like_file_name() {
+        assert!(matches!(
+            parse_args(strings(&[
+                "serve",
+                "show.freemix",
+                "--native-media",
+                "--record-program=--capture.mp4",
+            ]))
+            .unwrap(),
+            Command::Serve {
+                record_program: Some(path),
+                ..
+            } if path == Path::new("--capture.mp4")
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_program_recording_option_relationships() {
+        for (arguments, expected) in [
+            (
+                strings(&["serve", "show.freemix", "--record-program", "capture.mp4"]),
+                "--record-program requires --native-media",
+            ),
+            (
+                strings(&[
+                    "serve",
+                    "show.freemix",
+                    "--native-media",
+                    "--record-program",
+                ]),
+                "missing value for --record-program",
+            ),
+            (
+                strings(&[
+                    "serve",
+                    "show.freemix",
+                    "--native-media",
+                    "--record-program",
+                    "--once",
+                ]),
+                "missing value for --record-program",
+            ),
+            (
+                strings(&[
+                    "serve",
+                    "show.freemix",
+                    "--native-media",
+                    "--record-program",
+                    "one.mp4",
+                    "--record-program",
+                    "two.mp4",
+                ]),
+                "duplicate option `--record-program`",
+            ),
+            (
+                strings(&[
+                    "serve",
+                    "show.freemix",
+                    "--native-media",
+                    "--record-program=",
+                ]),
+                "missing value for --record-program",
+            ),
+            (
+                strings(&[
+                    "serve",
+                    "show.freemix",
+                    "--native-media",
+                    "--record-program=one.mp4",
+                    "--record-program=two.mp4",
+                ]),
+                "duplicate option `--record-program`",
+            ),
+        ] {
+            assert_eq!(parse_args(arguments).unwrap_err().to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn capability_digest_distinguishes_recorder_modes() {
+        assert_eq!(
+            capabilities_digest(false, false, false),
+            CAPABILITIES_DIGEST
+        );
+        assert_eq!(
+            capabilities_digest(true, false, false),
+            NATIVE_MEDIA_CAPABILITIES_DIGEST
+        );
+        assert_eq!(
+            capabilities_digest(true, false, true),
+            PROGRAM_RECORDER_CAPABILITIES_DIGEST
+        );
+        assert_eq!(
+            capabilities_digest(true, true, false),
+            FULLSCREEN_PROGRAM_CAPABILITIES_DIGEST
+        );
+        assert_eq!(
+            capabilities_digest(true, true, true),
+            FULLSCREEN_PROGRAM_RECORDER_CAPABILITIES_DIGEST
+        );
+    }
+
+    #[cfg(feature = "native-media")]
+    #[test]
+    fn native_telemetry_diagnostic_names_scoped_metrics_and_unavailable_gpu_time() {
+        let origin = Instant::now();
+        let adapter = fm_gpu::NativeAdapterInfo {
+            name: "Test Adapter".to_owned(),
+            backend: NativeBackend::Metal,
+        };
+        let mut telemetry = NativeRuntimeTelemetry::new(origin, &adapter);
+        let deadline = origin
+            .checked_sub(Duration::from_millis(10))
+            .expect("test deadline is representable");
+        telemetry.observe_host_lateness(deadline, origin);
+        let diagnostic = telemetry.diagnostic(Some(fm_gpu::PresentationTelemetry {
+            pending_depth: 1,
+            peak_pending_depth: 1,
+            frames_dropped: 2,
+            ..fm_gpu::PresentationTelemetry::default()
+        }));
+
+        assert!(diagnostic.starts_with("FREEMIXD_TELEMETRY\tv=3\t"));
+        assert!(diagnostic.contains("\thost_lateness_samples_total=1\t"));
+        assert!(diagnostic.contains("\thost_lateness_samples_retained=1\t"));
+        assert!(diagnostic.contains("\thost_lateness_p50_ms=10.000\t"));
+        assert!(diagnostic.contains("\tpresentation_active=true\t"));
+        assert!(diagnostic.contains("\tpresentation_pending_depth=1\t"));
+        assert!(diagnostic.contains("\tpresentation_dropped=2\t"));
+        assert!(diagnostic.contains("\trecorder_configured=false\t"));
+        assert!(diagnostic.contains("\tcamera_configured_sources=0\t"));
+        assert!(diagnostic.contains("\tcamera_frames_received=0\t"));
+        assert!(diagnostic.contains("\tcamera_frames_ingested=0\t"));
+        assert!(diagnostic.contains("\tgpu_backend=Metal\t"));
+        assert!(diagnostic.contains("\tgpu_adapter=Test Adapter\t"));
+        assert!(diagnostic.contains("\tgpu_timing=Unsupported\t"));
+        assert!(diagnostic.contains("\tgpu_pass_samples_total=0\t"));
+        assert!(diagnostic.contains("\tgpu_pass_samples_retained=0\t"));
+        assert!(diagnostic.contains("\tgpu_pass_p50_ms=none\t"));
+        assert!(diagnostic.contains("\tmetric_errors=0\t"));
+    }
+
+    #[cfg(all(feature = "native-media", target_os = "macos"))]
+    #[test]
+    fn camera_source_diagnostics_are_stable_bounded_and_saturating() {
+        assert_eq!(lifecycle_label(LifecycleState::Closed), "closed");
+        assert_eq!(lifecycle_label(LifecycleState::Open), "open");
+        assert_eq!(lifecycle_label(LifecycleState::Running), "running");
+        assert_eq!(lifecycle_label(LifecycleState::Lost), "lost");
+        assert_eq!(lifecycle_label(LifecycleState::Recovering), "recovering");
+        assert_eq!(health_label(EndpointHealthState::Healthy), "healthy");
+        assert_eq!(health_label(EndpointHealthState::Degraded), "degraded");
+        assert_eq!(health_label(EndpointHealthState::SignalLost), "signal_lost");
+        assert_eq!(health_label(EndpointHealthState::Failed), "failed");
+
+        let source = NativeCameraSourceTelemetry {
+            input: test_input_id(1),
+            lifecycle: LifecycleState::Running,
+            health: EndpointHealthState::Healthy,
+            frames_received: 7,
+            frames_ingested: 6,
+            native_dropped: 2,
+            queue_dropped: 1,
+            queue_depth: 0,
+            queue_peak_depth: 1,
+        };
+        let diagnostic = source.diagnostic();
+        assert!(diagnostic.starts_with(
+            "FREEMIXD_CAMERA_SOURCE\tv=1\tclassification=diagnostic-not-certification\t"
+        ));
+        assert!(diagnostic.contains("\tsample_phase=pre_cleanup\t"));
+        assert!(diagnostic.contains("\tsample_lifecycle=running\thealth=healthy\t"));
+        assert!(diagnostic.len() < 512);
+
+        let mut second = source;
+        second.input = test_input_id(2);
+        let mut unsorted = [second, source];
+        sort_camera_source_telemetry(&mut unsorted);
+        assert_eq!(
+            unsorted.map(|sample| sample.input),
+            [test_input_id(1), test_input_id(2)]
+        );
+
+        let mut saturated = source;
+        saturated.frames_received = u64::MAX;
+        saturated.frames_ingested = u64::MAX;
+        saturated.native_dropped = u64::MAX;
+        saturated.queue_dropped = u64::MAX;
+        saturated.queue_depth = u64::MAX;
+        saturated.queue_peak_depth = u64::MAX;
+        let aggregate = aggregate_camera_telemetry(&[saturated, source]);
+        assert_eq!(aggregate.configured_sources, 2);
+        assert_eq!(aggregate.frames_received, u64::MAX);
+        assert_eq!(aggregate.frames_ingested, u64::MAX);
+        assert_eq!(aggregate.native_dropped, u64::MAX);
+        assert_eq!(aggregate.queue_dropped, u64::MAX);
+        assert_eq!(aggregate.queue_depth, u64::MAX);
+        assert_eq!(aggregate.queue_peak_depth, u64::MAX);
+    }
+
+    #[cfg(feature = "native-media")]
+    #[test]
+    fn recorder_capability_is_configured_support_not_live_health() {
+        let digest = capabilities_digest(true, false, true);
+        let mut policy = RecorderCapturePolicy::default();
+        assert!(policy.fail("backend:failed".to_owned(), false));
+        assert_eq!(digest, capabilities_digest(true, false, true));
+        assert!(!policy.active());
+    }
+
+    #[cfg(feature = "native-media")]
+    #[test]
+    fn startup_pair_barrier_requires_mux_output_and_prioritizes_failure() {
+        assert_eq!(
+            startup_pair_decision(RecorderState::Recording, 0, 0, false),
+            StartupPairDecision::Pending
+        );
+        assert_eq!(
+            startup_pair_decision(RecorderState::Recording, 1, 0, false),
+            StartupPairDecision::Pending
+        );
+        assert_eq!(
+            startup_pair_decision(RecorderState::Recording, 1, 1, false),
+            StartupPairDecision::Ready
+        );
+        assert_eq!(
+            startup_pair_decision(RecorderState::Recording, 1, 1, true),
+            StartupPairDecision::Failed
+        );
+        assert_eq!(
+            startup_pair_decision(RecorderState::Failed, 1, 1, true),
+            StartupPairDecision::Failed
+        );
+    }
+
+    #[test]
+    fn native_client_write_timeouts_are_disconnects() {
+        for kind in [std::io::ErrorKind::TimedOut, std::io::ErrorKind::WouldBlock] {
+            let error = client_write_error(std::io::Error::from(kind));
+            assert!(is_client_disconnect(error.as_ref()));
+        }
+    }
+
+    #[cfg(feature = "native-media")]
+    #[test]
+    fn recorder_capture_failure_policy_is_sticky_and_stops_capture_only() {
+        let mut policy = RecorderCapturePolicy::default();
+        assert!(policy.active());
+        assert!(policy.fail("readback:first".to_owned(), true));
+        assert!(!policy.active());
+        assert!(!policy.fail("enqueue:second".to_owned(), false));
+        assert_eq!(policy.first_failure.as_deref(), Some("readback:first"));
+        assert!(policy.app_capture_failure);
+    }
+
+    #[cfg(feature = "native-media")]
+    #[test]
+    fn recording_output_requires_mp4_and_existing_directory_parent() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(
+            create_record_output(&directory.path().join("capture.mov"))
+                .unwrap_err()
+                .to_string()
+                .contains("final extension `.mp4`")
+        );
+        assert!(
+            create_record_output(&directory.path().join("missing/capture.mp4"))
+                .unwrap_err()
+                .to_string()
+                .contains("existing canonical directory")
+        );
+        let not_directory = directory.path().join("parent-file");
+        fs::write(&not_directory, b"parent").unwrap();
+        assert!(
+            create_record_output(&not_directory.join("capture.mp4"))
+                .unwrap_err()
+                .to_string()
+                .contains("existing canonical directory")
+        );
+    }
+
+    #[cfg(feature = "native-media")]
+    #[test]
+    fn recording_output_is_exclusive_and_never_overwrites() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("capture.mp4");
+        drop(create_record_output(&path).unwrap());
+        fs::write(&path, b"keep-me").unwrap();
+        assert!(create_record_output(&path).is_err());
+        assert_eq!(fs::read(path).unwrap(), b"keep-me");
+
+        let occupied_directory = directory.path().join("occupied.mp4");
+        fs::create_dir(&occupied_directory).unwrap();
+        assert!(create_record_output(&occupied_directory).is_err());
+    }
+
+    #[cfg(all(feature = "native-media", unix))]
+    #[test]
+    fn recording_output_rejects_existing_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        fs::write(&target, b"keep-me").unwrap();
+        let output = directory.path().join("capture.mp4");
+        symlink(&target, &output).unwrap();
+        assert!(create_record_output(&output).is_err());
+        assert_eq!(fs::read(target).unwrap(), b"keep-me");
+    }
+
+    #[cfg(feature = "native-media")]
+    #[test]
+    fn recording_path_policy_protects_final_component_not_hostile_parent_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("capture.mp4");
+        drop(create_record_output(&path).unwrap());
+        assert!(create_record_output(&path).is_err());
+        // Concurrent hostile replacement of the canonical parent is outside
+        // this path-based API boundary and requires platform file capabilities.
+    }
+
+    #[test]
+    fn parses_fullscreen_program_display_opt_in() {
+        assert!(matches!(
+            parse_args(strings(&[
+                "serve",
+                "show.freemix",
+                "--native-media",
+                "--fullscreen-program",
+                "--fullscreen-display",
+                "2",
+            ]))
+            .unwrap(),
+            Command::Serve {
+                native_media: true,
+                fullscreen_program: true,
+                fullscreen_display: 2,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn fullscreen_display_defaults_to_zero() {
+        assert!(matches!(
+            parse_args(strings(&[
+                "serve",
+                "show.freemix",
+                "--native-media",
+                "--fullscreen-program",
+            ]))
+            .unwrap(),
+            Command::Serve {
+                fullscreen_program: true,
+                fullscreen_display: 0,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_fullscreen_option_relationships_and_values() {
+        for (arguments, expected) in [
+            (
+                strings(&["serve", "show.freemix", "--fullscreen-program"]),
+                "--fullscreen-program requires --native-media",
+            ),
+            (
+                strings(&["serve", "show.freemix", "--fullscreen-display", "0"]),
+                "--fullscreen-display requires --fullscreen-program",
+            ),
+            (
+                strings(&[
+                    "serve",
+                    "show.freemix",
+                    "--native-media",
+                    "--fullscreen-program",
+                    "--fullscreen-display",
+                ]),
+                "missing value for --fullscreen-display",
+            ),
+        ] {
+            assert_eq!(parse_args(arguments).unwrap_err().to_string(), expected);
+        }
+        assert!(
+            parse_args(strings(&[
+                "serve",
+                "show.freemix",
+                "--native-media",
+                "--fullscreen-program",
+                "--fullscreen-display",
+                "-1",
+            ]))
+            .unwrap_err()
+            .to_string()
+            .contains("invalid fullscreen display index")
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_fullscreen_options() {
+        for arguments in [
+            strings(&[
+                "serve",
+                "show.freemix",
+                "--native-media",
+                "--fullscreen-program",
+                "--fullscreen-program",
+            ]),
+            strings(&[
+                "serve",
+                "show.freemix",
+                "--native-media",
+                "--fullscreen-program",
+                "--fullscreen-display",
+                "0",
+                "--fullscreen-display",
+                "1",
+            ]),
+        ] {
+            assert!(parse_args(arguments).is_err());
+        }
+    }
+
+    #[cfg(not(feature = "native-media"))]
+    #[test]
+    fn native_media_opt_in_fails_when_support_is_not_compiled() {
+        let store = ProjectStore::new("unloaded-test-project.freemix").unwrap();
+        let error = NativeDaemon::start(&store, &test_project(), None)
+            .err()
+            .unwrap();
+        assert_eq!(
+            error.to_string(),
+            "native-media support was not compiled in"
+        );
+    }
+
+    #[cfg(feature = "native-media")]
+    #[test]
+    fn native_mode_rejects_unimplemented_simulated_sine_audio() {
+        let error = validate_native_audio_modes(&test_project()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires unsupported simulated sine audio")
+        );
+    }
+
+    #[cfg(feature = "native-media")]
+    #[test]
+    fn native_source_extraction_builds_retained_generators_without_assets() {
+        let store = ProjectStore::new("unloaded-test-project.freemix").unwrap();
+        let resolution = resolve_native_sources(&store, &test_project(), None).unwrap();
+        let sources = resolution.sources;
+        assert_eq!(sources.len(), 2);
+        for (index, source) in sources.iter().enumerate() {
+            let NativeResolvedSource::RetainedFrame { input, frame } = source else {
+                panic!("simulated source must be retained")
+            };
+            assert_eq!(*input, test_input_id(u128::try_from(index + 1).unwrap()));
+            assert_eq!(frame.payload().dimensions().width(), 1_280);
+            assert_eq!(frame.payload().dimensions().height(), 720);
+            assert_eq!(frame.timing().sequence().get(), 0);
+            assert_eq!(frame.timing().presentation_timestamp().as_nanos(), 0);
+            assert!(frame.metadata().is_some());
+        }
+        let NativeResolvedSource::RetainedFrame { frame, .. } = &sources[0] else {
+            unreachable!()
+        };
+        assert_eq!(
+            &frame.payload().plane(0).unwrap().bytes()[..4],
+            &[7, 11, 13, 255]
+        );
+    }
+
+    #[cfg(all(feature = "native-media", target_os = "macos"))]
+    #[test]
+    fn macos_camera_resolution_is_exact_non_prompting_and_reaps_helper() {
+        let source_id = deterministic_camera_id(CameraIdKind::Source, "fake-camera");
+        let stable_key = format!("macos.avfoundation.camera.v1.{source_id}");
+
+        let directory = tempfile::tempdir().unwrap();
+        let helper = fake_camera_helper(directory.path(), 0);
+        let capture_marker = PathBuf::from(format!("{}.capture", helper.display()));
+        let pid_file = PathBuf::from(format!("{}.pid", helper.display()));
+        let permission_marker = PathBuf::from(format!("{}.permission", helper.display()));
+        let (sources, cameras) =
+            resolve_macos_camera_sources(&camera_test_project(&stable_key), Some(helper.as_path()))
+                .unwrap();
+        assert_eq!(sources.len(), 1);
+        let NativeResolvedSource::LiveFrame { input, frame } = &sources[0] else {
+            panic!("camera source must enter the live frame lane")
+        };
+        assert_eq!(*input, test_input_id(1));
+        assert_eq!(frame.timing().sequence().get(), 7);
+        assert_eq!(
+            frame.timing().presentation_timestamp().as_nanos(),
+            1_000_000_000
+        );
+        assert_eq!(frame.payload().plane(0).unwrap().bytes(), &[3, 5, 7, 255]);
+        assert_eq!(
+            frame.metadata().unwrap().color().transfer,
+            fm_types::TransferFunction::Bt709
+        );
+        assert_eq!(
+            fs::read_to_string(&capture_marker).unwrap(),
+            "capture\nfake-camera\n1\n1\n30000\n1001\n"
+        );
+        assert!(!permission_marker.exists());
+        let pid = fs::read_to_string(&pid_file).unwrap();
+        drop(cameras);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline
+            && std::process::Command::new("kill")
+                .args(["-0", pid.trim()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !std::process::Command::new("kill")
+                .args(["-0", pid.trim()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success()),
+            "camera helper {pid} survived source cleanup"
+        );
+
+        let unknown_directory = tempfile::tempdir().unwrap();
+        let unknown_helper = fake_camera_helper(unknown_directory.path(), 0);
+        let unknown_capture = PathBuf::from(format!("{}.capture", unknown_helper.display()));
+        let error = resolve_macos_camera_sources(
+            &camera_test_project("macos.avfoundation.camera.v1.999"),
+            Some(unknown_helper.as_path()),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("unknown camera stable key"));
+        assert!(!unknown_capture.exists(), "unknown key invoked capture");
+
+        let prompt_directory = tempfile::tempdir().unwrap();
+        let prompt_helper = fake_camera_helper(prompt_directory.path(), 1);
+        let prompt_capture = PathBuf::from(format!("{}.capture", prompt_helper.display()));
+        let prompt_request = PathBuf::from(format!("{}.permission", prompt_helper.display()));
+        let error = resolve_macos_camera_sources(
+            &camera_test_project(&stable_key),
+            Some(prompt_helper.as_path()),
+        )
+        .err()
+        .unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("camera permission is not granted")
+        );
+        assert!(
+            !prompt_capture.exists(),
+            "permission preflight invoked capture"
+        );
+        assert!(
+            !prompt_request.exists(),
+            "daemon requested camera permission"
+        );
+    }
+
+    #[cfg(feature = "native-media")]
+    #[test]
+    fn native_source_extraction_keeps_asset_resolution_errors_path_free() {
+        let store = ProjectStore::new("secret-native-project-marker.freemix").unwrap();
+        let error = resolve_native_sources(
+            &store,
+            &media_test_project("asset://secret-uri-marker/../clip.mkv"),
+            None,
+        )
+        .err()
+        .unwrap();
+        let message = error.to_string();
+        assert!(message.contains("invalid project asset URI"));
+        assert!(!message.contains("secret-native-project-marker"));
+        assert!(!message.contains("secret-uri-marker"));
+    }
+
+    #[cfg(feature = "native-media")]
+    #[test]
+    fn native_source_extraction_routes_png_to_one_timed_retained_frame() {
+        let directory = tempfile::tempdir().unwrap();
+        let project_path = directory.path().join("still-project.freemix");
+        let assets = project_path.join("assets");
+        fs::create_dir_all(&assets).unwrap();
+        let mut png = Vec::new();
+        PngEncoder::new(&mut png)
+            .write_image(&[1, 2, 3, 4], 1, 1, ExtendedColorType::Rgba8)
+            .unwrap();
+        fs::write(assets.join("still.data"), png).unwrap();
+
+        let sources = resolve_native_sources(
+            &ProjectStore::new(&project_path).unwrap(),
+            &media_test_project("asset://still.data"),
+            None,
+        )
+        .unwrap()
+        .sources;
+        assert_eq!(sources.len(), 2);
+        for source in sources {
+            let NativeResolvedSource::RetainedFrame { frame, .. } = source else {
+                panic!("PNG signature must route to retained still decode")
+            };
+            assert_eq!(
+                frame.payload().dimensions(),
+                VideoDimensions::new(1, 1).unwrap()
+            );
+            assert_eq!(frame.payload().plane(0).unwrap().bytes(), &[1, 2, 3, 4]);
+            assert_eq!(frame.timing().presentation_timestamp().as_nanos(), 0);
+            assert_eq!(frame.timing().duration().as_nanos(), 1);
+            assert_eq!(frame.timing().sequence().get(), 0);
+            assert_eq!(frame.timing().clock_domain(), native_clock_domain());
+        }
+    }
+
+    #[cfg(feature = "native-media")]
+    #[test]
+    fn recognized_corrupt_png_does_not_fall_back_to_ffmpeg() {
+        let directory = tempfile::tempdir().unwrap();
+        let project_path = directory.path().join("corrupt-still.freemix");
+        let assets = project_path.join("assets");
+        fs::create_dir_all(&assets).unwrap();
+        fs::write(assets.join("bad.bin"), b"\x89PNG\r\n\x1a\ncorrupt").unwrap();
+
+        let error = resolve_native_sources(
+            &ProjectStore::new(&project_path).unwrap(),
+            &media_test_project("asset://bad.bin"),
+            None,
+        )
+        .err()
+        .unwrap();
+        let message = error.to_string();
+        assert!(message.contains("native still decode failed"));
+        assert!(!message.contains("corrupt-still"));
+        assert!(!message.contains("bad.bin"));
+    }
+
+    #[cfg(feature = "native-media")]
+    #[test]
+    fn host_pacer_offsets_use_exact_rational_deadlines() {
+        let rate = FrameRate::new(30_000, 1_001).unwrap();
+        let mut pacer = FramePacer::new(rate, 0);
+        assert_eq!(host_deadline_offset(&pacer).unwrap(), Duration::ZERO);
+        pacer.advance().unwrap();
+        assert_eq!(host_deadline_offset(&pacer).unwrap().as_nanos(), 33_366_666);
+        for _ in 1..30_000 {
+            pacer.advance().unwrap();
+        }
+        assert_eq!(host_deadline_offset(&pacer).unwrap().as_secs(), 1_001);
+    }
+
+    #[test]
+    fn failed_save_aborts_preparation_without_authority_or_output() {
+        let mut durable = test_project();
+        let initial_engine = restore_engine(&durable).unwrap().snapshot().unwrap();
+        let mut control = test_control(&durable);
+        let subscription = control.subscribe().unwrap();
+        let before_diagnostics = control.diagnostics();
+        let before_snapshot = control.snapshot().clone();
+        let server = test_server(&control);
+        let command = test_command("failed-save", "failed-save-key", CommandPayload::Cut);
+
+        let error = execute_durable_command(
+            &mut control,
+            &FailingSaver,
+            &mut durable,
+            &operator(),
+            &server,
+            &command,
+            0,
+        )
+        .err()
+        .expect("save failure must not produce a command result");
+
+        assert_eq!(error.to_string(), "injected save failure");
+        assert_eq!(durable, test_project());
+        assert_eq!(control.diagnostics(), before_diagnostics);
+        assert_eq!(control.snapshot(), &before_snapshot);
+        assert_eq!(live_engine_snapshot(&mut control), initial_engine);
+        assert_eq!(subscription.try_recv(), Err(TryRecvError::Empty));
+        let prepared = control
+            .prepare_submit(&operator(), command, 0)
+            .unwrap()
+            .prepared()
+            .expect("failed save must not install a receipt");
+        prepared.abort();
+    }
+
+    #[test]
+    fn save_precedes_commit_ticks_and_returned_result() {
+        let mut durable = test_project();
+        let mut control = test_control(&durable);
+        let subscription = control.subscribe().unwrap();
+        let saver = ObservingSaver {
+            subscription: &subscription,
+            saved: RefCell::new(None),
+        };
+        let server = test_server(&control);
+
+        let execution = execute_durable_command(
+            &mut control,
+            &saver,
+            &mut durable,
+            &operator(),
+            &server,
+            &test_command(
+                "ordered-fade",
+                "ordered-fade-key",
+                CommandPayload::Fade { duration_frames: 4 },
+            ),
+            0,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            execution.submission.output.result,
+            CommandResult::Accepted { revision: 1, .. }
+        ));
+        assert_eq!(saver.saved.borrow().as_ref(), Some(&durable));
+        assert_eq!(durable.position().frames_rendered, 4);
+        assert!(matches!(
+            subscription.try_recv().unwrap(),
+            LiveEvent::Durable(_)
+        ));
+        assert!(matches!(
+            subscription.try_recv().unwrap(),
+            LiveEvent::Runtime(_)
+        ));
+    }
+
+    #[test]
+    fn projected_project_equals_committed_settled_engine() {
+        let mut durable = test_project();
+        let original_project = durable.project().clone();
+        let mut control = test_control(&durable);
+        let server = test_server(&control);
+
+        execute_durable_command(
+            &mut control,
+            &CountingSaver::default(),
+            &mut durable,
+            &operator(),
+            &server,
+            &test_command(
+                "settled-fade",
+                "settled-fade-key",
+                CommandPayload::Fade { duration_frames: 7 },
+            ),
+            0,
+        )
+        .unwrap();
+
+        let restored = restore_engine(&durable).unwrap().snapshot().unwrap();
+        assert_eq!(live_engine_snapshot(&mut control), restored);
+        assert_eq!(durable.position().frames_rendered, 7);
+        assert_eq!(durable.position().runtime_generation, 1);
+        assert_eq!(durable.position().clock_time_nanos, 240_000_000);
+        let mut expected_project = original_project;
+        expected_project.set_main_mix(durable.project().main_mix().unwrap());
+        assert_eq!(durable.project(), &expected_project);
+    }
+
+    #[test]
+    fn idle_snapshot_checkpoint_preserves_project_routing_and_receipts() {
+        let mut durable = test_project();
+        let mut control = test_control(&durable);
+        let server = test_server(&control);
+        execute_durable_command(
+            &mut control,
+            &CountingSaver::default(),
+            &mut durable,
+            &operator(),
+            &server,
+            &test_command("checkpoint-cut", "checkpoint-key", CommandPayload::Cut),
+            0,
+        )
+        .unwrap();
+        control.tick(&server).unwrap();
+
+        let checkpoint =
+            stored_project_checkpoint(&durable, &control.idle_engine_snapshot().unwrap()).unwrap();
+        assert_eq!(checkpoint.project(), durable.project());
+        assert_eq!(checkpoint.runtime_routing(), durable.runtime_routing());
+        assert_eq!(
+            checkpoint.idempotency_receipts(),
+            durable.idempotency_receipts()
+        );
+        assert_eq!(
+            checkpoint.position().frames_rendered,
+            durable.position().frames_rendered + 1
+        );
+        assert_eq!(checkpoint.position().revision, durable.position().revision);
+    }
+
+    #[test]
+    fn authorization_denial_is_saved_before_becoming_replayable() {
+        let mut durable = test_project();
+        let mut control = test_control(&durable);
+        let saver = CountingSaver::default();
+        let server = test_server(&control);
+        let command = test_command("denied", "denied-key", CommandPayload::Cut);
+
+        let denied = execute_durable_command(
+            &mut control,
+            &saver,
+            &mut durable,
+            &viewer(),
+            &server,
+            &command,
+            0,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            denied.submission.output.result,
+            CommandResult::Rejected { ref code, .. } if code == "permission_denied"
+        ));
+        assert_eq!(saver.0.get(), 1);
+        assert_eq!(durable.idempotency_receipts().len(), 1);
+        let replay = execute_durable_command(
+            &mut control,
+            &saver,
+            &mut durable,
+            &viewer(),
+            &server,
+            &command,
+            0,
+        )
+        .unwrap();
+        assert!(replay.submission.replayed);
+        assert_eq!(saver.0.get(), 1);
+        assert!(replay.runtime_events.is_empty());
+
+        let mut restarted = test_control(&durable);
+        let restarted_server = test_server(&restarted);
+        let mut restarted_durable = durable.clone();
+        let replay_after_restart = execute_durable_command(
+            &mut restarted,
+            &saver,
+            &mut restarted_durable,
+            &operator(),
+            &restarted_server,
+            &command,
+            0,
+        )
+        .unwrap();
+        assert!(replay_after_restart.submission.replayed);
+        assert_eq!(
+            replay_after_restart.submission.output.result,
+            denied.submission.output.result
+        );
+        assert_eq!(saver.0.get(), 1);
+        assert_eq!(restarted_durable, durable);
+    }
+
+    #[test]
+    fn crash_after_save_restarts_from_settled_receipt_without_reexecution() {
+        let root = std::env::temp_dir().join(format!(
+            "freemixd-{}-{}.freemix",
+            std::process::id(),
+            now_millis().unwrap()
+        ));
+        let store = ProjectStore::new(&root).unwrap();
+        let mut durable = test_project();
+        let mut control = test_control(&durable);
+        let server = test_server(&control);
+        let command = test_command(
+            "crash-fade",
+            "crash-fade-key",
+            CommandPayload::Fade { duration_frames: 4 },
+        );
+
+        let crashed = catch_unwind(AssertUnwindSafe(|| {
+            let _ = execute_durable_command(
+                &mut control,
+                &CrashAfterSave(&store),
+                &mut durable,
+                &operator(),
+                &server,
+                &command,
+                0,
+            );
+        }));
+        assert!(crashed.is_err());
+        assert_eq!(control.diagnostics().current_revision, 0);
+        assert_eq!(durable.position().revision, 0);
+
+        let saved = store.load().unwrap();
+        assert_eq!(saved.position().revision, 1);
+        assert_eq!(saved.position().frames_rendered, 4);
+        assert_eq!(saved.idempotency_receipts().len(), 1);
+        let mut restarted = test_control(&saved);
+        let restarted_server = test_server(&restarted);
+        let save_counter = CountingSaver::default();
+        let mut restarted_durable = saved.clone();
+        let replay = execute_durable_command(
+            &mut restarted,
+            &save_counter,
+            &mut restarted_durable,
+            &operator(),
+            &restarted_server,
+            &command,
+            0,
+        )
+        .unwrap();
+        assert!(replay.submission.replayed);
+        assert!(replay.runtime_events.is_empty());
+        assert_eq!(save_counter.0.get(), 0);
+        assert_eq!(restarted_durable, saved);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn test_project() -> StoredProject {
+        let frame_rate = FrameRate::new(25, 1).unwrap();
+        let mut project = Project::new(
+            ProjectId::new(NonZeroU128::new(42).unwrap()),
+            "Unit Test",
+            ProjectSettings {
+                frame_rate,
+                video: VideoFormat {
+                    dimensions: VideoDimensions::new(1_280, 720).unwrap(),
+                    frame_rate,
+                    pixel_format: PixelFormat::Rgba8,
+                    scan: ScanMode::Progressive,
+                    color: ColorMetadata::default(),
+                },
+                audio: AudioFormat {
+                    sample_rate: SampleRate::new(44_100).unwrap(),
+                    sample_format: SampleFormat::I16,
+                    channels: ChannelLayout::stereo(),
+                },
+            },
+        );
+        project.add_input(Input {
+            id: test_input_id(1),
+            name: "Custom solid and tone".into(),
+            kind: InputKind::Simulated(SimulatedInput::new(
+                SimulatedVideo::Solid(SolidColor::new(7, 11, 13, 255)),
+                SimulatedAudio::Sine { frequency_hz: 997 },
+            )),
+            required_capabilities: vec!["simulation.custom".into()],
+        });
+        project.add_input(Input {
+            id: test_input_id(2),
+            name: "Bars".into(),
+            kind: InputKind::Simulated(SimulatedInput::new(
+                SimulatedVideo::Bars,
+                SimulatedAudio::Silence,
+            )),
+            required_capabilities: Vec::new(),
+        });
+        project.set_main_mix(MainMix::new(test_input_id(1), test_input_id(2)));
+        StoredProject::from_project(
+            project,
+            RuntimeRouting {
+                desired_program_id: Some(test_input_id(1)),
+                realized_program_id: Some(test_input_id(1)),
+                desired_preview_id: Some(test_input_id(2)),
+                realized_preview_id: Some(test_input_id(2)),
+            },
+            ProjectPosition::default(),
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
+    #[cfg(feature = "native-media")]
+    fn media_test_project(asset_uri: &str) -> StoredProject {
+        let baseline = test_project();
+        let mut project = Project::new(
+            baseline.project().id(),
+            "Media Unit Test",
+            baseline.project().settings().clone(),
+        );
+        for value in [1, 2] {
+            project.add_input(Input {
+                id: test_input_id(value),
+                name: format!("Media {value}"),
+                kind: InputKind::Media {
+                    asset_uri: asset_uri.into(),
+                },
+                required_capabilities: Vec::new(),
+            });
+        }
+        project.set_main_mix(MainMix::new(test_input_id(1), test_input_id(2)));
+        StoredProject::from_project(
+            project,
+            RuntimeRouting {
+                desired_program_id: Some(test_input_id(1)),
+                realized_program_id: Some(test_input_id(1)),
+                desired_preview_id: Some(test_input_id(2)),
+                realized_preview_id: Some(test_input_id(2)),
+            },
+            ProjectPosition::default(),
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
+    fn test_input_id(value: u128) -> InputId {
+        InputId::new(NonZeroU128::new(value).unwrap())
+    }
+
+    fn test_control(project: &StoredProject) -> ControlService<Policy> {
+        ControlService::new(
+            restore_engine(project).unwrap(),
+            Policy::development(),
+            "unit-engine",
+            "unit-log",
+            ControlLimits::default(),
+        )
+    }
+
+    fn test_server(control: &ControlService<Policy>) -> ServerIdentity {
+        let engine = control.diagnostics().engine;
+        ServerIdentity {
+            engine_id: engine.engine_id,
+            project_id: "42".into(),
+            state_epoch: engine.state_epoch,
+            log_id: engine.log_id,
+        }
+    }
+
+    fn test_command(id: &str, key: &str, payload: CommandPayload) -> CommandMessage {
+        CommandMessage {
+            protocol: PROTOCOL_VERSION,
+            id: id.into(),
+            idempotency_key: key.into(),
+            expected_revision: None,
+            deadline_ms: None,
+            payload,
+        }
+    }
+
+    fn operator() -> Principal {
+        development_principal().unwrap()
+    }
+
+    fn viewer() -> Principal {
+        Principal::authenticated(
+            UserId::new("unit-viewer").unwrap(),
+            SessionId::new("unit-session").unwrap(),
+            [AuthRole::Viewer],
+        )
+    }
+
+    fn live_engine_snapshot(control: &mut ControlService<Policy>) -> EngineSnapshot {
+        let prepared = control
+            .prepare_submit(
+                &viewer(),
+                test_command("snapshot-probe", "snapshot-probe-key", CommandPayload::Cut),
+                0,
+            )
+            .unwrap()
+            .prepared()
+            .unwrap();
+        let snapshot = prepared.project(0).unwrap();
+        prepared.abort();
+        snapshot
+    }
+}

@@ -1,0 +1,12 @@
+[package]
+name = "fm-graph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fm-capabilities = { path = "../../foundation/fm-capabilities" }
+
+[lints]
+workspace = true

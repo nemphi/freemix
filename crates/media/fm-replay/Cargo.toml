@@ -1,0 +1,16 @@
+[package]
+name = "fm-replay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fm-audio = { path = "../fm-audio" }
+fm-frame = { path = "../fm-frame" }
+fm-playback = { path = "../fm-playback" }
+fm-record = { path = "../fm-record" }
+fm-types = { path = "../../foundation/fm-types" }
+
+[lints]
+workspace = true

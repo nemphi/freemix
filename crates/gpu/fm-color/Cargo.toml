@@ -1,0 +1,22 @@
+[package]
+name = "fm-color"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+native-wgpu = ["dep:fm-gpu", "fm-gpu/native-wgpu"]
+
+[dependencies]
+fm-frame = { path = "../../media/fm-frame" }
+fm-gpu = { path = "../fm-gpu", optional = true }
+fm-types = { path = "../../foundation/fm-types" }
+fm-video = { path = "../../media/fm-video" }
+
+[dev-dependencies]
+half = "2.7.1"
+
+[lints]
+workspace = true

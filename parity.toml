@@ -1,0 +1,1455 @@
+schema_version = 2
+
+[registry]
+profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "browser-control", "profile-a-hd", "profile-b-uhd", "profile-c-replay", "vendor-certified"]
+workstreams = ["media-core-clocks", "gpu-compositor-color", "audio-dsp", "codecs-network-recording", "platform-professional-hardware", "engine-control-persistence-security", "studio-web-ux", "graphics-data-automation-plugins", "replay-guests", "qa-automation-hardware-lab"]
+
+[[tests]]
+id = "accept-in-001"
+state = "planned"
+[[tests]]
+id = "accept-in-002"
+state = "planned"
+[[tests]]
+id = "accept-in-003"
+state = "planned"
+[[tests]]
+id = "accept-in-004"
+state = "planned"
+[[tests]]
+id = "accept-in-005"
+state = "planned"
+[[tests]]
+id = "accept-in-006"
+state = "planned"
+[[tests]]
+id = "accept-in-007"
+state = "planned"
+[[tests]]
+id = "accept-in-008"
+state = "planned"
+[[tests]]
+id = "accept-in-009"
+state = "planned"
+[[tests]]
+id = "accept-in-010"
+state = "planned"
+[[tests]]
+id = "accept-in-011"
+state = "planned"
+[[tests]]
+id = "accept-in-012"
+state = "planned"
+[[tests]]
+id = "accept-in-013"
+state = "planned"
+[[tests]]
+id = "accept-in-014"
+state = "planned"
+[[tests]]
+id = "accept-in-015"
+state = "planned"
+[[tests]]
+id = "accept-in-016"
+state = "planned"
+[[tests]]
+id = "accept-in-017"
+state = "planned"
+[[tests]]
+id = "accept-in-018"
+state = "planned"
+[[tests]]
+id = "accept-in-019"
+state = "planned"
+[[tests]]
+id = "accept-in-020"
+state = "planned"
+[[tests]]
+id = "accept-in-021"
+state = "planned"
+[[tests]]
+id = "accept-in-022"
+state = "planned"
+[[tests]]
+id = "accept-in-023"
+state = "planned"
+[[tests]]
+id = "accept-in-024"
+state = "planned"
+[[tests]]
+id = "accept-in-025"
+state = "planned"
+[[tests]]
+id = "accept-in-026"
+state = "planned"
+[[tests]]
+id = "accept-in-027"
+state = "planned"
+[[tests]]
+id = "accept-in-028"
+state = "planned"
+[[tests]]
+id = "accept-in-029"
+state = "planned"
+[[tests]]
+id = "accept-in-030"
+state = "planned"
+
+[[tests]]
+id = "accept-sw-001"
+state = "planned"
+[[tests]]
+id = "accept-sw-002"
+state = "planned"
+[[tests]]
+id = "accept-sw-003"
+state = "planned"
+[[tests]]
+id = "accept-sw-004"
+state = "planned"
+[[tests]]
+id = "accept-sw-005"
+state = "planned"
+[[tests]]
+id = "accept-sw-006"
+state = "planned"
+[[tests]]
+id = "accept-sw-007"
+state = "planned"
+[[tests]]
+id = "accept-sw-008"
+state = "planned"
+[[tests]]
+id = "accept-sw-009"
+state = "planned"
+[[tests]]
+id = "accept-sw-010"
+state = "planned"
+[[tests]]
+id = "accept-sw-011"
+state = "planned"
+[[tests]]
+id = "accept-sw-012"
+state = "planned"
+[[tests]]
+id = "accept-sw-013"
+state = "planned"
+[[tests]]
+id = "accept-sw-014"
+state = "planned"
+[[tests]]
+id = "accept-sw-015"
+state = "planned"
+[[tests]]
+id = "accept-sw-016"
+state = "planned"
+[[tests]]
+id = "accept-sw-017"
+state = "planned"
+[[tests]]
+id = "accept-sw-018"
+state = "planned"
+
+[[tests]]
+id = "accept-gx-001"
+state = "planned"
+[[tests]]
+id = "accept-gx-002"
+state = "planned"
+[[tests]]
+id = "accept-gx-003"
+state = "planned"
+[[tests]]
+id = "accept-gx-004"
+state = "planned"
+[[tests]]
+id = "accept-gx-005"
+state = "planned"
+[[tests]]
+id = "accept-gx-006"
+state = "planned"
+[[tests]]
+id = "accept-gx-007"
+state = "planned"
+[[tests]]
+id = "accept-gx-008"
+state = "planned"
+[[tests]]
+id = "accept-gx-009"
+state = "planned"
+[[tests]]
+id = "accept-gx-010"
+state = "planned"
+
+[[tests]]
+id = "accept-au-001"
+state = "planned"
+[[tests]]
+id = "accept-au-002"
+state = "planned"
+[[tests]]
+id = "accept-au-003"
+state = "planned"
+[[tests]]
+id = "accept-au-004"
+state = "planned"
+[[tests]]
+id = "accept-au-005"
+state = "planned"
+[[tests]]
+id = "accept-au-006"
+state = "planned"
+[[tests]]
+id = "accept-au-007"
+state = "planned"
+[[tests]]
+id = "accept-au-008"
+state = "planned"
+[[tests]]
+id = "accept-au-009"
+state = "planned"
+[[tests]]
+id = "accept-au-010"
+state = "planned"
+[[tests]]
+id = "accept-au-011"
+state = "planned"
+
+[[tests]]
+id = "accept-or-001"
+state = "planned"
+[[tests]]
+id = "accept-or-002"
+state = "planned"
+[[tests]]
+id = "accept-or-003"
+state = "planned"
+[[tests]]
+id = "accept-or-004"
+state = "planned"
+[[tests]]
+id = "accept-or-005"
+state = "planned"
+[[tests]]
+id = "accept-or-006"
+state = "planned"
+[[tests]]
+id = "accept-or-007"
+state = "planned"
+[[tests]]
+id = "accept-or-008"
+state = "planned"
+[[tests]]
+id = "accept-or-009"
+state = "planned"
+[[tests]]
+id = "accept-or-010"
+state = "planned"
+[[tests]]
+id = "accept-or-011"
+state = "planned"
+[[tests]]
+id = "accept-or-012"
+state = "planned"
+[[tests]]
+id = "accept-or-013"
+state = "planned"
+[[tests]]
+id = "accept-or-014"
+state = "planned"
+[[tests]]
+id = "accept-or-015"
+state = "planned"
+[[tests]]
+id = "accept-or-016"
+state = "planned"
+[[tests]]
+id = "accept-or-017"
+state = "planned"
+
+[[tests]]
+id = "accept-rc-001"
+state = "planned"
+[[tests]]
+id = "accept-rc-002"
+state = "planned"
+[[tests]]
+id = "accept-rc-003"
+state = "planned"
+[[tests]]
+id = "accept-rc-004"
+state = "planned"
+[[tests]]
+id = "accept-rc-005"
+state = "planned"
+[[tests]]
+id = "accept-rc-006"
+state = "planned"
+[[tests]]
+id = "accept-rc-007"
+state = "planned"
+[[tests]]
+id = "accept-rc-008"
+state = "present"
+paths = ["apps/freemixd/tests/process.rs", "crates/services/fm-server/tests/server.rs", "crates/foundation/fm-protocol/tests/protocol.rs", "crates/services/fm-client/tests/client.rs"]
+commands = ["cargo test -p freemixd --test process", "cargo test -p fm-server --test server", "cargo test -p fm-protocol --test protocol", "cargo test -p fm-client --test client"]
+[[tests]]
+id = "accept-rc-009"
+state = "planned"
+[[tests]]
+id = "accept-rc-010"
+state = "planned"
+[[tests]]
+id = "accept-rc-011"
+state = "planned"
+[[tests]]
+id = "accept-rc-012"
+state = "planned"
+[[tests]]
+id = "accept-rc-013"
+state = "planned"
+[[tests]]
+id = "accept-rc-014"
+state = "planned"
+[[tests]]
+id = "accept-rc-015"
+state = "planned"
+[[tests]]
+id = "accept-rc-016"
+state = "planned"
+[[tests]]
+id = "accept-rc-017"
+state = "planned"
+
+[[features]]
+id = "IN-001"
+priority = "P0"
+phase = 3
+owner = "platform-professional-hardware"
+dependencies = []
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "profile-a-hd"]
+tests = ["accept-in-001"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "IN-002"
+priority = "P1"
+phase = 8
+owner = "platform-professional-hardware"
+dependencies = ["IN-001"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "vendor-certified"]
+tests = ["accept-in-002"]
+status = "blocked"
+substitution_policy = "exact-authorized-integration-required"
+
+[[features]]
+id = "IN-003"
+priority = "P0"
+phase = 2
+owner = "codecs-network-recording"
+dependencies = []
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "profile-a-hd"]
+tests = ["accept-in-003"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "IN-004"
+priority = "P1"
+phase = 8
+owner = "codecs-network-recording"
+dependencies = ["IN-003"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "profile-b-uhd"]
+tests = ["accept-in-004"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "IN-005"
+priority = "P1"
+phase = 3
+owner = "audio-dsp"
+dependencies = ["IN-003", "AU-003"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1"]
+tests = ["accept-in-005"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "IN-006"
+priority = "P1"
+phase = 5
+owner = "media-core-clocks"
+dependencies = ["IN-003"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1"]
+tests = ["accept-in-006"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "IN-007"
+priority = "P2"
+phase = 9
+owner = "codecs-network-recording"
+dependencies = ["IN-003"]
+capability_profiles = ["windows-tier1"]
+tests = ["accept-in-007"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "IN-008"
+priority = "P0"
+phase = 2
+owner = "gpu-compositor-color"
+dependencies = []
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "profile-a-hd"]
+tests = ["accept-in-008"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "IN-009"
+priority = "P1"
+phase = 5
+owner = "media-core-clocks"
+dependencies = ["IN-008"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1"]
+tests = ["accept-in-009"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "IN-010"
+priority = "P1"
+phase = 3
+owner = "gpu-compositor-color"
+dependencies = ["IN-003"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1"]
+tests = ["accept-in-010"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "IN-011"
+priority = "P1"
+phase = 3
+owner = "platform-professional-hardware"
+dependencies = ["IN-026"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1"]
+tests = ["accept-in-011"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "IN-012"
+priority = "P1"
+phase = 6
+owner = "replay-guests"
+dependencies = ["IN-011"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1"]
+tests = ["accept-in-012"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "IN-013"
+priority = "P1"
+phase = 5
+owner = "graphics-data-automation-plugins"
+dependencies = ["IN-026"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1"]
+tests = ["accept-in-013"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "IN-014"
+priority = "P2"
+phase = 9
+owner = "graphics-data-automation-plugins"
+dependencies = ["IN-008"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1"]
+tests = ["accept-in-014"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "IN-015"
+priority = "P0"
+phase = 4
+owner = "codecs-network-recording"
+dependencies = ["IN-026"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "profile-a-hd"]
+tests = ["accept-in-015"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "IN-016"
+priority = "P1"
+phase = 4
+owner = "codecs-network-recording"
+dependencies = ["IN-015"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1"]
+tests = ["accept-in-016"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "IN-017"
+priority = "P1"
+phase = 4
+owner = "codecs-network-recording"
+dependencies = ["IN-015"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "profile-b-uhd"]
+tests = ["accept-in-017"]
+status = "planned"
+substitution_policy = "exact-authorized-integration-required"
+
+[[features]]
+id = "IN-018"
+priority = "P1"
+phase = 8
+owner = "platform-professional-hardware"
+dependencies = ["IN-001"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "vendor-certified"]
+tests = ["accept-in-018"]
+status = "blocked"
+substitution_policy = "exact-authorized-integration-required"
+
+[[features]]
+id = "IN-019"
+priority = "P1"
+phase = 8
+owner = "codecs-network-recording"
+dependencies = ["IN-015"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "vendor-certified"]
+tests = ["accept-in-019"]
+status = "planned"
+substitution_policy = "exact-authorized-integration-required"
+
+[[features]]
+id = "IN-020"
+priority = "P0"
+phase = 3
+owner = "gpu-compositor-color"
+dependencies = ["SW-006"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "profile-a-hd"]
+tests = ["accept-in-020"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "IN-021"
+priority = "P1"
+phase = 9
+owner = "gpu-compositor-color"
+dependencies = ["IN-020", "SW-008"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1"]
+tests = ["accept-in-021"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "IN-022"
+priority = "P1"
+phase = 4
+owner = "media-core-clocks"
+dependencies = ["IN-001"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1"]
+tests = ["accept-in-022"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "IN-023"
+priority = "P1"
+phase = 3
+owner = "gpu-compositor-color"
+dependencies = ["SW-001"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1"]
+tests = ["accept-in-023"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "IN-024"
+priority = "P1"
+phase = 3
+owner = "media-core-clocks"
+dependencies = ["IN-023"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1"]
+tests = ["accept-in-024"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "IN-025"
+priority = "P1"
+phase = 3
+owner = "engine-control-persistence-security"
+dependencies = ["IN-026"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1"]
+tests = ["accept-in-025"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "IN-026"
+priority = "P0"
+phase = 2
+owner = "engine-control-persistence-security"
+dependencies = []
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "profile-a-hd"]
+tests = ["accept-in-026"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "IN-027"
+priority = "P1"
+phase = 5
+owner = "graphics-data-automation-plugins"
+dependencies = ["IN-026"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1"]
+tests = ["accept-in-027"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "IN-028"
+priority = "P1"
+phase = 5
+owner = "platform-professional-hardware"
+dependencies = ["IN-001"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "vendor-certified"]
+tests = ["accept-in-028"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "IN-029"
+priority = "P2"
+phase = 6
+owner = "replay-guests"
+dependencies = ["RC-001"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "vendor-certified"]
+tests = ["accept-in-029"]
+status = "blocked"
+substitution_policy = "exact-authorized-integration-required"
+
+[[features]]
+id = "IN-030"
+priority = "P2"
+phase = 9
+owner = "platform-professional-hardware"
+dependencies = ["IN-003"]
+capability_profiles = ["windows-tier1"]
+tests = ["accept-in-030"]
+status = "planned"
+substitution_policy = "exact-authorized-integration-required"
+
+[[features]]
+id = "SW-001"
+priority = "P0"
+phase = 2
+owner = "gpu-compositor-color"
+dependencies = []
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "profile-a-hd"]
+tests = ["accept-sw-001"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "SW-002"
+priority = "P0"
+phase = 3
+owner = "gpu-compositor-color"
+dependencies = ["SW-001"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "profile-a-hd"]
+tests = ["accept-sw-002"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "SW-003"
+priority = "P1"
+phase = 3
+owner = "gpu-compositor-color"
+dependencies = ["SW-002", "IN-010"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1"]
+tests = ["accept-sw-003"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "SW-004"
+priority = "P0"
+phase = 3
+owner = "gpu-compositor-color"
+dependencies = ["SW-001"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "profile-a-hd"]
+tests = ["accept-sw-004"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "SW-005"
+priority = "P0"
+phase = 3
+owner = "gpu-compositor-color"
+dependencies = ["SW-001"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "profile-a-hd"]
+tests = ["accept-sw-005"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "SW-006"
+priority = "P0"
+phase = 2
+owner = "gpu-compositor-color"
+dependencies = []
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "profile-a-hd"]
+tests = ["accept-sw-006"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "SW-007"
+priority = "P0"
+phase = 3
+owner = "gpu-compositor-color"
+dependencies = ["SW-006"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "profile-a-hd"]
+tests = ["accept-sw-007"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "SW-008"
+priority = "P0"
+phase = 3
+owner = "gpu-compositor-color"
+dependencies = ["SW-006"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "profile-a-hd"]
+tests = ["accept-sw-008"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "SW-009"
+priority = "P1"
+phase = 8
+owner = "gpu-compositor-color"
+dependencies = ["SW-007"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "profile-b-uhd"]
+tests = ["accept-sw-009"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "SW-010"
+priority = "P1"
+phase = 3
+owner = "gpu-compositor-color"
+dependencies = ["SW-007"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "profile-b-uhd"]
+tests = ["accept-sw-010"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "SW-011"
+priority = "P0"
+phase = 3
+owner = "gpu-compositor-color"
+dependencies = ["SW-001"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "profile-a-hd"]
+tests = ["accept-sw-011"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "SW-012"
+priority = "P1"
+phase = 4
+owner = "gpu-compositor-color"
+dependencies = ["SW-001"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1"]
+tests = ["accept-sw-012"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "SW-013"
+priority = "P1"
+phase = 3
+owner = "studio-web-ux"
+dependencies = ["SW-001"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1"]
+tests = ["accept-sw-013"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "SW-014"
+priority = "P1"
+phase = 3
+owner = "studio-web-ux"
+dependencies = ["SW-011"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1"]
+tests = ["accept-sw-014"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "SW-015"
+priority = "P1"
+phase = 5
+owner = "gpu-compositor-color"
+dependencies = ["SW-006"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1"]
+tests = ["accept-sw-015"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "SW-016"
+priority = "P1"
+phase = 3
+owner = "media-core-clocks"
+dependencies = ["SW-001"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1"]
+tests = ["accept-sw-016"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "SW-017"
+priority = "P1"
+phase = 5
+owner = "engine-control-persistence-security"
+dependencies = ["IN-026"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1"]
+tests = ["accept-sw-017"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "SW-018"
+priority = "P1"
+phase = 5
+owner = "gpu-compositor-color"
+dependencies = ["IN-020"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1"]
+tests = ["accept-sw-018"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "GX-001"
+priority = "P0"
+phase = 5
+owner = "graphics-data-automation-plugins"
+dependencies = ["SW-005"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "profile-a-hd"]
+tests = ["accept-gx-001"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "GX-002"
+priority = "P1"
+phase = 5
+owner = "graphics-data-automation-plugins"
+dependencies = ["GX-001"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1"]
+tests = ["accept-gx-002"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "GX-003"
+priority = "P1"
+phase = 5
+owner = "graphics-data-automation-plugins"
+dependencies = ["GX-002"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1"]
+tests = ["accept-gx-003"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "GX-004"
+priority = "P1"
+phase = 5
+owner = "graphics-data-automation-plugins"
+dependencies = ["GX-001"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1"]
+tests = ["accept-gx-004"]
+status = "planned"
+substitution_policy = "exact-authorized-integration-required"
+
+[[features]]
+id = "GX-005"
+priority = "P1"
+phase = 5
+owner = "graphics-data-automation-plugins"
+dependencies = ["GX-004"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1"]
+tests = ["accept-gx-005"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "GX-006"
+priority = "P1"
+phase = 5
+owner = "studio-web-ux"
+dependencies = ["GX-001", "RC-007"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "browser-control"]
+tests = ["accept-gx-006"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "GX-007"
+priority = "P1"
+phase = 5
+owner = "graphics-data-automation-plugins"
+dependencies = ["SW-005"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "browser-control"]
+tests = ["accept-gx-007"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "GX-008"
+priority = "P2"
+phase = 9
+owner = "graphics-data-automation-plugins"
+dependencies = ["GX-001"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1"]
+tests = ["accept-gx-008"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "GX-009"
+priority = "P1"
+phase = 8
+owner = "platform-professional-hardware"
+dependencies = ["GX-001"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "vendor-certified"]
+tests = ["accept-gx-009"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "GX-010"
+priority = "P2"
+phase = 9
+owner = "graphics-data-automation-plugins"
+dependencies = ["GX-004"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "browser-control", "vendor-certified"]
+tests = ["accept-gx-010"]
+status = "blocked"
+substitution_policy = "exact-authorized-integration-required"
+
+[[features]]
+id = "AU-001"
+priority = "P0"
+phase = 3
+owner = "audio-dsp"
+dependencies = []
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "profile-a-hd"]
+tests = ["accept-au-001"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "AU-002"
+priority = "P0"
+phase = 3
+owner = "audio-dsp"
+dependencies = ["AU-001"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "profile-a-hd"]
+tests = ["accept-au-002"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "AU-003"
+priority = "P0"
+phase = 3
+owner = "audio-dsp"
+dependencies = ["AU-001"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "profile-a-hd"]
+tests = ["accept-au-003"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "AU-004"
+priority = "P0"
+phase = 3
+owner = "media-core-clocks"
+dependencies = ["AU-003"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "profile-a-hd"]
+tests = ["accept-au-004"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "AU-005"
+priority = "P0"
+phase = 3
+owner = "audio-dsp"
+dependencies = ["AU-001"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "profile-a-hd"]
+tests = ["accept-au-005"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "AU-006"
+priority = "P1"
+phase = 8
+owner = "audio-dsp"
+dependencies = ["AU-005"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "vendor-certified"]
+tests = ["accept-au-006"]
+status = "blocked"
+substitution_policy = "exact-authorized-integration-required"
+
+[[features]]
+id = "AU-007"
+priority = "P1"
+phase = 3
+owner = "audio-dsp"
+dependencies = ["AU-001"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1"]
+tests = ["accept-au-007"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "AU-008"
+priority = "P1"
+phase = 3
+owner = "audio-dsp"
+dependencies = ["AU-002"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1"]
+tests = ["accept-au-008"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "AU-009"
+priority = "P1"
+phase = 5
+owner = "audio-dsp"
+dependencies = ["AU-001"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1"]
+tests = ["accept-au-009"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "AU-010"
+priority = "P1"
+phase = 4
+owner = "audio-dsp"
+dependencies = ["AU-003"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1"]
+tests = ["accept-au-010"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "AU-011"
+priority = "P1"
+phase = 4
+owner = "platform-professional-hardware"
+dependencies = ["AU-002"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1"]
+tests = ["accept-au-011"]
+status = "planned"
+substitution_policy = "exact-authorized-integration-required"
+
+[[features]]
+id = "OR-001"
+priority = "P0"
+phase = 2
+owner = "codecs-network-recording"
+dependencies = ["IN-003"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "profile-a-hd"]
+tests = ["accept-or-001"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "OR-002"
+priority = "P1"
+phase = 4
+owner = "codecs-network-recording"
+dependencies = ["OR-001"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1"]
+tests = ["accept-or-002"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "OR-003"
+priority = "P1"
+phase = 4
+owner = "codecs-network-recording"
+dependencies = ["OR-001"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1"]
+tests = ["accept-or-003"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "OR-004"
+priority = "P1"
+phase = 4
+owner = "codecs-network-recording"
+dependencies = ["OR-001"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "profile-c-replay"]
+tests = ["accept-or-004"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "OR-005"
+priority = "P1"
+phase = 4
+owner = "codecs-network-recording"
+dependencies = ["IN-015"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "profile-a-hd"]
+tests = ["accept-or-005"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "OR-006"
+priority = "P1"
+phase = 4
+owner = "codecs-network-recording"
+dependencies = ["OR-005"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1"]
+tests = ["accept-or-006"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "OR-007"
+priority = "P1"
+phase = 4
+owner = "codecs-network-recording"
+dependencies = ["OR-005"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "profile-b-uhd"]
+tests = ["accept-or-007"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "OR-008"
+priority = "P1"
+phase = 8
+owner = "platform-professional-hardware"
+dependencies = ["SW-012"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "vendor-certified"]
+tests = ["accept-or-008"]
+status = "blocked"
+substitution_policy = "exact-authorized-integration-required"
+
+[[features]]
+id = "OR-009"
+priority = "P1"
+phase = 8
+owner = "codecs-network-recording"
+dependencies = ["SW-012", "IN-017"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "vendor-certified"]
+tests = ["accept-or-009"]
+status = "blocked"
+substitution_policy = "exact-authorized-integration-required"
+
+[[features]]
+id = "OR-010"
+priority = "P1"
+phase = 8
+owner = "platform-professional-hardware"
+dependencies = ["SW-012", "AU-011"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "vendor-certified"]
+tests = ["accept-or-010"]
+status = "planned"
+substitution_policy = "exact-authorized-integration-required"
+
+[[features]]
+id = "OR-011"
+priority = "P0"
+phase = 2
+owner = "platform-professional-hardware"
+dependencies = ["SW-001"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "profile-a-hd"]
+tests = ["accept-or-011"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "OR-012"
+priority = "P1"
+phase = 7
+owner = "replay-guests"
+dependencies = ["OR-004"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "profile-c-replay"]
+tests = ["accept-or-012"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "OR-013"
+priority = "P1"
+phase = 7
+owner = "replay-guests"
+dependencies = ["OR-012"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "profile-c-replay"]
+tests = ["accept-or-013"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "OR-014"
+priority = "P1"
+phase = 7
+owner = "replay-guests"
+dependencies = ["OR-012"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "profile-c-replay"]
+tests = ["accept-or-014"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "OR-015"
+priority = "P1"
+phase = 5
+owner = "graphics-data-automation-plugins"
+dependencies = ["IN-006"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1"]
+tests = ["accept-or-015"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "OR-016"
+priority = "P2"
+phase = 8
+owner = "codecs-network-recording"
+dependencies = ["IN-019", "OR-004"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "vendor-certified"]
+tests = ["accept-or-016"]
+status = "planned"
+substitution_policy = "exact-authorized-integration-required"
+
+[[features]]
+id = "OR-017"
+priority = "P1"
+phase = 4
+owner = "studio-web-ux"
+dependencies = ["OR-005"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "browser-control"]
+tests = ["accept-or-017"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "RC-001"
+priority = "P1"
+phase = 6
+owner = "replay-guests"
+dependencies = ["IN-015", "AU-008"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "browser-control"]
+tests = ["accept-rc-001"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "RC-002"
+priority = "P1"
+phase = 6
+owner = "replay-guests"
+dependencies = ["RC-001", "AU-002"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "browser-control"]
+tests = ["accept-rc-002"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "RC-003"
+priority = "P1"
+phase = 6
+owner = "replay-guests"
+dependencies = ["RC-001"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "browser-control"]
+tests = ["accept-rc-003"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "RC-004"
+priority = "P0"
+phase = 3
+owner = "graphics-data-automation-plugins"
+dependencies = ["SW-001"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "profile-a-hd"]
+tests = ["accept-rc-004"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "RC-005"
+priority = "P1"
+phase = 5
+owner = "graphics-data-automation-plugins"
+dependencies = ["RC-004"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1"]
+tests = ["accept-rc-005"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "RC-006"
+priority = "P1"
+phase = 5
+owner = "graphics-data-automation-plugins"
+dependencies = ["RC-005"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1"]
+tests = ["accept-rc-006"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "RC-007"
+priority = "P1"
+phase = 4
+owner = "studio-web-ux"
+dependencies = ["RC-008"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "browser-control"]
+tests = ["accept-rc-007"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "RC-008"
+priority = "P0"
+phase = 1
+owner = "engine-control-persistence-security"
+dependencies = []
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "browser-control"]
+tests = ["accept-rc-008"]
+status = "verified"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "RC-009"
+priority = "P2"
+phase = 9
+owner = "engine-control-persistence-security"
+dependencies = ["RC-008"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1"]
+tests = ["accept-rc-009"]
+status = "planned"
+substitution_policy = "exact-authorized-integration-required"
+
+[[features]]
+id = "RC-010"
+priority = "P1"
+phase = 5
+owner = "graphics-data-automation-plugins"
+dependencies = ["RC-008"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1"]
+tests = ["accept-rc-010"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "RC-011"
+priority = "P1"
+phase = 5
+owner = "graphics-data-automation-plugins"
+dependencies = ["RC-010"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1"]
+tests = ["accept-rc-011"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "RC-012"
+priority = "P1"
+phase = 5
+owner = "engine-control-persistence-security"
+dependencies = ["IN-026"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1"]
+tests = ["accept-rc-012"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "RC-013"
+priority = "P1"
+phase = 5
+owner = "engine-control-persistence-security"
+dependencies = ["RC-012"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1"]
+tests = ["accept-rc-013"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "RC-014"
+priority = "P1"
+phase = 5
+owner = "studio-web-ux"
+dependencies = ["RC-007"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "browser-control"]
+tests = ["accept-rc-014"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "RC-015"
+priority = "P1"
+phase = 4
+owner = "engine-control-persistence-security"
+dependencies = ["RC-008"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1"]
+tests = ["accept-rc-015"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "RC-016"
+priority = "P2"
+phase = 9
+owner = "studio-web-ux"
+dependencies = ["RC-007"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "browser-control"]
+tests = ["accept-rc-016"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"
+
+[[features]]
+id = "RC-017"
+priority = "P1"
+phase = 5
+owner = "graphics-data-automation-plugins"
+dependencies = ["RC-010"]
+capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1"]
+tests = ["accept-rc-017"]
+status = "planned"
+substitution_policy = "equivalent-behavior-allowed"

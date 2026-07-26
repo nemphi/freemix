@@ -1,0 +1,14 @@
+[package]
+name = "fm-io-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fm-capabilities = { path = "../../foundation/fm-capabilities" }
+fm-frame = { path = "../../media/fm-frame" }
+fm-types = { path = "../../foundation/fm-types" }
+
+[lints]
+workspace = true

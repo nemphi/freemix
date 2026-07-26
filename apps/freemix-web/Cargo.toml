@@ -1,0 +1,14 @@
+[package]
+name = "freemix-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fm-client = { path = "../../crates/services/fm-client" }
+fm-protocol = { path = "../../crates/foundation/fm-protocol" }
+fm-types = { path = "../../crates/foundation/fm-types" }
+
+[lints]
+workspace = true

@@ -1,0 +1,13 @@
+[package]
+name = "fm-ptz"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fm-command = { path = "../../foundation/fm-command" }
+fm-types = { path = "../../foundation/fm-types" }
+
+[lints]
+workspace = true

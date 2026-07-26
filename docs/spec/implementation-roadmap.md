@@ -68,6 +68,162 @@ saved, restarted, resumed, and tested deterministically.
 9. Instrument latency, queue depth, frame drops, and GPU time.
 10. Pass the first one-hour Basic Show scenario on each Tier-1 OS.
 
+Current implementation boundary for item 4: `fm-compositor` executes bounded
+native `CompositionPlan` layers with crop, nearest scaling, quarter-turn
+rotation, translation, opacity, stable z-order, premultiplied source-over, and
+canonical RGBA16F inputs. Persisted daemon scene realization remains pending:
+schema v3 `fm-model::Layer` has no background, geometry, opacity, or z-order,
+and switcher `InputId` routing is not yet mapped to `SceneId`/`OutputId`.
+Connecting those contracts requires an explicit schema migration and routing
+decision rather than an implicit compatibility interpretation.
+
+Current implementation boundary for item 5: `freemix-studio` opens a native
+`eframe`/wgpu shell by default with responsive Program/Preview monitor wells,
+stable-ID input tiles, realized/desired tally, permission-gated Cut/Fade
+controls, bounded worker channels, optimistic Preview intent, and negotiated
+client-state replication. Blocking TCP and daemon supervision remain off the
+render thread. Project input names and video frames are not present in the
+replicated client contract, so tiles use ordinal/ID labels and monitor wells
+state that preview delivery is pending. Automatic worker reconnect and real
+preview presentation remain later increments.
+
+Current implementation boundary for item 6: `fm-frame` defines a bounded,
+portable local-preview contract for shared-image versus encoded fallback,
+stream/engine/adapter identity, image metadata, opaque handle references,
+ready/release synchronization, monotonic frame and resize generations, exact
+release acknowledgement, timeout reclamation, and client-death reclamation.
+Outstanding resources and handle references cannot be reissued before release.
+This is lifecycle groundwork, not preview delivery. The daemon still owns
+non-shareable opaque wgpu 30 textures in a separate process, Studio currently
+renders through eframe's wgpu 29 device, no authenticated native-handle/fence
+IPC exists, and the engine produces no separate Preview image tap. A platform
+bridge plus output color transform, bounded shared ring, sidecar IPC, and
+encoded fallback are required before item 6 can claim presentation without CPU
+readback.
+
+Current implementation boundary for item 7: `fm-codec-ffmpeg` provides a
+transactional sequential local-audio cursor with global block sequence,
+sample-contiguous timing, sticky EOS, and explicit per-page operation
+block/sample/byte limits. Cursor progress no longer spends prior pages against
+those limits. `fm-audio` provides a deterministic reference Master
+with planar F32 identity mapping, gain/mute/follow-video, meters, timed canonical
+blocks, sample-count timing validation, and transactional gain ramps. Opt-in
+native daemon mode maintains bounded CPU audio rings on a decode worker,
+allocates Master intervals directly from absolute engine frame numbers, follows
+the authoritative `ProgramFrame.primary`, and writes a bounded fake sink. During
+a Fade it intentionally keeps the old primary until completion, then hard
+switches. Local audio must exactly match the project sample rate/layout and its
+first timestamp must align with the selected video's first timestamp; no
+resampling or implicit mapping is performed. Missing audio, stills, and
+configured simulated silence produce silence, while unsupported simulated sine
+audio is rejected. This remains a diagnostic/reference path: it allocates while
+mixing, waits for all preflighted sources, and has no OS audio device,
+bus/output routing, persisted strip controls, transition crossfade, drift
+correction, or externally delivered audio. Later FFmpeg pages still rescan and
+trim from the beginning, so deep playback becomes progressively more expensive
+and can fail transactionally at fixed metadata-output or subprocess-timeout
+bounds. Item 7 and the related parity rows therefore remain incomplete.
+
+Current implementation boundary for item 8: `fm-gpu` provides a portable,
+bounded latest-frame presentation policy plus opaque, context-bound native
+surface configuration, acquisition, submission, presentation dispatch, and
+same-context recreation. Configure/acquire/present validation is captured
+without exposing native handles; a failed configure poisons that surface instead
+of retaining stale state. `fm-color::NativeSdrOutputTransform` writes canonical
+premultiplied linear BT.2020 RGBA16F directly into non-sRGB BGRA8/RGBA8 surface
+targets as opaque, hard-clipped sRGB Rec.709 with black aspect-fit bars and no
+CPU readback. CPU oracles and explicitly invoked ignored Metal tests cover
+Rec.709, Display-P3, and BT.2020 source primaries across sRGB, BT.709, and
+BT.1886 transfer functions, over-range and fractional-alpha pixels, and
+two-dimensional fitting. With the
+opt-in `macos-program-surface` feature and `--fullscreen-program`, `freemixd`
+owns one borderless macOS Program window on its main-thread winit loop while one
+worker retains all media and GPU submission. `--fullscreen-display` selects a
+zero-based deterministic monitor entry. The selected winit monitor identity is
+retained across inventory changes; removal suspends and hides output, reconnect
+retargets it, resize updates coalesce, and surface loss has one
+generation-correlated same-context recreation path. An ignored generated-bars
+subprocess test requires at least one validated queue-presentation dispatch.
+This remains a single macOS/Metal diagnostic output, not display certification:
+the display choice is not persisted, physical scanout and visible pixels are not
+observed, real unplug/replug and induced surface loss are policy-tested rather
+than hardware-induced, and no second output, HDR, exclusive mode, or
+cross-platform surface adapter exists. `fm-record` provides a private
+CRC-protected packet spool with bounded queues and records, durable action
+receipts and directory publication, segmentation, corruption isolation,
+validate-before-repair torn-tail recovery, and a bounded subprocess-kill test.
+It is not the playable recorder. `fm-codec-ffmpeg` owns a separate bounded
+startup-only recorder that pairs tight SDR RGBA8 Program readback with the exact
+planar F32 Master block, sends both over authenticated loopback HTTP inputs to
+FFmpeg, and writes fragmented MP4 with H.264/libx264 and AAC into a caller-owned
+exclusive empty file. Queue admission, retained bytes, connection/no-progress,
+stop/kill, child reaping, output flush/sync, and sticky failures are bounded. A
+paced pre-readiness barrier requires both a completed raw pair and observed mux
+output; `FREEMIXD_RECORDER` reports frozen pair, output-byte, finalization,
+cleanup, and failure state. `--record-program` enables this path only with
+`--native-media`; Unix signals and Windows Ctrl-C stop acceptance, settle any
+remaining Fade control state without rendering shutdown-only frames, checkpoint,
+and finalize without publishing false runtime-realized events. Separate
+required-tool macOS integrations start recording from an unaligned restored
+frame and decode the resulting H.264/AAC file, while a generator integration
+covers signal shutdown during a 3,600-frame Fade. This remains a diagnostic
+recorder: Program capture uses
+synchronous GPU-to-CPU readback, recording cannot be started or stopped through
+the protocol, encoding is software-only and fixed-format, parent path traversal
+is not file-capability based, and there is no zero-copy bridge, hardware encoder,
+codec/segment policy, disk-space status, second recorder, or cross-platform
+native evidence. Multi-file `fm-record` repair is necessarily sequential after
+validation and assumes exclusive ownership of each recorder directory. Item 8
+and its parity rows therefore remain incomplete.
+
+Current implementation boundary for item 9: `fm-gpu` presentation telemetry
+now reports current and peak occupancy for its one-slot latest-frame queue in
+addition to saturating accepted, presented, replaced, dropped, acquisition, and
+recovery counters. Native contexts request `TIMESTAMP_QUERY` only when the
+adapter advertises it and use a four-slot nonblocking readback ring to measure
+real fullscreen render-pass duration. Unsupported adapters continue without
+profiling; ring pressure or unavailable timestamp results increment saturating
+counters instead of blocking or failing rendering. `fm-observability` exposes a
+distinct bounded `gpu_time_ms` histogram rather than mislabeling CPU wall time or
+GPU utilization. Opt-in native daemon mode aggregates up to 256 host-deadline
+lateness and GPU-pass samples plus sampled current and observed-peak audio
+retention, exact fake-sink and presentation high watermarks/drops, and sampled
+recorder outstanding-pair/retained-byte pressure. Cooperative daemon teardown
+emits one idempotent final `FREEMIXD_TELEMETRY` record with lifetime and retained
+sample populations, p50/p95/p99 values, capability state, pending/lost samples,
+and metric errors; native Metal and daemon tests require actual GPU samples where
+supported. A forced fullscreen worker timeout cannot guarantee that final worker
+diagnostic before process exit. Host lateness means time past the
+native frame deadline immediately before realization, not capture or
+glass-to-glass latency. GPU duration excludes queue wait, presentation,
+compositor feedback, and physical scanout. There is no live telemetry protocol,
+component-dimensioned metric registry, alerting/UI, CPU/GPU utilization, disk or
+network instrumentation, cross-platform native evidence, or QR/audio-loop
+latency fixture. Item 9 therefore remains incomplete and the broader RC-015
+parity row remains planned.
+
+Current implementation boundary for item 10: headless native mode accepts a
+bounded `--diagnostic-stop-after` duration after readiness and exits through the
+normal cooperative checkpoint and telemetry path. The ignored
+`phase2_native_diagnostic_soak` integration creates two small generated video
+inputs with silent audio, alternates Cut and four-frame Fade commands, validates
+accepted command targets plus durable and runtime events, and then checks
+bounded telemetry, persisted receipts/routing/clock progress, and continued
+rendering after restart. Its default duration is 60 seconds; environment flags
+can require native startup and GPU timestamps, and its report is explicitly
+classified `diagnostic-not-certification` with `basic_show_complete=false`. A
+required local 60-second macOS/Metal run rendered all 1,500 requested frames,
+completed 59 commands, reported 1,333 lifetime GPU timing samples, resumed to
+1,575 total frames after a separate three-second restart, and exposed 1,492
+bounded fake audio-sink drops rather than hiding them. This is useful lifecycle
+and pressure evidence, not the universal Basic Show scenario. That scenario
+requires four cameras, two clips, a title, a browser source, a two-box scene,
+streaming, and recording for one hour on every Tier-1 OS. Cameras and persisted
+scenes are scheduled for Phase 3, streaming for Phase 4, and title/browser inputs
+for Phase 5; no Windows/DX12 or Linux/Vulkan one-hour evidence exists. Item 10 is
+therefore incomplete and is structurally blocked by capabilities scheduled
+after Phase 2.
+
 Exit: a useful offline/file-based switcher, with no engine dependency on UI
 lifecycle.
 
@@ -84,6 +240,132 @@ lifecycle.
 8. Add scopes and professional color correction.
 9. Add shortcuts and initial MIDI/OSC/controller support.
 10. Certify Profile A without network contribution.
+
+Current implementation boundary for item 1: `fm-io-macos` is the first native
+platform leaf. An isolated Swift helper uses `AVFoundation` to enumerate camera
+video and microphone devices without prompting, report their independent
+authorization states, and expose exact
+normalized rational-rate formats, and capture selected CPU-backed BGRA frames
+with original `CoreMedia` timestamps. Rust communicates through bounded binary discovery and
+stream protocols, derives collision-checked stable device/source IDs, implements
+the `fm-io-api` discovery and source lifecycle contracts, and never substitutes
+a different device. Discovery is capped at 64 devices, 256 formats per device,
+256 KiB total metadata, 3840x2160 at 60 fps, and 4 KiB identifier/name fields.
+Capture records are capped at 64 MiB and feed a negotiated queue of at most
+eight frames with drop-oldest accounting; native `AVFoundation` drops are
+reported separately. The v3 capture protocol requires source-derived color
+primaries and transfer attachments on every delivered CoreVideo buffer. It
+accepts Rec.709, Display-P3 D65, or BT.2020 primaries paired with sRGB or BT.709
+transfer, derives identity matrix and full-range RGB semantics from the
+negotiated BGRA representation, verifies opaque active pixels, and rejects
+missing, malformed, unknown, or unsupported metadata instead of substituting
+defaults. Startup waits for a running-session
+marker, stop/reap and worker cleanup have explicit deadlines and retained ownership, and helper
+interruptions, disconnects, malformed frames, no-frame deadlines, Hold/Stop
+fallback, and recovery are observable. Capture magic is emitted only after the
+session is running and before the delegate is attached; Rust revalidates the
+negotiated dimensions, positive CoreMedia timescales, and the 60 fps bound.
+Swift compilation targets the Cargo
+architecture with a macOS 13 deployment minimum. Applications can supply a
+packaged helper path; the embedded Cargo `OUT_DIR` path is developer-only.
+`freemix-capture-node cameras` now selects this adapter and emits bounded,
+versioned, one-line records with stable IDs, adapter-qualified project
+`stable_key` values, permission state, format counts, and percent-escaped names.
+The v2 key is bounded, derived from the collision-checked source ID, and supports
+exact adapter lookup without display-name or discovery-order substitution. The
+command never prompts unless `--request-permission` is
+present when using the built-in helper; `--helper` trusts an
+application-packaged executable. `camera-smoke` selects one exact snapshot source
+and advertised format, acquires 1 to 300 frames under a 1 to 60 second acquisition
+deadline, reports source timestamps plus native/queue drops, and always attempts
+bounded stop/close cleanup. It never requests permission. A hermetic helper test
+acquires two framed samples, verifies telemetry and helper-process disappearance,
+and proves `prompt-required` preflight never invokes capture. The v2 discovery
+protocol carries normalized frame-rate numerators and denominators. The helper
+advertises supported candidate rates through 60 fps: every integer rate plus
+24000/1001, 30000/1001, and 60000/1001, with common rates prioritized within
+the existing 256-format bound. Selection and `CoreMedia` frame duration use the
+exact rational value rather than floating-point or nearest-rate substitution.
+
+The same helper now has separate `discover-audio`, `request-audio-permission`,
+and `capture-audio` commands, preserving the camera D2/F3 protocol. `FMAUDD1`
+discovery reports independently identified microphone endpoints and exact native
+formats up to 192 kHz, accepting mono or a two-channel format only when Core
+Audio explicitly labels it stereo. `FMAUDF1` carries bounded interleaved
+little-endian F32 records with original CoreMedia PTS, sample rate, channel
+count, sample count, and independent sequence telemetry. Rust validates all
+length arithmetic before allocating, limits each block to 16,384 samples and
+128 KiB, rejects non-finite samples, derives duration from the exact sample
+span, and deinterleaves into planar `AudioBlock`s. Each microphone has a
+collision-checked `macos.avfoundation.audio.v1` stable key and source-specific
+clock domain; no equivalence to a camera or Master clock is claimed.
+`MacosAudioSource` implements the standard lifecycle with a queue of at most 32
+blocks. Queue overflow is sticky failure rather than silent sample loss, and
+stop, recovery, drop, worker, and helper ownership are bounded. The capture node
+adds `audio-inputs` and `audio-smoke`; discovery prompts only with explicit
+`--request-permission`, while smoke requires the reported stable key plus exact
+sample rate/channel count and never substitutes a newly indexed or default
+device. Its v1 smoke diagnostic reports timing, samples, signal peak, queue
+pressure, and explicitly marks native drop measurement unavailable. Hermetic
+protocol and process tests prove PCM layout, finite-sample rejection, exact
+arguments, no permission invocation, and helper reaping. Non-prompting local
+discovery found two audio inputs with four and one bounded formats respectively
+and `prompt-required` microphone permission. The developer helper embeds camera
+and microphone usage descriptions, but remains an unsigned Cargo `OUT_DIR`
+artifact rather than application packaging.
+
+`freemixd --native-media` now realizes macOS `Device` inputs by exact persisted
+`stable_key`; `--camera-helper` supplies an application-packaged helper path. It
+discovers once without prompting, requires already-granted permission, rejects
+duplicate or unknown keys, and opens only an advertised BGRA mode matching the
+project dimensions and exact rational frame rate. Camera helpers start
+concurrently, all sources share one three-second initial-frame deadline, and each adapter queue
+is bounded to one frame with Stop fallback. The native runtime seeds and updates
+a dedicated live-video lane that retains exactly one GPU frame, preserves the
+original `CoreMedia` timing and clock, accepts monotonic sequence gaps caused by
+bounded drops, rejects clock/PTS regressions, and never schedules FFmpeg refill.
+Normal and failed startup paths retain camera ownership through bounded stop,
+close, worker, and child cleanup. Hermetic tests prove exact helper arguments,
+initial timing, unknown-key non-substitution, no permission invocation, and child
+reaping. A required hermetic daemon process run binds a fake camera by persisted
+key at 30000/1001, starts with Rec.709/sRGB and then cycles the six supported
+camera primary/transfer combinations, continuously ingests BGRA frames through
+Metal, renders and checkpoints for one second, and confirms helper-process
+disappearance. A readiness barrier ensures the startup frame is ingested before
+updates. Protocol tests decode all six combinations, capture-node process tests
+exercise Display-P3/sRGB and BT.2020/BT.709 records, current schema-v3
+persistence round-trips Display-P3/BT.709, and native Metal readback tests
+compare all three primaries across sRGB, BT.709, and BT.1886 against CPU oracles.
+The daemon run also exercises the validated BGRA-to-RGBA swizzle while preserving
+source timing. `FREEMIXD_TELEMETRY` v3
+adds bounded daemon-wide camera aggregates for configured sources,
+adapter-received frames, successful live GPU ingests, native `AVFoundation`
+drops, and current/peak/dropped Rust queue frames.
+The required helper run reports one configured source, all 12 received frames,
+two synthetic native drops, zero final queue depth, a one-frame queue peak, and
+accounts for every received frame as either ingested or queue-dropped.
+`FREEMIXD_CAMERA_SOURCE` v1 emits one fixed-shape local diagnostic per camera in
+ascending project input-ID order before cleanup, with sampled lifecycle, health,
+received/ingested frames, native drops, and queue depth/peak/drops. The aggregate
+is folded from the same snapshots once native runtime telemetry exists; camera
+startup failures before runtime construction still emit source diagnostics with
+zero successful GPU ingests. These diagnostics omit hardware identifiers, names,
+stable keys, paths, health details, clocks, and media, and remain
+diagnostic evidence rather than a network telemetry subscription.
+
+Portable protocol/lifecycle and capture-node process tests pass; required local
+D2 discovery enumerated two real macOS camera endpoints with 252 and 126 bounded
+candidate modes and `prompt-required` permission, and the real smoke command
+stopped at permission preflight without prompting. No real camera
+frame-acquisition or daemon hardware evidence therefore
+exists; the passing daemon run is hermetic rather than device certification. The
+slice also omits paired/synchronized camera audio, signed helper packaging, source-clock scheduling
+and drift correction, live per-source telemetry subscription, HDR transfers,
+ICC-only profiles,
+gamma-tag fallback, configurable unknown-metadata policy, certified
+hot-plug/recovery loops, Windows/Linux adapters, audio-device daemon/Master
+realization, and screen/window/application-audio capture. Item 1 and `IN-001`, `IN-005`, and
+`IN-011` therefore remain incomplete and planned.
 
 Exit: `P0` switcher, composition, audio, display, record, and control rows pass.
 

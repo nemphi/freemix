@@ -1,0 +1,12 @@
+[package]
+name = "fm-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fm-types = { path = "../fm-types" }
+
+[lints]
+workspace = true

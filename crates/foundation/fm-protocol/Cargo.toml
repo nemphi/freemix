@@ -1,0 +1,13 @@
+[package]
+name = "fm-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fm-command = { path = "../fm-command" }
+fm-types = { path = "../fm-types" }
+
+[lints]
+workspace = true

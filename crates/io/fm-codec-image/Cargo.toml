@@ -1,0 +1,13 @@
+[package]
+name = "fm-codec-image"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fm-frame = { path = "../../media/fm-frame" }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+
+[lints]
+workspace = true

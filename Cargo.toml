@@ -1,0 +1,110 @@
+[workspace]
+members = [
+    "apps/freemix-cli",
+    "apps/freemixd",
+    "apps/freemix-studio",
+    "apps/freemix-web",
+    "apps/freemix-plugin-host",
+    "apps/freemix-dsp-host",
+    "apps/freemix-capture-node",
+    "crates/foundation/fm-capabilities",
+    "crates/foundation/fm-command",
+    "crates/foundation/fm-model",
+    "crates/foundation/fm-protocol",
+    "crates/foundation/fm-types",
+    "crates/foundation/fm-plugin-api",
+    "crates/media/fm-clock",
+    "crates/media/fm-frame",
+    "crates/media/fm-graph",
+    "crates/media/fm-audio",
+    "crates/media/fm-playback",
+    "crates/media/fm-record",
+    "crates/media/fm-replay",
+    "crates/media/fm-scheduler",
+    "crates/media/fm-sim",
+    "crates/media/fm-video",
+    "crates/gpu/fm-gpu",
+    "crates/gpu/fm-color",
+    "crates/gpu/fm-compositor",
+    "crates/gpu/fm-scopes",
+    "crates/io/fm-codec-api",
+    "crates/io/fm-codec-ffmpeg",
+    "crates/io/fm-codec-image",
+    "crates/io/fm-io-api",
+    "crates/io/fm-io-macos",
+    "crates/io/fm-io-network",
+    "crates/io/fm-io-srt",
+    "crates/io/fm-io-webrtc",
+    "crates/io/fm-browser-input",
+    "crates/features/fm-switcher",
+    "crates/features/fm-titles",
+    "crates/features/fm-data",
+    "crates/features/fm-automation",
+    "crates/features/fm-ptz",
+    "crates/features/fm-telestrator",
+    "crates/features/fm-guest",
+    "crates/features/fm-presentations",
+    "crates/features/fm-virtual-set",
+    "crates/features/fm-social",
+    "crates/features/fm-plugin-host-api",
+    "crates/services/fm-persistence",
+    "crates/services/fm-engine",
+    "crates/services/fm-auth",
+    "crates/services/fm-control",
+    "crates/services/fm-server",
+    "crates/services/fm-client",
+    "crates/services/fm-observability",
+    "crates/services/fm-plugin-host",
+    "crates/services/fm-dsp-host",
+    "crates/services/fm-vmix-compat",
+    "crates/ui/fm-ui-egui",
+    "crates/ui/fm-ui-model",
+    "tools/xtask",
+]
+default-members = [
+    "apps/freemix-cli",
+    "crates/foundation/fm-capabilities",
+    "crates/foundation/fm-command",
+    "crates/foundation/fm-model",
+    "crates/foundation/fm-protocol",
+    "crates/foundation/fm-types",
+    "crates/media/fm-clock",
+    "crates/media/fm-frame",
+    "crates/media/fm-graph",
+    "crates/media/fm-audio",
+    "crates/media/fm-playback",
+    "crates/media/fm-scheduler",
+    "crates/media/fm-sim",
+    "crates/media/fm-video",
+    "crates/io/fm-codec-image",
+    "crates/features/fm-switcher",
+    "crates/services/fm-persistence",
+    "crates/services/fm-engine",
+    "crates/services/fm-auth",
+    "crates/services/fm-control",
+    "crates/services/fm-server",
+    "crates/services/fm-client",
+    "crates/ui/fm-ui-model",
+    "tools/xtask",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.97"
+version = "0.1.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.release]
+lto = "thin"
+codegen-units = 16

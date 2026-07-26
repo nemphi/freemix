@@ -1,0 +1,12 @@
+[package]
+name = "fm-vmix-compat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fm-protocol = { path = "../../foundation/fm-protocol" }
+
+[lints]
+workspace = true

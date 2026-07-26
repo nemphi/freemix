@@ -1,0 +1,14 @@
+[package]
+name = "fm-ui-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fm-command = { path = "../../foundation/fm-command" }
+fm-protocol = { path = "../../foundation/fm-protocol" }
+fm-types = { path = "../../foundation/fm-types" }
+
+[lints]
+workspace = true

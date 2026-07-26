@@ -1,0 +1,13 @@
+[package]
+name = "fm-plugin-host-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fm-command = { path = "../../foundation/fm-command" }
+fm-plugin-api = { path = "../../foundation/fm-plugin-api" }
+
+[lints]
+workspace = true

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>dev.freemix.capture-helper</string>
+    <key>CFBundleName</key>
+    <string>FreeMix Capture Helper</string>
+    <key>NSCameraUsageDescription</key>
+    <string>FreeMix uses camera access only for sources explicitly selected by the operator.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>FreeMix uses microphone access only for sources explicitly selected by the operator.</string>
+</dict>
+</plist>

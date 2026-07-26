@@ -1,0 +1,19 @@
+[package]
+name = "fm-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+native-wgpu = ["dep:raw-window-handle", "dep:wgpu"]
+
+[dependencies]
+fm-capabilities = { path = "../../foundation/fm-capabilities" }
+fm-frame = { path = "../../media/fm-frame" }
+raw-window-handle = { version = "0.6.2", optional = true }
+wgpu = { version = "30.0.0", default-features = false, features = ["std", "dx12", "gles", "metal", "vulkan", "wgsl"], optional = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,108 @@
+use std::{fs::File, io::Read};
+
+use crate::{CURRENT_SCHEMA_VERSION, MAX_MANIFEST_BYTES, ProjectStore, StoreError, json};
+
+const V1_SCHEMA_VERSION: u32 = 1;
+const V2_SCHEMA_VERSION: u32 = 2;
+const V1_DEFAULTS: [&str; 4] = [
+    "frames_rendered=0",
+    "runtime_generation=0",
+    "clock_time_nanos=0",
+    "idempotency_receipts=[]",
+];
+const V3_DEFAULTS: [&str; 8] = [
+    "settings.frame_rate=60000/1001",
+    "settings.video=1920x1080/nv12/progressive/bt709",
+    "settings.audio=48000/f32/stereo",
+    "inputs.kind=deterministic_simulated",
+    "scenes=[]",
+    "audio_buses=[]",
+    "outputs=[]",
+    "restart_policy=never",
+];
+
+/// Summary of an explicitly completed manifest migration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MigrationReport {
+    from_schema: u32,
+    to_schema: u32,
+    defaulted_fields: Vec<&'static str>,
+}
+
+impl MigrationReport {
+    #[must_use]
+    pub const fn from_schema(&self) -> u32 {
+        self.from_schema
+    }
+
+    #[must_use]
+    pub const fn to_schema(&self) -> u32 {
+        self.to_schema
+    }
+
+    #[must_use]
+    pub fn defaulted_fields(&self) -> &[&'static str] {
+        &self.defaulted_fields
+    }
+}
+
+impl ProjectStore {
+    /// Explicitly migrates a schema-v1 manifest through v2 to canonical v3.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed data, the wrong schema, validation,
+    /// size-limit, or filesystem failures.
+    pub fn migrate_v1(&self) -> Result<MigrationReport, StoreError> {
+        let source = self.read_legacy_manifest()?;
+        let project = json::decode_v1(&source).map_err(StoreError::from_decode)?;
+        self.save(&project)?;
+        Ok(MigrationReport {
+            from_schema: V1_SCHEMA_VERSION,
+            to_schema: CURRENT_SCHEMA_VERSION,
+            defaulted_fields: V1_DEFAULTS.into_iter().chain(V3_DEFAULTS).collect(),
+        })
+    }
+
+    /// Explicitly migrates a schema-v2 manifest to canonical v3.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed data, the wrong schema, validation,
+    /// size-limit, or filesystem failures.
+    pub fn migrate_v2(&self) -> Result<MigrationReport, StoreError> {
+        let source = self.read_legacy_manifest()?;
+        let project = json::decode_v2(&source).map_err(StoreError::from_decode)?;
+        self.save(&project)?;
+        Ok(MigrationReport {
+            from_schema: V2_SCHEMA_VERSION,
+            to_schema: CURRENT_SCHEMA_VERSION,
+            defaulted_fields: V3_DEFAULTS.to_vec(),
+        })
+    }
+
+    fn read_legacy_manifest(&self) -> Result<String, StoreError> {
+        let mut file = File::open(self.manifest_path()).map_err(StoreError::Io)?;
+        let size = file.metadata().map_err(StoreError::Io)?.len();
+        if size > MAX_MANIFEST_BYTES {
+            return Err(StoreError::ManifestTooLarge {
+                size,
+                maximum: MAX_MANIFEST_BYTES,
+            });
+        }
+        let mut bytes = Vec::with_capacity(usize::try_from(size).unwrap_or_default());
+        file.by_ref()
+            .take(MAX_MANIFEST_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(StoreError::Io)?;
+        if bytes.len() as u64 > MAX_MANIFEST_BYTES {
+            return Err(StoreError::ManifestTooLarge {
+                size: bytes.len() as u64,
+                maximum: MAX_MANIFEST_BYTES,
+            });
+        }
+        String::from_utf8(bytes).map_err(|error| {
+            StoreError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+        })
+    }
+}

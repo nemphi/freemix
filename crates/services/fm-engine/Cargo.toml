@@ -1,0 +1,16 @@
+[package]
+name = "fm-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fm-clock = { path = "../../media/fm-clock" }
+fm-command = { path = "../../foundation/fm-command" }
+fm-scheduler = { path = "../../media/fm-scheduler" }
+fm-switcher = { path = "../../features/fm-switcher" }
+fm-types = { path = "../../foundation/fm-types" }
+
+[lints]
+workspace = true

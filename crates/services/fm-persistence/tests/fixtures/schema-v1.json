@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "project_id": 9001,
+  "show_name": "Golden V1 Show",
+  "input_ids": [1, 2],
+  "desired_program_id": 1,
+  "realized_program_id": 1,
+  "desired_preview_id": 2,
+  "realized_preview_id": 2,
+  "revision": 17,
+  "state_epoch": 4,
+  "event_sequence": 29
+}
