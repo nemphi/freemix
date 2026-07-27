@@ -90,12 +90,14 @@ client-state replication. Blocking TCP and daemon supervision remain off the
 render thread. The worker now reconnects automatically after bounded backoff,
 negotiates durable resume or an authoritative snapshot, resumes unresolved
 command sequences, and requests a snapshot when runtime realization becomes
-uncertain. Connect, readiness, protocol read, write, and flush waits are bounded
-and cancellable; deferred intents are capped, and supervised daemon shutdown or
-restart performs bounded process-group/job and descendant cleanup. Project
-input names and video frames are not present in the replicated client contract,
-so tiles use ordinal/ID labels and monitor wells state that real preview
-delivery remains pending.
+uncertain. TCP establishment is finite, using one attempt of up to the
+configured timeout, but cancellation is checked only before and after that
+attempt. Supervisor readiness and connected protocol read, write, and flush
+waits are polled and cancellable; deferred intents are capped, and supervised
+daemon shutdown or restart performs bounded process-group/job and descendant
+cleanup. Project input names and video frames are not present in the replicated
+client contract, so tiles use ordinal/ID labels and monitor wells state that
+real preview delivery remains pending.
 
 Current implementation boundary for item 6: `fm-frame` defines a bounded,
 portable local-preview contract for shared-image versus encoded fallback,
@@ -128,19 +130,21 @@ absolute engine frame numbers, follows the authoritative `ProgramFrame`, and
 writes a bounded fake sink. Fade now crossfades both sources with sample-linear
 gains derived from the explicit mix start and end endpoints of each audio
 interval. Automatic Fade and held or reversed Fade T-bar movement propagate
-those exact endpoints; identical source IDs collapse to one unity-gain source
-instead of being mixed twice. Local audio must exactly match the project sample
-rate/layout and its first timestamp must align with the selected video's first
-timestamp; no resampling or implicit mapping is performed. Missing audio,
-stills, and configured simulated silence produce silence, while unsupported
-simulated sine audio is rejected. This remains a diagnostic/reference path: it
-allocates while mixing, waits for all preflighted sources, and has no OS audio
-device, bus/output routing, persisted strip controls, drift correction, or
-externally delivered audio. Only Cut/Fade audio policy is realized. Later FFmpeg
-pages still rescan and trim from the beginning, so deep playback becomes
-progressively more expensive and can fail transactionally at fixed
-metadata-output or subprocess-timeout bounds. Item 7 and the related parity
-rows therefore remain incomplete.
+those exact endpoints; this T-bar propagation is internal switcher/engine-tick
+behavior and is not exposed by `EngineCommand`, the protocol, or the UI.
+Identical source IDs collapse to one unity-gain source instead of being mixed
+twice. Local audio must exactly match the project sample rate/layout and its
+first timestamp must align with the selected video's first timestamp; no
+resampling or implicit mapping is performed. Missing audio, stills, and
+configured simulated silence produce silence, while unsupported simulated sine
+audio is rejected. This remains a diagnostic/reference path: it allocates while
+mixing, waits for all preflighted sources, and has no OS audio device,
+bus/output routing, persisted strip controls, drift correction, or externally
+delivered audio. Only Cut/Fade audio policy is realized. Later FFmpeg pages still
+rescan and trim from the beginning, so deep playback becomes progressively more
+expensive and can fail transactionally at fixed metadata-output or
+subprocess-timeout bounds. Item 7 and the related parity rows therefore remain
+incomplete.
 
 Current implementation boundary for item 8: `fm-gpu` provides a portable,
 bounded latest-frame presentation policy plus opaque, context-bound native
@@ -312,14 +316,17 @@ must produce the same clock with a strictly newer PTS before recovery completes;
 the first accepted frame is marked discontinuous. Sequence remapping creates one
 globally monotonic stream while preserving native sequence gaps, including gaps
 from bounded queue drops before the first recovered delivery. Received,
-queue-drop, native-drop, continuity-rejection, timeout-discard, depth, and peak
-telemetry is cumulative across attempts. Recovery startup, first-frame waits,
-timeout discard, helper/worker reaping, and late-producer exclusion have bounded
-cleanup, with hermetic helper-process evidence covering malformed, regressed,
-recovered, timed-out, and truncated attempts. This does not provide daemon
-recovery: `freemixd` still uses Stop fallback, does not automatically invoke
-this recovery handshake or rediscover hot-plugged devices, and has no hardware
-recovery certification.
+queue-drop, native-drop, continuity-rejection, and timeout-discard counters plus
+peak depth are cumulative across attempts; current queue depth is instantaneous.
+Recovery startup, first-frame waits, timeout discard, and late-producer
+exclusion are bounded. Foreground helper cleanup attempts return by a bounded
+deadline. If child or worker completion misses it, ownership is retained and
+handed to a background reaper on final teardown rather than detached; blocking
+reap/join completion itself is not guaranteed within a bounded time. Hermetic
+helper-process evidence covers malformed, regressed, recovered, timed-out, and
+truncated attempts. This does not provide daemon recovery: `freemixd` still uses
+Stop fallback, does not automatically invoke this recovery handshake or
+rediscover hot-plugged devices, and has no hardware recovery certification.
 
 The same helper now has separate `discover-audio`, `request-audio-permission`,
 and `capture-audio` commands, preserving the camera D2/F3 protocol. `FMAUDD1`
