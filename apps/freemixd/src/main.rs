@@ -12,7 +12,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU32, Ordering as AtomicOrdering},
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -23,7 +23,7 @@ use std::fs::{self, File, OpenOptions};
 #[cfg(feature = "native-media")]
 use std::num::NonZeroU32;
 #[cfg(all(feature = "native-media", target_os = "macos"))]
-use std::{collections::BTreeMap, num::NonZeroUsize, thread::JoinHandle};
+use std::{collections::BTreeMap, num::NonZeroUsize, sync::Mutex, thread::JoinHandle};
 
 use fm_auth::{Policy, Principal, Role as AuthRole, SessionId, UserId};
 use fm_clock::{ClockDomainId, ClockTime};
@@ -79,8 +79,8 @@ use fm_gpu::NativeSurface;
 use fm_gpu::{NativeBackend, NativeContext, NativeTexture};
 #[cfg(all(feature = "native-media", target_os = "macos"))]
 use fm_io_api::{
-    EndpointHealthState, LifecycleState, MediaSource, MediaTransfer, MemoryDomain,
-    OpenOptions as IoOpenOptions, SignalLossPolicy,
+    EndpointHealthState, IoError, LifecycleState, MediaSource, MediaTransfer, MemoryDomain,
+    OpenOptions as IoOpenOptions, Remediation, SignalLossPolicy,
 };
 #[cfg(all(feature = "native-media", target_os = "macos"))]
 use fm_io_macos::{CameraTelemetry, CameraVideoSource, MacosCameraAdapter};
@@ -121,6 +121,8 @@ const CAMERA_RECOVERY_POLICY: CameraRecoveryPolicy = CameraRecoveryPolicy {
     max_attempts: 3,
     initial_backoff: Duration::from_millis(100),
     max_backoff: Duration::from_millis(400),
+    rearm_backoff: Duration::from_secs(10),
+    shutdown_timeout: Duration::from_secs(15),
 };
 const NATIVE_CLIENT_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
 #[cfg(feature = "native-media")]
@@ -251,14 +253,13 @@ struct NativeSourceResolution {
 struct NativeCameraInput {
     input: InputId,
     source: Option<CameraVideoSource>,
-    recovery: Option<NativeCameraRecovery>,
+    worker: Option<NativeCameraWorker>,
+    frame: Arc<Mutex<Option<CpuVideoFrame>>>,
+    worker_snapshot: Arc<Mutex<CameraWorkerSnapshot>>,
     recovery_policy: CameraRecoveryPolicy,
-    recovery_attempts: u64,
-    recovery_successes: u64,
-    recovery_exhausted: u64,
-    recovery_outcome: CameraRecoveryOutcome,
-    last_telemetry: CameraTelemetry,
     ingested_frames: u64,
+    last_ingested_sequence: Option<u64>,
+    last_ingested_discontinuity: bool,
 }
 
 #[cfg(all(feature = "native-media", target_os = "macos"))]
@@ -267,6 +268,8 @@ struct CameraRecoveryPolicy {
     max_attempts: u32,
     initial_backoff: Duration,
     max_backoff: Duration,
+    rearm_backoff: Duration,
+    shutdown_timeout: Duration,
 }
 
 #[cfg(all(feature = "native-media", target_os = "macos"))]
@@ -277,29 +280,49 @@ enum CameraRecoveryOutcome {
     Pending,
     Recovered,
     Exhausted,
+    Rearming,
     WorkerFailed,
 }
 
 #[cfg(all(feature = "native-media", target_os = "macos"))]
-struct NativeCameraRecovery {
-    worker: Option<JoinHandle<CameraRecoveryResult>>,
+struct NativeCameraWorker {
+    handle: Option<JoinHandle<CameraWorkerResult>>,
     cancel: Arc<AtomicBool>,
-    attempts: Arc<AtomicU32>,
 }
 
 #[cfg(all(feature = "native-media", target_os = "macos"))]
-struct CameraRecoveryResult {
-    source: CameraVideoSource,
-    attempts: u32,
-    outcome: CameraRecoveryWorkerOutcome,
+struct CameraWorkerResult {
+    failure: Option<IoError>,
+    cleanup_failure: Option<IoError>,
 }
 
 #[cfg(all(feature = "native-media", target_os = "macos"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CameraRecoveryWorkerOutcome {
-    Recovered,
-    Exhausted,
-    Cancelled,
+#[derive(Clone, Copy)]
+struct CameraWorkerSnapshot {
+    telemetry: CameraTelemetry,
+    lifecycle: LifecycleState,
+    health: EndpointHealthState,
+    recovery_attempts: u64,
+    recovery_successes: u64,
+    recovery_exhausted: u64,
+    recovery_worker_failures: u64,
+    recovery_outcome: CameraRecoveryOutcome,
+}
+
+#[cfg(all(feature = "native-media", target_os = "macos"))]
+impl CameraWorkerSnapshot {
+    fn running(source: &CameraVideoSource) -> Self {
+        Self {
+            telemetry: source.telemetry(),
+            lifecycle: source.lifecycle(),
+            health: source.health().state,
+            recovery_attempts: 0,
+            recovery_successes: 0,
+            recovery_exhausted: 0,
+            recovery_worker_failures: 0,
+            recovery_outcome: CameraRecoveryOutcome::Never,
+        }
+    }
 }
 
 #[cfg(all(feature = "native-media", target_os = "macos"))]
@@ -327,88 +350,76 @@ impl NativeCameraInputs {
         mut ingest: impl FnMut(InputId, CpuVideoFrame) -> AppResult<()>,
     ) -> AppResult<()> {
         for camera in &mut self.inputs {
-            Self::collect_recovery(camera);
-            if camera.recovery.is_some() {
-                continue;
-            }
-            let Some(source) = camera.source.as_mut() else {
-                continue;
-            };
-            match source.try_receive()? {
-                Some(MediaTransfer::Live(frame)) => {
-                    ingest(camera.input, frame)?;
-                    camera.ingested_frames = camera.ingested_frames.saturating_add(1);
-                }
-                Some(MediaTransfer::Fallback { .. })
-                    if camera.recovery_outcome != CameraRecoveryOutcome::Exhausted =>
-                {
-                    Self::start_recovery(camera)?;
-                }
-                Some(MediaTransfer::Fallback { .. }) | None => {}
+            Self::collect_finished_worker(camera)?;
+            let frame = camera
+                .frame
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(frame) = frame {
+                let timing = frame.timing();
+                ingest(camera.input, frame)?;
+                camera.ingested_frames = camera.ingested_frames.saturating_add(1);
+                camera.last_ingested_sequence = Some(timing.sequence().get());
+                camera.last_ingested_discontinuity =
+                    timing.flags().contains(fm_frame::MediaFlags::DISCONTINUITY);
             }
         }
         Ok(())
     }
 
-    fn start_recovery(camera: &mut NativeCameraInput) -> AppResult<()> {
-        let Some(source) = camera.source.take() else {
-            return Ok(());
-        };
-        camera.last_telemetry = source.telemetry();
-        let cancel = Arc::new(AtomicBool::new(false));
-        let attempts = Arc::new(AtomicU32::new(0));
-        let worker_cancel = Arc::clone(&cancel);
-        let worker_attempts = Arc::clone(&attempts);
-        let policy = camera.recovery_policy;
-        let worker = thread::Builder::new()
-            .name("freemix-camera-recovery".to_owned())
-            .spawn(move || recover_camera(source, policy, &worker_cancel, &worker_attempts))?;
-        camera.recovery = Some(NativeCameraRecovery {
-            worker: Some(worker),
-            cancel,
-            attempts,
-        });
-        camera.recovery_outcome = CameraRecoveryOutcome::Pending;
-        Ok(())
-    }
-
-    fn collect_recovery(camera: &mut NativeCameraInput) {
+    fn collect_finished_worker(camera: &mut NativeCameraInput) -> AppResult<()> {
         let finished = camera
-            .recovery
+            .worker
             .as_ref()
-            .and_then(|recovery| recovery.worker.as_ref())
+            .and_then(|worker| worker.handle.as_ref())
             .is_some_and(JoinHandle::is_finished);
         if !finished {
-            return;
+            return Ok(());
         }
-        let mut recovery = camera.recovery.take().expect("recovery was checked");
-        let worker = recovery.worker.take().expect("recovery worker is owned");
-        if let Ok(result) = worker.join() {
-            camera.recovery_attempts = camera
-                .recovery_attempts
-                .saturating_add(u64::from(result.attempts));
-            camera.last_telemetry = result.source.telemetry();
-            camera.source = Some(result.source);
-            match result.outcome {
-                CameraRecoveryWorkerOutcome::Recovered => {
-                    camera.recovery_successes = camera.recovery_successes.saturating_add(1);
-                    camera.recovery_outcome = CameraRecoveryOutcome::Recovered;
-                }
-                CameraRecoveryWorkerOutcome::Exhausted => {
-                    camera.recovery_exhausted = camera.recovery_exhausted.saturating_add(1);
-                    camera.recovery_outcome = CameraRecoveryOutcome::Exhausted;
-                }
-                CameraRecoveryWorkerOutcome::Cancelled => {
-                    camera.recovery_outcome = CameraRecoveryOutcome::Exhausted;
-                }
+        let mut worker = camera.worker.take().expect("camera worker was checked");
+        let handle = worker.handle.take().expect("camera worker is owned");
+        if let Ok(result) = handle.join() {
+            if let Some(failure) = result.failure.or(result.cleanup_failure) {
+                Err(failure.into())
+            } else {
+                Err(AppFailure("camera worker exited unexpectedly".to_owned()).into())
             }
         } else {
-            camera.recovery_attempts = camera
-                .recovery_attempts
-                .saturating_add(u64::from(recovery.attempts.load(AtomicOrdering::Acquire)));
-            camera.recovery_exhausted = camera.recovery_exhausted.saturating_add(1);
-            camera.recovery_outcome = CameraRecoveryOutcome::WorkerFailed;
+            let mut snapshot = camera
+                .worker_snapshot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            snapshot.recovery_worker_failures = snapshot.recovery_worker_failures.saturating_add(1);
+            snapshot.recovery_outcome = CameraRecoveryOutcome::WorkerFailed;
+            snapshot.lifecycle = LifecycleState::Lost;
+            snapshot.health = EndpointHealthState::Failed;
+            Err(AppFailure("camera worker panicked".to_owned()).into())
         }
+    }
+
+    fn start_workers(&mut self) -> AppResult<()> {
+        for camera in &mut self.inputs {
+            let source = camera
+                .source
+                .take()
+                .expect("started camera source is available");
+            let frame = Arc::clone(&camera.frame);
+            let snapshot = Arc::clone(&camera.worker_snapshot);
+            let cancel = Arc::new(AtomicBool::new(false));
+            let worker_cancel = Arc::clone(&cancel);
+            let policy = camera.recovery_policy;
+            let handle = thread::Builder::new()
+                .name("freemix-camera-supervisor".to_owned())
+                .spawn(move || {
+                    supervise_camera(source, policy, &worker_cancel, &frame, &snapshot)
+                })?;
+            camera.worker = Some(NativeCameraWorker {
+                handle: Some(handle),
+                cancel,
+            });
+        }
+        Ok(())
     }
 
     fn source_telemetry(&self) -> Vec<NativeCameraSourceTelemetry> {
@@ -416,47 +427,25 @@ impl NativeCameraInputs {
             .inputs
             .iter()
             .map(|camera| {
-                let telemetry = camera
-                    .source
-                    .as_ref()
-                    .map_or(camera.last_telemetry, CameraVideoSource::telemetry);
-                let pending_attempts = camera.recovery.as_ref().map_or(0, |recovery| {
-                    u64::from(recovery.attempts.load(AtomicOrdering::Acquire))
-                });
-                let lifecycle = camera.source.as_ref().map_or_else(
-                    || {
-                        if camera.recovery.is_some() {
-                            LifecycleState::Recovering
-                        } else {
-                            LifecycleState::Lost
-                        }
-                    },
-                    MediaSource::lifecycle,
-                );
-                let health = camera.source.as_ref().map_or_else(
-                    || {
-                        if camera.recovery_outcome == CameraRecoveryOutcome::WorkerFailed {
-                            EndpointHealthState::Failed
-                        } else {
-                            EndpointHealthState::SignalLost
-                        }
-                    },
-                    |source| source.health().state,
-                );
+                let snapshot = *camera
+                    .worker_snapshot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 NativeCameraSourceTelemetry {
                     input: camera.input,
-                    lifecycle,
-                    health,
-                    frames_received: telemetry.received,
+                    lifecycle: snapshot.lifecycle,
+                    health: snapshot.health,
+                    frames_received: snapshot.telemetry.received,
                     frames_ingested: camera.ingested_frames,
-                    native_dropped: telemetry.native_dropped,
-                    queue_dropped: telemetry.dropped,
-                    queue_depth: saturating_u64(telemetry.current),
-                    queue_peak_depth: saturating_u64(telemetry.peak),
-                    recovery_attempts: camera.recovery_attempts.saturating_add(pending_attempts),
-                    recovery_successes: camera.recovery_successes,
-                    recovery_exhausted: camera.recovery_exhausted,
-                    recovery_outcome: camera.recovery_outcome,
+                    native_dropped: snapshot.telemetry.native_dropped,
+                    queue_dropped: snapshot.telemetry.dropped,
+                    queue_depth: saturating_u64(snapshot.telemetry.current),
+                    queue_peak_depth: saturating_u64(snapshot.telemetry.peak),
+                    recovery_attempts: snapshot.recovery_attempts,
+                    recovery_successes: snapshot.recovery_successes,
+                    recovery_exhausted: snapshot.recovery_exhausted,
+                    recovery_worker_failures: snapshot.recovery_worker_failures,
+                    recovery_outcome: snapshot.recovery_outcome,
                 }
             })
             .collect::<Vec<_>>();
@@ -483,26 +472,58 @@ impl NativeCameraInputs {
     }
 
     fn shutdown(&mut self) -> AppResult<()> {
+        for camera in &mut self.inputs {
+            if let Some(worker) = &camera.worker {
+                worker.cancel.store(true, AtomicOrdering::Release);
+                if let Some(handle) = &worker.handle {
+                    handle.thread().unpark();
+                }
+            }
+        }
+        let timeout = self
+            .inputs
+            .iter()
+            .map(|camera| camera.recovery_policy.shutdown_timeout)
+            .max()
+            .unwrap_or(Duration::ZERO);
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(Instant::now);
+        while self.inputs.iter().any(|camera| {
+            camera
+                .worker
+                .as_ref()
+                .and_then(|worker| worker.handle.as_ref())
+                .is_some_and(|handle| !handle.is_finished())
+        }) && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(5));
+        }
+
         let mut failure = None;
         for camera in &mut self.inputs {
-            if let Some(mut recovery) = camera.recovery.take() {
-                recovery.cancel.store(true, AtomicOrdering::Release);
-                if let Some(worker) = recovery.worker.take() {
-                    worker.thread().unpark();
-                    if let Ok(result) = worker.join() {
-                        camera.recovery_attempts = camera
-                            .recovery_attempts
-                            .saturating_add(u64::from(result.attempts));
-                        camera.last_telemetry = result.source.telemetry();
-                        camera.source = Some(result.source);
-                    } else {
-                        camera.recovery_attempts = camera.recovery_attempts.saturating_add(
-                            u64::from(recovery.attempts.load(AtomicOrdering::Acquire)),
-                        );
-                        failure.get_or_insert_with(|| {
-                            "camera recovery worker failed during shutdown".to_owned()
-                        });
+            if let Some(mut worker) = camera.worker.take()
+                && let Some(handle) = worker.handle.take()
+            {
+                if handle.is_finished() {
+                    match handle.join() {
+                        Ok(result) => {
+                            if result.failure.is_some() || result.cleanup_failure.is_some() {
+                                failure.get_or_insert_with(|| {
+                                    "camera worker failed during shutdown".to_owned()
+                                });
+                            }
+                        }
+                        Err(_) => {
+                            failure.get_or_insert_with(|| {
+                                "camera worker failed during shutdown".to_owned()
+                            });
+                        }
                     }
+                } else {
+                    failure.get_or_insert_with(|| {
+                        "camera workers missed the aggregate shutdown deadline".to_owned()
+                    });
                 }
             }
             let Some(source) = camera.source.as_mut() else {
@@ -532,43 +553,180 @@ impl NativeCameraInputs {
 }
 
 #[cfg(all(feature = "native-media", target_os = "macos"))]
-fn recover_camera(
+fn supervise_camera(
     mut source: CameraVideoSource,
     policy: CameraRecoveryPolicy,
     cancel: &AtomicBool,
-    visible_attempts: &AtomicU32,
-) -> CameraRecoveryResult {
-    let mut attempts = 0_u32;
-    let mut backoff = policy.initial_backoff;
-    while attempts < policy.max_attempts {
-        thread::park_timeout(backoff);
+    frame: &Mutex<Option<CpuVideoFrame>>,
+    snapshot: &Mutex<CameraWorkerSnapshot>,
+) -> CameraWorkerResult {
+    loop {
         if cancel.load(AtomicOrdering::Acquire) {
-            return CameraRecoveryResult {
-                source,
-                attempts,
-                outcome: CameraRecoveryWorkerOutcome::Cancelled,
-            };
+            return finish_camera_worker(&mut source, None, snapshot);
         }
-        attempts = attempts.saturating_add(1);
-        visible_attempts.store(attempts, AtomicOrdering::Release);
-        if source
-            .begin_recovery()
-            .and_then(|()| source.finish_recovery())
-            .is_ok()
-        {
-            return CameraRecoveryResult {
-                source,
-                attempts,
-                outcome: CameraRecoveryWorkerOutcome::Recovered,
-            };
+        update_camera_worker_snapshot(snapshot, &source);
+        match source.try_receive() {
+            Ok(Some(MediaTransfer::Live(next))) => {
+                *frame
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(next);
+                thread::park_timeout(NATIVE_IO_POLL_INTERVAL);
+                continue;
+            }
+            Ok(None) => {
+                thread::park_timeout(NATIVE_IO_POLL_INTERVAL);
+                continue;
+            }
+            Ok(Some(MediaTransfer::Fallback { .. })) => {}
+            Err(error) if recoverable_camera_error(&error) => {}
+            Err(error) => return finish_camera_worker(&mut source, Some(error), snapshot),
         }
-        backoff = backoff.saturating_mul(2).min(policy.max_backoff);
+
+        loop {
+            let mut attempts = 0_u32;
+            let mut backoff = policy.initial_backoff;
+            while attempts < policy.max_attempts {
+                if wait_for_camera_worker(cancel, backoff) {
+                    return finish_camera_worker(&mut source, None, snapshot);
+                }
+                attempts = attempts.saturating_add(1);
+                {
+                    let mut state = snapshot
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    state.recovery_attempts = state.recovery_attempts.saturating_add(1);
+                    state.recovery_outcome = CameraRecoveryOutcome::Pending;
+                    state.lifecycle = LifecycleState::Recovering;
+                    state.health = EndpointHealthState::SignalLost;
+                }
+                let result = source
+                    .begin_recovery()
+                    .and_then(|()| source.finish_recovery());
+                update_camera_worker_snapshot(snapshot, &source);
+                match result {
+                    Ok(()) => {
+                        let mut state = snapshot
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        state.recovery_successes = state.recovery_successes.saturating_add(1);
+                        state.recovery_outcome = CameraRecoveryOutcome::Recovered;
+                        break;
+                    }
+                    Err(error) if recoverable_camera_error(&error) => {}
+                    Err(error) => {
+                        return finish_camera_worker(&mut source, Some(error), snapshot);
+                    }
+                }
+                backoff = backoff.saturating_mul(2).min(policy.max_backoff);
+            }
+            if source.lifecycle() == LifecycleState::Running {
+                break;
+            }
+            {
+                let mut state = snapshot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.recovery_exhausted = state.recovery_exhausted.saturating_add(1);
+                state.recovery_outcome = CameraRecoveryOutcome::Exhausted;
+                state.lifecycle = LifecycleState::Lost;
+                state.health = EndpointHealthState::SignalLost;
+                state.recovery_outcome = CameraRecoveryOutcome::Rearming;
+            }
+            if wait_for_camera_worker(cancel, policy.rearm_backoff) {
+                return finish_camera_worker(&mut source, None, snapshot);
+            }
+        }
     }
-    CameraRecoveryResult {
-        source,
-        attempts,
-        outcome: CameraRecoveryWorkerOutcome::Exhausted,
+}
+
+#[cfg(all(feature = "native-media", target_os = "macos"))]
+fn recoverable_camera_error(error: &IoError) -> bool {
+    match error {
+        IoError::SignalLost { .. } => true,
+        IoError::AdapterFailure {
+            remediation: Some(remediation),
+            ..
+        }
+        | IoError::EndpointUnavailable { remediation }
+        | IoError::DriverUnavailable { remediation } => matches!(
+            remediation,
+            Remediation::ReconnectDevice | Remediation::RestartAdapter
+        ),
+        IoError::InvalidState { .. }
+        | IoError::UnsupportedFormat
+        | IoError::UnsupportedClock
+        | IoError::UnsupportedMemoryDomain
+        | IoError::QueueCapacityUnsupported { .. }
+        | IoError::PermissionDenied { .. }
+        | IoError::MediaTooLarge { .. }
+        | IoError::MalformedTimestamp(_)
+        | IoError::AdapterFailure {
+            remediation: None, ..
+        } => false,
     }
+}
+
+#[cfg(all(feature = "native-media", target_os = "macos"))]
+fn wait_for_camera_worker(cancel: &AtomicBool, duration: Duration) -> bool {
+    let deadline = Instant::now()
+        .checked_add(duration)
+        .unwrap_or_else(Instant::now);
+    while !cancel.load(AtomicOrdering::Acquire) && Instant::now() < deadline {
+        thread::park_timeout(deadline.saturating_duration_since(Instant::now()));
+    }
+    cancel.load(AtomicOrdering::Acquire)
+}
+
+#[cfg(all(feature = "native-media", target_os = "macos"))]
+fn update_camera_worker_snapshot(
+    snapshot: &Mutex<CameraWorkerSnapshot>,
+    source: &CameraVideoSource,
+) {
+    let mut state = snapshot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.telemetry = source.telemetry();
+    state.lifecycle = source.lifecycle();
+    state.health = source.health().state;
+}
+
+#[cfg(all(feature = "native-media", target_os = "macos"))]
+fn finish_camera_worker(
+    source: &mut CameraVideoSource,
+    failure: Option<IoError>,
+    snapshot: &Mutex<CameraWorkerSnapshot>,
+) -> CameraWorkerResult {
+    let cleanup_failure = close_camera_source(source).err();
+    update_camera_worker_snapshot(snapshot, source);
+    if failure.is_some() || cleanup_failure.is_some() {
+        let mut state = snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.recovery_worker_failures = state.recovery_worker_failures.saturating_add(1);
+        state.recovery_outcome = CameraRecoveryOutcome::WorkerFailed;
+        state.health = EndpointHealthState::Failed;
+    }
+    CameraWorkerResult {
+        failure,
+        cleanup_failure,
+    }
+}
+
+#[cfg(all(feature = "native-media", target_os = "macos"))]
+fn close_camera_source(source: &mut CameraVideoSource) -> Result<(), IoError> {
+    if matches!(
+        source.lifecycle(),
+        LifecycleState::Running | LifecycleState::Recovering
+    ) {
+        source.stop()?;
+    }
+    if matches!(
+        source.lifecycle(),
+        LifecycleState::Open | LifecycleState::Lost
+    ) {
+        source.close()?;
+    }
+    Ok(())
 }
 
 #[cfg(feature = "native-media")]
@@ -584,6 +742,7 @@ struct NativeCameraTelemetry {
     recovery_attempts: u64,
     recovery_successes: u64,
     recovery_exhausted: u64,
+    recovery_worker_failures: u64,
 }
 
 #[cfg(all(feature = "native-media", target_os = "macos"))]
@@ -601,6 +760,7 @@ struct NativeCameraSourceTelemetry {
     recovery_attempts: u64,
     recovery_successes: u64,
     recovery_exhausted: u64,
+    recovery_worker_failures: u64,
     recovery_outcome: CameraRecoveryOutcome,
 }
 
@@ -608,7 +768,7 @@ struct NativeCameraSourceTelemetry {
 impl NativeCameraSourceTelemetry {
     fn diagnostic(self) -> String {
         format!(
-            "FREEMIXD_CAMERA_SOURCE\tv=1\tclassification=diagnostic-not-certification\tinput_id={}\tsample_phase=pre_cleanup\tsample_lifecycle={}\thealth={}\tframes_received={}\tframes_ingested={}\tnative_dropped={}\tqueue_depth={}\tqueue_peak_depth={}\tqueue_dropped={}\trecovery_attempts={}\trecovery_successes={}\trecovery_exhausted={}\trecovery_outcome={}",
+            "FREEMIXD_CAMERA_SOURCE\tv=1\tclassification=diagnostic-not-certification\tinput_id={}\tsample_phase=pre_cleanup\tsample_lifecycle={}\thealth={}\tframes_received={}\tframes_ingested={}\tnative_dropped={}\tqueue_depth={}\tqueue_peak_depth={}\tqueue_dropped={}\trecovery_attempts={}\trecovery_successes={}\trecovery_exhausted={}\trecovery_worker_failures={}\trecovery_outcome={}",
             self.input,
             lifecycle_label(self.lifecycle),
             health_label(self.health),
@@ -621,6 +781,7 @@ impl NativeCameraSourceTelemetry {
             self.recovery_attempts,
             self.recovery_successes,
             self.recovery_exhausted,
+            self.recovery_worker_failures,
             recovery_outcome_label(self.recovery_outcome),
         )
     }
@@ -656,6 +817,9 @@ fn aggregate_camera_telemetry(sources: &[NativeCameraSourceTelemetry]) -> Native
         aggregate.recovery_exhausted = aggregate
             .recovery_exhausted
             .saturating_add(source.recovery_exhausted);
+        aggregate.recovery_worker_failures = aggregate
+            .recovery_worker_failures
+            .saturating_add(source.recovery_worker_failures);
     }
     aggregate
 }
@@ -667,6 +831,7 @@ const fn recovery_outcome_label(outcome: CameraRecoveryOutcome) -> &'static str 
         CameraRecoveryOutcome::Pending => "pending",
         CameraRecoveryOutcome::Recovered => "recovered",
         CameraRecoveryOutcome::Exhausted => "exhausted",
+        CameraRecoveryOutcome::Rearming => "rearming",
         CameraRecoveryOutcome::WorkerFailed => "worker_failed",
     }
 }
@@ -833,7 +998,7 @@ impl NativeRuntimeTelemetry {
         let presentation_active = presentation.is_some();
         let presentation = presentation.unwrap_or_default();
         format!(
-            "FREEMIXD_TELEMETRY\tv=3\thost_lateness_samples_total={}\thost_lateness_samples_retained={}\thost_lateness_metric_samples_dropped={}\thost_lateness_p50_ms={}\thost_lateness_p95_ms={}\thost_lateness_p99_ms={}\taudio_retained_blocks={}\taudio_observed_peak_retained_blocks={}\taudio_retained_samples={}\taudio_observed_peak_retained_samples={}\taudio_sink_depth={}\taudio_sink_peak_depth={}\taudio_sink_dropped={}\tcamera_configured_sources={}\tcamera_frames_received={}\tcamera_frames_ingested={}\tcamera_native_dropped={}\tcamera_queue_depth={}\tcamera_queue_peak_depth={}\tcamera_queue_dropped={}\tcamera_recovery_attempts={}\tcamera_recovery_successes={}\tcamera_recovery_exhausted={}\tpresentation_active={}\tpresentation_pending_depth={}\tpresentation_peak_pending_depth={}\tpresentation_dropped={}\trecorder_configured={}\trecorder_outstanding_pairs={}\trecorder_observed_peak_outstanding_pairs={}\trecorder_retained_bytes={}\trecorder_observed_peak_retained_bytes={}\tgpu_backend={:?}\tgpu_adapter={}\tgpu_timing={:?}\tgpu_pass_samples_total={}\tgpu_pass_samples_retained={}\tgpu_pass_metric_samples_dropped={}\tgpu_pass_p50_ms={}\tgpu_pass_p95_ms={}\tgpu_pass_p99_ms={}\tgpu_samples_pending={}\tgpu_samples_dropped={}\tgpu_samples_unavailable={}\tmetric_errors={}\tmetric_samples_dropped={}",
+            "FREEMIXD_TELEMETRY\tv=3\thost_lateness_samples_total={}\thost_lateness_samples_retained={}\thost_lateness_metric_samples_dropped={}\thost_lateness_p50_ms={}\thost_lateness_p95_ms={}\thost_lateness_p99_ms={}\taudio_retained_blocks={}\taudio_observed_peak_retained_blocks={}\taudio_retained_samples={}\taudio_observed_peak_retained_samples={}\taudio_sink_depth={}\taudio_sink_peak_depth={}\taudio_sink_dropped={}\tcamera_configured_sources={}\tcamera_frames_received={}\tcamera_frames_ingested={}\tcamera_native_dropped={}\tcamera_queue_depth={}\tcamera_queue_peak_depth={}\tcamera_queue_dropped={}\tcamera_recovery_attempts={}\tcamera_recovery_successes={}\tcamera_recovery_exhausted={}\tcamera_recovery_worker_failures={}\tpresentation_active={}\tpresentation_pending_depth={}\tpresentation_peak_pending_depth={}\tpresentation_dropped={}\trecorder_configured={}\trecorder_outstanding_pairs={}\trecorder_observed_peak_outstanding_pairs={}\trecorder_retained_bytes={}\trecorder_observed_peak_retained_bytes={}\tgpu_backend={:?}\tgpu_adapter={}\tgpu_timing={:?}\tgpu_pass_samples_total={}\tgpu_pass_samples_retained={}\tgpu_pass_metric_samples_dropped={}\tgpu_pass_p50_ms={}\tgpu_pass_p95_ms={}\tgpu_pass_p99_ms={}\tgpu_samples_pending={}\tgpu_samples_dropped={}\tgpu_samples_unavailable={}\tmetric_errors={}\tmetric_samples_dropped={}",
             host.count,
             host.retained_samples,
             host.dropped_samples,
@@ -857,6 +1022,7 @@ impl NativeRuntimeTelemetry {
             self.camera.recovery_attempts,
             self.camera.recovery_successes,
             self.camera.recovery_exhausted,
+            self.camera.recovery_worker_failures,
             presentation_active,
             presentation.pending_depth,
             presentation.peak_pending_depth,
@@ -1740,6 +1906,16 @@ fn resolve_macos_camera_sources(
     stored: &StoredProject,
     camera_helper: Option<&Path>,
 ) -> AppResult<(Vec<NativeResolvedSource>, NativeCameraInputs)> {
+    resolve_macos_camera_sources_with_policy(stored, camera_helper, CAMERA_RECOVERY_POLICY)
+}
+
+#[cfg(all(feature = "native-media", target_os = "macos"))]
+#[allow(clippy::too_many_lines)]
+fn resolve_macos_camera_sources_with_policy(
+    stored: &StoredProject,
+    camera_helper: Option<&Path>,
+    recovery_policy: CameraRecoveryPolicy,
+) -> AppResult<(Vec<NativeResolvedSource>, NativeCameraInputs)> {
     let device_inputs = stored
         .project()
         .inputs()
@@ -1812,15 +1988,14 @@ fn resolve_macos_camera_sources(
         })?;
         cameras.inputs.push(NativeCameraInput {
             input,
+            worker_snapshot: Arc::new(Mutex::new(CameraWorkerSnapshot::running(&source))),
             source: Some(source),
-            recovery: None,
-            recovery_policy: CAMERA_RECOVERY_POLICY,
-            recovery_attempts: 0,
-            recovery_successes: 0,
-            recovery_exhausted: 0,
-            recovery_outcome: CameraRecoveryOutcome::Never,
-            last_telemetry: CameraTelemetry::default(),
+            worker: None,
+            frame: Arc::new(Mutex::new(None)),
+            recovery_policy,
             ingested_frames: 0,
+            last_ingested_sequence: None,
+            last_ingested_discontinuity: false,
         });
     }
 
@@ -1904,6 +2079,7 @@ fn resolve_macos_camera_sources(
                 .expect("all camera inputs produced an initial frame"),
         })
         .collect();
+    cameras.start_workers()?;
     Ok((sources, cameras))
 }
 
@@ -3769,18 +3945,25 @@ mod tests {
 
     #[cfg(all(feature = "native-media", target_os = "macos"))]
     fn camera_discovery(permission: u8) -> Vec<u8> {
+        camera_discovery_for(permission, &[("fake-camera", "Fake Camera")])
+    }
+
+    #[cfg(all(feature = "native-media", target_os = "macos"))]
+    fn camera_discovery_for(permission: u8, cameras: &[(&str, &str)]) -> Vec<u8> {
         let mut bytes = b"FMCAMD2\0".to_vec();
         bytes.push(permission);
-        bytes.extend_from_slice(&1_u32.to_le_bytes());
-        for value in ["fake-camera", "Fake Camera"] {
-            bytes.extend_from_slice(&u32::try_from(value.len()).unwrap().to_le_bytes());
-            bytes.extend_from_slice(value.as_bytes());
+        bytes.extend_from_slice(&u32::try_from(cameras.len()).unwrap().to_le_bytes());
+        for &(native_id, name) in cameras {
+            for value in [native_id, name] {
+                bytes.extend_from_slice(&u32::try_from(value.len()).unwrap().to_le_bytes());
+                bytes.extend_from_slice(value.as_bytes());
+            }
+            bytes.extend_from_slice(&1_u32.to_le_bytes());
+            bytes.extend_from_slice(&1_u32.to_le_bytes());
+            bytes.extend_from_slice(&1_u32.to_le_bytes());
+            bytes.extend_from_slice(&30_000_u32.to_le_bytes());
+            bytes.extend_from_slice(&1_001_u32.to_le_bytes());
         }
-        bytes.extend_from_slice(&1_u32.to_le_bytes());
-        bytes.extend_from_slice(&1_u32.to_le_bytes());
-        bytes.extend_from_slice(&1_u32.to_le_bytes());
-        bytes.extend_from_slice(&30_000_u32.to_le_bytes());
-        bytes.extend_from_slice(&1_001_u32.to_le_bytes());
         bytes
     }
 
@@ -3832,7 +4015,11 @@ mod tests {
     }
 
     #[cfg(all(feature = "native-media", target_os = "macos"))]
-    fn recovering_camera_helper(directory: &Path, recover_on_capture: Option<u32>) -> PathBuf {
+    fn recovering_camera_helper(
+        directory: &Path,
+        recover_on_capture: Option<u32>,
+        initial_exit: i32,
+    ) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
 
         let helper = directory.join("recovering-camera-helper.sh");
@@ -3843,7 +4030,7 @@ mod tests {
             )
         });
         let script = format!(
-            "#!/bin/sh\ncase \"$1\" in\n  discover) printf '{}' ;;\n  capture)\n    count=0\n    if test -f \"$0.count\"; then read count < \"$0.count\"; fi\n    count=$((count + 1))\n    printf '%s' \"$count\" > \"$0.count\"\n    printf '%s\\n' \"$@\" >> \"$0.capture\"\n    printf '%s\\n' \"$$\" >> \"$0.pids\"\n    case \"$count\" in\n  1) printf '{}'; sleep 0.10; exit 20 ;;\n{recovery_case}  *) printf '{}'; sleep 0.03; exit 20 ;;\n    esac ;;\n  *) exit 90 ;;\nesac\n",
+            "#!/bin/sh\ncase \"$1\" in\n  discover) printf '{}' ;;\n  capture)\n    count=0\n    if test -f \"$0.count\"; then read count < \"$0.count\"; fi\n    count=$((count + 1))\n    printf '%s' \"$count\" > \"$0.count\"\n    printf '%s\\n' \"$@\" >> \"$0.capture\"\n    printf '%s\\n' \"$$\" >> \"$0.pids\"\n    case \"$count\" in\n  1) printf '{}'; sleep 0.10; exit {initial_exit} ;;\n{recovery_case}  *) printf '{}'; sleep 0.03; exit 20 ;;\n    esac ;;\n  *) exit 90 ;;\nesac\n",
             shell_octal(&camera_discovery(0)),
             shell_octal(&camera_frame(7, 1_000)),
             shell_octal(b"FMCAMF3\0"),
@@ -3853,6 +4040,64 @@ mod tests {
         permissions.set_mode(0o700);
         fs::set_permissions(&helper, permissions).unwrap();
         helper
+    }
+
+    #[cfg(all(feature = "native-media", target_os = "macos"))]
+    fn hanging_recovery_camera_helper(directory: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let helper = directory.join("hanging-recovery-camera-helper.sh");
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  discover) printf '{}' ;;\n  capture)\n    count=0\n    if test -f \"$0.count\"; then read count < \"$0.count\"; fi\n    count=$((count + 1))\n    printf '%s' \"$count\" > \"$0.count\"\n    printf '%s\\n' \"$$\" >> \"$0.pids\"\n    case \"$count\" in\n      1) printf '{}'; sleep 0.10; exit 20 ;;\n      *) printf '{}'; exec sleep 30 ;;\n    esac ;;\n  *) exit 90 ;;\nesac\n",
+            shell_octal(&camera_discovery(0)),
+            shell_octal(&camera_frame(7, 1_000)),
+            shell_octal(b"FMCAMF3\0"),
+        );
+        fs::write(&helper, script).unwrap();
+        let mut permissions = fs::metadata(&helper).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&helper, permissions).unwrap();
+        helper
+    }
+
+    #[cfg(all(feature = "native-media", target_os = "macos"))]
+    fn two_camera_helper(directory: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let helper = directory.join("two-camera-helper.sh");
+        let discovery = camera_discovery_for(
+            0,
+            &[
+                ("fake-camera-a", "Fake Camera A"),
+                ("fake-camera-b", "Fake Camera B"),
+            ],
+        );
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  discover) printf '{}' ;;\n  capture)\n    printf '%s\\n' \"$$\" >> \"$0.pids\"\n    printf '%s\\n' \"$@\" >> \"$0.capture\"\n    case \"$2\" in\n      fake-camera-a)\n        count=0\n        if test -f \"$0.a.count\"; then read count < \"$0.a.count\"; fi\n        count=$((count + 1))\n        printf '%s' \"$count\" > \"$0.a.count\"\n        case \"$count\" in\n          1) printf '{}'; sleep 0.10; exit 20 ;;\n          *) sleep 0.05; printf '{}'; exec sleep 30 ;;\n        esac ;;\n      fake-camera-b) printf '{}'; exec sleep 30 ;;\n      *) exit 89 ;;\n    esac ;;\n  *) exit 90 ;;\nesac\n",
+            shell_octal(&discovery),
+            shell_octal(&camera_frame(7, 1_000)),
+            shell_octal(&camera_frame(0, 2_000)),
+            shell_octal(&camera_frame(11, 1_000)),
+        );
+        fs::write(&helper, script).unwrap();
+        let mut permissions = fs::metadata(&helper).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&helper, permissions).unwrap();
+        helper
+    }
+
+    #[cfg(all(feature = "native-media", target_os = "macos"))]
+    fn test_camera_recovery_policy(
+        max_attempts: u32,
+        rearm_backoff: Duration,
+    ) -> CameraRecoveryPolicy {
+        CameraRecoveryPolicy {
+            max_attempts,
+            initial_backoff: Duration::from_millis(5),
+            max_backoff: Duration::from_millis(10),
+            rearm_backoff,
+            shutdown_timeout: Duration::from_secs(4),
+        }
     }
 
     #[cfg(all(feature = "native-media", target_os = "macos"))]
@@ -3919,6 +4164,53 @@ mod tests {
             )),
             required_capabilities: Vec::new(),
         });
+        project.set_main_mix(MainMix::new(test_input_id(1), test_input_id(2)));
+        StoredProject::from_project(
+            project,
+            RuntimeRouting {
+                desired_program_id: Some(test_input_id(1)),
+                realized_program_id: Some(test_input_id(1)),
+                desired_preview_id: Some(test_input_id(2)),
+                realized_preview_id: Some(test_input_id(2)),
+            },
+            ProjectPosition::default(),
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
+    #[cfg(all(feature = "native-media", target_os = "macos"))]
+    fn two_camera_test_project(first_key: &str, second_key: &str) -> StoredProject {
+        let frame_rate = FrameRate::new(30_000, 1_001).unwrap();
+        let mut project = Project::new(
+            ProjectId::new(NonZeroU128::new(44).unwrap()),
+            "Two Camera Unit Test",
+            ProjectSettings {
+                frame_rate,
+                video: VideoFormat {
+                    dimensions: VideoDimensions::new(1, 1).unwrap(),
+                    frame_rate,
+                    pixel_format: PixelFormat::Rgba8,
+                    scan: ScanMode::Progressive,
+                    color: ColorMetadata::default(),
+                },
+                audio: AudioFormat {
+                    sample_rate: SampleRate::new(48_000).unwrap(),
+                    sample_format: SampleFormat::F32,
+                    channels: ChannelLayout::stereo(),
+                },
+            },
+        );
+        for (value, key) in [(1, first_key), (2, second_key)] {
+            project.add_input(Input {
+                id: test_input_id(value),
+                name: format!("Camera {value}"),
+                kind: InputKind::Device {
+                    stable_key: key.to_owned(),
+                },
+                required_capabilities: Vec::new(),
+            });
+        }
         project.set_main_mix(MainMix::new(test_input_id(1), test_input_id(2)));
         StoredProject::from_project(
             project,
@@ -4391,6 +4683,7 @@ mod tests {
             recovery_attempts: 2,
             recovery_successes: 1,
             recovery_exhausted: 0,
+            recovery_worker_failures: 0,
             recovery_outcome: CameraRecoveryOutcome::Recovered,
         };
         let diagnostic = source.diagnostic();
@@ -4422,6 +4715,7 @@ mod tests {
         saturated.recovery_attempts = u64::MAX;
         saturated.recovery_successes = u64::MAX;
         saturated.recovery_exhausted = u64::MAX;
+        saturated.recovery_worker_failures = u64::MAX;
         let aggregate = aggregate_camera_telemetry(&[saturated, source]);
         assert_eq!(aggregate.configured_sources, 2);
         assert_eq!(aggregate.frames_received, u64::MAX);
@@ -4433,6 +4727,7 @@ mod tests {
         assert_eq!(aggregate.recovery_attempts, u64::MAX);
         assert_eq!(aggregate.recovery_successes, u64::MAX);
         assert_eq!(aggregate.recovery_exhausted, u64::MAX);
+        assert_eq!(aggregate.recovery_worker_failures, u64::MAX);
     }
 
     #[cfg(feature = "native-media")]
@@ -4820,40 +5115,43 @@ mod tests {
 
     #[cfg(all(feature = "native-media", target_os = "macos"))]
     #[test]
-    fn camera_loss_holds_rendering_and_recovers_same_input_with_mapped_discontinuity() {
+    fn camera_poll_into_ingests_recovered_mapped_discontinuity_while_ticks_continue() {
         let source_id = deterministic_camera_id(CameraIdKind::Source, "fake-camera");
         let stable_key = format!("macos.avfoundation.camera.v1.{source_id}");
         let project = camera_test_project(&stable_key);
         let directory = tempfile::tempdir().unwrap();
-        let helper = recovering_camera_helper(directory.path(), Some(3));
+        let helper = recovering_camera_helper(directory.path(), Some(3), 20);
         let capture_log = PathBuf::from(format!("{}.capture", helper.display()));
         let pid_log = PathBuf::from(format!("{}.pids", helper.display()));
-        let (sources, mut cameras) =
-            resolve_macos_camera_sources(&project, Some(helper.as_path())).unwrap();
+        let runtime = NativeMediaRuntime::new_blocking([platform_native_backend()]).unwrap();
+        let (sources, mut cameras) = resolve_macos_camera_sources_with_policy(
+            &project,
+            Some(helper.as_path()),
+            test_camera_recovery_policy(3, Duration::from_millis(100)),
+        )
+        .unwrap();
         let NativeResolvedSource::LiveFrame { input, frame } = &sources[0] else {
             panic!("camera source must be live")
         };
         assert_eq!(*input, test_input_id(1));
         assert_eq!(frame.timing().sequence().get(), 7);
-        cameras.inputs[0].recovery_policy = CameraRecoveryPolicy {
-            max_attempts: 3,
-            initial_backoff: Duration::from_millis(10),
-            max_backoff: Duration::from_millis(20),
-        };
+        let mut playback = runtime
+            .preflight_resolved_source_playback_mixed_blocking(
+                None,
+                sources,
+                native_clock_domain(),
+                StreamSelector::Best,
+                NativeSourceLimits::default(),
+            )
+            .unwrap();
 
         let mut control = test_control(&project);
         let server = test_server(&control);
-        let mut recovered = None;
         let mut rendered = 0_u64;
         let mut checkpointed = 0_u64;
         let deadline = Instant::now() + Duration::from_secs(5);
-        while recovered.is_none() && Instant::now() < deadline {
-            cameras
-                .poll_with(|input, frame| {
-                    recovered = Some((input, frame));
-                    Ok(())
-                })
-                .unwrap();
+        while cameras.inputs[0].ingested_frames == 0 && Instant::now() < deadline {
+            cameras.poll_into(&runtime, &mut playback).unwrap();
             control.tick(&server).unwrap();
             rendered = rendered.saturating_add(1);
             let snapshot = control.idle_engine_snapshot().unwrap();
@@ -4862,25 +5160,16 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
         }
 
-        let (input, frame) = recovered.expect("camera did not recover");
-        assert_eq!(input, test_input_id(1));
-        assert_eq!(frame.timing().sequence().get(), 8);
-        assert_eq!(
-            frame.timing().presentation_timestamp().as_nanos(),
-            2_000_000_000
-        );
-        assert!(
-            frame
-                .timing()
-                .flags()
-                .contains(fm_frame::MediaFlags::DISCONTINUITY)
-        );
+        assert_eq!(cameras.inputs[0].ingested_frames, 1);
+        assert_eq!(cameras.inputs[0].last_ingested_sequence, Some(8));
+        assert!(cameras.inputs[0].last_ingested_discontinuity);
         assert!(rendered > 10, "render loop stalled during camera recovery");
         assert_eq!(checkpointed, rendered);
         let telemetry = cameras.source_telemetry();
         assert_eq!(telemetry[0].recovery_attempts, 2);
         assert_eq!(telemetry[0].recovery_successes, 1);
         assert_eq!(telemetry[0].recovery_exhausted, 0);
+        assert_eq!(telemetry[0].recovery_worker_failures, 0);
         assert_eq!(
             telemetry[0].recovery_outcome,
             CameraRecoveryOutcome::Recovered
@@ -4901,52 +5190,214 @@ mod tests {
 
     #[cfg(all(feature = "native-media", target_os = "macos"))]
     #[test]
-    fn camera_recovery_exhaustion_is_bounded_isolated_and_reaps_every_helper() {
+    fn camera_recovery_rearms_after_exhaustion_and_eventually_recovers() {
         let source_id = deterministic_camera_id(CameraIdKind::Source, "fake-camera");
         let stable_key = format!("macos.avfoundation.camera.v1.{source_id}");
         let project = camera_test_project(&stable_key);
         let directory = tempfile::tempdir().unwrap();
-        let helper = recovering_camera_helper(directory.path(), None);
+        let helper = recovering_camera_helper(directory.path(), Some(4), 20);
         let capture_count = PathBuf::from(format!("{}.count", helper.display()));
         let pid_log = PathBuf::from(format!("{}.pids", helper.display()));
-        let (_, mut cameras) =
-            resolve_macos_camera_sources(&project, Some(helper.as_path())).unwrap();
-        cameras.inputs[0].recovery_policy = CameraRecoveryPolicy {
-            max_attempts: 2,
-            initial_backoff: Duration::from_millis(5),
-            max_backoff: Duration::from_millis(10),
-        };
+        let (_, mut cameras) = resolve_macos_camera_sources_with_policy(
+            &project,
+            Some(helper.as_path()),
+            test_camera_recovery_policy(2, Duration::from_millis(20)),
+        )
+        .unwrap();
 
         let mut control = test_control(&project);
         let server = test_server(&control);
         let mut rendered = 0_u64;
         let deadline = Instant::now() + Duration::from_secs(5);
-        while cameras.inputs[0].recovery_outcome != CameraRecoveryOutcome::Exhausted
-            && Instant::now() < deadline
-        {
+        loop {
             cameras.poll_with(|_, _| Ok(())).unwrap();
             control.tick(&server).unwrap();
             rendered = rendered.saturating_add(1);
+            let telemetry = cameras.source_telemetry();
+            if telemetry[0].recovery_successes == 1 || Instant::now() >= deadline {
+                break;
+            }
             thread::sleep(Duration::from_millis(1));
         }
-        assert_eq!(
-            cameras.inputs[0].recovery_outcome,
-            CameraRecoveryOutcome::Exhausted
-        );
-        assert_eq!(cameras.inputs[0].recovery_attempts, 2);
-        assert_eq!(cameras.inputs[0].recovery_successes, 0);
-        assert_eq!(cameras.inputs[0].recovery_exhausted, 1);
+        let telemetry = cameras.source_telemetry();
+        assert_eq!(telemetry[0].recovery_attempts, 3);
+        assert_eq!(telemetry[0].recovery_successes, 1);
+        assert_eq!(telemetry[0].recovery_exhausted, 1);
+        assert_eq!(telemetry[0].recovery_worker_failures, 0);
         assert!(
             rendered > 10,
             "render loop stopped on recoverable camera loss"
         );
-
-        for _ in 0..20 {
-            cameras.poll_with(|_, _| Ok(())).unwrap();
-            control.tick(&server).unwrap();
-        }
-        assert_eq!(fs::read_to_string(capture_count).unwrap(), "3");
+        assert_eq!(fs::read_to_string(capture_count).unwrap(), "4");
         cameras.shutdown().unwrap();
+        assert_helper_processes_reaped(&pid_log);
+    }
+
+    #[cfg(all(feature = "native-media", target_os = "macos"))]
+    #[test]
+    fn generic_camera_helper_exit_is_recoverable_but_malformed_contract_is_fatal() {
+        let source_id = deterministic_camera_id(CameraIdKind::Source, "fake-camera");
+        let stable_key = format!("macos.avfoundation.camera.v1.{source_id}");
+        let project = camera_test_project(&stable_key);
+        let directory = tempfile::tempdir().unwrap();
+        let helper = recovering_camera_helper(directory.path(), Some(2), 21);
+        let pid_log = PathBuf::from(format!("{}.pids", helper.display()));
+        let (_, mut cameras) = resolve_macos_camera_sources_with_policy(
+            &project,
+            Some(helper.as_path()),
+            test_camera_recovery_policy(2, Duration::from_millis(20)),
+        )
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while cameras.inputs[0].ingested_frames == 0 && Instant::now() < deadline {
+            let poll_started = Instant::now();
+            cameras.poll_with(|_, _| Ok(())).unwrap();
+            assert!(
+                poll_started.elapsed() < Duration::from_millis(100),
+                "render-thread camera poll performed blocking cleanup"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        let telemetry = cameras.source_telemetry();
+        assert_eq!(telemetry[0].recovery_attempts, 1);
+        assert_eq!(telemetry[0].recovery_successes, 1);
+        assert_eq!(telemetry[0].recovery_exhausted, 0);
+        assert_eq!(telemetry[0].recovery_worker_failures, 0);
+        assert!(!recoverable_camera_error(&IoError::MalformedTimestamp(
+            fm_io_api::TimestampValidationError::OriginalTimestampOverflow,
+        )));
+        cameras.shutdown().unwrap();
+        assert_helper_processes_reaped(&pid_log);
+    }
+
+    #[cfg(all(feature = "native-media", target_os = "macos"))]
+    #[test]
+    fn fatal_camera_contract_error_propagates_without_counting_as_exhaustion() {
+        let snapshot = Arc::new(Mutex::new(CameraWorkerSnapshot {
+            telemetry: CameraTelemetry::default(),
+            lifecycle: LifecycleState::Lost,
+            health: EndpointHealthState::Failed,
+            recovery_attempts: 0,
+            recovery_successes: 0,
+            recovery_exhausted: 0,
+            recovery_worker_failures: 1,
+            recovery_outcome: CameraRecoveryOutcome::WorkerFailed,
+        }));
+        let handle = thread::spawn(|| CameraWorkerResult {
+            failure: Some(IoError::MalformedTimestamp(
+                fm_io_api::TimestampValidationError::OriginalTimestampOverflow,
+            )),
+            cleanup_failure: None,
+        });
+        let mut cameras = NativeCameraInputs {
+            inputs: vec![NativeCameraInput {
+                input: test_input_id(1),
+                source: None,
+                worker: Some(NativeCameraWorker {
+                    handle: Some(handle),
+                    cancel: Arc::new(AtomicBool::new(false)),
+                }),
+                frame: Arc::new(Mutex::new(None)),
+                worker_snapshot: snapshot,
+                recovery_policy: test_camera_recovery_policy(1, Duration::from_millis(10)),
+                ingested_frames: 0,
+                last_ingested_sequence: None,
+                last_ingested_discontinuity: false,
+            }],
+            telemetry_emitted: false,
+        };
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let error = loop {
+            if let Err(error) = cameras.poll_with(|_, _| Ok(())) {
+                break error;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fatal camera error was swallowed"
+            );
+            thread::sleep(Duration::from_millis(1));
+        };
+        assert!(error.to_string().contains("malformed timestamp"));
+        let telemetry = cameras.source_telemetry();
+        assert_eq!(telemetry[0].recovery_exhausted, 0);
+        assert_eq!(telemetry[0].recovery_worker_failures, 1);
+        assert_eq!(
+            telemetry[0].recovery_outcome,
+            CameraRecoveryOutcome::WorkerFailed
+        );
+    }
+
+    #[cfg(all(feature = "native-media", target_os = "macos"))]
+    #[test]
+    fn one_recovering_camera_does_not_interrupt_second_camera() {
+        let first_id = deterministic_camera_id(CameraIdKind::Source, "fake-camera-a");
+        let second_id = deterministic_camera_id(CameraIdKind::Source, "fake-camera-b");
+        let first_key = format!("macos.avfoundation.camera.v1.{first_id}");
+        let second_key = format!("macos.avfoundation.camera.v1.{second_id}");
+        let project = two_camera_test_project(&first_key, &second_key);
+        let directory = tempfile::tempdir().unwrap();
+        let helper = two_camera_helper(directory.path());
+        let pid_log = PathBuf::from(format!("{}.pids", helper.display()));
+        let (_, mut cameras) = resolve_macos_camera_sources_with_policy(
+            &project,
+            Some(helper.as_path()),
+            test_camera_recovery_policy(2, Duration::from_millis(20)),
+        )
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut recovered_input = None;
+        while recovered_input.is_none() && Instant::now() < deadline {
+            cameras
+                .poll_with(|input, frame| {
+                    if frame
+                        .timing()
+                        .flags()
+                        .contains(fm_frame::MediaFlags::DISCONTINUITY)
+                    {
+                        recovered_input = Some(input);
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(recovered_input, Some(test_input_id(1)));
+        let telemetry = cameras.source_telemetry();
+        assert_eq!(telemetry[0].recovery_successes, 1);
+        assert_eq!(telemetry[0].recovery_worker_failures, 0);
+        assert_eq!(telemetry[1].lifecycle, LifecycleState::Running);
+        assert_eq!(telemetry[1].recovery_attempts, 0);
+        assert_eq!(telemetry[1].recovery_worker_failures, 0);
+        cameras.shutdown().unwrap();
+        assert_helper_processes_reaped(&pid_log);
+    }
+
+    #[cfg(all(feature = "native-media", target_os = "macos"))]
+    #[test]
+    fn camera_shutdown_during_recovery_is_aggregate_bounded_and_reaps_helper() {
+        let source_id = deterministic_camera_id(CameraIdKind::Source, "fake-camera");
+        let stable_key = format!("macos.avfoundation.camera.v1.{source_id}");
+        let project = camera_test_project(&stable_key);
+        let directory = tempfile::tempdir().unwrap();
+        let helper = hanging_recovery_camera_helper(directory.path());
+        let pid_log = PathBuf::from(format!("{}.pids", helper.display()));
+        let (_, mut cameras) = resolve_macos_camera_sources_with_policy(
+            &project,
+            Some(helper.as_path()),
+            test_camera_recovery_policy(3, Duration::from_millis(20)),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while cameras.source_telemetry()[0].recovery_attempts == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(cameras.source_telemetry()[0].recovery_attempts, 1);
+
+        let shutdown_started = Instant::now();
+        cameras.shutdown().unwrap();
+        assert!(shutdown_started.elapsed() < Duration::from_secs(4));
         assert_helper_processes_reaped(&pid_log);
     }
 
