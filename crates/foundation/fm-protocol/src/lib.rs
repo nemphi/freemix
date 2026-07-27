@@ -18,4 +18,7 @@ pub use dto::{
     ServerHello, ServerIdentity, SnapshotMessage, SnapshotReason, StructuredError, WireInputId,
     WireMessage, choose_handshake_outcome,
 };
-pub use version::{NegotiationError, ProtocolVersion, negotiate_version};
+pub use version::{
+    BASE_PROTOCOL_VERSION, CURRENT_PROTOCOL_VERSION, NegotiationError, ProtocolVersion,
+    WIPE_PROTOCOL_VERSION, negotiate_version,
+};

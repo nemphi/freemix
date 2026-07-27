@@ -174,6 +174,10 @@ pub enum ClientError {
     QueueFull {
         capacity: usize,
     },
+    UnsupportedCommandVersion {
+        negotiated: ProtocolVersion,
+        required: ProtocolVersion,
+    },
     EmptyIdempotencyKey,
     DuplicateIdempotencyKey(String),
     CommandIdExhausted,
@@ -239,6 +243,13 @@ impl fmt::Display for ClientError {
             Self::QueueFull { capacity } => {
                 write!(formatter, "outbound queue reached capacity {capacity}")
             }
+            Self::UnsupportedCommandVersion {
+                negotiated,
+                required,
+            } => write!(
+                formatter,
+                "command requires protocol {required}, but the session negotiated {negotiated}"
+            ),
             Self::EmptyIdempotencyKey => formatter.write_str("idempotency key must not be empty"),
             Self::DuplicateIdempotencyKey(key) => {
                 write!(formatter, "idempotency key {key:?} is already in use")
@@ -752,6 +763,17 @@ impl Client {
         if self.state != ConnectionState::Ready {
             return Err(self.invalid_state("queue a command"));
         }
+        let protocol = self
+            .session
+            .as_ref()
+            .ok_or_else(|| self.invalid_state("queue a command"))?
+            .protocol;
+        if !payload.is_supported_by(protocol) {
+            return Err(ClientError::UnsupportedCommandVersion {
+                negotiated: protocol,
+                required: payload.minimum_protocol_version(),
+            });
+        }
         self.ensure_queue_space()?;
         let idempotency_key = idempotency_key.into();
         if idempotency_key.is_empty() {
@@ -764,11 +786,6 @@ impl Client {
             .next_command_id
             .checked_add(1)
             .ok_or(ClientError::CommandIdExhausted)?;
-        let protocol = self
-            .session
-            .as_ref()
-            .ok_or_else(|| self.invalid_state("queue a command"))?
-            .protocol;
         let client_id = &self.config.client_id;
         let sequence = self.next_command_id;
         let command = CommandMessage {

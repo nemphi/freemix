@@ -1,6 +1,7 @@
 use core::fmt;
 use fm_audio::AudioError;
 use fm_frame::{AudioBlockError, TimingError, VideoFrameMetadataError, VideoPayloadError};
+use fm_switcher::TransitionKind;
 use fm_types::InputId;
 use fm_video::{BlendError, FrameError};
 
@@ -85,6 +86,8 @@ impl From<BlendError> for VideoError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RenderError {
     MissingSource { input: InputId },
+    MissingTransitionKind,
+    UnsupportedTransition(TransitionKind),
     Video(VideoError),
 }
 
@@ -92,6 +95,12 @@ impl fmt::Display for RenderError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingSource { input } => write!(formatter, "source {input} is not registered"),
+            Self::MissingTransitionKind => {
+                formatter.write_str("program-frame transition kind is missing")
+            }
+            Self::UnsupportedTransition(kind) => {
+                write!(formatter, "simulated transition {kind:?} is not supported")
+            }
             Self::Video(error) => error.fmt(formatter),
         }
     }

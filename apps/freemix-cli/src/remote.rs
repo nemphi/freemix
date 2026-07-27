@@ -8,15 +8,13 @@ use std::{
 
 use fm_client::{Client, ClientConfig, Intake, Outbound};
 use fm_protocol::{
-    CapabilityReportSummary, ClientHello, ClientType, CommandPayload, CommandResult, EventPayload,
-    HandshakeOutcome, HandshakeResponse, ProtocolVersion, Role, RuntimeLifecycleEvent, ServerHello,
-    ServerIdentity, SnapshotReason, WireMessage, decode_line, encode_line,
+    CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, ClientHello, ClientType, CommandPayload,
+    CommandResult, EventPayload, HandshakeOutcome, HandshakeResponse, Role, RuntimeLifecycleEvent,
+    ServerHello, ServerIdentity, SnapshotReason, WireMessage, decode_line, encode_line,
 };
 use fm_types::ProjectId;
 
 type RemoteResult<T> = Result<T, Box<dyn Error>>;
-
-const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 0);
 
 pub fn status(address: SocketAddr) -> RemoteResult<()> {
     let remote = Remote::connect(address)?;
@@ -58,7 +56,7 @@ impl Remote {
         stream.set_nodelay(true)?;
         let mut remote = Self::uninitialized(stream)?;
         remote.write(&WireMessage::ClientHello(ClientHello {
-            versions: vec![PROTOCOL_VERSION],
+            versions: vec![CURRENT_PROTOCOL_VERSION],
             build: format!("freemix-cli-{}", env!("CARGO_PKG_VERSION")),
             client_type: ClientType::Cli,
             desired_role: Role::Operator,
@@ -78,7 +76,7 @@ impl Remote {
 
         let project_id = project_id(&hello)?;
         let mut client = Client::new(ClientConfig::new(
-            vec![PROTOCOL_VERSION],
+            vec![CURRENT_PROTOCOL_VERSION],
             env!("CARGO_PKG_VERSION"),
             ClientType::Cli,
             Role::Operator,
@@ -116,7 +114,7 @@ impl Remote {
             writer: stream.try_clone()?,
             reader: BufReader::new(stream),
             client: Client::new(ClientConfig::new(
-                vec![PROTOCOL_VERSION],
+                vec![CURRENT_PROTOCOL_VERSION],
                 env!("CARGO_PKG_VERSION"),
                 ClientType::Cli,
                 Role::Operator,

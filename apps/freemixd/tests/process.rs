@@ -360,6 +360,40 @@ fn current_client_receives_structured_handshake_rejection() {
 }
 
 #[test]
+fn old_client_wipe_is_rejected_before_durable_acceptance() {
+    let directory = TestDirectory::new("old-client-wipe");
+    let project_path = directory.project_path();
+    create_project(&project_path);
+
+    let daemon = Daemon::start(&project_path);
+    let mut client = daemon.connect();
+    let hello = client.handshake(None);
+    assert_eq!(hello.negotiated, ProtocolVersion::new(1, 0));
+    assert!(matches!(client.receive(), WireMessage::Snapshot(_)));
+
+    client.send(&command(
+        "unsupported-wipe",
+        "unsupported-wipe-key",
+        CommandPayload::Wipe { duration_frames: 3 },
+    ));
+    assert!(matches!(
+        client.next_result(),
+        CommandResult::Rejected {
+            code,
+            current_revision: 0,
+            retryable: false,
+            ..
+        } if code == "protocol_mismatch"
+    ));
+
+    drop(client);
+    daemon.wait_success();
+    let persisted = ProjectStore::new(&project_path).unwrap().load().unwrap();
+    assert_eq!(persisted.position().revision, 0);
+    assert!(persisted.idempotency_receipts().is_empty());
+}
+
+#[test]
 fn commands_survive_restart_resume_and_duplicate_replay() {
     let directory = TestDirectory::new("restart");
     let project_path = directory.project_path();

@@ -1890,20 +1890,16 @@ struct NativeMixPlan {
 fn native_mix_plan(program: ProgramFrame) -> Result<NativeMixPlan, NativeSourceRenderError> {
     let (secondary, transition) = match program.secondary {
         Some(secondary) if secondary != program.primary => {
-            if program.transition_kind != Some(SwitcherTransitionKind::Fade) {
-                return Err(program.transition_kind.map_or(
-                    NativeSourceRenderError::MissingTransitionKind,
-                    NativeSourceRenderError::UnsupportedTransition,
-                ));
-            }
+            let kind = match program.transition_kind {
+                Some(SwitcherTransitionKind::Fade) => TransitionKind::Fade,
+                Some(SwitcherTransitionKind::Wipe) => TransitionKind::Wipe,
+                Some(kind) => return Err(NativeSourceRenderError::UnsupportedTransition(kind)),
+                None => return Err(NativeSourceRenderError::MissingTransitionKind),
+            };
             (
                 secondary,
-                TransitionPlan::compile(
-                    TransitionKind::Fade,
-                    program.mix_numerator,
-                    program.mix_denominator,
-                )
-                .map_err(NativeSourceRenderError::InvalidMix)?,
+                TransitionPlan::compile(kind, program.mix_numerator, program.mix_denominator)
+                    .map_err(NativeSourceRenderError::InvalidMix)?,
             )
         }
         Some(_) | None => (
@@ -3118,9 +3114,9 @@ impl NativeMediaRuntime {
     /// prefixes. Source frames are selected by rebased PTS at the exact output
     /// deadline, with the final retained frame held only after confirmed EOS.
     /// A frame without a secondary is rendered as
-    /// `Cut(primary, primary)`; a frame with one is rendered as a `Fade` with
-    /// its exact numerator and denominator. This method performs no decode,
-    /// normalization, source upload, or CPU readback.
+    /// `Cut(primary, primary)`; a frame with one is rendered using its supported
+    /// transition kind and exact numerator and denominator. This method performs
+    /// no decode, normalization, source upload, or CPU readback.
     ///
     /// # Errors
     ///
@@ -3158,13 +3154,13 @@ impl NativeMediaRuntime {
         block_on(self.render_frame_result(registry, frame))
     }
 
-    /// Renders a GPU-resident Cut or Fade between canonical RGBA16-float
+    /// Renders a GPU-resident Cut, Fade, or Wipe between canonical RGBA16-float
     /// working frames. This production operation performs no CPU readback.
     ///
     /// # Errors
     ///
     /// Returns a typed compositor or GPU validation failure.
-    pub async fn render_cut_or_fade(
+    pub async fn render_transition(
         &self,
         plan: TransitionPlan,
         from: &NativeWorkingFrame,
@@ -3792,7 +3788,7 @@ mod tests {
     }
 
     #[test]
-    fn program_frame_maps_exactly_to_cut_or_fade() {
+    fn program_frame_maps_exactly_to_cut_fade_or_wipe() {
         let primary = input(1);
         let secondary = input((1_u128 << 64) + 1);
         let cut = native_mix_plan(ProgramFrame {
@@ -3855,18 +3851,34 @@ mod tests {
             ))
         ));
 
+        let wipe = native_mix_plan(ProgramFrame {
+            primary,
+            secondary: Some(secondary),
+            transition_kind: Some(SwitcherTransitionKind::Wipe),
+            mix_numerator: 1,
+            mix_denominator: 2,
+            mix_start_numerator: 1,
+            mix_end_numerator: 2,
+        })
+        .unwrap();
+        assert_eq!(wipe.primary, primary);
+        assert_eq!(wipe.secondary, secondary);
+        assert_eq!(wipe.transition.kind(), TransitionKind::Wipe);
+        assert_eq!(wipe.transition.numerator(), 1);
+        assert_eq!(wipe.transition.denominator(), 2);
+
         assert!(matches!(
             native_mix_plan(ProgramFrame {
                 primary,
                 secondary: Some(secondary),
-                transition_kind: Some(SwitcherTransitionKind::Wipe),
+                transition_kind: Some(SwitcherTransitionKind::Slide),
                 mix_numerator: 1,
                 mix_denominator: 2,
                 mix_start_numerator: 1,
                 mix_end_numerator: 2,
             }),
             Err(NativeSourceRenderError::UnsupportedTransition(
-                SwitcherTransitionKind::Wipe
+                SwitcherTransitionKind::Slide
             ))
         ));
     }

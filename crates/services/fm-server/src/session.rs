@@ -179,6 +179,12 @@ impl Session {
                 received: command.protocol,
             });
         }
+        if !command.payload.is_supported_by(self.negotiated) {
+            return Err(SessionError::UnsupportedCommandVersion {
+                negotiated: self.negotiated,
+                required: command.payload.minimum_protocol_version(),
+            });
+        }
         if encoded_bytes > self.limits.max_command_bytes {
             return Err(SessionError::CommandTooLarge {
                 size: encoded_bytes,
@@ -351,6 +357,10 @@ pub enum SessionError {
         expected: ProtocolVersion,
         received: ProtocolVersion,
     },
+    UnsupportedCommandVersion {
+        negotiated: ProtocolVersion,
+        required: ProtocolVersion,
+    },
     CommandTooLarge {
         size: usize,
         maximum: usize,
@@ -381,6 +391,13 @@ impl fmt::Display for SessionError {
                     "command protocol {received} does not match session protocol {expected}"
                 )
             }
+            Self::UnsupportedCommandVersion {
+                negotiated,
+                required,
+            } => write!(
+                formatter,
+                "command requires protocol {required}, but the session negotiated {negotiated}"
+            ),
             Self::CommandTooLarge { size, maximum } => {
                 write!(formatter, "command size {size} exceeds maximum {maximum}")
             }

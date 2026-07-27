@@ -126,6 +126,70 @@ fn fade_renders_exact_endpoints_and_intermediate_mix() {
 }
 
 #[test]
+fn wipe_renders_exact_endpoints_and_floor_pixel_boundary() {
+    let mut pipeline = SimulatedPipeline::new(5, 1).unwrap();
+    let red = Rgba8::new(255, 0, 0, 255);
+    let blue = Rgba8::new(0, 0, 255, 255);
+    pipeline
+        .register(SimulatedSource::new(input(1), SourcePattern::Solid(red)))
+        .unwrap();
+    pipeline
+        .register(SimulatedSource::new(input(2), SourcePattern::Solid(blue)))
+        .unwrap();
+    let frame = |numerator| ProgramFrame {
+        primary: input(1),
+        secondary: Some(input(2)),
+        transition_kind: Some(TransitionKind::Wipe),
+        mix_numerator: numerator,
+        mix_denominator: 2,
+        mix_start_numerator: numerator,
+        mix_end_numerator: numerator,
+    };
+
+    let start = pipeline.render(0, frame(0)).unwrap();
+    assert!((0..5).all(|x| start.pixel(x, 0) == Some(red)));
+
+    let half = pipeline.render(0, frame(1)).unwrap();
+    assert_eq!(half.pixel(0, 0), Some(blue));
+    assert_eq!(half.pixel(1, 0), Some(blue));
+    assert!((2..5).all(|x| half.pixel(x, 0) == Some(red)));
+
+    let end = pipeline.render(0, frame(2)).unwrap();
+    assert!((0..5).all(|x| end.pixel(x, 0) == Some(blue)));
+}
+
+#[test]
+fn pipeline_rejects_missing_and_unsupported_transition_kinds() {
+    let mut pipeline = SimulatedPipeline::new(1, 1).unwrap();
+    for value in [1, 2] {
+        pipeline
+            .register(SimulatedSource::new(
+                input(value),
+                SourcePattern::Solid(Rgba8::default()),
+            ))
+            .unwrap();
+    }
+    let frame = |transition_kind| ProgramFrame {
+        primary: input(1),
+        secondary: Some(input(2)),
+        transition_kind,
+        mix_numerator: 1,
+        mix_denominator: 2,
+        mix_start_numerator: 1,
+        mix_end_numerator: 1,
+    };
+
+    assert_eq!(
+        pipeline.render(0, frame(None)),
+        Err(RenderError::MissingTransitionKind)
+    );
+    assert_eq!(
+        pipeline.render(0, frame(Some(TransitionKind::Slide))),
+        Err(RenderError::UnsupportedTransition(TransitionKind::Slide))
+    );
+}
+
+#[test]
 fn moving_bars_change_deterministically_with_frame_number() {
     let mut pipeline = SimulatedPipeline::new(14, 4).unwrap();
     pipeline

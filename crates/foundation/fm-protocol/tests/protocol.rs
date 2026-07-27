@@ -2,15 +2,16 @@ use core::{fmt::Write, num::NonZeroU128};
 
 use fm_command::{Deadline, Revision, StateEpoch};
 use fm_protocol::{
-    CapabilityReportMessage, CapabilityReportSummary, ClientHello, ClientType, CodecError,
-    CommandMessage, CommandPayload, CommandResult, DurableEvent, DurableEventBatch, DurableGap,
-    EngineIdentity, ErrorMessage, EventCursor, EventMessage, EventPayload, FieldIssue,
-    HandshakeOutcome, HandshakeRequest, HandshakeResponse, HeartbeatMessage, LineDecoder,
-    MAX_FIELD_VALUE_BYTES, MAX_FIELDS_PER_MESSAGE, MAX_LINE_BYTES, MAX_LIST_ITEMS,
-    MAX_MESSAGES_PER_PUSH, ProtocolVersion, ResumeCursor, Role, RuntimeDomainBoundary,
-    RuntimeEventMessage, RuntimeFailureDisposition, RuntimeLifecycleEvent, ServerHello,
-    ServerIdentity, SnapshotMessage, SnapshotReason, StructuredError, WireInputId, WireMessage,
-    choose_handshake_outcome, decode_line, encode_line, negotiate_version,
+    BASE_PROTOCOL_VERSION, CURRENT_PROTOCOL_VERSION, CapabilityReportMessage,
+    CapabilityReportSummary, ClientHello, ClientType, CodecError, CommandMessage, CommandPayload,
+    CommandResult, DurableEvent, DurableEventBatch, DurableGap, EngineIdentity, ErrorMessage,
+    EventCursor, EventMessage, EventPayload, FieldIssue, HandshakeOutcome, HandshakeRequest,
+    HandshakeResponse, HeartbeatMessage, LineDecoder, MAX_FIELD_VALUE_BYTES,
+    MAX_FIELDS_PER_MESSAGE, MAX_LINE_BYTES, MAX_LIST_ITEMS, MAX_MESSAGES_PER_PUSH, ProtocolVersion,
+    ResumeCursor, Role, RuntimeDomainBoundary, RuntimeEventMessage, RuntimeFailureDisposition,
+    RuntimeLifecycleEvent, ServerHello, ServerIdentity, SnapshotMessage, SnapshotReason,
+    StructuredError, WIPE_PROTOCOL_VERSION, WireInputId, WireMessage, choose_handshake_outcome,
+    decode_line, encode_line, negotiate_version,
 };
 
 fn input(value: u128) -> WireInputId {
@@ -100,6 +101,7 @@ fn additive_wipe_command_has_a_stable_wire_form_without_changing_existing_bytes(
 
     let fixture = include_str!("fixtures/command_wipe.wire");
     let message = WireMessage::Command(CommandMessage {
+        protocol: CURRENT_PROTOCOL_VERSION,
         payload: CommandPayload::Wipe {
             duration_frames: 45,
         },
@@ -146,6 +148,7 @@ fn every_message_variant_round_trips() {
             ..command()
         }),
         WireMessage::Command(CommandMessage {
+            protocol: CURRENT_PROTOCOL_VERSION,
             payload: CommandPayload::Wipe { duration_frames: 9 },
             ..command()
         }),
@@ -188,6 +191,25 @@ fn every_message_variant_round_trips() {
         let encoded = encode_line(&message).unwrap();
         assert_eq!(decode_line(&encoded).unwrap(), message);
     }
+}
+
+#[test]
+fn command_minimum_versions_gate_only_wipe() {
+    for payload in [
+        CommandPayload::SelectPreview { input: input(1) },
+        CommandPayload::Cut,
+        CommandPayload::Fade { duration_frames: 1 },
+    ] {
+        assert_eq!(payload.minimum_protocol_version(), BASE_PROTOCOL_VERSION);
+        assert!(payload.is_supported_by(BASE_PROTOCOL_VERSION));
+    }
+
+    let wipe = CommandPayload::Wipe { duration_frames: 1 };
+    assert_eq!(WIPE_PROTOCOL_VERSION, ProtocolVersion::new(1, 3));
+    assert_eq!(CURRENT_PROTOCOL_VERSION, WIPE_PROTOCOL_VERSION);
+    assert_eq!(wipe.minimum_protocol_version(), WIPE_PROTOCOL_VERSION);
+    assert!(!wipe.is_supported_by(ProtocolVersion::new(1, 2)));
+    assert!(wipe.is_supported_by(CURRENT_PROTOCOL_VERSION));
 }
 
 #[test]

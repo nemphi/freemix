@@ -257,10 +257,18 @@ async fn exercise_gpu_slice(
     }
 
     let points = [(0_u32, 0_u32), (32, 24), (63, 47)];
+    let from_readback = runtime
+        .diagnostic_readback(preroll.video()[0].texture())
+        .await
+        .expect("read Wipe source endpoint");
+    let to_readback = runtime
+        .diagnostic_readback(preroll.video()[1].texture())
+        .await
+        .expect("read Wipe target endpoint");
     for numerator in [0_u32, 1, 2] {
         let plan = TransitionPlan::compile(TransitionKind::Fade, numerator, 2).unwrap();
         let output = runtime
-            .render_cut_or_fade(plan, &preroll.video()[0], &preroll.video()[1])
+            .render_transition(plan, &preroll.video()[0], &preroll.video()[1])
             .await
             .expect("render GPU-resident Fade");
         assert_eq!(output.format(), TextureFormat::Rgba16Float);
@@ -300,6 +308,34 @@ async fn exercise_gpu_slice(
                     "fade {numerator}/2 at ({x},{y}) component {component_index}: GPU {value}, CPU half {expected}"
                 );
             }
+        }
+    }
+
+    for numerator in [0_u32, 1, 2] {
+        let plan = TransitionPlan::compile(TransitionKind::Wipe, numerator, 2).unwrap();
+        let output = runtime
+            .render_transition(plan, &preroll.video()[0], &preroll.video()[1])
+            .await
+            .expect("render GPU-resident Wipe");
+        let actual = runtime
+            .diagnostic_readback(&output)
+            .await
+            .expect("diagnostic Wipe readback");
+        let boundary = 64 * numerator / 2;
+
+        for x in [0_u32, 31, 32, 63] {
+            let expected = if x < boundary {
+                &to_readback
+            } else {
+                &from_readback
+            };
+            let pixel_index = usize::try_from(24 * 64 + x).unwrap();
+            let offset = pixel_index * 8;
+            assert_eq!(
+                &actual.bytes[offset..offset + 8],
+                &expected.bytes[offset..offset + 8],
+                "wipe {numerator}/2 at ({x},24)"
+            );
         }
     }
 
@@ -567,7 +603,7 @@ async fn assert_deadline_frame(
 
 #[test]
 #[ignore = "requires FFmpeg with libx264 and a native macOS Metal adapter"]
-fn local_h264_file_reaches_metal_normalization_and_fade() {
+fn local_h264_file_reaches_metal_normalization_fade_and_wipe() {
     let adapter = Adapter::new(Config::default()).expect("construct FFmpeg adapter");
     if !runtime_tools_available(&adapter) {
         return;

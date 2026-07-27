@@ -28,8 +28,9 @@ use fm_model::{
 use fm_persistence::{ProjectPosition, ProjectStore, RuntimeRouting, StoredProject};
 #[cfg(target_os = "macos")]
 use fm_protocol::{
-    ClientHello, ClientType, CommandMessage, CommandPayload, CommandResult, ProtocolVersion, Role,
-    RuntimeLifecycleEvent, SnapshotMessage, WireInputId, WireMessage, decode_line, encode_line,
+    CURRENT_PROTOCOL_VERSION, ClientHello, ClientType, CommandMessage, CommandPayload,
+    CommandResult, Role, RuntimeLifecycleEvent, SnapshotMessage, WireInputId, WireMessage,
+    decode_line, encode_line,
 };
 use fm_types::{
     AudioFormat, ChannelLayout, ColorMetadata, FrameRate, InputId, PixelFormat, ProjectId,
@@ -527,7 +528,7 @@ fn native_generator_fade_signal_shutdown_checkpoints() {
     let initial = client.handshake();
     assert_snapshot_routing(&initial, 0, input(1), input(2));
     client.send(&WireMessage::Command(CommandMessage {
-        protocol: ProtocolVersion::new(1, 0),
+        protocol: CURRENT_PROTOCOL_VERSION,
         id: "signal-fade".into(),
         idempotency_key: "signal-fade-key".into(),
         expected_revision: None,
@@ -840,7 +841,7 @@ fn native_media_daemon_survives_studio_transport_disconnect() {
 #[cfg(target_os = "macos")]
 #[test]
 #[ignore = "requires FFmpeg with libx264 and a native macOS Metal adapter"]
-fn native_media_fade_four_is_wall_clock_paced_and_checkpointed() {
+fn native_media_fade_and_wipe_are_wall_clock_paced_and_checkpointed() {
     let _hardware_lock = NATIVE_MEDIA_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -871,6 +872,21 @@ fn native_media_fade_four_is_wall_clock_paced_and_checkpointed() {
         "four-frame Fade exceeded socket timeout: {:?}",
         outcome.elapsed
     );
+    let wipe = client.command(
+        "paced-wipe",
+        "paced-wipe-key",
+        CommandPayload::Wipe { duration_frames: 4 },
+    );
+    assert!(
+        wipe.elapsed >= Duration::from_millis(100),
+        "four-frame Wipe collapsed into {:?}",
+        wipe.elapsed
+    );
+    assert!(
+        wipe.elapsed < PROCESS_TIMEOUT,
+        "four-frame Wipe exceeded socket timeout: {:?}",
+        wipe.elapsed
+    );
     drop(client);
 
     let output = daemon.wait();
@@ -880,26 +896,26 @@ fn native_media_fade_four_is_wall_clock_paced_and_checkpointed() {
         String::from_utf8_lossy(&output.stderr)
     );
     let persisted = ProjectStore::new(&project_path).unwrap().load().unwrap();
-    assert_eq!(persisted.position().revision, 1);
+    assert_eq!(persisted.position().revision, 2);
     assert_eq!(
         persisted.position().frames_rendered,
-        outcome.scheduled_frame + 4
+        wipe.scheduled_frame + 4
     );
     assert_eq!(
         persisted.runtime_routing().desired_program_id,
-        Some(input(2))
+        Some(input(1))
     );
     assert_eq!(
         persisted.runtime_routing().realized_program_id,
-        Some(input(2))
+        Some(input(1))
     );
     assert_eq!(
         persisted.runtime_routing().desired_preview_id,
-        Some(input(1))
+        Some(input(2))
     );
     assert_eq!(
         persisted.runtime_routing().realized_preview_id,
-        Some(input(1))
+        Some(input(2))
     );
 }
 
@@ -1351,7 +1367,7 @@ impl StudioClient {
 
     fn handshake_with_digest(&mut self) -> (String, SnapshotMessage) {
         self.send(&WireMessage::ClientHello(ClientHello {
-            versions: vec![ProtocolVersion::new(1, 0)],
+            versions: vec![CURRENT_PROTOCOL_VERSION],
             build: "native-daemon-process-test".into(),
             client_type: ClientType::Studio,
             desired_role: Role::Operator,
@@ -1376,7 +1392,7 @@ impl StudioClient {
 
     fn command(&mut self, id: &str, key: &str, payload: CommandPayload) -> CommandOutcome {
         let message = WireMessage::Command(CommandMessage {
-            protocol: ProtocolVersion::new(1, 0),
+            protocol: CURRENT_PROTOCOL_VERSION,
             id: id.into(),
             idempotency_key: key.into(),
             expected_revision: None,

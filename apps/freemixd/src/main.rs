@@ -41,10 +41,10 @@ use fm_persistence::{
     RuntimeRouting, StoreError, StoredProject,
 };
 use fm_protocol::{
-    CapabilityReportSummary, ClientHello, CommandMessage, CommandPayload, CommandResult,
-    ErrorMessage, EventCursor, HandshakeOutcome as ProtocolHandshakeOutcome, HandshakeRequest,
-    HandshakeResponse, HeartbeatMessage, LineDecoder, ProtocolVersion, ResumeCursor,
-    RuntimeEventMessage, ServerHello, ServerIdentity, StructuredError, WireMessage,
+    CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, ClientHello, CommandMessage, CommandPayload,
+    CommandResult, ErrorMessage, EventCursor, HandshakeOutcome as ProtocolHandshakeOutcome,
+    HandshakeRequest, HandshakeResponse, HeartbeatMessage, LineDecoder, ProtocolVersion,
+    ResumeCursor, RuntimeEventMessage, ServerHello, ServerIdentity, StructuredError, WireMessage,
     choose_handshake_outcome, encode_line,
 };
 use fm_server::{
@@ -99,7 +99,7 @@ use freemixd::native_media::{
 };
 
 const DEFAULT_LISTEN: &str = "127.0.0.1:0";
-const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 0);
+const PROTOCOL_VERSION: ProtocolVersion = CURRENT_PROTOCOL_VERSION;
 const CAPABILITIES_DIGEST: &str = "phase1-simulated";
 const NATIVE_MEDIA_CAPABILITIES_DIGEST: &str =
     "native-media-bounded-video-audio-master-camera-telemetry-v5";
@@ -3708,7 +3708,9 @@ fn session_rejection(
 ) -> CommandResult {
     let (code, retryable) = match error {
         SessionError::Authorization(_) => ("permission_denied", false),
-        SessionError::ProtocolMismatch { .. } => ("protocol_mismatch", false),
+        SessionError::ProtocolMismatch { .. } | SessionError::UnsupportedCommandVersion { .. } => {
+            ("protocol_mismatch", false)
+        }
         SessionError::CommandTooLarge { .. }
         | SessionError::TooManyInflightCommands
         | SessionError::InboundRateLimited

@@ -1,7 +1,7 @@
 use crate::{PipelineConfigError, RegistryError, RenderError, SimulatedSource, SourcePattern};
-use fm_switcher::ProgramFrame;
+use fm_switcher::{ProgramFrame, TransitionKind};
 use fm_types::InputId;
-use fm_video::{ImageFrame, crossfade, solid_color, vertical_color_bars};
+use fm_video::{BlendError, FrameError, ImageFrame, crossfade, solid_color, vertical_color_bars};
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug)]
@@ -98,12 +98,22 @@ impl SimulatedPipeline {
             return Ok(primary);
         };
         let secondary = self.render_input(secondary, frame_number)?;
-        Ok(crossfade(
-            &primary,
-            &secondary,
-            program.mix_numerator,
-            program.mix_denominator,
-        )?)
+        match program.transition_kind {
+            Some(TransitionKind::Fade) => Ok(crossfade(
+                &primary,
+                &secondary,
+                program.mix_numerator,
+                program.mix_denominator,
+            )?),
+            Some(TransitionKind::Wipe) => Ok(horizontal_wipe(
+                &primary,
+                &secondary,
+                program.mix_numerator,
+                program.mix_denominator,
+            )?),
+            Some(kind) => Err(RenderError::UnsupportedTransition(kind)),
+            None => Err(RenderError::MissingTransitionKind),
+        }
     }
 
     fn render_input(&self, input: InputId, frame_number: u64) -> Result<ImageFrame, RenderError> {
@@ -116,4 +126,41 @@ impl SimulatedPipeline {
             SourcePattern::Solid(color) => solid_color(self.width, self.height, color)?,
         })
     }
+}
+
+fn horizontal_wipe(
+    from: &ImageFrame,
+    to: &ImageFrame,
+    numerator: u32,
+    denominator: u32,
+) -> Result<ImageFrame, BlendError> {
+    if denominator == 0 {
+        return Err(BlendError::ZeroDenominator);
+    }
+    if numerator > denominator {
+        return Err(BlendError::NumeratorExceedsDenominator {
+            numerator,
+            denominator,
+        });
+    }
+    if numerator == 0 {
+        return Ok(from.clone());
+    }
+    if numerator == denominator {
+        return Ok(to.clone());
+    }
+
+    let boundary = u64::from(from.width()) * u64::from(numerator) / u64::from(denominator);
+    let boundary_bytes = usize::try_from(boundary)
+        .map_err(|_| BlendError::Frame(FrameError::LayoutOverflow))?
+        .checked_mul(4)
+        .ok_or(BlendError::Frame(FrameError::LayoutOverflow))?;
+    let mut pixels = from.pixels().to_vec();
+    for (output_row, to_row) in pixels
+        .chunks_exact_mut(from.stride())
+        .zip(to.pixels().chunks_exact(to.stride()))
+    {
+        output_row[..boundary_bytes].copy_from_slice(&to_row[..boundary_bytes]);
+    }
+    ImageFrame::new(from.width(), from.height(), from.stride(), pixels).map_err(BlendError::Frame)
 }

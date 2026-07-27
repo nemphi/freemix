@@ -2,8 +2,9 @@ use std::{convert::Infallible, net::IpAddr, num::NonZeroU128};
 
 use fm_auth::{Principal, Role as AuthRole, SessionId, UserId};
 use fm_protocol::{
-    ClientHello, ClientType, CommandMessage, CommandPayload, EngineIdentity, EventCursor,
-    EventMessage, EventPayload, ProtocolVersion, Role, SnapshotMessage, WireInputId,
+    CURRENT_PROTOCOL_VERSION, ClientHello, ClientType, CommandMessage, CommandPayload,
+    EngineIdentity, EventCursor, EventMessage, EventPayload, ProtocolVersion, Role,
+    SnapshotMessage, WIPE_PROTOCOL_VERSION, WireInputId,
 };
 use fm_server::{
     AuthenticationMode, ConfigError, ControlPlane, DisconnectReason, HandshakeError, HealthState,
@@ -244,21 +245,65 @@ fn wipe_uses_transition_authorization_and_fade_rate_accounting() {
         inbound_commands: RateLimit::new(1, 100),
         ..SessionLimits::default()
     };
-    let server = ready_server(config().with_session_limits(limits));
+    let current_config = ServerConfig::new(
+        ServerMode::Production,
+        AuthenticationMode::Required,
+        IpAddr::from([127, 0, 0, 1]),
+        vec![CURRENT_PROTOCOL_VERSION],
+        "capabilities-v1",
+    )
+    .with_session_limits(limits);
+    let server = ready_server(current_config);
+    let mut current_hello = hello(Role::Operator, None);
+    current_hello.versions = vec![CURRENT_PROTOCOL_VERSION];
     let mut operator = server
-        .handshake(
-            &hello(Role::Operator, None),
-            &principal(AuthRole::Operator),
-            0,
-        )
+        .handshake(&current_hello, &principal(AuthRole::Operator), 0)
         .unwrap()
         .session;
+    let mut wipe = wipe;
+    wipe.protocol = CURRENT_PROTOCOL_VERSION;
     operator.admit_command(&wipe, 10, 0).unwrap();
     operator.command_completed().unwrap();
+    let mut fade = command(CommandPayload::Fade { duration_frames: 3 });
+    fade.protocol = CURRENT_PROTOCOL_VERSION;
     assert_eq!(
-        operator.admit_command(&command(CommandPayload::Fade { duration_frames: 3 }), 10, 0,),
+        operator.admit_command(&fade, 10, 0),
         Err(SessionError::InboundRateLimited)
     );
+}
+
+#[test]
+fn old_client_cannot_admit_wipe_to_a_new_server() {
+    let server = ready_server(ServerConfig::new(
+        ServerMode::Production,
+        AuthenticationMode::Required,
+        IpAddr::from([127, 0, 0, 1]),
+        vec![CURRENT_PROTOCOL_VERSION],
+        "capabilities-v1",
+    ));
+    let mut old_hello = hello(Role::Operator, None);
+    old_hello.versions = vec![ProtocolVersion::new(1, 0)];
+    let outcome = server
+        .handshake(&old_hello, &principal(AuthRole::Operator), 0)
+        .unwrap();
+    assert_eq!(outcome.server_hello.negotiated, ProtocolVersion::new(1, 0));
+    let mut session = outcome.session;
+
+    let mut wipe = command(CommandPayload::Wipe { duration_frames: 3 });
+    wipe.protocol = ProtocolVersion::new(1, 0);
+    assert_eq!(
+        session.admit_command(&wipe, 10, 0),
+        Err(SessionError::UnsupportedCommandVersion {
+            negotiated: ProtocolVersion::new(1, 0),
+            required: WIPE_PROTOCOL_VERSION,
+        })
+    );
+    assert_eq!(session.accounting().inbound_commands_admitted_total, 0);
+    assert_eq!(session.accounting().inbound_commands_inflight, 0);
+
+    let mut cut = command(CommandPayload::Cut);
+    cut.protocol = ProtocolVersion::new(1, 0);
+    session.admit_command(&cut, 10, 0).unwrap();
 }
 
 #[test]

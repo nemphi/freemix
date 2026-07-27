@@ -3,7 +3,7 @@ use core::{fmt, num::NonZeroU128};
 use fm_command::{CommandEnvelope, Deadline, Revision, StateEpoch};
 use fm_types::InputId;
 
-use crate::ProtocolVersion;
+use crate::{BASE_PROTOCOL_VERSION, ProtocolVersion, WIPE_PROTOCOL_VERSION};
 
 /// Stable identity of one project's durable state on one server.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -207,6 +207,22 @@ pub enum CommandPayload {
     Cut,
     Fade { duration_frames: u32 },
     Wipe { duration_frames: u32 },
+}
+
+impl CommandPayload {
+    #[must_use]
+    pub const fn minimum_protocol_version(self) -> ProtocolVersion {
+        match self {
+            Self::SelectPreview { .. } | Self::Cut | Self::Fade { .. } => BASE_PROTOCOL_VERSION,
+            Self::Wipe { .. } => WIPE_PROTOCOL_VERSION,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_supported_by(self, version: ProtocolVersion) -> bool {
+        let required = self.minimum_protocol_version();
+        version.major == required.major && version.minor >= required.minor
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

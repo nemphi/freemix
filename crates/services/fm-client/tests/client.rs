@@ -4,10 +4,11 @@ use fm_client::{
     Client, ClientConfig, ClientError, CommandStatus, ConnectionState, Intake, Outbound, SyncMode,
 };
 use fm_protocol::{
-    CapabilityReportSummary, ClientType, CommandPayload, CommandResult, EngineIdentity,
-    EventCursor, EventMessage, EventPayload, HandshakeOutcome, HandshakeResponse, ProtocolVersion,
-    ResumeCursor, Role, RuntimeEventMessage, RuntimeLifecycleEvent, ServerIdentity,
-    SnapshotMessage, SnapshotReason, WireInputId, WireMessage,
+    CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, ClientType, CommandPayload, CommandResult,
+    EngineIdentity, EventCursor, EventMessage, EventPayload, HandshakeOutcome, HandshakeResponse,
+    ProtocolVersion, ResumeCursor, Role, RuntimeEventMessage, RuntimeLifecycleEvent,
+    ServerIdentity, SnapshotMessage, SnapshotReason, WIPE_PROTOCOL_VERSION, WireInputId,
+    WireMessage,
 };
 use fm_types::ProjectId;
 
@@ -38,7 +39,7 @@ fn server() -> ServerIdentity {
 
 fn config(capacity: usize) -> ClientConfig {
     let mut config = ClientConfig::new(
-        vec![ProtocolVersion::new(1, 2)],
+        vec![CURRENT_PROTOCOL_VERSION],
         "diagnostic 0.1",
         ClientType::Cli,
         Role::Operator,
@@ -53,7 +54,7 @@ fn config(capacity: usize) -> ClientConfig {
 
 fn handshake(revision: u64, resume: Option<ResumeCursor>) -> HandshakeResponse {
     HandshakeResponse {
-        negotiated: ProtocolVersion::new(1, 1),
+        negotiated: CURRENT_PROTOCOL_VERSION,
         granted_role: Role::Operator,
         permissions: vec!["switcher.take".to_owned()],
         capabilities: CapabilityReportSummary {
@@ -253,6 +254,38 @@ fn wipe_command_is_queued_with_its_exact_duration() {
         }
     );
     assert!(matches!(client.pop_outbound(), Some(Outbound::Command(queued)) if queued == command));
+}
+
+#[test]
+fn new_client_does_not_send_wipe_after_negotiating_with_an_old_daemon() {
+    let mut client = Client::new(config(1)).unwrap();
+    client.start_connect().unwrap();
+    client.transport_connected().unwrap();
+    let mut old_handshake = handshake(4, None);
+    old_handshake.negotiated = ProtocolVersion::new(1, 0);
+    client.accept_handshake(old_handshake).unwrap();
+    client.apply_snapshot(snapshot(4)).unwrap();
+
+    assert_eq!(
+        client.queue_command(
+            CommandPayload::Wipe { duration_frames: 3 },
+            "unsupported-wipe",
+            Some(4),
+            None,
+        ),
+        Err(ClientError::UnsupportedCommandVersion {
+            negotiated: ProtocolVersion::new(1, 0),
+            required: WIPE_PROTOCOL_VERSION,
+        })
+    );
+    assert_eq!(client.outbound_len(), 0);
+    assert!(client.command("diagnostic-a:1").is_none());
+
+    let cut = client
+        .queue_command(CommandPayload::Cut, "supported-cut", Some(4), None)
+        .unwrap();
+    assert_eq!(cut.id, "diagnostic-a:1");
+    assert_eq!(cut.protocol, ProtocolVersion::new(1, 0));
 }
 
 #[test]

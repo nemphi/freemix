@@ -11,10 +11,10 @@ use std::{
 };
 
 use fm_protocol::{
-    ClientType, CommandMessage, CommandPayload, CommandResult, EngineIdentity, EventCursor,
-    EventMessage, EventPayload, ProtocolVersion, Role, RuntimeDomainBoundary, RuntimeEventMessage,
-    RuntimeLifecycleEvent, ServerHello, ServerIdentity, SnapshotMessage, WireInputId, WireMessage,
-    decode_line, encode_line,
+    CURRENT_PROTOCOL_VERSION, ClientType, CommandMessage, CommandPayload, CommandResult,
+    EngineIdentity, EventCursor, EventMessage, EventPayload, ProtocolVersion, Role,
+    RuntimeDomainBoundary, RuntimeEventMessage, RuntimeLifecycleEvent, ServerHello, ServerIdentity,
+    SnapshotMessage, WireInputId, WireMessage, decode_line, encode_line,
 };
 
 static TEST_ROOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -36,6 +36,13 @@ impl FakeRemoteServer {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let worker = thread::spawn(move || serve_premature_event(&listener, kind));
+        Self { address, worker }
+    }
+
+    fn start_old_without_wipe() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || serve_old_daemon_without_wipe(&listener));
         Self { address, worker }
     }
 
@@ -158,11 +165,28 @@ fn serve_premature_event(listener: &TcpListener, kind: PrematureEvent) {
     write_message(&mut writer, &message);
 }
 
+fn serve_old_daemon_without_wipe(listener: &TcpListener) {
+    let engine = EngineIdentity {
+        engine_id: "project-42".into(),
+        state_epoch: 1,
+        log_id: "fake-remote-log".into(),
+    };
+    let (stream, _) = listener.accept().unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(stream);
+    assert_client_hello(read_message(&mut reader));
+    write_handshake(&mut writer, &engine, 0);
+
+    let mut unexpected = String::new();
+    assert_eq!(reader.read_line(&mut unexpected).unwrap(), 0);
+    assert!(unexpected.is_empty());
+}
+
 fn assert_client_hello(message: WireMessage) {
     let WireMessage::ClientHello(hello) = message else {
         panic!("expected client hello");
     };
-    assert_eq!(hello.versions, vec![ProtocolVersion::new(1, 0)]);
+    assert_eq!(hello.versions, vec![CURRENT_PROTOCOL_VERSION]);
     assert_eq!(hello.client_type, ClientType::Cli);
     assert_eq!(hello.desired_role, Role::Operator);
     assert_eq!(hello.cached_cursor, None);
@@ -358,6 +382,23 @@ fn remote_commands_use_protocol_server_and_replay_duplicate_keys() {
 fn remote_commands_reject_non_loopback_addresses_before_connecting() {
     let output = invoke(&["remote-status", "192.0.2.1:9123"]);
     assert_failure_contains(&output, "requires a loopback address");
+}
+
+#[test]
+fn new_cli_does_not_send_wipe_to_an_old_daemon() {
+    let server = FakeRemoteServer::start_old_without_wipe();
+    let output = invoke(&[
+        "remote-wipe",
+        &server.address(),
+        "3",
+        "--key",
+        "unsupported-wipe",
+    ]);
+    assert_failure_contains(
+        &output,
+        "command requires protocol 1.3, but the session negotiated 1.0",
+    );
+    server.finish();
 }
 
 #[test]
