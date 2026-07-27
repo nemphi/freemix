@@ -1051,6 +1051,66 @@ fn master_pts_rejection_rolls_back_the_render_cursor() {
 }
 
 #[test]
+fn batch_push_and_two_phase_render_are_transactional() {
+    let sample_rate = rate(10);
+    let mut sync = synchronizer(sample_rate, sample_rate, mapping(0, 0, 0));
+    let valid = block(
+        sample_rate,
+        mono(),
+        1,
+        7,
+        0,
+        duration(0, 2, sample_rate),
+        vec![vec![1.0, 2.0]],
+        MediaFlags::NONE,
+    );
+    let invalid = block(
+        sample_rate,
+        mono(),
+        1,
+        9,
+        200_000_000,
+        duration(2, 1, sample_rate),
+        vec![vec![3.0]],
+        MediaFlags::NONE,
+    );
+    assert!(matches!(
+        sync.push_batch(&[valid.clone(), invalid]),
+        Err(AudioSynchronizerError::Discontinuity(
+            SynchronizerDiscontinuity::Sequence { .. }
+        ))
+    ));
+    assert_eq!(sync.telemetry().buffered_samples(), 0);
+    assert_eq!(sync.telemetry().accepted_blocks(), 0);
+
+    let continuation = block(
+        sample_rate,
+        mono(),
+        1,
+        8,
+        200_000_000,
+        duration(2, 1, sample_rate),
+        vec![vec![3.0]],
+        MediaFlags::NONE,
+    );
+    sync.push_batch(&[valid, continuation]).unwrap();
+    let plan = sync.plan_render(interval(0, 0, 2, sample_rate), 2).unwrap();
+    let before = sync.telemetry();
+    let mut output = [0.0; 2];
+    sync.render_planned_into(plan, &mut [&mut output]).unwrap();
+    assert_eq!(output, [1.0, 2.0]);
+    assert_eq!(sync.telemetry(), before);
+
+    sync.commit_render(plan).unwrap();
+    assert_eq!(sync.telemetry().rendered_intervals(), 1);
+    assert_eq!(sync.telemetry().buffered_samples(), 1);
+    assert_eq!(
+        sync.commit_render(plan),
+        Err(AudioSynchronizerError::StaleRenderPlan)
+    );
+}
+
+#[test]
 fn reset_rearms_continuity_and_extreme_arithmetic_is_transactional() {
     let sample_rate = rate(1);
     let mut sync = synchronizer(sample_rate, sample_rate, mapping(0, 0, 0));

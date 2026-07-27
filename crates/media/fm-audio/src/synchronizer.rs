@@ -118,6 +118,7 @@ pub enum AudioSynchronizerError {
         required_sample: u64,
         buffered_end_sample: u64,
     },
+    StaleRenderPlan,
     Discontinuity(SynchronizerDiscontinuity),
     ArithmeticOverflow,
 }
@@ -219,6 +220,7 @@ impl fmt::Display for AudioSynchronizerError {
                 formatter,
                 "source sample {required_sample} is required but buffered input ends at {buffered_end_sample}"
             ),
+            Self::StaleRenderPlan => formatter.write_str("audio render plan is stale"),
             Self::Discontinuity(discontinuity) => {
                 write!(formatter, "audio discontinuity: {discontinuity:?}")
             }
@@ -487,10 +489,11 @@ struct OutputCursor {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct PreparedRender {
+pub struct AudioRenderPlan {
     cursor: OutputCursor,
     output_samples: usize,
     discard_before: u64,
+    generation: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -525,6 +528,7 @@ pub struct ClockMappedAudioSynchronizer {
     buffered_bytes: usize,
     input_cursor: Option<InputCursor>,
     output_cursor: Option<OutputCursor>,
+    render_generation: u64,
     telemetry: AudioSynchronizerTelemetry,
 }
 
@@ -597,6 +601,7 @@ impl ClockMappedAudioSynchronizer {
             buffered_bytes: 0,
             input_cursor: None,
             output_cursor: None,
+            render_generation: 0,
             telemetry: AudioSynchronizerTelemetry::default(),
         })
     }
@@ -649,33 +654,80 @@ impl ClockMappedAudioSynchronizer {
     /// Returns a typed format, timing, continuity, bounds, or arithmetic error.
     /// The input cursor and buffered samples remain unchanged on error.
     pub fn push(&mut self, block: &AudioBlock) -> Result<(), AudioSynchronizerError> {
-        let result = self.validate_push(block);
-        let (next_cursor, block_bytes) = match result {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                self.telemetry.rejected_blocks = self.telemetry.rejected_blocks.saturating_add(1);
-                return Err(error);
-            }
-        };
+        self.push_batch(core::slice::from_ref(block))
+    }
 
-        let write_position = (self.read_position + self.buffered_samples) % self.sample_capacity;
-        for (channel, source) in block.planes().iter().enumerate() {
-            let first = source.len().min(self.sample_capacity - write_position);
-            self.planes[channel][write_position..write_position + first]
-                .copy_from_slice(&source[..first]);
-            self.planes[channel][..source.len() - first].copy_from_slice(&source[first..]);
+    /// Validates a contiguous batch without changing buffered media or cursors.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same format, timing, continuity, and bound errors as
+    /// [`Self::push`].
+    pub fn preflight_push_batch(
+        &self,
+        blocks: &[AudioBlock],
+    ) -> Result<(), AudioSynchronizerError> {
+        let mut cursor = self.input_cursor;
+        let mut block_count = self.blocks.len();
+        let mut samples = self.buffered_samples;
+        let mut bytes = self.buffered_bytes;
+        for block in blocks {
+            let (next_cursor, block_bytes) =
+                self.validate_push_at(block, cursor, block_count, samples, bytes)?;
+            cursor = Some(next_cursor);
+            block_count = block_count
+                .checked_add(1)
+                .ok_or(AudioSynchronizerError::ArithmeticOverflow)?;
+            samples = samples
+                .checked_add(block.sample_count())
+                .ok_or(AudioSynchronizerError::ArithmeticOverflow)?;
+            bytes = bytes
+                .checked_add(block_bytes)
+                .ok_or(AudioSynchronizerError::ArithmeticOverflow)?;
         }
-        self.blocks.push_back(BufferedBlock {
-            remaining_samples: block.sample_count(),
-        });
-        self.buffered_samples += block.sample_count();
-        self.buffered_bytes += block_bytes;
-        self.input_cursor = Some(next_cursor);
-        self.telemetry.accepted_blocks = self.telemetry.accepted_blocks.saturating_add(1);
-        self.telemetry.accepted_samples = self
-            .telemetry
-            .accepted_samples
-            .saturating_add(u64::try_from(block.sample_count()).unwrap_or(u64::MAX));
+        Ok(())
+    }
+
+    /// Atomically validates and copies a contiguous batch into preallocated storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::preflight_push_batch`]. No block from
+    /// the batch is accepted when validation fails.
+    pub fn push_batch(&mut self, blocks: &[AudioBlock]) -> Result<(), AudioSynchronizerError> {
+        if let Err(error) = self.preflight_push_batch(blocks) {
+            self.telemetry.rejected_blocks = self
+                .telemetry
+                .rejected_blocks
+                .saturating_add(u64::try_from(blocks.len()).unwrap_or(u64::MAX));
+            return Err(error);
+        }
+        for block in blocks {
+            let result = self.validate_push(block);
+            let Ok((next_cursor, block_bytes)) = result else {
+                unreachable!("unchanged synchronizer passed batch preflight");
+            };
+
+            let write_position =
+                (self.read_position + self.buffered_samples) % self.sample_capacity;
+            for (channel, source) in block.planes().iter().enumerate() {
+                let first = source.len().min(self.sample_capacity - write_position);
+                self.planes[channel][write_position..write_position + first]
+                    .copy_from_slice(&source[..first]);
+                self.planes[channel][..source.len() - first].copy_from_slice(&source[first..]);
+            }
+            self.blocks.push_back(BufferedBlock {
+                remaining_samples: block.sample_count(),
+            });
+            self.buffered_samples += block.sample_count();
+            self.buffered_bytes += block_bytes;
+            self.input_cursor = Some(next_cursor);
+            self.telemetry.accepted_blocks = self.telemetry.accepted_blocks.saturating_add(1);
+            self.telemetry.accepted_samples = self
+                .telemetry
+                .accepted_samples
+                .saturating_add(u64::try_from(block.sample_count()).unwrap_or(u64::MAX));
+        }
         self.update_occupancy_telemetry();
         Ok(())
     }
@@ -697,19 +749,52 @@ impl ClockMappedAudioSynchronizer {
         interval: MasterAudioInterval,
         output: &mut [&mut [f32]],
     ) -> Result<(), AudioSynchronizerError> {
-        let prepared = match self.prepare_render(interval, output) {
-            Ok(prepared) => prepared,
+        let output_samples = output.first().map_or(0, |plane| plane.len());
+        if let Err(error) = self.validate_output(output, output_samples) {
+            self.record_render_failure(&error);
+            return Err(error);
+        }
+        let plan = match self.plan_render(interval, output_samples) {
+            Ok(plan) => plan,
             Err(error) => {
-                self.telemetry.failed_renders = self.telemetry.failed_renders.saturating_add(1);
-                if matches!(error, AudioSynchronizerError::NeedMoreInput { .. }) {
-                    self.telemetry.need_more_input =
-                        self.telemetry.need_more_input.saturating_add(1);
-                }
+                self.record_render_failure(&error);
                 return Err(error);
             }
         };
+        if let Err(error) = self.render_planned_into(plan, output) {
+            self.record_render_failure(&error);
+            return Err(error);
+        }
+        self.commit_render(plan)
+    }
 
-        for output_sample in 0..prepared.output_samples {
+    /// Plans one render into internal preallocated scratch without advancing
+    /// buffered media, output continuity, or telemetry.
+    ///
+    /// # Errors
+    ///
+    /// Returns a Master timing, mapping, bound, or missing-input error.
+    pub fn plan_render(
+        &mut self,
+        interval: MasterAudioInterval,
+        output_samples: usize,
+    ) -> Result<AudioRenderPlan, AudioSynchronizerError> {
+        self.prepare_render(interval, output_samples)
+    }
+
+    /// Writes a previously planned render without advancing synchronizer state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an output-shape error or [`AudioSynchronizerError::StaleRenderPlan`].
+    pub fn render_planned_into(
+        &self,
+        plan: AudioRenderPlan,
+        output: &mut [&mut [f32]],
+    ) -> Result<(), AudioSynchronizerError> {
+        self.validate_plan(plan)?;
+        self.validate_output(output, plan.output_samples)?;
+        for output_sample in 0..plan.output_samples {
             let phase = self.phases[output_sample];
             for (channel, plane) in output.iter_mut().enumerate() {
                 let first = f64::from(self.buffered_sample(channel, phase.source_sample));
@@ -724,14 +809,38 @@ impl ClockMappedAudioSynchronizer {
                 plane[output_sample] = interpolated_sample(value);
             }
         }
+        Ok(())
+    }
 
-        self.output_cursor = Some(prepared.cursor);
-        self.discard_before(prepared.discard_before);
+    /// Verifies that a render plan can still be committed without changing state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AudioSynchronizerError::StaleRenderPlan`] if another render or
+    /// reset invalidated the plan.
+    pub fn preflight_commit_render(
+        &self,
+        plan: AudioRenderPlan,
+    ) -> Result<(), AudioSynchronizerError> {
+        self.validate_plan(plan)
+    }
+
+    /// Commits the cursor and occupancy effects of a previously rendered plan.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AudioSynchronizerError::StaleRenderPlan`] if another render or
+    /// reset invalidated the plan.
+    pub fn commit_render(&mut self, plan: AudioRenderPlan) -> Result<(), AudioSynchronizerError> {
+        self.validate_plan(plan)?;
+        self.output_cursor = Some(plan.cursor);
+        self.discard_before(plan.discard_before);
+        self.render_generation = self.render_generation.wrapping_add(1);
         self.telemetry.rendered_intervals = self.telemetry.rendered_intervals.saturating_add(1);
         self.telemetry.rendered_samples = self
             .telemetry
             .rendered_samples
-            .saturating_add(u64::try_from(prepared.output_samples).unwrap_or(u64::MAX));
+            .saturating_add(u64::try_from(plan.output_samples).unwrap_or(u64::MAX));
         self.update_occupancy_telemetry();
         Ok(())
     }
@@ -746,6 +855,7 @@ impl ClockMappedAudioSynchronizer {
         self.buffered_bytes = 0;
         self.input_cursor = None;
         self.output_cursor = None;
+        self.render_generation = self.render_generation.wrapping_add(1);
         self.source_origin = source_origin;
         self.master_origin = master_origin;
         self.telemetry.resets = self.telemetry.resets.saturating_add(1);
@@ -756,6 +866,24 @@ impl ClockMappedAudioSynchronizer {
     fn validate_push(
         &self,
         block: &AudioBlock,
+    ) -> Result<(InputCursor, usize), AudioSynchronizerError> {
+        self.validate_push_at(
+            block,
+            self.input_cursor,
+            self.blocks.len(),
+            self.buffered_samples,
+            self.buffered_bytes,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn validate_push_at(
+        &self,
+        block: &AudioBlock,
+        input_cursor: Option<InputCursor>,
+        buffered_blocks: usize,
+        buffered_samples: usize,
+        buffered_bytes: usize,
     ) -> Result<(InputCursor, usize), AudioSynchronizerError> {
         if block.sample_rate() != self.source_rate {
             return Err(AudioSynchronizerError::SourceRateMismatch {
@@ -792,7 +920,7 @@ impl ClockMappedAudioSynchronizer {
 
         let sample_count = u64::try_from(block.sample_count())
             .map_err(|_| AudioSynchronizerError::ArithmeticOverflow)?;
-        let (first_sample, next_sequence) = if let Some(cursor) = self.input_cursor {
+        let (first_sample, next_sequence) = if let Some(cursor) = input_cursor {
             if timing.sequence() != cursor.next_sequence {
                 return Err(AudioSynchronizerError::Discontinuity(
                     SynchronizerDiscontinuity::Sequence {
@@ -850,19 +978,19 @@ impl ClockMappedAudioSynchronizer {
             .ok_or(AudioSynchronizerError::ArithmeticOverflow)?;
         Self::check_buffer_limit(
             BufferLimit::Blocks,
-            self.blocks.len(),
+            buffered_blocks,
             1,
             self.limits.max_blocks,
         )?;
         Self::check_buffer_limit(
             BufferLimit::Samples,
-            self.buffered_samples,
+            buffered_samples,
             block.sample_count(),
             self.limits.max_samples,
         )?;
         Self::check_buffer_limit(
             BufferLimit::Bytes,
-            self.buffered_bytes,
+            buffered_bytes,
             block_bytes,
             self.limits.max_bytes,
         )?;
@@ -901,30 +1029,16 @@ impl ClockMappedAudioSynchronizer {
     fn prepare_render(
         &mut self,
         interval: MasterAudioInterval,
-        output: &[&mut [f32]],
-    ) -> Result<PreparedRender, AudioSynchronizerError> {
-        let channels = self.channel_layout.channels().len();
-        if output.len() != channels {
-            return Err(AudioSynchronizerError::OutputPlaneCountMismatch {
-                expected: channels,
-                actual: output.len(),
-            });
-        }
-        let output_samples = output.first().map_or(0, |plane| plane.len());
+        output_samples: usize,
+    ) -> Result<AudioRenderPlan, AudioSynchronizerError> {
+        // Planning reuses shared phase scratch, so every attempt invalidates
+        // prior plans even when this attempt later fails validation.
+        self.render_generation = self.render_generation.wrapping_add(1);
         if output_samples == 0 || output_samples > self.limits.max_output_samples {
             return Err(AudioSynchronizerError::OutputSampleCountOutOfRange {
                 actual: output_samples,
                 maximum: self.limits.max_output_samples,
             });
-        }
-        for (plane, samples) in output.iter().enumerate() {
-            if samples.len() != output_samples {
-                return Err(AudioSynchronizerError::OutputPlaneLengthMismatch {
-                    plane,
-                    expected: output_samples,
-                    actual: samples.len(),
-                });
-            }
         }
         let expected_master_clock = self.mapping.master_domain().get();
         let actual_master_clock = interval.clock_domain.get();
@@ -1011,13 +1125,52 @@ impl ClockMappedAudioSynchronizer {
             u64::try_from(next_source_sample)
                 .map_err(|_| AudioSynchronizerError::ArithmeticOverflow)?
         };
-        Ok(PreparedRender {
+        Ok(AudioRenderPlan {
             cursor: OutputCursor {
                 next_sample: next_output_sample,
             },
             output_samples,
             discard_before,
+            generation: self.render_generation,
         })
+    }
+
+    fn validate_plan(&self, plan: AudioRenderPlan) -> Result<(), AudioSynchronizerError> {
+        if plan.generation != self.render_generation {
+            return Err(AudioSynchronizerError::StaleRenderPlan);
+        }
+        Ok(())
+    }
+
+    fn validate_output(
+        &self,
+        output: &[&mut [f32]],
+        output_samples: usize,
+    ) -> Result<(), AudioSynchronizerError> {
+        let channels = self.channel_layout.channels().len();
+        if output.len() != channels {
+            return Err(AudioSynchronizerError::OutputPlaneCountMismatch {
+                expected: channels,
+                actual: output.len(),
+            });
+        }
+        for (plane, samples) in output.iter().enumerate() {
+            if samples.len() != output_samples {
+                return Err(AudioSynchronizerError::OutputPlaneLengthMismatch {
+                    plane,
+                    expected: output_samples,
+                    actual: samples.len(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn record_render_failure(&mut self, error: &AudioSynchronizerError) {
+        self.telemetry.failed_renders = self.telemetry.failed_renders.saturating_add(1);
+        if matches!(error, AudioSynchronizerError::NeedMoreInput { .. }) {
+            self.telemetry.need_more_input = self.telemetry.need_more_input.saturating_add(1);
+        }
     }
 
     fn source_phase(

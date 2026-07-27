@@ -368,6 +368,48 @@ fn native_media_daemon_refills_beyond_startup_prefix_and_checkpoints_once() {
 
 #[cfg(target_os = "macos")]
 #[test]
+#[ignore = "requires FFmpeg with libx264/AAC, ffprobe, and a native macOS Metal adapter"]
+fn native_44_1k_local_audio_resamples_to_48k_master_recording() {
+    let _hardware_lock = NATIVE_MEDIA_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let directory = tempfile::tempdir().unwrap();
+    if require_recording_tools().is_none() {
+        return;
+    }
+    let project_path = directory.path().join("record-44-1k.freemix");
+    let output_path = directory.path().join("program-48k.mp4");
+    if !prepare_native_project(&project_path) {
+        return;
+    }
+
+    let Some(mut daemon) = require_native_recorder(NativeDaemonProcess::start_recording(
+        &project_path,
+        &output_path,
+    )) else {
+        return;
+    };
+    let mut client = StudioClient::connect(daemon.address);
+    client.handshake();
+    thread::sleep(Duration::from_millis(1_500));
+    daemon.signal_terminate();
+    let output = daemon.wait_for(RECORDING_PROCESS_TIMEOUT);
+    drop(client);
+    assert!(
+        output.status.success(),
+        "44.1k recording daemon failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let audio = ffprobe_stream(&output_path, "a:0").unwrap();
+    assert_eq!(probe_value(&audio, "sample_rate"), "48000");
+    assert_eq!(probe_value(&audio, "channels"), "2");
+    assert!(probe_count(&audio, "nb_read_packets") > 0);
+    decode_recording(&output_path).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 #[ignore = "requires a native macOS Metal adapter"]
 fn native_generator_daemon_requires_neither_assets_nor_ffmpeg_tools() {
     let _hardware_lock = NATIVE_MEDIA_TEST_LOCK
@@ -1329,7 +1371,7 @@ fn generate_h264(path: &Path, first: &str, second: &str) -> Result<(), String> {
             "-f",
             "lavfi",
             "-i",
-            "aevalsrc=0.10*sin(2*PI*440*t)|0.05*sin(2*PI*660*t):s=48000:d=6",
+            "aevalsrc=0.10*sin(2*PI*440*t)|0.05*sin(2*PI*660*t):s=44100:d=6",
             "-filter_complex",
             "[0:v][1:v]blend=all_expr='if(lt(N,6),A,B)',setparams=range=limited:color_primaries=bt709:color_trc=bt709:colorspace=bt709[video]",
             "-map",

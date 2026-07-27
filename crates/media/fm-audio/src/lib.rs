@@ -12,7 +12,7 @@ use fm_types::{AudioFormat, ChannelLayout, FrameRate, InputId, SampleFormat, Sam
 mod synchronizer;
 
 pub use synchronizer::{
-    AudioCadenceOrigin, AudioSynchronizerError, AudioSynchronizerLimits,
+    AudioCadenceOrigin, AudioRenderPlan, AudioSynchronizerError, AudioSynchronizerLimits,
     AudioSynchronizerTelemetry, BufferLimit, ClockMappedAudioSynchronizer, MAX_SYNCHRONIZER_BLOCKS,
     MAX_SYNCHRONIZER_BYTES, MAX_SYNCHRONIZER_OUTPUT_SAMPLES, MAX_SYNCHRONIZER_SAMPLES,
     MasterAudioInterval, SynchronizerDiscontinuity, SynchronizerLimit,
