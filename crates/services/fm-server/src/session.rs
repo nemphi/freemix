@@ -167,7 +167,9 @@ impl Session {
 
         let class = match command.payload {
             CommandPayload::SelectPreview { .. } => CommandClass::SelectPreview,
-            CommandPayload::Cut | CommandPayload::Fade { .. } => CommandClass::Transition,
+            CommandPayload::Cut | CommandPayload::Fade { .. } | CommandPayload::Wipe { .. } => {
+                CommandClass::Transition
+            }
         };
         self.policy.authorize(&self.principal, class)?;
 

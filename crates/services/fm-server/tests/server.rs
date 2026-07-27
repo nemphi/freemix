@@ -228,6 +228,40 @@ fn desired_role_and_commands_are_authorized_to_the_granted_scope() {
 }
 
 #[test]
+fn wipe_uses_transition_authorization_and_fade_rate_accounting() {
+    let server = ready_server(config());
+    let wipe = command(CommandPayload::Wipe { duration_frames: 3 });
+    let mut viewer = server
+        .handshake(&hello(Role::Viewer, None), &principal(AuthRole::Viewer), 0)
+        .unwrap()
+        .session;
+    assert!(matches!(
+        viewer.admit_command(&wipe, 10, 0),
+        Err(SessionError::Authorization(_))
+    ));
+
+    let limits = SessionLimits {
+        inbound_commands: RateLimit::new(1, 100),
+        ..SessionLimits::default()
+    };
+    let server = ready_server(config().with_session_limits(limits));
+    let mut operator = server
+        .handshake(
+            &hello(Role::Operator, None),
+            &principal(AuthRole::Operator),
+            0,
+        )
+        .unwrap()
+        .session;
+    operator.admit_command(&wipe, 10, 0).unwrap();
+    operator.command_completed().unwrap();
+    assert_eq!(
+        operator.admit_command(&command(CommandPayload::Fade { duration_frames: 3 }), 10, 0,),
+        Err(SessionError::InboundRateLimited)
+    );
+}
+
+#[test]
 fn heartbeat_tracks_cursor_and_times_out() {
     let server = ready_server(config());
     let mut session = server

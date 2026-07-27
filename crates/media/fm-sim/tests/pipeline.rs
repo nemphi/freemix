@@ -2,7 +2,7 @@ use fm_sim::{
     PipelineConfigError, RegistryError, RenderError, Rgba8, SimulatedPipeline, SimulatedSource,
     SourcePattern,
 };
-use fm_switcher::ProgramFrame;
+use fm_switcher::{ProgramFrame, TransitionKind};
 use fm_types::InputId;
 use std::num::NonZeroU128;
 
@@ -14,6 +14,7 @@ fn program(primary: InputId) -> ProgramFrame {
     ProgramFrame {
         primary,
         secondary: None,
+        transition_kind: None,
         mix_numerator: 0,
         mix_denominator: 1,
         mix_start_numerator: 0,
@@ -78,6 +79,7 @@ fn cut_program_frame_renders_only_primary_source() {
             ProgramFrame {
                 primary: input(1),
                 secondary: Some(input(1)),
+                transition_kind: None,
                 mix_numerator: u32::MAX,
                 mix_denominator: 0,
                 mix_start_numerator: u32::MAX,
@@ -102,6 +104,7 @@ fn fade_renders_exact_endpoints_and_intermediate_mix() {
     let frame = |numerator| ProgramFrame {
         primary: input(1),
         secondary: Some(input(2)),
+        transition_kind: Some(TransitionKind::Fade),
         mix_numerator: numerator,
         mix_denominator: 2,
         mix_start_numerator: numerator,
@@ -159,6 +162,7 @@ fn missing_primary_and_secondary_sources_are_structured_errors() {
             ProgramFrame {
                 primary: input(1),
                 secondary: Some(input(9)),
+                transition_kind: Some(TransitionKind::Fade),
                 mix_numerator: 1,
                 mix_denominator: 2,
                 mix_start_numerator: 1,
