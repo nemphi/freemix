@@ -19,6 +19,11 @@ struct ReceiveStatus {
     timed_out: bool,
 }
 
+struct PollCancellation<'a> {
+    interval: Duration,
+    cancelled: &'a mut dyn FnMut() -> bool,
+}
+
 /// An error from the raw newline-delimited TCP connection.
 #[derive(Debug)]
 pub enum TcpConnectionError {
@@ -83,40 +88,29 @@ impl TcpConnection {
     fn connect_cancellable(
         address: SocketAddr,
         connect_timeout: Duration,
-        poll_interval: Duration,
         cancelled: &mut impl FnMut() -> bool,
     ) -> Result<Option<Self>, TcpConnectionError> {
-        let deadline = Instant::now().checked_add(connect_timeout).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "TCP connect timeout is too large",
-            )
-        })?;
-        loop {
-            if cancelled() {
-                return Ok(None);
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(
-                    io::Error::new(io::ErrorKind::TimedOut, "TCP connect timed out").into(),
-                );
-            }
-            let attempt_timeout = if poll_interval.is_zero() {
-                remaining
-            } else {
-                remaining.min(poll_interval)
-            };
-            match TcpStream::connect_timeout(&address, attempt_timeout) {
-                Ok(reader) => return Self::from_stream(reader).map(Some),
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-                    ) => {}
-                Err(error) => return Err(error.into()),
-            }
+        Self::connect_cancellable_with(connect_timeout, cancelled, |timeout| {
+            TcpStream::connect_timeout(&address, timeout)
+        })
+    }
+
+    fn connect_cancellable_with(
+        connect_timeout: Duration,
+        cancelled: &mut impl FnMut() -> bool,
+        connect: impl FnOnce(Duration) -> io::Result<TcpStream>,
+    ) -> Result<Option<Self>, TcpConnectionError> {
+        if cancelled() {
+            return Ok(None);
         }
+        let result = connect(connect_timeout);
+        if cancelled() {
+            if let Ok(stream) = result {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+            return Ok(None);
+        }
+        Self::from_stream(result?).map(Some)
     }
 
     fn from_stream(reader: TcpStream) -> Result<Self, TcpConnectionError> {
@@ -147,8 +141,18 @@ impl TcpConnection {
     /// writing fails.
     pub fn send(&mut self, message: &WireMessage) -> Result<(), TcpConnectionError> {
         let encoded = encode_line(message)?;
+        self.writer.set_write_timeout(None)?;
         self.writer.write_all(encoded.as_bytes())?;
         Ok(())
+    }
+
+    fn send_cancellable(
+        &mut self,
+        message: &WireMessage,
+        wait: &mut PollCancellation<'_>,
+    ) -> Result<bool, TcpConnectionError> {
+        let encoded = encode_line(message)?;
+        self.write_all_cancellable(encoded.as_bytes(), wait)
     }
 
     /// Flushes records previously written with [`Self::send`].
@@ -157,8 +161,77 @@ impl TcpConnection {
     ///
     /// Returns an I/O error when the socket cannot be flushed.
     pub fn flush(&mut self) -> Result<(), TcpConnectionError> {
+        self.writer.set_write_timeout(None)?;
         self.writer.flush()?;
         Ok(())
+    }
+
+    fn flush_cancellable(
+        &mut self,
+        wait: &mut PollCancellation<'_>,
+    ) -> Result<bool, TcpConnectionError> {
+        let result = loop {
+            if (wait.cancelled)() {
+                break Ok(false);
+            }
+            self.writer
+                .set_write_timeout(Some(nonzero_interval(wait.interval)))?;
+            match self.writer.flush() {
+                Ok(()) => break Ok(true),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) => {}
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => break Err(error.into()),
+            }
+        };
+        self.reset_write_timeout(result)
+    }
+
+    fn write_all_cancellable(
+        &mut self,
+        bytes: &[u8],
+        wait: &mut PollCancellation<'_>,
+    ) -> Result<bool, TcpConnectionError> {
+        let mut written = 0;
+        let result = loop {
+            if (wait.cancelled)() {
+                break Ok(false);
+            }
+            self.writer
+                .set_write_timeout(Some(nonzero_interval(wait.interval)))?;
+            match self.writer.write(&bytes[written..]) {
+                Ok(0) => break Err(io::Error::from(io::ErrorKind::WriteZero).into()),
+                Ok(count) => {
+                    written += count;
+                    if written == bytes.len() {
+                        break Ok(true);
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) => {}
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => break Err(error.into()),
+            }
+        };
+        self.reset_write_timeout(result)
+    }
+
+    fn reset_write_timeout<T>(
+        &self,
+        result: Result<T, TcpConnectionError>,
+    ) -> Result<T, TcpConnectionError> {
+        let reset = self.writer.set_write_timeout(None);
+        match (result, reset) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error.into()),
+            (Ok(value), Ok(())) => Ok(value),
+        }
     }
 
     /// Reads one decoded message, or `None` for a clean EOF.
@@ -287,6 +360,7 @@ pub enum SessionEvent {
 #[derive(Debug)]
 pub enum TcpSessionError {
     Client(ClientError),
+    ResyncRequired(Box<ClientError>),
     Codec(CodecError),
     Disconnected {
         cause: DisconnectCause,
@@ -305,6 +379,7 @@ impl fmt::Display for TcpSessionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Client(error) => error.fmt(formatter),
+            Self::ResyncRequired(error) => error.fmt(formatter),
             Self::Codec(error) => error.fmt(formatter),
             Self::Disconnected { cause, backoff } => write!(
                 formatter,
@@ -330,6 +405,7 @@ impl std::error::Error for TcpSessionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Client(error) => Some(error),
+            Self::ResyncRequired(error) => Some(error.as_ref()),
             Self::Codec(error) => Some(error),
             Self::Disconnected { .. }
             | Self::ExpectedHandshake
@@ -414,12 +490,16 @@ impl TcpSession {
         self.prepare_connect()?;
         let connection =
             self.connection_result(TcpConnection::connect(address, connect_timeout))?;
-        self.finish_connect(connection, Self::read_wire)
+        self.finish_connect(connection, None)
     }
 
     /// Connects and synchronizes while polling for caller-requested cancellation.
     /// A cancelled wait closes the transport and enters reconnect backoff. Partial
     /// framed reads remain intact between polls until completion or cancellation.
+    /// TCP establishment uses one attempt with `connect_timeout`; cancellation
+    /// is checked before and after that attempt, so shutdown latency during the
+    /// attempt is finite but may be as long as `connect_timeout`. Once connected,
+    /// all protocol reads and writes poll at `poll_interval`.
     ///
     /// # Errors
     ///
@@ -433,18 +513,16 @@ impl TcpSession {
         mut cancelled: impl FnMut() -> bool,
     ) -> Result<SessionEvent, TcpSessionError> {
         self.prepare_connect()?;
-        let connection = TcpConnection::connect_cancellable(
-            address,
-            connect_timeout,
-            poll_interval,
-            &mut cancelled,
-        );
+        let connection =
+            TcpConnection::connect_cancellable(address, connect_timeout, &mut cancelled);
         let Some(connection) = self.connection_result(connection)? else {
             return Err(self.cancelled());
         };
-        self.finish_connect(connection, |session| {
-            session.read_wire_cancellable(poll_interval, &mut cancelled)
-        })
+        let mut wait = PollCancellation {
+            interval: poll_interval,
+            cancelled: &mut cancelled,
+        };
+        self.finish_connect(connection, Some(&mut wait))
     }
 
     fn prepare_connect(&mut self) -> Result<(), TcpSessionError> {
@@ -471,15 +549,15 @@ impl TcpSession {
     fn finish_connect(
         &mut self,
         connection: TcpConnection,
-        mut read: impl FnMut(&mut Self) -> Result<Option<WireMessage>, TcpSessionError>,
+        mut wait: Option<&mut PollCancellation<'_>>,
     ) -> Result<SessionEvent, TcpSessionError> {
         self.connection = Some(connection);
 
         let request = self.client.transport_connected()?;
-        self.send_wire(&WireMessage::HandshakeRequest(request))?;
-        self.flush_wire()?;
+        self.send_wire_wait(&WireMessage::HandshakeRequest(request), wait.as_deref_mut())?;
+        self.flush_wire_wait(wait.as_deref_mut())?;
 
-        let Some(first) = read(self)? else {
+        let Some(first) = self.read_wire_wait(wait.as_deref_mut())? else {
             return Err(self.disconnected(DisconnectCause::Eof));
         };
         let WireMessage::HandshakeResponse(response) = first else {
@@ -493,21 +571,19 @@ impl TcpSession {
             HandshakeOutcome::Resume { .. } => SyncMode::Resume,
         };
         if let Err(error) = self.client.intake(WireMessage::HandshakeResponse(response)) {
-            self.transition_disconnect();
-            return Err(TcpSessionError::Client(error));
+            return Err(self.connect_client_error(error));
         }
 
         while self.client.state() != &crate::ConnectionState::Ready {
-            let Some(message) = read(self)? else {
+            let Some(message) = self.read_wire_wait(wait.as_deref_mut())? else {
                 return Err(self.disconnected(DisconnectCause::Eof));
             };
             if let Err(error) = self.client.intake(message) {
-                self.transition_disconnect();
-                return Err(TcpSessionError::Client(error));
+                return Err(self.connect_client_error(error));
             }
         }
 
-        self.retry_unresolved()?;
+        self.retry_unresolved(wait)?;
         Ok(SessionEvent::Connected { mode })
     }
 
@@ -550,6 +626,33 @@ impl TcpSession {
     /// Returns an error when disconnected or when encoding, writing, or
     /// flushing a record fails.
     pub fn flush(&mut self) -> Result<usize, TcpSessionError> {
+        self.flush_with(None)
+    }
+
+    /// Flushes queued records while polling all writes for cancellation.
+    /// If a frame is partially written, cancellation closes the connection so
+    /// the retained command is retried as a complete frame after reconnect.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::flush`], or
+    /// [`TcpSessionError::Cancelled`] when `cancelled` returns `true`.
+    pub fn flush_cancellable(
+        &mut self,
+        poll_interval: Duration,
+        mut cancelled: impl FnMut() -> bool,
+    ) -> Result<usize, TcpSessionError> {
+        let mut wait = PollCancellation {
+            interval: poll_interval,
+            cancelled: &mut cancelled,
+        };
+        self.flush_with(Some(&mut wait))
+    }
+
+    fn flush_with(
+        &mut self,
+        mut wait: Option<&mut PollCancellation<'_>>,
+    ) -> Result<usize, TcpSessionError> {
         if self.connection.is_none() {
             return Err(TcpSessionError::NotConnected);
         }
@@ -576,10 +679,10 @@ impl TcpSession {
                 }
                 Outbound::Heartbeat(heartbeat) => WireMessage::Heartbeat(heartbeat),
             };
-            self.send_wire(&message)?;
+            self.send_wire_wait(&message, wait.as_deref_mut())?;
             flushed += 1;
         }
-        self.flush_wire()?;
+        self.flush_wire_wait(wait)?;
         Ok(flushed)
     }
 
@@ -606,7 +709,11 @@ impl TcpSession {
         poll_interval: Duration,
         mut cancelled: impl FnMut() -> bool,
     ) -> Result<SessionEvent, TcpSessionError> {
-        let message = self.read_wire_cancellable(poll_interval, &mut cancelled)?;
+        let mut wait = PollCancellation {
+            interval: poll_interval,
+            cancelled: &mut cancelled,
+        };
+        let message = self.read_wire_wait(Some(&mut wait))?;
         self.handle_received(message)
     }
 
@@ -640,11 +747,11 @@ impl TcpSession {
             WireMessage::DurableGap(gap) => {
                 let result = self.client.intake(WireMessage::DurableGap(gap.clone()));
                 if let Err(error) = result {
-                    self.transition_disconnect();
                     if matches!(error, ClientError::ResyncRequired { .. }) {
+                        self.transition_disconnect();
                         return Ok(SessionEvent::DurableGap { gap });
                     }
-                    return Err(TcpSessionError::Client(error));
+                    return Err(self.client_error(error));
                 }
                 Ok(SessionEvent::DurableGap { gap })
             }
@@ -670,7 +777,10 @@ impl TcpSession {
         Some(self.transition_disconnect())
     }
 
-    fn retry_unresolved(&mut self) -> Result<(), TcpSessionError> {
+    fn retry_unresolved(
+        &mut self,
+        mut wait: Option<&mut PollCancellation<'_>>,
+    ) -> Result<(), TcpSessionError> {
         let ids = self.sent_commands.clone();
         for id in ids {
             let Some(record) = self.client.command(&id) else {
@@ -682,19 +792,27 @@ impl TcpSession {
                 continue;
             }
             let message = WireMessage::Command(record.command.clone());
-            self.send_wire(&message)?;
+            self.send_wire_wait(&message, wait.as_deref_mut())?;
         }
-        self.flush_wire()
+        self.flush_wire_wait(wait)
     }
 
-    fn send_wire(&mut self, message: &WireMessage) -> Result<(), TcpSessionError> {
-        let result = self
+    fn send_wire_wait(
+        &mut self,
+        message: &WireMessage,
+        wait: Option<&mut PollCancellation<'_>>,
+    ) -> Result<(), TcpSessionError> {
+        let connection = self
             .connection
             .as_mut()
-            .ok_or(TcpSessionError::NotConnected)?
-            .send(message);
+            .ok_or(TcpSessionError::NotConnected)?;
+        let result = match wait {
+            Some(wait) => connection.send_cancellable(message, wait),
+            None => connection.send(message).map(|()| true),
+        };
         match result {
-            Ok(()) => Ok(()),
+            Ok(true) => Ok(()),
+            Ok(false) => Err(self.cancelled()),
             Err(TcpConnectionError::Io(error)) => {
                 Err(self.disconnected(DisconnectCause::Io(error.kind())))
             }
@@ -702,14 +820,21 @@ impl TcpSession {
         }
     }
 
-    fn flush_wire(&mut self) -> Result<(), TcpSessionError> {
-        let result = self
+    fn flush_wire_wait(
+        &mut self,
+        wait: Option<&mut PollCancellation<'_>>,
+    ) -> Result<(), TcpSessionError> {
+        let connection = self
             .connection
             .as_mut()
-            .ok_or(TcpSessionError::NotConnected)?
-            .flush();
+            .ok_or(TcpSessionError::NotConnected)?;
+        let result = match wait {
+            Some(wait) => connection.flush_cancellable(wait),
+            None => connection.flush().map(|()| true),
+        };
         match result {
-            Ok(()) => Ok(()),
+            Ok(true) => Ok(()),
+            Ok(false) => Err(self.cancelled()),
             Err(TcpConnectionError::Io(error)) => {
                 Err(self.disconnected(DisconnectCause::Io(error.kind())))
             }
@@ -718,37 +843,38 @@ impl TcpSession {
     }
 
     fn read_wire(&mut self) -> Result<Option<WireMessage>, TcpSessionError> {
-        let result = self
-            .connection
-            .as_mut()
-            .ok_or(TcpSessionError::NotConnected)?
-            .receive();
-        match result {
-            Ok(message) => Ok(message),
-            Err(TcpConnectionError::Io(error)) => {
-                Err(self.disconnected(DisconnectCause::Io(error.kind())))
-            }
-            Err(TcpConnectionError::Codec(error)) => {
-                self.transition_disconnect();
-                Err(TcpSessionError::Codec(error))
-            }
-        }
+        self.read_wire_wait(None)
     }
 
-    fn read_wire_cancellable(
+    fn read_wire_wait(
         &mut self,
-        poll_interval: Duration,
-        cancelled: &mut impl FnMut() -> bool,
+        mut wait: Option<&mut PollCancellation<'_>>,
     ) -> Result<Option<WireMessage>, TcpSessionError> {
         loop {
-            if cancelled() {
+            if let Some(wait) = wait.as_deref_mut()
+                && (wait.cancelled)()
+            {
                 return Err(self.cancelled());
             }
-            let result = self
+            let connection = self
                 .connection
                 .as_mut()
-                .ok_or(TcpSessionError::NotConnected)?
-                .receive_timeout(poll_interval);
+                .ok_or(TcpSessionError::NotConnected)?;
+            let result = if let Some(wait) = wait.as_deref_mut() {
+                connection.receive_timeout(wait.interval)
+            } else {
+                let result = connection.receive();
+                return match result {
+                    Ok(message) => Ok(message),
+                    Err(TcpConnectionError::Io(error)) => {
+                        Err(self.disconnected(DisconnectCause::Io(error.kind())))
+                    }
+                    Err(TcpConnectionError::Codec(error)) => {
+                        self.transition_disconnect();
+                        Err(TcpSessionError::Codec(error))
+                    }
+                };
+            };
             match result {
                 Ok(ReceiveStatus {
                     message,
@@ -769,12 +895,35 @@ impl TcpSession {
     }
 
     fn intake(&mut self, message: WireMessage) -> Result<Intake, TcpSessionError> {
-        self.client.intake(message).map_err(|error| {
-            if matches!(error, ClientError::ResyncRequired { .. }) {
-                self.transition_disconnect();
-            }
+        match self.client.intake(message) {
+            Ok(intake) => Ok(intake),
+            Err(error) => Err(self.client_error(error)),
+        }
+    }
+
+    fn client_error(&mut self, error: ClientError) -> TcpSessionError {
+        if matches!(
+            self.client.state(),
+            crate::ConnectionState::ResyncRequired { .. }
+        ) {
+            self.transition_disconnect();
+            TcpSessionError::ResyncRequired(Box::new(error))
+        } else {
             TcpSessionError::Client(error)
-        })
+        }
+    }
+
+    fn connect_client_error(&mut self, error: ClientError) -> TcpSessionError {
+        let resync = matches!(
+            self.client.state(),
+            crate::ConnectionState::ResyncRequired { .. }
+        );
+        self.transition_disconnect();
+        if resync {
+            TcpSessionError::ResyncRequired(Box::new(error))
+        } else {
+            TcpSessionError::Client(error)
+        }
     }
 
     fn cancelled(&mut self) -> TcpSessionError {
@@ -796,5 +945,106 @@ impl TcpSession {
 fn result_id(result: &CommandResult) -> &str {
     match result {
         CommandResult::Accepted { id, .. } | CommandResult::Rejected { id, .. } => id,
+    }
+}
+
+fn nonzero_interval(interval: Duration) -> Duration {
+    if interval.is_zero() {
+        Duration::from_millis(1)
+    } else {
+        interval
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io::Read,
+        net::{TcpListener, TcpStream},
+        sync::mpsc,
+        thread,
+    };
+
+    use super::*;
+
+    #[test]
+    fn cancellable_connect_allows_latency_beyond_poll_interval() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || listener.accept().unwrap());
+        let mut checks = 0;
+        let started = Instant::now();
+
+        let connection = TcpConnection::connect_cancellable_with(
+            Duration::from_secs(1),
+            &mut || {
+                checks += 1;
+                false
+            },
+            |timeout| {
+                thread::sleep(Duration::from_millis(75));
+                TcpStream::connect_timeout(&address, timeout)
+            },
+        )
+        .unwrap();
+
+        assert!(connection.is_some());
+        assert_eq!(checks, 2, "connect was split into abandoned attempts");
+        assert!(started.elapsed() >= Duration::from_millis(75));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn blocked_write_observes_cancellation_within_one_poll() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            release_rx.recv().unwrap();
+        });
+        let mut connection = TcpConnection::connect(address, Duration::from_secs(1)).unwrap();
+        let bytes = vec![b'x'; 64 * 1024 * 1024];
+        let started = Instant::now();
+        let mut cancelled = || started.elapsed() >= Duration::from_millis(100);
+        let mut wait = PollCancellation {
+            interval: Duration::from_millis(10),
+            cancelled: &mut cancelled,
+        };
+
+        assert!(!connection.write_all_cancellable(&bytes, &mut wait).unwrap());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        connection.shutdown();
+        release_tx.send(()).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn timed_writes_resume_without_repeating_partial_bytes() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            thread::sleep(Duration::from_millis(100));
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).unwrap();
+            received
+        });
+        let mut connection = TcpConnection::connect(address, Duration::from_secs(1)).unwrap();
+        let mut bytes = vec![b'x'; 16 * 1024 * 1024];
+        bytes.push(b'\n');
+        let mut checks = 0;
+        let mut wait = PollCancellation {
+            interval: Duration::from_millis(10),
+            cancelled: &mut || {
+                checks += 1;
+                false
+            },
+        };
+
+        assert!(connection.write_all_cancellable(&bytes, &mut wait).unwrap());
+        connection.shutdown();
+        assert_eq!(server.join().unwrap(), bytes);
+        assert!(checks > 1, "large frame completed without a partial write");
     }
 }

@@ -328,6 +328,19 @@ impl StudioRuntime {
         Ok(self.session.flush()?)
     }
 
+    /// Sends queued records while polling writes for cancellation.
+    ///
+    /// # Errors
+    ///
+    /// Propagates transport, codec, and cancellation errors.
+    pub fn flush_cancellable(
+        &mut self,
+        poll_interval: Duration,
+        cancelled: impl FnMut() -> bool,
+    ) -> Result<usize, StudioError> {
+        Ok(self.session.flush_cancellable(poll_interval, cancelled)?)
+    }
+
     /// Queues and immediately flushes a heartbeat using caller-supplied time.
     ///
     /// # Errors
@@ -336,6 +349,22 @@ impl StudioRuntime {
     pub fn send_heartbeat(&mut self, sent_at_ms: u64) -> Result<HeartbeatMessage, StudioError> {
         let heartbeat = self.session.queue_heartbeat(sent_at_ms)?;
         self.session.flush()?;
+        Ok(heartbeat)
+    }
+
+    /// Queues a heartbeat and flushes it with cancellable writes.
+    ///
+    /// # Errors
+    ///
+    /// Propagates client, transport, codec, and cancellation errors.
+    pub fn send_heartbeat_cancellable(
+        &mut self,
+        sent_at_ms: u64,
+        poll_interval: Duration,
+        cancelled: impl FnMut() -> bool,
+    ) -> Result<HeartbeatMessage, StudioError> {
+        let heartbeat = self.session.queue_heartbeat(sent_at_ms)?;
+        self.session.flush_cancellable(poll_interval, cancelled)?;
         Ok(heartbeat)
     }
 

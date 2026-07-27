@@ -20,6 +20,7 @@ use fm_protocol::{
     WireMessage, encode_line,
 };
 use fm_types::ProjectId;
+use fm_ui_model::ModelError;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -475,7 +476,7 @@ fn silent_handshake_can_be_cancelled_without_waiting_for_peer_eof() {
     let result =
         session.connect_cancellable(address, CONNECT_TIMEOUT, Duration::from_millis(10), || {
             polls += 1;
-            polls >= 3
+            polls >= 7
         });
     request_rx.recv().unwrap();
     assert!(matches!(
@@ -627,15 +628,74 @@ fn event_gap_forces_snapshot_and_preserves_unresolved_command() {
         .unwrap();
     session.flush().unwrap();
     assert_eq!(original_rx.recv().unwrap(), command);
-    assert!(matches!(
-        session.receive(),
-        Err(TcpSessionError::Client(ClientError::ResyncRequired {
-            expected_revision: 5,
-            received_revision: 6,
-        }))
-    ));
+    assert!(
+        matches!(session.receive(), Err(TcpSessionError::ResyncRequired(error))
+        if matches!(error.as_ref(), ClientError::ResyncRequired {
+                expected_revision: 5,
+                received_revision: 6,
+            }))
+    );
     assert_eq!(session.in_flight_len(), 1);
     assert_eq!(session.reconnect_backoff().unwrap().attempt, 1);
+    assert!(matches!(
+        session.connect(address, CONNECT_TIMEOUT).unwrap(),
+        SessionEvent::Connected {
+            mode: SyncMode::Snapshot
+        }
+    ));
+    server_thread.join().unwrap();
+}
+
+#[test]
+fn model_error_forces_snapshot_and_preserves_unresolved_command() {
+    let (address, server_thread) = spawn_server(move |listener| {
+        let mut first = Peer::accept(&listener);
+        accept_snapshot(&mut first, 4);
+        let WireMessage::Command(original) = first.receive() else {
+            panic!("expected original command")
+        };
+        first.send(&WireMessage::Event(EventMessage {
+            cursor: EventCursor {
+                engine: engine(),
+                revision: 5,
+            },
+            payload: EventPayload::DesiredSwitcher {
+                program: input(1),
+                preview: input(99),
+            },
+        }));
+        assert_eq!(first.stream.read(&mut [0_u8; 1]).unwrap(), 0);
+
+        let mut second = Peer::accept(&listener);
+        let WireMessage::HandshakeRequest(request) = second.receive() else {
+            panic!("expected snapshot reconnect")
+        };
+        assert_eq!(request.resume_cursor, None);
+        second.send(&WireMessage::HandshakeResponse(handshake(
+            5,
+            HandshakeOutcome::Snapshot {
+                reason: SnapshotReason::HistoryUnavailable,
+            },
+        )));
+        second.send(&WireMessage::Snapshot(snapshot(5)));
+        let WireMessage::Command(retried) = second.receive() else {
+            panic!("expected unresolved command retry")
+        };
+        assert_eq!(retried, original);
+    });
+
+    let mut session = TcpSession::new(client(2));
+    session.connect(address, CONNECT_TIMEOUT).unwrap();
+    session
+        .queue_command(CommandPayload::Cut, "model-error", Some(4), None)
+        .unwrap();
+    session.flush().unwrap();
+    assert!(
+        matches!(session.receive(), Err(TcpSessionError::ResyncRequired(error))
+        if matches!(error.as_ref(), ClientError::Model(ModelError::UnknownInput(value))
+            if *value == input(99).to_domain()))
+    );
+    assert_eq!(session.in_flight_len(), 1);
     assert!(matches!(
         session.connect(address, CONNECT_TIMEOUT).unwrap(),
         SessionEvent::Connected {

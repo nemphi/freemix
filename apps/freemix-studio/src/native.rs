@@ -288,26 +288,33 @@ impl WorkerRecovery {
         publisher: &StatePublisher,
     ) -> bool {
         if self.deferred_intents.len() == DEFERRED_INTENT_CAPACITY {
-            self.visible_error = Some("Studio deferred command queue is full".to_owned());
-            return publish_runtime(runtime, publisher, self.visible_error.clone());
+            self.deferred_rejections = self.deferred_rejections.saturating_add(1);
+            return publish_runtime(runtime, publisher, self.error());
         }
         self.deferred_intents.push_back(intent);
-        publish_deferred_runtime(runtime, publisher, self.deferred_intents.len())
+        publish_deferred_runtime(
+            runtime,
+            publisher,
+            self.deferred_intents.len(),
+            self.error(),
+        )
     }
 
-    fn report_deferred_rejections(&mut self) {
-        if self.deferred_rejections == 0 {
-            return;
-        }
-        let rejected = self.deferred_rejections;
-        self.deferred_rejections = 0;
-        let message = format!(
-            "Rejected {rejected} command(s): Studio deferred command queue reached capacity {DEFERRED_INTENT_CAPACITY}"
-        );
-        self.visible_error = Some(match self.visible_error.take() {
-            Some(existing) => format!("{existing}; {message}"),
-            None => message,
-        });
+    fn error(&self) -> Option<String> {
+        combined_error(self.visible_error.clone(), self.deferred_rejections)
+    }
+}
+
+fn combined_error(transient: Option<String>, deferred_rejections: usize) -> Option<String> {
+    let overflow = (deferred_rejections > 0).then(|| {
+        format!(
+            "Rejected {deferred_rejections} command(s): Studio deferred command queue reached capacity {DEFERRED_INTENT_CAPACITY}"
+        )
+    });
+    match (transient, overflow) {
+        (Some(transient), Some(overflow)) => Some(format!("{transient}; {overflow}")),
+        (Some(transient), None) => Some(transient),
+        (None, overflow) => overflow,
     }
 }
 
@@ -378,14 +385,11 @@ fn start_worker_runtime(
 }
 
 fn startup_failure_message(error: &crate::StudioError, deferred_rejections: usize) -> String {
-    let message = format!("Studio startup failed: {error}");
-    if deferred_rejections == 0 {
-        message
-    } else {
-        format!(
-            "{message}; Rejected {deferred_rejections} command(s): Studio deferred command queue reached capacity {DEFERRED_INTENT_CAPACITY}"
-        )
-    }
+    combined_error(
+        Some(format!("Studio startup failed: {error}")),
+        deferred_rejections,
+    )
+    .expect("startup failure always has an error")
 }
 
 fn initialize_worker(
@@ -413,7 +417,11 @@ fn initialize_worker(
             return None;
         }
     };
-    if !publish_runtime(&mut runtime, publisher, None) {
+    if !publish_runtime(
+        &mut runtime,
+        publisher,
+        combined_error(None, deferred_rejections),
+    ) {
         return None;
     }
     let connect_result = connect_worker(
@@ -434,8 +442,7 @@ fn initialize_worker(
     let mut recovery = WorkerRecovery::new(visible_error, reconnect_wait);
     recovery.deferred_intents = deferred_intents;
     recovery.deferred_rejections = deferred_rejections;
-    recovery.report_deferred_rejections();
-    if !publish_runtime(&mut runtime, publisher, recovery.visible_error.clone()) {
+    if !publish_runtime(&mut runtime, publisher, recovery.error()) {
         return None;
     }
     Some((runtime, recovery))
@@ -520,31 +527,25 @@ fn handle_worker_intent(
     publisher: &StatePublisher,
     recovery: &mut WorkerRecovery,
 ) -> bool {
-    let command_id = match begin_intent(runtime, intent, keys, publisher) {
+    let command_id = match begin_intent(runtime, intent, keys, publisher, recovery.error()) {
         Ok(command_id) => command_id,
         Err(error) => {
             recovery.visible_error = Some(error);
-            return publish_runtime(runtime, publisher, recovery.visible_error.clone());
+            return publish_runtime(runtime, publisher, recovery.error());
         }
     };
-    recovery.pending_command = Some(command_id);
-    let result = runtime
-        .flush()
-        .map_err(|error| worker_error("Could not send command", &error))
-        .and_then(|_| {
-            consume_command_sequence(
-                runtime,
-                recovery
-                    .pending_command
-                    .as_deref()
-                    .expect("pending command"),
-                publisher,
-                true,
-                requests,
-                &mut recovery.deferred_intents,
-                &mut recovery.deferred_rejections,
-            )
-        });
+    recovery.pending_command = Some(command_id.clone());
+    let result = flush_worker(runtime, requests, recovery).and_then(|()| {
+        consume_command_sequence(
+            runtime,
+            &command_id,
+            publisher,
+            true,
+            requests,
+            &mut recovery.deferred_intents,
+            &mut recovery.deferred_rejections,
+        )
+    });
     match result {
         Ok(()) => {
             recovery.pending_command = None;
@@ -564,9 +565,31 @@ fn handle_worker_intent(
             };
         }
     }
-    recovery.report_deferred_rejections();
-    recovery.visible_error.is_none()
-        || publish_runtime(runtime, publisher, recovery.visible_error.clone())
+    recovery.error().is_none() || publish_runtime(runtime, publisher, recovery.error())
+}
+
+fn flush_worker(
+    runtime: &mut StudioRuntime,
+    requests: &Receiver<WorkerRequest>,
+    recovery: &mut WorkerRecovery,
+) -> Result<(), WorkerFailure> {
+    let started = Instant::now();
+    let mut shutdown = false;
+    let result = runtime.flush_cancellable(IO_POLL_INTERVAL, || {
+        shutdown = cancellation_requested(
+            requests,
+            &mut recovery.deferred_intents,
+            &mut recovery.deferred_rejections,
+        );
+        shutdown || started.elapsed() >= PEER_WAIT_TIMEOUT
+    });
+    if shutdown {
+        Err(WorkerFailure::Shutdown)
+    } else {
+        result
+            .map(|_| ())
+            .map_err(|error| worker_error("Could not send command", &error))
+    }
 }
 
 fn handle_worker_timeout(
@@ -598,60 +621,14 @@ fn handle_worker_timeout(
                 if mode == SyncMode::Snapshot {
                     recovery.realization_uncertain = false;
                 }
-                if !recovery.realization_uncertain && !publish_runtime(runtime, publisher, None) {
+                if !recovery.realization_uncertain
+                    && !publish_runtime(runtime, publisher, recovery.error())
+                {
                     return false;
                 }
 
-                if let Some(command_id) = recovery.pending_command.as_deref() {
-                    let completed = runtime
-                        .session()
-                        .client()
-                        .command(command_id)
-                        .is_some_and(|record| matches!(record.status, CommandStatus::Completed(_)));
-                    let result = if completed {
-                        Ok(())
-                    } else {
-                        consume_command_sequence(
-                            runtime,
-                            command_id,
-                            publisher,
-                            !recovery.realization_uncertain,
-                            requests,
-                            &mut recovery.deferred_intents,
-                            &mut recovery.deferred_rejections,
-                        )
-                    };
-                    match result {
-                        Ok(()) => recovery.pending_command = None,
-                        Err(WorkerFailure::Shutdown) => return false,
-                        Err(error) => {
-                            recovery.visible_error = Some(error.message().to_owned());
-                            if error.invalidates_realization() {
-                                recovery.realization_uncertain = true;
-                            }
-                            recovery.reconnect_wait = if error.is_recoverable() {
-                                ReconnectWait::from_runtime(runtime)
-                            } else {
-                                recovery.pending_command = None;
-                                None
-                            };
-                        }
-                    }
-                }
-                if recovery.reconnect_wait.is_none() && recovery.realization_uncertain {
-                    match require_snapshot_reconnect(runtime) {
-                        Ok(wait) => {
-                            recovery.reconnect_wait = Some(wait);
-                            recovery.visible_error = Some(
-                                "Runtime realization changed during reconnect; requesting snapshot"
-                                    .to_owned(),
-                            );
-                        }
-                        Err(error) => {
-                            recovery.visible_error = Some(error.message().to_owned());
-                            recovery.pending_command = None;
-                        }
-                    }
+                if !resume_pending_command(runtime, requests, publisher, recovery) {
+                    return false;
                 }
             }
             Ok(other) => {
@@ -672,15 +649,81 @@ fn handle_worker_timeout(
                 };
             }
         }
-        recovery.report_deferred_rejections();
-        return publish_runtime(runtime, publisher, recovery.visible_error.clone());
+        return publish_runtime(runtime, publisher, recovery.error());
     }
 
-    handle_heartbeat_timeout(runtime, publisher, recovery, next_heartbeat, started)
+    handle_heartbeat_timeout(
+        runtime,
+        requests,
+        publisher,
+        recovery,
+        next_heartbeat,
+        started,
+    )
+}
+
+fn resume_pending_command(
+    runtime: &mut StudioRuntime,
+    requests: &Receiver<WorkerRequest>,
+    publisher: &StatePublisher,
+    recovery: &mut WorkerRecovery,
+) -> bool {
+    if let Some(command_id) = recovery.pending_command.clone() {
+        let completed = runtime
+            .session()
+            .client()
+            .command(&command_id)
+            .is_some_and(|record| matches!(record.status, CommandStatus::Completed(_)));
+        let result = if completed {
+            Ok(())
+        } else {
+            consume_command_sequence(
+                runtime,
+                &command_id,
+                publisher,
+                !recovery.realization_uncertain,
+                requests,
+                &mut recovery.deferred_intents,
+                &mut recovery.deferred_rejections,
+            )
+        };
+        match result {
+            Ok(()) => recovery.pending_command = None,
+            Err(WorkerFailure::Shutdown) => return false,
+            Err(error) => {
+                recovery.visible_error = Some(error.message().to_owned());
+                if error.invalidates_realization() {
+                    recovery.realization_uncertain = true;
+                }
+                recovery.reconnect_wait = if error.is_recoverable() {
+                    ReconnectWait::from_runtime(runtime)
+                } else {
+                    recovery.pending_command = None;
+                    None
+                };
+            }
+        }
+    }
+    if recovery.reconnect_wait.is_none() && recovery.realization_uncertain {
+        match require_snapshot_reconnect(runtime) {
+            Ok(wait) => {
+                recovery.reconnect_wait = Some(wait);
+                recovery.visible_error = Some(
+                    "Runtime realization changed during reconnect; requesting snapshot".to_owned(),
+                );
+            }
+            Err(error) => {
+                recovery.visible_error = Some(error.message().to_owned());
+                recovery.pending_command = None;
+            }
+        }
+    }
+    true
 }
 
 fn handle_heartbeat_timeout(
     runtime: &mut StudioRuntime,
+    requests: &Receiver<WorkerRequest>,
     publisher: &StatePublisher,
     recovery: &mut WorkerRecovery,
     next_heartbeat: &mut Instant,
@@ -688,14 +731,27 @@ fn handle_heartbeat_timeout(
 ) -> bool {
     if matches!(runtime.lifecycle(), Ok(LifecycleState::Ready)) {
         let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        if let Err(error) = runtime.send_heartbeat(elapsed_ms) {
+        let wait_started = Instant::now();
+        let mut shutdown = false;
+        let result = runtime.send_heartbeat_cancellable(elapsed_ms, IO_POLL_INTERVAL, || {
+            shutdown = cancellation_requested(
+                requests,
+                &mut recovery.deferred_intents,
+                &mut recovery.deferred_rejections,
+            );
+            shutdown || wait_started.elapsed() >= PEER_WAIT_TIMEOUT
+        });
+        if shutdown {
+            return false;
+        }
+        if let Err(error) = result {
             recovery.visible_error = Some(format!("Heartbeat failed: {error}"));
             if is_recoverable_failure(&error) {
                 recovery.realization_uncertain =
                     runtime.session().client().model().view().is_some();
                 recovery.reconnect_wait = ReconnectWait::from_runtime(runtime);
             }
-            if !publish_runtime(runtime, publisher, recovery.visible_error.clone()) {
+            if !publish_runtime(runtime, publisher, recovery.error()) {
                 return false;
             }
         }
@@ -709,6 +765,7 @@ fn begin_intent(
     intent: StudioIntent,
     keys: &mut IdempotencyKeys,
     publisher: &StatePublisher,
+    persistent_error: Option<String>,
 ) -> Result<String, String> {
     let payload = intent_payload(intent);
     let expected_revision = runtime
@@ -726,7 +783,7 @@ fn begin_intent(
         .map_err(|error| format!("Could not queue command: {error}"))?;
 
     // This publication exposes SelectPreview's optimistic desired state before I/O.
-    if !publish_runtime(runtime, publisher, None) {
+    if !publish_runtime(runtime, publisher, persistent_error) {
         return Err("Studio UI disconnected".to_owned());
     }
     Ok(command.id)
@@ -769,15 +826,16 @@ fn consume_command_sequence(
                 publish_runtime(
                     runtime,
                     publisher,
-                    Some(format!("Command rejected ({code}): {message}")),
+                    combined_error(
+                        Some(format!("Command rejected ({code}): {message}")),
+                        *deferred_rejections,
+                    ),
                 );
             }
             return Ok(());
         }
     };
-    if publish_updates && !publish_runtime(runtime, publisher, None) {
-        return Err(WorkerFailure::Fatal("Studio UI disconnected".to_owned()));
-    }
+    publish_command_update(runtime, publisher, publish_updates, *deferred_rejections)?;
     if runtime
         .session()
         .client()
@@ -804,9 +862,7 @@ fn consume_command_sequence(
         }
         other => return Err(unexpected_failure("durable event", &other)),
     }
-    if publish_updates && !publish_runtime(runtime, publisher, None) {
-        return Err(WorkerFailure::Fatal("Studio UI disconnected".to_owned()));
-    }
+    publish_command_update(runtime, publisher, publish_updates, *deferred_rejections)?;
 
     count_record(&mut consumed)?;
     match receive_command_event(
@@ -825,10 +881,27 @@ fn consume_command_sequence(
         }
         other => return Err(unexpected_failure("runtime event", &other)),
     }
-    if publish_updates && !publish_runtime(runtime, publisher, None) {
-        return Err(WorkerFailure::Fatal("Studio UI disconnected".to_owned()));
-    }
+    publish_command_update(runtime, publisher, publish_updates, *deferred_rejections)?;
     Ok(())
+}
+
+fn publish_command_update(
+    runtime: &mut StudioRuntime,
+    publisher: &StatePublisher,
+    publish: bool,
+    deferred_rejections: usize,
+) -> Result<(), WorkerFailure> {
+    if publish
+        && !publish_runtime(
+            runtime,
+            publisher,
+            combined_error(None, deferred_rejections),
+        )
+    {
+        Err(WorkerFailure::Fatal("Studio UI disconnected".to_owned()))
+    } else {
+        Ok(())
+    }
 }
 
 fn count_record(consumed: &mut usize) -> Result<(), WorkerFailure> {
@@ -928,9 +1001,10 @@ const fn is_resync_failure(error: &crate::StudioError) -> bool {
     matches!(
         error,
         crate::StudioError::Client(ClientError::ResyncRequired { .. })
-            | crate::StudioError::Session(TcpSessionError::Client(
-                ClientError::ResyncRequired { .. }
-            ))
+            | crate::StudioError::Session(
+                TcpSessionError::ResyncRequired(_)
+                    | TcpSessionError::Client(ClientError::ResyncRequired { .. })
+            )
     )
 }
 
@@ -1033,8 +1107,9 @@ fn publish_deferred_runtime(
     runtime: &mut StudioRuntime,
     publisher: &StatePublisher,
     deferred: usize,
+    error: Option<String>,
 ) -> bool {
-    let mut state = runtime_state(runtime, None);
+    let mut state = runtime_state(runtime, error);
     state.notice = Some(format!(
         "Queued {deferred} command(s) until Studio reconnects"
     ));
@@ -1177,7 +1252,7 @@ mod tests {
     }
 
     #[test]
-    fn active_wait_deferred_overflow_is_explicitly_rejected() {
+    fn active_wait_deferred_overflow_remains_observable() {
         let (sender, receiver) = sync_channel(1);
         let mut deferred = VecDeque::from(vec![StudioIntent::Cut; DEFERRED_INTENT_CAPACITY]);
         let mut rejected = 0;
@@ -1193,10 +1268,15 @@ mod tests {
 
         let mut recovery = WorkerRecovery::new(None, None);
         recovery.deferred_rejections = rejected;
-        recovery.report_deferred_rejections();
         assert_eq!(
-            recovery.visible_error.as_deref(),
+            recovery.error().as_deref(),
             Some("Rejected 1 command(s): Studio deferred command queue reached capacity 16")
+        );
+        recovery.visible_error = Some("temporary reconnect failure".to_owned());
+        recovery.visible_error = None;
+        assert!(
+            recovery.error().is_some(),
+            "success erased overflow rejection"
         );
     }
 
@@ -1702,6 +1782,72 @@ mod tests {
         server.join().unwrap();
     }
 
+    #[test]
+    fn worker_recovers_model_error_with_forced_snapshot() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut first = accept_worker_snapshot(&listener);
+            let WireMessage::Command(original) = first.receive() else {
+                panic!("expected command before model error")
+            };
+            first.send(&WireMessage::Event(EventMessage {
+                cursor: EventCursor {
+                    engine: test_engine(),
+                    revision: 5,
+                },
+                payload: EventPayload::DesiredSwitcher {
+                    program: wire_input(1),
+                    preview: wire_input(99),
+                },
+            }));
+            assert_eq!(first.stream.read(&mut [0_u8; 1]).unwrap(), 0);
+
+            let mut second = accept_worker_snapshot_at(&listener, 5, 3, 3);
+            let WireMessage::Command(retried) = second.receive() else {
+                panic!("expected unresolved retry after model error")
+            };
+            assert_eq!(retried, original);
+            second.send(&WireMessage::CommandResult(CommandResult::Rejected {
+                id: retried.id,
+                code: "already_applied".to_owned(),
+                message: "snapshot is authoritative".to_owned(),
+                fields: Vec::new(),
+                current_revision: 5,
+                retryable: false,
+            }));
+        });
+
+        let (requests, states, worker) = spawn_test_worker(address);
+        wait_until_ready(&states);
+        let target = InputId::new(NonZeroU128::new(3).unwrap());
+        try_enqueue(
+            &requests,
+            WorkerRequest::Intent(StudioIntent::SelectPreview(target)),
+        )
+        .unwrap();
+
+        let mut saw_backoff = false;
+        loop {
+            let state = states.recv_timeout(Duration::from_secs(3)).unwrap();
+            saw_backoff |= state.connection_status == StudioConnectionStatus::Backoff;
+            if saw_backoff
+                && state.connection_status == StudioConnectionStatus::Ready
+                && state.pending_commands == 0
+                && state.view.as_ref().is_some_and(|view| {
+                    view.cursor.revision.get() == 5
+                        && view.switcher.desired.preview == target
+                        && view.switcher.realized.preview == target
+                })
+            {
+                break;
+            }
+        }
+        try_enqueue(&requests, WorkerRequest::Shutdown).unwrap();
+        worker.join().unwrap();
+        server.join().unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn native_app_drop_joins_worker_and_reaps_daemon_silent_during_readiness() {
@@ -1709,9 +1855,10 @@ mod tests {
         let executable = base.with_extension("sh");
         let project = base.with_extension("freemix");
         let pid_path = PathBuf::from(format!("{}.pid", project.display()));
+        let descendant_pid_path = PathBuf::from(format!("{}.descendant.pid", project.display()));
         fs::write(
             &executable,
-            "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$2.pid\"\nIFS= read -r hold\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$2.pid\"\nsleep 30 &\nprintf '%s\\n' \"$!\" > \"$2.descendant.pid\"\nIFS= read -r hold\n",
         )
         .unwrap();
         let mut permissions = fs::metadata(&executable).unwrap().permissions();
@@ -1738,11 +1885,12 @@ mod tests {
             shutdown_sent: false,
         };
         let wait_started = Instant::now();
-        while !pid_path.exists() {
+        while !pid_path.exists() || !descendant_pid_path.exists() {
             assert!(wait_started.elapsed() < Duration::from_secs(3));
             thread::sleep(Duration::from_millis(10));
         }
         let pid = fs::read_to_string(&pid_path).unwrap();
+        let descendant_pid = fs::read_to_string(&descendant_pid_path).unwrap();
 
         let shutdown_started = Instant::now();
         drop(app);
@@ -1760,8 +1908,19 @@ mod tests {
                 .success(),
             "supervised daemon was not reaped before worker join"
         );
+        assert!(
+            !ProcessCommand::new("/bin/kill")
+                .args(["-0", descendant_pid.trim()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success(),
+            "readiness stdout descendant survived cancellation"
+        );
         let _ = fs::remove_file(executable);
         let _ = fs::remove_file(pid_path);
+        let _ = fs::remove_file(descendant_pid_path);
     }
 
     #[test]
