@@ -9,7 +9,7 @@ use fm_protocol::{
     HandshakeOutcome, LineDecoder, RuntimeEventMessage, WireMessage, encode_line,
 };
 
-use crate::{Client, ClientError, CommandStatus, Intake, Outbound, ReconnectBackoff, SyncMode};
+use crate::{Client, ClientError, Intake, Outbound, ReconnectBackoff, SyncMode};
 
 const READ_BUFFER_BYTES: usize = 8 * 1024;
 
@@ -698,12 +698,11 @@ impl TcpSession {
             };
             let message = match outbound {
                 Outbound::Command(command) => {
-                    if matches!(
-                        self.client
-                            .command(&command.id)
-                            .map(|record| &record.status),
-                        Some(CommandStatus::Completed(_))
-                    ) {
+                    if self
+                        .client
+                        .command(&command.id)
+                        .is_some_and(|record| record.status.is_terminal())
+                    {
                         continue;
                     }
                     if !self.sent_commands.iter().any(|id| id == &command.id) {
@@ -821,7 +820,7 @@ impl TcpSession {
                 self.sent_commands.retain(|sent| sent != &id);
                 continue;
             };
-            if matches!(record.status, CommandStatus::Completed(_)) {
+            if record.status.is_terminal() {
                 self.sent_commands.retain(|sent| sent != &id);
                 continue;
             }

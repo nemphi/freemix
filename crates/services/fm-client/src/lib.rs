@@ -39,7 +39,8 @@ pub struct ClientConfig {
     pub client_id: String,
     pub project_id: ProjectId,
     pub outbound_capacity: usize,
-    /// Maximum locally retained completed records. Eviction permits key reuse.
+    /// Maximum locally retained terminal records. Eviction forgets the key only
+    /// locally; callers must keep keys globally unique over server receipt retention.
     pub completed_command_capacity: usize,
     pub initial_backoff_ms: u64,
     pub max_backoff_ms: u64,
@@ -133,6 +134,23 @@ pub enum CommandStatus {
     Queued,
     Sent,
     Completed(CommandResult),
+    TerminalUncertain(CommandUncertainty),
+}
+
+impl CommandStatus {
+    #[must_use]
+    pub const fn is_terminal(&self) -> bool {
+        matches!(self, Self::Completed(_) | Self::TerminalUncertain(_))
+    }
+
+    const fn is_active(&self) -> bool {
+        matches!(self, Self::Queued | Self::Sent)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CommandUncertainty {
+    IdempotencyReplayCollision { received_command_id: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -198,7 +216,12 @@ pub enum ClientError {
     HeartbeatSequenceExhausted,
     UnknownCommand(String),
     CommandAlreadyCompleted(String),
+    CommandTerminalUncertain(String),
     ConflictingResult(String),
+    IdempotencyReplayCollision {
+        received_command_id: String,
+        affected_command_ids: Vec<String>,
+    },
     UnexpectedMessage,
 }
 
@@ -276,9 +299,19 @@ impl fmt::Display for ClientError {
             Self::CommandAlreadyCompleted(id) => {
                 write!(formatter, "command {id:?} is already complete")
             }
+            Self::CommandTerminalUncertain(id) => {
+                write!(formatter, "command {id:?} has a terminal uncertain outcome")
+            }
             Self::ConflictingResult(id) => {
                 write!(formatter, "command {id:?} received conflicting results")
             }
+            Self::IdempotencyReplayCollision {
+                received_command_id,
+                affected_command_ids,
+            } => write!(
+                formatter,
+                "server replayed unknown command ID {received_command_id:?} while sent command(s) {affected_command_ids:?} were active; outcomes are uncertain and an authoritative snapshot is required"
+            ),
             Self::UnexpectedMessage => formatter.write_str("unexpected inbound message type"),
         }
     }
@@ -467,6 +500,7 @@ impl Client {
         backoff
     }
 
+    #[cfg(feature = "std-tcp")]
     fn command_protocol_incompatible(
         &mut self,
         command_id: String,
@@ -609,7 +643,7 @@ impl Client {
             capabilities_digest: response.capabilities.digest,
         });
         for record in self.commands.values_mut() {
-            if !matches!(record.status, CommandStatus::Completed(_))
+            if record.status.is_active()
                 && record.command.payload.is_supported_by(response.negotiated)
             {
                 record.command.protocol = response.negotiated;
@@ -807,7 +841,9 @@ impl Client {
     /// Adds a command with a monotonic client-local ID and explicit replay key.
     /// [`CommandPayload::SelectPreview`] is also tracked as optimistic intent
     /// by the UI model. A key remains reserved while its command is active or
-    /// retained in completed local history, and may be reused after eviction.
+    /// retained in terminal local history. Local eviction forgets the key, but
+    /// callers must still generate globally unique keys for at least as long as
+    /// the server can retain receipts.
     ///
     /// # Errors
     ///
@@ -890,8 +926,14 @@ impl Client {
             .commands
             .get_mut(id)
             .ok_or_else(|| ClientError::UnknownCommand(id.to_owned()))?;
-        if matches!(record.status, CommandStatus::Completed(_)) {
-            return Err(ClientError::CommandAlreadyCompleted(id.to_owned()));
+        match &record.status {
+            CommandStatus::Completed(_) => {
+                return Err(ClientError::CommandAlreadyCompleted(id.to_owned()));
+            }
+            CommandStatus::TerminalUncertain(_) => {
+                return Err(ClientError::CommandTerminalUncertain(id.to_owned()));
+            }
+            CommandStatus::Queued | CommandStatus::Sent => {}
         }
         if !matches!(record.status, CommandStatus::Queued) {
             record.status = CommandStatus::Queued;
@@ -946,7 +988,7 @@ impl Client {
         let item = self.outbound.pop_front()?;
         if let Outbound::Command(command) = &item
             && let Some(record) = self.commands.get_mut(&command.id)
-            && !matches!(record.status, CommandStatus::Completed(_))
+            && !record.status.is_terminal()
         {
             record.status = CommandStatus::Sent;
         }
@@ -960,16 +1002,18 @@ impl Client {
     /// Rejects unknown command IDs and conflicting duplicate results.
     pub fn reconcile_result(&mut self, result: CommandResult) -> Result<Intake, ClientError> {
         let id = result_id(&result);
-        let record = self
-            .commands
-            .get(id)
-            .ok_or_else(|| ClientError::UnknownCommand(id.to_owned()))?;
+        let Some(record) = self.commands.get(id) else {
+            return self.handle_unknown_result_collision(&result);
+        };
         if let CommandStatus::Completed(previous) = &record.status {
             return if previous == &result {
                 Ok(Intake::DuplicateResult)
             } else {
                 Err(ClientError::ConflictingResult(id.to_owned()))
             };
+        }
+        if matches!(record.status, CommandStatus::TerminalUncertain(_)) {
+            return Err(ClientError::CommandTerminalUncertain(id.to_owned()));
         }
         self.model.reconcile_command(&result)?;
         let resolves_pending_incompatible = matches!(
@@ -996,15 +1040,68 @@ impl Client {
     ) -> Option<(String, ProtocolVersion, ProtocolVersion)> {
         let negotiated = self.session.as_ref()?.protocol;
         self.commands.values().find_map(|record| {
-            (!matches!(record.status, CommandStatus::Completed(_))
-                && !record.command.payload.is_supported_by(negotiated))
-            .then(|| {
-                (
-                    record.command.id.clone(),
-                    negotiated,
-                    record.command.payload.minimum_protocol_version(),
-                )
-            })
+            (record.status.is_active() && !record.command.payload.is_supported_by(negotiated)).then(
+                || {
+                    (
+                        record.command.id.clone(),
+                        negotiated,
+                        record.command.payload.minimum_protocol_version(),
+                    )
+                },
+            )
+        })
+    }
+
+    fn handle_unknown_result_collision<T>(
+        &mut self,
+        result: &CommandResult,
+    ) -> Result<T, ClientError> {
+        let received_command_id = result_id(result).to_owned();
+        let affected_command_ids = self
+            .commands
+            .iter()
+            .filter(|(_, record)| matches!(record.status, CommandStatus::Sent))
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        if affected_command_ids.is_empty() {
+            return Err(ClientError::UnknownCommand(received_command_id));
+        }
+
+        let current_revision = self
+            .last_applied_cursor()
+            .map_or(0, |cursor| cursor.revision);
+        for id in &affected_command_ids {
+            self.model.reconcile_command(&CommandResult::Rejected {
+                id: id.clone(),
+                code: "idempotency_replay_collision".to_owned(),
+                message: format!(
+                    "server returned retained receipt for unknown command {received_command_id:?}"
+                ),
+                fields: Vec::new(),
+                current_revision,
+                retryable: false,
+            })?;
+            if let Some(record) = self.commands.get_mut(id) {
+                record.status = CommandStatus::TerminalUncertain(
+                    CommandUncertainty::IdempotencyReplayCollision {
+                        received_command_id: received_command_id.clone(),
+                    },
+                );
+            }
+            self.completed_command_ids.push_back(id.clone());
+        }
+        self.outbound.retain(|item| {
+            !matches!(item, Outbound::Command(command) if affected_command_ids.contains(&command.id))
+        });
+        self.prune_completed_commands();
+        self.force_snapshot = true;
+        self.state = ConnectionState::ResyncRequired {
+            expected_revision: current_revision.saturating_add(1),
+            received_revision: result_revision(result),
+        };
+        Err(ClientError::IdempotencyReplayCollision {
+            received_command_id,
+            affected_command_ids,
         })
     }
 
@@ -1018,7 +1115,7 @@ impl Client {
                 .commands
                 .remove(&id)
                 .expect("completed command index must reference a retained record");
-            debug_assert!(matches!(record.status, CommandStatus::Completed(_)));
+            debug_assert!(record.status.is_terminal());
             self.idempotency_keys
                 .remove(&record.command.idempotency_key);
         }
@@ -1099,5 +1196,14 @@ fn engine_identity(server: &ServerIdentity) -> EngineIdentity {
 fn result_id(result: &CommandResult) -> &str {
     match result {
         CommandResult::Accepted { id, .. } | CommandResult::Rejected { id, .. } => id,
+    }
+}
+
+fn result_revision(result: &CommandResult) -> u64 {
+    match result {
+        CommandResult::Accepted { revision, .. } => *revision,
+        CommandResult::Rejected {
+            current_revision, ..
+        } => *current_revision,
     }
 }

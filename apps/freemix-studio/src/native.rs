@@ -10,7 +10,7 @@ use std::{
 };
 
 use eframe::egui;
-use fm_client::{ClientError, CommandStatus, SessionEvent, SyncMode, TcpSessionError};
+use fm_client::{ClientError, SessionEvent, SyncMode, TcpSessionError};
 use fm_protocol::{
     CommandPayload, CommandResult, DurableGap, WIPE_PROTOCOL_VERSION, WireInputId, WireMessage,
 };
@@ -673,12 +673,12 @@ fn resume_pending_command(
     recovery: &mut WorkerRecovery,
 ) -> bool {
     if let Some(command_id) = recovery.pending_command.clone() {
-        let completed = runtime
+        let terminal = runtime
             .session()
             .client()
             .command(&command_id)
-            .is_some_and(|record| matches!(record.status, CommandStatus::Completed(_)));
-        let result = if completed {
+            .is_some_and(|record| record.status.is_terminal());
+        let result = if terminal {
             Ok(())
         } else {
             consume_command_sequence(

@@ -1,7 +1,7 @@
 use core::num::NonZeroU128;
 
 use fm_client::{
-    Client, ClientConfig, ClientError, CommandStatus, ConnectionState,
+    Client, ClientConfig, ClientError, CommandStatus, CommandUncertainty, ConnectionState,
     DEFAULT_COMPLETED_COMMAND_CAPACITY, Intake, MAX_COMPLETED_COMMAND_CAPACITY, Outbound, SyncMode,
 };
 use fm_protocol::{
@@ -360,7 +360,7 @@ fn completed_eviction_preserves_all_unresolved_state_and_uncertainty() {
 }
 
 #[test]
-fn completion_order_evicts_command_and_key_together() {
+fn completion_order_evicts_command_and_local_key_index_together() {
     let mut settings = config(3);
     settings.completed_command_capacity = 2;
     let mut client = Client::new(settings).unwrap();
@@ -392,13 +392,102 @@ fn completion_order_evicts_command_and_key_together() {
     assert!(client.command(&commands[0].id).is_some());
     assert!(client.command(&commands[1].id).is_some());
     assert_eq!(client.retained_command_count(), 2);
-    let reused = client
+    // The bounded local index forgets the key; this does not make reuse safe
+    // while the server may still retain its original receipt.
+    let locally_accepted = client
         .queue_command(CommandPayload::Cut, "third", Some(4), None)
         .unwrap();
-    assert_eq!(reused.id, "diagnostic-a:4");
+    assert_eq!(locally_accepted.id, "diagnostic-a:4");
     assert_eq!(
         client.queue_command(CommandPayload::Cut, "first", Some(4), None),
         Err(ClientError::DuplicateIdempotencyKey("first".to_owned()))
+    );
+}
+
+#[test]
+fn replayed_evicted_receipt_terminally_fails_sent_commands_and_forces_snapshot() {
+    let mut settings = config(2);
+    settings.completed_command_capacity = 2;
+    let mut client = Client::new(settings).unwrap();
+    connect_snapshot(&mut client, 4);
+
+    let old = complete_cut(&mut client, "globally-reused-key".to_owned());
+    complete_cut(&mut client, "evictor-a".to_owned());
+    complete_cut(&mut client, "evictor-b".to_owned());
+    assert!(client.command(&old.id).is_none());
+    assert_eq!(client.retained_command_count(), 2);
+
+    let collision = client
+        .queue_command(
+            CommandPayload::SelectPreview { input: input(1) },
+            "globally-reused-key",
+            Some(4),
+            None,
+        )
+        .unwrap();
+    let collateral = client
+        .queue_command(CommandPayload::Cut, "still-unique", Some(4), None)
+        .unwrap();
+    assert!(matches!(client.pop_outbound(), Some(Outbound::Command(_))));
+    assert!(matches!(client.pop_outbound(), Some(Outbound::Command(_))));
+    assert_eq!(client.model().pending_commands().len(), 2);
+    assert_eq!(
+        client.model().view().unwrap().switcher.desired.preview,
+        input(1).to_domain()
+    );
+
+    let affected = vec![collision.id.clone(), collateral.id.clone()];
+    let error = client
+        .reconcile_result(CommandResult::Accepted {
+            id: old.id.clone(),
+            revision: 4,
+            scheduled_frame: None,
+        })
+        .unwrap_err();
+    assert_eq!(
+        error,
+        ClientError::IdempotencyReplayCollision {
+            received_command_id: old.id.clone(),
+            affected_command_ids: affected.clone(),
+        }
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("authoritative snapshot is required")
+    );
+    assert_eq!(
+        client.state(),
+        &ConnectionState::ResyncRequired {
+            expected_revision: 5,
+            received_revision: 4,
+        }
+    );
+    assert_eq!(client.retained_command_count(), 2);
+    assert_eq!(client.outbound_len(), 0);
+    assert!(client.model().pending_commands().is_empty());
+    assert_eq!(
+        client.model().view().unwrap().switcher.desired.preview,
+        input(2).to_domain()
+    );
+    for id in &affected {
+        assert_eq!(
+            client.command(id).unwrap().status,
+            CommandStatus::TerminalUncertain(CommandUncertainty::IdempotencyReplayCollision {
+                received_command_id: old.id.clone(),
+            })
+        );
+    }
+
+    client.start_connect().unwrap();
+    assert_eq!(client.transport_connected().unwrap().resume_cursor, None);
+    client.accept_handshake(handshake(4, None)).unwrap();
+    client.apply_snapshot(snapshot(4)).unwrap();
+    assert_eq!(client.state(), &ConnectionState::Ready);
+    assert_eq!(client.retained_command_count(), 2);
+    assert_eq!(
+        client.retry_command(&collision.id),
+        Err(ClientError::CommandTerminalUncertain(collision.id))
     );
 }
 

@@ -50,6 +50,10 @@ fn server() -> ServerIdentity {
 }
 
 fn client(capacity: usize) -> Client {
+    client_with_completed_history(capacity, fm_client::DEFAULT_COMPLETED_COMMAND_CAPACITY)
+}
+
+fn client_with_completed_history(capacity: usize, completed_command_capacity: usize) -> Client {
     let mut config = ClientConfig::new(
         vec![WIPE_PROTOCOL_VERSION],
         "tcp-test",
@@ -59,6 +63,7 @@ fn client(capacity: usize) -> Client {
         project_id(),
     );
     config.outbound_capacity = capacity;
+    config.completed_command_capacity = completed_command_capacity;
     config.initial_backoff_ms = 10;
     config.max_backoff_ms = 40;
     Client::new(config).unwrap()
@@ -527,6 +532,102 @@ fn explicit_result_terminally_resolves_pending_incompatible_wipe() {
         CommandStatus::Completed(terminal)
     );
     assert!(session.client().model().pending_commands().is_empty());
+    server_thread.join().unwrap();
+}
+
+#[test]
+fn replayed_evicted_receipt_forces_snapshot_without_retransmitting_collision() {
+    let (address, server_thread) = spawn_server(move |listener| {
+        let mut first = Peer::accept(&listener);
+        accept_snapshot(&mut first, 4);
+
+        let WireMessage::Command(old) = first.receive() else {
+            panic!("expected original command")
+        };
+        first.send(&WireMessage::CommandResult(CommandResult::Accepted {
+            id: old.id.clone(),
+            revision: 4,
+            scheduled_frame: None,
+        }));
+        let WireMessage::Command(evictor) = first.receive() else {
+            panic!("expected history evictor")
+        };
+        first.send(&WireMessage::CommandResult(CommandResult::Accepted {
+            id: evictor.id,
+            revision: 4,
+            scheduled_frame: None,
+        }));
+        let WireMessage::Command(collision) = first.receive() else {
+            panic!("expected key-collision command")
+        };
+        assert_eq!(collision.idempotency_key, old.idempotency_key);
+        first.send(&WireMessage::CommandResult(CommandResult::Accepted {
+            id: old.id,
+            revision: 4,
+            scheduled_frame: None,
+        }));
+        assert_eq!(first.stream.read(&mut [0_u8; 1]).unwrap(), 0);
+
+        let mut second = Peer::accept(&listener);
+        let request = accept_snapshot(&mut second, 4);
+        assert_eq!(request.resume_cursor, None);
+        assert!(matches!(second.receive(), WireMessage::Heartbeat(_)));
+    });
+
+    let mut session = TcpSession::new(client_with_completed_history(2, 1));
+    session.connect(address, CONNECT_TIMEOUT).unwrap();
+    let old = session
+        .queue_command(CommandPayload::Cut, "retained-server-key", Some(4), None)
+        .unwrap();
+    session.flush().unwrap();
+    session.receive().unwrap();
+    session
+        .queue_command(CommandPayload::Cut, "evictor", Some(4), None)
+        .unwrap();
+    session.flush().unwrap();
+    session.receive().unwrap();
+    assert!(session.client().command(&old.id).is_none());
+
+    let collision = session
+        .queue_command(
+            CommandPayload::SelectPreview { input: input(1) },
+            "retained-server-key",
+            Some(4),
+            None,
+        )
+        .unwrap();
+    session.flush().unwrap();
+    let error = session.receive().unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("authoritative snapshot is required")
+    );
+    assert!(matches!(
+        error,
+        TcpSessionError::ResyncRequired(inner)
+            if matches!(inner.as_ref(), ClientError::IdempotencyReplayCollision {
+                received_command_id,
+                affected_command_ids,
+            } if received_command_id == &old.id
+                && affected_command_ids == &vec![collision.id.clone()])
+    ));
+    assert!(matches!(
+        session.client().command(&collision.id).unwrap().status,
+        CommandStatus::TerminalUncertain(_)
+    ));
+    assert!(session.client().model().pending_commands().is_empty());
+    assert_eq!(session.in_flight_len(), 1);
+
+    assert!(matches!(
+        session.connect(address, CONNECT_TIMEOUT).unwrap(),
+        SessionEvent::Connected {
+            mode: SyncMode::Snapshot
+        }
+    ));
+    assert_eq!(session.in_flight_len(), 0);
+    session.queue_heartbeat(9_999).unwrap();
+    assert_eq!(session.flush().unwrap(), 1);
     server_thread.join().unwrap();
 }
 
