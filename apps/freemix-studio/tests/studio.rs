@@ -353,6 +353,10 @@ fn helper(directory: &TestDirectory, behavior: &str) -> PathBuf {
         "identity-change" => format!(
             "#!/bin/sh\nif test -e \"$2.count\"; then id=42; else id={PROJECT_VALUE}; : > \"$2.count\"; fi\nprintf 'FREEMIXD_READY\\tv=1\\taddress=127.0.0.1:32123\\tproject_id=%s\\n' \"$id\"\nIFS= read -r hold\n"
         ),
+        "exit-with-descendant" => {
+            "#!/bin/sh\nsleep 30 &\nprintf '%s\\n' \"$!\" > \"$2.descendant.pid\"\nexit 7\n"
+                .to_owned()
+        }
         _ => unreachable!(),
     };
     fs::write(&path, body).unwrap();
@@ -461,6 +465,35 @@ fn supervisor_observes_crash_and_rejects_identity_change_on_restart() {
         Err(SupervisorError::ProjectIdentityChanged { expected, received })
             if expected == project_id() && received.to_string() == "42"
     ));
+}
+
+#[cfg(unix)]
+#[test]
+fn supervisor_cleans_descendants_before_joining_readiness_after_direct_exit() {
+    let directory = TestDirectory::new("exit-descendant");
+    let executable = helper(&directory, "exit-with-descendant");
+    let project = directory.path("show.freemix");
+    let descendant_pid_path = PathBuf::from(format!("{}.descendant.pid", project.display()));
+    let started = std::time::Instant::now();
+
+    assert!(matches!(
+        DaemonSupervisor::launch(
+            supervised(&directory, &executable),
+            RestartPolicy::default()
+        ),
+        Err(SupervisorError::ExitedBeforeReady { status }) if status.code() == Some(7)
+    ));
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let descendant_pid = fs::read_to_string(descendant_pid_path).unwrap();
+    assert!(
+        !ProcessCommand::new("/bin/kill")
+            .args(["-0", descendant_pid.trim()])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success(),
+        "direct-exit descendant survived readiness cleanup"
+    );
 }
 
 #[test]

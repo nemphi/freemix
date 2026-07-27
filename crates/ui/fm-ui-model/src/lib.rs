@@ -400,6 +400,10 @@ pub enum ModelError {
         current_sequence: u64,
         observed_sequence: u64,
     },
+    RuntimeGenerationOutOfOrder {
+        current_generation: u64,
+        observed_generation: u64,
+    },
     ConflictingRuntimeSequence {
         sequence: u64,
     },
@@ -452,6 +456,13 @@ impl fmt::Display for ModelError {
             } => write!(
                 formatter,
                 "out-of-order runtime sequence {observed_sequence}; current sequence is {current_sequence}"
+            ),
+            Self::RuntimeGenerationOutOfOrder {
+                current_generation,
+                observed_generation,
+            } => write!(
+                formatter,
+                "out-of-order runtime generation {observed_generation}; current generation is {current_generation}"
             ),
             Self::ConflictingRuntimeSequence { sequence } => write!(
                 formatter,
@@ -810,22 +821,31 @@ impl ClientModel {
             });
         }
         if let Some(previous) = &self.last_runtime_realization {
-            match realization.sequence.cmp(&previous.sequence) {
+            match realization.generation.cmp(&previous.generation) {
                 Ordering::Less => {
-                    return Err(ModelError::RuntimeOutOfOrder {
-                        current_sequence: previous.sequence,
-                        observed_sequence: realization.sequence,
-                    });
-                }
-                Ordering::Equal if previous == &realization => {
-                    return Ok(RuntimeRealizationApplied::Duplicate);
-                }
-                Ordering::Equal => {
-                    return Err(ModelError::ConflictingRuntimeSequence {
-                        sequence: realization.sequence,
+                    return Err(ModelError::RuntimeGenerationOutOfOrder {
+                        current_generation: previous.generation,
+                        observed_generation: realization.generation,
                     });
                 }
                 Ordering::Greater => {}
+                Ordering::Equal => match realization.sequence.cmp(&previous.sequence) {
+                    Ordering::Less => {
+                        return Err(ModelError::RuntimeOutOfOrder {
+                            current_sequence: previous.sequence,
+                            observed_sequence: realization.sequence,
+                        });
+                    }
+                    Ordering::Equal if previous == &realization => {
+                        return Ok(RuntimeRealizationApplied::Duplicate);
+                    }
+                    Ordering::Equal => {
+                        return Err(ModelError::ConflictingRuntimeSequence {
+                            sequence: realization.sequence,
+                        });
+                    }
+                    Ordering::Greater => {}
+                },
             }
         }
         let desired = self

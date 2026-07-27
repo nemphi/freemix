@@ -4,16 +4,14 @@ use std::{
     io::{self, BufRead, BufReader},
     net::SocketAddr,
     num::NonZeroU128,
-    process::{Child, ChildStdout, Command, ExitStatus, Stdio},
+    process::{ChildStdout, Command, ExitStatus, Stdio},
     str::FromStr,
     thread::{self, JoinHandle},
     time::Duration,
 };
 
+use command_group::{CommandGroup, GroupChild};
 use fm_types::ProjectId;
-
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
 
 use crate::SupervisedConfig;
 
@@ -172,7 +170,7 @@ impl Error for SupervisorError {
 pub struct DaemonSupervisor {
     config: SupervisedConfig,
     restart_policy: RestartPolicy,
-    child: Option<Child>,
+    child: Option<GroupChild>,
     stdout: Option<BufReader<ChildStdout>>,
     stable_project_id: Option<ProjectId>,
     restarts: u8,
@@ -338,10 +336,8 @@ impl DaemonSupervisor {
             .arg(self.config.listen.to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped());
-        #[cfg(unix)]
-        command.process_group(0);
-        let mut child = command.spawn().map_err(SupervisorError::Spawn)?;
-        let Some(stdout) = child.stdout.take() else {
+        let mut child = command.group_spawn().map_err(SupervisorError::Spawn)?;
+        let Some(stdout) = child.inner().stdout.take() else {
             reap_local_child(&mut child);
             return Err(SupervisorError::MissingStdout);
         };
@@ -355,11 +351,12 @@ impl DaemonSupervisor {
         while !reader.is_finished() {
             if cancelled() {
                 terminate_local_child(&mut child).map_err(SupervisorError::Process)?;
-                finish_cancelled_reader(reader)?;
+                drop(join_readiness_reader(reader)?);
                 return Err(SupervisorError::ReadinessCancelled);
             }
-            match child.try_wait() {
+            match child.inner().try_wait() {
                 Ok(Some(status)) => {
+                    terminate_local_child(&mut child).map_err(SupervisorError::Process)?;
                     drop(join_readiness_reader(reader)?);
                     return Err(SupervisorError::ExitedBeforeReady { status });
                 }
@@ -463,49 +460,16 @@ impl Drop for DaemonSupervisor {
     }
 }
 
-fn reap_local_child(child: &mut Child) {
+fn reap_local_child(child: &mut GroupChild) {
     let _ = terminate_local_child(child);
 }
 
-fn terminate_local_child(child: &mut Child) -> io::Result<()> {
-    if child.try_wait()?.is_none() {
-        kill_supervised_child(child)?;
-        child.wait()?;
+fn terminate_local_child(child: &mut GroupChild) -> io::Result<()> {
+    if let Err(error) = child.kill()
+        && error.kind() != io::ErrorKind::InvalidInput
+    {
+        return Err(error);
     }
+    child.wait()?;
     Ok(())
-}
-
-#[cfg(unix)]
-fn finish_cancelled_reader(reader: ReadinessReader) -> Result<(), SupervisorError> {
-    drop(join_readiness_reader(reader)?);
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn finish_cancelled_reader(reader: ReadinessReader) -> Result<(), SupervisorError> {
-    // ChildStdout may remain inherited by descendants on platforms without the
-    // process-group cleanup above. Detaching prevents it from owning UI shutdown.
-    drop(reader);
-    Ok(())
-}
-
-#[cfg(unix)]
-fn kill_supervised_child(child: &mut Child) -> io::Result<()> {
-    // The child is spawned as its own process-group leader, so this also closes
-    // readiness stdout inherited by descendants before the reader is joined.
-    let status = Command::new("/bin/kill")
-        .args(["-KILL", &format!("-{}", child.id())])
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!(
-            "failed to kill freemixd process group: {status}"
-        )))
-    }
-}
-
-#[cfg(not(unix))]
-fn kill_supervised_child(child: &mut Child) -> io::Result<()> {
-    child.kill()
 }

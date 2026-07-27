@@ -388,6 +388,52 @@ fn runtime_realization_can_use_current_or_retained_desired_revision() {
 }
 
 #[test]
+fn runtime_realization_ordering_is_scoped_to_generation() {
+    let project_id = project(10);
+    let mut model = ClientModel::new(project_id);
+    model.install_snapshot(snapshot(project_id, 7)).unwrap();
+    let identity = model.reconnect_cursor().unwrap().engine.clone();
+    model
+        .apply_event(event(
+            project_id,
+            identity.clone(),
+            8,
+            DurableChange::DesiredSwitcher(BusSelection::new(input(2), input(3))),
+        ))
+        .unwrap();
+
+    model
+        .apply_runtime_realization(realization(project_id, identity.clone(), 7, 1, 1))
+        .unwrap();
+    model
+        .apply_runtime_realization(realization(project_id, identity.clone(), 8, 2, 1))
+        .unwrap();
+    assert_eq!(
+        model.state().unwrap().switcher().runtime_generation,
+        Some(2)
+    );
+
+    assert_eq!(
+        model.apply_runtime_realization(realization(project_id, identity.clone(), 7, 1, 2,)),
+        Err(ModelError::RuntimeGenerationOutOfOrder {
+            current_generation: 2,
+            observed_generation: 1,
+        })
+    );
+    assert_eq!(
+        model.apply_runtime_realization(realization(project_id, identity.clone(), 7, 2, 0,)),
+        Err(ModelError::RuntimeOutOfOrder {
+            current_sequence: 1,
+            observed_sequence: 0,
+        })
+    );
+    assert_eq!(
+        model.apply_runtime_realization(realization(project_id, identity, 7, 2, 1)),
+        Err(ModelError::ConflictingRuntimeSequence { sequence: 1 })
+    );
+}
+
+#[test]
 fn runtime_realization_rejects_unknown_revision_and_identity() {
     let project_id = project(10);
     let mut model = ClientModel::new(project_id);

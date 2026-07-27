@@ -461,6 +461,73 @@ fn wrong_first_record_and_wrong_project_reject_current_handshake() {
 }
 
 #[test]
+fn incompatible_handshake_remains_terminal_after_socket_close() {
+    let (address, server_thread) = spawn_server(|listener| {
+        let mut peer = Peer::accept(&listener);
+        assert!(matches!(peer.receive(), WireMessage::HandshakeRequest(_)));
+        let mut response = handshake(
+            0,
+            HandshakeOutcome::Snapshot {
+                reason: SnapshotReason::NoCursor,
+            },
+        );
+        response.negotiated = ProtocolVersion::new(2, 0);
+        peer.send(&WireMessage::HandshakeResponse(response));
+        assert_eq!(peer.stream.read(&mut [0_u8; 1]).unwrap(), 0);
+    });
+    let mut session = TcpSession::new(client(2));
+
+    assert!(matches!(
+        session.connect(address, CONNECT_TIMEOUT),
+        Err(TcpSessionError::Client(ClientError::IncompatibleProtocol(
+            ProtocolVersion { major: 2, minor: 0 }
+        )))
+    ));
+    assert_eq!(
+        session.client().state(),
+        &ConnectionState::Incompatible {
+            negotiated: ProtocolVersion::new(2, 0)
+        }
+    );
+    assert_eq!(session.reconnect_backoff(), None);
+    assert!(session.connection().is_none());
+    server_thread.join().unwrap();
+}
+
+#[test]
+fn encoding_failure_disconnects_and_preserves_unresolved_envelope() {
+    let (address, server_thread) = spawn_server(|listener| {
+        let mut peer = Peer::accept(&listener);
+        accept_snapshot(&mut peer, 4);
+        assert_eq!(peer.stream.read(&mut [0_u8; 1]).unwrap(), 0);
+    });
+    let mut session = TcpSession::new(client(2));
+    session.connect(address, CONNECT_TIMEOUT).unwrap();
+    let command = session
+        .queue_command(
+            CommandPayload::Cut,
+            "x".repeat(MAX_LINE_BYTES),
+            Some(4),
+            None,
+        )
+        .unwrap();
+
+    assert!(matches!(
+        session.flush(),
+        Err(TcpSessionError::Codec(
+            CodecError::LineTooLong | CodecError::FieldValueTooLong
+        ))
+    ));
+    assert_eq!(session.in_flight_len(), 1);
+    assert_eq!(session.reconnect_backoff().unwrap().attempt, 1);
+    assert!(session.connection().is_none());
+    let record = session.client().command(&command.id).unwrap();
+    assert_eq!(record.command, command);
+    assert_eq!(record.status, CommandStatus::Sent);
+    server_thread.join().unwrap();
+}
+
+#[test]
 fn silent_handshake_can_be_cancelled_without_waiting_for_peer_eof() {
     let (request_tx, request_rx) = mpsc::channel();
     let (address, server_thread) = spawn_server(move |listener| {

@@ -542,7 +542,7 @@ impl TcpSession {
             Err(TcpConnectionError::Io(error)) => {
                 Err(self.disconnected(DisconnectCause::Io(error.kind())))
             }
-            Err(TcpConnectionError::Codec(error)) => Err(TcpSessionError::Codec(error)),
+            Err(TcpConnectionError::Codec(error)) => Err(self.codec_error(error)),
         }
     }
 
@@ -816,7 +816,7 @@ impl TcpSession {
             Err(TcpConnectionError::Io(error)) => {
                 Err(self.disconnected(DisconnectCause::Io(error.kind())))
             }
-            Err(TcpConnectionError::Codec(error)) => Err(TcpSessionError::Codec(error)),
+            Err(TcpConnectionError::Codec(error)) => Err(self.codec_error(error)),
         }
     }
 
@@ -838,7 +838,7 @@ impl TcpSession {
             Err(TcpConnectionError::Io(error)) => {
                 Err(self.disconnected(DisconnectCause::Io(error.kind())))
             }
-            Err(TcpConnectionError::Codec(error)) => Err(TcpSessionError::Codec(error)),
+            Err(TcpConnectionError::Codec(error)) => Err(self.codec_error(error)),
         }
     }
 
@@ -914,6 +914,15 @@ impl TcpSession {
     }
 
     fn connect_client_error(&mut self, error: ClientError) -> TcpSessionError {
+        if matches!(
+            self.client.state(),
+            crate::ConnectionState::Incompatible { .. }
+        ) {
+            if let Some(connection) = self.connection.take() {
+                connection.shutdown();
+            }
+            return TcpSessionError::Client(error);
+        }
         let resync = matches!(
             self.client.state(),
             crate::ConnectionState::ResyncRequired { .. }
@@ -924,6 +933,14 @@ impl TcpSession {
         } else {
             TcpSessionError::Client(error)
         }
+    }
+
+    fn codec_error(&mut self, error: CodecError) -> TcpSessionError {
+        if let Some(connection) = self.connection.as_ref() {
+            connection.shutdown();
+        }
+        self.transition_disconnect();
+        TcpSessionError::Codec(error)
     }
 
     fn cancelled(&mut self) -> TcpSessionError {
