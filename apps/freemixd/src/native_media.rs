@@ -45,7 +45,7 @@ use fm_gpu::{
     NativeTexture, NativeTextureReadback,
 };
 use fm_sim::{CollectingAudioSink, OverflowPolicy, SinkConfigError, SinkTelemetry};
-use fm_switcher::ProgramFrame;
+use fm_switcher::{ProgramFrame, TransitionKind as SwitcherTransitionKind};
 use fm_types::{AudioFormat, FrameRate, InputId, SampleFormat, TimeBase};
 
 const RGBA16_FLOAT_BYTES_PER_PIXEL: u64 = 8;
@@ -468,6 +468,8 @@ pub enum NativeSourceRenderError {
         actual_width: u32,
         actual_height: u32,
     },
+    MissingTransitionKind,
+    UnsupportedTransition(SwitcherTransitionKind),
     InvalidMix(TransitionError),
     Compositor(NativeTransitionError),
 }
@@ -486,6 +488,12 @@ impl fmt::Display for NativeSourceRenderError {
                 formatter,
                 "source {input} texture dimensions {actual_width}x{actual_height} do not match registry dimensions {expected_width}x{expected_height}"
             ),
+            Self::MissingTransitionKind => {
+                formatter.write_str("program-frame transition kind is missing")
+            }
+            Self::UnsupportedTransition(kind) => {
+                write!(formatter, "native transition {kind:?} is not supported")
+            }
             Self::InvalidMix(error) => write!(formatter, "program-frame mix is invalid: {error}"),
             Self::Compositor(error) => write!(formatter, "native composition failed: {error}"),
         }
@@ -497,7 +505,10 @@ impl Error for NativeSourceRenderError {
         match self {
             Self::InvalidMix(error) => Some(error),
             Self::Compositor(error) => Some(error),
-            Self::MissingSource { .. } | Self::DimensionMismatch { .. } => None,
+            Self::MissingSource { .. }
+            | Self::DimensionMismatch { .. }
+            | Self::MissingTransitionKind
+            | Self::UnsupportedTransition(_) => None,
         }
     }
 }
@@ -1876,19 +1887,29 @@ struct NativeMixPlan {
     transition: TransitionPlan,
 }
 
-fn native_mix_plan(program: ProgramFrame) -> Result<NativeMixPlan, TransitionError> {
+fn native_mix_plan(program: ProgramFrame) -> Result<NativeMixPlan, NativeSourceRenderError> {
     let (secondary, transition) = match program.secondary {
-        Some(secondary) if secondary != program.primary => (
-            secondary,
-            TransitionPlan::compile(
-                TransitionKind::Fade,
-                program.mix_numerator,
-                program.mix_denominator,
-            )?,
-        ),
+        Some(secondary) if secondary != program.primary => {
+            if program.transition_kind != Some(SwitcherTransitionKind::Fade) {
+                return Err(program.transition_kind.map_or(
+                    NativeSourceRenderError::MissingTransitionKind,
+                    NativeSourceRenderError::UnsupportedTransition,
+                ));
+            }
+            (
+                secondary,
+                TransitionPlan::compile(
+                    TransitionKind::Fade,
+                    program.mix_numerator,
+                    program.mix_denominator,
+                )
+                .map_err(NativeSourceRenderError::InvalidMix)?,
+            )
+        }
         Some(_) | None => (
             program.primary,
-            TransitionPlan::compile(TransitionKind::Cut, 0, 1)?,
+            TransitionPlan::compile(TransitionKind::Cut, 0, 1)
+                .map_err(NativeSourceRenderError::InvalidMix)?,
         ),
     };
     Ok(NativeMixPlan {
@@ -3110,7 +3131,7 @@ impl NativeMediaRuntime {
         registry: &NativeSourceRegistry,
         frame: &FrameResult,
     ) -> Result<NativeTexture, NativeSourceRenderError> {
-        let plan = native_mix_plan(frame.program).map_err(NativeSourceRenderError::InvalidMix)?;
+        let plan = native_mix_plan(frame.program)?;
         let primary = registry_frame(registry, plan.primary, frame.deadline)?;
         let secondary = registry_frame(registry, plan.secondary, frame.deadline)?;
         self.renderer
@@ -3408,6 +3429,7 @@ mod tests {
             program: ProgramFrame {
                 primary,
                 secondary,
+                transition_kind: secondary.map(|_| SwitcherTransitionKind::Fade),
                 mix_numerator,
                 mix_denominator,
                 mix_start_numerator,
@@ -3776,6 +3798,7 @@ mod tests {
         let cut = native_mix_plan(ProgramFrame {
             primary,
             secondary: None,
+            transition_kind: None,
             mix_numerator: u32::MAX,
             mix_denominator: 0,
             mix_start_numerator: u32::MAX,
@@ -3791,6 +3814,7 @@ mod tests {
         let identical = native_mix_plan(ProgramFrame {
             primary,
             secondary: Some(primary),
+            transition_kind: Some(SwitcherTransitionKind::Fade),
             mix_numerator: u32::MAX,
             mix_denominator: 0,
             mix_start_numerator: u32::MAX,
@@ -3804,6 +3828,7 @@ mod tests {
         let fade = native_mix_plan(ProgramFrame {
             primary,
             secondary: Some(secondary),
+            transition_kind: Some(SwitcherTransitionKind::Fade),
             mix_numerator: 7,
             mix_denominator: 11,
             mix_start_numerator: 7,
@@ -3815,17 +3840,35 @@ mod tests {
         assert_eq!(fade.transition.kind(), TransitionKind::Fade);
         assert_eq!(fade.transition.numerator(), 7);
         assert_eq!(fade.transition.denominator(), 11);
-        assert_eq!(
+        assert!(matches!(
             native_mix_plan(ProgramFrame {
                 primary,
                 secondary: Some(secondary),
+                transition_kind: Some(SwitcherTransitionKind::Fade),
                 mix_numerator: 1,
                 mix_denominator: 0,
                 mix_start_numerator: 1,
                 mix_end_numerator: 1,
             }),
-            Err(TransitionError::ZeroDenominator)
-        );
+            Err(NativeSourceRenderError::InvalidMix(
+                TransitionError::ZeroDenominator
+            ))
+        ));
+
+        assert!(matches!(
+            native_mix_plan(ProgramFrame {
+                primary,
+                secondary: Some(secondary),
+                transition_kind: Some(SwitcherTransitionKind::Wipe),
+                mix_numerator: 1,
+                mix_denominator: 2,
+                mix_start_numerator: 1,
+                mix_end_numerator: 2,
+            }),
+            Err(NativeSourceRenderError::UnsupportedTransition(
+                SwitcherTransitionKind::Wipe
+            ))
+        ));
     }
 
     #[test]
@@ -4135,6 +4178,7 @@ mod tests {
             native_audio_mix_plan(ProgramFrame {
                 primary: old,
                 secondary: Some(new),
+                transition_kind: Some(SwitcherTransitionKind::Fade),
                 mix_numerator: 2,
                 mix_denominator: 4,
                 mix_start_numerator: 2,
@@ -4151,6 +4195,7 @@ mod tests {
             native_audio_mix_plan(ProgramFrame {
                 primary: new,
                 secondary: None,
+                transition_kind: None,
                 mix_numerator: u32::MAX,
                 mix_denominator: 0,
                 mix_start_numerator: u32::MAX,
@@ -4167,6 +4212,7 @@ mod tests {
             native_audio_mix_plan(ProgramFrame {
                 primary: old,
                 secondary: Some(new),
+                transition_kind: Some(SwitcherTransitionKind::Fade),
                 mix_numerator: 1,
                 mix_denominator: 0,
                 mix_start_numerator: 1,
@@ -4178,6 +4224,7 @@ mod tests {
             native_audio_mix_plan(ProgramFrame {
                 primary: old,
                 secondary: Some(old),
+                transition_kind: Some(SwitcherTransitionKind::Fade),
                 mix_numerator: u32::MAX,
                 mix_denominator: 0,
                 mix_start_numerator: u32::MAX,

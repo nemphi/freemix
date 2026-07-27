@@ -525,6 +525,7 @@ async fn assert_deadline_frame(
         program: ProgramFrame {
             primary: input,
             secondary: None,
+            transition_kind: None,
             mix_numerator: 0,
             mix_denominator: 1,
             mix_start_numerator: 0,
