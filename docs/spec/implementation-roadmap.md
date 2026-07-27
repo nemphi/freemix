@@ -71,21 +71,31 @@ saved, restarted, resumed, and tested deterministically.
 Current implementation boundary for item 4: `fm-compositor` executes bounded
 native `CompositionPlan` layers with crop, nearest scaling, quarter-turn
 rotation, translation, opacity, stable z-order, premultiplied source-over, and
-canonical RGBA16F inputs. Persisted daemon scene realization remains pending:
-schema v3 `fm-model::Layer` has no background, geometry, opacity, or z-order,
-and switcher `InputId` routing is not yet mapped to `SceneId`/`OutputId`.
-Connecting those contracts requires an explicit schema migration and routing
-decision rather than an implicit compatibility interpretation.
+canonical RGBA16F inputs. Schema v4 now persists each scene background and each
+layer's explicit input/scene source, geometry, crop, opacity, and z-order.
+`InputKind::Scene` explicitly routes a `SceneId` plus an optional audio
+`InputId`, while every persisted output explicitly routes a video `SceneId` and
+audio `BusId`. The explicit v3-to-v4 migration supplies opaque-black,
+canvas-identity, no-crop, full-opacity, and zero-z-order defaults while
+preserving legacy sources and layer counts; outputs are preserved as declared
+and are not inferred. Native `freemixd` scene realization remains explicitly
+unsupported and pending: native media rejects scene inputs because it does not
+yet connect the persisted model to compositor execution.
 
 Current implementation boundary for item 5: `freemix-studio` opens a native
 `eframe`/wgpu shell by default with responsive Program/Preview monitor wells,
 stable-ID input tiles, realized/desired tally, permission-gated Cut/Fade
 controls, bounded worker channels, optimistic Preview intent, and negotiated
 client-state replication. Blocking TCP and daemon supervision remain off the
-render thread. Project input names and video frames are not present in the
-replicated client contract, so tiles use ordinal/ID labels and monitor wells
-state that preview delivery is pending. Automatic worker reconnect and real
-preview presentation remain later increments.
+render thread. The worker now reconnects automatically after bounded backoff,
+negotiates durable resume or an authoritative snapshot, resumes unresolved
+command sequences, and requests a snapshot when runtime realization becomes
+uncertain. Connect, readiness, protocol read, write, and flush waits are bounded
+and cancellable; deferred intents are capped, and supervised daemon shutdown or
+restart performs bounded process-group/job and descendant cleanup. Project
+input names and video frames are not present in the replicated client contract,
+so tiles use ordinal/ID labels and monitor wells state that real preview
+delivery remains pending.
 
 Current implementation boundary for item 6: `fm-frame` defines a bounded,
 portable local-preview contract for shared-image versus encoded fallback,
@@ -112,22 +122,25 @@ blocks, sample-count timing validation, and transactional gain ramps.
 inverse Master-to-source nanosecond mapping with explicit floor rounding before
 anchors and overflow rejection. This is arithmetic groundwork for live audio
 synchronization; no estimator filtering, sample interpolation, FIFO, or drift
-resampler is connected yet. Opt-in
-native daemon mode maintains bounded CPU audio rings on a decode worker,
-allocates Master intervals directly from absolute engine frame numbers, follows
-the authoritative `ProgramFrame.primary`, and writes a bounded fake sink. During
-a Fade it intentionally keeps the old primary until completion, then hard
-switches. Local audio must exactly match the project sample rate/layout and its
-first timestamp must align with the selected video's first timestamp; no
-resampling or implicit mapping is performed. Missing audio, stills, and
-configured simulated silence produce silence, while unsupported simulated sine
-audio is rejected. This remains a diagnostic/reference path: it allocates while
-mixing, waits for all preflighted sources, and has no OS audio device,
-bus/output routing, persisted strip controls, transition crossfade, drift
-correction, or externally delivered audio. Later FFmpeg pages still rescan and
-trim from the beginning, so deep playback becomes progressively more expensive
-and can fail transactionally at fixed metadata-output or subprocess-timeout
-bounds. Item 7 and the related parity rows therefore remain incomplete.
+resampler is connected yet. Opt-in native daemon mode maintains bounded CPU
+audio rings on a decode worker, allocates Master intervals directly from
+absolute engine frame numbers, follows the authoritative `ProgramFrame`, and
+writes a bounded fake sink. Fade now crossfades both sources with sample-linear
+gains derived from the explicit mix start and end endpoints of each audio
+interval. Automatic Fade and held or reversed Fade T-bar movement propagate
+those exact endpoints; identical source IDs collapse to one unity-gain source
+instead of being mixed twice. Local audio must exactly match the project sample
+rate/layout and its first timestamp must align with the selected video's first
+timestamp; no resampling or implicit mapping is performed. Missing audio,
+stills, and configured simulated silence produce silence, while unsupported
+simulated sine audio is rejected. This remains a diagnostic/reference path: it
+allocates while mixing, waits for all preflighted sources, and has no OS audio
+device, bus/output routing, persisted strip controls, drift correction, or
+externally delivered audio. Only Cut/Fade audio policy is realized. Later FFmpeg
+pages still rescan and trim from the beginning, so deep playback becomes
+progressively more expensive and can fail transactionally at fixed
+metadata-output or subprocess-timeout bounds. Item 7 and the related parity
+rows therefore remain incomplete.
 
 Current implementation boundary for item 8: `fm-gpu` provides a portable,
 bounded latest-frame presentation policy plus opaque, context-bound native
@@ -292,6 +305,22 @@ advertises supported candidate rates through 60 fps: every integer rate plus
 the existing 256-format bound. Selection and `CoreMedia` frame duration use the
 exact rational value rather than floating-point or nearest-rate substitution.
 
+At this adapter boundary, camera recovery is adapter-local, caller-driven, and
+bounded. Hold continues returning the last delivered frame through signal loss
+and rejected recovery attempts. A restarted helper retains source identity and
+must produce the same clock with a strictly newer PTS before recovery completes;
+the first accepted frame is marked discontinuous. Sequence remapping creates one
+globally monotonic stream while preserving native sequence gaps, including gaps
+from bounded queue drops before the first recovered delivery. Received,
+queue-drop, native-drop, continuity-rejection, timeout-discard, depth, and peak
+telemetry is cumulative across attempts. Recovery startup, first-frame waits,
+timeout discard, helper/worker reaping, and late-producer exclusion have bounded
+cleanup, with hermetic helper-process evidence covering malformed, regressed,
+recovered, timed-out, and truncated attempts. This does not provide daemon
+recovery: `freemixd` still uses Stop fallback, does not automatically invoke
+this recovery handshake or rediscover hot-plugged devices, and has no hardware
+recovery certification.
+
 The same helper now has separate `discover-audio`, `request-audio-permission`,
 and `capture-audio` commands, preserving the camera D2/F3 protocol. `FMAUDD1`
 discovery reports independently identified microphone endpoints and exact native
@@ -338,7 +367,7 @@ camera primary/transfer combinations, continuously ingests BGRA frames through
 Metal, renders and checkpoints for one second, and confirms helper-process
 disappearance. A readiness barrier ensures the startup frame is ingested before
 updates. Protocol tests decode all six combinations, capture-node process tests
-exercise Display-P3/sRGB and BT.2020/BT.709 records, current schema-v3
+exercise Display-P3/sRGB and BT.2020/BT.709 records, current schema-v4
 persistence round-trips Display-P3/BT.709, and native Metal readback tests
 compare all three primaries across sRGB, BT.709, and BT.1886 against CPU oracles.
 The daemon run also exercises the validated BGRA-to-RGBA swizzle while preserving
@@ -371,6 +400,14 @@ gamma-tag fallback, configurable unknown-metadata policy, certified
 hot-plug/recovery loops, Windows/Linux adapters, audio-device daemon/Master
 realization, and screen/window/application-audio capture. Item 1 and `IN-001`, `IN-005`, and
 `IN-011` therefore remain incomplete and planned.
+
+Current implementation boundary for item 5: `fm-compositor` now provides a
+deterministic left-to-right Wipe primitive in both its CPU reference path and
+native RGBA16F renderer. Exact rational progress selects
+`floor(width * numerator / denominator)` replacement columns and preserves
+identical start/end frames. The engine, protocol, and UI do not expose Wipe,
+and AlphaFade, FTB, stinger, Slide/Zoom, and broader transition integration
+remain incomplete.
 
 Exit: `P0` switcher, composition, audio, display, record, and control rows pass.
 
