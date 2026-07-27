@@ -387,7 +387,7 @@ Exit: `P0` switcher, composition, audio, display, record, and control rows pass.
 7. Implement engine OS service mode, health/readiness, support bundles.
 8. Implement remote browser control, WebRTC multiview preview, roles/pairing.
 9. Add disk/network/GPU preflight and alert policy.
-10. Run process-kill, disk-full, network impairment, and 24-hour soak.
+10. Run process-kill, disk-full, network impairment, and 24-hour soak. (needs to be in a VM or something else, don't kill my pc)
 11. Publish the first supported hardware/capability matrix.
 
 Exit: a remote-controlled headless production can stream and record
