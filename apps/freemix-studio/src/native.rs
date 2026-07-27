@@ -10,7 +10,9 @@ use std::{
 };
 
 use eframe::egui;
-use fm_client::{ClientError, SessionEvent, SyncMode, TcpSessionError};
+use fm_client::{
+    ClientError, CommandStatus, CommandUncertainty, SessionEvent, SyncMode, TcpSessionError,
+};
 use fm_protocol::{
     CommandPayload, CommandResult, DurableGap, WIPE_PROTOCOL_VERSION, WireInputId, WireMessage,
 };
@@ -29,6 +31,7 @@ const REQUEST_CAPACITY: usize = 16;
 const DEFERRED_INTENT_CAPACITY: usize = 16;
 const STATE_CAPACITY: usize = 16;
 const MAX_COMMAND_RECORDS: usize = 8;
+const TERMINAL_UNCERTAINTY_CAPACITY: usize = 8;
 static NEXT_WORKER_NONCE: AtomicU64 = AtomicU64::new(1);
 
 /// Opens the cross-platform native Studio window.
@@ -265,6 +268,14 @@ struct WorkerRecovery {
     visible_error: Option<String>,
     realization_uncertain: bool,
     deferred_rejections: usize,
+    // Never evicted during a worker lifetime; restart is the explicit clear operation.
+    terminal_uncertainties: Vec<TerminalUncertaintyNotice>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct TerminalUncertaintyNotice {
+    command_id: String,
+    received_command_id: String,
 }
 
 impl WorkerRecovery {
@@ -276,6 +287,7 @@ impl WorkerRecovery {
             visible_error,
             realization_uncertain: false,
             deferred_rejections: 0,
+            terminal_uncertainties: Vec::new(),
         }
     }
 
@@ -298,7 +310,71 @@ impl WorkerRecovery {
     }
 
     fn error(&self) -> Option<String> {
-        combined_error(self.visible_error.clone(), self.deferred_rejections)
+        combined_error(
+            join_errors(self.visible_error.clone(), self.terminal_error()),
+            self.deferred_rejections,
+        )
+    }
+
+    fn terminal_error(&self) -> Option<String> {
+        (!self.terminal_uncertainties.is_empty()).then(|| {
+            let commands = self
+                .terminal_uncertainties
+                .iter()
+                .map(|notice| {
+                    format!(
+                        "{:?} (server receipt {:?})",
+                        notice.command_id, notice.received_command_id
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("Terminal command uncertainty remains after authoritative resync: {commands}")
+        })
+    }
+
+    fn capture_pending_terminal_uncertainty(&mut self, runtime: &StudioRuntime) -> bool {
+        let Some(command_id) = self.pending_command.as_ref() else {
+            return false;
+        };
+        let Some(CommandStatus::TerminalUncertain(
+            CommandUncertainty::IdempotencyReplayCollision {
+                received_command_id,
+            },
+        )) = runtime
+            .session()
+            .client()
+            .command(command_id)
+            .map(|record| &record.status)
+        else {
+            return false;
+        };
+        if self
+            .terminal_uncertainties
+            .iter()
+            .any(|notice| notice.command_id == *command_id)
+        {
+            return true;
+        }
+        if self.terminal_uncertainties.len() == TERMINAL_UNCERTAINTY_CAPACITY {
+            self.visible_error = Some(format!(
+                "Terminal uncertainty ledger reached capacity {TERMINAL_UNCERTAINTY_CAPACITY}; restart Studio to explicitly clear operator history"
+            ));
+            return false;
+        }
+        self.terminal_uncertainties.push(TerminalUncertaintyNotice {
+            command_id: command_id.clone(),
+            received_command_id: received_command_id.clone(),
+        });
+        true
+    }
+}
+
+fn join_errors(first: Option<String>, second: Option<String>) -> Option<String> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some(format!("{first}; {second}")),
+        (Some(first), None) => Some(first),
+        (None, second) => second,
     }
 }
 
@@ -530,6 +606,12 @@ fn handle_worker_intent(
     publisher: &StatePublisher,
     recovery: &mut WorkerRecovery,
 ) -> bool {
+    if recovery.terminal_uncertainties.len() == TERMINAL_UNCERTAINTY_CAPACITY {
+        recovery.visible_error = Some(format!(
+            "Command not sent: terminal uncertainty ledger reached capacity {TERMINAL_UNCERTAINTY_CAPACITY}; restart Studio to explicitly clear operator history"
+        ));
+        return publish_recovery_runtime(runtime, publisher, recovery);
+    }
     let command_id = match begin_intent(runtime, intent, keys, publisher, recovery.error()) {
         Ok(command_id) => command_id,
         Err(error) => {
@@ -538,12 +620,17 @@ fn handle_worker_intent(
         }
     };
     recovery.pending_command = Some(command_id.clone());
+    let persistent_error = recovery.terminal_error();
+    let publication = CommandPublication {
+        publisher,
+        publish_updates: true,
+        persistent_error: persistent_error.as_deref(),
+    };
     let result = flush_worker(runtime, requests, recovery).and_then(|()| {
         consume_command_sequence(
             runtime,
             &command_id,
-            publisher,
-            true,
+            publication,
             requests,
             &mut recovery.deferred_intents,
             &mut recovery.deferred_rejections,
@@ -557,6 +644,9 @@ fn handle_worker_intent(
         Err(WorkerFailure::Shutdown) => return false,
         Err(error) => {
             recovery.visible_error = Some(error.message().to_owned());
+            if recovery.capture_pending_terminal_uncertainty(runtime) {
+                recovery.visible_error = None;
+            }
             if error.invalidates_realization() {
                 recovery.realization_uncertain = true;
             }
@@ -678,33 +768,41 @@ fn resume_pending_command(
             .client()
             .command(&command_id)
             .is_some_and(|record| record.status.is_terminal());
-        let result = if terminal {
-            Ok(())
+        if terminal {
+            recovery.pending_command = None;
         } else {
-            consume_command_sequence(
+            let persistent_error = recovery.terminal_error();
+            let publication = CommandPublication {
+                publisher,
+                publish_updates: !recovery.realization_uncertain,
+                persistent_error: persistent_error.as_deref(),
+            };
+            let result = consume_command_sequence(
                 runtime,
                 &command_id,
-                publisher,
-                !recovery.realization_uncertain,
+                publication,
                 requests,
                 &mut recovery.deferred_intents,
                 &mut recovery.deferred_rejections,
-            )
-        };
-        match result {
-            Ok(()) => recovery.pending_command = None,
-            Err(WorkerFailure::Shutdown) => return false,
-            Err(error) => {
-                recovery.visible_error = Some(error.message().to_owned());
-                if error.invalidates_realization() {
-                    recovery.realization_uncertain = true;
+            );
+            match result {
+                Ok(()) => recovery.pending_command = None,
+                Err(WorkerFailure::Shutdown) => return false,
+                Err(error) => {
+                    recovery.visible_error = Some(error.message().to_owned());
+                    if recovery.capture_pending_terminal_uncertainty(runtime) {
+                        recovery.visible_error = None;
+                    }
+                    if error.invalidates_realization() {
+                        recovery.realization_uncertain = true;
+                    }
+                    recovery.reconnect_wait = if error.is_recoverable() {
+                        ReconnectWait::from_runtime(runtime)
+                    } else {
+                        recovery.pending_command = None;
+                        None
+                    };
                 }
-                recovery.reconnect_wait = if error.is_recoverable() {
-                    ReconnectWait::from_runtime(runtime)
-                } else {
-                    recovery.pending_command = None;
-                    None
-                };
             }
         }
     }
@@ -796,8 +894,7 @@ fn begin_intent(
 fn consume_command_sequence(
     runtime: &mut StudioRuntime,
     command_id: &str,
-    publisher: &StatePublisher,
-    publish_updates: bool,
+    publication: CommandPublication<'_>,
     requests: &Receiver<WorkerRequest>,
     deferred_intents: &mut VecDeque<StudioIntent>,
     deferred_rejections: &mut usize,
@@ -826,20 +923,15 @@ fn consume_command_sequence(
     let accepted_revision = match &result {
         CommandResult::Accepted { revision, .. } => *revision,
         CommandResult::Rejected { code, message, .. } => {
-            if publish_updates {
-                publish_runtime(
-                    runtime,
-                    publisher,
-                    combined_error(
-                        Some(format!("Command rejected ({code}): {message}")),
-                        *deferred_rejections,
-                    ),
-                );
-            }
+            publication.rejection(
+                runtime,
+                format!("Command rejected ({code}): {message}"),
+                *deferred_rejections,
+            );
             return Ok(());
         }
     };
-    publish_command_update(runtime, publisher, publish_updates, *deferred_rejections)?;
+    publication.update(runtime, *deferred_rejections)?;
     if runtime
         .session()
         .client()
@@ -866,7 +958,7 @@ fn consume_command_sequence(
         }
         other => return Err(unexpected_failure("durable event", &other)),
     }
-    publish_command_update(runtime, publisher, publish_updates, *deferred_rejections)?;
+    publication.update(runtime, *deferred_rejections)?;
 
     count_record(&mut consumed)?;
     match receive_command_event(
@@ -885,26 +977,50 @@ fn consume_command_sequence(
         }
         other => return Err(unexpected_failure("runtime event", &other)),
     }
-    publish_command_update(runtime, publisher, publish_updates, *deferred_rejections)?;
+    publication.update(runtime, *deferred_rejections)?;
     Ok(())
 }
 
-fn publish_command_update(
-    runtime: &mut StudioRuntime,
-    publisher: &StatePublisher,
-    publish: bool,
-    deferred_rejections: usize,
-) -> Result<(), WorkerFailure> {
-    if publish
-        && !publish_runtime(
-            runtime,
-            publisher,
-            combined_error(None, deferred_rejections),
-        )
-    {
-        Err(WorkerFailure::Fatal("Studio UI disconnected".to_owned()))
-    } else {
-        Ok(())
+#[derive(Clone, Copy)]
+struct CommandPublication<'a> {
+    publisher: &'a StatePublisher,
+    publish_updates: bool,
+    persistent_error: Option<&'a str>,
+}
+
+impl CommandPublication<'_> {
+    fn update(
+        self,
+        runtime: &mut StudioRuntime,
+        deferred_rejections: usize,
+    ) -> Result<(), WorkerFailure> {
+        if self.publish_updates
+            && !publish_runtime(
+                runtime,
+                self.publisher,
+                combined_error(
+                    self.persistent_error.map(str::to_owned),
+                    deferred_rejections,
+                ),
+            )
+        {
+            Err(WorkerFailure::Fatal("Studio UI disconnected".to_owned()))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn rejection(self, runtime: &mut StudioRuntime, error: String, deferred_rejections: usize) {
+        if self.publish_updates {
+            publish_runtime(
+                runtime,
+                self.publisher,
+                combined_error(
+                    join_errors(Some(error), self.persistent_error.map(str::to_owned)),
+                    deferred_rejections,
+                ),
+            );
+        }
     }
 }
 
@@ -1720,6 +1836,59 @@ mod tests {
         }));
     }
 
+    fn serve_worker_receipt_collision(listener: &TcpListener) {
+        let mut first = accept_worker_snapshot(listener);
+        let WireMessage::Command(command) = first.receive() else {
+            panic!("expected command before replay collision");
+        };
+        assert_eq!(
+            command.payload,
+            CommandPayload::SelectPreview {
+                input: wire_input(3)
+            }
+        );
+        first.send(&WireMessage::CommandResult(CommandResult::Accepted {
+            id: "old-evicted-command".to_owned(),
+            revision: 4,
+            scheduled_frame: None,
+        }));
+        assert_eq!(first.stream.read(&mut [0_u8; 1]).unwrap(), 0);
+
+        let mut second = accept_worker_snapshot_at(listener, 4, 2, 2);
+        let WireMessage::Command(after_resync) = second.receive() else {
+            panic!("expected explicit command after collision resync");
+        };
+        assert_eq!(
+            after_resync.payload,
+            CommandPayload::Cut,
+            "terminally uncertain command was retried"
+        );
+        second.send(&WireMessage::CommandResult(CommandResult::Accepted {
+            id: after_resync.id,
+            revision: 5,
+            scheduled_frame: None,
+        }));
+        second.send(&WireMessage::Event(EventMessage {
+            cursor: EventCursor {
+                engine: test_engine(),
+                revision: 5,
+            },
+            payload: EventPayload::DesiredSwitcher {
+                program: wire_input(2),
+                preview: wire_input(1),
+            },
+        }));
+        second.send(&WireMessage::RuntimeEvent(RuntimeEventMessage {
+            server: test_server(),
+            revision: 5,
+            generation: 1,
+            sequence: 1,
+            event: RuntimeLifecycleEvent::Realized {
+                domain: "switcher".to_owned(),
+            },
+        }));
+    }
+
     fn serve_worker_deferred_wipe(listener: &TcpListener) {
         let mut first = accept_worker_snapshot_version_at(listener, WIPE_PROTOCOL_VERSION, 4, 2, 2);
         let WireMessage::Command(original) = first.receive() else {
@@ -2160,6 +2329,58 @@ mod tests {
                 break;
             }
         }
+        try_enqueue(&requests, WorkerRequest::Shutdown).unwrap();
+        worker.join().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn terminal_collision_remains_visible_after_snapshot_and_successful_command() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || serve_worker_receipt_collision(&listener));
+        let (requests, states, worker) = spawn_test_worker(address);
+        wait_until_ready(&states);
+        try_enqueue(
+            &requests,
+            WorkerRequest::Intent(StudioIntent::SelectPreview(wire_input(3).to_domain())),
+        )
+        .unwrap();
+
+        let mut saw_recovery = false;
+        let mut sent_after_resync = false;
+        loop {
+            let state = states.recv_timeout(Duration::from_secs(3)).unwrap();
+            saw_recovery |= matches!(
+                state.connection_status,
+                StudioConnectionStatus::Backoff | StudioConnectionStatus::Synchronizing
+            );
+            let sticky = state.error.as_deref().is_some_and(|error| {
+                error.contains("Terminal command uncertainty remains")
+                    && error.contains("worker-test:1")
+                    && error.contains("old-evicted-command")
+            });
+            if saw_recovery
+                && sticky
+                && state.connection_status == StudioConnectionStatus::Ready
+                && state.pending_commands == 0
+                && !sent_after_resync
+            {
+                try_enqueue(&requests, WorkerRequest::Intent(StudioIntent::Cut)).unwrap();
+                sent_after_resync = true;
+            }
+            if sent_after_resync
+                && sticky
+                && state.pending_commands == 0
+                && state.view.as_ref().is_some_and(|view| {
+                    view.cursor.revision.get() == 5
+                        && view.switcher.realized.program == wire_input(2).to_domain()
+                })
+            {
+                break;
+            }
+        }
+        assert!(saw_recovery);
         try_enqueue(&requests, WorkerRequest::Shutdown).unwrap();
         worker.join().unwrap();
         server.join().unwrap();
