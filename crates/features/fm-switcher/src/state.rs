@@ -11,8 +11,13 @@ use crate::{
 pub struct ProgramFrame {
     pub primary: InputId,
     pub secondary: Option<InputId>,
+    /// Point mix used to compose the video frame.
     pub mix_numerator: u32,
     pub mix_denominator: u32,
+    /// Transition mix at the start of this frame's media interval.
+    pub mix_start_numerator: u32,
+    /// Transition mix at the end of this frame's media interval.
+    pub mix_end_numerator: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -156,6 +161,8 @@ impl SwitcherState {
                 secondary: Some(transition.to()),
                 mix_numerator: transition.mix_numerator(),
                 mix_denominator: transition.mix_denominator(),
+                mix_start_numerator: transition.mix_numerator(),
+                mix_end_numerator: transition.mix_end_numerator(),
             }
         } else if let Some(t_bar) = self.t_bar {
             ProgramFrame {
@@ -163,6 +170,8 @@ impl SwitcherState {
                 secondary: Some(t_bar.to()),
                 mix_numerator: u32::from(t_bar.position().basis_points()),
                 mix_denominator: u32::from(TBarPosition::MAX),
+                mix_start_numerator: u32::from(t_bar.interval_start().basis_points()),
+                mix_end_numerator: u32::from(t_bar.position().basis_points()),
             }
         } else {
             ProgramFrame {
@@ -170,11 +179,16 @@ impl SwitcherState {
                 secondary: None,
                 mix_numerator: 0,
                 mix_denominator: 1,
+                mix_start_numerator: 0,
+                mix_end_numerator: 0,
             }
         }
     }
 
     pub fn advance_frame(&mut self) -> Option<SwitcherEvent> {
+        if let Some(t_bar) = &mut self.t_bar {
+            t_bar.settle_frame();
+        }
         let mut transition = self.transition?;
         if transition.advance() {
             let kind = transition.kind();
@@ -189,6 +203,9 @@ impl SwitcherState {
     /// Advances one frame and reports both the legacy program change and completion event.
     #[must_use]
     pub fn advance_frame_events(&mut self) -> Vec<SwitcherEvent> {
+        if let Some(t_bar) = &mut self.t_bar {
+            t_bar.settle_frame();
+        }
         let Some(mut transition) = self.transition else {
             return Vec::new();
         };

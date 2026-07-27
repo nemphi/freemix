@@ -41,6 +41,7 @@ pub struct TBarState {
     kind: TransitionKind,
     from: InputId,
     to: InputId,
+    interval_start: TBarPosition,
     position: TBarPosition,
 }
 
@@ -50,6 +51,7 @@ impl TBarState {
             kind,
             from,
             to,
+            interval_start: TBarPosition::START,
             position: TBarPosition::START,
         }
     }
@@ -74,8 +76,17 @@ impl TBarState {
         self.position
     }
 
+    #[must_use]
+    pub const fn interval_start(self) -> TBarPosition {
+        self.interval_start
+    }
+
     pub(crate) const fn set_position(&mut self, position: TBarPosition) {
         self.position = position;
+    }
+
+    pub(crate) const fn settle_frame(&mut self) {
+        self.interval_start = self.position;
     }
 }
 
@@ -138,6 +149,16 @@ impl TransitionState {
     #[must_use]
     pub const fn mix_denominator(self) -> u32 {
         self.duration_frames
+    }
+
+    #[must_use]
+    pub const fn mix_end_numerator(self) -> u32 {
+        let next = self.elapsed_frames.saturating_add(1);
+        if next < self.duration_frames {
+            next
+        } else {
+            self.duration_frames
+        }
     }
 
     pub(crate) const fn advance(&mut self) -> bool {

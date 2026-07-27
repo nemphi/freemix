@@ -527,6 +527,8 @@ async fn assert_deadline_frame(
             secondary: None,
             mix_numerator: 0,
             mix_denominator: 1,
+            mix_start_numerator: 0,
+            mix_end_numerator: 0,
         },
         events: Vec::new(),
         revision: Revision::new(0),

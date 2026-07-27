@@ -765,6 +765,40 @@ trait MixerBlockView {
     fn planes(&self) -> &[Vec<f32>];
 }
 
+trait MixerSubmission<B> {
+    fn input(&self) -> InputId;
+    fn block(&self) -> &B;
+    fn source_gain(&self) -> SourceGain;
+}
+
+impl<B> MixerSubmission<B> for (InputId, &B) {
+    fn input(&self) -> InputId {
+        self.0
+    }
+
+    fn block(&self) -> &B {
+        self.1
+    }
+
+    fn source_gain(&self) -> SourceGain {
+        SourceGain::UNITY
+    }
+}
+
+impl<B> MixerSubmission<B> for (InputId, &B, SourceGain) {
+    fn input(&self) -> InputId {
+        self.0
+    }
+
+    fn block(&self) -> &B {
+        self.1
+    }
+
+    fn source_gain(&self) -> SourceGain {
+        self.2
+    }
+}
+
 impl MixerBlockView for AudioBlock {
     fn sample_rate(&self) -> SampleRate {
         self.format.sample_rate
@@ -945,12 +979,8 @@ impl MasterMixer {
         blocks: &[(InputId, &AudioBlock)],
         active_video_input: Option<InputId>,
     ) -> Result<MasterOutput, AudioError> {
-        let blocks = blocks
-            .iter()
-            .map(|(id, block)| (*id, *block, SourceGain::UNITY))
-            .collect::<Vec<_>>();
         let active_video_inputs = active_video_input.as_slice();
-        let mixed = self.mix_block_views(samples, &blocks, active_video_inputs)?;
+        let mixed = self.mix_block_views(samples, blocks, active_video_inputs)?;
         let block = AudioBlock::from_planar(self.format.clone(), mixed.planes)?;
         Ok(MasterOutput {
             block,
@@ -978,12 +1008,12 @@ impl MasterMixer {
         blocks: &[(InputId, &fm_frame::AudioBlock)],
         active_video_input: Option<InputId>,
     ) -> Result<TimedMasterOutput, AudioError> {
-        let blocks = blocks
-            .iter()
-            .map(|(id, block)| (*id, *block, SourceGain::UNITY))
-            .collect::<Vec<_>>();
         let active_video_inputs = active_video_input.as_slice();
-        self.mix_timed_with_source_gains(output_timing, samples, &blocks, active_video_inputs)
+        validate_sample_count(samples)?;
+        validate_canonical_output(&self.format, samples)?;
+        validate_timed_duration(output_timing, self.format.sample_rate, samples)?;
+        let mixed = self.mix_block_views(samples, blocks, active_video_inputs)?;
+        self.timed_output(output_timing, mixed)
     }
 
     /// Renders timed blocks with independent linear source envelopes.
@@ -1008,6 +1038,14 @@ impl MasterMixer {
         validate_canonical_output(&self.format, samples)?;
         validate_timed_duration(output_timing, self.format.sample_rate, samples)?;
         let mixed = self.mix_block_views(samples, blocks, active_video_inputs)?;
+        self.timed_output(output_timing, mixed)
+    }
+
+    fn timed_output(
+        &self,
+        output_timing: fm_frame::MediaTiming,
+        mixed: MixedMaster,
+    ) -> Result<TimedMasterOutput, AudioError> {
         let block = fm_frame::AudioBlock::new(
             output_timing,
             self.format.sample_rate,
@@ -1020,19 +1058,21 @@ impl MasterMixer {
         })
     }
 
-    fn mix_block_views<B: MixerBlockView>(
+    fn mix_block_views<B: MixerBlockView, S: MixerSubmission<B>>(
         &mut self,
         samples: usize,
-        blocks: &[(InputId, &B, SourceGain)],
+        blocks: &[S],
         active_video_inputs: &[InputId],
     ) -> Result<MixedMaster, AudioError> {
         validate_sample_count(samples)?;
         let mut seen = BTreeSet::new();
-        for (id, block, _) in blocks {
-            if !seen.insert(*id) {
-                return Err(AudioError::DuplicateInput(*id));
+        for submission in blocks {
+            let id = submission.input();
+            let block = submission.block();
+            if !seen.insert(id) {
+                return Err(AudioError::DuplicateInput(id));
             }
-            let strip = self.inputs.get(id).ok_or(AudioError::UnknownInput(*id))?;
+            let strip = self.inputs.get(&id).ok_or(AudioError::UnknownInput(id))?;
             if block.sample_rate() != strip.format.sample_rate
                 || block.channel_layout() != &strip.format.channels
             {
@@ -1051,17 +1091,17 @@ impl MasterMixer {
         let mut output = vec![vec![0.0; samples]; channels];
         let mut next_ramps = Vec::with_capacity(self.inputs.len());
         for (id, strip) in &self.inputs {
-            let block = blocks
-                .iter()
-                .find_map(|(block_id, block, gain)| (*block_id == *id).then_some((*block, *gain)));
+            let block = blocks.iter().find_map(|submission| {
+                (submission.input() == *id).then(|| (submission.block(), submission.source_gain()))
+            });
             let audible = !strip.state.muted
                 && (!strip.state.follow_video || active_video_inputs.contains(id));
             let mut ramp = strip.ramp;
-            let gains: Vec<_> = (0..samples).map(|_| ramp.next()).collect();
             if let Some((block, source_gain)) = block
                 && audible
             {
-                for (sample, strip_gain) in gains.into_iter().enumerate() {
+                for (sample, _) in block.planes()[0].iter().enumerate() {
+                    let strip_gain = ramp.next();
                     let source_gain = source_gain.at_sample(sample, samples);
                     for route in &strip.map.routes {
                         output[route.destination][sample] += block.planes()[route.source][sample]
@@ -1069,6 +1109,10 @@ impl MasterMixer {
                             * source_gain
                             * route.gain.linear();
                     }
+                }
+            } else {
+                for _ in 0..samples {
+                    ramp.next();
                 }
             }
             next_ramps.push((*id, ramp));

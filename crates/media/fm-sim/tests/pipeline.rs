@@ -16,6 +16,8 @@ fn program(primary: InputId) -> ProgramFrame {
         secondary: None,
         mix_numerator: 0,
         mix_denominator: 1,
+        mix_start_numerator: 0,
+        mix_end_numerator: 0,
     }
 }
 
@@ -69,6 +71,21 @@ fn cut_program_frame_renders_only_primary_source() {
 
     assert_eq!(output.pixel(0, 0), Some(red));
     assert_eq!(output.pixel(1, 1), Some(red));
+
+    let identical = pipeline
+        .render(
+            43,
+            ProgramFrame {
+                primary: input(1),
+                secondary: Some(input(1)),
+                mix_numerator: u32::MAX,
+                mix_denominator: 0,
+                mix_start_numerator: u32::MAX,
+                mix_end_numerator: u32::MAX,
+            },
+        )
+        .unwrap();
+    assert_eq!(identical.pixel(0, 0), Some(red));
 }
 
 #[test]
@@ -87,6 +104,8 @@ fn fade_renders_exact_endpoints_and_intermediate_mix() {
         secondary: Some(input(2)),
         mix_numerator: numerator,
         mix_denominator: 2,
+        mix_start_numerator: numerator,
+        mix_end_numerator: numerator,
     };
 
     assert_eq!(
@@ -142,6 +161,8 @@ fn missing_primary_and_secondary_sources_are_structured_errors() {
                 secondary: Some(input(9)),
                 mix_numerator: 1,
                 mix_denominator: 2,
+                mix_start_numerator: 1,
+                mix_end_numerator: 1,
             }
         ),
         Err(RenderError::MissingSource { input: input(9) })

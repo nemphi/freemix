@@ -1845,19 +1845,21 @@ fn native_audio_mix_plan(
             secondary: None,
         });
     };
-    let end_numerator = program
-        .mix_numerator
-        .checked_add(1)
-        .unwrap_or(program.mix_numerator)
-        .min(program.mix_denominator);
+    if secondary == program.primary {
+        return Ok(NativeAudioMixPlan {
+            primary: program.primary,
+            primary_gain: SourceGain::UNITY,
+            secondary: None,
+        });
+    }
     let secondary_gain = SourceGain::new(
-        program.mix_numerator,
-        end_numerator,
+        program.mix_start_numerator,
+        program.mix_end_numerator,
         program.mix_denominator,
     )?;
     let primary_gain = SourceGain::new(
-        program.mix_denominator - program.mix_numerator,
-        program.mix_denominator - end_numerator,
+        program.mix_denominator - program.mix_start_numerator,
+        program.mix_denominator - program.mix_end_numerator,
         program.mix_denominator,
     )?;
     Ok(NativeAudioMixPlan {
@@ -1876,7 +1878,7 @@ struct NativeMixPlan {
 
 fn native_mix_plan(program: ProgramFrame) -> Result<NativeMixPlan, TransitionError> {
     let (secondary, transition) = match program.secondary {
-        Some(secondary) => (
+        Some(secondary) if secondary != program.primary => (
             secondary,
             TransitionPlan::compile(
                 TransitionKind::Fade,
@@ -1884,7 +1886,7 @@ fn native_mix_plan(program: ProgramFrame) -> Result<NativeMixPlan, TransitionErr
                 program.mix_denominator,
             )?,
         ),
-        None => (
+        Some(_) | None => (
             program.primary,
             TransitionPlan::compile(TransitionKind::Cut, 0, 1)?,
         ),
@@ -3364,6 +3366,31 @@ mod tests {
         mix_numerator: u32,
         mix_denominator: u32,
     ) -> FrameResult {
+        let mix_end_numerator = if secondary.is_some() {
+            mix_numerator.saturating_add(1).min(mix_denominator)
+        } else {
+            0
+        };
+        frame_result_with_interval(
+            frame,
+            primary,
+            secondary,
+            mix_numerator,
+            mix_denominator,
+            mix_numerator,
+            mix_end_numerator,
+        )
+    }
+
+    fn frame_result_with_interval(
+        frame: u64,
+        primary: InputId,
+        secondary: Option<InputId>,
+        mix_numerator: u32,
+        mix_denominator: u32,
+        mix_start_numerator: u32,
+        mix_end_numerator: u32,
+    ) -> FrameResult {
         FrameResult {
             frame: FrameNumber::new(frame),
             deadline: ClockTime::ZERO,
@@ -3372,6 +3399,8 @@ mod tests {
                 secondary,
                 mix_numerator,
                 mix_denominator,
+                mix_start_numerator,
+                mix_end_numerator,
             },
             events: Vec::new(),
             revision: Revision::new(0),
@@ -3738,6 +3767,8 @@ mod tests {
             secondary: None,
             mix_numerator: u32::MAX,
             mix_denominator: 0,
+            mix_start_numerator: u32::MAX,
+            mix_end_numerator: u32::MAX,
         })
         .unwrap();
         assert_eq!(cut.primary, primary);
@@ -3746,11 +3777,26 @@ mod tests {
         assert_eq!(cut.transition.numerator(), 0);
         assert_eq!(cut.transition.denominator(), 1);
 
+        let identical = native_mix_plan(ProgramFrame {
+            primary,
+            secondary: Some(primary),
+            mix_numerator: u32::MAX,
+            mix_denominator: 0,
+            mix_start_numerator: u32::MAX,
+            mix_end_numerator: u32::MAX,
+        })
+        .unwrap();
+        assert_eq!(identical.primary, primary);
+        assert_eq!(identical.secondary, primary);
+        assert_eq!(identical.transition.kind(), TransitionKind::Cut);
+
         let fade = native_mix_plan(ProgramFrame {
             primary,
             secondary: Some(secondary),
             mix_numerator: 7,
             mix_denominator: 11,
+            mix_start_numerator: 7,
+            mix_end_numerator: 8,
         })
         .unwrap();
         assert_eq!(fade.primary, primary);
@@ -3764,6 +3810,8 @@ mod tests {
                 secondary: Some(secondary),
                 mix_numerator: 1,
                 mix_denominator: 0,
+                mix_start_numerator: 1,
+                mix_end_numerator: 1,
             }),
             Err(TransitionError::ZeroDenominator)
         );
@@ -4078,6 +4126,8 @@ mod tests {
                 secondary: Some(new),
                 mix_numerator: 2,
                 mix_denominator: 4,
+                mix_start_numerator: 2,
+                mix_end_numerator: 3,
             })
             .unwrap(),
             NativeAudioMixPlan {
@@ -4092,6 +4142,8 @@ mod tests {
                 secondary: None,
                 mix_numerator: u32::MAX,
                 mix_denominator: 0,
+                mix_start_numerator: u32::MAX,
+                mix_end_numerator: u32::MAX,
             })
             .unwrap(),
             NativeAudioMixPlan {
@@ -4106,9 +4158,111 @@ mod tests {
                 secondary: Some(new),
                 mix_numerator: 1,
                 mix_denominator: 0,
+                mix_start_numerator: 1,
+                mix_end_numerator: 1,
             })
             .is_err()
         );
+        assert_eq!(
+            native_audio_mix_plan(ProgramFrame {
+                primary: old,
+                secondary: Some(old),
+                mix_numerator: u32::MAX,
+                mix_denominator: 0,
+                mix_start_numerator: u32::MAX,
+                mix_end_numerator: u32::MAX,
+            })
+            .unwrap(),
+            NativeAudioMixPlan {
+                primary: old,
+                primary_gain: SourceGain::UNITY,
+                secondary: None,
+            }
+        );
+    }
+
+    #[test]
+    fn identical_fade_sources_render_once_at_unity_without_poisoning_runtime() {
+        let source = input(1);
+        let mut master = audio_test_master(&[(source, 0.25)], 2);
+
+        assert!(master.service_next_frame().unwrap());
+        let output = master
+            .render_frame_audio(&frame_result_with_interval(
+                0,
+                source,
+                Some(source),
+                u32::MAX,
+                0,
+                u32::MAX,
+                u32::MAX,
+            ))
+            .unwrap();
+        assert!(
+            output
+                .plane(0)
+                .unwrap()
+                .iter()
+                .all(|sample| *sample == 0.25)
+        );
+        assert_eq!(master.expected_next_frame(), 1);
+
+        assert!(master.service_next_frame().unwrap());
+        master
+            .render_frame_audio(&frame_result_with_mix(1, source, None, 0, 1))
+            .unwrap();
+        assert_eq!(master.expected_next_frame(), 2);
+    }
+
+    #[test]
+    fn t_bar_master_audio_holds_reverses_and_accepts_irregular_ratios() {
+        let old = input(1);
+        let new = input(2);
+        let mut master = audio_test_master(&[(old, 1.0), (new, -1.0)], 3);
+
+        assert!(master.service_next_frame().unwrap());
+        let held = master
+            .render_frame_audio(&frame_result_with_interval(
+                0,
+                old,
+                Some(new),
+                7_500,
+                10_000,
+                7_500,
+                7_500,
+            ))
+            .unwrap();
+        assert!(held.plane(0).unwrap().iter().all(|sample| *sample == -0.5));
+
+        assert!(master.service_next_frame().unwrap());
+        let reversed = master
+            .render_frame_audio(&frame_result_with_interval(
+                1,
+                old,
+                Some(new),
+                2_500,
+                10_000,
+                7_500,
+                2_500,
+            ))
+            .unwrap();
+        let reversed = reversed.plane(0).unwrap();
+        assert!((reversed[0] - (-0.5 + 1.0 / 1_920.0)).abs() < 1.0e-6);
+        assert_eq!(reversed[1_919], 0.5);
+
+        assert!(master.service_next_frame().unwrap());
+        let irregular = master
+            .render_frame_audio(&frame_result_with_interval(
+                2,
+                old,
+                Some(new),
+                7_333,
+                10_000,
+                2_500,
+                7_333,
+            ))
+            .unwrap();
+        assert!((irregular.plane(0).unwrap()[1_919] - -0.4666).abs() < 1.0e-6);
     }
 
     #[test]
@@ -4140,6 +4294,36 @@ mod tests {
         assert_eq!(second[1_919], -1.0);
         assert_eq!(cut[0], -1.0);
         assert!((second[0] - first[1_919] + step).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn fade_master_audio_uses_exact_fractional_cadence_intervals() {
+        let old = input(1);
+        let new = input(2);
+        let mut master = audio_test_master(&[(old, 1.0), (new, -1.0)], 3);
+        master.frame_rate = FrameRate::new(30_000, 1_001).unwrap();
+
+        assert!(master.service_next_frame().unwrap());
+        let first = master
+            .render_frame_audio(&frame_result_with_mix(0, old, Some(new), 0, 2))
+            .unwrap();
+        assert!(master.service_next_frame().unwrap());
+        let second = master
+            .render_frame_audio(&frame_result_with_mix(1, old, Some(new), 1, 2))
+            .unwrap();
+        assert!(master.service_next_frame().unwrap());
+        let cut = master
+            .render_frame_audio(&frame_result_with_mix(2, new, None, 0, 1))
+            .unwrap();
+
+        assert_eq!(first.sample_count(), 1_601);
+        assert_eq!(second.sample_count(), 1_602);
+        assert_eq!(cut.sample_count(), 1_601);
+        assert!((first.plane(0).unwrap()[0] - (1.0 - 1.0 / 1_601.0)).abs() < 1.0e-6);
+        assert_eq!(first.plane(0).unwrap()[1_600], 0.0);
+        assert!((second.plane(0).unwrap()[0] + 1.0 / 1_602.0).abs() < 1.0e-6);
+        assert_eq!(second.plane(0).unwrap()[1_601], -1.0);
+        assert_eq!(cut.plane(0).unwrap()[0], -1.0);
     }
 
     #[test]

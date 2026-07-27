@@ -91,7 +91,10 @@ impl SimulatedPipeline {
         program: ProgramFrame,
     ) -> Result<ImageFrame, RenderError> {
         let primary = self.render_input(program.primary, frame_number)?;
-        let Some(secondary) = program.secondary else {
+        let Some(secondary) = program
+            .secondary
+            .filter(|secondary| *secondary != program.primary)
+        else {
             return Ok(primary);
         };
         let secondary = self.render_input(secondary, frame_number)?;

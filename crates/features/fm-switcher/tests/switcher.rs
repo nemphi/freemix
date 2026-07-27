@@ -61,10 +61,21 @@ fn fade_realizes_on_exact_frame_boundary() {
 
     let initial = switcher.program_frame();
     assert_eq!((initial.mix_numerator, initial.mix_denominator), (0, 3));
+    assert_eq!(
+        (initial.mix_start_numerator, initial.mix_end_numerator),
+        (0, 1)
+    );
     assert_eq!(switcher.advance_frame(), None);
-    assert_eq!(switcher.program_frame().mix_numerator, 1);
+    let second = switcher.program_frame();
+    assert_eq!(second.mix_numerator, 1);
+    assert_eq!(
+        (second.mix_start_numerator, second.mix_end_numerator),
+        (1, 2)
+    );
     assert_eq!(switcher.advance_frame(), None);
-    assert_eq!(switcher.program_frame().mix_numerator, 2);
+    let third = switcher.program_frame();
+    assert_eq!(third.mix_numerator, 2);
+    assert_eq!((third.mix_start_numerator, third.mix_end_numerator), (2, 3));
     assert!(matches!(
         switcher.advance_frame(),
         Some(SwitcherEvent::ProgramChanged { .. })
@@ -133,13 +144,40 @@ fn t_bar_can_reverse_then_commit_or_cancel() {
             TBarPosition::new(8_000).unwrap(),
         ))
         .unwrap();
-    assert_eq!(switcher.program_frame().mix_numerator, 8_000);
+    let forward = switcher.program_frame();
+    assert_eq!(forward.mix_numerator, 8_000);
+    assert_eq!(
+        (forward.mix_start_numerator, forward.mix_end_numerator),
+        (0, 8_000)
+    );
+    assert_eq!(switcher.advance_frame(), None);
+    let held = switcher.program_frame();
+    assert_eq!(
+        (held.mix_start_numerator, held.mix_end_numerator),
+        (8_000, 8_000)
+    );
     switcher
         .apply(SwitcherCommand::SetTBarPosition(
             TBarPosition::new(2_500).unwrap(),
         ))
         .unwrap();
-    assert_eq!(switcher.program_frame().mix_numerator, 2_500);
+    let reverse = switcher.program_frame();
+    assert_eq!(reverse.mix_numerator, 2_500);
+    assert_eq!(
+        (reverse.mix_start_numerator, reverse.mix_end_numerator),
+        (8_000, 2_500)
+    );
+    assert_eq!(switcher.advance_frame(), None);
+    switcher
+        .apply(SwitcherCommand::SetTBarPosition(
+            TBarPosition::new(7_333).unwrap(),
+        ))
+        .unwrap();
+    let irregular = switcher.program_frame();
+    assert_eq!(
+        (irregular.mix_start_numerator, irregular.mix_end_numerator),
+        (2_500, 7_333)
+    );
     assert_eq!(switcher.program(), input(1));
 
     let events = switcher.apply(SwitcherCommand::CommitTBar).unwrap();
