@@ -33,7 +33,7 @@ use std::{
 };
 
 use fm_capabilities::StableId;
-use fm_frame::{ClockDomainId, CpuVideoFrame, MediaFlags};
+use fm_frame::{ClockDomainId, CpuVideoFrame, MediaFlags, MediaTiming, SequenceNumber};
 use fm_io_api::{
     ClockCapability, DeviceId, Discovery, DiscoveryEvent, DiscoveryEventKind, DiscoverySnapshot,
     DriverState, EndpointCapabilities, EndpointHealth, EndpointHealthState, FallbackKind,
@@ -602,7 +602,6 @@ impl QueueState {
             self.telemetry.dropped = self.telemetry.dropped.saturating_add(1);
         }
         self.frames.push_back(frame);
-        self.last_activity = Some(Instant::now());
         self.telemetry.current = self.frames.len();
         self.telemetry.peak = self.telemetry.peak.max(self.frames.len());
     }
@@ -1069,50 +1068,83 @@ impl CameraVideoSource {
         };
     }
 
-    fn apply_recovery_continuity(
-        &mut self,
+    fn prepare_frame(
+        &self,
         frame: CpuVideoFrame,
+        recovering: bool,
     ) -> Result<CpuVideoFrame, IoError> {
-        let Some(pending) = self.pending_recovery else {
-            return Ok(frame);
-        };
         let timing = frame.timing();
-        if timing.clock_domain() != pending.clock {
-            return Err(IoError::MalformedTimestamp(
-                TimestampValidationError::WrongClock {
-                    expected: pending.clock,
-                    actual: timing.clock_domain(),
-                },
-            ));
-        }
-        let actual_nanos = timing.presentation_timestamp().as_nanos();
-        if let Some(previous_nanos) = pending.previous_pts_nanos
-            && actual_nanos <= previous_nanos
-        {
-            return Err(IoError::MalformedTimestamp(
-                TimestampValidationError::NonMonotonic {
-                    previous_nanos,
-                    actual_nanos,
-                },
-            ));
+        if recovering {
+            let pending = self
+                .pending_recovery
+                .expect("a started recovery has a continuity anchor");
+            if timing.clock_domain() != pending.clock {
+                return Err(IoError::MalformedTimestamp(
+                    TimestampValidationError::WrongClock {
+                        expected: pending.clock,
+                        actual: timing.clock_domain(),
+                    },
+                ));
+            }
+            let actual_nanos = timing.presentation_timestamp().as_nanos();
+            if let Some(previous_nanos) = pending.previous_pts_nanos
+                && actual_nanos <= previous_nanos
+            {
+                return Err(IoError::MalformedTimestamp(
+                    TimestampValidationError::NonMonotonic {
+                        previous_nanos,
+                        actual_nanos,
+                    },
+                ));
+            }
         }
 
+        let sequence = match self.last_delivered.as_ref() {
+            Some(previous) => previous
+                .timing()
+                .sequence()
+                .checked_next()
+                .ok_or_else(|| adapter_failure("camera adapter sequence overflow"))?,
+            None => SequenceNumber::new(0),
+        };
+        let mut flags = timing.flags();
+        if recovering {
+            flags |= MediaFlags::DISCONTINUITY;
+        }
+        let mut replacement_timing = MediaTiming::new(
+            timing.original_timestamp(),
+            timing.presentation_timestamp(),
+            timing.duration(),
+            timing.clock_domain(),
+            sequence,
+        )
+        .map_err(|error| adapter_failure(format!("camera frame timing is invalid: {error}")))?
+        .with_flags(flags);
+        if let Some(capture_timestamp) = timing.capture_timestamp() {
+            replacement_timing = replacement_timing.with_capture_timestamp(capture_timestamp);
+        }
+        if let Some(timecode) = timing.timecode() {
+            replacement_timing = replacement_timing.with_timecode(timecode);
+        }
         let metadata = frame.metadata();
-        let frame = CpuVideoFrame::new(
-            timing.with_flags(timing.flags() | MediaFlags::DISCONTINUITY),
-            frame.into_payload(),
-        );
+        let frame = CpuVideoFrame::new(replacement_timing, frame.into_payload());
         let frame = if let Some(metadata) = metadata {
             frame.with_metadata(metadata).map_err(|error| {
-                adapter_failure(format!(
-                    "recovered camera frame metadata is invalid: {error}"
-                ))
+                adapter_failure(format!("camera frame metadata is invalid: {error}"))
             })?
         } else {
             frame
         };
-        self.pending_recovery = None;
         Ok(frame)
+    }
+
+    fn accept_frame(&mut self, frame: CpuVideoFrame) -> MediaTransfer<CpuVideoFrame> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .last_activity = Some(Instant::now());
+        self.last_delivered = Some(frame.clone());
+        MediaTransfer::Live(frame)
     }
 
     #[cfg(test)]
@@ -1334,6 +1366,7 @@ impl MediaSource for CameraVideoSource {
             return Ok(());
         }
         let held_frame = self.last_delivered.clone();
+        let recovery_health = self.health.clone();
         let pending_recovery = RecoveryContinuity {
             clock: self
                 .options
@@ -1361,7 +1394,13 @@ impl MediaSource for CameraVideoSource {
         }
         self.last_delivered = held_frame;
         self.pending_recovery = Some(pending_recovery);
-        self.resume_running = false;
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .last_activity = None;
+        self.lifecycle = LifecycleState::Recovering;
+        self.health = recovery_health;
+        self.resume_running = true;
         Ok(())
     }
 
@@ -1371,6 +1410,35 @@ impl MediaSource for CameraVideoSource {
                 return Err(error);
             }
             return self.lost_transfer();
+        }
+        if self.lifecycle == LifecycleState::Recovering {
+            if let Some(error) = self.sticky_error() {
+                return Err(error);
+            }
+            if self.lifecycle == LifecycleState::Lost {
+                return self.lost_transfer();
+            }
+            if self.pending_recovery.is_none() {
+                return self.lost_transfer();
+            }
+            let frame = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop();
+            let Some(frame) = frame else {
+                return self.lost_transfer();
+            };
+            let frame = match self.prepare_frame(frame, true) {
+                Ok(frame) => frame,
+                Err(IoError::MalformedTimestamp(_)) => return self.lost_transfer(),
+                Err(error) => return Err(error),
+            };
+            self.pending_recovery = None;
+            self.resume_running = false;
+            self.lifecycle = LifecycleState::Running;
+            self.health = EndpointHealth::HEALTHY;
+            return Ok(Some(self.accept_frame(frame)));
         }
         if self.lifecycle != LifecycleState::Running {
             return Err(invalid_state("receive", self.lifecycle));
@@ -1389,9 +1457,8 @@ impl MediaSource for CameraVideoSource {
             (state.pop(), state.last_activity)
         };
         if let Some(frame) = frame {
-            let frame = self.apply_recovery_continuity(frame)?;
-            self.last_delivered = Some(frame.clone());
-            return Ok(Some(MediaTransfer::Live(frame)));
+            let frame = self.prepare_frame(frame, false)?;
+            return Ok(Some(self.accept_frame(frame)));
         }
         if last_activity.is_some_and(|activity| activity.elapsed() >= SIGNAL_LOSS_TIMEOUT) {
             self.transition_to_signal_lost(
@@ -2007,7 +2074,7 @@ mod tests {
                 Some(MediaTransfer::Fallback {
                     kind: FallbackKind::Hold,
                     media,
-                }) if media.timing().sequence().get() == 7
+                }) if media.timing().sequence().get() == 0
             ));
             assert_eq!(source.lifecycle(), LifecycleState::Lost);
         }
@@ -2015,7 +2082,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_continuity_is_transactional_and_allows_sequence_reset() {
+    fn recovery_rejects_regressions_without_consuming_continuity() {
         let mut source = source_with_policy(SignalLossPolicy::Hold);
         source.start_without_helper_for_test();
         let clock = source.options.as_ref().unwrap().clock_domain;
@@ -2028,50 +2095,63 @@ mod tests {
             Some(MediaTransfer::Live(frame)) => frame,
             result => panic!("unexpected anchor transfer: {result:?}"),
         };
+        assert_eq!(anchor.timing().sequence().get(), 0);
+        source.expire_activity_for_test();
+        assert!(matches!(
+            source.try_receive().unwrap(),
+            Some(MediaTransfer::Fallback {
+                kind: FallbackKind::Hold,
+                ..
+            })
+        ));
+        source.begin_recovery().unwrap();
         source.pending_recovery = Some(RecoveryContinuity {
             clock,
             previous_pts_nanos: Some(anchor.timing().presentation_timestamp().as_nanos()),
         });
-
-        let wrong_clock = ClockDomainId::new(NonZeroU128::new(999).unwrap());
         source
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(test_frame_at(0, 2_000, wrong_clock), 0);
-        assert!(matches!(
-            source.try_receive(),
-            Err(IoError::MalformedTimestamp(
-                TimestampValidationError::WrongClock { .. }
-            ))
-        ));
-        assert!(source.pending_recovery.is_some());
-        assert_eq!(source.last_delivered.as_ref().unwrap(), &anchor);
+            .last_activity = None;
+
+        for (helper_sequence, pts) in [(0, 500), (1, 1_000)] {
+            source
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(test_frame_at(helper_sequence, pts, clock), 0);
+            assert!(matches!(
+                source.try_receive().unwrap(),
+                Some(MediaTransfer::Fallback {
+                    kind: FallbackKind::Hold,
+                    media,
+                }) if media == anchor
+            ));
+            assert_eq!(source.lifecycle(), LifecycleState::Recovering);
+            assert_eq!(source.health().state, EndpointHealthState::SignalLost);
+            assert!(source.pending_recovery.is_some());
+            assert_eq!(source.last_delivered.as_ref().unwrap(), &anchor);
+            assert!(
+                source
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .last_activity
+                    .is_none()
+            );
+        }
 
         source
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(test_frame_at(0, 1_000, clock), 0);
-        assert!(matches!(
-            source.try_receive(),
-            Err(IoError::MalformedTimestamp(
-                TimestampValidationError::NonMonotonic { .. }
-            ))
-        ));
-        assert!(source.pending_recovery.is_some());
-        assert_eq!(source.last_delivered.as_ref().unwrap(), &anchor);
-
-        source
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(test_frame_at(0, 2_000, clock), 0);
+            .push(test_frame_at(2, 2_000, clock), 0);
         let recovered = match source.try_receive().unwrap() {
             Some(MediaTransfer::Live(frame)) => frame,
             result => panic!("unexpected recovered transfer: {result:?}"),
         };
-        assert_eq!(recovered.timing().sequence().get(), 0);
+        assert_eq!(recovered.timing().sequence().get(), 1);
         assert!(
             recovered
                 .timing()
@@ -2079,6 +2159,20 @@ mod tests {
                 .contains(MediaFlags::DISCONTINUITY)
         );
         assert!(source.pending_recovery.is_none());
+        assert_eq!(source.lifecycle(), LifecycleState::Running);
+        assert_eq!(source.health(), &EndpointHealth::HEALTHY);
+
+        source
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(test_frame_at(3, 2_033, clock), 0);
+        let second = match source.try_receive().unwrap() {
+            Some(MediaTransfer::Live(frame)) => frame,
+            result => panic!("unexpected second recovered transfer: {result:?}"),
+        };
+        assert_eq!(second.timing().sequence().get(), 2);
+        assert!(!second.timing().flags().contains(MediaFlags::DISCONTINUITY));
     }
 
     #[test]
@@ -2211,8 +2305,12 @@ mod tests {
                 let deadline = Instant::now() + Duration::from_secs(1);
                 loop {
                     match source.try_receive() {
-                        Err(IoError::SignalLost { .. }) => break,
-                        Ok(None) if Instant::now() < deadline => {
+                        Err(IoError::SignalLost { .. })
+                            if source.lifecycle() == LifecycleState::Lost =>
+                        {
+                            break;
+                        }
+                        Err(IoError::SignalLost { .. }) | Ok(None) if Instant::now() < deadline => {
                             std::thread::sleep(Duration::from_millis(5));
                         }
                         result => panic!("unexpected exit-20 result: {result:?}"),
@@ -2234,8 +2332,12 @@ mod tests {
                 let deadline = Instant::now() + Duration::from_secs(1);
                 loop {
                     match source.try_receive() {
-                        Err(IoError::SignalLost { .. }) => break,
-                        Ok(None) if Instant::now() < deadline => {
+                        Err(IoError::SignalLost { .. })
+                            if source.lifecycle() == LifecycleState::Lost =>
+                        {
+                            break;
+                        }
+                        Err(IoError::SignalLost { .. }) | Ok(None) if Instant::now() < deadline => {
                             std::thread::sleep(Duration::from_millis(5));
                         }
                         result => panic!("unexpected recovery exit-20 result: {result:?}"),
@@ -2273,14 +2375,19 @@ mod tests {
         let helper = std::env::temp_dir().join(format!("fm-camera-recovery-{suffix}.sh"));
         let count_file = helper.with_extension("count");
         let pid_file = helper.with_extension("pids");
+        let invalid_marker = helper.with_extension("invalid");
         let script = format!(
-            "#!/bin/sh\ncount=0\nif [ -f '{}' ]; then count=$(cat '{}'); fi\ncount=$((count + 1))\nprintf '%s' \"$count\" > '{}'\nprintf '%s\\n' \"$$\" >> '{}'\ncase \"$count\" in\n  1) printf '{}'; sleep 0.2; exit 20;;\n  2) printf 'BADMAGIC'; exit 91;;\n  3) printf '{}'; exec sleep 30;;\n  *) exit 90;;\nesac\n",
+            "#!/bin/sh\ncount=0\nif [ -f '{}' ]; then count=$(cat '{}'); fi\ncount=$((count + 1))\nprintf '%s' \"$count\" > '{}'\nprintf '%s\\n' \"$$\" >> '{}'\ncase \"$count\" in\n  1) printf '{}'; sleep 0.2; exit 20;;\n  2) printf 'BADMAGIC'; exit 91;;\n  3) printf '\\106\\115\\103\\101\\115\\106\\063\\000'; sleep 0.1; printf '{}'; sleep 0.1; printf '{}'; touch '{}'; sleep 0.5; printf '{}'; printf '{}'; exec sleep 30;;\n  *) exit 90;;\nesac\n",
             count_file.display(),
             count_file.display(),
             count_file.display(),
             pid_file.display(),
             shell_octal(&capture_frame(7, 1_000)),
-            shell_octal(&capture_frame(0, 2_000)),
+            shell_octal(&capture_frame(0, 500)[8..]),
+            shell_octal(&capture_frame(1, 1_000)[8..]),
+            invalid_marker.display(),
+            shell_octal(&capture_frame(2, 2_000)[8..]),
+            shell_octal(&capture_frame(3, 2_033)[8..]),
         );
         fs::write(&helper, script).unwrap();
         let mut permissions = fs::metadata(&helper).unwrap().permissions();
@@ -2316,7 +2423,7 @@ mod tests {
                 None => panic!("initial helper frame was not delivered"),
             }
         };
-        assert_eq!(first.timing().sequence().get(), 7);
+        assert_eq!(first.timing().sequence().get(), 0);
 
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
@@ -2348,15 +2455,62 @@ mod tests {
 
         source.begin_recovery().unwrap();
         source.finish_recovery().unwrap();
+        assert_eq!(source.lifecycle(), LifecycleState::Recovering);
+        assert_ne!(source.health().state, EndpointHealthState::Healthy);
+        assert!(!invalid_marker.exists());
+        assert!(matches!(
+            source.try_receive().unwrap(),
+            Some(MediaTransfer::Fallback {
+                kind: FallbackKind::Hold,
+                media,
+            }) if media == first
+        ));
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !invalid_marker.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            invalid_marker.exists(),
+            "invalid recovery frames were not emitted"
+        );
+        for _ in 0..2 {
+            assert!(matches!(
+                source.try_receive().unwrap(),
+                Some(MediaTransfer::Fallback {
+                    kind: FallbackKind::Hold,
+                    media,
+                }) if media == first
+            ));
+            assert_eq!(source.lifecycle(), LifecycleState::Recovering);
+            assert_ne!(source.health().state, EndpointHealthState::Healthy);
+        }
+        assert!(
+            source
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .last_activity
+                .is_none()
+        );
+
         let deadline = Instant::now() + Duration::from_secs(2);
         let recovered = loop {
             match source.try_receive().unwrap() {
                 Some(MediaTransfer::Live(frame)) => break frame,
-                None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+                Some(MediaTransfer::Fallback {
+                    kind: FallbackKind::Hold,
+                    ..
+                })
+                | None
+                    if Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
                 result => panic!("unexpected recovered transfer: {result:?}"),
             }
         };
-        assert_eq!(recovered.timing().sequence().get(), 0);
+        assert_eq!(recovered.timing().sequence().get(), 1);
         assert_eq!(
             recovered.timing().clock_domain(),
             first.timing().clock_domain()
@@ -2370,6 +2524,16 @@ mod tests {
                 .flags()
                 .contains(MediaFlags::DISCONTINUITY)
         );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let second = loop {
+            match source.try_receive().unwrap() {
+                Some(MediaTransfer::Live(frame)) => break frame,
+                None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+                result => panic!("unexpected second recovered transfer: {result:?}"),
+            }
+        };
+        assert_eq!(second.timing().sequence().get(), 2);
+        assert!(!second.timing().flags().contains(MediaFlags::DISCONTINUITY));
         assert_eq!(source.descriptor().id, expected_id);
         assert_eq!(source.descriptor().stable_key, expected_key);
 
@@ -2388,5 +2552,6 @@ mod tests {
         fs::remove_file(helper).unwrap();
         fs::remove_file(count_file).unwrap();
         fs::remove_file(pid_file).unwrap();
+        fs::remove_file(invalid_marker).unwrap();
     }
 }
