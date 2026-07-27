@@ -585,6 +585,7 @@ struct QueueState {
     capacity: usize,
     telemetry: CameraTelemetry,
     native_dropped_base: u64,
+    accepting_frames: bool,
     sticky_failure: Option<String>,
     #[cfg(target_os = "macos")]
     stderr: Vec<u8>,
@@ -618,6 +619,14 @@ impl QueueState {
         frame
     }
 
+    fn push_from_worker(&mut self, frame: CpuVideoFrame, native_dropped_total: u64) -> bool {
+        if !self.accepting_frames {
+            return false;
+        }
+        self.push(frame, native_dropped_total);
+        true
+    }
+
     fn fail(&mut self, detail: impl Into<String>) {
         if self.sticky_failure.is_none() {
             self.sticky_failure = Some(detail.into());
@@ -647,8 +656,11 @@ pub struct CameraVideoSource {
     pending_recovery: Option<RecoveryContinuity>,
     recovery_deadline: Option<Instant>,
     map_recovery_sequences: bool,
+    recovery_sequence_offset: Option<i128>,
     #[cfg(target_os = "macos")]
     capture: Option<CaptureProcess>,
+    #[cfg(test)]
+    force_shutdown_failure: bool,
 }
 
 impl CameraVideoSource {
@@ -668,8 +680,11 @@ impl CameraVideoSource {
             pending_recovery: None,
             recovery_deadline: None,
             map_recovery_sequences: false,
+            recovery_sequence_offset: None,
             #[cfg(target_os = "macos")]
             capture: None,
+            #[cfg(test)]
+            force_shutdown_failure: false,
         }
     }
 
@@ -770,6 +785,7 @@ impl CameraVideoSource {
                 state.native_dropped_base = 0;
             }
             state.sticky_failure = None;
+            state.accepting_frames = true;
             #[cfg(target_os = "macos")]
             state.stderr.clear();
             state.last_activity = None;
@@ -778,6 +794,7 @@ impl CameraVideoSource {
         self.pending_recovery = None;
         self.recovery_deadline = None;
         self.map_recovery_sequences = false;
+        self.recovery_sequence_offset = None;
 
         #[cfg(target_os = "macos")]
         {
@@ -973,10 +990,12 @@ impl CameraVideoSource {
                 };
                 let error = loop {
                     match reader.read_captured_frame() {
-                        Ok(Some(captured)) => state
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .push(captured.frame, captured.native_dropped_total),
+                        Ok(Some(captured)) => {
+                            let _ = state
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .push_from_worker(captured.frame, captured.native_dropped_total);
+                        }
                         Ok(None) => return,
                         Err(error) => break error,
                     }
@@ -1065,6 +1084,14 @@ impl CameraVideoSource {
     }
 
     fn shutdown(&mut self) -> Result<(), IoError> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .accepting_frames = false;
+        #[cfg(test)]
+        if self.force_shutdown_failure {
+            return Err(adapter_failure("injected camera helper shutdown failure"));
+        }
         #[cfg(target_os = "macos")]
         {
             let Some(capture) = self.capture.as_mut() else {
@@ -1190,7 +1217,7 @@ impl CameraVideoSource {
         &self,
         frame: CpuVideoFrame,
         recovering: bool,
-    ) -> Result<CpuVideoFrame, IoError> {
+    ) -> Result<(CpuVideoFrame, Option<i128>), IoError> {
         let timing = frame.timing();
         if recovering {
             let pending = self
@@ -1217,16 +1244,34 @@ impl CameraVideoSource {
             }
         }
         if !recovering && !self.map_recovery_sequences {
-            return Ok(frame);
+            return Ok((frame, None));
         }
 
-        let sequence = match self.last_delivered.as_ref() {
-            Some(previous) => previous
-                .timing()
-                .sequence()
-                .checked_next()
-                .ok_or_else(|| adapter_failure("camera adapter sequence overflow"))?,
-            None => timing.sequence(),
+        let mut new_offset = None;
+        let sequence = if self.map_recovery_sequences {
+            let offset = if let Some(offset) = self.recovery_sequence_offset {
+                offset
+            } else {
+                let previous = self
+                    .last_delivered
+                    .as_ref()
+                    .expect("sequence mapping requires a delivered anchor");
+                let next = previous
+                    .timing()
+                    .sequence()
+                    .checked_next()
+                    .ok_or_else(|| adapter_failure("camera adapter sequence overflow"))?;
+                let offset = i128::from(next.get()) - i128::from(timing.sequence().get());
+                new_offset = Some(offset);
+                offset
+            };
+            let mapped = i128::from(timing.sequence().get())
+                .checked_add(offset)
+                .and_then(|sequence| u64::try_from(sequence).ok())
+                .ok_or_else(|| adapter_failure("camera adapter sequence overflow"))?;
+            fm_frame::SequenceNumber::new(mapped)
+        } else {
+            timing.sequence()
         };
         let mut flags = timing.flags();
         if recovering {
@@ -1256,7 +1301,7 @@ impl CameraVideoSource {
         } else {
             frame
         };
-        Ok(frame)
+        Ok((frame, new_offset))
     }
 
     fn accept_frame(&mut self, frame: CpuVideoFrame) -> MediaTransfer<CpuVideoFrame> {
@@ -1288,14 +1333,16 @@ impl CameraVideoSource {
             state.telemetry.current = 0;
             state.sticky_failure = None;
         }
+        if let Err(error) = cleanup {
+            let detail = format!("camera recovery timed out; cleanup failed: {error}");
+            self.resume_running = true;
+            self.lifecycle = LifecycleState::Lost;
+            self.set_failed_health(detail.clone());
+            return Err(adapter_failure(detail));
+        }
         self.transition_to_signal_lost(
             "camera recovery produced no valid frame before the deadline".to_owned(),
         );
-        if let Err(error) = cleanup {
-            self.set_failed_health(format!(
-                "camera recovery timed out; cleanup failed: {error}"
-            ));
-        }
         self.lost_transfer()
     }
 
@@ -1328,6 +1375,7 @@ impl CameraVideoSource {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.last_activity = Some(Instant::now());
+        state.accepting_frames = true;
         drop(state);
         self.lifecycle = LifecycleState::Running;
         self.health = EndpointHealth::HEALTHY;
@@ -1385,6 +1433,7 @@ impl MediaSource for CameraVideoSource {
         self.pending_recovery = None;
         self.recovery_deadline = None;
         self.map_recovery_sequences = false;
+        self.recovery_sequence_offset = None;
         self.resume_running = false;
         self.lifecycle = LifecycleState::Open;
         self.health = EndpointHealth::HEALTHY;
@@ -1416,6 +1465,7 @@ impl MediaSource for CameraVideoSource {
         self.recovery_deadline = None;
         self.resume_running = false;
         self.map_recovery_sequences = false;
+        self.recovery_sequence_offset = None;
         self.lifecycle = LifecycleState::Open;
         self.health = EndpointHealth::HEALTHY;
         Ok(())
@@ -1444,6 +1494,7 @@ impl MediaSource for CameraVideoSource {
         self.recovery_deadline = None;
         self.resume_running = false;
         self.map_recovery_sequences = false;
+        self.recovery_sequence_offset = None;
         self.lifecycle = LifecycleState::Closed;
         Ok(())
     }
@@ -1473,6 +1524,7 @@ impl MediaSource for CameraVideoSource {
         let has_continuity_anchor = held_frame.is_some();
         let recovery_health = self.health.clone();
         let map_recovery_sequences = self.map_recovery_sequences;
+        let recovery_sequence_offset = self.recovery_sequence_offset;
         let pending_recovery = RecoveryContinuity {
             clock: self
                 .options
@@ -1487,6 +1539,7 @@ impl MediaSource for CameraVideoSource {
         if let Err(error) = self.start_capture(true) {
             self.last_delivered = held_frame;
             self.map_recovery_sequences = map_recovery_sequences;
+            self.recovery_sequence_offset = recovery_sequence_offset;
             self.state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1503,6 +1556,7 @@ impl MediaSource for CameraVideoSource {
         self.pending_recovery = Some(pending_recovery);
         self.recovery_deadline = Some(Instant::now() + RECOVERY_FRAME_TIMEOUT);
         self.map_recovery_sequences = has_continuity_anchor;
+        self.recovery_sequence_offset = None;
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1537,8 +1591,8 @@ impl MediaSource for CameraVideoSource {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .pop();
                 if let Some(frame) = frame {
-                    let frame = match self.prepare_frame(frame, true) {
-                        Ok(frame) => frame,
+                    let (frame, new_offset) = match self.prepare_frame(frame, true) {
+                        Ok(prepared) => prepared,
                         Err(IoError::MalformedTimestamp(_)) => {
                             let mut state = self
                                 .state
@@ -1550,6 +1604,9 @@ impl MediaSource for CameraVideoSource {
                         }
                         Err(error) => return Err(self.terminal_capture_error(&error)),
                     };
+                    if let Some(offset) = new_offset {
+                        self.recovery_sequence_offset = Some(offset);
+                    }
                     self.pending_recovery = None;
                     self.recovery_deadline = None;
                     self.resume_running = false;
@@ -1583,10 +1640,13 @@ impl MediaSource for CameraVideoSource {
             (state.pop(), state.last_activity)
         };
         if let Some(frame) = frame {
-            let frame = match self.prepare_frame(frame, false) {
-                Ok(frame) => frame,
+            let (frame, new_offset) = match self.prepare_frame(frame, false) {
+                Ok(prepared) => prepared,
                 Err(error) => return Err(self.terminal_capture_error(&error)),
             };
+            if let Some(offset) = new_offset {
+                self.recovery_sequence_offset = Some(offset);
+            }
             return Ok(Some(self.accept_frame(frame)));
         }
         if last_activity.is_some_and(|activity| activity.elapsed() >= SIGNAL_LOSS_TIMEOUT) {
@@ -2362,6 +2422,51 @@ mod tests {
     }
 
     #[test]
+    fn recovered_sequence_offset_preserves_helper_gap() {
+        let mut source = source_with_policy(SignalLossPolicy::Hold);
+        source.start_without_helper_for_test();
+        let clock = source.options.as_ref().unwrap().clock_domain;
+        source
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(test_frame_at(7, 1_000, clock), 0);
+        let anchor = match source.try_receive().unwrap() {
+            Some(MediaTransfer::Live(frame)) => frame,
+            result => panic!("unexpected sequence-gap anchor: {result:?}"),
+        };
+        source.lifecycle = LifecycleState::Recovering;
+        source.pending_recovery = Some(RecoveryContinuity {
+            clock,
+            previous_pts_nanos: Some(anchor.timing().presentation_timestamp().as_nanos()),
+        });
+        source.map_recovery_sequences = true;
+        source.recovery_sequence_offset = None;
+        source.recovery_deadline = Some(Instant::now() + Duration::from_secs(1));
+        source
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(test_frame_at(0, 2_000, clock), 0);
+        let first = match source.try_receive().unwrap() {
+            Some(MediaTransfer::Live(frame)) => frame,
+            result => panic!("unexpected first mapped frame: {result:?}"),
+        };
+        assert_eq!(first.timing().sequence().get(), 8);
+
+        source
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(test_frame_at(2, 2_066, clock), 0);
+        let after_gap = match source.try_receive().unwrap() {
+            Some(MediaTransfer::Live(frame)) => frame,
+            result => panic!("unexpected mapped gap frame: {result:?}"),
+        };
+        assert_eq!(after_gap.timing().sequence().get(), 10);
+    }
+
+    #[test]
     fn unanchored_recovery_preserves_native_starting_sequence() {
         let mut source = source_with_policy(SignalLossPolicy::Stop);
         source.start_without_helper_for_test();
@@ -2432,6 +2537,58 @@ mod tests {
         assert_eq!(telemetry.recovery_timeout_discarded, 2);
         assert_eq!(telemetry.current, 0);
         assert_eq!(telemetry.received, 3);
+    }
+
+    #[test]
+    fn recovery_timeout_cleanup_failure_blocks_late_producer() {
+        let mut source = source_with_policy(SignalLossPolicy::Hold);
+        source.start_without_helper_for_test();
+        let clock = source.options.as_ref().unwrap().clock_domain;
+        source
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(test_frame_at(7, 1_000, clock), 0);
+        assert!(matches!(
+            source.try_receive().unwrap(),
+            Some(MediaTransfer::Live(_))
+        ));
+        source.lifecycle = LifecycleState::Recovering;
+        source.pending_recovery = Some(RecoveryContinuity {
+            clock,
+            previous_pts_nanos: Some(1_000_000_000),
+        });
+        source.recovery_deadline = Some(Instant::now());
+        source
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(test_frame_at(0, 500, clock), 0);
+        source.force_shutdown_failure = true;
+
+        assert!(matches!(
+            source.recovery_timeout_transfer(),
+            Err(IoError::AdapterFailure { .. })
+        ));
+        assert_eq!(source.lifecycle(), LifecycleState::Lost);
+        assert_eq!(source.health().state, EndpointHealthState::Failed);
+        assert!(source.pending_recovery.is_none());
+        let telemetry = source.telemetry();
+        assert_eq!(telemetry.recovery_timeout_discarded, 1);
+        assert_eq!(telemetry.current, 0);
+        let received = telemetry.received;
+        let accepted = source
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push_from_worker(test_frame_at(1, 600, clock), 0);
+        assert!(!accepted);
+        assert_eq!(source.telemetry().received, received);
+        assert_eq!(source.telemetry().current, 0);
+
+        source.force_shutdown_failure = false;
+        source.stop().unwrap();
+        source.close().unwrap();
     }
 
     #[test]
