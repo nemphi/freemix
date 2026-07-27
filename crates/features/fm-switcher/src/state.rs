@@ -11,6 +11,7 @@ use crate::{
 pub struct ProgramFrame {
     pub primary: InputId,
     pub secondary: Option<InputId>,
+    pub transition_kind: Option<TransitionKind>,
     /// Point mix used to compose the video frame.
     pub mix_numerator: u32,
     pub mix_denominator: u32,
@@ -135,6 +136,13 @@ impl SwitcherState {
                 }
                 self.start_transition(kind, duration_frames)
             }
+            SwitcherCommand::Wipe { duration_frames } => {
+                self.require_idle()?;
+                if duration_frames == 0 {
+                    return Err(SwitcherError::ZeroDuration);
+                }
+                self.start_transition(TransitionKind::Wipe, duration_frames)
+            }
             SwitcherCommand::StartTBar { kind } => self.start_t_bar(kind),
             SwitcherCommand::SetTBarPosition(position) => self.set_t_bar_position(position),
             SwitcherCommand::CommitTBar => self.commit_t_bar(),
@@ -159,6 +167,7 @@ impl SwitcherState {
             ProgramFrame {
                 primary: transition.from(),
                 secondary: Some(transition.to()),
+                transition_kind: Some(transition.kind()),
                 mix_numerator: transition.mix_numerator(),
                 mix_denominator: transition.mix_denominator(),
                 mix_start_numerator: transition.mix_numerator(),
@@ -168,6 +177,7 @@ impl SwitcherState {
             ProgramFrame {
                 primary: t_bar.from(),
                 secondary: Some(t_bar.to()),
+                transition_kind: Some(t_bar.kind()),
                 mix_numerator: u32::from(t_bar.position().basis_points()),
                 mix_denominator: u32::from(TBarPosition::MAX),
                 mix_start_numerator: u32::from(t_bar.interval_start().basis_points()),
@@ -177,6 +187,7 @@ impl SwitcherState {
             ProgramFrame {
                 primary: self.program,
                 secondary: None,
+                transition_kind: None,
                 mix_numerator: 0,
                 mix_denominator: 1,
                 mix_start_numerator: 0,

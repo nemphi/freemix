@@ -10,7 +10,7 @@ use fm_engine::{
     ShowState, SnapshotError,
 };
 use fm_scheduler::FrameNumber;
-use fm_switcher::{SwitcherEvent, SwitcherState};
+use fm_switcher::{SwitcherEvent, SwitcherState, TransitionKind};
 use fm_types::{FrameRate, InputId};
 
 fn input(value: u128) -> InputId {
@@ -114,6 +114,36 @@ fn fade_duration_is_bounded_before_projection_or_scheduling() {
         before.show().desired_switcher()
     );
     assert_eq!(engine.realized_switcher(), before.realized_switcher());
+}
+
+#[test]
+fn wipe_duration_is_bounded_before_projection_or_scheduling() {
+    for (key, duration, message) in [
+        ("zero-wipe", 0, "wipe duration must be nonzero"),
+        (
+            "oversized-wipe",
+            3_601,
+            "wipe duration must not exceed 3600 frames",
+        ),
+    ] {
+        let mut engine = engine();
+        let outcome = engine
+            .execute(
+                envelope(
+                    key,
+                    EngineCommand::Wipe {
+                        duration_frames: duration,
+                    },
+                ),
+                0,
+            )
+            .unwrap();
+        let rejection = outcome.receipt.rejected().unwrap();
+        assert_eq!(rejection.rejection.code, RejectionCode::InvalidCommand);
+        assert_eq!(rejection.rejection.message, message);
+        assert_eq!(engine.revision(), Revision::new(0));
+        assert!(engine.snapshot().is_ok());
+    }
 }
 
 #[test]
@@ -404,6 +434,37 @@ fn fade_renders_exactly_the_requested_number_of_frames() {
     let after = engine.tick().unwrap();
     assert_eq!(after.program.primary, input(2));
     assert_eq!(after.program.secondary, None);
+}
+
+#[test]
+fn wipe_is_idempotent_and_realizes_on_exact_frame_boundaries() {
+    let mut engine = engine();
+    let command = envelope("wipe", EngineCommand::Wipe { duration_frames: 3 });
+    let first = engine.execute(command.clone(), 0).unwrap();
+    let duplicate = engine.execute(command, 0).unwrap();
+
+    assert_eq!(first.receipt.accepted().unwrap().revision, Revision::new(1));
+    assert!(duplicate.replayed);
+    assert_eq!(duplicate.receipt, first.receipt);
+    assert_eq!(engine.revision(), Revision::new(1));
+    assert_eq!(engine.event_sequence(), EventSequence::new(1));
+
+    for (start, end) in [(0, 1), (1, 2), (2, 3)] {
+        let frame = engine.tick().unwrap();
+        assert_eq!(frame.program.transition_kind, Some(TransitionKind::Wipe));
+        assert_eq!(
+            (
+                frame.program.mix_start_numerator,
+                frame.program.mix_end_numerator
+            ),
+            (start, end)
+        );
+    }
+    let endpoint = engine.tick().unwrap();
+    assert_eq!(endpoint.program.primary, input(2));
+    assert_eq!(endpoint.program.secondary, None);
+    assert_eq!(endpoint.program.transition_kind, None);
+    assert_eq!(engine.runtime_generation(), RuntimeGeneration::new(1));
 }
 
 #[test]

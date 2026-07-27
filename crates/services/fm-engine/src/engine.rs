@@ -15,13 +15,14 @@ use fm_types::{FrameRate, InputId};
 use crate::{EngineError, ShowState, SnapshotError};
 
 type RuntimeScheduler = FrameScheduler<(), (), EngineCommand, ()>;
-const MAX_FADE_DURATION_FRAMES: u32 = 3_600;
+const MAX_TRANSITION_DURATION_FRAMES: u32 = 3_600;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EngineCommand {
     SelectPreview(InputId),
     Cut,
     Fade { duration_frames: u32 },
+    Wipe { duration_frames: u32 },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -219,7 +220,7 @@ pub struct Engine {
     frame_rate: FrameRate,
     runtime_generation: RuntimeGeneration,
     pending_actions: usize,
-    fade_in_flight: bool,
+    transition_in_flight: Option<TransitionKind>,
 }
 
 impl Engine {
@@ -235,7 +236,7 @@ impl Engine {
             frame_rate,
             runtime_generation: RuntimeGeneration::default(),
             pending_actions: 0,
-            fade_in_flight: false,
+            transition_in_flight: None,
         }
     }
 
@@ -385,14 +386,19 @@ impl Engine {
                     .map_err(EngineError::Schedule)?,
             )
         };
-        let runtime_busy = self.fade_in_flight;
+        let runtime_busy = self.transition_in_flight;
         let outcome = self
             .commands
             .apply(envelope, now_millis, move |_, command| {
-                if runtime_busy {
+                if let Some(kind) = runtime_busy {
+                    let name = match kind {
+                        TransitionKind::Fade => "fade",
+                        TransitionKind::Wipe => "wipe",
+                        _ => "timed",
+                    };
                     return Err(Rejection::new(
                         RejectionCode::Conflict,
-                        "a fade transition is already in flight",
+                        format!("a {name} transition is already in flight"),
                     ));
                 }
                 Ok(EngineMutation {
@@ -406,9 +412,11 @@ impl Engine {
         }
         if outcome.receipt.accepted().is_some() && !outcome.replayed {
             self.pending_actions += 1;
-            if matches!(command, EngineCommand::Fade { .. }) {
-                self.fade_in_flight = true;
-            }
+            self.transition_in_flight = match command {
+                EngineCommand::Fade { .. } => Some(TransitionKind::Fade),
+                EngineCommand::Wipe { .. } => Some(TransitionKind::Wipe),
+                EngineCommand::SelectPreview(_) | EngineCommand::Cut => None,
+            };
         } else if let Some(action) = scheduled {
             self.scheduler.cancel_action(action);
         }
@@ -453,7 +461,7 @@ impl Engine {
         let program = self.realized_switcher.program_frame();
         if let Some(event) = self.realized_switcher.advance_frame() {
             events.push(event);
-            self.fade_in_flight = false;
+            self.transition_in_flight = None;
         }
 
         Ok(FrameResult {
@@ -474,7 +482,7 @@ impl Engine {
     /// is pending.
     pub fn snapshot(&self) -> Result<EngineSnapshot, SnapshotError> {
         if self.pending_actions != 0
-            || self.fade_in_flight
+            || self.transition_in_flight.is_some()
             || self.realized_switcher.transition().is_some()
         {
             return Err(SnapshotError::WorkInFlight);
@@ -563,7 +571,7 @@ impl Engine {
             frame_rate,
             runtime_generation: restore_state.runtime_generation,
             pending_actions: 0,
-            fade_in_flight: false,
+            transition_in_flight: None,
         })
     }
 }
@@ -654,10 +662,29 @@ impl Mutation<ShowState, EngineEvent, EngineAcceptance> for EngineMutation {
                         "fade duration must be nonzero",
                     ));
                 }
-                if duration_frames > MAX_FADE_DURATION_FRAMES {
+                if duration_frames > MAX_TRANSITION_DURATION_FRAMES {
                     return Err(Rejection::new(
                         RejectionCode::InvalidCommand,
-                        format!("fade duration must not exceed {MAX_FADE_DURATION_FRAMES} frames"),
+                        format!(
+                            "fade duration must not exceed {MAX_TRANSITION_DURATION_FRAMES} frames"
+                        ),
+                    ));
+                }
+                SwitcherCommand::Cut
+            }
+            EngineCommand::Wipe { duration_frames } => {
+                if duration_frames == 0 {
+                    return Err(Rejection::new(
+                        RejectionCode::InvalidCommand,
+                        "wipe duration must be nonzero",
+                    ));
+                }
+                if duration_frames > MAX_TRANSITION_DURATION_FRAMES {
+                    return Err(Rejection::new(
+                        RejectionCode::InvalidCommand,
+                        format!(
+                            "wipe duration must not exceed {MAX_TRANSITION_DURATION_FRAMES} frames"
+                        ),
                     ));
                 }
                 SwitcherCommand::Cut
@@ -685,6 +712,7 @@ fn apply_runtime(
             kind: TransitionKind::Fade,
             duration_frames,
         },
+        EngineCommand::Wipe { duration_frames } => SwitcherCommand::Wipe { duration_frames },
     })
 }
 

@@ -5,6 +5,7 @@ use crate::StingerSlotId;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransitionKind {
     Fade,
+    /// A horizontal wipe that reveals the target from left to right.
     Wipe,
     Slide,
     Zoom,

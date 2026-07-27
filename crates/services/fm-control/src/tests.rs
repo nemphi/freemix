@@ -113,6 +113,87 @@ fn authorization_runs_before_detailed_command_validation() {
 }
 
 #[test]
+fn wipe_propagates_with_authorization_idempotency_resume_and_exact_endpoints() {
+    let mut control = service(8, 8);
+    let denied = control
+        .submit(
+            &principal(Role::Viewer),
+            command(
+                "denied-wipe",
+                "denied-wipe-key",
+                CommandPayload::Wipe { duration_frames: 3 },
+            ),
+            0,
+        )
+        .unwrap();
+    assert!(matches!(
+        denied.output.result,
+        CommandResult::Rejected { ref code, .. } if code == "permission_denied"
+    ));
+    assert_eq!(control.diagnostics().current_revision, 0);
+
+    let identity = control.identity().clone();
+    let message = command(
+        "wipe",
+        "wipe-key",
+        CommandPayload::Wipe { duration_frames: 3 },
+    );
+    let accepted = control
+        .submit(&principal(Role::Operator), message.clone(), 0)
+        .unwrap();
+    assert_eq!(
+        accepted.output.result,
+        CommandResult::Accepted {
+            id: "wipe".to_owned(),
+            revision: 1,
+            scheduled_frame: Some(0),
+        }
+    );
+    assert_eq!(accepted.output.events.len(), 1);
+
+    let duplicate = control
+        .submit(&principal(Role::Operator), message, 0)
+        .unwrap();
+    assert!(duplicate.replayed);
+    assert_eq!(duplicate.output.result, accepted.output.result);
+    assert!(duplicate.output.events.is_empty());
+    assert_eq!(control.diagnostics().current_revision, 1);
+
+    let ResumeDecision::Events(events) = control.resume(&EventCursor {
+        engine: identity,
+        revision: 0,
+    }) else {
+        panic!("the accepted wipe should be resumable");
+    };
+    assert_eq!(events, accepted.output.events);
+
+    for (start, end) in [(0, 1), (1, 2), (2, 3)] {
+        let tick = control.tick(&server_identity()).unwrap();
+        assert_eq!(
+            tick.frame
+                .program
+                .transition_kind
+                .map(|kind| format!("{kind:?}")),
+            Some("Wipe".to_owned())
+        );
+        assert_eq!(
+            (
+                tick.frame.program.mix_start_numerator,
+                tick.frame.program.mix_end_numerator,
+            ),
+            (start, end)
+        );
+        assert_eq!(tick.runtime_events.len(), usize::from(end == 3));
+    }
+
+    let endpoint = control.tick(&server_identity()).unwrap();
+    assert_eq!(endpoint.frame.program.primary, input(2));
+    assert_eq!(endpoint.frame.program.secondary, None);
+    assert_eq!(endpoint.frame.program.transition_kind, None);
+    assert_eq!(control.diagnostics().current_revision, 1);
+}
+
+#[test]
 fn accepted_preparation_is_isolated_until_commit_and_projects_exactly() {
     let mut control = service(8, 8);
     let subscription = control.subscribe().unwrap();
@@ -851,7 +932,7 @@ fn failed_realizer_is_fatal_without_false_publication_or_control_updates() {
 
     let before_snapshot = control.snapshot().clone();
     let before_pending = control.pending_runtime_actions.clone();
-    let before_active_fade = control.active_fade;
+    let before_active_transition = control.active_transition;
     let before_runtime_generation = control.runtime_sequence_generation;
     let before_runtime_sequence = control.runtime_sequence;
     let mut projected = control.engine.clone();
@@ -878,7 +959,7 @@ fn failed_realizer_is_fatal_without_false_publication_or_control_updates() {
     );
     assert_eq!(control.snapshot(), &before_snapshot);
     assert_eq!(control.pending_runtime_actions, before_pending);
-    assert_eq!(control.active_fade, before_active_fade);
+    assert_eq!(control.active_transition, before_active_transition);
     assert_eq!(
         control.runtime_sequence_generation,
         before_runtime_generation

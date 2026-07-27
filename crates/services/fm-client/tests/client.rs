@@ -233,6 +233,29 @@ fn commands_have_monotonic_ids_and_results_reconcile_through_ui_model() {
 }
 
 #[test]
+fn wipe_command_is_queued_with_its_exact_duration() {
+    let mut client = ready_client(1);
+    let command = client
+        .queue_command(
+            CommandPayload::Wipe {
+                duration_frames: 45,
+            },
+            "wipe-45",
+            Some(4),
+            None,
+        )
+        .unwrap();
+
+    assert_eq!(
+        command.payload,
+        CommandPayload::Wipe {
+            duration_frames: 45,
+        }
+    );
+    assert!(matches!(client.pop_outbound(), Some(Outbound::Command(queued)) if queued == command));
+}
+
+#[test]
 fn event_gap_requests_snapshot_resync() {
     let mut client = ready_client(2);
     let error = client

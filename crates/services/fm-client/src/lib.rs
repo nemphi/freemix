@@ -783,7 +783,7 @@ impl Client {
             CommandPayload::SelectPreview { input } => {
                 Some(OptimisticChange::DesiredPreview(input.to_domain()))
             }
-            CommandPayload::Cut | CommandPayload::Fade { .. } => None,
+            CommandPayload::Cut | CommandPayload::Fade { .. } | CommandPayload::Wipe { .. } => None,
         };
         self.model
             .track_command(CommandId::new(command.id.clone()), optimistic)?;

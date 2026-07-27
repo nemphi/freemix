@@ -13,6 +13,9 @@ pub enum SwitcherCommand {
         kind: TransitionKind,
         duration_frames: u32,
     },
+    Wipe {
+        duration_frames: u32,
+    },
     StartTBar {
         kind: TransitionKind,
     },

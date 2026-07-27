@@ -473,7 +473,7 @@ struct PendingRuntimeAction {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ActiveFade {
+struct ActiveTransition {
     revision: u64,
     generation: u64,
 }
@@ -491,7 +491,7 @@ pub struct ControlService<A = Policy> {
     subscribers: HashMap<SubscriberId, Subscriber>,
     next_subscriber_id: u64,
     pending_runtime_actions: VecDeque<PendingRuntimeAction>,
-    active_fade: Option<ActiveFade>,
+    active_transition: Option<ActiveTransition>,
     runtime_sequence_generation: u64,
     runtime_sequence: u64,
 }
@@ -524,7 +524,7 @@ impl<A: AuthorizationHook> ControlService<A> {
             subscribers: HashMap::new(),
             next_subscriber_id: 1,
             pending_runtime_actions: VecDeque::new(),
-            active_fade: None,
+            active_transition: None,
             runtime_sequence_generation,
             runtime_sequence: 0,
         }
@@ -556,7 +556,7 @@ impl<A: AuthorizationHook> ControlService<A> {
     /// Returns [`SnapshotError::WorkInFlight`] while an engine action or
     /// transition is pending, including an unpublished control realization.
     pub fn idle_engine_snapshot(&self) -> Result<EngineSnapshot, SnapshotError> {
-        if !self.pending_runtime_actions.is_empty() || self.active_fade.is_some() {
+        if !self.pending_runtime_actions.is_empty() || self.active_transition.is_some() {
             return Err(SnapshotError::WorkInFlight);
         }
         self.engine.snapshot()
@@ -669,7 +669,9 @@ impl<A: AuthorizationHook> ControlService<A> {
 
         let command_class = match message.payload {
             CommandPayload::SelectPreview { .. } => CommandClass::SelectPreview,
-            CommandPayload::Cut | CommandPayload::Fade { .. } => CommandClass::Transition,
+            CommandPayload::Cut | CommandPayload::Fade { .. } | CommandPayload::Wipe { .. } => {
+                CommandClass::Transition
+            }
         };
         if let Err(denial) = self.authorizer.authorize(principal, command_class) {
             let result = CommandResult::Rejected {
@@ -702,6 +704,7 @@ impl<A: AuthorizationHook> ControlService<A> {
             }
             CommandPayload::Cut => EngineCommand::Cut,
             CommandPayload::Fade { duration_frames } => EngineCommand::Fade { duration_frames },
+            CommandPayload::Wipe { duration_frames } => EngineCommand::Wipe { duration_frames },
         };
         match self
             .engine
@@ -856,8 +859,11 @@ impl<A: AuthorizationHook> ControlService<A> {
                 .checked_add(offset)
                 .ok_or(ControlError::RuntimeGenerationOutOfOrder)
                 .map_err(TickWithRealizerError::Tick)?;
-            if matches!(pending.command, EngineCommand::Fade { .. }) {
-                self.active_fade = Some(ActiveFade {
+            if matches!(
+                pending.command,
+                EngineCommand::Fade { .. } | EngineCommand::Wipe { .. }
+            ) {
+                self.active_transition = Some(ActiveTransition {
                     revision: pending.revision,
                     generation,
                 });
@@ -869,16 +875,16 @@ impl<A: AuthorizationHook> ControlService<A> {
             }
         }
 
-        let completed_fade = (self.engine.realized_switcher().transition().is_none()
+        let completed_transition = (self.engine.realized_switcher().transition().is_none()
             && self.engine.realized_switcher().program()
                 == self.engine.show().desired_switcher().program()
             && self.engine.realized_switcher().preview()
                 == self.engine.show().desired_switcher().preview())
-        .then(|| self.active_fade.take())
+        .then(|| self.active_transition.take())
         .flatten();
-        if let (true, Some(fade)) = (publish_runtime_realization, completed_fade) {
+        if let (true, Some(transition)) = (publish_runtime_realization, completed_transition) {
             runtime_events.push(
-                self.runtime_realized(server, fade.revision, fade.generation)
+                self.runtime_realized(server, transition.revision, transition.generation)
                     .map_err(TickWithRealizerError::Tick)?,
             );
         }

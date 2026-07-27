@@ -206,6 +206,7 @@ pub enum CommandPayload {
     SelectPreview { input: WireInputId },
     Cut,
     Fade { duration_frames: u32 },
+    Wipe { duration_frames: u32 },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

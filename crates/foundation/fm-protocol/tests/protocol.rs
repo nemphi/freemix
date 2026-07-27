@@ -91,6 +91,25 @@ fn golden_command_fixture_is_stable() {
 }
 
 #[test]
+fn additive_wipe_command_has_a_stable_wire_form_without_changing_existing_bytes() {
+    let existing_fixture = include_str!("fixtures/command_select.wire");
+    assert_eq!(
+        encode_line(&WireMessage::Command(command())).unwrap(),
+        existing_fixture
+    );
+
+    let fixture = include_str!("fixtures/command_wipe.wire");
+    let message = WireMessage::Command(CommandMessage {
+        payload: CommandPayload::Wipe {
+            duration_frames: 45,
+        },
+        ..command()
+    });
+    assert_eq!(encode_line(&message).unwrap(), fixture);
+    assert_eq!(decode_line(fixture).unwrap(), message);
+}
+
+#[test]
 fn golden_client_hello_fixture_is_stable() {
     let fixture = include_str!("fixtures/client_hello.wire");
     let message = WireMessage::ClientHello(ClientHello {
@@ -124,6 +143,10 @@ fn every_message_variant_round_trips() {
         }),
         WireMessage::Command(CommandMessage {
             payload: CommandPayload::Fade { duration_frames: 9 },
+            ..command()
+        }),
+        WireMessage::Command(CommandMessage {
+            payload: CommandPayload::Wipe { duration_frames: 9 },
             ..command()
         }),
         WireMessage::CommandResult(CommandResult::Accepted {

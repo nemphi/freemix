@@ -60,6 +60,7 @@ fn fade_realizes_on_exact_frame_boundary() {
         .unwrap();
 
     let initial = switcher.program_frame();
+    assert_eq!(initial.transition_kind, Some(TransitionKind::Fade));
     assert_eq!((initial.mix_numerator, initial.mix_denominator), (0, 3));
     assert_eq!(
         (initial.mix_start_numerator, initial.mix_end_numerator),
@@ -82,6 +83,38 @@ fn fade_realizes_on_exact_frame_boundary() {
     ));
     assert_eq!(switcher.program(), input(2));
     assert_eq!(switcher.program_frame().secondary, None);
+    assert_eq!(switcher.program_frame().transition_kind, None);
+}
+
+#[test]
+fn horizontal_wipe_uses_exact_frame_intervals_and_carries_its_kind() {
+    let mut switcher = state();
+    assert!(matches!(
+        switcher
+            .apply(SwitcherCommand::Wipe { duration_frames: 3 })
+            .unwrap()
+            .as_slice(),
+        [SwitcherEvent::TransitionStarted {
+            kind: TransitionKind::Wipe,
+            duration_frames: 3,
+            ..
+        }]
+    ));
+
+    for (start, end) in [(0, 1), (1, 2), (2, 3)] {
+        let frame = switcher.program_frame();
+        assert_eq!(frame.transition_kind, Some(TransitionKind::Wipe));
+        assert_eq!(
+            (frame.mix_start_numerator, frame.mix_end_numerator),
+            (start, end)
+        );
+        let _ = switcher.advance_frame_events();
+    }
+
+    let endpoint = switcher.program_frame();
+    assert_eq!(endpoint.primary, input(2));
+    assert_eq!(endpoint.secondary, None);
+    assert_eq!(endpoint.transition_kind, None);
 }
 
 #[test]
