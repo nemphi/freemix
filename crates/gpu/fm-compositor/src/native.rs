@@ -8,7 +8,7 @@ use fm_gpu::{
 };
 use fm_video::{CropRect, Rotation, Transform};
 
-use crate::{CompositionPlan, SourceId, TransitionKind, TransitionPlan};
+use crate::{CompositionPlan, SourceId, TransitionKind, TransitionPlan, transition::wipe_boundary};
 
 /// Maximum width or height accepted for a native layer transform.
 ///
@@ -93,7 +93,7 @@ struct TransitionUniform {
     operation: u32,
     numerator: u32,
     denominator: u32,
-    padding: u32,
+    boundary: u32,
 };
 
 @group(0) @binding(0) var from_texture: texture_2d<f32>;
@@ -109,6 +109,12 @@ fn transition_fragment(@builtin(position) position: vec4<f32>) -> @location(0) v
         return destination;
     }
     if transition.numerator == 0u {
+        return source;
+    }
+    if transition.operation == 2u {
+        if u32(position.x) < transition.boundary {
+            return destination;
+        }
         return source;
     }
     return mix(source, destination, f32(transition.numerator) / f32(transition.denominator));
@@ -531,7 +537,7 @@ const fn rotated_dimensions(transform: Transform) -> (u32, u32) {
     }
 }
 
-/// Errors produced by the native Cut/Fade renderer.
+/// Errors produced by the native Cut/Fade/Wipe renderer.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NativeTransitionError {
     WidthMismatch { from: u32, to: u32 },
@@ -574,7 +580,7 @@ impl From<NativeGpuError> for NativeTransitionError {
     }
 }
 
-/// Native Cut/Fade renderer containing only its compiled GPU pipeline.
+/// Native Cut/Fade/Wipe renderer containing only its compiled GPU pipeline.
 pub struct NativeTransitionRenderer {
     pipeline: NativeFullscreenPipeline,
 }
@@ -602,7 +608,7 @@ impl NativeTransitionRenderer {
         Ok(Self { pipeline })
     }
 
-    /// Submits a GPU-resident Cut or Fade and returns its native texture.
+    /// Submits a GPU-resident Cut, Fade, or Wipe and returns its native texture.
     /// This operation does not poll or read pixels back.
     ///
     /// # Errors
@@ -622,7 +628,7 @@ impl NativeTransitionRenderer {
         let output = context
             .create_rgba16_float_render_target(from.width(), from.height())
             .await?;
-        let uniform = encode_uniform(plan);
+        let uniform = encode_uniform(plan, from.width());
         context
             .submit_fullscreen(&self.pipeline, from, to, &output, &uniform)
             .await?;
@@ -663,16 +669,21 @@ fn validate_dimensions(
     Ok(())
 }
 
-fn encode_uniform(plan: TransitionPlan) -> [u8; 16] {
+fn encode_uniform(plan: TransitionPlan, width: u32) -> [u8; 16] {
     let operation = match plan.kind() {
         TransitionKind::Cut => 0_u32,
         TransitionKind::Fade => 1_u32,
-        TransitionKind::Wipe
-        | TransitionKind::Slide
-        | TransitionKind::Zoom
-        | TransitionKind::Stinger => unreachable!("TransitionPlan only compiles Cut and Fade"),
+        TransitionKind::Wipe => 2_u32,
+        TransitionKind::Slide | TransitionKind::Zoom | TransitionKind::Stinger => {
+            unreachable!("TransitionPlan only compiles Cut, Fade, and Wipe")
+        }
     };
-    let words = [operation, plan.numerator(), plan.denominator(), 0];
+    let boundary = if plan.kind() == TransitionKind::Wipe {
+        wipe_boundary(width, plan.numerator(), plan.denominator())
+    } else {
+        0
+    };
+    let words = [operation, plan.numerator(), plan.denominator(), boundary];
     let mut bytes = [0; 16];
     for (chunk, word) in bytes.chunks_exact_mut(4).zip(words) {
         chunk.copy_from_slice(&word.to_le_bytes());
@@ -846,7 +857,7 @@ mod tests {
     #[test]
     fn uniform_is_four_native_u32_words() {
         let fade = TransitionPlan::compile(TransitionKind::Fade, 3, 7).unwrap();
-        let uniform = encode_uniform(fade);
+        let uniform = encode_uniform(fade, 11);
         assert_eq!(uniform.len(), 16);
         assert_eq!(u32::from_le_bytes(uniform[0..4].try_into().unwrap()), 1);
         assert_eq!(u32::from_le_bytes(uniform[4..8].try_into().unwrap()), 3);
@@ -855,9 +866,14 @@ mod tests {
 
         let cut = TransitionPlan::compile(TransitionKind::Cut, 0, 1).unwrap();
         assert_eq!(
-            u32::from_le_bytes(encode_uniform(cut)[0..4].try_into().unwrap()),
+            u32::from_le_bytes(encode_uniform(cut, 11)[0..4].try_into().unwrap()),
             0
         );
+
+        let wipe = TransitionPlan::compile(TransitionKind::Wipe, 1, 2).unwrap();
+        let uniform = encode_uniform(wipe, 5);
+        assert_eq!(u32::from_le_bytes(uniform[0..4].try_into().unwrap()), 2);
+        assert_eq!(u32::from_le_bytes(uniform[12..16].try_into().unwrap()), 2);
     }
 
     #[test]

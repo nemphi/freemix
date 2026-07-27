@@ -13,7 +13,8 @@ use fm_color::{ColorPipeline, NativeImportNormalizer, working_color_metadata};
 use fm_compositor::{
     CpuSourceFrame, CropRect, NativeCompositionRenderer, NativeSourceFrame,
     NativeTransitionRenderer, OutputTarget, Rgba8, Rotation, Scene, SourceId, SourceLayer,
-    Transform, TransitionKind, TransitionPlan, compile_scene, execute_cpu, image_from_cpu_frame,
+    Transform, TransitionKind, TransitionPlan, compile_scene, execute_cpu, execute_transition,
+    image_from_cpu_frame,
 };
 use fm_frame::{
     AlphaMode, ChromaLocation, ClockDomainId, ColorMetadata, ColorPrimaries, CpuVideoFrame,
@@ -277,6 +278,66 @@ fn native_metal_cut_and_fade_match_cpu_linear_frames() {
                         half_expected.to_f32()
                     );
                 }
+            }
+        }
+    });
+}
+
+#[test]
+#[ignore = "requires a native macOS Metal adapter"]
+fn native_metal_wipe_matches_cpu_at_odd_width_boundaries() {
+    block_on(async {
+        let from_cpu = sized_frame(
+            3,
+            5,
+            1,
+            &[
+                0, 0, 0, 255, 32, 32, 32, 255, 64, 64, 64, 255, 96, 96, 96, 255, 128, 128, 128, 255,
+            ],
+        );
+        let to_cpu = sized_frame(
+            4,
+            5,
+            1,
+            &[
+                255, 255, 255, 255, 224, 224, 224, 255, 192, 192, 192, 255, 160, 160, 160, 255,
+                144, 144, 144, 255,
+            ],
+        );
+        let from_image = canonical_cpu_image(&from_cpu);
+        let to_image = canonical_cpu_image(&to_cpu);
+
+        let context = NativeContext::new([NativeBackend::Metal]).await.unwrap();
+        let normalizer = NativeImportNormalizer::new(&context).await.unwrap();
+        let from = normalizer.normalize(&context, &from_cpu).await.unwrap();
+        let to = normalizer.normalize(&context, &to_cpu).await.unwrap();
+        let renderer = NativeTransitionRenderer::new(&context).await.unwrap();
+        let from_half = context.readback(from.texture()).await.unwrap();
+        let to_half = context.readback(to.texture()).await.unwrap();
+
+        for (numerator, denominator) in [(0, 2), (1, 3), (1, 2), (2, 2)] {
+            let plan =
+                TransitionPlan::compile(TransitionKind::Wipe, numerator, denominator).unwrap();
+            let expected = execute_transition(plan, &from_image, &to_image).unwrap();
+            let output = renderer
+                .render(&context, plan, from.texture(), to.texture())
+                .await
+                .unwrap();
+            let actual = context.readback(&output).await.unwrap();
+            assert_rgba16f_matches_cpu(&actual, &expected);
+
+            let boundary = 5 * numerator / denominator;
+            for (pixel, actual) in actual.bytes.chunks_exact(8).enumerate() {
+                let endpoint = if u32::try_from(pixel).unwrap() < boundary {
+                    &to_half
+                } else {
+                    &from_half
+                };
+                assert_eq!(
+                    actual,
+                    &endpoint.bytes[pixel * 8..pixel * 8 + 8],
+                    "Wipe {numerator}/{denominator}, pixel {pixel} endpoint"
+                );
             }
         }
     });

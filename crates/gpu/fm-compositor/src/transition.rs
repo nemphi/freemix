@@ -1,6 +1,6 @@
 use core::fmt;
 
-use fm_video::{BlendError, ImageFrame, crossfade};
+use fm_video::{BlendError, FrameError, ImageFrame, crossfade};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransitionKind {
@@ -21,7 +21,7 @@ pub struct TransitionPlan {
 }
 
 impl TransitionPlan {
-    /// Compiles a Cut or Fade at an exact rational progress value.
+    /// Compiles a Cut, Fade, or Wipe at an exact rational progress value.
     ///
     /// # Errors
     /// Returns an error for a zero denominator, progress beyond the endpoint,
@@ -41,15 +41,14 @@ impl TransitionPlan {
             });
         }
         match kind {
-            TransitionKind::Cut | TransitionKind::Fade => Ok(Self {
+            TransitionKind::Cut | TransitionKind::Fade | TransitionKind::Wipe => Ok(Self {
                 kind,
                 numerator,
                 denominator,
             }),
-            TransitionKind::Wipe
-            | TransitionKind::Slide
-            | TransitionKind::Zoom
-            | TransitionKind::Stinger => Err(TransitionError::UnsupportedKind(kind)),
+            TransitionKind::Slide | TransitionKind::Zoom | TransitionKind::Stinger => {
+                Err(TransitionError::UnsupportedKind(kind))
+            }
         }
     }
 
@@ -107,13 +106,15 @@ impl From<BlendError> for TransitionError {
     }
 }
 
-/// Executes a Cut or exact integer Fade between equal-format frames.
+/// Executes a Cut, exact integer Fade, or horizontal Wipe between equal-format frames.
 ///
 /// Cut is atomic and always returns `to`. Fade returns byte-identical endpoint
 /// clones at zero and full progress through `fm-video`'s reference crossfade.
+/// Wipe replaces columns from left to right, with its boundary at
+/// `floor(width * numerator / denominator)`, and also returns byte-identical endpoints.
 ///
 /// # Errors
-/// Returns an error if Fade inputs have incompatible layouts.
+/// Returns an error if Fade or Wipe inputs have incompatible layouts.
 pub fn execute_transition(
     plan: TransitionPlan,
     from: &ImageFrame,
@@ -122,9 +123,68 @@ pub fn execute_transition(
     match plan.kind {
         TransitionKind::Cut => Ok(to.clone()),
         TransitionKind::Fade => Ok(crossfade(from, to, plan.numerator, plan.denominator)?),
-        TransitionKind::Wipe
-        | TransitionKind::Slide
-        | TransitionKind::Zoom
-        | TransitionKind::Stinger => Err(TransitionError::UnsupportedKind(plan.kind)),
+        TransitionKind::Wipe => wipe(from, to, plan.numerator, plan.denominator),
+        TransitionKind::Slide | TransitionKind::Zoom | TransitionKind::Stinger => {
+            Err(TransitionError::UnsupportedKind(plan.kind))
+        }
     }
+}
+
+pub(crate) fn wipe_boundary(width: u32, numerator: u32, denominator: u32) -> u32 {
+    let boundary = u64::from(width) * u64::from(numerator) / u64::from(denominator);
+    u32::try_from(boundary).expect("wipe boundary cannot exceed frame width")
+}
+
+fn wipe(
+    from: &ImageFrame,
+    to: &ImageFrame,
+    numerator: u32,
+    denominator: u32,
+) -> Result<ImageFrame, TransitionError> {
+    validate_wipe_inputs(from, to)?;
+    if numerator == 0 {
+        return Ok(from.clone());
+    }
+    if numerator == denominator {
+        return Ok(to.clone());
+    }
+
+    let boundary = wipe_boundary(from.width(), numerator, denominator);
+    let boundary_bytes = usize::try_from(boundary)
+        .map_err(|_| BlendError::Frame(FrameError::LayoutOverflow))?
+        .checked_mul(4)
+        .ok_or(BlendError::Frame(FrameError::LayoutOverflow))?;
+    let mut pixels = from.pixels().to_vec();
+    for (output_row, to_row) in pixels
+        .chunks_exact_mut(from.stride())
+        .zip(to.pixels().chunks_exact(to.stride()))
+    {
+        output_row[..boundary_bytes].copy_from_slice(&to_row[..boundary_bytes]);
+    }
+    Ok(
+        ImageFrame::new(from.width(), from.height(), from.stride(), pixels)
+            .map_err(BlendError::Frame)?,
+    )
+}
+
+fn validate_wipe_inputs(from: &ImageFrame, to: &ImageFrame) -> Result<(), BlendError> {
+    if from.width() != to.width() {
+        return Err(BlendError::WidthMismatch {
+            left: from.width(),
+            right: to.width(),
+        });
+    }
+    if from.height() != to.height() {
+        return Err(BlendError::HeightMismatch {
+            left: from.height(),
+            right: to.height(),
+        });
+    }
+    if from.stride() != to.stride() {
+        return Err(BlendError::StrideMismatch {
+            left: from.stride(),
+            right: to.stride(),
+        });
+    }
+    Ok(())
 }
