@@ -107,7 +107,12 @@ sample-contiguous timing, sticky EOS, and explicit per-page operation
 block/sample/byte limits. Cursor progress no longer spends prior pages against
 those limits. `fm-audio` provides a deterministic reference Master
 with planar F32 identity mapping, gain/mute/follow-video, meters, timed canonical
-blocks, sample-count timing validation, and transactional gain ramps. Opt-in
+blocks, sample-count timing validation, and transactional gain ramps.
+`fm-clock::ClockMapping` now also exposes checked signed source-to-Master and
+inverse Master-to-source nanosecond mapping with explicit floor rounding before
+anchors and overflow rejection. This is arithmetic groundwork for live audio
+synchronization; no estimator filtering, sample interpolation, FIFO, or drift
+resampler is connected yet. Opt-in
 native daemon mode maintains bounded CPU audio rings on a decode worker,
 allocates Master intervals directly from absolute engine frame numbers, follows
 the authoritative `ProgramFrame.primary`, and writes a bounded fake sink. During

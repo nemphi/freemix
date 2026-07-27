@@ -71,6 +71,60 @@ impl ClockMapping {
         self.drift_ppb
     }
 
+    #[must_use]
+    pub const fn source_anchor(self) -> ClockSnapshot {
+        self.source_anchor
+    }
+
+    #[must_use]
+    pub const fn master_anchor(self) -> ClockSnapshot {
+        self.master_anchor
+    }
+
+    /// Maps a signed source-domain nanosecond position into the master domain.
+    /// Fractional nanoseconds round toward negative infinity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MappingError::ArithmeticOverflow`] when the mapped position is
+    /// outside `i64` or intermediate checked arithmetic overflows.
+    pub fn map_source_nanos(self, source_nanos: i64) -> Result<i64, MappingError> {
+        let source_delta = i128::from(source_nanos)
+            .checked_sub(i128::from(self.source_anchor.time().as_nanos()))
+            .ok_or(MappingError::ArithmeticOverflow)?;
+        let scale = PARTS_PER_BILLION + i128::from(self.drift_ppb);
+        let numerator = source_delta
+            .checked_mul(scale)
+            .ok_or(MappingError::ArithmeticOverflow)?;
+        let master_delta = floor_div(numerator, PARTS_PER_BILLION)?;
+        let mapped = i128::from(self.master_anchor.time().as_nanos())
+            .checked_add(master_delta)
+            .ok_or(MappingError::ArithmeticOverflow)?;
+        i64::try_from(mapped).map_err(|_| MappingError::ArithmeticOverflow)
+    }
+
+    /// Inverts this affine mapping for a signed master-domain nanosecond
+    /// position. Fractional source nanoseconds round toward negative infinity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MappingError::ArithmeticOverflow`] when the source position is
+    /// outside `i64` or intermediate checked arithmetic overflows.
+    pub fn source_nanos_at_master(self, master_nanos: i64) -> Result<i64, MappingError> {
+        let master_delta = i128::from(master_nanos)
+            .checked_sub(i128::from(self.master_anchor.time().as_nanos()))
+            .ok_or(MappingError::ArithmeticOverflow)?;
+        let numerator = master_delta
+            .checked_mul(PARTS_PER_BILLION)
+            .ok_or(MappingError::ArithmeticOverflow)?;
+        let scale = PARTS_PER_BILLION + i128::from(self.drift_ppb);
+        let source_delta = floor_div(numerator, scale)?;
+        let source = i128::from(self.source_anchor.time().as_nanos())
+            .checked_add(source_delta)
+            .ok_or(MappingError::ArithmeticOverflow)?;
+        i64::try_from(source).map_err(|_| MappingError::ArithmeticOverflow)
+    }
+
     /// Maps a snapshot into the master domain.
     ///
     /// # Errors
@@ -82,21 +136,29 @@ impl ClockMapping {
         if source.domain() != self.source_domain() {
             return Err(MappingError::DomainMismatch);
         }
-        let source_delta =
-            i128::from(source.time().as_nanos()) - i128::from(self.source_anchor.time().as_nanos());
-        let scale = PARTS_PER_BILLION + i128::from(self.drift_ppb);
-        let master_delta = source_delta
-            .checked_mul(scale)
-            .ok_or(MappingError::ArithmeticOverflow)?
-            / PARTS_PER_BILLION;
-        let mapped = i128::from(self.master_anchor.time().as_nanos())
-            .checked_add(master_delta)
-            .ok_or(MappingError::ArithmeticOverflow)?;
+        let source_nanos = i64::try_from(source.time().as_nanos())
+            .map_err(|_| MappingError::ArithmeticOverflow)?;
+        let mapped = self.map_source_nanos(source_nanos)?;
         let nanos = u64::try_from(mapped).map_err(|_| MappingError::ArithmeticOverflow)?;
         Ok(ClockSnapshot::new(
             self.master_domain(),
             ClockTime::from_nanos(nanos),
         ))
+    }
+}
+
+fn floor_div(numerator: i128, denominator: i128) -> Result<i128, MappingError> {
+    if denominator <= 0 {
+        return Err(MappingError::InvalidRate);
+    }
+    let quotient = numerator / denominator;
+    let remainder = numerator % denominator;
+    if remainder < 0 {
+        quotient
+            .checked_sub(1)
+            .ok_or(MappingError::ArithmeticOverflow)
+    } else {
+        Ok(quotient)
     }
 }
 
@@ -206,6 +268,35 @@ mod tests {
         assert_eq!(
             mapping.map(sample(source, 0)).unwrap(),
             sample(master, 8_999)
+        );
+    }
+
+    #[test]
+    fn signed_mapping_and_inverse_use_floor_rounding_before_anchors() {
+        let source = domain(1);
+        let master = domain(2);
+        let mapping =
+            ClockMapping::new(sample(source, 1_000), sample(master, 10_000), 500_000_000).unwrap();
+        assert_eq!(mapping.map_source_nanos(999).unwrap(), 9_998);
+        assert_eq!(mapping.source_nanos_at_master(9_998).unwrap(), 998);
+        assert_eq!(mapping.source_nanos_at_master(10_003).unwrap(), 1_002);
+        assert_eq!(mapping.source_anchor(), sample(source, 1_000));
+        assert_eq!(mapping.master_anchor(), sample(master, 10_000));
+    }
+
+    #[test]
+    fn signed_mapping_reports_representability_overflow() {
+        let source = domain(1);
+        let master = domain(2);
+        let mapping = ClockMapping::new(
+            sample(source, 0),
+            sample(master, i64::MAX.cast_unsigned()),
+            i64::MAX,
+        )
+        .unwrap();
+        assert_eq!(
+            mapping.map_source_nanos(i64::MAX),
+            Err(MappingError::ArithmeticOverflow)
         );
     }
 
