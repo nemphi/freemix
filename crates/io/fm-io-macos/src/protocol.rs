@@ -319,8 +319,7 @@ impl<R: Read> FrameReader<R> {
         clock_domain: ClockDomainId,
         expected_dimensions: Option<(u32, u32)>,
     ) -> Result<Self, ProtocolError> {
-        let mut magic = [0; 8];
-        reader.read_exact(&mut magic)?;
+        let magic = read_capture_magic(&mut reader)?;
         if &magic != CAPTURE_MAGIC {
             return Err(ProtocolError::malformed("invalid capture magic"));
         }
@@ -570,6 +569,26 @@ impl<R: Read> FrameReader<R> {
         self.read_captured_frame()
             .map(|captured| captured.map(|captured| captured.frame))
     }
+}
+
+fn read_capture_magic(reader: &mut impl Read) -> Result<[u8; 8], ProtocolError> {
+    let mut magic = [0; 8];
+    let mut offset = 0;
+    while offset < magic.len() {
+        match reader.read(&mut magic[offset..]) {
+            Ok(0) if offset == 0 => {
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+            }
+            Ok(0) => return Err(ProtocolError::malformed("truncated capture magic")),
+            Ok(read) => offset += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof && offset > 0 => {
+                return Err(ProtocolError::malformed("truncated capture magic"));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(magic)
 }
 
 /// Streaming parser for bounded interleaved F32 microphone blocks.

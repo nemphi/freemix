@@ -575,6 +575,7 @@ pub struct CameraTelemetry {
     pub native_dropped: u64,
     pub continuity_rejected: u64,
     pub recovery_timeout_discarded: u64,
+    pub terminal_error_discarded: u64,
     pub current: usize,
     pub peak: usize,
 }
@@ -1424,6 +1425,11 @@ impl CameraVideoSource {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let discarded = u64::try_from(state.frames.len()).unwrap_or(u64::MAX);
+            state.telemetry.terminal_error_discarded = state
+                .telemetry
+                .terminal_error_discarded
+                .saturating_add(discarded);
             state.frames.clear();
             state.telemetry.current = 0;
             state.sticky_failure = None;
@@ -2339,6 +2345,7 @@ mod tests {
                 native_dropped: 5,
                 continuity_rejected: 0,
                 recovery_timeout_discarded: 0,
+                terminal_error_discarded: 0,
                 current: 2,
                 peak: 2,
             }
@@ -2829,6 +2836,45 @@ mod tests {
     }
 
     #[test]
+    fn malformed_after_valid_queue_accounts_terminal_discards_exactly() {
+        let mut source = source_with_policy(SignalLossPolicy::Stop);
+        source.start_without_helper_for_test();
+        {
+            let mut state = source
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.push(test_frame(7), 0);
+            state.push(test_frame(8), 0);
+            state.fail(CaptureFailure::contract("injected malformed frame"));
+        }
+
+        assert!(matches!(
+            source.try_receive(),
+            Err(IoError::AdapterFailure {
+                remediation: None,
+                ..
+            })
+        ));
+        let telemetry = source.telemetry();
+        assert_eq!(telemetry.received, 2);
+        assert_eq!(telemetry.dropped, 0);
+        assert_eq!(telemetry.continuity_rejected, 0);
+        assert_eq!(telemetry.recovery_timeout_discarded, 0);
+        assert_eq!(telemetry.terminal_error_discarded, 2);
+        assert_eq!(telemetry.current, 0);
+        assert_eq!(
+            telemetry.received,
+            telemetry
+                .dropped
+                .saturating_add(telemetry.continuity_rejected)
+                .saturating_add(telemetry.recovery_timeout_discarded)
+                .saturating_add(telemetry.terminal_error_discarded)
+                .saturating_add(u64::try_from(telemetry.current).unwrap())
+        );
+    }
+
+    #[test]
     fn clock_capability_is_conservative() {
         let clock = coremedia_clock();
         assert_eq!(clock.timestamps.quality, TimestampQuality::Monotonic);
@@ -2843,6 +2889,84 @@ mod tests {
         assert_eq!(output.bytes, b"ab");
         assert!(output.exceeded);
         assert_eq!(escaped_diagnostic(b"line\n\x1b[31m"), "line\\n\\u{1b}[31m");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn partial_capture_magic_is_fatal_but_empty_runtime_exit_is_recoverable() {
+        use std::{
+            fs,
+            os::unix::fs::PermissionsExt,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let helper = std::env::temp_dir().join(format!("fm-partial-camera-magic-{suffix}.sh"));
+        fs::write(
+            &helper,
+            "#!/bin/sh\nprintf '\\106\\115\\103\\101'\nexit 21\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&helper).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&helper, permissions).unwrap();
+
+        let adapter = MacosCameraAdapter::from_discovery_with_helper(
+            &discovery(0, &[("a", "A", &[(640, 480, 30, 1)])]),
+            helper.clone(),
+        )
+        .unwrap();
+        let descriptor = adapter.snapshot().sources[0].clone();
+        let mut source = adapter.open_video_source(descriptor.id).unwrap();
+        source
+            .open(OpenOptions {
+                format: descriptor.capabilities.formats[0].clone(),
+                clock_domain: descriptor.capabilities.clocks[0].domain,
+                memory_domain: MemoryDomain::Cpu,
+                queue_capacity: NonZeroUsize::MIN,
+                signal_loss: SignalLossPolicy::Stop,
+            })
+            .unwrap();
+
+        assert!(matches!(
+            source.start(),
+            Err(IoError::AdapterFailure {
+                remediation: None,
+                ..
+            })
+        ));
+        assert_eq!(source.lifecycle(), LifecycleState::Open);
+        source.close().unwrap();
+
+        fs::write(&helper, "#!/bin/sh\nexit 21\n").unwrap();
+        let adapter = MacosCameraAdapter::from_discovery_with_helper(
+            &discovery(0, &[("a", "A", &[(640, 480, 30, 1)])]),
+            helper.clone(),
+        )
+        .unwrap();
+        let descriptor = adapter.snapshot().sources[0].clone();
+        let mut source = adapter.open_video_source(descriptor.id).unwrap();
+        source
+            .open(OpenOptions {
+                format: descriptor.capabilities.formats[0].clone(),
+                clock_domain: descriptor.capabilities.clocks[0].domain,
+                memory_domain: MemoryDomain::Cpu,
+                queue_capacity: NonZeroUsize::MIN,
+                signal_loss: SignalLossPolicy::Stop,
+            })
+            .unwrap();
+        assert!(matches!(
+            source.start(),
+            Err(IoError::AdapterFailure {
+                remediation: Some(Remediation::RestartAdapter),
+                ..
+            })
+        ));
+        source.close().unwrap();
+        fs::remove_file(helper).unwrap();
     }
 
     #[cfg(target_os = "macos")]
