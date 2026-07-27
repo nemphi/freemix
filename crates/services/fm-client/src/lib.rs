@@ -24,6 +24,11 @@ use fm_ui_model::{
     RuntimeRealization,
 };
 
+/// Default number of recent completed command statuses retained locally.
+pub const DEFAULT_COMPLETED_COMMAND_CAPACITY: usize = 256;
+/// Largest accepted completed-command history bound.
+pub const MAX_COMPLETED_COMMAND_CAPACITY: usize = 65_536;
+
 /// Static client settings. An external scheduler supplies all clock behavior.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClientConfig {
@@ -34,6 +39,8 @@ pub struct ClientConfig {
     pub client_id: String,
     pub project_id: ProjectId,
     pub outbound_capacity: usize,
+    /// Maximum locally retained completed records. Eviction permits key reuse.
+    pub completed_command_capacity: usize,
     pub initial_backoff_ms: u64,
     pub max_backoff_ms: u64,
 }
@@ -57,6 +64,7 @@ impl ClientConfig {
             client_id: client_id.into(),
             project_id,
             outbound_capacity: 256,
+            completed_command_capacity: DEFAULT_COMPLETED_COMMAND_CAPACITY,
             initial_backoff_ms: 250,
             max_backoff_ms: 30_000,
         }
@@ -294,6 +302,7 @@ pub struct Client {
     outbound: VecDeque<Outbound>,
     commands: BTreeMap<String, CommandRecord>,
     idempotency_keys: HashSet<String>,
+    completed_command_ids: VecDeque<String>,
     next_command_id: u64,
     next_heartbeat_sequence: u64,
     reconnect_attempt: u32,
@@ -322,6 +331,13 @@ impl Client {
                 "outbound capacity must be greater than zero",
             ));
         }
+        if config.completed_command_capacity == 0
+            || config.completed_command_capacity > MAX_COMPLETED_COMMAND_CAPACITY
+        {
+            return Err(ClientError::InvalidConfig(
+                "completed command capacity must be finite and between 1 and 65536",
+            ));
+        }
         if config.initial_backoff_ms == 0 || config.max_backoff_ms < config.initial_backoff_ms {
             return Err(ClientError::InvalidConfig(
                 "invalid reconnect backoff range",
@@ -336,6 +352,7 @@ impl Client {
             outbound: VecDeque::new(),
             commands: BTreeMap::new(),
             idempotency_keys: HashSet::new(),
+            completed_command_ids: VecDeque::new(),
             next_command_id: 1,
             next_heartbeat_sequence: 1,
             reconnect_attempt: 0,
@@ -388,6 +405,12 @@ impl Client {
     #[must_use]
     pub fn command(&self, id: &str) -> Option<&CommandRecord> {
         self.commands.get(id)
+    }
+
+    /// Number of active commands plus bounded, completion-ordered local history.
+    #[must_use]
+    pub fn retained_command_count(&self) -> usize {
+        self.commands.len()
     }
 
     /// Begins a connection attempt. Backoff timing remains caller-owned.
@@ -783,7 +806,8 @@ impl Client {
 
     /// Adds a command with a monotonic client-local ID and explicit replay key.
     /// [`CommandPayload::SelectPreview`] is also tracked as optimistic intent
-    /// by the UI model.
+    /// by the UI model. A key remains reserved while its command is active or
+    /// retained in completed local history, and may be reused after eviction.
     ///
     /// # Errors
     ///
@@ -952,9 +976,15 @@ impl Client {
             &self.state,
             ConnectionState::PendingIncompatible { command_id, .. } if command_id == id
         );
+        let completed_id = id.to_owned();
         if let Some(record) = self.commands.get_mut(id) {
             record.status = CommandStatus::Completed(result);
         }
+        self.outbound.retain(
+            |item| !matches!(item, Outbound::Command(command) if command.id == completed_id),
+        );
+        self.completed_command_ids.push_back(completed_id);
+        self.prune_completed_commands();
         if resolves_pending_incompatible {
             self.state = ConnectionState::Disconnected;
         }
@@ -976,6 +1006,22 @@ impl Client {
                 )
             })
         })
+    }
+
+    fn prune_completed_commands(&mut self) {
+        while self.completed_command_ids.len() > self.config.completed_command_capacity {
+            let id = self
+                .completed_command_ids
+                .pop_front()
+                .expect("completed command retention must have an oldest record");
+            let record = self
+                .commands
+                .remove(&id)
+                .expect("completed command index must reference a retained record");
+            debug_assert!(matches!(record.status, CommandStatus::Completed(_)));
+            self.idempotency_keys
+                .remove(&record.command.idempotency_key);
+        }
     }
 
     fn apply_gap(&mut self, gap: &DurableGap) -> Result<(), ClientError> {

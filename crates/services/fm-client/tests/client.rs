@@ -1,7 +1,8 @@
 use core::num::NonZeroU128;
 
 use fm_client::{
-    Client, ClientConfig, ClientError, CommandStatus, ConnectionState, Intake, Outbound, SyncMode,
+    Client, ClientConfig, ClientError, CommandStatus, ConnectionState,
+    DEFAULT_COMPLETED_COMMAND_CAPACITY, Intake, MAX_COMPLETED_COMMAND_CAPACITY, Outbound, SyncMode,
 };
 use fm_protocol::{
     CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, ClientType, CommandPayload, CommandResult,
@@ -53,8 +54,16 @@ fn config(capacity: usize) -> ClientConfig {
 }
 
 fn handshake(revision: u64, resume: Option<ResumeCursor>) -> HandshakeResponse {
+    handshake_version(CURRENT_PROTOCOL_VERSION, revision, resume)
+}
+
+fn handshake_version(
+    negotiated: ProtocolVersion,
+    revision: u64,
+    resume: Option<ResumeCursor>,
+) -> HandshakeResponse {
     HandshakeResponse {
-        negotiated: CURRENT_PROTOCOL_VERSION,
+        negotiated,
         granted_role: Role::Operator,
         permissions: vec!["switcher.take".to_owned()],
         capabilities: CapabilityReportSummary {
@@ -99,6 +108,24 @@ fn ready_client(capacity: usize) -> Client {
     let mut client = Client::new(config(capacity)).unwrap();
     connect_snapshot(&mut client, 4);
     client
+}
+
+fn complete_cut(client: &mut Client, key: String) -> fm_protocol::CommandMessage {
+    let command = client
+        .queue_command(CommandPayload::Cut, key, Some(4), None)
+        .unwrap();
+    assert!(matches!(
+        client.pop_outbound(),
+        Some(Outbound::Command(queued)) if queued == command
+    ));
+    client
+        .reconcile_result(CommandResult::Accepted {
+            id: command.id.clone(),
+            revision: 4,
+            scheduled_frame: None,
+        })
+        .unwrap();
+    command
 }
 
 fn runtime_event(
@@ -182,6 +209,196 @@ fn incompatible_handshake_is_terminal_until_configuration_changes() {
         &ConnectionState::Incompatible {
             negotiated: ProtocolVersion::new(2, 0)
         }
+    );
+}
+
+#[test]
+fn completed_history_configuration_requires_a_finite_nonzero_bound() {
+    assert_eq!(
+        config(1).completed_command_capacity,
+        DEFAULT_COMPLETED_COMMAND_CAPACITY
+    );
+
+    let mut zero = config(1);
+    zero.completed_command_capacity = 0;
+    assert!(matches!(
+        Client::new(zero),
+        Err(ClientError::InvalidConfig(
+            "completed command capacity must be finite and between 1 and 65536"
+        ))
+    ));
+
+    let mut unbounded = config(1);
+    unbounded.completed_command_capacity = usize::MAX;
+    assert!(unbounded.completed_command_capacity > MAX_COMPLETED_COMMAND_CAPACITY);
+    assert!(matches!(
+        Client::new(unbounded),
+        Err(ClientError::InvalidConfig(
+            "completed command capacity must be finite and between 1 and 65536"
+        ))
+    ));
+}
+
+#[test]
+fn completed_history_stays_constant_and_reconnect_scan_is_bounded() {
+    const RETAINED: usize = 32;
+    const COMPLETED: usize = 4_096;
+
+    let mut settings = config(1);
+    settings.completed_command_capacity = RETAINED;
+    let mut client = Client::new(settings).unwrap();
+    connect_snapshot(&mut client, 4);
+
+    for sequence in 1..=COMPLETED {
+        complete_cut(&mut client, format!("stress-{sequence}"));
+        assert!(client.retained_command_count() <= RETAINED);
+    }
+    assert_eq!(client.retained_command_count(), RETAINED);
+    assert!(client.command("diagnostic-a:4064").is_none());
+    assert!(matches!(
+        client.command("diagnostic-a:4065").unwrap().status,
+        CommandStatus::Completed(_)
+    ));
+    assert!(matches!(
+        client.command("diagnostic-a:4096").unwrap().status,
+        CommandStatus::Completed(_)
+    ));
+
+    let _ = client.transport_disconnected();
+    client.start_connect().unwrap();
+    let cursor = client.transport_connected().unwrap().resume_cursor.unwrap();
+    client
+        .accept_handshake(handshake_version(
+            ProtocolVersion::new(1, 2),
+            4,
+            Some(cursor),
+        ))
+        .unwrap();
+    assert_eq!(client.state(), &ConnectionState::Ready);
+    assert_eq!(client.retained_command_count(), RETAINED);
+    assert_eq!(
+        client
+            .command("diagnostic-a:4096")
+            .unwrap()
+            .command
+            .protocol,
+        CURRENT_PROTOCOL_VERSION
+    );
+}
+
+#[test]
+fn completed_eviction_preserves_all_unresolved_state_and_uncertainty() {
+    let mut settings = config(2);
+    settings.completed_command_capacity = 2;
+    let mut client = Client::new(settings).unwrap();
+    connect_snapshot(&mut client, 4);
+
+    let wipe = client
+        .queue_command(
+            CommandPayload::Wipe {
+                duration_frames: 45,
+            },
+            "unresolved-wipe",
+            Some(4),
+            None,
+        )
+        .unwrap();
+    assert!(matches!(client.pop_outbound(), Some(Outbound::Command(_))));
+    let preview = client
+        .queue_command(
+            CommandPayload::SelectPreview { input: input(1) },
+            "unresolved-preview",
+            Some(4),
+            None,
+        )
+        .unwrap();
+    assert!(matches!(client.pop_outbound(), Some(Outbound::Command(_))));
+
+    for sequence in 0..128 {
+        complete_cut(&mut client, format!("completed-{sequence}"));
+    }
+    assert_eq!(client.retained_command_count(), 4);
+    assert_eq!(client.command(&wipe.id).unwrap().command, wipe);
+    assert_eq!(
+        client.command(&wipe.id).unwrap().status,
+        CommandStatus::Sent
+    );
+    assert_eq!(client.command(&preview.id).unwrap().command, preview);
+    assert_eq!(
+        client.command(&preview.id).unwrap().status,
+        CommandStatus::Sent
+    );
+    assert_eq!(client.model().pending_commands().len(), 2);
+    assert_eq!(
+        client.model().view().unwrap().switcher.desired.preview,
+        input(1).to_domain()
+    );
+
+    let _ = client.transport_disconnected();
+    client.start_connect().unwrap();
+    let cursor = client.transport_connected().unwrap().resume_cursor.unwrap();
+    client
+        .accept_handshake(handshake_version(
+            ProtocolVersion::new(1, 2),
+            4,
+            Some(cursor),
+        ))
+        .unwrap();
+    assert_eq!(client.retained_command_count(), 4);
+    assert_eq!(client.command(&wipe.id).unwrap().command, wipe);
+    assert_eq!(
+        client.command(&preview.id).unwrap().command.protocol,
+        ProtocolVersion::new(1, 2)
+    );
+    assert_eq!(client.model().pending_commands().len(), 2);
+    assert_eq!(
+        client.queue_command(CommandPayload::Cut, "unresolved-wipe", Some(4), None),
+        Err(ClientError::DuplicateIdempotencyKey(
+            "unresolved-wipe".to_owned()
+        ))
+    );
+}
+
+#[test]
+fn completion_order_evicts_command_and_key_together() {
+    let mut settings = config(3);
+    settings.completed_command_capacity = 2;
+    let mut client = Client::new(settings).unwrap();
+    connect_snapshot(&mut client, 4);
+
+    let commands = ["first", "second", "third"].map(|key| {
+        let command = client
+            .queue_command(CommandPayload::Cut, key, Some(4), None)
+            .unwrap();
+        client.pop_outbound();
+        command
+    });
+    client.retry_command(&commands[2].id).unwrap();
+    assert_eq!(client.outbound_len(), 1);
+    for index in [2, 0, 1] {
+        client
+            .reconcile_result(CommandResult::Accepted {
+                id: commands[index].id.clone(),
+                revision: 4,
+                scheduled_frame: None,
+            })
+            .unwrap();
+        if index == 2 {
+            assert_eq!(client.outbound_len(), 0);
+        }
+    }
+
+    assert!(client.command(&commands[2].id).is_none());
+    assert!(client.command(&commands[0].id).is_some());
+    assert!(client.command(&commands[1].id).is_some());
+    assert_eq!(client.retained_command_count(), 2);
+    let reused = client
+        .queue_command(CommandPayload::Cut, "third", Some(4), None)
+        .unwrap();
+    assert_eq!(reused.id, "diagnostic-a:4");
+    assert_eq!(
+        client.queue_command(CommandPayload::Cut, "first", Some(4), None),
+        Err(ClientError::DuplicateIdempotencyKey("first".to_owned()))
     );
 }
 
