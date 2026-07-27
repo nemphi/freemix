@@ -62,6 +62,11 @@ pub enum AudioError {
     DuplicateInput(InputId),
     UnknownInput(InputId),
     RampTooLong(usize),
+    InvalidSourceGain {
+        start_numerator: u32,
+        end_numerator: u32,
+        denominator: u32,
+    },
     CadenceBlockTooLarge(u128),
 }
 
@@ -132,6 +137,14 @@ impl fmt::Display for AudioError {
             Self::RampTooLong(samples) => write!(
                 formatter,
                 "gain ramp of {samples} samples exceeds the limit of {MAX_RAMP_SAMPLES}"
+            ),
+            Self::InvalidSourceGain {
+                start_numerator,
+                end_numerator,
+                denominator,
+            } => write!(
+                formatter,
+                "source gain {start_numerator}/{denominator}..{end_numerator}/{denominator} is outside 0.0..=1.0"
             ),
             Self::CadenceBlockTooLarge(samples) => write!(
                 formatter,
@@ -587,6 +600,76 @@ impl Default for InputState {
     }
 }
 
+/// Exact rational source gain endpoints for one Master sample interval.
+///
+/// The first rendered sample advances one of `samples` equal steps from the
+/// start endpoint and the final sample is exactly the end endpoint. This is
+/// the same endpoint convention used by input-strip gain ramps.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SourceGain {
+    start_numerator: u32,
+    end_numerator: u32,
+    denominator: u32,
+}
+
+impl SourceGain {
+    pub const UNITY: Self = Self {
+        start_numerator: 1,
+        end_numerator: 1,
+        denominator: 1,
+    };
+
+    /// Creates a linear source gain from exact rational endpoints.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AudioError::InvalidSourceGain`] for a zero denominator or an
+    /// endpoint greater than one.
+    pub const fn new(
+        start_numerator: u32,
+        end_numerator: u32,
+        denominator: u32,
+    ) -> Result<Self, AudioError> {
+        if denominator == 0 || start_numerator > denominator || end_numerator > denominator {
+            return Err(AudioError::InvalidSourceGain {
+                start_numerator,
+                end_numerator,
+                denominator,
+            });
+        }
+        Ok(Self {
+            start_numerator,
+            end_numerator,
+            denominator,
+        })
+    }
+
+    #[must_use]
+    pub const fn start_numerator(self) -> u32 {
+        self.start_numerator
+    }
+
+    #[must_use]
+    pub const fn end_numerator(self) -> u32 {
+        self.end_numerator
+    }
+
+    #[must_use]
+    pub const fn denominator(self) -> u32 {
+        self.denominator
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn at_sample(self, sample: usize, samples: usize) -> f32 {
+        let denominator = f64::from(self.denominator);
+        let start = f64::from(self.start_numerator) / denominator;
+        let end = f64::from(self.end_numerator) / denominator;
+        let step = f64::from(u32::try_from(sample + 1).expect("sample count is bounded"));
+        let steps = f64::from(u32::try_from(samples).expect("sample count is bounded"));
+        (start + (end - start) * (step / steps)) as f32
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct GainRamp {
     current: f32,
@@ -862,7 +945,12 @@ impl MasterMixer {
         blocks: &[(InputId, &AudioBlock)],
         active_video_input: Option<InputId>,
     ) -> Result<MasterOutput, AudioError> {
-        let mixed = self.mix_block_views(samples, blocks, active_video_input)?;
+        let blocks = blocks
+            .iter()
+            .map(|(id, block)| (*id, *block, SourceGain::UNITY))
+            .collect::<Vec<_>>();
+        let active_video_inputs = active_video_input.as_slice();
+        let mixed = self.mix_block_views(samples, &blocks, active_video_inputs)?;
         let block = AudioBlock::from_planar(self.format.clone(), mixed.planes)?;
         Ok(MasterOutput {
             block,
@@ -890,10 +978,36 @@ impl MasterMixer {
         blocks: &[(InputId, &fm_frame::AudioBlock)],
         active_video_input: Option<InputId>,
     ) -> Result<TimedMasterOutput, AudioError> {
+        let blocks = blocks
+            .iter()
+            .map(|(id, block)| (*id, *block, SourceGain::UNITY))
+            .collect::<Vec<_>>();
+        let active_video_inputs = active_video_input.as_slice();
+        self.mix_timed_with_source_gains(output_timing, samples, &blocks, active_video_inputs)
+    }
+
+    /// Renders timed blocks with independent linear source envelopes.
+    ///
+    /// Source gain is multiplied by the persistent input-strip and channel-map
+    /// gains. Every ID in `active_video_inputs` satisfies follow-video for this
+    /// interval. All submissions are validated before output or strip-ramp
+    /// state changes, so failures are transactional.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation and construction errors as
+    /// [`Self::mix_timed`].
+    pub fn mix_timed_with_source_gains(
+        &mut self,
+        output_timing: fm_frame::MediaTiming,
+        samples: usize,
+        blocks: &[(InputId, &fm_frame::AudioBlock, SourceGain)],
+        active_video_inputs: &[InputId],
+    ) -> Result<TimedMasterOutput, AudioError> {
         validate_sample_count(samples)?;
         validate_canonical_output(&self.format, samples)?;
         validate_timed_duration(output_timing, self.format.sample_rate, samples)?;
-        let mixed = self.mix_block_views(samples, blocks, active_video_input)?;
+        let mixed = self.mix_block_views(samples, blocks, active_video_inputs)?;
         let block = fm_frame::AudioBlock::new(
             output_timing,
             self.format.sample_rate,
@@ -909,12 +1023,12 @@ impl MasterMixer {
     fn mix_block_views<B: MixerBlockView>(
         &mut self,
         samples: usize,
-        blocks: &[(InputId, &B)],
-        active_video_input: Option<InputId>,
+        blocks: &[(InputId, &B, SourceGain)],
+        active_video_inputs: &[InputId],
     ) -> Result<MixedMaster, AudioError> {
         validate_sample_count(samples)?;
         let mut seen = BTreeSet::new();
-        for (id, block) in blocks {
+        for (id, block, _) in blocks {
             if !seen.insert(*id) {
                 return Err(AudioError::DuplicateInput(*id));
             }
@@ -939,18 +1053,21 @@ impl MasterMixer {
         for (id, strip) in &self.inputs {
             let block = blocks
                 .iter()
-                .find_map(|(block_id, block)| (*block_id == *id).then_some(*block));
+                .find_map(|(block_id, block, gain)| (*block_id == *id).then_some((*block, *gain)));
             let audible = !strip.state.muted
-                && (!strip.state.follow_video || active_video_input == Some(*id));
+                && (!strip.state.follow_video || active_video_inputs.contains(id));
             let mut ramp = strip.ramp;
             let gains: Vec<_> = (0..samples).map(|_| ramp.next()).collect();
-            if let Some(block) = block
+            if let Some((block, source_gain)) = block
                 && audible
             {
                 for (sample, strip_gain) in gains.into_iter().enumerate() {
+                    let source_gain = source_gain.at_sample(sample, samples);
                     for route in &strip.map.routes {
-                        output[route.destination][sample] +=
-                            block.planes()[route.source][sample] * strip_gain * route.gain.linear();
+                        output[route.destination][sample] += block.planes()[route.source][sample]
+                            * strip_gain
+                            * source_gain
+                            * route.gain.linear();
                     }
                 }
             }
@@ -1347,6 +1464,180 @@ mod tests {
             output.meters.channels(),
             &[ChannelMeter::default(), ChannelMeter::default()]
         );
+    }
+
+    #[test]
+    fn timed_source_gains_hit_endpoints_and_continue_linearly_across_intervals() {
+        let format = mono_format();
+        let primary = input_id(1);
+        let secondary = input_id(2);
+        let primary_block = canonical_block(timing(1), &format, vec![vec![1.0; 4]]);
+        let secondary_block = canonical_block(timing(2), &format, vec![vec![-1.0; 4]]);
+        let mut mixer = MasterMixer::new(format.clone()).unwrap();
+        mixer.set_clipping_policy(ClippingPolicy::Allow);
+        for id in [primary, secondary] {
+            mixer
+                .add_input(
+                    id,
+                    format.clone(),
+                    ChannelMap::identity(1).unwrap(),
+                    InputState {
+                        follow_video: true,
+                        ..InputState::default()
+                    },
+                )
+                .unwrap();
+        }
+
+        let first = mixer
+            .mix_timed_with_source_gains(
+                timing_for_samples(10, 4),
+                4,
+                &[
+                    (primary, &primary_block, SourceGain::new(2, 1, 2).unwrap()),
+                    (
+                        secondary,
+                        &secondary_block,
+                        SourceGain::new(0, 1, 2).unwrap(),
+                    ),
+                ],
+                &[primary, secondary],
+            )
+            .unwrap();
+        let second = mixer
+            .mix_timed_with_source_gains(
+                timing_for_samples(11, 4),
+                4,
+                &[
+                    (primary, &primary_block, SourceGain::new(1, 0, 2).unwrap()),
+                    (
+                        secondary,
+                        &secondary_block,
+                        SourceGain::new(1, 2, 2).unwrap(),
+                    ),
+                ],
+                &[primary, secondary],
+            )
+            .unwrap();
+
+        assert_eq!(first.block.plane(0).unwrap(), &[0.75, 0.5, 0.25, 0.0]);
+        assert_eq!(second.block.plane(0).unwrap(), &[-0.25, -0.5, -0.75, -1.0]);
+        let joined = first
+            .block
+            .plane(0)
+            .unwrap()
+            .iter()
+            .chain(second.block.plane(0).unwrap());
+        for (left, right) in joined.clone().zip(joined.skip(1)) {
+            assert_close(*right - *left, -0.25);
+        }
+    }
+
+    #[test]
+    fn timed_source_gains_preserve_mute_and_follow_video() {
+        let format = mono_format();
+        let primary = input_id(1);
+        let secondary = input_id(2);
+        let muted = input_id(3);
+        let inactive = input_id(4);
+        let block = canonical_block(timing(1), &format, vec![vec![1.0; 2]]);
+        let mut mixer = MasterMixer::new(format.clone()).unwrap();
+        mixer.set_clipping_policy(ClippingPolicy::Allow);
+        for (id, is_muted) in [
+            (primary, false),
+            (secondary, false),
+            (muted, true),
+            (inactive, false),
+        ] {
+            mixer
+                .add_input(
+                    id,
+                    format.clone(),
+                    ChannelMap::identity(1).unwrap(),
+                    InputState {
+                        muted: is_muted,
+                        follow_video: true,
+                        ..InputState::default()
+                    },
+                )
+                .unwrap();
+        }
+
+        let output = mixer
+            .mix_timed_with_source_gains(
+                timing_for_samples(3, 2),
+                2,
+                &[
+                    (primary, &block, SourceGain::UNITY),
+                    (secondary, &block, SourceGain::UNITY),
+                    (muted, &block, SourceGain::UNITY),
+                    (inactive, &block, SourceGain::UNITY),
+                ],
+                &[primary, secondary, muted],
+            )
+            .unwrap();
+
+        assert_eq!(output.block.plane(0).unwrap(), &[2.0, 2.0]);
+    }
+
+    #[test]
+    fn timed_source_gain_failures_are_transactional() {
+        let format = mono_format();
+        let id = input_id(1);
+        assert_eq!(
+            SourceGain::new(0, 1, 0),
+            Err(AudioError::InvalidSourceGain {
+                start_numerator: 0,
+                end_numerator: 1,
+                denominator: 0,
+            })
+        );
+        assert!(SourceGain::new(0, 2, 1).is_err());
+
+        let valid = canonical_block(timing(1), &format, vec![vec![1.0; 2]]);
+        let wrong_count = canonical_block(timing(2), &format, vec![vec![1.0]]);
+        let mut mixer = MasterMixer::new(format.clone()).unwrap();
+        mixer
+            .add_input(
+                id,
+                format,
+                ChannelMap::identity(1).unwrap(),
+                InputState::default(),
+            )
+            .unwrap();
+        mixer
+            .set_input_state(
+                id,
+                InputState {
+                    gain: Gain::SILENCE,
+                    ..InputState::default()
+                },
+                4,
+            )
+            .unwrap();
+
+        assert_eq!(
+            mixer.mix_timed_with_source_gains(
+                timing_for_samples(4, 2),
+                2,
+                &[(id, &wrong_count, SourceGain::new(0, 1, 1).unwrap())],
+                &[id],
+            ),
+            Err(AudioError::SampleCountMismatch {
+                expected: 2,
+                actual: 1,
+            })
+        );
+        assert_eq!(mixer.current_linear_gain(id), Some(1.0));
+        let rendered = mixer
+            .mix_timed_with_source_gains(
+                timing_for_samples(5, 2),
+                2,
+                &[(id, &valid, SourceGain::new(0, 1, 1).unwrap())],
+                &[id],
+            )
+            .unwrap();
+        assert_eq!(rendered.block.plane(0).unwrap(), &[0.375, 0.5]);
     }
 
     #[test]

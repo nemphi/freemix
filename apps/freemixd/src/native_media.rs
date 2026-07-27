@@ -20,7 +20,7 @@ use std::{
     thread,
 };
 
-use fm_audio::{ChannelMap, InputState, MasterMixer};
+use fm_audio::{ChannelMap, InputState, MasterMixer, SourceGain};
 use fm_clock::ClockTime;
 #[cfg(test)]
 use fm_codec_ffmpeg::SequenceRequest;
@@ -1426,10 +1426,9 @@ impl NativeMasterRuntime {
         Ok(())
     }
 
-    /// Mixes the serviced interval from `frame.program.primary`, retains a copy
-    /// in the bounded fake sink, and discards the authoritative owned block.
-    /// Fade deliberately keeps the old primary until the switcher completes;
-    /// source interpolation is deferred to a later audio-policy slice.
+    /// Mixes the serviced Program interval, retains a copy in the bounded fake
+    /// sink, and discards the authoritative owned block. Fade linearly weights
+    /// both sources across the exact interval; Cut keeps one source at unity.
     ///
     /// This method performs no probe, decode, channel mapping, or blocking wait.
     ///
@@ -1445,9 +1444,9 @@ impl NativeMasterRuntime {
     /// owned audio block. A clone is retained in the bounded fake sink so
     /// existing diagnostics remain identical to [`Self::render_frame`].
     ///
-    /// Fade deliberately keeps the old primary until the switcher completes;
-    /// source interpolation is deferred to a later audio-policy slice. This
-    /// method performs no probe, decode, channel mapping, or blocking wait.
+    /// Fade linearly weights both sources across the exact interval; Cut keeps
+    /// one source at unity. This method performs no probe, decode, channel
+    /// mapping, or blocking wait.
     ///
     /// # Errors
     ///
@@ -1492,25 +1491,53 @@ impl NativeMasterRuntime {
             self.format.sample_rate.hertz(),
             self.clock_domain,
         )?;
-        let primary = authoritative_audio_primary(frame.program);
-        let block = coalesce_source(
+        let samples = usize::try_from(end_sample - start_sample)
+            .map_err(|_| NativeMasterError::BoundsExceeded)?;
+        let plan = native_audio_mix_plan(frame.program)?;
+        let primary_block = coalesce_source(
             self.sources
-                .get(&primary)
-                .ok_or(NativeMasterError::DecodeContract { input: primary })?,
+                .get(&plan.primary)
+                .ok_or(NativeMasterError::DecodeContract {
+                    input: plan.primary,
+                })?,
             timing,
             start_sample,
             end_sample,
             &self.format,
         )?;
-        let samples = usize::try_from(end_sample - start_sample)
-            .map_err(|_| NativeMasterError::BoundsExceeded)?;
-        let output = self
-            .mixer
-            .mix_timed(timing, samples, &[(primary, &block)], Some(primary))?;
+        let mut next_mixer = self.mixer.clone();
+        let output = if let Some((secondary, secondary_gain)) = plan.secondary {
+            let secondary_block = coalesce_source(
+                self.sources
+                    .get(&secondary)
+                    .ok_or(NativeMasterError::DecodeContract { input: secondary })?,
+                timing,
+                start_sample,
+                end_sample,
+                &self.format,
+            )?;
+            next_mixer.mix_timed_with_source_gains(
+                timing,
+                samples,
+                &[
+                    (plan.primary, &primary_block, plan.primary_gain),
+                    (secondary, &secondary_block, secondary_gain),
+                ],
+                &[plan.primary, secondary],
+            )?
+        } else {
+            next_mixer.mix_timed(
+                timing,
+                samples,
+                &[(plan.primary, &primary_block)],
+                Some(plan.primary),
+            )?
+        };
         let block = output.block;
         self.sink
             .collect(block.clone())
             .map_err(|_| NativeMasterError::SinkRejected)?;
+        self.mixer = next_mixer;
         self.expected_next_frame = self
             .expected_next_frame
             .checked_add(1)
@@ -1801,8 +1828,43 @@ fn coalesce_source(
     )?)
 }
 
-const fn authoritative_audio_primary(program: ProgramFrame) -> InputId {
-    program.primary
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeAudioMixPlan {
+    primary: InputId,
+    primary_gain: SourceGain,
+    secondary: Option<(InputId, SourceGain)>,
+}
+
+fn native_audio_mix_plan(
+    program: ProgramFrame,
+) -> Result<NativeAudioMixPlan, fm_audio::AudioError> {
+    let Some(secondary) = program.secondary else {
+        return Ok(NativeAudioMixPlan {
+            primary: program.primary,
+            primary_gain: SourceGain::UNITY,
+            secondary: None,
+        });
+    };
+    let end_numerator = program
+        .mix_numerator
+        .checked_add(1)
+        .unwrap_or(program.mix_numerator)
+        .min(program.mix_denominator);
+    let secondary_gain = SourceGain::new(
+        program.mix_numerator,
+        end_numerator,
+        program.mix_denominator,
+    )?;
+    let primary_gain = SourceGain::new(
+        program.mix_denominator - program.mix_numerator,
+        program.mix_denominator - end_numerator,
+        program.mix_denominator,
+    )?;
+    Ok(NativeAudioMixPlan {
+        primary: program.primary,
+        primary_gain,
+        secondary: Some((secondary, secondary_gain)),
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3292,18 +3354,77 @@ mod tests {
     }
 
     fn frame_result(frame: u64, primary: InputId, secondary: Option<InputId>) -> FrameResult {
+        frame_result_with_mix(frame, primary, secondary, u32::from(secondary.is_some()), 2)
+    }
+
+    fn frame_result_with_mix(
+        frame: u64,
+        primary: InputId,
+        secondary: Option<InputId>,
+        mix_numerator: u32,
+        mix_denominator: u32,
+    ) -> FrameResult {
         FrameResult {
             frame: FrameNumber::new(frame),
             deadline: ClockTime::ZERO,
             program: ProgramFrame {
                 primary,
                 secondary,
-                mix_numerator: u32::from(secondary.is_some()),
-                mix_denominator: 2,
+                mix_numerator,
+                mix_denominator,
             },
             events: Vec::new(),
             revision: Revision::new(0),
             runtime_generation: RuntimeGeneration::new(0),
+        }
+    }
+
+    fn audio_test_master(sources: &[(InputId, f32)], sink_blocks: usize) -> NativeMasterRuntime {
+        let format = mono_audio_format();
+        let mut mixer = MasterMixer::new(format.clone()).unwrap();
+        let mut audio_sources = BTreeMap::new();
+        let samples_per_source = 3 * 1_920;
+        for &(input, sample) in sources {
+            mixer
+                .add_input(
+                    input,
+                    format.clone(),
+                    ChannelMap::identity(1).unwrap(),
+                    InputState {
+                        follow_video: true,
+                        ..InputState::default()
+                    },
+                )
+                .unwrap();
+            audio_sources.insert(
+                input,
+                audio_source(
+                    vec![audio_chunk(0, &vec![sample; samples_per_source])],
+                    true,
+                ),
+            );
+        }
+        let retained_samples = sources.len() * samples_per_source;
+        NativeMasterRuntime {
+            format,
+            frame_rate: FrameRate::new(25, 1).unwrap(),
+            clock_domain: ClockDomainId::new(NonZeroU128::new(9).unwrap()),
+            expected_next_frame: 0,
+            ready_frame: None,
+            mixer,
+            sink: CollectingAudioSink::new(sink_blocks, OverflowPolicy::DropOldest).unwrap(),
+            sources: audio_sources,
+            worker: NativeAudioDecodeWorker::spawn(BTreeMap::new()).unwrap(),
+            retained: NativeAudioCharge {
+                blocks: sources.len(),
+                samples: retained_samples,
+                bytes: retained_samples * size_of::<f32>(),
+            },
+            limits: NativeAudioLimits {
+                sink_blocks,
+                ..NativeAudioLimits::default()
+            },
+            failed: false,
         }
     }
 
@@ -3948,27 +4069,77 @@ mod tests {
     }
 
     #[test]
-    fn authoritative_audio_primary_keeps_old_source_during_fade_then_hard_switches() {
+    fn audio_mix_plan_maps_cut_and_exact_fade_interval_endpoints() {
         let old = input(1);
         let new = input(2);
         assert_eq!(
-            authoritative_audio_primary(ProgramFrame {
+            native_audio_mix_plan(ProgramFrame {
                 primary: old,
                 secondary: Some(new),
-                mix_numerator: 3,
+                mix_numerator: 2,
                 mix_denominator: 4,
-            }),
-            old
+            })
+            .unwrap(),
+            NativeAudioMixPlan {
+                primary: old,
+                primary_gain: SourceGain::new(2, 1, 4).unwrap(),
+                secondary: Some((new, SourceGain::new(2, 3, 4).unwrap())),
+            }
         );
         assert_eq!(
-            authoritative_audio_primary(ProgramFrame {
+            native_audio_mix_plan(ProgramFrame {
                 primary: new,
                 secondary: None,
-                mix_numerator: 0,
-                mix_denominator: 1,
-            }),
-            new
+                mix_numerator: u32::MAX,
+                mix_denominator: 0,
+            })
+            .unwrap(),
+            NativeAudioMixPlan {
+                primary: new,
+                primary_gain: SourceGain::UNITY,
+                secondary: None,
+            }
         );
+        assert!(
+            native_audio_mix_plan(ProgramFrame {
+                primary: old,
+                secondary: Some(new),
+                mix_numerator: 1,
+                mix_denominator: 0,
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn fade_master_audio_is_linear_continuous_and_reaches_cut_endpoint() {
+        let old = input(1);
+        let new = input(2);
+        let mut master = audio_test_master(&[(old, 1.0), (new, -1.0)], 3);
+
+        assert!(master.service_next_frame().unwrap());
+        let first = master
+            .render_frame_audio(&frame_result_with_mix(0, old, Some(new), 0, 2))
+            .unwrap();
+        assert!(master.service_next_frame().unwrap());
+        let second = master
+            .render_frame_audio(&frame_result_with_mix(1, old, Some(new), 1, 2))
+            .unwrap();
+        assert!(master.service_next_frame().unwrap());
+        let cut = master
+            .render_frame_audio(&frame_result_with_mix(2, new, None, 0, 1))
+            .unwrap();
+
+        let first = first.plane(0).unwrap();
+        let second = second.plane(0).unwrap();
+        let cut = cut.plane(0).unwrap();
+        let step = 1.0 / 1_920.0;
+        assert!((first[0] - (1.0 - step)).abs() < 1.0e-6);
+        assert_eq!(first[1_919], 0.0);
+        assert!((second[0] + step).abs() < 1.0e-6);
+        assert_eq!(second[1_919], -1.0);
+        assert_eq!(cut[0], -1.0);
+        assert!((second[0] - first[1_919] + step).abs() < 1.0e-6);
     }
 
     #[test]
@@ -4014,30 +4185,53 @@ mod tests {
     #[test]
     fn returned_master_audio_sink_failure_is_sticky_and_transactional() {
         let source_id = input(1);
-        let mut master = silent_test_master(source_id, 1);
+        let secondary = input(2);
+        let mut master = audio_test_master(&[(source_id, 1.0), (secondary, -1.0)], 1);
         master.sink = CollectingAudioSink::new(1, OverflowPolicy::Reject).unwrap();
+        master
+            .mixer
+            .set_input_state(
+                source_id,
+                InputState {
+                    gain: fm_audio::Gain::SILENCE,
+                    follow_video: true,
+                    ..InputState::default()
+                },
+                3_840,
+            )
+            .unwrap();
 
         assert!(master.service_next_frame().unwrap());
         let first = master
-            .render_frame_audio(&frame_result(0, source_id, None))
+            .render_frame_audio(&frame_result_with_mix(0, source_id, Some(secondary), 0, 2))
             .unwrap();
+        let gain_after_first = master.mixer.current_linear_gain(source_id);
+        assert!((gain_after_first.unwrap() - 0.5).abs() < 1.0e-5);
         assert!(master.service_next_frame().unwrap());
         let ready = master.ready_frame;
 
         assert!(matches!(
-            master.render_frame_audio(&frame_result(1, source_id, None)),
+            master.render_frame_audio(&frame_result_with_mix(1, source_id, Some(secondary), 1, 2,)),
             Err(NativeMasterError::SinkRejected)
         ));
         assert_eq!(master.expected_next_frame(), 1);
         assert_eq!(master.ready_frame, ready);
         assert_eq!(master.collected_audio().next(), Some(&first));
+        assert_eq!(
+            master.mixer.current_linear_gain(source_id),
+            gain_after_first
+        );
         assert!(matches!(
-            master.render_frame_audio(&frame_result(1, source_id, None)),
+            master.render_frame_audio(&frame_result_with_mix(1, source_id, Some(secondary), 1, 2,)),
             Err(NativeMasterError::Failed)
         ));
         assert_eq!(master.expected_next_frame(), 1);
         assert_eq!(master.ready_frame, ready);
         assert_eq!(master.collected_audio().next(), Some(&first));
+        assert_eq!(
+            master.mixer.current_linear_gain(source_id),
+            gain_after_first
+        );
     }
 
     #[test]
