@@ -771,6 +771,7 @@ dependencies = [
 name = "fm-audio"
 version = "0.1.0"
 dependencies = [
+ "fm-clock",
  "fm-frame",
  "fm-types",
 ]

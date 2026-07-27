@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+fm-clock = { path = "../fm-clock" }
 fm-frame = { path = "../fm-frame" }
 fm-types = { path = "../../foundation/fm-types" }
 

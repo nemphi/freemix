@@ -9,6 +9,15 @@ use std::fmt;
 
 use fm_types::{AudioFormat, ChannelLayout, FrameRate, InputId, SampleFormat, SampleRate};
 
+mod synchronizer;
+
+pub use synchronizer::{
+    AudioSynchronizerError, AudioSynchronizerLimits, AudioSynchronizerTelemetry, BufferLimit,
+    ClockMappedAudioSynchronizer, MAX_SYNCHRONIZER_BLOCKS, MAX_SYNCHRONIZER_BYTES,
+    MAX_SYNCHRONIZER_OUTPUT_SAMPLES, MAX_SYNCHRONIZER_SAMPLES, MasterAudioInterval,
+    SynchronizerDiscontinuity, SynchronizerLimit,
+};
+
 /// Maximum number of channels accepted by a block or mixer.
 pub const MAX_CHANNELS: usize = 32;
 /// Maximum number of samples per channel accepted in one operation.
