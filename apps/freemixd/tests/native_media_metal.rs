@@ -27,9 +27,13 @@ use fm_frame::{
     MatrixCoefficients, SignalRange, TransferFunction, VideoFrameMetadata,
 };
 use fm_gpu::{NativeBackend, TextureFormat};
-use fm_model::{Input, InputKind, Project, ProjectSettings, Rgba8, Scene};
+use fm_model::{
+    CropRect, Input, InputKind, Layer, LayerGeometry, Project, ProjectSettings,
+    Rgba8 as ModelRgba8, Rotation, Scene, SimulatedAudio, SimulatedInput, SimulatedVideo,
+    SourceRef,
+};
 use fm_scheduler::FrameNumber;
-use fm_sim::{SimulatedVideoSource, SourcePattern};
+use fm_sim::{Rgba8 as SimRgba8, SimulatedVideoSource, SourcePattern};
 use fm_switcher::{ProgramFrame, TransitionKind as SwitcherTransitionKind};
 use fm_types::{
     AudioFormat, ChannelLayout, ColorMetadata as ModelColorMetadata, FrameRate, InputId,
@@ -643,19 +647,35 @@ fn native_metal_renders_scenes_before_exact_fade_and_wipe() {
     let runtime = block_on(NativeMediaRuntime::new([NativeBackend::Metal]))
         .expect("create Metal scene runtime");
     let clock_domain = ClockDomainId::new(NonZeroU128::new(91).unwrap());
+    let frame_rate = FrameRate::new(30, 1).unwrap();
+    let red_leaf = InputId::new(NonZeroU128::new(1).unwrap());
+    let blue_leaf = InputId::new(NonZeroU128::new(2).unwrap());
+    let primary_input = InputId::new(NonZeroU128::new(3).unwrap());
+    let secondary_input = InputId::new(NonZeroU128::new(4).unwrap());
+    let retained = |input, color| {
+        let mut source =
+            SimulatedVideoSource::new(4, 2, frame_rate, clock_domain, SourcePattern::Solid(color))
+                .unwrap();
+        NativeResolvedSource::RetainedFrame {
+            input,
+            frame: source.next_frame().unwrap().unwrap(),
+        }
+    };
     let playback = runtime
         .preflight_resolved_source_playback_mixed_blocking(
             None,
-            Vec::<NativeResolvedSource>::new(),
+            [
+                retained(red_leaf, SimRgba8::new(255, 0, 0, 255)),
+                retained(blue_leaf, SimRgba8::new(0, 0, 255, 255)),
+            ],
             clock_domain,
             StreamSelector::Best,
             NativeSourceLimits::default(),
         )
-        .expect("create empty physical source registry");
-    let frame_rate = FrameRate::new(30, 1).unwrap();
+        .expect("normalize timed physical source frames");
     let mut project = Project::new(
         ProjectId::new(NonZeroU128::new(90).unwrap()),
-        "Metal nested scene transition",
+        "Metal shared nested scene transition",
         ProjectSettings {
             frame_rate,
             video: VideoFormat {
@@ -672,11 +692,30 @@ fn native_metal_renders_scenes_before_exact_fade_and_wipe() {
             },
         },
     );
-    let red_input = InputId::new(NonZeroU128::new(1).unwrap());
-    let blue_input = InputId::new(NonZeroU128::new(2).unwrap());
-    let red_scene = SceneId::new(NonZeroU128::new(11).unwrap());
-    let blue_scene = SceneId::new(NonZeroU128::new(12).unwrap());
-    for (id, scene_id) in [(red_input, red_scene), (blue_input, blue_scene)] {
+    for (id, color) in [
+        (
+            red_leaf,
+            SimulatedVideo::Solid(fm_model::SolidColor::new(255, 0, 0, 255)),
+        ),
+        (
+            blue_leaf,
+            SimulatedVideo::Solid(fm_model::SolidColor::new(0, 0, 255, 255)),
+        ),
+    ] {
+        project.add_input(Input {
+            id,
+            name: format!("physical {id}"),
+            kind: InputKind::Simulated(SimulatedInput::new(color, SimulatedAudio::Silence)),
+            required_capabilities: Vec::new(),
+        });
+    }
+    let shared_scene = SceneId::new(NonZeroU128::new(11).unwrap());
+    let primary_scene = SceneId::new(NonZeroU128::new(12).unwrap());
+    let secondary_scene = SceneId::new(NonZeroU128::new(13).unwrap());
+    for (id, scene_id) in [
+        (primary_input, primary_scene),
+        (secondary_input, secondary_scene),
+    ] {
         project.add_input(Input {
             id,
             name: format!("scene {id}"),
@@ -688,60 +727,163 @@ fn native_metal_renders_scenes_before_exact_fade_and_wipe() {
         });
     }
     project.add_scene(Scene {
-        id: red_scene,
-        name: "red".into(),
-        background: Rgba8::new(255, 0, 0, 255),
-        layers: Vec::new(),
+        id: shared_scene,
+        name: "shared red window".into(),
+        background: ModelRgba8::OPAQUE_BLACK,
+        layers: vec![metal_scene_layer(
+            SourceRef::Input(red_leaf),
+            LayerGeometry::new(1, 0, 2, 2, Rotation::Deg0),
+            None,
+            0,
+        )],
     });
     project.add_scene(Scene {
-        id: blue_scene,
-        name: "blue".into(),
-        background: Rgba8::new(0, 0, 255, 255),
-        layers: Vec::new(),
+        id: primary_scene,
+        name: "cropped shared primary".into(),
+        background: ModelRgba8::OPAQUE_BLACK,
+        layers: vec![metal_scene_layer(
+            SourceRef::Scene(shared_scene),
+            LayerGeometry::new(0, 0, 2, 2, Rotation::Deg0),
+            Some(CropRect::new(1, 0, 2, 2)),
+            0,
+        )],
+    });
+    project.add_scene(Scene {
+        id: secondary_scene,
+        name: "shared plus blue secondary".into(),
+        background: ModelRgba8::OPAQUE_BLACK,
+        layers: vec![
+            metal_scene_layer(
+                SourceRef::Scene(shared_scene),
+                LayerGeometry::new(0, 0, 4, 2, Rotation::Deg0),
+                None,
+                0,
+            ),
+            metal_scene_layer(
+                SourceRef::Input(blue_leaf),
+                LayerGeometry::new(2, 0, 2, 2, Rotation::Deg0),
+                None,
+                1,
+            ),
+        ],
     });
     let plan = NativeProjectPlan::compile(&project, NativeProjectLimits::default())
         .expect("compile scene routes");
+    assert_eq!(plan.peak_rgba16f_targets(), 5);
+    let red = native_leaf_rgba16f(&runtime, playback.registry(), red_leaf);
+    let blue = native_leaf_rgba16f(&runtime, playback.registry(), blue_leaf);
+    let half = |value| f16::from_f32(value * 0.5).to_f32();
 
     for kind in [SwitcherTransitionKind::Fade, SwitcherTransitionKind::Wipe] {
-        let frame = FrameResult {
-            frame: FrameNumber::new(0),
-            deadline: ClockTime::from_nanos(0),
-            program: ProgramFrame {
-                primary: red_input,
-                secondary: Some(blue_input),
-                transition_kind: Some(kind),
-                mix_numerator: 1,
-                mix_denominator: 2,
-                mix_start_numerator: 0,
-                mix_end_numerator: 1,
-            },
-            events: Vec::new(),
-            revision: Revision::new(0),
-            runtime_generation: RuntimeGeneration::new(0),
-        };
-        let output =
-            block_on(runtime.render_project_frame_result(playback.registry(), &plan, &frame))
-                .expect("render scenes before transition");
-        let readback =
-            block_on(runtime.diagnostic_readback(&output)).expect("read scene transition");
-        for x in 0..4_u32 {
-            let offset = usize::try_from(x).unwrap() * 8;
-            let component = |index: usize| {
-                f16::from_bits(u16::from_le_bytes([
-                    readback.bytes[offset + index * 2],
-                    readback.bytes[offset + index * 2 + 1],
-                ]))
-                .to_f32()
+        for (sequence, deadline) in [0, 33_333_333, 2_000_000_000].into_iter().enumerate() {
+            let frame = FrameResult {
+                frame: FrameNumber::new(u64::try_from(sequence).unwrap()),
+                deadline: ClockTime::from_nanos(deadline),
+                program: ProgramFrame {
+                    primary: primary_input,
+                    secondary: Some(secondary_input),
+                    transition_kind: Some(kind),
+                    mix_numerator: 1,
+                    mix_denominator: 2,
+                    mix_start_numerator: 0,
+                    mix_end_numerator: 1,
+                },
+                events: Vec::new(),
+                revision: Revision::new(0),
+                runtime_generation: RuntimeGeneration::new(0),
             };
-            let expected = match kind {
-                SwitcherTransitionKind::Fade => [0.5, 0.0, 0.5, 1.0],
-                SwitcherTransitionKind::Wipe if x < 2 => [0.0, 0.0, 1.0, 1.0],
-                SwitcherTransitionKind::Wipe => [1.0, 0.0, 0.0, 1.0],
-                _ => unreachable!(),
-            };
-            for (index, expected) in expected.into_iter().enumerate() {
-                assert_eq!(component(index), expected, "{kind:?} x={x} channel={index}");
+            let output =
+                block_on(runtime.render_project_frame_result(playback.registry(), &plan, &frame))
+                    .expect("render nested scenes before transition");
+            let readback =
+                block_on(runtime.diagnostic_readback(&output)).expect("read scene transition");
+            for x in 0..4_u32 {
+                let expected = match kind {
+                    SwitcherTransitionKind::Fade => match x {
+                        0 => [half(red[0]), half(red[1]), half(red[2]), 1.0],
+                        1 => red,
+                        2 | 3 => [half(blue[0]), half(blue[1]), half(blue[2]), 1.0],
+                        _ => unreachable!(),
+                    },
+                    SwitcherTransitionKind::Wipe if x == 1 => red,
+                    SwitcherTransitionKind::Wipe => [0.0, 0.0, 0.0, 1.0],
+                    _ => unreachable!(),
+                };
+                assert_metal_rgba16f(&readback.bytes, 4, x, 0, expected, kind, deadline);
             }
         }
+    }
+}
+
+fn native_leaf_rgba16f(
+    runtime: &NativeMediaRuntime,
+    registry: &NativeSourceRegistry,
+    input: InputId,
+) -> [f32; 4] {
+    let frame = FrameResult {
+        frame: FrameNumber::new(0),
+        deadline: ClockTime::from_nanos(0),
+        program: ProgramFrame {
+            primary: input,
+            secondary: None,
+            transition_kind: None,
+            mix_numerator: 0,
+            mix_denominator: 1,
+            mix_start_numerator: 0,
+            mix_end_numerator: 0,
+        },
+        events: Vec::new(),
+        revision: Revision::new(0),
+        runtime_generation: RuntimeGeneration::new(0),
+    };
+    let output =
+        block_on(runtime.render_frame_result(registry, &frame)).expect("render timed leaf");
+    let readback = block_on(runtime.diagnostic_readback(&output)).expect("read timed leaf");
+    std::array::from_fn(|channel| {
+        let offset = channel * 2;
+        f16::from_bits(u16::from_le_bytes([
+            readback.bytes[offset],
+            readback.bytes[offset + 1],
+        ]))
+        .to_f32()
+    })
+}
+
+fn metal_scene_layer(
+    source: SourceRef,
+    geometry: LayerGeometry,
+    crop: Option<CropRect>,
+    z_order: i32,
+) -> Layer {
+    Layer {
+        name: "Metal geometry".into(),
+        source,
+        enabled: true,
+        geometry,
+        crop,
+        opacity: u8::MAX,
+        z_order,
+    }
+}
+
+#[allow(clippy::float_cmp)]
+fn assert_metal_rgba16f(
+    bytes: &[u8],
+    width: u32,
+    x: u32,
+    y: u32,
+    expected: [f32; 4],
+    kind: SwitcherTransitionKind,
+    deadline: u64,
+) {
+    let pixel = usize::try_from(y * width + x).unwrap();
+    for (channel, expected) in expected.into_iter().enumerate() {
+        let offset = pixel * 8 + channel * 2;
+        let actual =
+            f16::from_bits(u16::from_le_bytes([bytes[offset], bytes[offset + 1]])).to_f32();
+        assert_eq!(
+            actual, expected,
+            "{kind:?} deadline={deadline} x={x} channel={channel}"
+        );
     }
 }

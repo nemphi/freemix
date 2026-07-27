@@ -108,6 +108,22 @@ struct NativeScenePlan {
     sources: Vec<(SourceId, NativeSceneSource)>,
 }
 
+impl NativeScenePlan {
+    fn scene_dependencies(&self) -> impl Iterator<Item = SceneId> + '_ {
+        self.sources.iter().filter_map(|(_, source)| match source {
+            NativeSceneSource::Scene(scene) => Some(*scene),
+            NativeSceneSource::Leaf(_) => None,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NativeSceneExecution {
+    roots: BTreeSet<SceneId>,
+    required: BTreeSet<SceneId>,
+    remaining_consumers: BTreeMap<SceneId, usize>,
+}
+
 /// Typed failures produced before any native device or decoder is opened.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NativeProjectPlanError {
@@ -130,8 +146,9 @@ pub enum NativeProjectPlanError {
     TransientByteSizeOverflow {
         width: u32,
         height: u32,
-        scenes: usize,
+        targets: usize,
     },
+    TransientTargetCountOverflow,
     TransientBytesExceeded {
         required: u64,
         maximum: u64,
@@ -171,14 +188,17 @@ impl fmt::Display for NativeProjectPlanError {
             Self::TransientByteSizeOverflow {
                 width,
                 height,
-                scenes,
+                targets,
             } => write!(
                 formatter,
-                "{scenes} native scene targets at {width}x{height} overflow the RGBA16F byte charge"
+                "{targets} simultaneous native targets at {width}x{height} overflow the RGBA16F byte charge"
             ),
+            Self::TransientTargetCountOverflow => {
+                formatter.write_str("native transient target count overflowed")
+            }
             Self::TransientBytesExceeded { required, maximum } => write!(
                 formatter,
-                "native scene transient RGBA16F bytes {required} exceed limit {maximum}"
+                "native transient RGBA16F bytes {required} exceed limit {maximum}"
             ),
             Self::Scene { scene, error } => {
                 write!(formatter, "native scene {scene} is invalid: {error}")
@@ -209,6 +229,7 @@ pub struct NativeProjectPlan {
     video_routes: BTreeMap<InputId, NativeVideoRoute>,
     audio_routes: BTreeMap<InputId, NativeAudioRoute>,
     scenes: Vec<NativeScenePlan>,
+    peak_rgba16f_targets: usize,
     transient_rgba16f_bytes: u64,
 }
 
@@ -290,28 +311,6 @@ impl NativeProjectPlan {
         }
 
         let dimensions = project.settings().video.dimensions;
-        let frame_bytes = u64::from(dimensions.width())
-            .checked_mul(u64::from(dimensions.height()))
-            .and_then(|pixels| pixels.checked_mul(RGBA16_FLOAT_BYTES_PER_PIXEL))
-            .ok_or(NativeProjectPlanError::TransientByteSizeOverflow {
-                width: dimensions.width(),
-                height: dimensions.height(),
-                scenes: order.len(),
-            })?;
-        let transient_rgba16f_bytes = frame_bytes
-            .checked_mul(u64::try_from(order.len()).unwrap_or(u64::MAX))
-            .ok_or(NativeProjectPlanError::TransientByteSizeOverflow {
-                width: dimensions.width(),
-                height: dimensions.height(),
-                scenes: order.len(),
-            })?;
-        if transient_rgba16f_bytes > limits.max_transient_rgba16f_bytes {
-            return Err(NativeProjectPlanError::TransientBytesExceeded {
-                required: transient_rgba16f_bytes,
-                maximum: limits.max_transient_rgba16f_bytes,
-            });
-        }
-
         let mut next_source = 0_u64;
         let mut scenes = Vec::with_capacity(order.len());
         for scene_id in order {
@@ -401,6 +400,31 @@ impl NativeProjectPlan {
             });
         }
 
+        let peak_rgba16f_targets = maximum_native_execution_peak(&video_routes, &scenes)?;
+        let frame_bytes = u64::from(dimensions.width())
+            .checked_mul(u64::from(dimensions.height()))
+            .and_then(|pixels| pixels.checked_mul(RGBA16_FLOAT_BYTES_PER_PIXEL))
+            .ok_or(NativeProjectPlanError::TransientByteSizeOverflow {
+                width: dimensions.width(),
+                height: dimensions.height(),
+                targets: peak_rgba16f_targets,
+            })?;
+        let target_count = u64::try_from(peak_rgba16f_targets)
+            .map_err(|_| NativeProjectPlanError::TransientTargetCountOverflow)?;
+        let transient_rgba16f_bytes = frame_bytes.checked_mul(target_count).ok_or(
+            NativeProjectPlanError::TransientByteSizeOverflow {
+                width: dimensions.width(),
+                height: dimensions.height(),
+                targets: peak_rgba16f_targets,
+            },
+        )?;
+        if transient_rgba16f_bytes > limits.max_transient_rgba16f_bytes {
+            return Err(NativeProjectPlanError::TransientBytesExceeded {
+                required: transient_rgba16f_bytes,
+                maximum: limits.max_transient_rgba16f_bytes,
+            });
+        }
+
         let mut audio_routes = BTreeMap::new();
         for input in project.inputs() {
             let mut visiting = BTreeSet::new();
@@ -411,6 +435,7 @@ impl NativeProjectPlan {
             video_routes,
             audio_routes,
             scenes,
+            peak_rgba16f_targets,
             transient_rgba16f_bytes,
         })
     }
@@ -438,6 +463,12 @@ impl NativeProjectPlan {
             .sum()
     }
 
+    /// Maximum simultaneous scene, transition, and previous Program targets.
+    #[must_use]
+    pub const fn peak_rgba16f_targets(&self) -> usize {
+        self.peak_rgba16f_targets
+    }
+
     #[must_use]
     pub const fn transient_rgba16f_bytes(&self) -> u64 {
         self.transient_rgba16f_bytes
@@ -448,6 +479,85 @@ impl NativeProjectPlan {
             .iter()
             .filter_map(|(input, route)| (*route == NativeAudioRoute::Silence).then_some(*input))
     }
+
+    fn scene_execution(
+        &self,
+        primary: InputId,
+        secondary: InputId,
+    ) -> Option<NativeSceneExecution> {
+        scene_execution_for_routes(
+            self.video_routes.get(&primary).copied(),
+            self.video_routes.get(&secondary).copied(),
+            &self.scenes,
+        )
+    }
+}
+
+fn maximum_native_execution_peak(
+    routes: &BTreeMap<InputId, NativeVideoRoute>,
+    scenes: &[NativeScenePlan],
+) -> Result<usize, NativeProjectPlanError> {
+    let routes = routes.values().copied().collect::<Vec<_>>();
+    let mut maximum = 2_usize;
+    for primary in &routes {
+        for secondary in &routes {
+            let execution = scene_execution_for_routes(Some(*primary), Some(*secondary), scenes)
+                .ok_or(NativeProjectPlanError::TransientTargetCountOverflow)?;
+            maximum = maximum.max(native_execution_peak(&execution)?);
+        }
+    }
+    Ok(maximum)
+}
+
+fn scene_execution_for_routes(
+    primary: Option<NativeVideoRoute>,
+    secondary: Option<NativeVideoRoute>,
+    scenes: &[NativeScenePlan],
+) -> Option<NativeSceneExecution> {
+    let roots = [primary, secondary]
+        .into_iter()
+        .flatten()
+        .filter_map(|route| match route {
+            NativeVideoRoute::Scene(scene) => Some(scene),
+            NativeVideoRoute::Leaf(_) => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let mut required = roots.clone();
+    for scene in scenes.iter().rev() {
+        if required.contains(&scene.id) {
+            required.extend(scene.scene_dependencies());
+        }
+    }
+    let mut remaining_consumers = required
+        .iter()
+        .map(|scene| (*scene, 0_usize))
+        .collect::<BTreeMap<_, _>>();
+    for scene in scenes {
+        if !required.contains(&scene.id) {
+            continue;
+        }
+        for dependency in scene.scene_dependencies() {
+            let consumers = remaining_consumers.get_mut(&dependency)?;
+            *consumers = consumers.checked_add(1)?;
+        }
+    }
+    Some(NativeSceneExecution {
+        roots,
+        required,
+        remaining_consumers,
+    })
+}
+
+fn native_execution_peak(
+    execution: &NativeSceneExecution,
+) -> Result<usize, NativeProjectPlanError> {
+    // Queue submission does not prove dropped scene targets are reusable in-frame.
+    // Charge the full closure plus the transition and previous Program targets.
+    execution
+        .required
+        .len()
+        .checked_add(2)
+        .ok_or(NativeProjectPlanError::TransientTargetCountOverflow)
 }
 
 fn resolve_scene_source(
@@ -971,6 +1081,7 @@ pub enum NativeSourceRenderError {
     MissingTransitionKind,
     UnsupportedTransition(SwitcherTransitionKind),
     InvalidMix(TransitionError),
+    ResourceBounds,
     SceneCompositor(NativeCompositionError),
     Compositor(NativeTransitionError),
 }
@@ -996,6 +1107,9 @@ impl fmt::Display for NativeSourceRenderError {
                 write!(formatter, "native transition {kind:?} is not supported")
             }
             Self::InvalidMix(error) => write!(formatter, "program-frame mix is invalid: {error}"),
+            Self::ResourceBounds => {
+                formatter.write_str("native scene execution exceeded planned resource bounds")
+            }
             Self::SceneCompositor(error) => {
                 write!(formatter, "native scene composition failed: {error}")
             }
@@ -1013,6 +1127,7 @@ impl Error for NativeSourceRenderError {
             Self::MissingSource { .. }
             | Self::DimensionMismatch { .. }
             | Self::MissingTransitionKind
+            | Self::ResourceBounds
             | Self::UnsupportedTransition(_) => None,
         }
     }
@@ -3784,8 +3899,9 @@ impl NativeMediaRuntime {
             .map_err(NativeSourceRenderError::Compositor)
     }
 
-    /// Renders every reachable scene exactly once in dependency-first order,
-    /// then applies the authoritative Cut, Fade, or Wipe to the routed inputs.
+    /// Derives the active scene roots from the authoritative transition, renders
+    /// only their dependency closure once in dependency-first order, releases
+    /// non-root outputs after their last consumer, then applies Cut, Fade, or Wipe.
     ///
     /// # Errors
     ///
@@ -3796,8 +3912,15 @@ impl NativeMediaRuntime {
         project: &NativeProjectPlan,
         frame: &FrameResult,
     ) -> Result<NativeTexture, NativeSourceRenderError> {
+        let plan = native_mix_plan(frame.program)?;
+        let mut execution = project
+            .scene_execution(plan.primary, plan.secondary)
+            .ok_or(NativeSourceRenderError::ResourceBounds)?;
         let mut scene_outputs: BTreeMap<SceneId, (SourceId, NativeTexture)> = BTreeMap::new();
         for scene in &project.scenes {
+            if !execution.required.contains(&scene.id) {
+                continue;
+            }
             let sources = scene
                 .sources
                 .iter()
@@ -3823,10 +3946,27 @@ impl NativeMediaRuntime {
                 .render(&self.context, &scene.composition, &sources)
                 .await
                 .map_err(NativeSourceRenderError::SceneCompositor)?;
+            drop(sources);
             scene_outputs.insert(scene.id, (scene.output, output));
+            for dependency in scene.scene_dependencies() {
+                let consumers = execution
+                    .remaining_consumers
+                    .get_mut(&dependency)
+                    .ok_or(NativeSourceRenderError::ResourceBounds)?;
+                *consumers = consumers
+                    .checked_sub(1)
+                    .ok_or(NativeSourceRenderError::ResourceBounds)?;
+                if *consumers == 0 && !execution.roots.contains(&dependency) {
+                    scene_outputs.remove(&dependency);
+                }
+            }
         }
 
-        let plan = native_mix_plan(frame.program)?;
+        debug_assert!(
+            scene_outputs
+                .keys()
+                .all(|scene| execution.roots.contains(scene))
+        );
         let primary = project_texture(
             registry,
             project,
@@ -4319,6 +4459,13 @@ mod tests {
 
     #[test]
     fn native_project_plan_accepts_empty_scene_and_ignores_unreachable_scene() {
+        let mut leaf_only = native_plan_project(4, 2);
+        add_leaf(&mut leaf_only, input(9));
+        let leaf_plan =
+            NativeProjectPlan::compile(&leaf_only, NativeProjectLimits::default()).unwrap();
+        assert_eq!(leaf_plan.peak_rgba16f_targets(), 2);
+        assert_eq!(leaf_plan.transient_rgba16f_bytes(), 2 * 4 * 2 * 8);
+
         let mut project = native_plan_project(4, 2);
         add_scene_input(&mut project, input(1), scene(10), None);
         add_scene(&mut project, scene(10), Vec::new());
@@ -4328,7 +4475,8 @@ mod tests {
 
         assert_eq!(plan.scene_order().collect::<Vec<_>>(), vec![scene(10)]);
         assert_eq!(plan.active_layer_count(), 0);
-        assert_eq!(plan.transient_rgba16f_bytes(), 4 * 2 * 8);
+        assert_eq!(plan.peak_rgba16f_targets(), 3);
+        assert_eq!(plan.transient_rgba16f_bytes(), 3 * 4 * 2 * 8);
         assert_eq!(
             plan.video_route(input(1)),
             Some(NativeVideoRoute::Scene(scene(10)))
@@ -4368,6 +4516,27 @@ mod tests {
             vec![scene(10), scene(20), scene(30)]
         );
         assert_eq!(plan.active_layer_count(), 4);
+        assert_eq!(plan.peak_rgba16f_targets(), 5);
+        assert_eq!(plan.transient_rgba16f_bytes(), 5 * 4 * 2 * 8);
+        assert_eq!(
+            NativeProjectPlan::compile(
+                &project,
+                NativeProjectLimits {
+                    max_transient_rgba16f_bytes: 319,
+                    ..NativeProjectLimits::default()
+                }
+            ),
+            Err(NativeProjectPlanError::TransientBytesExceeded {
+                required: 320,
+                maximum: 319,
+            })
+        );
+        let primary_only = plan.scene_execution(input(2), input(2)).unwrap();
+        assert_eq!(
+            primary_only.required,
+            BTreeSet::from([scene(10), scene(20)])
+        );
+        assert!(!primary_only.required.contains(&scene(30)));
     }
 
     #[test]
@@ -4605,13 +4774,13 @@ mod tests {
             NativeProjectPlan::compile(
                 &bounded,
                 NativeProjectLimits {
-                    max_transient_rgba16f_bytes: 63,
+                    max_transient_rgba16f_bytes: 191,
                     ..NativeProjectLimits::default()
                 },
             ),
             Err(NativeProjectPlanError::TransientBytesExceeded {
-                required: 64,
-                maximum: 63,
+                required: 192,
+                maximum: 191,
             })
         );
     }
