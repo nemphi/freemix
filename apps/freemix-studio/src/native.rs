@@ -461,15 +461,11 @@ fn run_worker(
     // unsolicited broadcasts. Active waits below remain cancellable.
     loop {
         if !recovery.active()
-            && let Some(position) = recovery
-                .deferred_intents
-                .iter()
-                .position(|intent| intent_supported_by_session(runtime.session(), *intent))
+            && let Some(intent) = pop_supported_deferred_intent(
+                &mut recovery.deferred_intents,
+                session_supports_wipe(runtime.session()),
+            )
         {
-            let intent = recovery
-                .deferred_intents
-                .remove(position)
-                .expect("deferred intent position must remain valid");
             if !handle_worker_intent(
                 &mut runtime,
                 intent,
@@ -490,7 +486,10 @@ fn run_worker(
         match requests.recv_timeout(timeout) {
             Ok(WorkerRequest::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
             Ok(WorkerRequest::Intent(intent)) => {
-                if recovery.active() || !intent_supported_by_session(runtime.session(), intent) {
+                if recovery.active()
+                    || !recovery.deferred_intents.is_empty()
+                    || !intent_supported_by_session(runtime.session(), intent)
+                {
                     if !recovery.defer_intent(&mut runtime, intent, publisher) {
                         break;
                     }
@@ -1058,11 +1057,29 @@ const fn intent_payload(intent: StudioIntent) -> CommandPayload {
 }
 
 fn intent_supported_by_session(session: &fm_client::TcpSession, intent: StudioIntent) -> bool {
-    !matches!(intent, StudioIntent::Wipe { .. })
-        || session.client().session().is_some_and(|session| {
-            session.protocol.major == WIPE_PROTOCOL_VERSION.major
-                && session.protocol.minor >= WIPE_PROTOCOL_VERSION.minor
-        })
+    intent_supported(intent, session_supports_wipe(session))
+}
+
+fn session_supports_wipe(session: &fm_client::TcpSession) -> bool {
+    session.client().session().is_some_and(|session| {
+        session.protocol.major == WIPE_PROTOCOL_VERSION.major
+            && session.protocol.minor >= WIPE_PROTOCOL_VERSION.minor
+    })
+}
+
+const fn intent_supported(intent: StudioIntent, supports_wipe: bool) -> bool {
+    !matches!(intent, StudioIntent::Wipe { .. }) || supports_wipe
+}
+
+fn pop_supported_deferred_intent(
+    deferred: &mut VecDeque<StudioIntent>,
+    supports_wipe: bool,
+) -> Option<StudioIntent> {
+    deferred
+        .front()
+        .copied()
+        .filter(|intent| intent_supported(*intent, supports_wipe))?;
+    deferred.pop_front()
 }
 
 const fn lifecycle_status(lifecycle: LifecycleState) -> StudioConnectionStatus {
@@ -1133,18 +1150,15 @@ fn publish_deferred_runtime(
 ) -> bool {
     let mut state = runtime_state(runtime, error);
     let incompatible_wipe = deferred
-        .iter()
-        .any(|intent| !intent_supported_by_session(runtime.session(), *intent));
+        .front()
+        .is_some_and(|intent| !intent_supported_by_session(runtime.session(), *intent));
     state.notice = Some(if incompatible_wipe {
         format!(
-            "Queued {} command(s); pending Wipe requires protocol {WIPE_PROTOCOL_VERSION}",
+            "Blocked {} command(s) in operator FIFO; head Wipe requires protocol {WIPE_PROTOCOL_VERSION}",
             deferred.len()
         )
     } else {
-        format!(
-            "Queued {} command(s) until Studio reconnects",
-            deferred.len()
-        )
+        format!("Queued {} command(s) in operator FIFO", deferred.len())
     });
     publisher.publish(state)
 }
@@ -1339,6 +1353,40 @@ mod tests {
         assert!(
             recovery.error().is_some(),
             "success erased overflow rejection"
+        );
+    }
+
+    #[test]
+    fn unsupported_head_wipe_blocks_preview_until_fifo_can_resume() {
+        let preview = StudioIntent::SelectPreview(InputId::new(NonZeroU128::new(9).unwrap()));
+        let wipe = StudioIntent::Wipe {
+            duration_frames: 60,
+        };
+        let fade = StudioIntent::Fade {
+            duration_frames: 30,
+        };
+        let mut deferred = VecDeque::from([wipe, preview, StudioIntent::Cut, fade]);
+
+        assert_eq!(pop_supported_deferred_intent(&mut deferred, false), None);
+        assert_eq!(
+            deferred,
+            VecDeque::from([wipe, preview, StudioIntent::Cut, fade])
+        );
+        assert_eq!(
+            pop_supported_deferred_intent(&mut deferred, true),
+            Some(wipe)
+        );
+        assert_eq!(
+            pop_supported_deferred_intent(&mut deferred, true),
+            Some(preview)
+        );
+        assert_eq!(
+            pop_supported_deferred_intent(&mut deferred, true),
+            Some(StudioIntent::Cut)
+        );
+        assert_eq!(
+            pop_supported_deferred_intent(&mut deferred, true),
+            Some(fade)
         );
     }
 
@@ -1742,6 +1790,45 @@ mod tests {
                 domain: "switcher".to_owned(),
             },
         }));
+
+        serve_deferred_preview(&mut compatible);
+    }
+
+    fn serve_deferred_preview(peer: &mut FakePeer) {
+        let WireMessage::Command(preview) = peer.receive() else {
+            panic!("expected Preview after deferred Wipe");
+        };
+        assert_eq!(
+            preview.payload,
+            CommandPayload::SelectPreview {
+                input: wire_input(2)
+            }
+        );
+        assert_eq!(preview.expected_revision, Some(6));
+        peer.send(&WireMessage::CommandResult(CommandResult::Accepted {
+            id: preview.id,
+            revision: 7,
+            scheduled_frame: None,
+        }));
+        peer.send(&WireMessage::Event(EventMessage {
+            cursor: EventCursor {
+                engine: test_engine(),
+                revision: 7,
+            },
+            payload: EventPayload::DesiredSwitcher {
+                program: wire_input(3),
+                preview: wire_input(2),
+            },
+        }));
+        peer.send(&WireMessage::RuntimeEvent(RuntimeEventMessage {
+            server: test_server(),
+            revision: 7,
+            generation: 1,
+            sequence: 2,
+            event: RuntimeLifecycleEvent::Realized {
+                domain: "switcher".to_owned(),
+            },
+        }));
     }
 
     fn serve_worker_reconnect_snapshot_and_deferred(listener: &TcpListener) {
@@ -1958,17 +2045,23 @@ mod tests {
                     }),
                 )
                 .unwrap();
+                try_enqueue(
+                    &requests,
+                    WorkerRequest::Intent(StudioIntent::SelectPreview(wire_input(2).to_domain())),
+                )
+                .unwrap();
                 deferred = true;
             }
-            saw_pending_notice |= state
-                .notice
-                .as_deref()
-                .is_some_and(|notice| notice.contains("pending Wipe requires protocol 1.3"));
+            saw_pending_notice |= state.notice.as_deref().is_some_and(|notice| {
+                notice.contains("Blocked 2 command(s) in operator FIFO")
+                    && notice.contains("head Wipe requires protocol 1.3")
+            });
             if deferred
                 && state.pending_commands == 0
                 && state.view.as_ref().is_some_and(|view| {
-                    view.cursor.revision.get() == 6
+                    view.cursor.revision.get() == 7
                         && view.switcher.realized.program == wire_input(3).to_domain()
+                        && view.switcher.realized.preview == wire_input(2).to_domain()
                 })
             {
                 assert!(state.supports_wipe);

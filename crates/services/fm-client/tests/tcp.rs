@@ -386,7 +386,7 @@ fn unresolved_command_retries_original_envelope_but_completed_result_does_not() 
 }
 
 #[test]
-fn unresolved_wipe_is_pending_incompatible_until_a_compatible_reconnect() {
+fn unresolved_wipe_backoff_grows_and_caps_until_a_compatible_reconnect() {
     let (original_tx, original_rx) = mpsc::channel();
     let (address, server_thread) = spawn_server(move |listener| {
         let mut first = Peer::accept(&listener);
@@ -398,13 +398,15 @@ fn unresolved_wipe_is_pending_incompatible_until_a_compatible_reconnect() {
         original_tx.send(original.clone()).unwrap();
         drop(first);
 
-        let mut downgraded = Peer::accept(&listener);
-        accept_resume_version(&mut downgraded, ProtocolVersion::new(1, 2), 4);
-        assert_eq!(
-            downgraded.stream.read(&mut [0_u8; 1]).unwrap(),
-            0,
-            "Wipe was retransmitted to a protocol 1.2 peer"
-        );
+        for _ in 0..3 {
+            let mut downgraded = Peer::accept(&listener);
+            accept_resume_version(&mut downgraded, ProtocolVersion::new(1, 2), 4);
+            assert_eq!(
+                downgraded.stream.read(&mut [0_u8; 1]).unwrap(),
+                0,
+                "Wipe was retransmitted to a protocol 1.2 peer"
+            );
+        }
 
         let mut compatible = Peer::accept(&listener);
         accept_resume_version(&mut compatible, WIPE_PROTOCOL_VERSION, 4);
@@ -435,19 +437,23 @@ fn unresolved_wipe_is_pending_incompatible_until_a_compatible_reconnect() {
     assert_eq!(original_rx.recv().unwrap(), command);
     assert!(matches!(
         session.receive().unwrap(),
-        SessionEvent::Disconnected { .. }
+        SessionEvent::Disconnected { backoff, .. }
+            if backoff == fm_client::ReconnectBackoff { attempt: 1, delay_ms: 10 }
     ));
-    assert!(matches!(
-        session.connect(address, CONNECT_TIMEOUT),
-        Err(TcpSessionError::PendingCommandIncompatible {
-            ref command_id,
-            negotiated,
-            required,
-            ..
-        }) if command_id == &command.id
-            && negotiated == ProtocolVersion::new(1, 2)
-            && required == WIPE_PROTOCOL_VERSION
-    ));
+    for (attempt, delay_ms) in [(2, 20), (3, 40), (4, 40)] {
+        assert!(matches!(
+            session.connect(address, CONNECT_TIMEOUT),
+            Err(TcpSessionError::PendingCommandIncompatible {
+                ref command_id,
+                negotiated,
+                required,
+                backoff,
+            }) if command_id == &command.id
+                && negotiated == ProtocolVersion::new(1, 2)
+                && required == WIPE_PROTOCOL_VERSION
+                && backoff == fm_client::ReconnectBackoff { attempt, delay_ms }
+        ));
+    }
     assert!(matches!(
         session.client().state(),
         ConnectionState::PendingIncompatible { command_id, .. } if command_id == &command.id
@@ -466,6 +472,7 @@ fn unresolved_wipe_is_pending_incompatible_until_a_compatible_reconnect() {
             ..
         }
     ));
+    assert_eq!(session.disconnect().unwrap().attempt, 1);
     server_thread.join().unwrap();
 }
 

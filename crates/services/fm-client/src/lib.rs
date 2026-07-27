@@ -996,7 +996,10 @@ impl Client {
 
     fn finish_sync(&mut self) {
         self.state = ConnectionState::Ready;
-        self.reconnect_attempt = 0;
+        // Synchronizing is not recovery while an uncertain command cannot be retried.
+        if self.unresolved_incompatible_command().is_none() {
+            self.reconnect_attempt = 0;
+        }
         self.force_snapshot = false;
     }
 
