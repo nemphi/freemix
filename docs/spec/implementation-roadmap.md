@@ -135,24 +135,26 @@ estimator.
 
 Opt-in native daemon mode still maintains bounded CPU audio rings on a decode
 worker, allocates Master intervals directly from absolute engine frame numbers,
-follows the authoritative `ProgramFrame`, and writes a bounded fake sink. Fade
-crossfades both sources with sample-linear gains derived from the explicit mix
-start and end endpoints of each audio interval. Automatic Fade and held or
-reversed Fade T-bar movement propagate those exact endpoints; this T-bar
-propagation is internal switcher/engine-tick behavior and is not exposed by
-`EngineCommand`, the protocol, or the UI. Identical source IDs collapse to one
-unity-gain source instead of being mixed twice. This existing local path still
-requires audio to exactly match the project sample rate/layout and its first
-timestamp to align with the selected video's first timestamp; it performs no
-resampling or implicit mapping. Missing audio, stills, and configured simulated
-silence produce silence, while unsupported simulated sine audio is rejected.
-This remains a diagnostic/reference path: it allocates while mixing, waits for
-all preflighted sources, and has no OS audio device, bus/output routing,
-persisted strip controls, drift correction, or externally delivered audio. Only
-Cut/Fade audio policy is realized. Later FFmpeg pages still rescan and trim from
-the beginning, so deep playback becomes progressively more expensive and can
-fail transactionally at fixed metadata-output or subprocess-timeout bounds.
-Item 7 and the related parity rows therefore remain incomplete.
+follows the authoritative `ProgramFrame`, and writes a bounded fake sink. Cut
+keeps one source at unity; Fade and Wipe currently both crossfade two sources
+with sample-linear gains derived from the explicit mix start and end endpoints
+of each audio interval. Automatic Fade and held or reversed Fade T-bar movement
+propagate those exact endpoints; this T-bar propagation is internal
+switcher/engine-tick behavior and is not exposed by `EngineCommand`, the
+protocol, or the UI. Identical source IDs collapse to one unity-gain source
+instead of being mixed twice. This existing local path still requires audio to
+exactly match the project sample rate/layout and its first timestamp to align
+with the selected video's first timestamp; it performs no resampling or implicit
+mapping. Missing audio, stills, and configured simulated silence produce
+silence, while unsupported simulated sine audio is rejected. This remains a
+diagnostic/reference path: it allocates while mixing, waits for all preflighted
+sources, and has no OS audio device, bus/output routing, persisted strip
+controls, drift correction, or externally delivered audio. Dedicated Wipe audio
+policy testing is absent, and broader transition audio policies remain
+incomplete. Later FFmpeg pages still rescan and trim from the beginning, so deep
+playback becomes progressively more expensive and can fail transactionally at
+fixed metadata-output or subprocess-timeout bounds. Item 7 and the related
+parity rows therefore remain incomplete.
 
 Current implementation boundary for item 8: `fm-gpu` provides a portable,
 bounded latest-frame presentation policy plus opaque, context-bound native
@@ -375,9 +377,12 @@ runtime helper exits enter bounded retry with capped backoff; exhausted attempts
 enter a bounded rearm wait and retry again. Every attempt retains the exact
 source identity, clock, and mode. A one-frame latest slot reports replacement
 pressure and carries a pending discontinuity onto its replacement, so a dropped
-first recovery frame cannot hide the handoff. Malformed framing, timestamps, or
-other media contracts are fatal rather than retried. Daemon shutdown requests
-cancellation for all workers before waiting against one aggregate deadline.
+first recovery frame cannot hide the handoff. Malformed framing and other media
+contract failures are fatal rather than retried. During recovery, continuity
+timestamp regressions are instead rejected, counted, and skipped while Hold
+continues; if no valid frame arrives before the first-frame deadline, timeout
+returns to daemon retry. Daemon shutdown requests cancellation for all workers
+before waiting against one aggregate deadline.
 
 `FREEMIXD_TELEMETRY` v3 and `FREEMIXD_CAMERA_SOURCE` v1 now include recovery
 attempt/success/exhaustion/failure state, adapter queue and ready-delivery state,
@@ -394,12 +399,13 @@ while rendering/checkpointing continues, retry exhaustion and rearm, generic
 runtime exit recovery, fatal malformed contracts without restart, one recovering
 camera alongside one uninterrupted camera, aggregate multi-camera startup
 cleanup and shutdown cancellation, frame conservation, and helper reaping. The
-required Metal process run still covers all six supported camera
-primary/transfer combinations, validated BGRA-to-RGBA swizzle, source timing,
-checkpointing, and cleanup.
-Protocol and capture-node tests cover the same metadata boundaries, schema-v4
-persistence round-trips Display-P3/BT.709, and native Metal readback compares all
-three primaries across sRGB, BT.709, and BT.1886 against CPU oracles.
+hermetic daemon process exercises generated camera metadata plus selected GPU
+ingest, frame conservation, source timing, checkpointing, and cleanup. Separate
+protocol and capture-node tests cover metadata boundaries, and schema-v4
+persistence round-trips Display-P3/BT.709. Separate native Metal readback tests
+compare color conversions across supported primary/transfer combinations
+against CPU oracles; this does not claim that every combination traverses and
+is pixel-validated through the full daemon path.
 
 Portable protocol/lifecycle and capture-node process tests pass; required local
 D2 discovery enumerated two real macOS camera endpoints with 252 and 126 bounded
