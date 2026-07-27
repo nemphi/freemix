@@ -98,9 +98,27 @@ impl StudioRuntime {
     ///
     /// Returns an error for daemon startup/readiness or invalid client configuration.
     pub fn new(config: StudioConfig) -> Result<Self, StudioError> {
+        Self::new_cancellable(config, Duration::from_millis(50), || false)
+    }
+
+    /// Creates a disconnected runtime with cancellable supervised readiness.
+    ///
+    /// # Errors
+    ///
+    /// Returns startup, readiness, cancellation, or client configuration errors.
+    pub fn new_cancellable(
+        config: StudioConfig,
+        poll_interval: Duration,
+        cancelled: impl FnMut() -> bool,
+    ) -> Result<Self, StudioError> {
         let (supervisor, address, project_id) = match config.connection {
             ConnectionConfig::Supervised(supervised) => {
-                let supervisor = DaemonSupervisor::launch(supervised, config.restart_policy)?;
+                let supervisor = DaemonSupervisor::launch_cancellable(
+                    supervised,
+                    config.restart_policy,
+                    poll_interval,
+                    cancelled,
+                )?;
                 let readiness = supervisor
                     .readiness()
                     .ok_or(StudioError::Supervisor(SupervisorError::MissingReadiness))?;
@@ -246,7 +264,7 @@ impl StudioRuntime {
         elapsed_backoff: Duration,
         connect_timeout: Duration,
         poll_interval: Duration,
-        cancelled: impl FnMut() -> bool,
+        mut cancelled: impl FnMut() -> bool,
     ) -> Result<SessionEvent, StudioError> {
         if let Some(backoff) = self.session.reconnect_backoff() {
             let required = Duration::from_millis(backoff.delay_ms);
@@ -260,7 +278,9 @@ impl StudioRuntime {
         if let Some(supervisor) = &mut self.supervisor
             && matches!(supervisor.poll()?, SupervisorState::Exited { .. })
         {
-            self.address = supervisor.restart()?.address;
+            self.address = supervisor
+                .restart_cancellable(poll_interval, &mut cancelled)?
+                .address;
         }
         self.connect_cancellable(connect_timeout, poll_interval, cancelled)
     }

@@ -77,6 +77,49 @@ impl TcpConnection {
         connect_timeout: Duration,
     ) -> Result<Self, TcpConnectionError> {
         let reader = TcpStream::connect_timeout(&address, connect_timeout)?;
+        Self::from_stream(reader)
+    }
+
+    fn connect_cancellable(
+        address: SocketAddr,
+        connect_timeout: Duration,
+        poll_interval: Duration,
+        cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<Option<Self>, TcpConnectionError> {
+        let deadline = Instant::now().checked_add(connect_timeout).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "TCP connect timeout is too large",
+            )
+        })?;
+        loop {
+            if cancelled() {
+                return Ok(None);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(
+                    io::Error::new(io::ErrorKind::TimedOut, "TCP connect timed out").into(),
+                );
+            }
+            let attempt_timeout = if poll_interval.is_zero() {
+                remaining
+            } else {
+                remaining.min(poll_interval)
+            };
+            match TcpStream::connect_timeout(&address, attempt_timeout) {
+                Ok(reader) => return Self::from_stream(reader).map(Some),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                    ) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
+    fn from_stream(reader: TcpStream) -> Result<Self, TcpConnectionError> {
         reader.set_nodelay(true)?;
         let writer = reader.try_clone()?;
         Ok(Self {
@@ -368,7 +411,10 @@ impl TcpSession {
         address: SocketAddr,
         connect_timeout: Duration,
     ) -> Result<SessionEvent, TcpSessionError> {
-        self.connect_with(address, connect_timeout, Self::read_wire)
+        self.prepare_connect()?;
+        let connection =
+            self.connection_result(TcpConnection::connect(address, connect_timeout))?;
+        self.finish_connect(connection, Self::read_wire)
     }
 
     /// Connects and synchronizes while polling for caller-requested cancellation.
@@ -386,28 +432,47 @@ impl TcpSession {
         poll_interval: Duration,
         mut cancelled: impl FnMut() -> bool,
     ) -> Result<SessionEvent, TcpSessionError> {
-        self.connect_with(address, connect_timeout, |session| {
+        self.prepare_connect()?;
+        let connection = TcpConnection::connect_cancellable(
+            address,
+            connect_timeout,
+            poll_interval,
+            &mut cancelled,
+        );
+        let Some(connection) = self.connection_result(connection)? else {
+            return Err(self.cancelled());
+        };
+        self.finish_connect(connection, |session| {
             session.read_wire_cancellable(poll_interval, &mut cancelled)
         })
     }
 
-    fn connect_with(
-        &mut self,
-        address: SocketAddr,
-        connect_timeout: Duration,
-        mut read: impl FnMut(&mut Self) -> Result<Option<WireMessage>, TcpSessionError>,
-    ) -> Result<SessionEvent, TcpSessionError> {
+    fn prepare_connect(&mut self) -> Result<(), TcpSessionError> {
         if self.connection.is_some() {
             return Err(TcpSessionError::AlreadyConnected);
         }
         self.client.start_connect()?;
-        let connection = match TcpConnection::connect(address, connect_timeout) {
-            Ok(connection) => connection,
+        Ok(())
+    }
+
+    fn connection_result<T>(
+        &mut self,
+        result: Result<T, TcpConnectionError>,
+    ) -> Result<T, TcpSessionError> {
+        match result {
+            Ok(connection) => Ok(connection),
             Err(TcpConnectionError::Io(error)) => {
-                return Err(self.disconnected(DisconnectCause::Io(error.kind())));
+                Err(self.disconnected(DisconnectCause::Io(error.kind())))
             }
-            Err(TcpConnectionError::Codec(error)) => return Err(TcpSessionError::Codec(error)),
-        };
+            Err(TcpConnectionError::Codec(error)) => Err(TcpSessionError::Codec(error)),
+        }
+    }
+
+    fn finish_connect(
+        &mut self,
+        connection: TcpConnection,
+        mut read: impl FnMut(&mut Self) -> Result<Option<WireMessage>, TcpSessionError>,
+    ) -> Result<SessionEvent, TcpSessionError> {
         self.connection = Some(connection);
 
         let request = self.client.transport_connected()?;
@@ -559,19 +624,15 @@ impl TcpSession {
 
         match message {
             WireMessage::Event(event) => {
-                let intake = self.client.intake(WireMessage::Event(event.clone()))?;
+                let intake = self.intake(WireMessage::Event(event.clone()))?;
                 Ok(SessionEvent::Event { event, intake })
             }
             WireMessage::RuntimeEvent(event) => {
-                let intake = self
-                    .client
-                    .intake(WireMessage::RuntimeEvent(event.clone()))?;
+                let intake = self.intake(WireMessage::RuntimeEvent(event.clone()))?;
                 Ok(SessionEvent::RuntimeEvent { event, intake })
             }
             WireMessage::CommandResult(result) => {
-                let intake = self
-                    .client
-                    .intake(WireMessage::CommandResult(result.clone()))?;
+                let intake = self.intake(WireMessage::CommandResult(result.clone()))?;
                 let id = result_id(&result);
                 self.sent_commands.retain(|sent| sent != id);
                 Ok(SessionEvent::CommandResult { result, intake })
@@ -681,8 +742,7 @@ impl TcpSession {
     ) -> Result<Option<WireMessage>, TcpSessionError> {
         loop {
             if cancelled() {
-                let backoff = self.transition_disconnect();
-                return Err(TcpSessionError::Cancelled { backoff });
+                return Err(self.cancelled());
             }
             let result = self
                 .connection
@@ -706,6 +766,20 @@ impl TcpSession {
                 }
             }
         }
+    }
+
+    fn intake(&mut self, message: WireMessage) -> Result<Intake, TcpSessionError> {
+        self.client.intake(message).map_err(|error| {
+            if matches!(error, ClientError::ResyncRequired { .. }) {
+                self.transition_disconnect();
+            }
+            TcpSessionError::Client(error)
+        })
+    }
+
+    fn cancelled(&mut self) -> TcpSessionError {
+        let backoff = self.transition_disconnect();
+        TcpSessionError::Cancelled { backoff }
     }
 
     fn disconnected(&mut self, cause: DisconnectCause) -> TcpSessionError {

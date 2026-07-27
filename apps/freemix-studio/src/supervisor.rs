@@ -6,6 +6,8 @@ use std::{
     num::NonZeroU128,
     process::{Child, ChildStdout, Command, ExitStatus, Stdio},
     str::FromStr,
+    thread::{self, JoinHandle},
+    time::Duration,
 };
 
 use fm_types::ProjectId;
@@ -14,6 +16,7 @@ use crate::SupervisedConfig;
 
 const READY_PREFIX: &str = "FREEMIXD_READY";
 const READY_VERSION: u8 = 1;
+const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RestartPolicy {
@@ -97,6 +100,7 @@ pub enum SupervisorError {
     Spawn(io::Error),
     MissingStdout,
     MissingReadiness,
+    ReadinessCancelled,
     ReadinessIo(io::Error),
     InvalidReadiness(ReadinessParseError),
     ExitedBeforeReady {
@@ -125,6 +129,7 @@ impl fmt::Display for SupervisorError {
             Self::MissingReadiness => {
                 formatter.write_str("freemixd supervisor has no readiness record")
             }
+            Self::ReadinessCancelled => formatter.write_str("freemixd readiness wait cancelled"),
             Self::ReadinessIo(error) => {
                 write!(formatter, "failed to read freemixd readiness: {error}")
             }
@@ -183,6 +188,22 @@ impl DaemonSupervisor {
         config: SupervisedConfig,
         restart_policy: RestartPolicy,
     ) -> Result<Self, SupervisorError> {
+        Self::launch_cancellable(config, restart_policy, READINESS_POLL_INTERVAL, || false)
+    }
+
+    /// Launches freemixd and polls its readiness wait for cancellation.
+    /// Cancellation terminates and reaps the child before returning.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SupervisorError::ReadinessCancelled`] when `cancelled`
+    /// returns `true`, in addition to the errors from [`Self::launch`].
+    pub fn launch_cancellable(
+        config: SupervisedConfig,
+        restart_policy: RestartPolicy,
+        poll_interval: Duration,
+        mut cancelled: impl FnMut() -> bool,
+    ) -> Result<Self, SupervisorError> {
         if !config.listen.ip().is_loopback() {
             return Err(SupervisorError::NonLoopbackConfigured(config.listen));
         }
@@ -195,7 +216,7 @@ impl DaemonSupervisor {
             restarts: 0,
             state: SupervisorState::Launching,
         };
-        supervisor.spawn()?;
+        supervisor.spawn_cancellable(poll_interval, &mut cancelled)?;
         Ok(supervisor)
     }
 
@@ -260,6 +281,19 @@ impl DaemonSupervisor {
     ///
     /// Returns an error after the configured restart budget or on process/readiness failure.
     pub fn restart(&mut self) -> Result<ReadinessRecord, SupervisorError> {
+        self.restart_cancellable(READINESS_POLL_INTERVAL, || false)
+    }
+
+    /// Terminates the current child and performs one restart with cancellable readiness.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::restart`], including readiness cancellation.
+    pub fn restart_cancellable(
+        &mut self,
+        poll_interval: Duration,
+        mut cancelled: impl FnMut() -> bool,
+    ) -> Result<ReadinessRecord, SupervisorError> {
         if self.restarts >= self.restart_policy.maximum_restarts {
             self.terminate_and_reap()?;
             self.state = SupervisorState::RestartLimitReached;
@@ -269,7 +303,7 @@ impl DaemonSupervisor {
         }
         self.terminate_and_reap()?;
         self.restarts += 1;
-        self.spawn()
+        self.spawn_cancellable(poll_interval, &mut cancelled)
             .inspect_err(|_| self.state = SupervisorState::Failed)
     }
 
@@ -284,8 +318,15 @@ impl DaemonSupervisor {
         Ok(())
     }
 
-    fn spawn(&mut self) -> Result<ReadinessRecord, SupervisorError> {
+    fn spawn_cancellable(
+        &mut self,
+        poll_interval: Duration,
+        cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<ReadinessRecord, SupervisorError> {
         self.state = SupervisorState::Launching;
+        if cancelled() {
+            return Err(SupervisorError::ReadinessCancelled);
+        }
         let mut child = Command::new(&self.config.daemon_executable)
             .arg("serve")
             .arg(&self.config.project_bundle)
@@ -299,18 +340,59 @@ impl DaemonSupervisor {
             reap_local_child(&mut child);
             return Err(SupervisorError::MissingStdout);
         };
-        let mut stdout = BufReader::new(stdout);
-        let mut line = String::new();
-        let bytes = match stdout.read_line(&mut line) {
-            Ok(bytes) => bytes,
+        let reader = match spawn_readiness_reader(stdout) {
+            Ok(reader) => reader,
             Err(error) => {
                 reap_local_child(&mut child);
                 return Err(SupervisorError::ReadinessIo(error));
             }
         };
+        while !reader.is_finished() {
+            if cancelled() {
+                reap_local_child(&mut child);
+                drop(join_readiness_reader(reader)?);
+                return Err(SupervisorError::ReadinessCancelled);
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    drop(join_readiness_reader(reader)?);
+                    return Err(SupervisorError::ExitedBeforeReady { status });
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    reap_local_child(&mut child);
+                    drop(join_readiness_reader(reader)?);
+                    return Err(SupervisorError::Process(error));
+                }
+            }
+            thread::sleep(poll_interval);
+        }
+        let read = match join_readiness_reader(reader) {
+            Ok(read) => read,
+            Err(error) => {
+                reap_local_child(&mut child);
+                return Err(error);
+            }
+        };
+        let (stdout, line, bytes) = match read {
+            (stdout, line, Ok(bytes)) => (stdout, line, bytes),
+            (_, _, Err(error)) => {
+                reap_local_child(&mut child);
+                return Err(SupervisorError::ReadinessIo(error));
+            }
+        };
         if bytes == 0 {
-            let status = child.wait().map_err(SupervisorError::Process)?;
-            return Err(SupervisorError::ExitedBeforeReady { status });
+            return match child.try_wait() {
+                Ok(Some(status)) => Err(SupervisorError::ExitedBeforeReady { status }),
+                Ok(None) => {
+                    reap_local_child(&mut child);
+                    Err(SupervisorError::MissingReadiness)
+                }
+                Err(error) => {
+                    reap_local_child(&mut child);
+                    Err(SupervisorError::Process(error))
+                }
+            };
         }
         let readiness = match line.parse::<ReadinessRecord>() {
             Ok(readiness) => readiness,
@@ -355,6 +437,27 @@ impl DaemonSupervisor {
         }
         Ok(())
     }
+}
+
+type ReadinessReader = JoinHandle<(BufReader<ChildStdout>, String, io::Result<usize>)>;
+
+fn spawn_readiness_reader(stdout: ChildStdout) -> io::Result<ReadinessReader> {
+    thread::Builder::new()
+        .name("freemixd-readiness".to_owned())
+        .spawn(move || {
+            let mut stdout = BufReader::new(stdout);
+            let mut line = String::new();
+            let result = stdout.read_line(&mut line);
+            (stdout, line, result)
+        })
+}
+
+fn join_readiness_reader(
+    reader: ReadinessReader,
+) -> Result<(BufReader<ChildStdout>, String, io::Result<usize>), SupervisorError> {
+    reader.join().map_err(|_| {
+        SupervisorError::ReadinessIo(io::Error::other("freemixd readiness reader panicked"))
+    })
 }
 
 impl Drop for DaemonSupervisor {

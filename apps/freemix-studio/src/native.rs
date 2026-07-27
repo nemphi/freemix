@@ -83,8 +83,8 @@ fn try_enqueue(
 struct StudioApp {
     shell: StudioShell,
     state: StudioUiState,
-    requests: SyncSender<WorkerRequest>,
-    updates: Receiver<StudioUiState>,
+    requests: Option<SyncSender<WorkerRequest>>,
+    updates: Option<Receiver<StudioUiState>>,
     worker: Option<JoinHandle<()>>,
     shutdown_sent: bool,
 }
@@ -109,8 +109,8 @@ impl StudioApp {
         Ok(Self {
             shell: StudioShell::default(),
             state: StudioUiState::new(StudioConnectionStatus::Launching),
-            requests: request_sender,
-            updates: state_receiver,
+            requests: Some(request_sender),
+            updates: Some(state_receiver),
             worker: Some(worker),
             shutdown_sent: false,
         })
@@ -122,7 +122,9 @@ impl StudioApp {
 
     fn send_shutdown(&mut self) {
         if !self.shutdown_sent {
-            let _ = try_enqueue(&self.requests, WorkerRequest::Shutdown);
+            if let Some(requests) = &self.requests {
+                let _ = try_enqueue(requests, WorkerRequest::Shutdown);
+            }
             self.shutdown_sent = true;
         }
     }
@@ -130,14 +132,18 @@ impl StudioApp {
 
 impl eframe::App for StudioApp {
     fn logic(&mut self, _context: &egui::Context, _frame: &mut eframe::Frame) {
-        while let Ok(state) = self.updates.try_recv() {
-            self.state = state;
+        if let Some(updates) = &self.updates {
+            while let Ok(state) = updates.try_recv() {
+                self.state = state;
+            }
         }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         for intent in self.shell.draw(ui, &self.state) {
-            if let Err(error) = try_enqueue(&self.requests, WorkerRequest::Intent(intent)) {
+            if let Some(requests) = &self.requests
+                && let Err(error) = try_enqueue(requests, WorkerRequest::Intent(intent))
+            {
                 self.report_enqueue_error(error);
             }
         }
@@ -151,8 +157,11 @@ impl eframe::App for StudioApp {
 impl Drop for StudioApp {
     fn drop(&mut self) {
         self.send_shutdown();
-        // Dropping the handle detaches: the render thread never waits on socket work.
-        self.worker.take();
+        self.requests.take();
+        self.updates.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -253,6 +262,7 @@ struct WorkerRecovery {
     reconnect_wait: Option<ReconnectWait>,
     visible_error: Option<String>,
     realization_uncertain: bool,
+    deferred_rejections: usize,
 }
 
 impl WorkerRecovery {
@@ -263,6 +273,7 @@ impl WorkerRecovery {
             reconnect_wait,
             visible_error,
             realization_uncertain: false,
+            deferred_rejections: 0,
         }
     }
 
@@ -283,17 +294,35 @@ impl WorkerRecovery {
         self.deferred_intents.push_back(intent);
         publish_deferred_runtime(runtime, publisher, self.deferred_intents.len())
     }
+
+    fn report_deferred_rejections(&mut self) {
+        if self.deferred_rejections == 0 {
+            return;
+        }
+        let rejected = self.deferred_rejections;
+        self.deferred_rejections = 0;
+        let message = format!(
+            "Rejected {rejected} command(s): Studio deferred command queue reached capacity {DEFERRED_INTENT_CAPACITY}"
+        );
+        self.visible_error = Some(match self.visible_error.take() {
+            Some(existing) => format!("{existing}; {message}"),
+            None => message,
+        });
+    }
 }
 
 fn cancellation_requested(
     requests: &Receiver<WorkerRequest>,
     deferred_intents: &mut VecDeque<StudioIntent>,
+    deferred_rejections: &mut usize,
 ) -> bool {
     match requests.try_recv() {
         Ok(WorkerRequest::Shutdown) | Err(TryRecvError::Disconnected) => true,
         Ok(WorkerRequest::Intent(intent)) => {
             if deferred_intents.len() < DEFERRED_INTENT_CAPACITY {
                 deferred_intents.push_back(intent);
+            } else {
+                *deferred_rejections = deferred_rejections.saturating_add(1);
             }
             false
         }
@@ -305,11 +334,12 @@ fn connect_worker(
     runtime: &mut StudioRuntime,
     requests: &Receiver<WorkerRequest>,
     deferred_intents: &mut VecDeque<StudioIntent>,
+    deferred_rejections: &mut usize,
 ) -> Option<Result<SessionEvent, crate::StudioError>> {
     let started = Instant::now();
     let mut shutdown = false;
     let result = runtime.connect_cancellable(CONNECT_TIMEOUT, IO_POLL_INTERVAL, || {
-        shutdown = cancellation_requested(requests, deferred_intents);
+        shutdown = cancellation_requested(requests, deferred_intents, deferred_rejections);
         shutdown || started.elapsed() >= PEER_WAIT_TIMEOUT
     });
     (!shutdown).then_some(result)
@@ -320,15 +350,95 @@ fn reconnect_worker(
     elapsed_backoff: Duration,
     requests: &Receiver<WorkerRequest>,
     deferred_intents: &mut VecDeque<StudioIntent>,
+    deferred_rejections: &mut usize,
 ) -> Option<Result<SessionEvent, crate::StudioError>> {
     let started = Instant::now();
     let mut shutdown = false;
     let result =
         runtime.reconnect_cancellable(elapsed_backoff, CONNECT_TIMEOUT, IO_POLL_INTERVAL, || {
-            shutdown = cancellation_requested(requests, deferred_intents);
+            shutdown = cancellation_requested(requests, deferred_intents, deferred_rejections);
             shutdown || started.elapsed() >= PEER_WAIT_TIMEOUT
         });
     (!shutdown).then_some(result)
+}
+
+fn start_worker_runtime(
+    config: StudioConfig,
+    requests: &Receiver<WorkerRequest>,
+    deferred_intents: &mut VecDeque<StudioIntent>,
+    deferred_rejections: &mut usize,
+) -> Option<Result<StudioRuntime, crate::StudioError>> {
+    let started = Instant::now();
+    let mut shutdown = false;
+    let result = StudioRuntime::new_cancellable(config, IO_POLL_INTERVAL, || {
+        shutdown = cancellation_requested(requests, deferred_intents, deferred_rejections);
+        shutdown || started.elapsed() >= PEER_WAIT_TIMEOUT
+    });
+    (!shutdown).then_some(result)
+}
+
+fn startup_failure_message(error: &crate::StudioError, deferred_rejections: usize) -> String {
+    let message = format!("Studio startup failed: {error}");
+    if deferred_rejections == 0 {
+        message
+    } else {
+        format!(
+            "{message}; Rejected {deferred_rejections} command(s): Studio deferred command queue reached capacity {DEFERRED_INTENT_CAPACITY}"
+        )
+    }
+}
+
+fn initialize_worker(
+    config: StudioConfig,
+    requests: &Receiver<WorkerRequest>,
+    publisher: &StatePublisher,
+) -> Option<(StudioRuntime, WorkerRecovery)> {
+    if !publisher.publish(StudioUiState::new(StudioConnectionStatus::Launching)) {
+        return None;
+    }
+    let mut deferred_intents = VecDeque::new();
+    let mut deferred_rejections = 0;
+    let startup_result = start_worker_runtime(
+        config,
+        requests,
+        &mut deferred_intents,
+        &mut deferred_rejections,
+    )?;
+    let mut runtime = match startup_result {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let mut state = StudioUiState::new(StudioConnectionStatus::Failed);
+            state.error = Some(startup_failure_message(&error, deferred_rejections));
+            publisher.publish(state);
+            return None;
+        }
+    };
+    if !publish_runtime(&mut runtime, publisher, None) {
+        return None;
+    }
+    let connect_result = connect_worker(
+        &mut runtime,
+        requests,
+        &mut deferred_intents,
+        &mut deferred_rejections,
+    )?;
+    let (visible_error, reconnect_wait) = match connect_result {
+        Ok(_) => (None, None),
+        Err(error) => {
+            let reconnect_wait = is_recoverable_failure(&error)
+                .then(|| ReconnectWait::from_runtime(&runtime))
+                .flatten();
+            (Some(format!("Connection failed: {error}")), reconnect_wait)
+        }
+    };
+    let mut recovery = WorkerRecovery::new(visible_error, reconnect_wait);
+    recovery.deferred_intents = deferred_intents;
+    recovery.deferred_rejections = deferred_rejections;
+    recovery.report_deferred_rejections();
+    if !publish_runtime(&mut runtime, publisher, recovery.visible_error.clone()) {
+        return None;
+    }
+    Some((runtime, recovery))
 }
 
 fn run_worker(
@@ -336,43 +446,12 @@ fn run_worker(
     requests: &Receiver<WorkerRequest>,
     publisher: &StatePublisher,
 ) {
-    if !publisher.publish(StudioUiState::new(StudioConnectionStatus::Launching)) {
-        return;
-    }
-    let mut runtime = match StudioRuntime::new(config) {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            let mut state = StudioUiState::new(StudioConnectionStatus::Failed);
-            state.error = Some(format!("Studio startup failed: {error}"));
-            publisher.publish(state);
-            return;
-        }
-    };
-    if !publish_runtime(&mut runtime, publisher, None) {
-        return;
-    }
-    let mut deferred_intents = VecDeque::new();
-    let Some(connect_result) = connect_worker(&mut runtime, requests, &mut deferred_intents) else {
+    let Some((mut runtime, mut recovery)) = initialize_worker(config, requests, publisher) else {
         return;
     };
-    let (visible_error, reconnect_wait) = match connect_result {
-        Ok(_) => (None, None),
-        Err(error) => {
-            let reconnect_wait = is_transport_failure(&error)
-                .then(|| ReconnectWait::from_runtime(&runtime))
-                .flatten();
-            (Some(format!("Connection failed: {error}")), reconnect_wait)
-        }
-    };
-    if !publish_runtime(&mut runtime, publisher, visible_error.clone()) {
-        return;
-    }
-
     let started = Instant::now();
     let mut next_heartbeat = Instant::now() + HEARTBEAT_INTERVAL;
     let mut keys = IdempotencyKeys::new(worker_nonce());
-    let mut recovery = WorkerRecovery::new(visible_error, reconnect_wait);
-    recovery.deferred_intents = deferred_intents;
 
     // Idle receive is unnecessary: the current single-client daemon has no
     // unsolicited broadcasts. Active waits below remain cancellable.
@@ -463,6 +542,7 @@ fn handle_worker_intent(
                 true,
                 requests,
                 &mut recovery.deferred_intents,
+                &mut recovery.deferred_rejections,
             )
         });
     match result {
@@ -484,6 +564,7 @@ fn handle_worker_intent(
             };
         }
     }
+    recovery.report_deferred_rejections();
     recovery.visible_error.is_none()
         || publish_runtime(runtime, publisher, recovery.visible_error.clone())
 }
@@ -505,6 +586,7 @@ fn handle_worker_timeout(
             wait.started.elapsed(),
             requests,
             &mut recovery.deferred_intents,
+            &mut recovery.deferred_rejections,
         ) else {
             return false;
         };
@@ -536,6 +618,7 @@ fn handle_worker_timeout(
                             !recovery.realization_uncertain,
                             requests,
                             &mut recovery.deferred_intents,
+                            &mut recovery.deferred_rejections,
                         )
                     };
                     match result {
@@ -578,7 +661,10 @@ fn handle_worker_timeout(
             }
             Err(error) => {
                 recovery.visible_error = Some(format!("Reconnect failed: {error}"));
-                recovery.reconnect_wait = if is_transport_failure(&error) {
+                if is_resync_failure(&error) {
+                    recovery.realization_uncertain = true;
+                }
+                recovery.reconnect_wait = if is_recoverable_failure(&error) {
                     ReconnectWait::from_runtime(runtime)
                 } else {
                     recovery.pending_command = None;
@@ -586,6 +672,7 @@ fn handle_worker_timeout(
                 };
             }
         }
+        recovery.report_deferred_rejections();
         return publish_runtime(runtime, publisher, recovery.visible_error.clone());
     }
 
@@ -603,7 +690,7 @@ fn handle_heartbeat_timeout(
         let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         if let Err(error) = runtime.send_heartbeat(elapsed_ms) {
             recovery.visible_error = Some(format!("Heartbeat failed: {error}"));
-            if is_transport_failure(&error) {
+            if is_recoverable_failure(&error) {
                 recovery.realization_uncertain =
                     runtime.session().client().model().view().is_some();
                 recovery.reconnect_wait = ReconnectWait::from_runtime(runtime);
@@ -652,10 +739,20 @@ fn consume_command_sequence(
     publish_updates: bool,
     requests: &Receiver<WorkerRequest>,
     deferred_intents: &mut VecDeque<StudioIntent>,
+    deferred_rejections: &mut usize,
 ) -> Result<(), WorkerFailure> {
+    let deadline = Instant::now()
+        .checked_add(PEER_WAIT_TIMEOUT)
+        .expect("peer wait timeout must fit in Instant");
     let mut consumed = 0;
     count_record(&mut consumed)?;
-    let result = match receive_command_event(runtime, requests, deferred_intents)? {
+    let result = match receive_command_event(
+        runtime,
+        requests,
+        deferred_intents,
+        deferred_rejections,
+        deadline,
+    )? {
         SessionEvent::CommandResult { result, .. } => result,
         other => return Err(unexpected_failure("command result", &other)),
     };
@@ -691,7 +788,13 @@ fn consume_command_sequence(
     }
 
     count_record(&mut consumed)?;
-    match receive_command_event(runtime, requests, deferred_intents)? {
+    match receive_command_event(
+        runtime,
+        requests,
+        deferred_intents,
+        deferred_rejections,
+        deadline,
+    )? {
         SessionEvent::Event { event, .. } if event.cursor.revision == accepted_revision => {}
         SessionEvent::Event { event, .. } => {
             return Err(WorkerFailure::Fatal(format!(
@@ -706,7 +809,13 @@ fn consume_command_sequence(
     }
 
     count_record(&mut consumed)?;
-    match receive_command_event(runtime, requests, deferred_intents)? {
+    match receive_command_event(
+        runtime,
+        requests,
+        deferred_intents,
+        deferred_rejections,
+        deadline,
+    )? {
         SessionEvent::RuntimeEvent { event, .. } if event.revision == accepted_revision => {}
         SessionEvent::RuntimeEvent { event, .. } => {
             return Err(WorkerFailure::Fatal(format!(
@@ -737,12 +846,13 @@ fn receive_command_event(
     runtime: &mut StudioRuntime,
     requests: &Receiver<WorkerRequest>,
     deferred_intents: &mut VecDeque<StudioIntent>,
+    deferred_rejections: &mut usize,
+    deadline: Instant,
 ) -> Result<SessionEvent, WorkerFailure> {
-    let started = Instant::now();
     let mut shutdown = false;
     let result = runtime.receive_cancellable(IO_POLL_INTERVAL, || {
-        shutdown = cancellation_requested(requests, deferred_intents);
-        shutdown || started.elapsed() >= PEER_WAIT_TIMEOUT
+        shutdown = cancellation_requested(requests, deferred_intents, deferred_rejections);
+        shutdown || Instant::now() >= deadline
     });
     if shutdown {
         Err(WorkerFailure::Shutdown)
@@ -796,7 +906,9 @@ fn require_snapshot_reconnect(runtime: &mut StudioRuntime) -> Result<ReconnectWa
 
 fn worker_error(context: &str, error: &crate::StudioError) -> WorkerFailure {
     let message = format!("{context}: {error}");
-    if is_transport_failure(error) {
+    if is_resync_failure(error) {
+        WorkerFailure::Resync(message)
+    } else if is_transport_failure(error) {
         WorkerFailure::Transport(message)
     } else {
         WorkerFailure::Fatal(message)
@@ -810,6 +922,20 @@ const fn is_transport_failure(error: &crate::StudioError) -> bool {
             TcpSessionError::Disconnected { .. } | TcpSessionError::Cancelled { .. }
         )
     )
+}
+
+const fn is_resync_failure(error: &crate::StudioError) -> bool {
+    matches!(
+        error,
+        crate::StudioError::Client(ClientError::ResyncRequired { .. })
+            | crate::StudioError::Session(TcpSessionError::Client(
+                ClientError::ResyncRequired { .. }
+            ))
+    )
+}
+
+const fn is_recoverable_failure(error: &crate::StudioError) -> bool {
+    is_transport_failure(error) || is_resync_failure(error)
 }
 
 fn unexpected_failure(expected: &str, event: &SessionEvent) -> WorkerFailure {
@@ -924,6 +1050,14 @@ mod tests {
         num::NonZeroU128,
     };
 
+    #[cfg(unix)]
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
+        path::PathBuf,
+        process::{Command as ProcessCommand, Stdio},
+    };
+
     use fm_client::ReconnectBackoff;
     use fm_protocol::{
         CapabilityReportSummary, EngineIdentity, EventCursor, EventMessage, EventPayload,
@@ -933,6 +1067,8 @@ mod tests {
     };
     use fm_types::{InputId, ProjectId};
 
+    #[cfg(unix)]
+    use crate::SupervisedConfig;
     use crate::{ConnectionConfig, ExistingConfig, RestartPolicy};
 
     use super::*;
@@ -1037,6 +1173,30 @@ mod tests {
         assert_eq!(
             try_enqueue(&sender, WorkerRequest::Shutdown),
             Err(EnqueueError::Disconnected)
+        );
+    }
+
+    #[test]
+    fn active_wait_deferred_overflow_is_explicitly_rejected() {
+        let (sender, receiver) = sync_channel(1);
+        let mut deferred = VecDeque::from(vec![StudioIntent::Cut; DEFERRED_INTENT_CAPACITY]);
+        let mut rejected = 0;
+        try_enqueue(&sender, WorkerRequest::Intent(StudioIntent::Cut)).unwrap();
+
+        assert!(!cancellation_requested(
+            &receiver,
+            &mut deferred,
+            &mut rejected,
+        ));
+        assert_eq!(deferred.len(), DEFERRED_INTENT_CAPACITY);
+        assert_eq!(rejected, 1);
+
+        let mut recovery = WorkerRecovery::new(None, None);
+        recovery.deferred_rejections = rejected;
+        recovery.report_deferred_rejections();
+        assert_eq!(
+            recovery.visible_error.as_deref(),
+            Some("Rejected 1 command(s): Studio deferred command queue reached capacity 16")
         );
     }
 
@@ -1183,6 +1343,24 @@ mod tests {
         Receiver<StudioUiState>,
         JoinHandle<()>,
     ) {
+        spawn_test_worker_config(StudioConfig {
+            connection: ConnectionConfig::Existing(ExistingConfig {
+                address,
+                expected_project_id: test_project_id(),
+            }),
+            client_id: "worker-test".to_owned(),
+            desired_role: Role::Operator,
+            restart_policy: RestartPolicy::default(),
+        })
+    }
+
+    fn spawn_test_worker_config(
+        config: StudioConfig,
+    ) -> (
+        SyncSender<WorkerRequest>,
+        Receiver<StudioUiState>,
+        JoinHandle<()>,
+    ) {
         let (request_sender, request_receiver) = sync_channel(REQUEST_CAPACITY);
         let (state_sender, state_receiver) = sync_channel(STATE_CAPACITY);
         let worker = thread::spawn(move || {
@@ -1190,19 +1368,7 @@ mod tests {
                 sender: state_sender,
                 repaint_context: egui::Context::default(),
             };
-            run_worker(
-                StudioConfig {
-                    connection: ConnectionConfig::Existing(ExistingConfig {
-                        address,
-                        expected_project_id: test_project_id(),
-                    }),
-                    client_id: "worker-test".to_owned(),
-                    desired_role: Role::Operator,
-                    restart_policy: RestartPolicy::default(),
-                },
-                &request_receiver,
-                &publisher,
-            );
+            run_worker(config, &request_receiver, &publisher);
         });
         (request_sender, state_receiver, worker)
     }
@@ -1478,6 +1644,127 @@ mod tests {
     }
 
     #[test]
+    fn worker_recovers_event_gap_with_forced_snapshot() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut first = accept_worker_snapshot(&listener);
+            let WireMessage::Command(command) = first.receive() else {
+                panic!("expected command before event gap")
+            };
+            first.send(&WireMessage::CommandResult(CommandResult::Accepted {
+                id: command.id,
+                revision: 5,
+                scheduled_frame: None,
+            }));
+            first.send(&WireMessage::Event(EventMessage {
+                cursor: EventCursor {
+                    engine: test_engine(),
+                    revision: 6,
+                },
+                payload: EventPayload::DesiredSwitcher {
+                    program: wire_input(1),
+                    preview: wire_input(3),
+                },
+            }));
+            assert_eq!(first.stream.read(&mut [0_u8; 1]).unwrap(), 0);
+            accept_worker_snapshot_at(&listener, 6, 3, 3);
+        });
+
+        let (requests, states, worker) = spawn_test_worker(address);
+        wait_until_ready(&states);
+        let target = InputId::new(NonZeroU128::new(3).unwrap());
+        try_enqueue(
+            &requests,
+            WorkerRequest::Intent(StudioIntent::SelectPreview(target)),
+        )
+        .unwrap();
+
+        let mut saw_backoff = false;
+        loop {
+            let state = states.recv_timeout(Duration::from_secs(3)).unwrap();
+            saw_backoff |= state.connection_status == StudioConnectionStatus::Backoff;
+            if saw_backoff
+                && state.connection_status == StudioConnectionStatus::Ready
+                && state.pending_commands == 0
+                && state.view.as_ref().is_some_and(|view| {
+                    view.cursor.revision.get() == 6
+                        && view.switcher.desired.preview == target
+                        && view.switcher.realized.preview == target
+                })
+            {
+                assert_eq!(state.error, None);
+                break;
+            }
+        }
+        try_enqueue(&requests, WorkerRequest::Shutdown).unwrap();
+        worker.join().unwrap();
+        server.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_app_drop_joins_worker_and_reaps_daemon_silent_during_readiness() {
+        let base = std::env::temp_dir().join(format!("{}-silent-readiness", worker_nonce()));
+        let executable = base.with_extension("sh");
+        let project = base.with_extension("freemix");
+        let pid_path = PathBuf::from(format!("{}.pid", project.display()));
+        fs::write(
+            &executable,
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$2.pid\"\nIFS= read -r hold\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions).unwrap();
+
+        let config = StudioConfig {
+            connection: ConnectionConfig::Supervised(SupervisedConfig {
+                project_bundle: project,
+                daemon_executable: executable.clone(),
+                listen: "127.0.0.1:0".parse().unwrap(),
+            }),
+            client_id: "silent-readiness".to_owned(),
+            desired_role: Role::Operator,
+            restart_policy: RestartPolicy::default(),
+        };
+        let (requests, states, worker) = spawn_test_worker_config(config);
+        let app = StudioApp {
+            shell: StudioShell::default(),
+            state: StudioUiState::new(StudioConnectionStatus::Launching),
+            requests: Some(requests),
+            updates: Some(states),
+            worker: Some(worker),
+            shutdown_sent: false,
+        };
+        let wait_started = Instant::now();
+        while !pid_path.exists() {
+            assert!(wait_started.elapsed() < Duration::from_secs(3));
+            thread::sleep(Duration::from_millis(10));
+        }
+        let pid = fs::read_to_string(&pid_path).unwrap();
+
+        let shutdown_started = Instant::now();
+        drop(app);
+        assert!(
+            shutdown_started.elapsed() < Duration::from_millis(250),
+            "worker did not join a cancelled readiness wait"
+        );
+        assert!(
+            !ProcessCommand::new("/bin/kill")
+                .args(["-0", pid.trim()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success(),
+            "supervised daemon was not reaped before worker join"
+        );
+        let _ = fs::remove_file(executable);
+        let _ = fs::remove_file(pid_path);
+    }
+
+    #[test]
     fn worker_shutdown_cancels_a_silent_handshake() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -1596,6 +1883,66 @@ mod tests {
                 break;
             }
         }
+        try_enqueue(&requests, WorkerRequest::Shutdown).unwrap();
+        worker.join().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn command_response_uses_one_aggregate_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (command_tx, command_rx) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let mut peer = accept_worker_snapshot(&listener);
+            let WireMessage::Command(command) = peer.receive() else {
+                panic!("expected command")
+            };
+            command_tx.send(()).unwrap();
+            thread::sleep(Duration::from_millis(150));
+            peer.send(&WireMessage::CommandResult(CommandResult::Accepted {
+                id: command.id,
+                revision: 5,
+                scheduled_frame: None,
+            }));
+            thread::sleep(Duration::from_millis(150));
+            let event = encode_line(&WireMessage::Event(EventMessage {
+                cursor: EventCursor {
+                    engine: test_engine(),
+                    revision: 5,
+                },
+                payload: EventPayload::DesiredSwitcher {
+                    program: wire_input(1),
+                    preview: wire_input(3),
+                },
+            }))
+            .unwrap();
+            let _ = peer.stream.write_all(event.as_bytes());
+            let _ = peer.stream.flush();
+            let _ = peer.stream.read(&mut [0_u8; 1]);
+        });
+
+        let (requests, states, worker) = spawn_test_worker(address);
+        wait_until_ready(&states);
+        try_enqueue(
+            &requests,
+            WorkerRequest::Intent(StudioIntent::SelectPreview(InputId::new(
+                NonZeroU128::new(3).unwrap(),
+            ))),
+        )
+        .unwrap();
+        command_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let response_started = Instant::now();
+        loop {
+            let state = states.recv_timeout(Duration::from_secs(3)).unwrap();
+            if state.connection_status == StudioConnectionStatus::Backoff {
+                break;
+            }
+        }
+        assert!(
+            response_started.elapsed() < Duration::from_millis(400),
+            "each command response record received a fresh timeout"
+        );
         try_enqueue(&requests, WorkerRequest::Shutdown).unwrap();
         worker.join().unwrap();
         server.join().unwrap();

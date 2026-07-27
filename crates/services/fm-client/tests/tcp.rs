@@ -565,3 +565,82 @@ fn cancellable_receive_preserves_a_partial_framed_record() {
     assert!(polls > 1, "partial record did not span polling cycles");
     server_thread.join().unwrap();
 }
+
+#[test]
+fn tcp_establishment_checks_cancellation_before_blocking() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let mut session = TcpSession::new(client(2));
+    let started = Instant::now();
+
+    assert!(matches!(
+        session.connect_cancellable(
+            address,
+            CONNECT_TIMEOUT,
+            Duration::from_millis(10),
+            || true,
+        ),
+        Err(TcpSessionError::Cancelled { backoff }) if backoff.attempt == 1
+    ));
+    assert!(started.elapsed() < Duration::from_millis(100));
+    assert!(listener.set_nonblocking(true).is_ok());
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+}
+
+#[test]
+fn event_gap_forces_snapshot_and_preserves_unresolved_command() {
+    let (original_tx, original_rx) = mpsc::channel();
+    let (address, server_thread) = spawn_server(move |listener| {
+        let mut first = Peer::accept(&listener);
+        accept_snapshot(&mut first, 4);
+        let WireMessage::Command(original) = first.receive() else {
+            panic!("expected original command")
+        };
+        original_tx.send(original.clone()).unwrap();
+        first.send(&WireMessage::Event(event(6)));
+        assert_eq!(first.stream.read(&mut [0_u8; 1]).unwrap(), 0);
+
+        let mut second = Peer::accept(&listener);
+        let WireMessage::HandshakeRequest(request) = second.receive() else {
+            panic!("expected snapshot reconnect")
+        };
+        assert_eq!(request.resume_cursor, None);
+        second.send(&WireMessage::HandshakeResponse(handshake(
+            6,
+            HandshakeOutcome::Snapshot {
+                reason: SnapshotReason::HistoryUnavailable,
+            },
+        )));
+        second.send(&WireMessage::Snapshot(snapshot(6)));
+        let WireMessage::Command(retried) = second.receive() else {
+            panic!("expected unresolved command retry")
+        };
+        assert_eq!(retried, original);
+    });
+
+    let mut session = TcpSession::new(client(2));
+    session.connect(address, CONNECT_TIMEOUT).unwrap();
+    let command = session
+        .queue_command(CommandPayload::Cut, "event-gap", Some(4), None)
+        .unwrap();
+    session.flush().unwrap();
+    assert_eq!(original_rx.recv().unwrap(), command);
+    assert!(matches!(
+        session.receive(),
+        Err(TcpSessionError::Client(ClientError::ResyncRequired {
+            expected_revision: 5,
+            received_revision: 6,
+        }))
+    ));
+    assert_eq!(session.in_flight_len(), 1);
+    assert_eq!(session.reconnect_backoff().unwrap().attempt, 1);
+    assert!(matches!(
+        session.connect(address, CONNECT_TIMEOUT).unwrap(),
+        SessionEvent::Connected {
+            mode: SyncMode::Snapshot
+        }
+    ));
+    server_thread.join().unwrap();
+}
