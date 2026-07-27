@@ -11,7 +11,9 @@ use std::{
 
 use eframe::egui;
 use fm_client::{ClientError, CommandStatus, SessionEvent, SyncMode, TcpSessionError};
-use fm_protocol::{CommandPayload, CommandResult, DurableGap, WireInputId, WireMessage};
+use fm_protocol::{
+    CommandPayload, CommandResult, DurableGap, WIPE_PROTOCOL_VERSION, WireInputId, WireMessage,
+};
 use fm_ui_egui::{StudioConnectionStatus, StudioIntent, StudioShell, StudioUiState};
 
 use crate::{LifecycleState, StudioConfig, StudioRuntime};
@@ -292,12 +294,7 @@ impl WorkerRecovery {
             return publish_runtime(runtime, publisher, self.error());
         }
         self.deferred_intents.push_back(intent);
-        publish_deferred_runtime(
-            runtime,
-            publisher,
-            self.deferred_intents.len(),
-            self.error(),
-        )
+        publish_deferred_runtime(runtime, publisher, &self.deferred_intents, self.error())
     }
 
     fn error(&self) -> Option<String> {
@@ -442,7 +439,7 @@ fn initialize_worker(
     let mut recovery = WorkerRecovery::new(visible_error, reconnect_wait);
     recovery.deferred_intents = deferred_intents;
     recovery.deferred_rejections = deferred_rejections;
-    if !publish_runtime(&mut runtime, publisher, recovery.error()) {
+    if !publish_recovery_runtime(&mut runtime, publisher, &recovery) {
         return None;
     }
     Some((runtime, recovery))
@@ -464,8 +461,15 @@ fn run_worker(
     // unsolicited broadcasts. Active waits below remain cancellable.
     loop {
         if !recovery.active()
-            && let Some(intent) = recovery.deferred_intents.pop_front()
+            && let Some(position) = recovery
+                .deferred_intents
+                .iter()
+                .position(|intent| intent_supported_by_session(runtime.session(), *intent))
         {
+            let intent = recovery
+                .deferred_intents
+                .remove(position)
+                .expect("deferred intent position must remain valid");
             if !handle_worker_intent(
                 &mut runtime,
                 intent,
@@ -486,7 +490,7 @@ fn run_worker(
         match requests.recv_timeout(timeout) {
             Ok(WorkerRequest::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
             Ok(WorkerRequest::Intent(intent)) => {
-                if recovery.active() {
+                if recovery.active() || !intent_supported_by_session(runtime.session(), intent) {
                     if !recovery.defer_intent(&mut runtime, intent, publisher) {
                         break;
                     }
@@ -565,7 +569,8 @@ fn handle_worker_intent(
             };
         }
     }
-    recovery.error().is_none() || publish_runtime(runtime, publisher, recovery.error())
+    (recovery.error().is_none() && recovery.deferred_intents.is_empty())
+        || publish_recovery_runtime(runtime, publisher, recovery)
 }
 
 fn flush_worker(
@@ -622,7 +627,7 @@ fn handle_worker_timeout(
                     recovery.realization_uncertain = false;
                 }
                 if !recovery.realization_uncertain
-                    && !publish_runtime(runtime, publisher, recovery.error())
+                    && !publish_recovery_runtime(runtime, publisher, recovery)
                 {
                     return false;
                 }
@@ -649,7 +654,7 @@ fn handle_worker_timeout(
                 };
             }
         }
-        return publish_runtime(runtime, publisher, recovery.error());
+        return publish_recovery_runtime(runtime, publisher, recovery);
     }
 
     handle_heartbeat_timeout(
@@ -992,7 +997,9 @@ const fn is_transport_failure(error: &crate::StudioError) -> bool {
     matches!(
         error,
         crate::StudioError::Session(
-            TcpSessionError::Disconnected { .. } | TcpSessionError::Cancelled { .. }
+            TcpSessionError::Disconnected { .. }
+                | TcpSessionError::Cancelled { .. }
+                | TcpSessionError::PendingCommandIncompatible { .. }
         )
     )
 }
@@ -1046,7 +1053,16 @@ const fn intent_payload(intent: StudioIntent) -> CommandPayload {
         },
         StudioIntent::Cut => CommandPayload::Cut,
         StudioIntent::Fade { duration_frames } => CommandPayload::Fade { duration_frames },
+        StudioIntent::Wipe { duration_frames } => CommandPayload::Wipe { duration_frames },
     }
+}
+
+fn intent_supported_by_session(session: &fm_client::TcpSession, intent: StudioIntent) -> bool {
+    !matches!(intent, StudioIntent::Wipe { .. })
+        || session.client().session().is_some_and(|session| {
+            session.protocol.major == WIPE_PROTOCOL_VERSION.major
+                && session.protocol.minor >= WIPE_PROTOCOL_VERSION.minor
+        })
 }
 
 const fn lifecycle_status(lifecycle: LifecycleState) -> StudioConnectionStatus {
@@ -1057,6 +1073,7 @@ const fn lifecycle_status(lifecycle: LifecycleState) -> StudioConnectionStatus {
         LifecycleState::Synchronizing => StudioConnectionStatus::Synchronizing,
         LifecycleState::Ready => StudioConnectionStatus::Ready,
         LifecycleState::Backoff(_) => StudioConnectionStatus::Backoff,
+        LifecycleState::PendingIncompatible => StudioConnectionStatus::PendingIncompatible,
         LifecycleState::Incompatible => StudioConnectionStatus::Incompatible,
         LifecycleState::DaemonExited { .. }
         | LifecycleState::DaemonFailed
@@ -1078,8 +1095,13 @@ fn runtime_state(runtime: &mut StudioRuntime, error: Option<String>) -> StudioUi
         .session()
         .map(|session| session.permissions.as_slice());
     let (can_select_preview, can_transition) = switcher_permissions(permissions);
+    let supports_wipe = client.session().is_some_and(|session| {
+        session.protocol.major == WIPE_PROTOCOL_VERSION.major
+            && session.protocol.minor >= WIPE_PROTOCOL_VERSION.minor
+    });
     let mut state = StudioUiState::new(connection_status)
-        .with_switcher_permissions(can_select_preview, can_transition);
+        .with_switcher_permissions(can_select_preview, can_transition)
+        .with_wipe_support(supports_wipe);
     if connection_status == StudioConnectionStatus::Ready {
         state.view = client.model().view();
     }
@@ -1106,14 +1128,42 @@ fn publish_runtime(
 fn publish_deferred_runtime(
     runtime: &mut StudioRuntime,
     publisher: &StatePublisher,
-    deferred: usize,
+    deferred: &VecDeque<StudioIntent>,
     error: Option<String>,
 ) -> bool {
     let mut state = runtime_state(runtime, error);
-    state.notice = Some(format!(
-        "Queued {deferred} command(s) until Studio reconnects"
-    ));
+    let incompatible_wipe = deferred
+        .iter()
+        .any(|intent| !intent_supported_by_session(runtime.session(), *intent));
+    state.notice = Some(if incompatible_wipe {
+        format!(
+            "Queued {} command(s); pending Wipe requires protocol {WIPE_PROTOCOL_VERSION}",
+            deferred.len()
+        )
+    } else {
+        format!(
+            "Queued {} command(s) until Studio reconnects",
+            deferred.len()
+        )
+    });
     publisher.publish(state)
+}
+
+fn publish_recovery_runtime(
+    runtime: &mut StudioRuntime,
+    publisher: &StatePublisher,
+    recovery: &WorkerRecovery,
+) -> bool {
+    if recovery.deferred_intents.is_empty() {
+        publish_runtime(runtime, publisher, recovery.error())
+    } else {
+        publish_deferred_runtime(
+            runtime,
+            publisher,
+            &recovery.deferred_intents,
+            recovery.error(),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -1181,6 +1231,10 @@ mod tests {
             lifecycle_status(LifecycleState::Incompatible),
             StudioConnectionStatus::Incompatible
         );
+        assert_eq!(
+            lifecycle_status(LifecycleState::PendingIncompatible),
+            StudioConnectionStatus::PendingIncompatible
+        );
         for lifecycle in [
             LifecycleState::DaemonExited { code: Some(1) },
             LifecycleState::DaemonFailed,
@@ -1206,6 +1260,14 @@ mod tests {
                 duration_frames: u32::MAX,
             }),
             CommandPayload::Fade {
+                duration_frames: u32::MAX,
+            }
+        );
+        assert_eq!(
+            intent_payload(StudioIntent::Wipe {
+                duration_frames: u32::MAX,
+            }),
+            CommandPayload::Wipe {
                 duration_frames: u32::MAX,
             }
         );
@@ -1355,13 +1417,29 @@ mod tests {
         desired_preview: u128,
         realized_preview: u128,
     ) -> FakePeer {
+        accept_worker_snapshot_version_at(
+            listener,
+            ProtocolVersion::new(1, 2),
+            revision,
+            desired_preview,
+            realized_preview,
+        )
+    }
+
+    fn accept_worker_snapshot_version_at(
+        listener: &TcpListener,
+        negotiated: ProtocolVersion,
+        revision: u64,
+        desired_preview: u128,
+        realized_preview: u128,
+    ) -> FakePeer {
         let mut peer = FakePeer::accept(listener);
         let WireMessage::HandshakeRequest(request) = peer.receive() else {
             panic!("expected snapshot handshake request");
         };
         assert_eq!(request.resume_cursor, None);
         peer.send(&WireMessage::HandshakeResponse(HandshakeResponse {
-            negotiated: ProtocolVersion::new(1, 2),
+            negotiated,
             granted_role: Role::Operator,
             permissions: vec!["select_preview".to_owned(), "transition".to_owned()],
             capabilities: CapabilityReportSummary {
@@ -1391,13 +1469,21 @@ mod tests {
     }
 
     fn accept_worker_resume(listener: &TcpListener, current_revision: u64) -> (FakePeer, u64) {
+        accept_worker_resume_version(listener, ProtocolVersion::new(1, 2), current_revision)
+    }
+
+    fn accept_worker_resume_version(
+        listener: &TcpListener,
+        negotiated: ProtocolVersion,
+        current_revision: u64,
+    ) -> (FakePeer, u64) {
         let mut peer = FakePeer::accept(listener);
         let WireMessage::HandshakeRequest(request) = peer.receive() else {
             panic!("expected reconnect handshake request");
         };
         let cursor = request.resume_cursor.expect("resume cursor");
         peer.send(&WireMessage::HandshakeResponse(HandshakeResponse {
-            negotiated: ProtocolVersion::new(1, 2),
+            negotiated,
             granted_role: Role::Operator,
             permissions: vec!["select_preview".to_owned(), "transition".to_owned()],
             capabilities: CapabilityReportSummary {
@@ -1414,6 +1500,48 @@ mod tests {
             },
         }));
         (peer, cursor.revision)
+    }
+
+    fn accept_worker_reconnect_snapshot_version(
+        listener: &TcpListener,
+        negotiated: ProtocolVersion,
+        revision: u64,
+        desired: (u128, u128),
+        realized: (u128, u128),
+    ) -> FakePeer {
+        let mut peer = FakePeer::accept(listener);
+        let WireMessage::HandshakeRequest(request) = peer.receive() else {
+            panic!("expected reconnect snapshot handshake request");
+        };
+        assert!(request.resume_cursor.is_some());
+        peer.send(&WireMessage::HandshakeResponse(HandshakeResponse {
+            negotiated,
+            granted_role: Role::Operator,
+            permissions: vec!["select_preview".to_owned(), "transition".to_owned()],
+            capabilities: CapabilityReportSummary {
+                digest: "sha256:worker-test".to_owned(),
+                total: 1,
+                available: 1,
+                degraded: 0,
+                unavailable: 0,
+            },
+            server: test_server(),
+            current_revision: revision,
+            outcome: HandshakeOutcome::Snapshot {
+                reason: SnapshotReason::HistoryUnavailable,
+            },
+        }));
+        peer.send(&WireMessage::Snapshot(SnapshotMessage {
+            engine: test_engine(),
+            revision,
+            show_name: "Worker test".to_owned(),
+            inputs: vec![wire_input(1), wire_input(2), wire_input(3)],
+            desired_program: wire_input(desired.0),
+            desired_preview: wire_input(desired.1),
+            realized_program: wire_input(realized.0),
+            realized_preview: wire_input(realized.1),
+        }));
+        peer
     }
 
     fn spawn_test_worker(
@@ -1495,6 +1623,119 @@ mod tests {
         peer.send(&WireMessage::RuntimeEvent(RuntimeEventMessage {
             server: test_server(),
             revision: 5,
+            generation: 1,
+            sequence: 1,
+            event: RuntimeLifecycleEvent::Realized {
+                domain: "switcher".to_owned(),
+            },
+        }));
+    }
+
+    fn serve_worker_wipe(listener: &TcpListener) {
+        let mut peer = accept_worker_snapshot_version_at(listener, WIPE_PROTOCOL_VERSION, 4, 2, 2);
+        let WireMessage::Command(command) = peer.receive() else {
+            panic!("expected Wipe command");
+        };
+        assert_eq!(command.protocol, WIPE_PROTOCOL_VERSION);
+        assert_eq!(
+            command.payload,
+            CommandPayload::Wipe {
+                duration_frames: 45
+            }
+        );
+        assert_eq!(command.expected_revision, Some(4));
+        assert_eq!(command.deadline_ms, None);
+        assert!(!command.idempotency_key.is_empty());
+        peer.send(&WireMessage::CommandResult(CommandResult::Accepted {
+            id: command.id,
+            revision: 5,
+            scheduled_frame: Some(9),
+        }));
+        peer.send(&WireMessage::Event(EventMessage {
+            cursor: EventCursor {
+                engine: test_engine(),
+                revision: 5,
+            },
+            payload: EventPayload::DesiredSwitcher {
+                program: wire_input(2),
+                preview: wire_input(1),
+            },
+        }));
+        peer.send(&WireMessage::RuntimeEvent(RuntimeEventMessage {
+            server: test_server(),
+            revision: 5,
+            generation: 1,
+            sequence: 1,
+            event: RuntimeLifecycleEvent::Realized {
+                domain: "switcher".to_owned(),
+            },
+        }));
+    }
+
+    fn serve_worker_deferred_wipe(listener: &TcpListener) {
+        let mut first = accept_worker_snapshot_version_at(listener, WIPE_PROTOCOL_VERSION, 4, 2, 2);
+        let WireMessage::Command(original) = first.receive() else {
+            panic!("expected original Select Preview command");
+        };
+        drop(first);
+
+        let (mut downgraded, revision) =
+            accept_worker_resume_version(listener, ProtocolVersion::new(1, 2), 5);
+        assert_eq!(revision, 4);
+        downgraded.send(&WireMessage::Event(EventMessage {
+            cursor: EventCursor {
+                engine: test_engine(),
+                revision: 5,
+            },
+            payload: EventPayload::DesiredSwitcher {
+                program: wire_input(1),
+                preview: wire_input(3),
+            },
+        }));
+        let WireMessage::Command(retried) = downgraded.receive() else {
+            panic!("expected original command retry, not deferred Wipe");
+        };
+        assert_eq!(retried.protocol, ProtocolVersion::new(1, 2));
+        assert_eq!(retried.id, original.id);
+        assert_eq!(retried.idempotency_key, original.idempotency_key);
+        assert_eq!(retried.payload, original.payload);
+        downgraded.send(&WireMessage::CommandResult(CommandResult::Accepted {
+            id: retried.id,
+            revision: 5,
+            scheduled_frame: None,
+        }));
+        assert_eq!(downgraded.stream.read(&mut [0_u8; 1]).unwrap(), 0);
+
+        let mut compatible =
+            accept_worker_snapshot_version_at(listener, WIPE_PROTOCOL_VERSION, 5, 3, 3);
+        let WireMessage::Command(wipe) = compatible.receive() else {
+            panic!("expected deferred Wipe command");
+        };
+        assert_eq!(wipe.protocol, WIPE_PROTOCOL_VERSION);
+        assert_eq!(
+            wipe.payload,
+            CommandPayload::Wipe {
+                duration_frames: 60
+            }
+        );
+        compatible.send(&WireMessage::CommandResult(CommandResult::Accepted {
+            id: wipe.id,
+            revision: 6,
+            scheduled_frame: None,
+        }));
+        compatible.send(&WireMessage::Event(EventMessage {
+            cursor: EventCursor {
+                engine: test_engine(),
+                revision: 6,
+            },
+            payload: EventPayload::DesiredSwitcher {
+                program: wire_input(3),
+                preview: wire_input(1),
+            },
+        }));
+        compatible.send(&WireMessage::RuntimeEvent(RuntimeEventMessage {
+            server: test_server(),
+            revision: 6,
             generation: 1,
             sequence: 1,
             event: RuntimeLifecycleEvent::Realized {
@@ -1612,6 +1853,221 @@ mod tests {
             worker.is_finished(),
             "idle worker did not shut down promptly"
         );
+        worker.join().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn worker_wipe_flow_preserves_exact_envelope_result_event_and_runtime_order() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || serve_worker_wipe(&listener));
+        let (requests, states, worker) = spawn_test_worker(address);
+        wait_until_ready(&states);
+        try_enqueue(
+            &requests,
+            WorkerRequest::Intent(StudioIntent::Wipe {
+                duration_frames: 45,
+            }),
+        )
+        .unwrap();
+
+        let mut pending_seen = false;
+        loop {
+            let state = states.recv_timeout(Duration::from_secs(3)).unwrap();
+            pending_seen |= state.pending_commands == 1;
+            if state.pending_commands == 0
+                && state.view.as_ref().is_some_and(|view| {
+                    view.cursor.revision.get() == 5
+                        && view.switcher.realized.program == wire_input(2).to_domain()
+                        && view.switcher.realized.preview == wire_input(1).to_domain()
+                })
+            {
+                assert!(state.supports_wipe);
+                assert_eq!(state.error, None);
+                break;
+            }
+        }
+        assert!(pending_seen);
+        try_enqueue(&requests, WorkerRequest::Shutdown).unwrap();
+        worker.join().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn runtime_state_tracks_wipe_support_across_protocol_reconnects() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut first =
+                accept_worker_snapshot_version_at(&listener, WIPE_PROTOCOL_VERSION, 4, 2, 2);
+            assert_eq!(first.stream.read(&mut [0_u8; 1]).unwrap(), 0);
+            accept_worker_reconnect_snapshot_version(
+                &listener,
+                ProtocolVersion::new(1, 2),
+                4,
+                (1, 2),
+                (1, 2),
+            );
+        });
+        let config = StudioConfig {
+            connection: ConnectionConfig::Existing(ExistingConfig {
+                address,
+                expected_project_id: test_project_id(),
+            }),
+            client_id: "support-change".to_owned(),
+            desired_role: Role::Operator,
+            restart_policy: RestartPolicy::default(),
+        };
+        let mut runtime = StudioRuntime::new(config).unwrap();
+        runtime.connect(CONNECT_TIMEOUT).unwrap();
+        let current = runtime_state(&mut runtime, None);
+        assert!(current.supports_wipe);
+        assert!(current.can_transition);
+        runtime.session_mut().disconnect().unwrap();
+        runtime
+            .reconnect(Duration::from_millis(250), CONNECT_TIMEOUT)
+            .unwrap();
+        let downgraded = runtime_state(&mut runtime, None);
+        assert!(!downgraded.supports_wipe);
+        assert!(downgraded.can_transition, "Cut/Fade permission was lost");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn deferred_wipe_waits_through_a_1_2_reconnect_then_runs_on_1_3() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || serve_worker_deferred_wipe(&listener));
+        let (requests, states, worker) = spawn_test_worker(address);
+        wait_until_ready(&states);
+        try_enqueue(
+            &requests,
+            WorkerRequest::Intent(StudioIntent::SelectPreview(wire_input(3).to_domain())),
+        )
+        .unwrap();
+        let mut deferred = false;
+        let mut saw_pending_notice = false;
+        loop {
+            let state = states.recv_timeout(Duration::from_secs(3)).unwrap();
+            if state.connection_status == StudioConnectionStatus::Backoff && !deferred {
+                try_enqueue(
+                    &requests,
+                    WorkerRequest::Intent(StudioIntent::Wipe {
+                        duration_frames: 60,
+                    }),
+                )
+                .unwrap();
+                deferred = true;
+            }
+            saw_pending_notice |= state
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("pending Wipe requires protocol 1.3"));
+            if deferred
+                && state.pending_commands == 0
+                && state.view.as_ref().is_some_and(|view| {
+                    view.cursor.revision.get() == 6
+                        && view.switcher.realized.program == wire_input(3).to_domain()
+                })
+            {
+                assert!(state.supports_wipe);
+                assert!(saw_pending_notice);
+                break;
+            }
+        }
+        try_enqueue(&requests, WorkerRequest::Shutdown).unwrap();
+        worker.join().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn unresolved_wipe_downgrade_is_visible_and_retries_only_on_1_3() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut first =
+                accept_worker_snapshot_version_at(&listener, WIPE_PROTOCOL_VERSION, 4, 2, 2);
+            let WireMessage::Command(original) = first.receive() else {
+                panic!("expected original Wipe command");
+            };
+            drop(first);
+
+            let (mut downgraded, revision) =
+                accept_worker_resume_version(&listener, ProtocolVersion::new(1, 2), 4);
+            assert_eq!(revision, 4);
+            assert_eq!(
+                downgraded.stream.read(&mut [0_u8; 1]).unwrap(),
+                0,
+                "unresolved Wipe reached protocol 1.2"
+            );
+
+            let mut compatible = accept_worker_reconnect_snapshot_version(
+                &listener,
+                WIPE_PROTOCOL_VERSION,
+                4,
+                (1, 2),
+                (1, 2),
+            );
+            let WireMessage::Command(retried) = compatible.receive() else {
+                panic!("expected unresolved Wipe retry");
+            };
+            assert_eq!(retried, original);
+            compatible.send(&WireMessage::CommandResult(CommandResult::Accepted {
+                id: retried.id,
+                revision: 5,
+                scheduled_frame: None,
+            }));
+            compatible.send(&WireMessage::Event(EventMessage {
+                cursor: EventCursor {
+                    engine: test_engine(),
+                    revision: 5,
+                },
+                payload: EventPayload::DesiredSwitcher {
+                    program: wire_input(2),
+                    preview: wire_input(1),
+                },
+            }));
+            compatible.send(&WireMessage::RuntimeEvent(RuntimeEventMessage {
+                server: test_server(),
+                revision: 5,
+                generation: 1,
+                sequence: 1,
+                event: RuntimeLifecycleEvent::Realized {
+                    domain: "switcher".to_owned(),
+                },
+            }));
+        });
+
+        let (requests, states, worker) = spawn_test_worker(address);
+        wait_until_ready(&states);
+        try_enqueue(
+            &requests,
+            WorkerRequest::Intent(StudioIntent::Wipe {
+                duration_frames: 45,
+            }),
+        )
+        .unwrap();
+        let mut saw_pending_incompatible = false;
+        loop {
+            let state = states.recv_timeout(Duration::from_secs(3)).unwrap();
+            saw_pending_incompatible |= state.connection_status
+                == StudioConnectionStatus::PendingIncompatible
+                && state.error.as_deref().is_some_and(|error| {
+                    error.contains("requires protocol 1.3") && error.contains("negotiated 1.2")
+                });
+            if state.pending_commands == 0
+                && state.view.as_ref().is_some_and(|view| {
+                    view.cursor.revision.get() == 5
+                        && view.switcher.realized.program == wire_input(2).to_domain()
+                })
+            {
+                assert!(saw_pending_incompatible);
+                assert!(state.supports_wipe);
+                break;
+            }
+        }
+        try_enqueue(&requests, WorkerRequest::Shutdown).unwrap();
         worker.join().unwrap();
         server.join().unwrap();
     }

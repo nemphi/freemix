@@ -22,6 +22,7 @@ pub enum LifecycleState {
     Ready,
     Backoff(ReconnectBackoff),
     ResyncRequired,
+    PendingIncompatible,
     Incompatible,
 }
 
@@ -188,6 +189,7 @@ impl StudioRuntime {
             ConnectionState::Ready => LifecycleState::Ready,
             ConnectionState::Backoff(backoff) => LifecycleState::Backoff(*backoff),
             ConnectionState::ResyncRequired { .. } => LifecycleState::ResyncRequired,
+            ConnectionState::PendingIncompatible { .. } => LifecycleState::PendingIncompatible,
             ConnectionState::Incompatible { .. } => LifecycleState::Incompatible,
         })
     }

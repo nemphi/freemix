@@ -91,6 +91,12 @@ pub enum ConnectionState {
         expected_revision: u64,
         received_revision: u64,
     },
+    PendingIncompatible {
+        command_id: String,
+        negotiated: ProtocolVersion,
+        required: ProtocolVersion,
+        backoff: ReconnectBackoff,
+    },
     Incompatible {
         negotiated: ProtocolVersion,
     },
@@ -393,7 +399,8 @@ impl Client {
         match self.state {
             ConnectionState::Disconnected
             | ConnectionState::Backoff(_)
-            | ConnectionState::ResyncRequired { .. } => {
+            | ConnectionState::ResyncRequired { .. }
+            | ConnectionState::PendingIncompatible { .. } => {
                 self.state = ConnectionState::Connecting;
                 Ok(())
             }
@@ -432,6 +439,32 @@ impl Client {
         self.reset_runtime_sequences();
         self.outbound
             .retain(|item| matches!(item, Outbound::Command(_)));
+        let backoff = self.next_reconnect_backoff();
+        self.state = ConnectionState::Backoff(backoff);
+        backoff
+    }
+
+    fn command_protocol_incompatible(
+        &mut self,
+        command_id: String,
+        negotiated: ProtocolVersion,
+        required: ProtocolVersion,
+    ) -> ReconnectBackoff {
+        self.session = None;
+        self.reset_runtime_sequences();
+        self.outbound
+            .retain(|item| matches!(item, Outbound::Command(_)));
+        let backoff = self.next_reconnect_backoff();
+        self.state = ConnectionState::PendingIncompatible {
+            command_id,
+            negotiated,
+            required,
+            backoff,
+        };
+        backoff
+    }
+
+    fn next_reconnect_backoff(&mut self) -> ReconnectBackoff {
         self.reconnect_attempt = self.reconnect_attempt.saturating_add(1);
         let exponent = self.reconnect_attempt.saturating_sub(1).min(63);
         let delay_ms = self
@@ -439,12 +472,10 @@ impl Client {
             .initial_backoff_ms
             .saturating_mul(1_u64 << exponent)
             .min(self.config.max_backoff_ms);
-        let backoff = ReconnectBackoff {
+        ReconnectBackoff {
             attempt: self.reconnect_attempt,
             delay_ms,
-        };
-        self.state = ConnectionState::Backoff(backoff);
-        backoff
+        }
     }
 
     /// Dispatches one inbound protocol DTO.
@@ -555,12 +586,16 @@ impl Client {
             capabilities_digest: response.capabilities.digest,
         });
         for record in self.commands.values_mut() {
-            if !matches!(record.status, CommandStatus::Completed(_)) {
+            if !matches!(record.status, CommandStatus::Completed(_))
+                && record.command.payload.is_supported_by(response.negotiated)
+            {
                 record.command.protocol = response.negotiated;
             }
         }
         for item in &mut self.outbound {
-            if let Outbound::Command(command) = item {
+            if let Outbound::Command(command) = item
+                && command.payload.is_supported_by(response.negotiated)
+            {
                 command.protocol = response.negotiated;
             }
         }
@@ -913,10 +948,34 @@ impl Client {
             };
         }
         self.model.reconcile_command(&result)?;
+        let resolves_pending_incompatible = matches!(
+            &self.state,
+            ConnectionState::PendingIncompatible { command_id, .. } if command_id == id
+        );
         if let Some(record) = self.commands.get_mut(id) {
             record.status = CommandStatus::Completed(result);
         }
+        if resolves_pending_incompatible {
+            self.state = ConnectionState::Disconnected;
+        }
         Ok(Intake::ResultReconciled)
+    }
+
+    fn unresolved_incompatible_command(
+        &self,
+    ) -> Option<(String, ProtocolVersion, ProtocolVersion)> {
+        let negotiated = self.session.as_ref()?.protocol;
+        self.commands.values().find_map(|record| {
+            (!matches!(record.status, CommandStatus::Completed(_))
+                && !record.command.payload.is_supported_by(negotiated))
+            .then(|| {
+                (
+                    record.command.id.clone(),
+                    negotiated,
+                    record.command.payload.minimum_protocol_version(),
+                )
+            })
+        })
     }
 
     fn apply_gap(&mut self, gap: &DurableGap) -> Result<(), ClientError> {

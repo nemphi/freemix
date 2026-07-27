@@ -30,6 +30,8 @@ pub enum StudioIntent {
     Cut,
     /// Performs a Fade transition with a duration in frames.
     Fade { duration_frames: u32 },
+    /// Performs a Wipe transition with a duration in frames.
+    Wipe { duration_frames: u32 },
 }
 
 /// Native studio connection lifecycle as presented to an operator.
@@ -52,6 +54,8 @@ pub enum StudioConnectionStatus {
     Failed,
     /// The peer protocol is incompatible with this studio.
     Incompatible,
+    /// An unresolved command cannot be retried on the negotiated protocol.
+    PendingIncompatible,
 }
 
 impl StudioConnectionStatus {
@@ -67,6 +71,7 @@ impl StudioConnectionStatus {
             Self::Disconnected => "DISCONNECTED",
             Self::Failed => "FAILED",
             Self::Incompatible => "INCOMPATIBLE",
+            Self::PendingIncompatible => "PENDING / INCOMPATIBLE",
         }
     }
 
@@ -84,6 +89,7 @@ pub struct StudioUiState {
     pub view: Option<ClientView>,
     pub can_select_preview: bool,
     pub can_transition: bool,
+    pub supports_wipe: bool,
     pub pending_commands: usize,
     pub notice: Option<String>,
     pub error: Option<String>,
@@ -98,6 +104,7 @@ impl StudioUiState {
             view: None,
             can_select_preview: false,
             can_transition: false,
+            supports_wipe: false,
             pending_commands: 0,
             notice: None,
             error: None,
@@ -121,6 +128,37 @@ impl StudioUiState {
         self.can_select_preview = can_select_preview;
         self.can_transition = can_transition;
         self
+    }
+
+    /// Publishes whether the negotiated protocol can carry Wipe commands.
+    #[must_use]
+    pub const fn with_wipe_support(mut self, supports_wipe: bool) -> Self {
+        self.supports_wipe = supports_wipe;
+        self
+    }
+}
+
+/// Pure transition-control availability derived from one UI state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransitionAvailability {
+    pub cut: bool,
+    pub fade: bool,
+    pub wipe: bool,
+}
+
+/// Computes transition availability without drawing or dispatching intents.
+#[must_use]
+pub const fn transition_availability(
+    connection_status: StudioConnectionStatus,
+    has_view: bool,
+    can_transition: bool,
+    supports_wipe: bool,
+) -> TransitionAvailability {
+    let base = connection_status.controls_enabled() && has_view && can_transition;
+    TransitionAvailability {
+        cut: base,
+        fade: base,
+        wipe: base && supports_wipe,
     }
 }
 
@@ -224,25 +262,25 @@ pub const fn tally_state(input: InputId, switcher: SwitcherState) -> TallyState 
 /// Stateful controller for the pure studio presentation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StudioShell {
-    fade_duration_frames: u32,
+    transition_duration_frames: u32,
 }
 
 impl StudioShell {
-    pub const MIN_FADE_DURATION_FRAMES: u32 = 1;
-    pub const MAX_FADE_DURATION_FRAMES: u32 = 3_600;
-    pub const DEFAULT_FADE_DURATION_FRAMES: u32 = 30;
+    pub const MIN_TRANSITION_DURATION_FRAMES: u32 = 1;
+    pub const MAX_TRANSITION_DURATION_FRAMES: u32 = 3_600;
+    pub const DEFAULT_TRANSITION_DURATION_FRAMES: u32 = 30;
 
     /// Returns the current transition duration in frames.
     #[must_use]
-    pub const fn fade_duration_frames(&self) -> u32 {
-        self.fade_duration_frames
+    pub const fn transition_duration_frames(&self) -> u32 {
+        self.transition_duration_frames
     }
 
     /// Sets and clamps the transition duration to the supported frame range.
-    pub fn set_fade_duration_frames(&mut self, duration_frames: u32) {
-        self.fade_duration_frames = duration_frames.clamp(
-            Self::MIN_FADE_DURATION_FRAMES,
-            Self::MAX_FADE_DURATION_FRAMES,
+    pub fn set_transition_duration_frames(&mut self, duration_frames: u32) {
+        self.transition_duration_frames = duration_frames.clamp(
+            Self::MIN_TRANSITION_DURATION_FRAMES,
+            Self::MAX_TRANSITION_DURATION_FRAMES,
         );
     }
 
@@ -252,7 +290,7 @@ impl StudioShell {
     /// immediate-mode drawing.
     pub fn draw(&mut self, ui: &mut Ui, state: &StudioUiState) -> Vec<StudioIntent> {
         apply_console_visuals(ui.ctx());
-        self.set_fade_duration_frames(self.fade_duration_frames);
+        self.set_transition_duration_frames(self.transition_duration_frames);
 
         let mut intents = Vec::new();
         Frame::new()
@@ -275,7 +313,7 @@ impl StudioShell {
 impl Default for StudioShell {
     fn default() -> Self {
         Self {
-            fade_duration_frames: Self::DEFAULT_FADE_DURATION_FRAMES,
+            transition_duration_frames: Self::DEFAULT_TRANSITION_DURATION_FRAMES,
         }
     }
 }
@@ -400,8 +438,12 @@ fn draw_transition_row(
     state: &StudioUiState,
     intents: &mut Vec<StudioIntent>,
 ) {
-    let enabled =
-        state.connection_status.controls_enabled() && state.view.is_some() && state.can_transition;
+    let availability = transition_availability(
+        state.connection_status,
+        state.view.is_some(),
+        state.can_transition,
+        state.supports_wipe,
+    );
     Frame::new()
         .fill(GRAPHITE_RAISED)
         .stroke(Stroke::new(1.0, Color32::from_rgb(67, 61, 44)))
@@ -411,7 +453,7 @@ fn draw_transition_row(
                 ui.label(RichText::new("TRANSITION").small().strong().color(AMBER));
                 if ui
                     .add_enabled(
-                        enabled,
+                        availability.cut,
                         Button::new(RichText::new("CUT").strong())
                             .fill(Color32::from_rgb(98, 66, 17))
                             .min_size(Vec2::new(92.0, 32.0)),
@@ -422,7 +464,7 @@ fn draw_transition_row(
                 }
                 if ui
                     .add_enabled(
-                        enabled,
+                        availability.fade,
                         Button::new(RichText::new("FADE").strong())
                             .fill(Color32::from_rgb(98, 66, 17))
                             .min_size(Vec2::new(92.0, 32.0)),
@@ -430,21 +472,34 @@ fn draw_transition_row(
                     .clicked()
                 {
                     intents.push(StudioIntent::Fade {
-                        duration_frames: shell.fade_duration_frames,
+                        duration_frames: shell.transition_duration_frames,
+                    });
+                }
+                if ui
+                    .add_enabled(
+                        availability.wipe,
+                        Button::new(RichText::new("WIPE").strong())
+                            .fill(Color32::from_rgb(98, 66, 17))
+                            .min_size(Vec2::new(92.0, 32.0)),
+                    )
+                    .clicked()
+                {
+                    intents.push(StudioIntent::Wipe {
+                        duration_frames: shell.transition_duration_frames,
                     });
                 }
                 ui.label(RichText::new("DURATION").small().color(MUTED));
                 ui.add_enabled(
-                    enabled,
-                    DragValue::new(&mut shell.fade_duration_frames)
+                    availability.fade,
+                    DragValue::new(&mut shell.transition_duration_frames)
                         .range(
-                            StudioShell::MIN_FADE_DURATION_FRAMES
-                                ..=StudioShell::MAX_FADE_DURATION_FRAMES,
+                            StudioShell::MIN_TRANSITION_DURATION_FRAMES
+                                ..=StudioShell::MAX_TRANSITION_DURATION_FRAMES,
                         )
                         .suffix(" FRAMES")
                         .speed(1.0),
                 );
-                shell.set_fade_duration_frames(shell.fade_duration_frames);
+                shell.set_transition_duration_frames(shell.transition_duration_frames);
             });
         });
 }
@@ -526,7 +581,9 @@ fn label_for_input(view: &ClientView, input: InputId) -> String {
 const fn connection_color(status: StudioConnectionStatus) -> Color32 {
     match status {
         StudioConnectionStatus::Ready => PREVIEW,
-        StudioConnectionStatus::Failed | StudioConnectionStatus::Incompatible => ERROR,
+        StudioConnectionStatus::Failed
+        | StudioConnectionStatus::Incompatible
+        | StudioConnectionStatus::PendingIncompatible => ERROR,
         StudioConnectionStatus::Disconnected => MUTED,
         StudioConnectionStatus::Launching
         | StudioConnectionStatus::Connecting
@@ -593,6 +650,7 @@ mod tests {
             StudioConnectionStatus::Disconnected,
             StudioConnectionStatus::Failed,
             StudioConnectionStatus::Incompatible,
+            StudioConnectionStatus::PendingIncompatible,
         ];
         assert!(StudioConnectionStatus::Ready.controls_enabled());
         for status in statuses {
@@ -657,22 +715,49 @@ mod tests {
     }
 
     #[test]
-    fn fade_duration_is_bounded() {
+    fn transition_duration_is_shared_and_bounded() {
         let mut shell = StudioShell::default();
         assert_eq!(
-            shell.fade_duration_frames(),
-            StudioShell::DEFAULT_FADE_DURATION_FRAMES
+            shell.transition_duration_frames(),
+            StudioShell::DEFAULT_TRANSITION_DURATION_FRAMES
         );
-        shell.set_fade_duration_frames(0);
+        shell.set_transition_duration_frames(0);
         assert_eq!(
-            shell.fade_duration_frames(),
-            StudioShell::MIN_FADE_DURATION_FRAMES
+            shell.transition_duration_frames(),
+            StudioShell::MIN_TRANSITION_DURATION_FRAMES
         );
-        shell.set_fade_duration_frames(u32::MAX);
+        shell.set_transition_duration_frames(u32::MAX);
         assert_eq!(
-            shell.fade_duration_frames(),
-            StudioShell::MAX_FADE_DURATION_FRAMES
+            shell.transition_duration_frames(),
+            StudioShell::MAX_TRANSITION_DURATION_FRAMES
         );
+    }
+
+    #[test]
+    fn wipe_availability_requires_every_gate_while_cut_and_fade_do_not_require_support() {
+        assert_eq!(
+            transition_availability(StudioConnectionStatus::Ready, true, true, false),
+            TransitionAvailability {
+                cut: true,
+                fade: true,
+                wipe: false,
+            }
+        );
+        assert!(transition_availability(StudioConnectionStatus::Ready, true, true, true).wipe);
+        for availability in [
+            transition_availability(StudioConnectionStatus::Connecting, true, true, true),
+            transition_availability(StudioConnectionStatus::Ready, false, true, true),
+            transition_availability(StudioConnectionStatus::Ready, true, false, true),
+        ] {
+            assert_eq!(
+                availability,
+                TransitionAvailability {
+                    cut: false,
+                    fade: false,
+                    wipe: false,
+                }
+            );
+        }
     }
 
     #[test]
@@ -682,6 +767,14 @@ mod tests {
             StudioIntent::SelectPreview(input(9))
         );
         assert_ne!(StudioIntent::Cut, StudioIntent::Fade { duration_frames: 1 });
+        assert_ne!(
+            StudioIntent::Fade {
+                duration_frames: 30
+            },
+            StudioIntent::Wipe {
+                duration_frames: 30
+            }
+        );
         assert_eq!(
             StudioIntent::Fade {
                 duration_frames: 30

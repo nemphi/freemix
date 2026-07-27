@@ -19,7 +19,7 @@ use fm_protocol::{
     CapabilityReportSummary, CommandPayload, CommandResult, EngineIdentity, EventCursor,
     EventMessage, EventPayload, HandshakeOutcome, HandshakeResponse, LineDecoder, ProtocolVersion,
     Role, RuntimeEventMessage, RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage,
-    SnapshotReason, WireInputId, WireMessage, encode_line,
+    SnapshotReason, WIPE_PROTOCOL_VERSION, WireInputId, WireMessage, encode_line,
 };
 use fm_types::ProjectId;
 use freemix_studio::{
@@ -58,8 +58,17 @@ fn server(project: ProjectId) -> ServerIdentity {
 }
 
 fn handshake(project: ProjectId, revision: u64, outcome: HandshakeOutcome) -> HandshakeResponse {
+    handshake_version(ProtocolVersion::new(1, 2), project, revision, outcome)
+}
+
+fn handshake_version(
+    negotiated: ProtocolVersion,
+    project: ProjectId,
+    revision: u64,
+    outcome: HandshakeOutcome,
+) -> HandshakeResponse {
     HandshakeResponse {
-        negotiated: ProtocolVersion::new(1, 2),
+        negotiated,
         granted_role: Role::Operator,
         permissions: vec!["switcher.take".to_owned()],
         capabilities: CapabilityReportSummary {
@@ -173,6 +182,7 @@ fn serve_snapshot_then_resume(listener: &TcpListener) {
     let WireMessage::HandshakeRequest(request) = first.receive() else {
         panic!("expected modern handshake request");
     };
+    assert_eq!(request.versions, vec![WIPE_PROTOCOL_VERSION]);
     assert_eq!(request.resume_cursor, None);
     first.send(&WireMessage::HandshakeResponse(handshake(
         project_id(),
@@ -229,6 +239,10 @@ fn existing_runtime_handles_status_runtime_heartbeat_eof_and_resume() {
         }
     );
     assert_eq!(runtime.lifecycle().unwrap(), LifecycleState::Ready);
+    assert_eq!(
+        runtime.session().client().session().unwrap().protocol,
+        ProtocolVersion::new(1, 2)
+    );
 
     runtime.send_heartbeat(1234).unwrap();
     let command = runtime
@@ -313,6 +327,39 @@ fn existing_runtime_rejects_wrong_project_handshake() {
             ClientError::InvalidHandshake("server selected a different project")
         )))
     ));
+    server_thread.join().unwrap();
+}
+
+#[test]
+fn existing_runtime_negotiates_wipe_protocol_with_a_1_3_peer() {
+    let (address, server_thread) = spawn_server(|listener| {
+        let mut peer = Peer::accept(&listener);
+        let WireMessage::HandshakeRequest(request) = peer.receive() else {
+            panic!("expected modern handshake request");
+        };
+        assert_eq!(request.versions, vec![WIPE_PROTOCOL_VERSION]);
+        peer.send(&WireMessage::HandshakeResponse(handshake_version(
+            WIPE_PROTOCOL_VERSION,
+            project_id(),
+            4,
+            HandshakeOutcome::Snapshot {
+                reason: SnapshotReason::NoCursor,
+            },
+        )));
+        peer.send(&WireMessage::Snapshot(snapshot(4)));
+    });
+
+    let mut runtime = StudioRuntime::new(existing_config(address, project_id())).unwrap();
+    assert_eq!(
+        runtime.connect(CONNECT_TIMEOUT).unwrap(),
+        SessionEvent::Connected {
+            mode: SyncMode::Snapshot
+        }
+    );
+    assert_eq!(
+        runtime.session().client().session().unwrap().protocol,
+        WIPE_PROTOCOL_VERSION
+    );
     server_thread.join().unwrap();
 }
 

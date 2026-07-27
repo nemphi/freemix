@@ -16,8 +16,8 @@ use fm_protocol::{
     CapabilityReportSummary, ClientType, CodecError, CommandPayload, CommandResult, EngineIdentity,
     EventCursor, EventMessage, EventPayload, HandshakeOutcome, HandshakeRequest, HandshakeResponse,
     LineDecoder, MAX_LINE_BYTES, ProtocolVersion, ResumeCursor, Role, RuntimeEventMessage,
-    RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage, SnapshotReason, WireInputId,
-    WireMessage, encode_line,
+    RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage, SnapshotReason, WIPE_PROTOCOL_VERSION,
+    WireInputId, WireMessage, encode_line,
 };
 use fm_types::ProjectId;
 use fm_ui_model::ModelError;
@@ -51,7 +51,7 @@ fn server() -> ServerIdentity {
 
 fn client(capacity: usize) -> Client {
     let mut config = ClientConfig::new(
-        vec![ProtocolVersion::new(1, 2)],
+        vec![WIPE_PROTOCOL_VERSION],
         "tcp-test",
         ClientType::Integration,
         Role::Operator,
@@ -65,8 +65,16 @@ fn client(capacity: usize) -> Client {
 }
 
 fn handshake(revision: u64, outcome: HandshakeOutcome) -> HandshakeResponse {
+    handshake_version(ProtocolVersion::new(1, 1), revision, outcome)
+}
+
+fn handshake_version(
+    negotiated: ProtocolVersion,
+    revision: u64,
+    outcome: HandshakeOutcome,
+) -> HandshakeResponse {
     HandshakeResponse {
-        negotiated: ProtocolVersion::new(1, 1),
+        negotiated,
         granted_role: Role::Operator,
         permissions: vec!["switcher.take".to_owned()],
         capabilities: CapabilityReportSummary {
@@ -121,10 +129,19 @@ fn runtime_event(revision: u64) -> RuntimeEventMessage {
 }
 
 fn accept_snapshot(peer: &mut Peer, revision: u64) -> HandshakeRequest {
+    accept_snapshot_version(peer, ProtocolVersion::new(1, 1), revision)
+}
+
+fn accept_snapshot_version(
+    peer: &mut Peer,
+    negotiated: ProtocolVersion,
+    revision: u64,
+) -> HandshakeRequest {
     let WireMessage::HandshakeRequest(request) = peer.receive() else {
         panic!("adapter emitted a legacy or invalid handshake")
     };
-    peer.send(&WireMessage::HandshakeResponse(handshake(
+    peer.send(&WireMessage::HandshakeResponse(handshake_version(
+        negotiated,
         revision,
         HandshakeOutcome::Snapshot {
             reason: SnapshotReason::NoCursor,
@@ -135,11 +152,20 @@ fn accept_snapshot(peer: &mut Peer, revision: u64) -> HandshakeRequest {
 }
 
 fn accept_resume(peer: &mut Peer, revision: u64) -> ResumeCursor {
+    accept_resume_version(peer, ProtocolVersion::new(1, 1), revision)
+}
+
+fn accept_resume_version(
+    peer: &mut Peer,
+    negotiated: ProtocolVersion,
+    revision: u64,
+) -> ResumeCursor {
     let WireMessage::HandshakeRequest(request) = peer.receive() else {
         panic!("adapter emitted a legacy or invalid handshake")
     };
     let cursor = request.resume_cursor.expect("resume cursor");
-    peer.send(&WireMessage::HandshakeResponse(handshake(
+    peer.send(&WireMessage::HandshakeResponse(handshake_version(
+        negotiated,
         revision,
         HandshakeOutcome::Resume {
             cursor: cursor.clone(),
@@ -356,6 +382,144 @@ fn unresolved_command_retries_original_envelope_but_completed_result_does_not() 
     session.connect(address, CONNECT_TIMEOUT).unwrap();
     session.queue_heartbeat(9_999).unwrap();
     assert_eq!(session.flush().unwrap(), 1);
+    server_thread.join().unwrap();
+}
+
+#[test]
+fn unresolved_wipe_is_pending_incompatible_until_a_compatible_reconnect() {
+    let (original_tx, original_rx) = mpsc::channel();
+    let (address, server_thread) = spawn_server(move |listener| {
+        let mut first = Peer::accept(&listener);
+        let request = accept_snapshot_version(&mut first, WIPE_PROTOCOL_VERSION, 4);
+        assert_eq!(request.versions, vec![WIPE_PROTOCOL_VERSION]);
+        let WireMessage::Command(original) = first.receive() else {
+            panic!("expected original Wipe command")
+        };
+        original_tx.send(original.clone()).unwrap();
+        drop(first);
+
+        let mut downgraded = Peer::accept(&listener);
+        accept_resume_version(&mut downgraded, ProtocolVersion::new(1, 2), 4);
+        assert_eq!(
+            downgraded.stream.read(&mut [0_u8; 1]).unwrap(),
+            0,
+            "Wipe was retransmitted to a protocol 1.2 peer"
+        );
+
+        let mut compatible = Peer::accept(&listener);
+        accept_resume_version(&mut compatible, WIPE_PROTOCOL_VERSION, 4);
+        let WireMessage::Command(retried) = compatible.receive() else {
+            panic!("expected unresolved Wipe retry")
+        };
+        assert_eq!(retried, original);
+        compatible.send(&WireMessage::CommandResult(CommandResult::Accepted {
+            id: retried.id,
+            revision: 4,
+            scheduled_frame: None,
+        }));
+    });
+
+    let mut session = TcpSession::new(client(2));
+    session.connect(address, CONNECT_TIMEOUT).unwrap();
+    let command = session
+        .queue_command(
+            CommandPayload::Wipe {
+                duration_frames: 45,
+            },
+            "uncertain-wipe",
+            Some(4),
+            None,
+        )
+        .unwrap();
+    session.flush().unwrap();
+    assert_eq!(original_rx.recv().unwrap(), command);
+    assert!(matches!(
+        session.receive().unwrap(),
+        SessionEvent::Disconnected { .. }
+    ));
+    assert!(matches!(
+        session.connect(address, CONNECT_TIMEOUT),
+        Err(TcpSessionError::PendingCommandIncompatible {
+            ref command_id,
+            negotiated,
+            required,
+            ..
+        }) if command_id == &command.id
+            && negotiated == ProtocolVersion::new(1, 2)
+            && required == WIPE_PROTOCOL_VERSION
+    ));
+    assert!(matches!(
+        session.client().state(),
+        ConnectionState::PendingIncompatible { command_id, .. } if command_id == &command.id
+    ));
+    assert_eq!(session.in_flight_len(), 1);
+    assert_eq!(
+        session.client().command(&command.id).unwrap().command,
+        command
+    );
+
+    session.connect(address, CONNECT_TIMEOUT).unwrap();
+    assert!(matches!(
+        session.receive().unwrap(),
+        SessionEvent::CommandResult {
+            intake: Intake::ResultReconciled,
+            ..
+        }
+    ));
+    server_thread.join().unwrap();
+}
+
+#[test]
+fn explicit_result_terminally_resolves_pending_incompatible_wipe() {
+    let (address, server_thread) = spawn_server(move |listener| {
+        let mut first = Peer::accept(&listener);
+        accept_snapshot_version(&mut first, WIPE_PROTOCOL_VERSION, 4);
+        assert!(matches!(first.receive(), WireMessage::Command(_)));
+        drop(first);
+
+        let mut downgraded = Peer::accept(&listener);
+        accept_resume_version(&mut downgraded, ProtocolVersion::new(1, 2), 4);
+        assert_eq!(downgraded.stream.read(&mut [0_u8; 1]).unwrap(), 0);
+    });
+
+    let mut session = TcpSession::new(client(2));
+    session.connect(address, CONNECT_TIMEOUT).unwrap();
+    let command = session
+        .queue_command(
+            CommandPayload::Wipe { duration_frames: 3 },
+            "terminal-wipe",
+            Some(4),
+            None,
+        )
+        .unwrap();
+    session.flush().unwrap();
+    assert!(matches!(
+        session.receive().unwrap(),
+        SessionEvent::Disconnected { .. }
+    ));
+    assert!(matches!(
+        session.connect(address, CONNECT_TIMEOUT),
+        Err(TcpSessionError::PendingCommandIncompatible { .. })
+    ));
+
+    let terminal = CommandResult::Rejected {
+        id: command.id.clone(),
+        code: "operator_resolved_uncertainty".to_owned(),
+        message: "operator accepted the uncertain outcome".to_owned(),
+        fields: Vec::new(),
+        current_revision: 4,
+        retryable: false,
+    };
+    session
+        .client_mut()
+        .reconcile_result(terminal.clone())
+        .unwrap();
+    assert_eq!(session.client().state(), &ConnectionState::Disconnected);
+    assert_eq!(
+        session.client().command(&command.id).unwrap().status,
+        CommandStatus::Completed(terminal)
+    );
+    assert!(session.client().model().pending_commands().is_empty());
     server_thread.join().unwrap();
 }
 
