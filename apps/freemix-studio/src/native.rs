@@ -9,7 +9,7 @@ use std::{
 };
 
 use eframe::egui;
-use fm_client::SessionEvent;
+use fm_client::{CommandStatus, SessionEvent, TcpSessionError};
 use fm_protocol::{CommandPayload, CommandResult, WireInputId};
 use fm_ui_egui::{StudioConnectionStatus, StudioIntent, StudioShell, StudioUiState};
 
@@ -195,6 +195,43 @@ fn worker_nonce() -> String {
     )
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ReconnectWait {
+    started: Instant,
+    delay: Duration,
+}
+
+impl ReconnectWait {
+    fn from_runtime(runtime: &StudioRuntime) -> Option<Self> {
+        runtime.session().reconnect_backoff().map(|backoff| Self {
+            started: Instant::now(),
+            delay: Duration::from_millis(backoff.delay_ms),
+        })
+    }
+
+    fn remaining(self) -> Duration {
+        self.delay.saturating_sub(self.started.elapsed())
+    }
+}
+
+#[derive(Debug)]
+enum WorkerFailure {
+    Transport(String),
+    Fatal(String),
+}
+
+impl WorkerFailure {
+    fn message(&self) -> &str {
+        match self {
+            Self::Transport(message) | Self::Fatal(message) => message,
+        }
+    }
+
+    const fn is_transport(&self) -> bool {
+        matches!(self, Self::Transport(_))
+    }
+}
+
 fn run_worker(
     config: StudioConfig,
     requests: &Receiver<WorkerRequest>,
@@ -215,9 +252,14 @@ fn run_worker(
     if !publish_runtime(&mut runtime, publisher, None) {
         return;
     }
-    let mut visible_error = match runtime.connect(CONNECT_TIMEOUT) {
-        Ok(_) => None,
-        Err(error) => Some(format!("Connection failed: {error}")),
+    let (mut visible_error, mut reconnect_wait) = match runtime.connect(CONNECT_TIMEOUT) {
+        Ok(_) => (None, None),
+        Err(error) => {
+            let reconnect_wait = is_transport_failure(&error)
+                .then(|| ReconnectWait::from_runtime(&runtime))
+                .flatten();
+            (Some(format!("Connection failed: {error}")), reconnect_wait)
+        }
     };
     if !publish_runtime(&mut runtime, publisher, visible_error.clone()) {
         return;
@@ -226,45 +268,180 @@ fn run_worker(
     let started = Instant::now();
     let mut next_heartbeat = Instant::now() + HEARTBEAT_INTERVAL;
     let mut keys = IdempotencyKeys::new(worker_nonce());
+    let mut pending_command = None;
 
     // Idle receive is intentionally forbidden: the current single-client daemon
     // has no unsolicited broadcasts and TCP receive has no cancellation timeout.
     loop {
         let now = Instant::now();
-        let timeout = next_heartbeat.saturating_duration_since(now);
+        let timeout = reconnect_wait.map_or_else(
+            || next_heartbeat.saturating_duration_since(now),
+            ReconnectWait::remaining,
+        );
         match requests.recv_timeout(timeout) {
             Ok(WorkerRequest::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
             Ok(WorkerRequest::Intent(intent)) => {
-                visible_error = process_intent(&mut runtime, intent, &mut keys, publisher).err();
-                if visible_error.is_some()
-                    && !publish_runtime(&mut runtime, publisher, visible_error.clone())
-                {
+                if !handle_worker_intent(
+                    &mut runtime,
+                    intent,
+                    &mut keys,
+                    publisher,
+                    &mut pending_command,
+                    &mut reconnect_wait,
+                    &mut visible_error,
+                ) {
                     break;
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
-                if matches!(runtime.lifecycle(), Ok(LifecycleState::Ready)) {
-                    let elapsed_ms =
-                        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-                    if let Err(error) = runtime.send_heartbeat(elapsed_ms) {
-                        visible_error = Some(format!("Heartbeat failed: {error}"));
-                        if !publish_runtime(&mut runtime, publisher, visible_error.clone()) {
-                            break;
-                        }
-                    }
+                if !handle_worker_timeout(
+                    &mut runtime,
+                    publisher,
+                    &mut pending_command,
+                    &mut reconnect_wait,
+                    &mut visible_error,
+                    &mut next_heartbeat,
+                    started,
+                ) {
+                    break;
                 }
-                next_heartbeat = Instant::now() + HEARTBEAT_INTERVAL;
             }
         }
     }
 }
 
-fn process_intent(
+fn handle_worker_intent(
     runtime: &mut StudioRuntime,
     intent: StudioIntent,
     keys: &mut IdempotencyKeys,
     publisher: &StatePublisher,
-) -> Result<(), String> {
+    pending_command: &mut Option<String>,
+    reconnect_wait: &mut Option<ReconnectWait>,
+    visible_error: &mut Option<String>,
+) -> bool {
+    if reconnect_wait.is_some() || pending_command.is_some() {
+        *visible_error = Some("Cannot send a command while Studio is reconnecting".to_owned());
+        return publish_runtime(runtime, publisher, visible_error.clone());
+    }
+
+    let command_id = match begin_intent(runtime, intent, keys, publisher) {
+        Ok(command_id) => command_id,
+        Err(error) => {
+            *visible_error = Some(error);
+            return publish_runtime(runtime, publisher, visible_error.clone());
+        }
+    };
+    *pending_command = Some(command_id);
+    let result = runtime
+        .flush()
+        .map_err(|error| worker_error("Could not send command", &error))
+        .and_then(|_| {
+            consume_command_sequence(
+                runtime,
+                pending_command.as_deref().expect("pending command"),
+                publisher,
+            )
+        });
+    match result {
+        Ok(()) => {
+            *pending_command = None;
+            *visible_error = None;
+        }
+        Err(error) => {
+            *visible_error = Some(error.message().to_owned());
+            *reconnect_wait = if error.is_transport() {
+                ReconnectWait::from_runtime(runtime)
+            } else {
+                *pending_command = None;
+                None
+            };
+        }
+    }
+    visible_error.is_none() || publish_runtime(runtime, publisher, visible_error.clone())
+}
+
+fn handle_worker_timeout(
+    runtime: &mut StudioRuntime,
+    publisher: &StatePublisher,
+    pending_command: &mut Option<String>,
+    reconnect_wait: &mut Option<ReconnectWait>,
+    visible_error: &mut Option<String>,
+    next_heartbeat: &mut Instant,
+    started: Instant,
+) -> bool {
+    if let Some(wait) = *reconnect_wait {
+        if !wait.remaining().is_zero() {
+            return true;
+        }
+        match runtime.reconnect(wait.started.elapsed(), CONNECT_TIMEOUT) {
+            Ok(_) => {
+                *reconnect_wait = None;
+                *visible_error = None;
+                *next_heartbeat = Instant::now() + HEARTBEAT_INTERVAL;
+                if !publish_runtime(runtime, publisher, None) {
+                    return false;
+                }
+
+                if let Some(command_id) = pending_command.as_deref() {
+                    let completed = runtime
+                        .session()
+                        .client()
+                        .command(command_id)
+                        .is_some_and(|record| matches!(record.status, CommandStatus::Completed(_)));
+                    let result = if completed {
+                        Ok(())
+                    } else {
+                        consume_command_sequence(runtime, command_id, publisher)
+                    };
+                    match result {
+                        Ok(()) => *pending_command = None,
+                        Err(error) => {
+                            *visible_error = Some(error.message().to_owned());
+                            *reconnect_wait = if error.is_transport() {
+                                ReconnectWait::from_runtime(runtime)
+                            } else {
+                                *pending_command = None;
+                                None
+                            };
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                *visible_error = Some(format!("Reconnect failed: {error}"));
+                *reconnect_wait = if is_transport_failure(&error) {
+                    ReconnectWait::from_runtime(runtime)
+                } else {
+                    *pending_command = None;
+                    None
+                };
+            }
+        }
+        return publish_runtime(runtime, publisher, visible_error.clone());
+    }
+
+    if matches!(runtime.lifecycle(), Ok(LifecycleState::Ready)) {
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if let Err(error) = runtime.send_heartbeat(elapsed_ms) {
+            *visible_error = Some(format!("Heartbeat failed: {error}"));
+            if is_transport_failure(&error) {
+                *reconnect_wait = ReconnectWait::from_runtime(runtime);
+            }
+            if !publish_runtime(runtime, publisher, visible_error.clone()) {
+                return false;
+            }
+        }
+    }
+    *next_heartbeat = Instant::now() + HEARTBEAT_INTERVAL;
+    true
+}
+
+fn begin_intent(
+    runtime: &mut StudioRuntime,
+    intent: StudioIntent,
+    keys: &mut IdempotencyKeys,
+    publisher: &StatePublisher,
+) -> Result<String, String> {
     let payload = intent_payload(intent);
     let expected_revision = runtime
         .session()
@@ -284,29 +461,25 @@ fn process_intent(
     if !publish_runtime(runtime, publisher, None) {
         return Err("Studio UI disconnected".to_owned());
     }
-    runtime
-        .flush()
-        .map_err(|error| format!("Could not send command: {error}"))?;
-
-    consume_command_sequence(runtime, &command.id, publisher)
+    Ok(command.id)
 }
 
 fn consume_command_sequence(
     runtime: &mut StudioRuntime,
     command_id: &str,
     publisher: &StatePublisher,
-) -> Result<(), String> {
+) -> Result<(), WorkerFailure> {
     let mut consumed = 0;
     count_record(&mut consumed)?;
-    let result = match runtime.receive().map_err(|error| transport_error(&error))? {
+    let result = match receive_command_event(runtime)? {
         SessionEvent::CommandResult { result, .. } => result,
-        other => return Err(unexpected("command result", &other)),
+        other => return Err(unexpected_failure("command result", &other)),
     };
     if result_id(&result) != command_id {
-        return Err(format!(
+        return Err(WorkerFailure::Fatal(format!(
             "Unexpected command result ID {:?}; expected {command_id:?}",
             result_id(&result)
-        ));
+        )));
     }
     let accepted_revision = match &result {
         CommandResult::Accepted { revision, .. } => *revision,
@@ -320,56 +493,84 @@ fn consume_command_sequence(
         }
     };
     if !publish_runtime(runtime, publisher, None) {
-        return Err("Studio UI disconnected".to_owned());
+        return Err(WorkerFailure::Fatal("Studio UI disconnected".to_owned()));
+    }
+    if runtime
+        .session()
+        .client()
+        .last_applied_cursor()
+        .is_some_and(|cursor| cursor.revision >= accepted_revision)
+    {
+        return Ok(());
     }
 
     count_record(&mut consumed)?;
-    match runtime.receive().map_err(|error| transport_error(&error))? {
+    match receive_command_event(runtime)? {
         SessionEvent::Event { event, .. } if event.cursor.revision == accepted_revision => {}
         SessionEvent::Event { event, .. } => {
-            return Err(format!(
+            return Err(WorkerFailure::Fatal(format!(
                 "Unexpected durable event revision {}; expected {accepted_revision}",
                 event.cursor.revision
-            ));
+            )));
         }
-        other => return Err(unexpected("durable event", &other)),
+        other => return Err(unexpected_failure("durable event", &other)),
     }
     if !publish_runtime(runtime, publisher, None) {
-        return Err("Studio UI disconnected".to_owned());
+        return Err(WorkerFailure::Fatal("Studio UI disconnected".to_owned()));
     }
 
     count_record(&mut consumed)?;
-    match runtime.receive().map_err(|error| transport_error(&error))? {
+    match receive_command_event(runtime)? {
         SessionEvent::RuntimeEvent { event, .. } if event.revision == accepted_revision => {}
         SessionEvent::RuntimeEvent { event, .. } => {
-            return Err(format!(
+            return Err(WorkerFailure::Fatal(format!(
                 "Unexpected runtime event revision {}; expected {accepted_revision}",
                 event.revision
-            ));
+            )));
         }
-        other => return Err(unexpected("runtime event", &other)),
+        other => return Err(unexpected_failure("runtime event", &other)),
     }
     if !publish_runtime(runtime, publisher, None) {
-        return Err("Studio UI disconnected".to_owned());
+        return Err(WorkerFailure::Fatal("Studio UI disconnected".to_owned()));
     }
     Ok(())
 }
 
-fn count_record(consumed: &mut usize) -> Result<(), String> {
+fn count_record(consumed: &mut usize) -> Result<(), WorkerFailure> {
     *consumed = consumed.saturating_add(1);
     if *consumed > MAX_COMMAND_RECORDS {
-        Err("Command response exceeded the record limit".to_owned())
+        Err(WorkerFailure::Fatal(
+            "Command response exceeded the record limit".to_owned(),
+        ))
     } else {
         Ok(())
     }
 }
 
-fn transport_error(error: &crate::StudioError) -> String {
-    format!("Command response failed: {error}")
+fn receive_command_event(runtime: &mut StudioRuntime) -> Result<SessionEvent, WorkerFailure> {
+    runtime
+        .receive()
+        .map_err(|error| worker_error("Command response failed", &error))
 }
 
-fn unexpected(expected: &str, event: &SessionEvent) -> String {
-    match event {
+fn worker_error(context: &str, error: &crate::StudioError) -> WorkerFailure {
+    let message = format!("{context}: {error}");
+    if is_transport_failure(error) {
+        WorkerFailure::Transport(message)
+    } else {
+        WorkerFailure::Fatal(message)
+    }
+}
+
+const fn is_transport_failure(error: &crate::StudioError) -> bool {
+    matches!(
+        error,
+        crate::StudioError::Session(TcpSessionError::Disconnected { .. })
+    )
+}
+
+fn unexpected_failure(expected: &str, event: &SessionEvent) -> WorkerFailure {
+    let message = match event {
         SessionEvent::ServerError(error) => format!(
             "Server error while awaiting {expected}: {}: {}",
             error.error.code, error.error.message
@@ -378,10 +579,13 @@ fn unexpected(expected: &str, event: &SessionEvent) -> String {
             format!("Durable event gap while awaiting {expected}")
         }
         SessionEvent::Disconnected { cause, .. } => {
-            format!("Disconnected while awaiting {expected}: {cause:?}")
+            return WorkerFailure::Transport(format!(
+                "Disconnected while awaiting {expected}: {cause:?}"
+            ));
         }
         _ => format!("Unexpected response while awaiting {expected}: {event:?}"),
-    }
+    };
+    WorkerFailure::Fatal(message)
 }
 
 fn result_id(result: &CommandResult) -> &str {
@@ -642,7 +846,7 @@ mod tests {
         }
     }
 
-    fn serve_worker_select_preview(listener: &TcpListener) {
+    fn accept_worker_snapshot(listener: &TcpListener) -> FakePeer {
         let mut peer = FakePeer::accept(listener);
         assert!(matches!(peer.receive(), WireMessage::HandshakeRequest(_)));
         peer.send(&WireMessage::HandshakeResponse(HandshakeResponse {
@@ -672,6 +876,77 @@ mod tests {
             realized_program: wire_input(1),
             realized_preview: wire_input(2),
         }));
+        peer
+    }
+
+    fn accept_worker_resume(listener: &TcpListener, current_revision: u64) -> (FakePeer, u64) {
+        let mut peer = FakePeer::accept(listener);
+        let WireMessage::HandshakeRequest(request) = peer.receive() else {
+            panic!("expected reconnect handshake request");
+        };
+        let cursor = request.resume_cursor.expect("resume cursor");
+        peer.send(&WireMessage::HandshakeResponse(HandshakeResponse {
+            negotiated: ProtocolVersion::new(1, 2),
+            granted_role: Role::Operator,
+            permissions: vec!["select_preview".to_owned(), "transition".to_owned()],
+            capabilities: CapabilityReportSummary {
+                digest: "sha256:worker-test".to_owned(),
+                total: 1,
+                available: 1,
+                degraded: 0,
+                unavailable: 0,
+            },
+            server: test_server(),
+            current_revision,
+            outcome: HandshakeOutcome::Resume {
+                cursor: cursor.clone(),
+            },
+        }));
+        (peer, cursor.revision)
+    }
+
+    fn spawn_test_worker(
+        address: std::net::SocketAddr,
+    ) -> (
+        SyncSender<WorkerRequest>,
+        Receiver<StudioUiState>,
+        JoinHandle<()>,
+    ) {
+        let (request_sender, request_receiver) = sync_channel(REQUEST_CAPACITY);
+        let (state_sender, state_receiver) = sync_channel(STATE_CAPACITY);
+        let worker = thread::spawn(move || {
+            let publisher = StatePublisher {
+                sender: state_sender,
+                repaint_context: egui::Context::default(),
+            };
+            run_worker(
+                StudioConfig {
+                    connection: ConnectionConfig::Existing(ExistingConfig {
+                        address,
+                        expected_project_id: test_project_id(),
+                    }),
+                    client_id: "worker-test".to_owned(),
+                    desired_role: Role::Operator,
+                    restart_policy: RestartPolicy::default(),
+                },
+                &request_receiver,
+                &publisher,
+            );
+        });
+        (request_sender, state_receiver, worker)
+    }
+
+    fn wait_until_ready(states: &Receiver<StudioUiState>) {
+        loop {
+            let state = states.recv_timeout(Duration::from_secs(3)).unwrap();
+            if state.connection_status == StudioConnectionStatus::Ready {
+                return;
+            }
+        }
+    }
+
+    fn serve_worker_select_preview(listener: &TcpListener) {
+        let mut peer = accept_worker_snapshot(listener);
 
         let WireMessage::Command(command) = peer.receive() else {
             panic!("expected Select Preview command");
@@ -717,36 +992,9 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || serve_worker_select_preview(&listener));
 
-        let (request_sender, request_receiver) = sync_channel(REQUEST_CAPACITY);
-        let (state_sender, state_receiver) = sync_channel(STATE_CAPACITY);
-        let worker = thread::spawn(move || {
-            let publisher = StatePublisher {
-                sender: state_sender,
-                repaint_context: egui::Context::default(),
-            };
-            run_worker(
-                StudioConfig {
-                    connection: ConnectionConfig::Existing(ExistingConfig {
-                        address,
-                        expected_project_id: test_project_id(),
-                    }),
-                    client_id: "worker-test".to_owned(),
-                    desired_role: Role::Operator,
-                    restart_policy: RestartPolicy::default(),
-                },
-                &request_receiver,
-                &publisher,
-            );
-        });
+        let (request_sender, state_receiver, worker) = spawn_test_worker(address);
 
-        loop {
-            let state = state_receiver.recv_timeout(Duration::from_secs(3)).unwrap();
-            if state.connection_status == StudioConnectionStatus::Ready {
-                assert!(state.can_select_preview);
-                assert!(state.can_transition);
-                break;
-            }
-        }
+        wait_until_ready(&state_receiver);
         let target = InputId::new(NonZeroU128::new(3).unwrap());
         try_enqueue(
             &request_sender,
@@ -785,6 +1033,116 @@ mod tests {
             "idle worker did not shut down promptly"
         );
         worker.join().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn worker_reconnects_with_cursor_and_retries_one_command_envelope() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut first = accept_worker_snapshot(&listener);
+            let WireMessage::Command(original) = first.receive() else {
+                panic!("expected original command");
+            };
+            drop(first);
+
+            let (mut second, resumed_revision) = accept_worker_resume(&listener, 5);
+            assert_eq!(resumed_revision, 4);
+            second.send(&WireMessage::Event(EventMessage {
+                cursor: EventCursor {
+                    engine: test_engine(),
+                    revision: 5,
+                },
+                payload: EventPayload::DesiredSwitcher {
+                    program: wire_input(1),
+                    preview: wire_input(3),
+                },
+            }));
+            let WireMessage::Command(retried) = second.receive() else {
+                panic!("expected retried command");
+            };
+            assert_eq!(retried, original, "reconnect changed the command envelope");
+            second.send(&WireMessage::CommandResult(CommandResult::Accepted {
+                id: retried.id,
+                revision: 5,
+                scheduled_frame: None,
+            }));
+        });
+
+        let (requests, states, worker) = spawn_test_worker(address);
+        wait_until_ready(&states);
+        let target = InputId::new(NonZeroU128::new(3).unwrap());
+        try_enqueue(
+            &requests,
+            WorkerRequest::Intent(StudioIntent::SelectPreview(target)),
+        )
+        .unwrap();
+
+        let mut saw_backoff = false;
+        loop {
+            let state = states.recv_timeout(Duration::from_secs(3)).unwrap();
+            saw_backoff |= state.connection_status == StudioConnectionStatus::Backoff;
+            if saw_backoff
+                && state.connection_status == StudioConnectionStatus::Ready
+                && state.pending_commands == 0
+                && state.view.as_ref().is_some_and(|view| {
+                    view.cursor.revision.get() == 5 && view.switcher.desired.preview == target
+                })
+            {
+                assert_eq!(state.error, None);
+                break;
+            }
+        }
+
+        try_enqueue(&requests, WorkerRequest::Shutdown).unwrap();
+        worker.join().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn worker_shutdown_interrupts_reconnect_backoff() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut first = accept_worker_snapshot(&listener);
+            let WireMessage::Command(original) = first.receive() else {
+                panic!("expected original command");
+            };
+            drop(first);
+
+            let (mut second, resumed_revision) = accept_worker_resume(&listener, 4);
+            assert_eq!(resumed_revision, 4);
+            let WireMessage::Command(retried) = second.receive() else {
+                panic!("expected retried command");
+            };
+            assert_eq!(retried, original);
+        });
+
+        let (requests, states, worker) = spawn_test_worker(address);
+        wait_until_ready(&states);
+        try_enqueue(
+            &requests,
+            WorkerRequest::Intent(StudioIntent::SelectPreview(InputId::new(
+                NonZeroU128::new(3).unwrap(),
+            ))),
+        )
+        .unwrap();
+
+        let mut backoffs = 0;
+        while backoffs < 2 {
+            let state = states.recv_timeout(Duration::from_secs(3)).unwrap();
+            if state.connection_status == StudioConnectionStatus::Backoff {
+                backoffs += 1;
+            }
+        }
+        let shutdown_started = Instant::now();
+        try_enqueue(&requests, WorkerRequest::Shutdown).unwrap();
+        worker.join().unwrap();
+        assert!(
+            shutdown_started.elapsed() < Duration::from_millis(250),
+            "worker waited for the 500 ms reconnect delay during shutdown"
+        );
         server.join().unwrap();
     }
 }
