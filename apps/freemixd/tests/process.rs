@@ -12,8 +12,9 @@ use fm_client::{
     Client as ProtocolClient, ClientConfig, ClientError, ConnectionState, Intake, Outbound,
 };
 use fm_model::{
-    AudioBus, Input, InputKind, Layer, MainMix, Output, Project, ProjectSettings, RestartPolicy,
-    Scene, SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef, StartupPolicy,
+    AudioBus, Input, InputKind, Layer, LayerGeometry, MainMix, Output, Project, ProjectSettings,
+    RestartPolicy, Rgba8, Rotation, Scene, SimulatedAudio, SimulatedInput, SimulatedVideo,
+    SolidColor, SourceRef, StartupPolicy,
 };
 use fm_persistence::{ProjectPosition, ProjectStore, RuntimeRouting, StoredProject};
 use fm_protocol::{
@@ -492,7 +493,7 @@ fn v2_project_migrates_and_serves() {
     daemon.wait_success();
 
     let migrated = ProjectStore::new(project_path).unwrap().load().unwrap();
-    assert_eq!(migrated.schema_version(), 3);
+    assert_eq!(migrated.schema_version(), 4);
     assert_eq!(migrated.project().name(), "Legacy V2");
 }
 
@@ -654,10 +655,15 @@ fn canonical_project() -> Project {
     project.add_scene(Scene {
         id: scene_id(1),
         name: "Program scene".into(),
+        background: Rgba8::OPAQUE_BLACK,
         layers: vec![Layer {
             name: "Source".into(),
             source: SourceRef::Input(domain_input(1)),
             enabled: true,
+            geometry: LayerGeometry::new(0, 0, 1_280, 720, Rotation::Deg0),
+            crop: None,
+            opacity: u8::MAX,
+            z_order: 0,
         }],
     });
     project.add_audio_bus(AudioBus {

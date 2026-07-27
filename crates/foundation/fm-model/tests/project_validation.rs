@@ -1,11 +1,11 @@
 use std::num::NonZeroU128;
 
 use fm_model::{
-    AudioBus, BusSend, CURRENT_SCHEMA_VERSION, EntityRef, Input, InputKind, Layer, MainMix,
-    MigrationInput, OLDEST_SUPPORTED_SCHEMA_VERSION, Output, OutputFormat, Project,
-    ProjectSettings, RestartPolicy, SUPPORTED_SCHEMA_VERSIONS, Scene, SchemaVersion,
-    SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef, StartupPolicy,
-    ValidationErrorKind,
+    AudioBus, BusSend, CURRENT_SCHEMA_VERSION, CropRect, EntityRef, Input, InputKind, Layer,
+    LayerGeometry, MainMix, MigrationInput, OLDEST_SUPPORTED_SCHEMA_VERSION, Output, OutputFormat,
+    Project, ProjectSettings, RestartPolicy, Rgba8, Rotation, SUPPORTED_SCHEMA_VERSIONS, Scene,
+    SchemaVersion, SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef,
+    StartupPolicy, ValidationErrorKind,
 };
 use fm_types::{
     AudioFormat, BusId, ChannelLayout, ColorMetadata, FrameRate, InputId, OutputId, PixelFormat,
@@ -51,6 +51,22 @@ fn settings() -> ProjectSettings {
     }
 }
 
+fn identity_geometry() -> LayerGeometry {
+    LayerGeometry::new(0, 0, 1920, 1080, Rotation::Deg0)
+}
+
+fn layer(name: &str, source: SourceRef) -> Layer {
+    Layer {
+        name: name.into(),
+        source,
+        enabled: true,
+        geometry: identity_geometry(),
+        crop: None,
+        opacity: u8::MAX,
+        z_order: 0,
+    }
+}
+
 fn valid_project() -> Project {
     let mut project = Project::new(project_id(1), "Main show", settings());
     project.add_input(Input {
@@ -64,11 +80,8 @@ fn valid_project() -> Project {
     project.add_scene(Scene {
         id: scene_id(1),
         name: "Wide".into(),
-        layers: vec![Layer {
-            name: "Camera".into(),
-            source: SourceRef::Input(input_id(1)),
-            enabled: true,
-        }],
+        background: Rgba8::OPAQUE_BLACK,
+        layers: vec![layer("Camera", SourceRef::Input(input_id(1)))],
     });
     project.add_audio_bus(AudioBus {
         id: bus_id(1),
@@ -231,21 +244,21 @@ fn duplicate_routes_are_rejected() {
 
 #[test]
 fn schema_support_window_is_current_plus_previous_two() {
-    assert_eq!(CURRENT_SCHEMA_VERSION, SchemaVersion::new(3));
-    assert_eq!(OLDEST_SUPPORTED_SCHEMA_VERSION, SchemaVersion::new(1));
+    assert_eq!(CURRENT_SCHEMA_VERSION, SchemaVersion::new(4));
+    assert_eq!(OLDEST_SUPPORTED_SCHEMA_VERSION, SchemaVersion::new(2));
     assert_eq!(
         SUPPORTED_SCHEMA_VERSIONS,
         [
+            SchemaVersion::new(4),
             SchemaVersion::new(3),
             SchemaVersion::new(2),
-            SchemaVersion::new(1)
         ]
     );
     assert!(CURRENT_SCHEMA_VERSION.is_supported());
     assert!(!CURRENT_SCHEMA_VERSION.requires_migration());
-    assert!(SchemaVersion::new(1).requires_migration());
-    assert!(!SchemaVersion::new(0).is_supported());
-    assert!(!SchemaVersion::new(4).is_supported());
+    assert!(SchemaVersion::new(2).requires_migration());
+    assert!(!SchemaVersion::new(1).is_supported());
+    assert!(!SchemaVersion::new(5).is_supported());
 
     let input = MigrationInput::new(SchemaVersion::new(2), ("format-neutral", 7_u8));
     assert_eq!(input.schema_version(), SchemaVersion::new(2));
@@ -307,20 +320,14 @@ fn nested_scene_cycles_are_rejected() {
     project.add_scene(Scene {
         id: scene_id(2),
         name: "Nested A".into(),
-        layers: vec![Layer {
-            name: "B".into(),
-            source: SourceRef::Scene(scene_id(3)),
-            enabled: true,
-        }],
+        background: Rgba8::OPAQUE_BLACK,
+        layers: vec![layer("B", SourceRef::Scene(scene_id(3)))],
     });
     project.add_scene(Scene {
         id: scene_id(3),
         name: "Nested B".into(),
-        layers: vec![Layer {
-            name: "A".into(),
-            source: SourceRef::Scene(scene_id(2)),
-            enabled: true,
-        }],
+        background: Rgba8::OPAQUE_BLACK,
+        layers: vec![layer("A", SourceRef::Scene(scene_id(2)))],
     });
 
     let errors = project.validate().unwrap_err();
@@ -330,6 +337,130 @@ fn nested_scene_cycles_are_rejected() {
             .filter(|error| error.kind == ValidationErrorKind::Cycle)
             .count(),
         2
+    );
+}
+
+#[test]
+fn scene_inputs_validate_full_width_scene_and_audio_references() {
+    let high = u128::from(u64::MAX) + 100;
+    let mut project = Project::new(project_id(high), "Scene routing", settings());
+    project.add_input(Input {
+        id: input_id(high + 1),
+        name: "Audio".into(),
+        kind: InputKind::Color,
+        required_capabilities: Vec::new(),
+    });
+    project.add_input(Input {
+        id: input_id(high + 2),
+        name: "Scene input".into(),
+        kind: InputKind::Scene {
+            scene_id: scene_id(high + 3),
+            audio_source: Some(input_id(high + 1)),
+        },
+        required_capabilities: Vec::new(),
+    });
+    project.add_scene(Scene {
+        id: scene_id(high + 3),
+        name: "Scene".into(),
+        background: Rgba8::new(8, 4, 2, 16),
+        layers: Vec::new(),
+    });
+
+    assert_eq!(project.validate(), Ok(()));
+}
+
+#[test]
+fn scene_input_missing_scene_and_audio_references_are_reported() {
+    let mut project = Project::new(project_id(9), "Missing scene routes", settings());
+    project.add_input(Input {
+        id: input_id(9),
+        name: "Broken scene input".into(),
+        kind: InputKind::Scene {
+            scene_id: scene_id(99),
+            audio_source: Some(input_id(98)),
+        },
+        required_capabilities: Vec::new(),
+    });
+
+    let errors = project.validate().unwrap_err();
+    assert!(errors.iter().any(|error| {
+        error.kind == ValidationErrorKind::MissingReference(EntityRef::Scene(scene_id(99)))
+    }));
+    assert!(errors.iter().any(|error| {
+        error.kind == ValidationErrorKind::MissingReference(EntityRef::Input(input_id(98)))
+    }));
+}
+
+#[test]
+fn scene_composition_bounds_and_premultiplication_are_validated() {
+    let mut project = Project::new(project_id(10), "Bounds", settings());
+    project.add_input(Input {
+        id: input_id(1),
+        name: "Source".into(),
+        kind: InputKind::Color,
+        required_capabilities: Vec::new(),
+    });
+    let mut invalid_layer = layer("Source", SourceRef::Input(input_id(1)));
+    invalid_layer.geometry.width = 0;
+    invalid_layer.crop = Some(CropRect::new(1919, 0, 2, 1));
+    let mut layers = vec![invalid_layer];
+    while layers.len() <= Scene::MAX_LAYERS {
+        layers.push(layer("extra", SourceRef::Input(input_id(1))));
+    }
+    project.add_scene(Scene {
+        id: scene_id(1),
+        name: "Invalid".into(),
+        background: Rgba8::new(2, 0, 0, 1),
+        layers,
+    });
+
+    let errors = project.validate().unwrap_err();
+    for field in ["background", "layers", "layers.geometry", "layers.crop"] {
+        assert!(errors.iter().any(|error| error.field == field));
+    }
+}
+
+#[test]
+fn scene_input_video_and_audio_cycles_are_rejected() {
+    let mut project = Project::new(project_id(20), "Cycles", settings());
+    project.add_input(Input {
+        id: input_id(20),
+        name: "A".into(),
+        kind: InputKind::Scene {
+            scene_id: scene_id(20),
+            audio_source: Some(input_id(21)),
+        },
+        required_capabilities: Vec::new(),
+    });
+    project.add_input(Input {
+        id: input_id(21),
+        name: "B".into(),
+        kind: InputKind::Scene {
+            scene_id: scene_id(21),
+            audio_source: Some(input_id(20)),
+        },
+        required_capabilities: Vec::new(),
+    });
+    project.add_scene(Scene {
+        id: scene_id(20),
+        name: "A".into(),
+        background: Rgba8::OPAQUE_BLACK,
+        layers: vec![layer("B", SourceRef::Input(input_id(21)))],
+    });
+    project.add_scene(Scene {
+        id: scene_id(21),
+        name: "B".into(),
+        background: Rgba8::OPAQUE_BLACK,
+        layers: vec![layer("A", SourceRef::Input(input_id(20)))],
+    });
+
+    let errors = project.validate().unwrap_err();
+    assert_eq!(
+        errors
+            .iter()
+            .filter(|error| error.kind == ValidationErrorKind::Cycle)
+            .count(),
+        4
     );
 }
 

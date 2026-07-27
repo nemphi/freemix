@@ -1,7 +1,7 @@
 use std::fmt::Write as _;
 
 use fm_model::{
-    InputKind, RestartPolicy, SimulatedAudio, SimulatedVideo, SourceRef, StartupPolicy,
+    InputKind, RestartPolicy, Rotation, SimulatedAudio, SimulatedVideo, SourceRef, StartupPolicy,
 };
 use fm_types::{
     Channel, ChromaLocation, ColorPrimaries, MatrixCoefficients, PixelFormat, SampleFormat,
@@ -147,38 +147,7 @@ fn write_project_collections(output: &mut String, project: &fm_model::Project) {
         output.push_str("\n      }");
     }
     array_end(output, project.inputs().is_empty(), 4);
-    output.push_str(",\n    \"scenes\": [");
-    for (index, scene) in project.scenes().iter().enumerate() {
-        item_prefix(output, index, 6);
-        write!(
-            output,
-            "{{\n        \"id\": {},\n        \"name\": \"",
-            scene.id
-        )
-        .expect("writing to a string cannot fail");
-        escape_string(output, &scene.name);
-        output.push_str("\",\n        \"layers\": [");
-        for (layer_index, layer) in scene.layers.iter().enumerate() {
-            item_prefix(output, layer_index, 10);
-            output.push_str("{\n            \"name\": \"");
-            escape_string(output, &layer.name);
-            output.push_str("\",\n            \"source\": ");
-            match layer.source {
-                SourceRef::Input(id) => write!(output, "{{\"type\": \"input\", \"id\": {id}}}"),
-                SourceRef::Scene(id) => write!(output, "{{\"type\": \"scene\", \"id\": {id}}}"),
-            }
-            .expect("writing to a string cannot fail");
-            write!(
-                output,
-                ",\n            \"enabled\": {}\n          }}",
-                layer.enabled
-            )
-            .expect("writing to a string cannot fail");
-        }
-        array_end(output, scene.layers.is_empty(), 8);
-        output.push_str("\n      }");
-    }
-    array_end(output, project.scenes().is_empty(), 4);
+    write_scenes(output, project);
     output.push_str(",\n    \"audio_buses\": [");
     for (index, bus) in project.audio_buses().iter().enumerate() {
         item_prefix(output, index, 6);
@@ -224,6 +193,70 @@ fn write_project_collections(output: &mut String, project: &fm_model::Project) {
     output.push(',');
 }
 
+fn write_scenes(output: &mut String, project: &fm_model::Project) {
+    output.push_str(",\n    \"scenes\": [");
+    for (index, scene) in project.scenes().iter().enumerate() {
+        item_prefix(output, index, 6);
+        write!(
+            output,
+            "{{\n        \"id\": {},\n        \"name\": \"",
+            scene.id
+        )
+        .expect("writing to a string cannot fail");
+        escape_string(output, &scene.name);
+        write!(
+            output,
+            "\",\n        \"background\": {{\"red\": {}, \"green\": {}, \"blue\": {}, \"alpha\": {}}},\n        \"layers\": [",
+            scene.background.red,
+            scene.background.green,
+            scene.background.blue,
+            scene.background.alpha,
+        )
+        .expect("writing to a string cannot fail");
+        for (layer_index, layer) in scene.layers.iter().enumerate() {
+            item_prefix(output, layer_index, 10);
+            output.push_str("{\n            \"name\": \"");
+            escape_string(output, &layer.name);
+            output.push_str("\",\n            \"source\": ");
+            match layer.source {
+                SourceRef::Input(id) => write!(output, "{{\"type\": \"input\", \"id\": {id}}}"),
+                SourceRef::Scene(id) => write!(output, "{{\"type\": \"scene\", \"id\": {id}}}"),
+            }
+            .expect("writing to a string cannot fail");
+            write!(
+                output,
+                ",\n            \"enabled\": {},\n            \"geometry\": {{\"translation_x\": {}, \"translation_y\": {}, \"width\": {}, \"height\": {}, \"rotation\": \"{}\"}},\n            \"crop\": ",
+                layer.enabled,
+                layer.geometry.translation_x,
+                layer.geometry.translation_y,
+                layer.geometry.width,
+                layer.geometry.height,
+                rotation(layer.geometry.rotation),
+            )
+            .expect("writing to a string cannot fail");
+            if let Some(crop) = layer.crop {
+                write!(
+                    output,
+                    "{{\"x\": {}, \"y\": {}, \"width\": {}, \"height\": {}}}",
+                    crop.x, crop.y, crop.width, crop.height,
+                )
+                .expect("writing to a string cannot fail");
+            } else {
+                output.push_str("null");
+            }
+            write!(
+                output,
+                ",\n            \"opacity\": {},\n            \"z_order\": {}\n          }}",
+                layer.opacity, layer.z_order,
+            )
+            .expect("writing to a string cannot fail");
+        }
+        array_end(output, scene.layers.is_empty(), 8);
+        output.push_str("\n      }");
+    }
+    array_end(output, project.scenes().is_empty(), 4);
+}
+
 fn write_frame_rate(output: &mut String, rate: fm_types::FrameRate) {
     write!(
         output,
@@ -247,6 +280,22 @@ fn write_input_kind(output: &mut String, kind: &InputKind) {
         }
         InputKind::Network { endpoint } => {
             write_string_variant(output, "network", "endpoint", endpoint);
+        }
+        InputKind::Scene {
+            scene_id,
+            audio_source,
+        } => {
+            write!(
+                output,
+                "{{\"type\": \"scene\", \"scene_id\": {scene_id}, \"audio_source\": "
+            )
+            .expect("writing to a string cannot fail");
+            if let Some(audio_source) = audio_source {
+                write!(output, "{audio_source}").expect("writing to a string cannot fail");
+            } else {
+                output.push_str("null");
+            }
+            output.push('}');
         }
         InputKind::Simulated(simulated) => {
             output.push_str("{\"type\": \"simulated\", \"video\": ");
@@ -455,6 +504,15 @@ const fn startup_policy(value: StartupPolicy) -> &'static str {
     match value {
         StartupPolicy::Stopped => "stopped",
         StartupPolicy::ReconcileDesiredState => "reconcile_desired_state",
+    }
+}
+
+const fn rotation(value: Rotation) -> &'static str {
+    match value {
+        Rotation::Deg0 => "deg0",
+        Rotation::Deg90 => "deg90",
+        Rotation::Deg180 => "deg180",
+        Rotation::Deg270 => "deg270",
     }
 }
 

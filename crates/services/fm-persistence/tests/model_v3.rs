@@ -6,9 +6,9 @@ use std::{
 };
 
 use fm_model::{
-    AudioBus, BusSend, Input, InputKind, Layer, MainMix, Output, Project, ProjectSettings,
-    RestartPolicy, Scene, SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef,
-    StartupPolicy,
+    AudioBus, BusSend, CropRect, Input, InputKind, Layer, LayerGeometry, MainMix, Output, Project,
+    ProjectSettings, RestartPolicy, Rgba8, Rotation, Scene, SimulatedAudio, SimulatedInput,
+    SimulatedVideo, SolidColor, SourceRef, StartupPolicy,
 };
 use fm_persistence::{ProjectPosition, ProjectStore, RuntimeRouting, StoreError, StoredProject};
 use fm_types::{
@@ -94,7 +94,7 @@ fn rich_settings() -> ProjectSettings {
     }
 }
 
-fn rich_inputs(high: u128) -> [Input; 6] {
+fn rich_inputs(high: u128) -> [Input; 7] {
     [
         Input {
             id: input_id(high),
@@ -146,6 +146,15 @@ fn rich_inputs(high: u128) -> [Input; 6] {
             )),
             required_capabilities: Vec::new(),
         },
+        Input {
+            id: input_id(high + 6),
+            name: "Scene route".into(),
+            kind: InputKind::Scene {
+                scene_id: scene_id(high + 11),
+                audio_source: Some(input_id(high + 5)),
+            },
+            required_capabilities: vec!["scene.composite.basic".into()],
+        },
     ]
 }
 
@@ -165,25 +174,39 @@ fn rich_project() -> Project {
     project.add_scene(Scene {
         id: scene_id(high + 10),
         name: "Base".into(),
+        background: Rgba8::new(8, 4, 2, 16),
         layers: vec![Layer {
             name: "Camera".into(),
             source: SourceRef::Input(input_id(high + 2)),
             enabled: true,
+            geometry: LayerGeometry::new(-20, 30, 1920, 1080, Rotation::Deg90),
+            crop: Some(CropRect::new(10, 20, 1000, 700)),
+            opacity: 200,
+            z_order: -7,
         }],
     });
     project.add_scene(Scene {
         id: scene_id(high + 11),
         name: "Composite".into(),
+        background: Rgba8::OPAQUE_BLACK,
         layers: vec![
             Layer {
                 name: "Base scene".into(),
                 source: SourceRef::Scene(scene_id(high + 10)),
                 enabled: true,
+                geometry: LayerGeometry::new(0, 0, 3840, 2160, Rotation::Deg0),
+                crop: None,
+                opacity: u8::MAX,
+                z_order: 3,
             },
             Layer {
                 name: "Overlay".into(),
                 source: SourceRef::Input(input_id(high + 4)),
                 enabled: false,
+                geometry: LayerGeometry::new(100, -200, 640, 360, Rotation::Deg270),
+                crop: Some(CropRect::new(1, 2, 3, 4)),
+                opacity: 127,
+                z_order: 3,
             },
         ],
     });
@@ -254,10 +277,18 @@ fn complete_project_round_trip_preserves_formats_graph_capabilities_and_u128_ids
     );
     assert_eq!(loaded.project().settings(), &rich_settings());
     assert_eq!(loaded.runtime_routing(), expected.runtime_routing());
+    assert!(matches!(
+        loaded.project().inputs()[6].kind,
+        InputKind::Scene {
+            scene_id: id,
+            audio_source: Some(audio)
+        } if id.get().get() > u128::from(u64::MAX)
+            && audio.get().get() > u128::from(u64::MAX)
+    ));
 }
 
 #[test]
-fn display_p3_bt709_round_trips_in_schema_v3() {
+fn display_p3_bt709_round_trips_in_schema_v4() {
     let temp = TestDirectory::new("bt709-transfer");
     let store = temp.store("show");
     let mut settings = rich_settings();
@@ -285,7 +316,7 @@ fn display_p3_bt709_round_trips_in_schema_v3() {
 }
 
 #[test]
-fn v3_encoding_is_deterministic_for_the_complete_model() {
+fn v4_encoding_is_deterministic_for_the_complete_model() {
     let temp = TestDirectory::new("deterministic-rich");
     let first = temp.store("first");
     let second = temp.store("second");
@@ -340,6 +371,45 @@ fn malformed_enum_format_and_reference_are_rejected() {
 }
 
 #[test]
+fn strict_v4_composition_parser_rejects_unknown_values_ranges_and_fields() {
+    let temp = TestDirectory::new("strict-composition");
+    let store = temp.store("show");
+    store.save(&stored_rich_project()).unwrap();
+    let valid = fs::read_to_string(store.manifest_path()).unwrap();
+
+    for malformed in [
+        valid.replacen("\"rotation\": \"deg90\"", "\"rotation\": \"deg45\"", 1),
+        valid.replacen(
+            "\"translation_x\": -20",
+            "\"translation_x\": -2147483649",
+            1,
+        ),
+        valid.replacen(
+            "\"rotation\": \"deg90\"",
+            "\"rotation\": \"deg90\", \"future\": 1",
+            1,
+        ),
+    ] {
+        fs::write(store.manifest_path(), malformed).unwrap();
+        assert!(matches!(
+            store.load(),
+            Err(StoreError::MalformedManifest { .. })
+        ));
+    }
+
+    fs::write(
+        store.manifest_path(),
+        valid.replacen(
+            "\"red\": 8, \"green\": 4, \"blue\": 2, \"alpha\": 16",
+            "\"red\": 17, \"green\": 4, \"blue\": 2, \"alpha\": 16",
+            1,
+        ),
+    )
+    .unwrap();
+    assert!(matches!(store.load(), Err(StoreError::Validation(_))));
+}
+
+#[test]
 fn golden_v2_manifest_migrates_with_cli_defaults_and_main_mix() {
     let temp = TestDirectory::new("v2-migration");
     let store = temp.store("show");
@@ -353,7 +423,7 @@ fn golden_v2_manifest_migrates_with_cli_defaults_and_main_mix() {
     let report = store.migrate_v2().unwrap();
     let migrated = store.load().unwrap();
 
-    assert_eq!((report.from_schema(), report.to_schema()), (2, 3));
+    assert_eq!((report.from_schema(), report.to_schema()), (2, 4));
     assert_eq!(
         migrated.project().settings().frame_rate,
         FrameRate::new(60_000, 1_001).unwrap()
@@ -375,4 +445,67 @@ fn golden_v2_manifest_migrates_with_cli_defaults_and_main_mix() {
         Some(input_id(2))
     );
     assert_eq!(migrated.position().frames_rendered, 300);
+}
+
+#[test]
+fn frozen_v3_manifest_migrates_with_composition_defaults_only() {
+    let temp = TestDirectory::new("v3-migration");
+    let store = temp.store("show");
+    let second = temp.store("second");
+    fs::create_dir_all(store.root()).unwrap();
+    fs::create_dir_all(second.root()).unwrap();
+    fs::write(
+        store.manifest_path(),
+        include_str!("fixtures/schema-v3.json"),
+    )
+    .unwrap();
+    fs::write(
+        second.manifest_path(),
+        include_str!("fixtures/schema-v3.json"),
+    )
+    .unwrap();
+
+    let report = store.migrate_v3().unwrap();
+    second.migrate_v3().unwrap();
+    let migrated = store.load().unwrap();
+
+    assert_eq!((report.from_schema(), report.to_schema()), (3, 4));
+    assert_eq!(
+        report.defaulted_fields(),
+        [
+            "scenes.background=rgba8(0,0,0,255)",
+            "scenes.layers.geometry=canvas_identity",
+            "scenes.layers.crop=null",
+            "scenes.layers.opacity=255",
+            "scenes.layers.z_order=0",
+        ]
+    );
+    let scene = &migrated.project().scenes()[0];
+    assert_eq!(scene.background, Rgba8::OPAQUE_BLACK);
+    assert_eq!(
+        scene.layers[0].geometry,
+        LayerGeometry::new(0, 0, 3840, 2160, Rotation::Deg0)
+    );
+    assert_eq!(scene.layers[0].crop, None);
+    assert_eq!(scene.layers[0].opacity, u8::MAX);
+    assert_eq!(scene.layers[0].z_order, 0);
+    assert_eq!(scene.layers[1].z_order, 0);
+    assert!(
+        matches!(scene.layers[0].source, SourceRef::Input(id) if id == input_id(u128::from(u64::MAX) + 102))
+    );
+    assert!(
+        matches!(scene.layers[1].source, SourceRef::Input(id) if id == input_id(u128::from(u64::MAX) + 103))
+    );
+    assert!(
+        migrated
+            .project()
+            .inputs()
+            .iter()
+            .all(|input| !matches!(input.kind, InputKind::Scene { .. }))
+    );
+    assert_eq!(migrated.project().outputs().len(), 1);
+    assert_eq!(
+        fs::read(store.manifest_path()).unwrap(),
+        fs::read(second.manifest_path()).unwrap()
+    );
 }

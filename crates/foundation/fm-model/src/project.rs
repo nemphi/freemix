@@ -2,11 +2,11 @@ use fm_types::{AudioFormat, BusId, FrameRate, InputId, OutputId, ProjectId, Scen
 
 use crate::{ValidationError, validation::validate_project};
 
-pub const CURRENT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(3);
-pub const OLDEST_SUPPORTED_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1);
+pub const CURRENT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(4);
+pub const OLDEST_SUPPORTED_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(2);
 pub const SUPPORTED_SCHEMA_VERSIONS: [SchemaVersion; 3] = [
     CURRENT_SCHEMA_VERSION,
-    SchemaVersion::new(2),
+    SchemaVersion::new(3),
     OLDEST_SUPPORTED_SCHEMA_VERSION,
 ];
 
@@ -265,6 +265,10 @@ pub enum InputKind {
     Network {
         endpoint: String,
     },
+    Scene {
+        scene_id: SceneId,
+        audio_source: Option<InputId>,
+    },
     Simulated(SimulatedInput),
 }
 
@@ -352,7 +356,12 @@ impl RestartPolicy {
 pub struct Scene {
     pub id: SceneId,
     pub name: String,
+    pub background: Rgba8,
     pub layers: Vec<Layer>,
+}
+
+impl Scene {
+    pub const MAX_LAYERS: usize = 64;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -360,6 +369,94 @@ pub struct Layer {
     pub name: String,
     pub source: SourceRef,
     pub enabled: bool,
+    pub geometry: LayerGeometry,
+    pub crop: Option<CropRect>,
+    pub opacity: u8,
+    pub z_order: i32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LayerGeometry {
+    pub translation_x: i32,
+    pub translation_y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub rotation: Rotation,
+}
+
+impl LayerGeometry {
+    #[must_use]
+    pub const fn new(
+        translation_x: i32,
+        translation_y: i32,
+        width: u32,
+        height: u32,
+        rotation: Rotation,
+    ) -> Self {
+        Self {
+            translation_x,
+            translation_y,
+            width,
+            height,
+            rotation,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Rotation {
+    #[default]
+    Deg0,
+    Deg90,
+    Deg180,
+    Deg270,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CropRect {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl CropRect {
+    #[must_use]
+    pub const fn new(x: u32, y: u32, width: u32, height: u32) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Rgba8 {
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+    pub alpha: u8,
+}
+
+impl Rgba8 {
+    pub const OPAQUE_BLACK: Self = Self::new(0, 0, 0, u8::MAX);
+
+    #[must_use]
+    pub const fn new(red: u8, green: u8, blue: u8, alpha: u8) -> Self {
+        Self {
+            red,
+            green,
+            blue,
+            alpha,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_premultiplied(self) -> bool {
+        self.red <= self.alpha && self.green <= self.alpha && self.blue <= self.alpha
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

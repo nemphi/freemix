@@ -1,0 +1,97 @@
+{
+  "schema_version": 3,
+  "project": {
+    "id": 18446744073709551716,
+    "name": "Frozen V3 Scene",
+    "settings": {
+      "frame_rate": {"numerator": 24000, "denominator": 1001},
+      "video": {
+        "width": 3840,
+        "height": 2160,
+        "frame_rate": {"numerator": 24000, "denominator": 1001},
+        "pixel_format": "p010",
+        "scan": "progressive",
+        "color": {
+          "primaries": "bt2020",
+          "transfer": "pq",
+          "matrix": "bt2020_non_constant",
+          "range": "limited",
+          "chroma_location": "top_left"
+        }
+      },
+      "audio": {
+        "sample_rate_hz": 48000,
+        "sample_format": "f32",
+        "channels": ["left", "right"]
+      }
+    },
+    "inputs": [
+      {
+        "id": 18446744073709551717,
+        "name": "Camera",
+        "kind": {"type": "device", "stable_key": "camera:v3"},
+        "required_capabilities": ["capture.camera.raw"]
+      },
+      {
+        "id": 18446744073709551718,
+        "name": "Backup",
+        "kind": {"type": "color"},
+        "required_capabilities": []
+      }
+    ],
+    "scenes": [
+      {
+        "id": 18446744073709551719,
+        "name": "Program",
+        "layers": [
+          {
+            "name": "Camera",
+            "source": {"type": "input", "id": 18446744073709551717},
+            "enabled": true
+          },
+          {
+            "name": "Backup",
+            "source": {"type": "input", "id": 18446744073709551718},
+            "enabled": false
+          }
+        ]
+      }
+    ],
+    "audio_buses": [
+      {
+        "id": 18446744073709551720,
+        "name": "Master",
+        "sends": []
+      }
+    ],
+    "outputs": [
+      {
+        "id": 18446744073709551721,
+        "name": "Program output",
+        "video_source": 18446744073709551719,
+        "audio_source": 18446744073709551720,
+        "startup": "stopped",
+        "required_capabilities": []
+      }
+    ],
+    "main_mix": {"desired_program": 18446744073709551717, "desired_preview": 18446744073709551718},
+    "restart_policy": {"type": "never"}
+  },
+  "runtime": {
+    "routing": {
+      "desired_program_id": 18446744073709551717,
+      "realized_program_id": 18446744073709551717,
+      "desired_preview_id": 18446744073709551718,
+      "realized_preview_id": 18446744073709551718
+    },
+    "position": {
+      "revision": 7,
+      "state_epoch": 2,
+      "event_sequence": 9,
+      "frames_rendered": 240,
+      "runtime_generation": 3,
+      "clock_time_nanos": 10000000
+    },
+    "idempotency_receipts": []
+  }
+}

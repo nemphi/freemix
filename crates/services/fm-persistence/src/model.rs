@@ -167,7 +167,7 @@ impl StoredProject {
         Ok(stored)
     }
 
-    /// Legacy constructor that deterministically synthesizes a simulated v3 project.
+    /// Legacy constructor that deterministically synthesizes a simulated current project.
     ///
     /// # Errors
     ///

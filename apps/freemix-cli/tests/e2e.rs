@@ -721,7 +721,7 @@ fn status_escapes_show_names_onto_one_line() {
 }
 
 #[test]
-fn edited_schema_v3_configuration_survives_commands_restart_and_render() {
+fn edited_schema_v4_configuration_survives_commands_restart_and_render() {
     let root = unique_test_root();
     let project = root.join("edited.freemix");
     let solid_image = root.join("solid.ppm");
@@ -730,7 +730,7 @@ fn edited_schema_v3_configuration_survives_commands_restart_and_render() {
     let project_path = project.to_str().unwrap();
     assert_success(&invoke(&["new", project_path, "--name", "Edited V3"]));
 
-    edit_schema_v3_configuration(&project);
+    edit_schema_v4_configuration(&project);
 
     let before = status(&project);
     assert_status(&before, 0, 0, 1, 1, 2, 2);
@@ -779,7 +779,7 @@ fn edited_schema_v3_configuration_survives_commands_restart_and_render() {
     fs::remove_dir_all(root).unwrap();
 }
 
-fn edit_schema_v3_configuration(project: &Path) {
+fn edit_schema_v4_configuration(project: &Path) {
     let mut source = manifest(project);
     let default_rate = r#"{"numerator": 60000, "denominator": 1001}"#;
     assert_eq!(source.matches(default_rate).count(), 2);
@@ -819,7 +819,7 @@ fn edit_schema_v3_configuration(project: &Path) {
     replace_once(
         &mut source,
         r#""scenes": []"#,
-        r#""scenes": [{"id": 11, "name": "Edited scene", "layers": [{"name": "Source", "source": {"type": "input", "id": 1}, "enabled": true}]}]"#,
+        r#""scenes": [{"id": 11, "name": "Edited scene", "background": {"red": 0, "green": 0, "blue": 0, "alpha": 255}, "layers": [{"name": "Source", "source": {"type": "input", "id": 1}, "enabled": true, "geometry": {"translation_x": 0, "translation_y": 0, "width": 1280, "height": 720, "rotation": "deg0"}, "crop": null, "opacity": 255, "z_order": 0}]}]"#,
     );
     replace_once(
         &mut source,
@@ -926,7 +926,7 @@ fn supported_legacy_manifest_is_migrated_before_cli_load() {
     assert!(migrated_status.contains("project_id=42 show=\"Legacy CLI\""));
     assert_status(&migrated_status, 0, 0, 1, 1, 2, 2);
     let migrated = manifest(&project);
-    assert!(migrated.starts_with("{\n  \"schema_version\": 3,"));
+    assert!(migrated.starts_with("{\n  \"schema_version\": 4,"));
     assert!(migrated.contains(r#""type": "simulated""#));
 
     assert_success(&invoke(&[

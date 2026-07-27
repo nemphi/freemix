@@ -4,9 +4,9 @@ use std::{
 };
 
 use fm_model::{
-    AudioBus, BusSend, Input, InputKind, Layer, MainMix, Output, Project, ProjectSettings,
-    RestartPolicy, Scene, SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef,
-    StartupPolicy,
+    AudioBus, BusSend, CropRect, Input, InputKind, Layer, LayerGeometry, MainMix, Output, Project,
+    ProjectSettings, RestartPolicy, Rgba8, Rotation, Scene, SimulatedAudio, SimulatedInput,
+    SimulatedVideo, SolidColor, SourceRef, StartupPolicy,
 };
 use fm_types::{
     AudioFormat, BusId, Channel, ChannelLayout, ChromaLocation, ColorMetadata, ColorPrimaries,
@@ -26,6 +26,7 @@ use super::{
 
 const V1_SCHEMA_VERSION: u32 = 1;
 const V2_SCHEMA_VERSION: u32 = 2;
+const V3_SCHEMA_VERSION: u32 = 3;
 
 pub(crate) fn decode(source: &str) -> Result<StoredProject, DecodeError> {
     let mut root = Object::new(Reader::new(source).document()?, "manifest")?;
@@ -38,7 +39,7 @@ pub(crate) fn decode(source: &str) -> Result<StoredProject, DecodeError> {
             },
         ));
     }
-    let project = ProjectDto::parse(root.take("project")?)?.into_domain();
+    let project = ProjectDto::parse(root.take("project")?, false)?.into_domain();
     let (routing, position, receipts) = parse_runtime(root.take("runtime")?)?;
     root.finish()?;
     StoredProject::from_project(project, routing, position, receipts)
@@ -46,11 +47,29 @@ pub(crate) fn decode(source: &str) -> Result<StoredProject, DecodeError> {
 }
 
 pub(crate) fn decode_v1(source: &str) -> Result<StoredProject, DecodeError> {
-    LegacyDto::parse(source, V1_SCHEMA_VERSION)?.into_v3()
+    LegacyDto::parse(source, V1_SCHEMA_VERSION)?.into_current()
 }
 
 pub(crate) fn decode_v2(source: &str) -> Result<StoredProject, DecodeError> {
-    LegacyDto::parse(source, V2_SCHEMA_VERSION)?.into_v3()
+    LegacyDto::parse(source, V2_SCHEMA_VERSION)?.into_current()
+}
+
+pub(crate) fn decode_v3(source: &str) -> Result<StoredProject, DecodeError> {
+    let mut root = Object::new(Reader::new(source).document()?, "manifest")?;
+    let schema = root.u32("schema_version")?;
+    if schema != V3_SCHEMA_VERSION {
+        return Err(DecodeError::Validation(
+            ProjectValidationError::UnsupportedSchema {
+                found: schema,
+                supported: V3_SCHEMA_VERSION,
+            },
+        ));
+    }
+    let project = ProjectDto::parse(root.take("project")?, true)?.into_domain();
+    let (routing, position, receipts) = parse_runtime(root.take("runtime")?)?;
+    root.finish()?;
+    StoredProject::from_project(project, routing, position, receipts)
+        .map_err(DecodeError::Validation)
 }
 
 struct ProjectDto {
@@ -66,14 +85,23 @@ struct ProjectDto {
 }
 
 impl ProjectDto {
-    fn parse(value: Value) -> Result<Self, DecodeError> {
+    fn parse(value: Value, schema_v3: bool) -> Result<Self, DecodeError> {
         let mut object = Object::new(value, "project")?;
+        let id = ProjectId::new(object.nonzero_u128("id")?);
+        let name = object.string("name")?;
+        let settings = parse_settings(object.take("settings")?)?;
+        let inputs = parse_array(object.take("inputs")?, "inputs", |value| {
+            parse_input(value, schema_v3)
+        })?;
+        let dimensions = settings.video.dimensions;
         let dto = Self {
-            id: ProjectId::new(object.nonzero_u128("id")?),
-            name: object.string("name")?,
-            settings: parse_settings(object.take("settings")?)?,
-            inputs: parse_array(object.take("inputs")?, "inputs", parse_input)?,
-            scenes: parse_array(object.take("scenes")?, "scenes", parse_scene)?,
+            id,
+            name,
+            settings,
+            inputs,
+            scenes: parse_array(object.take("scenes")?, "scenes", |value| {
+                parse_scene(value, schema_v3, dimensions.width(), dimensions.height())
+            })?,
             audio_buses: parse_array(object.take("audio_buses")?, "audio_buses", parse_bus)?,
             outputs: parse_array(object.take("outputs")?, "outputs", parse_output)?,
             main_mix: parse_optional(object.take("main_mix")?, parse_main_mix)?,
@@ -235,12 +263,12 @@ fn parse_audio(value: Value) -> Result<AudioFormat, DecodeError> {
     })
 }
 
-fn parse_input(value: Value) -> Result<Input, DecodeError> {
+fn parse_input(value: Value, schema_v3: bool) -> Result<Input, DecodeError> {
     let mut object = Object::new(value, "input")?;
     let input = Input {
         id: InputId::new(object.nonzero_u128("id")?),
         name: object.string("name")?,
-        kind: parse_input_kind(object.take("kind")?)?,
+        kind: parse_input_kind(object.take("kind")?, schema_v3)?,
         required_capabilities: parse_strings(
             object.take("required_capabilities")?,
             "required_capabilities",
@@ -250,7 +278,7 @@ fn parse_input(value: Value) -> Result<Input, DecodeError> {
     Ok(input)
 }
 
-fn parse_input_kind(value: Value) -> Result<InputKind, DecodeError> {
+fn parse_input_kind(value: Value, schema_v3: bool) -> Result<InputKind, DecodeError> {
     let mut object = Object::new(value, "input kind")?;
     let kind = match object.string("type")?.as_str() {
         "color" => InputKind::Color,
@@ -262,6 +290,10 @@ fn parse_input_kind(value: Value) -> Result<InputKind, DecodeError> {
         },
         "network" => InputKind::Network {
             endpoint: object.string("endpoint")?,
+        },
+        "scene" if !schema_v3 => InputKind::Scene {
+            scene_id: SceneId::new(object.nonzero_u128("scene_id")?),
+            audio_source: object.optional_input_id("audio_source")?,
         },
         "simulated" => InputKind::Simulated(SimulatedInput::new(
             parse_simulated_video(object.take("video")?)?,
@@ -302,26 +334,111 @@ fn parse_simulated_audio(value: Value) -> Result<SimulatedAudio, DecodeError> {
     Ok(audio)
 }
 
-fn parse_scene(value: Value) -> Result<Scene, DecodeError> {
+fn parse_scene(
+    value: Value,
+    schema_v3: bool,
+    canvas_width: u32,
+    canvas_height: u32,
+) -> Result<Scene, DecodeError> {
     let mut object = Object::new(value, "scene")?;
+    let id = SceneId::new(object.nonzero_u128("id")?);
+    let name = object.string("name")?;
+    let background = if schema_v3 {
+        Rgba8::OPAQUE_BLACK
+    } else {
+        parse_rgba(object.take("background")?)?
+    };
     let scene = Scene {
-        id: SceneId::new(object.nonzero_u128("id")?),
-        name: object.string("name")?,
-        layers: parse_array(object.take("layers")?, "layers", parse_layer)?,
+        id,
+        name,
+        background,
+        layers: parse_array(object.take("layers")?, "layers", |value| {
+            parse_layer(value, schema_v3, canvas_width, canvas_height)
+        })?,
     };
     object.finish()?;
     Ok(scene)
 }
 
-fn parse_layer(value: Value) -> Result<Layer, DecodeError> {
+fn parse_layer(
+    value: Value,
+    schema_v3: bool,
+    canvas_width: u32,
+    canvas_height: u32,
+) -> Result<Layer, DecodeError> {
     let mut object = Object::new(value, "layer")?;
+    let name = object.string("name")?;
+    let source = parse_source(object.take("source")?)?;
+    let enabled = object.boolean("enabled")?;
+    let (geometry, crop, opacity, z_order) = if schema_v3 {
+        (
+            LayerGeometry::new(0, 0, canvas_width, canvas_height, Rotation::Deg0),
+            None,
+            u8::MAX,
+            0,
+        )
+    } else {
+        (
+            parse_geometry(object.take("geometry")?)?,
+            parse_optional(object.take("crop")?, parse_crop)?,
+            object.u8("opacity")?,
+            object.i32("z_order")?,
+        )
+    };
     let layer = Layer {
-        name: object.string("name")?,
-        source: parse_source(object.take("source")?)?,
-        enabled: object.boolean("enabled")?,
+        name,
+        source,
+        enabled,
+        geometry,
+        crop,
+        opacity,
+        z_order,
     };
     object.finish()?;
     Ok(layer)
+}
+
+fn parse_rgba(value: Value) -> Result<Rgba8, DecodeError> {
+    let mut object = Object::new(value, "RGBA8 color")?;
+    let color = Rgba8::new(
+        object.u8("red")?,
+        object.u8("green")?,
+        object.u8("blue")?,
+        object.u8("alpha")?,
+    );
+    object.finish()?;
+    Ok(color)
+}
+
+fn parse_geometry(value: Value) -> Result<LayerGeometry, DecodeError> {
+    let mut object = Object::new(value, "layer geometry")?;
+    let geometry = LayerGeometry::new(
+        object.i32("translation_x")?,
+        object.i32("translation_y")?,
+        object.u32("width")?,
+        object.u32("height")?,
+        match object.string("rotation")?.as_str() {
+            "deg0" => Rotation::Deg0,
+            "deg90" => Rotation::Deg90,
+            "deg180" => Rotation::Deg180,
+            "deg270" => Rotation::Deg270,
+            value => return Err(unknown_enum("rotation", value)),
+        },
+    );
+    object.finish()?;
+    Ok(geometry)
+}
+
+fn parse_crop(value: Value) -> Result<CropRect, DecodeError> {
+    let mut object = Object::new(value, "crop")?;
+    let crop = CropRect::new(
+        object.u32("x")?,
+        object.u32("y")?,
+        object.u32("width")?,
+        object.u32("height")?,
+    );
+    object.finish()?;
+    Ok(crop)
 }
 
 fn parse_source(value: Value) -> Result<SourceRef, DecodeError> {
@@ -530,7 +647,7 @@ impl LegacyDto {
         })
     }
 
-    fn into_v3(self) -> Result<StoredProject, DecodeError> {
+    fn into_current(self) -> Result<StoredProject, DecodeError> {
         StoredProject::new(
             CURRENT_SCHEMA_VERSION,
             self.project_id,
@@ -593,6 +710,21 @@ impl Object {
     fn u32(&mut self, field: &str) -> Result<u32, DecodeError> {
         u32::try_from(self.number(field)?)
             .map_err(|_| syntax(format!("field `{field}` exceeds u32")))
+    }
+
+    fn i32(&mut self, field: &str) -> Result<i32, DecodeError> {
+        match self.take(field)? {
+            Value::Number(value) => {
+                i32::try_from(value).map_err(|_| syntax(format!("field `{field}` exceeds i32")))
+            }
+            Value::NegativeNumber(value) => {
+                let magnitude = i128::try_from(value)
+                    .map_err(|_| syntax(format!("field `{field}` exceeds i32")))?;
+                i32::try_from(-magnitude)
+                    .map_err(|_| syntax(format!("field `{field}` exceeds i32")))
+            }
+            _ => Err(syntax(format!("field `{field}` must be an integer"))),
+        }
     }
 
     fn u64(&mut self, field: &str) -> Result<u64, DecodeError> {

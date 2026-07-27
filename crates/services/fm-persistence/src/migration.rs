@@ -4,6 +4,7 @@ use crate::{CURRENT_SCHEMA_VERSION, MAX_MANIFEST_BYTES, ProjectStore, StoreError
 
 const V1_SCHEMA_VERSION: u32 = 1;
 const V2_SCHEMA_VERSION: u32 = 2;
+const V3_SCHEMA_VERSION: u32 = 3;
 const V1_DEFAULTS: [&str; 4] = [
     "frames_rendered=0",
     "runtime_generation=0",
@@ -19,6 +20,13 @@ const V3_DEFAULTS: [&str; 8] = [
     "audio_buses=[]",
     "outputs=[]",
     "restart_policy=never",
+];
+const V4_DEFAULTS: [&str; 5] = [
+    "scenes.background=rgba8(0,0,0,255)",
+    "scenes.layers.geometry=canvas_identity",
+    "scenes.layers.crop=null",
+    "scenes.layers.opacity=255",
+    "scenes.layers.z_order=0",
 ];
 
 /// Summary of an explicitly completed manifest migration.
@@ -47,7 +55,7 @@ impl MigrationReport {
 }
 
 impl ProjectStore {
-    /// Explicitly migrates a schema-v1 manifest through v2 to canonical v3.
+    /// Explicitly migrates a schema-v1 manifest through v2 to canonical v4.
     ///
     /// # Errors
     ///
@@ -60,11 +68,15 @@ impl ProjectStore {
         Ok(MigrationReport {
             from_schema: V1_SCHEMA_VERSION,
             to_schema: CURRENT_SCHEMA_VERSION,
-            defaulted_fields: V1_DEFAULTS.into_iter().chain(V3_DEFAULTS).collect(),
+            defaulted_fields: V1_DEFAULTS
+                .into_iter()
+                .chain(V3_DEFAULTS)
+                .chain(V4_DEFAULTS)
+                .collect(),
         })
     }
 
-    /// Explicitly migrates a schema-v2 manifest to canonical v3.
+    /// Explicitly migrates a schema-v2 manifest to canonical v4.
     ///
     /// # Errors
     ///
@@ -77,7 +89,24 @@ impl ProjectStore {
         Ok(MigrationReport {
             from_schema: V2_SCHEMA_VERSION,
             to_schema: CURRENT_SCHEMA_VERSION,
-            defaulted_fields: V3_DEFAULTS.to_vec(),
+            defaulted_fields: V3_DEFAULTS.into_iter().chain(V4_DEFAULTS).collect(),
+        })
+    }
+
+    /// Explicitly migrates a schema-v3 manifest to canonical v4.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed data, the wrong schema, validation,
+    /// size-limit, or filesystem failures.
+    pub fn migrate_v3(&self) -> Result<MigrationReport, StoreError> {
+        let source = self.read_legacy_manifest()?;
+        let project = json::decode_v3(&source).map_err(StoreError::from_decode)?;
+        self.save(&project)?;
+        Ok(MigrationReport {
+            from_schema: V3_SCHEMA_VERSION,
+            to_schema: CURRENT_SCHEMA_VERSION,
+            defaulted_fields: V4_DEFAULTS.to_vec(),
         })
     }
 

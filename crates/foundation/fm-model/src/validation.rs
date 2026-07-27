@@ -1,8 +1,8 @@
 use fm_types::{BusId, InputId, OutputId, SceneId};
 
 use crate::{
-    InputKind, Project, ProjectSettings, RestartPolicy, SimulatedAudio, SourceRef,
-    cycles::{mark_bus_cycles, mark_scene_cycles},
+    InputKind, Project, ProjectSettings, RestartPolicy, Scene, SimulatedAudio, SourceRef,
+    cycles::{mark_audio_input_cycles, mark_bus_cycles, mark_scene_cycles},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -47,6 +47,7 @@ pub(crate) fn validate_project(project: &Project) -> Vec<ValidationError> {
     validate_buses(project, &mut errors);
     validate_outputs(project, &mut errors);
     mark_scene_cycles(project, &mut errors);
+    mark_audio_input_cycles(project, &mut errors);
     mark_bus_cycles(project, &mut errors);
     errors
 }
@@ -172,6 +173,39 @@ fn validate_inputs(project: &Project, errors: &mut Vec<ValidationError>) {
             InputKind::Network { endpoint } => {
                 require_name(errors, entity, "endpoint", endpoint);
             }
+            InputKind::Scene {
+                scene_id,
+                audio_source,
+            } => {
+                if !project.scenes().iter().any(|scene| scene.id == *scene_id) {
+                    errors.push(ValidationError {
+                        entity,
+                        field: "kind.scene.scene_id",
+                        kind: ValidationErrorKind::MissingReference(EntityRef::Scene(*scene_id)),
+                    });
+                }
+                if let Some(audio_source) = audio_source {
+                    if *audio_source == input.id {
+                        errors.push(ValidationError {
+                            entity,
+                            field: "kind.scene.audio_source",
+                            kind: ValidationErrorKind::SelfReference,
+                        });
+                    } else if !project
+                        .inputs()
+                        .iter()
+                        .any(|other| other.id == *audio_source)
+                    {
+                        errors.push(ValidationError {
+                            entity,
+                            field: "kind.scene.audio_source",
+                            kind: ValidationErrorKind::MissingReference(EntityRef::Input(
+                                *audio_source,
+                            )),
+                        });
+                    }
+                }
+            }
             InputKind::Simulated(simulated) => {
                 if let SimulatedAudio::Sine { frequency_hz } = simulated.audio {
                     let nyquist_hz = project.settings().audio.sample_rate.hertz() / 2;
@@ -226,8 +260,51 @@ fn validate_scenes(project: &Project, errors: &mut Vec<ValidationError>) {
     for scene in project.scenes() {
         let entity = Some(EntityRef::Scene(scene.id));
         require_name(errors, entity, "name", &scene.name);
+        if !scene.background.is_premultiplied() {
+            errors.push(ValidationError {
+                entity,
+                field: "background",
+                kind: ValidationErrorKind::OutOfRange,
+            });
+        }
+        if scene.layers.len() > Scene::MAX_LAYERS {
+            errors.push(ValidationError {
+                entity,
+                field: "layers",
+                kind: ValidationErrorKind::OutOfRange,
+            });
+        }
         for layer in &scene.layers {
             require_name(errors, entity, "layers.name", &layer.name);
+            if layer.geometry.width == 0
+                || layer.geometry.height == 0
+                || layer.geometry.width > ProjectSettings::MAX_VIDEO_WIDTH
+                || layer.geometry.height > ProjectSettings::MAX_VIDEO_HEIGHT
+            {
+                errors.push(ValidationError {
+                    entity,
+                    field: "layers.geometry",
+                    kind: ValidationErrorKind::OutOfRange,
+                });
+            }
+            if layer.crop.is_some_and(|crop| {
+                crop.width == 0
+                    || crop.height == 0
+                    || crop
+                        .x
+                        .checked_add(crop.width)
+                        .is_none_or(|right| right > project.settings().video.dimensions.width())
+                    || crop
+                        .y
+                        .checked_add(crop.height)
+                        .is_none_or(|bottom| bottom > project.settings().video.dimensions.height())
+            }) {
+                errors.push(ValidationError {
+                    entity,
+                    field: "layers.crop",
+                    kind: ValidationErrorKind::OutOfRange,
+                });
+            }
             match layer.source {
                 SourceRef::Input(id) if !project.inputs().iter().any(|input| input.id == id) => {
                     errors.push(ValidationError {

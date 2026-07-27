@@ -9,6 +9,7 @@ pub(super) enum Value {
     Null,
     Bool(bool),
     Number(u128),
+    NegativeNumber(u128),
     String(String),
     Array(Vec<Self>),
     Object(BTreeMap<String, Self>),
@@ -46,6 +47,10 @@ impl<'a> Reader<'a> {
             Some(b'f') if self.consume_literal("false") => Ok(Value::Bool(false)),
             Some(b'n') if self.consume_literal("null") => Ok(Value::Null),
             Some(byte) if byte.is_ascii_digit() => self.number().map(Value::Number),
+            Some(b'-') => {
+                self.offset += 1;
+                self.number().map(Value::NegativeNumber)
+            }
             _ => Err(self.syntax("expected JSON value")),
         }
     }
