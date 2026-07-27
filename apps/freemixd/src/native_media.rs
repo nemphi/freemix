@@ -13,7 +13,8 @@ use std::{
     path::{Path, PathBuf},
     pin::pin,
     sync::{
-        Arc,
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
         mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
     },
     task::{Context, Poll, Wake, Waker},
@@ -52,6 +53,7 @@ use fm_switcher::{ProgramFrame, TransitionKind as SwitcherTransitionKind};
 use fm_types::{AudioFormat, FrameRate, InputId, SampleFormat, SceneId, TimeBase};
 
 const RGBA16_FLOAT_BYTES_PER_PIXEL: u64 = 8;
+const NATIVE_PROJECT_IN_FLIGHT_SLOTS: usize = 1;
 const SOURCE_REFILL_LOW_WATERMARK: usize = 4;
 const SOURCE_REFILL_MAX_PAGE: u32 = 4;
 const AUDIO_REFILL_LOW_WATERMARK: usize = 8;
@@ -551,12 +553,13 @@ fn scene_execution_for_routes(
 fn native_execution_peak(
     execution: &NativeSceneExecution,
 ) -> Result<usize, NativeProjectPlanError> {
-    // Queue submission does not prove dropped scene targets are reusable in-frame.
-    // Charge the full closure plus the transition and previous Program targets.
+    // One fenced slot retains the full closure plus its transition target. The
+    // daemon also owns the previous Program target until the new frame returns.
     execution
         .required
         .len()
-        .checked_add(2)
+        .checked_add(NATIVE_PROJECT_IN_FLIGHT_SLOTS)
+        .and_then(|targets| targets.checked_add(1))
         .ok_or(NativeProjectPlanError::TransientTargetCountOverflow)
 }
 
@@ -1082,6 +1085,8 @@ pub enum NativeSourceRenderError {
     UnsupportedTransition(SwitcherTransitionKind),
     InvalidMix(TransitionError),
     ResourceBounds,
+    ConcurrentProjectRender,
+    Completion(NativeGpuError),
     SceneCompositor(NativeCompositionError),
     Compositor(NativeTransitionError),
 }
@@ -1110,6 +1115,12 @@ impl fmt::Display for NativeSourceRenderError {
             Self::ResourceBounds => {
                 formatter.write_str("native scene execution exceeded planned resource bounds")
             }
+            Self::ConcurrentProjectRender => {
+                formatter.write_str("native project rendering is already in progress")
+            }
+            Self::Completion(error) => {
+                write!(formatter, "native project completion failed: {error}")
+            }
             Self::SceneCompositor(error) => {
                 write!(formatter, "native scene composition failed: {error}")
             }
@@ -1122,12 +1133,14 @@ impl Error for NativeSourceRenderError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::InvalidMix(error) => Some(error),
+            Self::Completion(error) => Some(error),
             Self::SceneCompositor(error) => Some(error),
             Self::Compositor(error) => Some(error),
             Self::MissingSource { .. }
             | Self::DimensionMismatch { .. }
             | Self::MissingTransitionKind
             | Self::ResourceBounds
+            | Self::ConcurrentProjectRender
             | Self::UnsupportedTransition(_) => None,
         }
     }
@@ -3026,6 +3039,30 @@ pub struct NativeMediaRuntime {
     normalizer: NativeImportNormalizer,
     composition_renderer: NativeCompositionRenderer,
     renderer: NativeTransitionRenderer,
+    project_rendering: AtomicBool,
+    project_frames: Mutex<NativeProjectFrameState>,
+}
+
+/// Completion and slot accounting for bounded native project rendering.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NativeProjectFrameTelemetry {
+    pub frames_submitted: u64,
+    pub completion_waits: u64,
+    pub in_flight_slots: usize,
+    pub peak_in_flight_slots: usize,
+}
+
+#[derive(Default)]
+struct NativeProjectFrameState {
+    telemetry: NativeProjectFrameTelemetry,
+}
+
+struct NativeProjectRenderGuard<'a>(&'a AtomicBool);
+
+impl Drop for NativeProjectRenderGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, AtomicOrdering::Release);
+    }
 }
 
 /// Reusable private GPU target for blocking SDR Program capture.
@@ -3101,6 +3138,8 @@ impl NativeMediaRuntime {
             normalizer,
             composition_renderer,
             renderer,
+            project_rendering: AtomicBool::new(false),
+            project_frames: Mutex::new(NativeProjectFrameState::default()),
         })
     }
 
@@ -3108,6 +3147,93 @@ impl NativeMediaRuntime {
     #[must_use]
     pub const fn context(&self) -> &NativeContext {
         &self.context
+    }
+
+    /// Returns bounded project-frame completion and slot accounting.
+    #[must_use]
+    pub fn project_frame_telemetry(&self) -> NativeProjectFrameTelemetry {
+        self.project_frames
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .telemetry
+    }
+
+    fn acquire_project_render(
+        &self,
+    ) -> Result<NativeProjectRenderGuard<'_>, NativeSourceRenderError> {
+        self.project_rendering
+            .compare_exchange(
+                false,
+                true,
+                AtomicOrdering::Acquire,
+                AtomicOrdering::Relaxed,
+            )
+            .map_err(|_| NativeSourceRenderError::ConcurrentProjectRender)?;
+        Ok(NativeProjectRenderGuard(&self.project_rendering))
+    }
+
+    fn complete_in_flight_project_frame(&self) -> Result<(), NativeSourceRenderError> {
+        let occupied = self
+            .project_frames
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .telemetry
+            .in_flight_slots;
+        if occupied == 0 {
+            return Ok(());
+        }
+        self.context
+            .wait_for_submitted_work()
+            .map_err(NativeSourceRenderError::Completion)?;
+        let mut state = self
+            .project_frames
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.telemetry.in_flight_slots = 0;
+        state.telemetry.completion_waits = state
+            .telemetry
+            .completion_waits
+            .checked_add(1)
+            .ok_or(NativeSourceRenderError::ResourceBounds)?;
+        Ok(())
+    }
+
+    fn begin_project_frame(&self) -> Result<NativeProjectRenderGuard<'_>, NativeSourceRenderError> {
+        let guard = self.acquire_project_render()?;
+        self.complete_in_flight_project_frame()?;
+        let mut state = self
+            .project_frames
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.telemetry.in_flight_slots = NATIVE_PROJECT_IN_FLIGHT_SLOTS;
+        state.telemetry.peak_in_flight_slots = state
+            .telemetry
+            .peak_in_flight_slots
+            .max(NATIVE_PROJECT_IN_FLIGHT_SLOTS);
+        Ok(guard)
+    }
+
+    fn finish_project_frame(&self) -> Result<(), NativeSourceRenderError> {
+        let mut state = self
+            .project_frames
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.telemetry.frames_submitted = state
+            .telemetry
+            .frames_submitted
+            .checked_add(1)
+            .ok_or(NativeSourceRenderError::ResourceBounds)?;
+        Ok(())
+    }
+
+    /// Waits for the current bounded project-frame slot to complete and frees it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a concurrent-render, GPU completion, or accounting failure.
+    pub fn complete_project_frame_blocking(&self) -> Result<(), NativeSourceRenderError> {
+        let _guard = self.acquire_project_render()?;
+        self.complete_in_flight_project_frame()
     }
 
     /// Synchronously decodes a bounded local file, then asynchronously uploads
@@ -3916,6 +4042,7 @@ impl NativeMediaRuntime {
         let mut execution = project
             .scene_execution(plan.primary, plan.secondary)
             .ok_or(NativeSourceRenderError::ResourceBounds)?;
+        let _frame_slot = self.begin_project_frame()?;
         let mut scene_outputs: BTreeMap<SceneId, (SourceId, NativeTexture)> = BTreeMap::new();
         for scene in &project.scenes {
             if !execution.required.contains(&scene.id) {
@@ -3981,10 +4108,13 @@ impl NativeMediaRuntime {
             plan.secondary,
             frame.deadline,
         )?;
-        self.renderer
+        let output = self
+            .renderer
             .render(&self.context, plan.transition, primary, secondary)
             .await
-            .map_err(NativeSourceRenderError::Compositor)
+            .map_err(NativeSourceRenderError::Compositor)?;
+        self.finish_project_frame()?;
+        Ok(output)
     }
 
     /// Synchronous daemon wrapper for one authoritative program render.

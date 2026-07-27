@@ -1223,6 +1223,26 @@ impl NativeContext {
         self.fullscreen_timing.take_telemetry(&self.device)
     }
 
+    /// Waits for all native work submitted before this call to complete.
+    ///
+    /// This bounded diagnostic fence submits no commands beyond an empty queue
+    /// marker. It is intended for low-throughput ownership paths that must prove
+    /// prior resources are no longer retained by the backend.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed polling failure or timeout from the native backend.
+    pub fn wait_for_submitted_work(&self) -> Result<(), NativeGpuError> {
+        let submission = self.queue.submit([]);
+        self.device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: Some(DIAGNOSTIC_TIMEOUT),
+            })
+            .map(drop)
+            .map_err(|error| NativeGpuError::Poll(error.to_string()))
+    }
+
     /// Returns a cloneable, non-submitting factory in this context's ownership
     /// domain for main-thread surface creation and recreation.
     #[must_use]

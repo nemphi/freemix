@@ -815,6 +815,105 @@ fn native_metal_renders_scenes_before_exact_fade_and_wipe() {
     }
 }
 
+#[test]
+fn native_metal_project_frames_use_one_completed_in_flight_slot_without_readback() {
+    const FRAMES: u64 = 96;
+
+    let runtime = block_on(NativeMediaRuntime::new([NativeBackend::Metal]))
+        .expect("create Metal bounded-frame runtime");
+    let clock_domain = ClockDomainId::new(NonZeroU128::new(92).unwrap());
+    let playback = runtime
+        .preflight_resolved_source_playback_mixed_blocking(
+            None,
+            Vec::<NativeResolvedSource>::new(),
+            clock_domain,
+            StreamSelector::Best,
+            NativeSourceLimits::default(),
+        )
+        .expect("create empty physical registry");
+    let frame_rate = FrameRate::new(30, 1).unwrap();
+    let input = InputId::new(NonZeroU128::new(20).unwrap());
+    let scene = SceneId::new(NonZeroU128::new(21).unwrap());
+    let mut project = Project::new(
+        ProjectId::new(NonZeroU128::new(91).unwrap()),
+        "Metal bounded frame ring",
+        ProjectSettings {
+            frame_rate,
+            video: VideoFormat {
+                dimensions: VideoDimensions::new(4, 2).unwrap(),
+                frame_rate,
+                pixel_format: PixelFormat::Rgba8,
+                scan: ScanMode::Progressive,
+                color: ModelColorMetadata::default(),
+            },
+            audio: AudioFormat {
+                sample_rate: SampleRate::new(48_000).unwrap(),
+                sample_format: SampleFormat::F32,
+                channels: ChannelLayout::stereo(),
+            },
+        },
+    );
+    project.add_input(Input {
+        id: input,
+        name: "bounded scene".into(),
+        kind: InputKind::Scene {
+            scene_id: scene,
+            audio_source: None,
+        },
+        required_capabilities: Vec::new(),
+    });
+    project.add_scene(Scene {
+        id: scene,
+        name: "bounded background".into(),
+        background: ModelRgba8::OPAQUE_BLACK,
+        layers: Vec::new(),
+    });
+    let plan = NativeProjectPlan::compile(&project, NativeProjectLimits::default()).unwrap();
+    assert_eq!(plan.peak_rgba16f_targets(), 3);
+
+    let mut latest_program = None;
+    for frame_number in 0..FRAMES {
+        let frame = FrameResult {
+            frame: FrameNumber::new(frame_number),
+            deadline: ClockTime::from_nanos(frame_number * 33_333_333),
+            program: ProgramFrame {
+                primary: input,
+                secondary: None,
+                transition_kind: None,
+                mix_numerator: 0,
+                mix_denominator: 1,
+                mix_start_numerator: 0,
+                mix_end_numerator: 0,
+            },
+            events: Vec::new(),
+            revision: Revision::new(0),
+            runtime_generation: RuntimeGeneration::new(0),
+        };
+        let next =
+            block_on(runtime.render_project_frame_result(playback.registry(), &plan, &frame))
+                .expect("render bounded project frame without readback");
+        latest_program = Some(next);
+        let telemetry = runtime.project_frame_telemetry();
+        assert_eq!(telemetry.frames_submitted, frame_number + 1);
+        assert_eq!(telemetry.completion_waits, frame_number);
+        assert_eq!(telemetry.in_flight_slots, 1);
+        assert_eq!(telemetry.peak_in_flight_slots, 1);
+    }
+    assert!(latest_program.is_some());
+    runtime
+        .complete_project_frame_blocking()
+        .expect("complete final bounded frame slot");
+    assert_eq!(
+        runtime.project_frame_telemetry(),
+        freemixd::native_media::NativeProjectFrameTelemetry {
+            frames_submitted: FRAMES,
+            completion_waits: FRAMES,
+            in_flight_slots: 0,
+            peak_in_flight_slots: 1,
+        }
+    );
+}
+
 fn native_leaf_rgba16f(
     runtime: &NativeMediaRuntime,
     registry: &NativeSourceRegistry,
