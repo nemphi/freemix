@@ -586,6 +586,7 @@ struct QueueState {
     telemetry: CameraTelemetry,
     native_dropped_base: u64,
     accepting_frames: bool,
+    capture_sequence_origin: Option<u64>,
     sticky_failure: Option<String>,
     #[cfg(target_os = "macos")]
     stderr: Vec<u8>,
@@ -623,6 +624,8 @@ impl QueueState {
         if !self.accepting_frames {
             return false;
         }
+        self.capture_sequence_origin
+            .get_or_insert(frame.timing().sequence().get());
         self.push(frame, native_dropped_total);
         true
     }
@@ -657,6 +660,7 @@ pub struct CameraVideoSource {
     recovery_deadline: Option<Instant>,
     map_recovery_sequences: bool,
     recovery_sequence_offset: Option<i128>,
+    ready_delivery: Option<CpuVideoFrame>,
     #[cfg(target_os = "macos")]
     capture: Option<CaptureProcess>,
     #[cfg(test)]
@@ -681,6 +685,7 @@ impl CameraVideoSource {
             recovery_deadline: None,
             map_recovery_sequences: false,
             recovery_sequence_offset: None,
+            ready_delivery: None,
             #[cfg(target_os = "macos")]
             capture: None,
             #[cfg(test)]
@@ -786,6 +791,7 @@ impl CameraVideoSource {
             }
             state.sticky_failure = None;
             state.accepting_frames = true;
+            state.capture_sequence_origin = None;
             #[cfg(target_os = "macos")]
             state.stderr.clear();
             state.last_activity = None;
@@ -795,6 +801,7 @@ impl CameraVideoSource {
         self.recovery_deadline = None;
         self.map_recovery_sequences = false;
         self.recovery_sequence_offset = None;
+        self.ready_delivery = None;
 
         #[cfg(target_os = "macos")]
         {
@@ -1261,7 +1268,13 @@ impl CameraVideoSource {
                     .sequence()
                     .checked_next()
                     .ok_or_else(|| adapter_failure("camera adapter sequence overflow"))?;
-                let offset = i128::from(next.get()) - i128::from(timing.sequence().get());
+                let native_origin = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .capture_sequence_origin
+                    .unwrap_or_else(|| timing.sequence().get());
+                let offset = i128::from(next.get()) - i128::from(native_origin);
                 new_offset = Some(offset);
                 offset
             };
@@ -1368,6 +1381,29 @@ impl CameraVideoSource {
         adapter_failure(detail)
     }
 
+    fn wait_for_recovery_completion(&mut self) -> Result<(), IoError> {
+        loop {
+            match self.try_receive() {
+                Ok(Some(MediaTransfer::Live(frame))) => {
+                    self.ready_delivery = Some(frame);
+                    return Ok(());
+                }
+                Ok(Some(MediaTransfer::Fallback { .. }) | None) => {}
+                Err(IoError::SignalLost { .. }) if self.lifecycle == LifecycleState::Recovering => {
+                }
+                Err(error) => return Err(error),
+            }
+            if self.lifecycle != LifecycleState::Recovering {
+                let policy = self
+                    .options
+                    .as_ref()
+                    .map_or(SignalLossPolicy::Stop, |options| options.signal_loss);
+                return Err(IoError::SignalLost { policy });
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[cfg(test)]
     fn start_without_helper_for_test(&mut self) {
         let mut state = self
@@ -1434,6 +1470,7 @@ impl MediaSource for CameraVideoSource {
         self.recovery_deadline = None;
         self.map_recovery_sequences = false;
         self.recovery_sequence_offset = None;
+        self.ready_delivery = None;
         self.resume_running = false;
         self.lifecycle = LifecycleState::Open;
         self.health = EndpointHealth::HEALTHY;
@@ -1466,6 +1503,7 @@ impl MediaSource for CameraVideoSource {
         self.resume_running = false;
         self.map_recovery_sequences = false;
         self.recovery_sequence_offset = None;
+        self.ready_delivery = None;
         self.lifecycle = LifecycleState::Open;
         self.health = EndpointHealth::HEALTHY;
         Ok(())
@@ -1495,6 +1533,7 @@ impl MediaSource for CameraVideoSource {
         self.resume_running = false;
         self.map_recovery_sequences = false;
         self.recovery_sequence_offset = None;
+        self.ready_delivery = None;
         self.lifecycle = LifecycleState::Closed;
         Ok(())
     }
@@ -1564,7 +1603,7 @@ impl MediaSource for CameraVideoSource {
         self.lifecycle = LifecycleState::Recovering;
         self.health = recovery_health;
         self.resume_running = true;
-        Ok(())
+        self.wait_for_recovery_completion()
     }
 
     fn try_receive(&mut self) -> Result<Option<MediaTransfer<Self::Media>>, IoError> {
@@ -1625,6 +1664,9 @@ impl MediaSource for CameraVideoSource {
         }
         if self.lifecycle != LifecycleState::Running {
             return Err(invalid_state("receive", self.lifecycle));
+        }
+        if let Some(frame) = self.ready_delivery.take() {
+            return Ok(Some(MediaTransfer::Live(frame)));
         }
         if let Some(error) = self.sticky_error() {
             return Err(error);
@@ -2305,11 +2347,14 @@ mod tests {
             previous_pts_nanos: Some(anchor.timing().presentation_timestamp().as_nanos()),
         });
         source.map_recovery_sequences = true;
-        source
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .last_activity = None;
+        {
+            let mut state = source
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.capture_sequence_origin = Some(0);
+            state.last_activity = None;
+        }
 
         for (helper_sequence, pts) in [(0, 500), (1, 1_000)] {
             source
@@ -2351,7 +2396,7 @@ mod tests {
             Some(MediaTransfer::Live(frame)) => frame,
             result => panic!("unexpected recovered transfer: {result:?}"),
         };
-        assert_eq!(recovered.timing().sequence().get(), 8);
+        assert_eq!(recovered.timing().sequence().get(), 10);
         assert!(
             recovered
                 .timing()
@@ -2371,7 +2416,7 @@ mod tests {
             Some(MediaTransfer::Live(frame)) => frame,
             result => panic!("unexpected second recovered transfer: {result:?}"),
         };
-        assert_eq!(second.timing().sequence().get(), 9);
+        assert_eq!(second.timing().sequence().get(), 11);
         assert!(!second.timing().flags().contains(MediaFlags::DISCONTINUITY));
     }
 
@@ -2412,17 +2457,18 @@ mod tests {
                 .unwrap_or_else(Instant::now),
         );
 
+        source.wait_for_recovery_completion().unwrap();
+        assert_eq!(source.lifecycle(), LifecycleState::Running);
         let recovered = match source.try_receive().unwrap() {
             Some(MediaTransfer::Live(frame)) => frame,
             result => panic!("queued recovery frame was not accepted: {result:?}"),
         };
         assert_eq!(recovered.timing().sequence().get(), 8);
-        assert_eq!(source.lifecycle(), LifecycleState::Running);
         assert_eq!(source.telemetry().recovery_timeout_discarded, 0);
     }
 
     #[test]
-    fn recovered_sequence_offset_preserves_helper_gap() {
+    fn recovered_sequence_offset_preserves_leading_queue_drop() {
         let mut source = source_with_policy(SignalLossPolicy::Hold);
         source.start_without_helper_for_test();
         let clock = source.options.as_ref().unwrap().clock_domain;
@@ -2443,22 +2489,25 @@ mod tests {
         source.map_recovery_sequences = true;
         source.recovery_sequence_offset = None;
         source.recovery_deadline = Some(Instant::now() + Duration::from_secs(1));
-        source
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(test_frame_at(0, 2_000, clock), 0);
+        {
+            let mut state = source
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.capture_sequence_origin = None;
+            state.accepting_frames = true;
+            assert!(state.push_from_worker(test_frame_at(0, 2_000, clock), 0));
+            assert!(state.push_from_worker(test_frame_at(1, 2_033, clock), 0));
+            assert!(state.push_from_worker(test_frame_at(2, 2_066, clock), 0));
+        }
+        assert_eq!(source.telemetry().dropped, 1);
+        source.wait_for_recovery_completion().unwrap();
         let first = match source.try_receive().unwrap() {
             Some(MediaTransfer::Live(frame)) => frame,
             result => panic!("unexpected first mapped frame: {result:?}"),
         };
-        assert_eq!(first.timing().sequence().get(), 8);
+        assert_eq!(first.timing().sequence().get(), 9);
 
-        source
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(test_frame_at(2, 2_066, clock), 0);
         let after_gap = match source.try_receive().unwrap() {
             Some(MediaTransfer::Live(frame)) => frame,
             result => panic!("unexpected mapped gap frame: {result:?}"),
@@ -2537,6 +2586,30 @@ mod tests {
         assert_eq!(telemetry.recovery_timeout_discarded, 2);
         assert_eq!(telemetry.current, 0);
         assert_eq!(telemetry.received, 3);
+    }
+
+    #[test]
+    fn recovery_completion_timeout_returns_error_and_lost_state() {
+        let mut source = source_with_policy(SignalLossPolicy::Hold);
+        source.start_without_helper_for_test();
+        let clock = source.options.as_ref().unwrap().clock_domain;
+        source.lifecycle = LifecycleState::Recovering;
+        source.pending_recovery = Some(RecoveryContinuity {
+            clock,
+            previous_pts_nanos: None,
+        });
+        source.recovery_deadline = Some(
+            Instant::now()
+                .checked_sub(Duration::from_millis(1))
+                .unwrap_or_else(Instant::now),
+        );
+
+        assert!(matches!(
+            source.wait_for_recovery_completion(),
+            Err(IoError::SignalLost { .. })
+        ));
+        assert_eq!(source.lifecycle(), LifecycleState::Lost);
+        assert_ne!(source.lifecycle(), LifecycleState::Recovering);
     }
 
     #[test]
@@ -2940,62 +3013,17 @@ mod tests {
 
         source.begin_recovery().unwrap();
         source.finish_recovery().unwrap();
-        assert_eq!(source.lifecycle(), LifecycleState::Recovering);
-        assert_ne!(source.health().state, EndpointHealthState::Healthy);
-        assert!(!invalid_marker.exists());
-        assert!(matches!(
-            source.try_receive().unwrap(),
-            Some(MediaTransfer::Fallback {
-                kind: FallbackKind::Hold,
-                media,
-            }) if media == first
-        ));
-
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !invalid_marker.exists() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        assert_eq!(source.lifecycle(), LifecycleState::Running);
+        assert_eq!(source.health().state, EndpointHealthState::Healthy);
         assert!(
             invalid_marker.exists(),
             "invalid recovery frames were not emitted"
         );
-        for _ in 0..2 {
-            assert!(matches!(
-                source.try_receive().unwrap(),
-                Some(MediaTransfer::Fallback {
-                    kind: FallbackKind::Hold,
-                    media,
-                }) if media == first
-            ));
-            assert_eq!(source.lifecycle(), LifecycleState::Recovering);
-            assert_ne!(source.health().state, EndpointHealthState::Healthy);
-        }
-        assert!(
-            source
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .last_activity
-                .is_none()
-        );
-
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let recovered = loop {
-            match source.try_receive().unwrap() {
-                Some(MediaTransfer::Live(frame)) => break frame,
-                Some(MediaTransfer::Fallback {
-                    kind: FallbackKind::Hold,
-                    ..
-                })
-                | None
-                    if Instant::now() < deadline =>
-                {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                result => panic!("unexpected recovered transfer: {result:?}"),
-            }
+        let recovered = match source.try_receive().unwrap() {
+            Some(MediaTransfer::Live(frame)) => frame,
+            result => panic!("unexpected staged recovered transfer: {result:?}"),
         };
-        assert_eq!(recovered.timing().sequence().get(), 8);
+        assert_eq!(recovered.timing().sequence().get(), 10);
         assert_eq!(
             recovered.timing().clock_domain(),
             first.timing().clock_domain()
@@ -3017,7 +3045,7 @@ mod tests {
                 result => panic!("unexpected second recovered transfer: {result:?}"),
             }
         };
-        assert_eq!(second.timing().sequence().get(), 9);
+        assert_eq!(second.timing().sequence().get(), 11);
         assert!(!second.timing().flags().contains(MediaFlags::DISCONTINUITY));
         assert_eq!(source.telemetry().received, 5);
         assert_eq!(source.telemetry().native_dropped, 5);
@@ -3027,22 +3055,9 @@ mod tests {
 
         source.transition_to_signal_lost("injected post-recovery loss".to_owned());
         source.begin_recovery().unwrap();
-        source.finish_recovery().unwrap();
-        assert_eq!(source.lifecycle(), LifecycleState::Recovering);
-        let installed_deadline = source.recovery_deadline.unwrap();
-        assert!(installed_deadline > Instant::now());
-        assert!(installed_deadline <= Instant::now() + RECOVERY_FRAME_TIMEOUT);
-        source.recovery_deadline = Some(
-            Instant::now()
-                .checked_sub(Duration::from_millis(1))
-                .unwrap_or_else(Instant::now),
-        );
         assert!(matches!(
-            source.try_receive().unwrap(),
-            Some(MediaTransfer::Fallback {
-                kind: FallbackKind::Hold,
-                media,
-            }) if media == second
+            source.finish_recovery(),
+            Err(IoError::SignalLost { .. })
         ));
         assert_eq!(source.lifecycle(), LifecycleState::Lost);
         assert_eq!(source.health().state, EndpointHealthState::SignalLost);
@@ -3051,21 +3066,10 @@ mod tests {
         assert_eq!(source.telemetry().native_dropped, 5);
         assert_eq!(source.telemetry().recovery_timeout_discarded, 0);
         source.begin_recovery().unwrap();
-        source.finish_recovery().unwrap();
-        assert_eq!(source.lifecycle(), LifecycleState::Recovering);
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            match source.try_receive() {
-                Err(IoError::AdapterFailure { .. }) => break,
-                Ok(Some(MediaTransfer::Fallback {
-                    kind: FallbackKind::Hold,
-                    media,
-                })) if media == second && Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                result => panic!("unexpected malformed recovery result: {result:?}"),
-            }
-        }
+        assert!(matches!(
+            source.finish_recovery(),
+            Err(IoError::AdapterFailure { .. })
+        ));
         assert_eq!(source.lifecycle(), LifecycleState::Lost);
         assert_eq!(source.health().state, EndpointHealthState::Failed);
         assert!(source.capture.is_none());
