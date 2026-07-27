@@ -27,13 +27,18 @@ use fm_frame::{
     MatrixCoefficients, SignalRange, TransferFunction, VideoFrameMetadata,
 };
 use fm_gpu::{NativeBackend, TextureFormat};
+use fm_model::{Input, InputKind, Project, ProjectSettings, Rgba8, Scene};
 use fm_scheduler::FrameNumber;
 use fm_sim::{SimulatedVideoSource, SourcePattern};
-use fm_switcher::ProgramFrame;
-use fm_types::{FrameRate, InputId};
+use fm_switcher::{ProgramFrame, TransitionKind as SwitcherTransitionKind};
+use fm_types::{
+    AudioFormat, ChannelLayout, ColorMetadata as ModelColorMetadata, FrameRate, InputId,
+    PixelFormat, ProjectId, SampleFormat, SampleRate, ScanMode, SceneId, VideoDimensions,
+    VideoFormat,
+};
 use freemixd::native_media::{
-    NativeMediaRuntime, NativeResolvedSource, NativeSourceLimits, NativeSourcePlayback,
-    NativeSourceRegistry,
+    NativeMediaRuntime, NativeProjectLimits, NativeProjectPlan, NativeResolvedSource,
+    NativeSourceLimits, NativeSourcePlayback, NativeSourceRegistry,
 };
 use half::f16;
 use tempfile::tempdir;
@@ -630,4 +635,113 @@ fn local_h264_file_reaches_metal_normalization_fade_and_wipe() {
         &decoded,
         &cpu_frames,
     ));
+}
+
+#[test]
+#[allow(clippy::float_cmp, clippy::too_many_lines)]
+fn native_metal_renders_scenes_before_exact_fade_and_wipe() {
+    let runtime = block_on(NativeMediaRuntime::new([NativeBackend::Metal]))
+        .expect("create Metal scene runtime");
+    let clock_domain = ClockDomainId::new(NonZeroU128::new(91).unwrap());
+    let playback = runtime
+        .preflight_resolved_source_playback_mixed_blocking(
+            None,
+            Vec::<NativeResolvedSource>::new(),
+            clock_domain,
+            StreamSelector::Best,
+            NativeSourceLimits::default(),
+        )
+        .expect("create empty physical source registry");
+    let frame_rate = FrameRate::new(30, 1).unwrap();
+    let mut project = Project::new(
+        ProjectId::new(NonZeroU128::new(90).unwrap()),
+        "Metal nested scene transition",
+        ProjectSettings {
+            frame_rate,
+            video: VideoFormat {
+                dimensions: VideoDimensions::new(4, 2).unwrap(),
+                frame_rate,
+                pixel_format: PixelFormat::Rgba8,
+                scan: ScanMode::Progressive,
+                color: ModelColorMetadata::default(),
+            },
+            audio: AudioFormat {
+                sample_rate: SampleRate::new(48_000).unwrap(),
+                sample_format: SampleFormat::F32,
+                channels: ChannelLayout::stereo(),
+            },
+        },
+    );
+    let red_input = InputId::new(NonZeroU128::new(1).unwrap());
+    let blue_input = InputId::new(NonZeroU128::new(2).unwrap());
+    let red_scene = SceneId::new(NonZeroU128::new(11).unwrap());
+    let blue_scene = SceneId::new(NonZeroU128::new(12).unwrap());
+    for (id, scene_id) in [(red_input, red_scene), (blue_input, blue_scene)] {
+        project.add_input(Input {
+            id,
+            name: format!("scene {id}"),
+            kind: InputKind::Scene {
+                scene_id,
+                audio_source: None,
+            },
+            required_capabilities: Vec::new(),
+        });
+    }
+    project.add_scene(Scene {
+        id: red_scene,
+        name: "red".into(),
+        background: Rgba8::new(255, 0, 0, 255),
+        layers: Vec::new(),
+    });
+    project.add_scene(Scene {
+        id: blue_scene,
+        name: "blue".into(),
+        background: Rgba8::new(0, 0, 255, 255),
+        layers: Vec::new(),
+    });
+    let plan = NativeProjectPlan::compile(&project, NativeProjectLimits::default())
+        .expect("compile scene routes");
+
+    for kind in [SwitcherTransitionKind::Fade, SwitcherTransitionKind::Wipe] {
+        let frame = FrameResult {
+            frame: FrameNumber::new(0),
+            deadline: ClockTime::from_nanos(0),
+            program: ProgramFrame {
+                primary: red_input,
+                secondary: Some(blue_input),
+                transition_kind: Some(kind),
+                mix_numerator: 1,
+                mix_denominator: 2,
+                mix_start_numerator: 0,
+                mix_end_numerator: 1,
+            },
+            events: Vec::new(),
+            revision: Revision::new(0),
+            runtime_generation: RuntimeGeneration::new(0),
+        };
+        let output =
+            block_on(runtime.render_project_frame_result(playback.registry(), &plan, &frame))
+                .expect("render scenes before transition");
+        let readback =
+            block_on(runtime.diagnostic_readback(&output)).expect("read scene transition");
+        for x in 0..4_u32 {
+            let offset = usize::try_from(x).unwrap() * 8;
+            let component = |index: usize| {
+                f16::from_bits(u16::from_le_bytes([
+                    readback.bytes[offset + index * 2],
+                    readback.bytes[offset + index * 2 + 1],
+                ]))
+                .to_f32()
+            };
+            let expected = match kind {
+                SwitcherTransitionKind::Fade => [0.5, 0.0, 0.5, 1.0],
+                SwitcherTransitionKind::Wipe if x < 2 => [0.0, 0.0, 1.0, 1.0],
+                SwitcherTransitionKind::Wipe => [1.0, 0.0, 0.0, 1.0],
+                _ => unreachable!(),
+            };
+            for (index, expected) in expected.into_iter().enumerate() {
+                assert_eq!(component(index), expected, "{kind:?} x={x} channel={index}");
+            }
+        }
+    }
 }

@@ -32,8 +32,10 @@ use fm_color::{
     NativeImportError, NativeImportNormalizer, NativeSdrOutputTransform, NativeWorkingFrame,
 };
 use fm_compositor::{
-    NativeTransitionError, NativeTransitionRenderer, TransitionError, TransitionKind,
-    TransitionPlan,
+    CompositionPlan, NativeCompositionError, NativeCompositionRenderer, NativeSourceFrame,
+    NativeTransitionError, NativeTransitionRenderer, OutputTarget, PlanError,
+    Rgba8 as CompositorRgba8, Rotation as CompositorRotation, Scene as CompositorScene, SourceId,
+    SourceLayer, Transform, TransitionError, TransitionKind, TransitionPlan, compile_scene,
 };
 use fm_engine::FrameResult;
 use fm_frame::{
@@ -44,14 +46,501 @@ use fm_gpu::{
     DiagnosticReadback, NativeAdapterInfo, NativeBackend, NativeContext, NativeGpuError,
     NativeTexture, NativeTextureReadback,
 };
+use fm_model::{InputKind, Project, Rotation, SourceRef};
 use fm_sim::{CollectingAudioSink, OverflowPolicy, SinkConfigError, SinkTelemetry};
 use fm_switcher::{ProgramFrame, TransitionKind as SwitcherTransitionKind};
-use fm_types::{AudioFormat, FrameRate, InputId, SampleFormat, TimeBase};
+use fm_types::{AudioFormat, FrameRate, InputId, SampleFormat, SceneId, TimeBase};
 
 const RGBA16_FLOAT_BYTES_PER_PIXEL: u64 = 8;
 const SOURCE_REFILL_LOW_WATERMARK: usize = 4;
 const SOURCE_REFILL_MAX_PAGE: u32 = 4;
 const AUDIO_REFILL_LOW_WATERMARK: usize = 8;
+
+/// Resource bounds applied while compiling schema-v4 native scenes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeProjectLimits {
+    pub max_reachable_scenes: usize,
+    pub max_total_active_layers: usize,
+    pub max_transient_rgba16f_bytes: u64,
+}
+
+impl NativeProjectLimits {
+    pub const DEFAULT_MAX_REACHABLE_SCENES: usize = 64;
+    pub const DEFAULT_MAX_TOTAL_ACTIVE_LAYERS: usize = 64;
+    pub const DEFAULT_MAX_TRANSIENT_RGBA16F_BYTES: u64 = 512 * 1024 * 1024;
+}
+
+impl Default for NativeProjectLimits {
+    fn default() -> Self {
+        Self {
+            max_reachable_scenes: Self::DEFAULT_MAX_REACHABLE_SCENES,
+            max_total_active_layers: Self::DEFAULT_MAX_TOTAL_ACTIVE_LAYERS,
+            max_transient_rgba16f_bytes: Self::DEFAULT_MAX_TRANSIENT_RGBA16F_BYTES,
+        }
+    }
+}
+
+/// A schema input's native video realization route.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeVideoRoute {
+    Leaf(InputId),
+    Scene(SceneId),
+}
+
+/// A schema input's recursively resolved native audio terminal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeAudioRoute {
+    Leaf(InputId),
+    Silence,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum NativeSceneSource {
+    Leaf(InputId),
+    Scene(SceneId),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NativeScenePlan {
+    id: SceneId,
+    output: SourceId,
+    composition: CompositionPlan,
+    sources: Vec<(SourceId, NativeSceneSource)>,
+}
+
+/// Typed failures produced before any native device or decoder is opened.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NativeProjectPlanError {
+    MissingInput(InputId),
+    MissingScene(SceneId),
+    SceneCycle {
+        scene: SceneId,
+    },
+    AudioCycle {
+        input: InputId,
+    },
+    TooManyReachableScenes {
+        actual: usize,
+        maximum: usize,
+    },
+    TooManyActiveLayers {
+        actual: usize,
+        maximum: usize,
+    },
+    TransientByteSizeOverflow {
+        width: u32,
+        height: u32,
+        scenes: usize,
+    },
+    TransientBytesExceeded {
+        required: u64,
+        maximum: u64,
+    },
+    Scene {
+        scene: SceneId,
+        error: fm_compositor::SceneError,
+    },
+    Composition {
+        scene: SceneId,
+        error: PlanError,
+    },
+    SourceTokenExhausted,
+}
+
+impl fmt::Display for NativeProjectPlanError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingInput(input) => {
+                write!(formatter, "native scene references missing input {input}")
+            }
+            Self::MissingScene(scene) => write!(formatter, "native scene {scene} is missing"),
+            Self::SceneCycle { scene } => {
+                write!(formatter, "native scene dependency cycle reaches {scene}")
+            }
+            Self::AudioCycle { input } => {
+                write!(formatter, "native scene audio cycle reaches input {input}")
+            }
+            Self::TooManyReachableScenes { actual, maximum } => write!(
+                formatter,
+                "native project has {actual} reachable scenes; maximum is {maximum}"
+            ),
+            Self::TooManyActiveLayers { actual, maximum } => write!(
+                formatter,
+                "native project has {actual} active reachable scene layers; maximum is {maximum}"
+            ),
+            Self::TransientByteSizeOverflow {
+                width,
+                height,
+                scenes,
+            } => write!(
+                formatter,
+                "{scenes} native scene targets at {width}x{height} overflow the RGBA16F byte charge"
+            ),
+            Self::TransientBytesExceeded { required, maximum } => write!(
+                formatter,
+                "native scene transient RGBA16F bytes {required} exceed limit {maximum}"
+            ),
+            Self::Scene { scene, error } => {
+                write!(formatter, "native scene {scene} is invalid: {error}")
+            }
+            Self::Composition { scene, error } => {
+                write!(formatter, "native scene {scene} plan is invalid: {error}")
+            }
+            Self::SourceTokenExhausted => {
+                formatter.write_str("native scene source tokens are exhausted")
+            }
+        }
+    }
+}
+
+impl Error for NativeProjectPlanError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Scene { error, .. } => Some(error),
+            Self::Composition { error, .. } => Some(error),
+            _ => None,
+        }
+    }
+}
+
+/// Immutable, bounded native realization plan for one schema-v4 project.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeProjectPlan {
+    video_routes: BTreeMap<InputId, NativeVideoRoute>,
+    audio_routes: BTreeMap<InputId, NativeAudioRoute>,
+    scenes: Vec<NativeScenePlan>,
+    transient_rgba16f_bytes: u64,
+}
+
+impl NativeProjectPlan {
+    /// Compiles all scene-input roots and their enabled dependencies without I/O.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed missing-resource, cycle, scene-validation, or bound failures.
+    #[allow(clippy::too_many_lines)]
+    pub fn compile(
+        project: &Project,
+        limits: NativeProjectLimits,
+    ) -> Result<Self, NativeProjectPlanError> {
+        let inputs = project
+            .inputs()
+            .iter()
+            .map(|input| (input.id, input))
+            .collect::<BTreeMap<_, _>>();
+        let scene_models = project
+            .scenes()
+            .iter()
+            .map(|scene| (scene.id, scene))
+            .collect::<BTreeMap<_, _>>();
+        let video_routes = project
+            .inputs()
+            .iter()
+            .map(|input| {
+                let route = match input.kind {
+                    InputKind::Scene { scene_id, .. } => NativeVideoRoute::Scene(scene_id),
+                    _ => NativeVideoRoute::Leaf(input.id),
+                };
+                (input.id, route)
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        let mut order = Vec::new();
+        let mut visiting = BTreeSet::new();
+        let mut visited = BTreeSet::new();
+        let roots = video_routes
+            .values()
+            .filter_map(|route| match route {
+                NativeVideoRoute::Scene(scene) => Some(*scene),
+                NativeVideoRoute::Leaf(_) => None,
+            })
+            .collect::<BTreeSet<_>>();
+        for root in roots {
+            visit_native_scene(
+                root,
+                &inputs,
+                &scene_models,
+                &mut visiting,
+                &mut visited,
+                &mut order,
+            )?;
+        }
+        if order.len() > limits.max_reachable_scenes {
+            return Err(NativeProjectPlanError::TooManyReachableScenes {
+                actual: order.len(),
+                maximum: limits.max_reachable_scenes,
+            });
+        }
+        let active_layers = order.iter().try_fold(0_usize, |total, scene_id| {
+            let scene = scene_models
+                .get(scene_id)
+                .ok_or(NativeProjectPlanError::MissingScene(*scene_id))?;
+            total
+                .checked_add(scene.layers.iter().filter(|layer| layer.enabled).count())
+                .ok_or(NativeProjectPlanError::TooManyActiveLayers {
+                    actual: usize::MAX,
+                    maximum: limits.max_total_active_layers,
+                })
+        })?;
+        if active_layers > limits.max_total_active_layers {
+            return Err(NativeProjectPlanError::TooManyActiveLayers {
+                actual: active_layers,
+                maximum: limits.max_total_active_layers,
+            });
+        }
+
+        let dimensions = project.settings().video.dimensions;
+        let frame_bytes = u64::from(dimensions.width())
+            .checked_mul(u64::from(dimensions.height()))
+            .and_then(|pixels| pixels.checked_mul(RGBA16_FLOAT_BYTES_PER_PIXEL))
+            .ok_or(NativeProjectPlanError::TransientByteSizeOverflow {
+                width: dimensions.width(),
+                height: dimensions.height(),
+                scenes: order.len(),
+            })?;
+        let transient_rgba16f_bytes = frame_bytes
+            .checked_mul(u64::try_from(order.len()).unwrap_or(u64::MAX))
+            .ok_or(NativeProjectPlanError::TransientByteSizeOverflow {
+                width: dimensions.width(),
+                height: dimensions.height(),
+                scenes: order.len(),
+            })?;
+        if transient_rgba16f_bytes > limits.max_transient_rgba16f_bytes {
+            return Err(NativeProjectPlanError::TransientBytesExceeded {
+                required: transient_rgba16f_bytes,
+                maximum: limits.max_transient_rgba16f_bytes,
+            });
+        }
+
+        let mut next_source = 0_u64;
+        let mut scenes = Vec::with_capacity(order.len());
+        for scene_id in order {
+            let model = scene_models
+                .get(&scene_id)
+                .ok_or(NativeProjectPlanError::MissingScene(scene_id))?;
+            let mut scene = CompositorScene::new(
+                dimensions.width(),
+                dimensions.height(),
+                CompositorRgba8::new(
+                    model.background.red,
+                    model.background.green,
+                    model.background.blue,
+                    model.background.alpha,
+                ),
+            )
+            .map_err(|error| NativeProjectPlanError::Scene {
+                scene: scene_id,
+                error,
+            })?;
+            let mut tokens = BTreeMap::new();
+            for layer in &model.layers {
+                let token = if layer.enabled {
+                    let source = resolve_scene_source(layer.source, &inputs, &scene_models)?;
+                    if let Some(token) = tokens.get(&source) {
+                        *token
+                    } else {
+                        let token = SourceId::new(next_source);
+                        next_source = next_source
+                            .checked_add(1)
+                            .ok_or(NativeProjectPlanError::SourceTokenExhausted)?;
+                        tokens.insert(source, token);
+                        token
+                    }
+                } else {
+                    SourceId::new(0)
+                };
+                let geometry = layer.geometry;
+                let rotation = match geometry.rotation {
+                    Rotation::Deg0 => CompositorRotation::Deg0,
+                    Rotation::Deg90 => CompositorRotation::Deg90,
+                    Rotation::Deg180 => CompositorRotation::Deg180,
+                    Rotation::Deg270 => CompositorRotation::Deg270,
+                };
+                let mut native_layer = SourceLayer::new(
+                    token,
+                    layer.z_order,
+                    Transform::new(
+                        geometry.translation_x,
+                        geometry.translation_y,
+                        geometry.width,
+                        geometry.height,
+                        rotation,
+                    ),
+                )
+                .with_enabled(layer.enabled)
+                .with_opacity(layer.opacity);
+                if let Some(crop) = layer.crop {
+                    native_layer = native_layer.with_crop(fm_compositor::CropRect::new(
+                        crop.x,
+                        crop.y,
+                        crop.width,
+                        crop.height,
+                    ));
+                }
+                scene.push_layer(native_layer);
+            }
+            let (composition, _) =
+                compile_scene(&scene, OutputTarget::Program).map_err(|error| {
+                    NativeProjectPlanError::Composition {
+                        scene: scene_id,
+                        error,
+                    }
+                })?;
+            let output = SourceId::new(next_source);
+            next_source = next_source
+                .checked_add(1)
+                .ok_or(NativeProjectPlanError::SourceTokenExhausted)?;
+            scenes.push(NativeScenePlan {
+                id: scene_id,
+                output,
+                composition,
+                sources: tokens
+                    .into_iter()
+                    .map(|(source, token)| (token, source))
+                    .collect(),
+            });
+        }
+
+        let mut audio_routes = BTreeMap::new();
+        for input in project.inputs() {
+            let mut visiting = BTreeSet::new();
+            let route = resolve_audio_route(input.id, &inputs, &mut audio_routes, &mut visiting)?;
+            audio_routes.insert(input.id, route);
+        }
+        Ok(Self {
+            video_routes,
+            audio_routes,
+            scenes,
+            transient_rgba16f_bytes,
+        })
+    }
+
+    #[must_use]
+    pub fn video_route(&self, input: InputId) -> Option<NativeVideoRoute> {
+        self.video_routes.get(&input).copied()
+    }
+
+    #[must_use]
+    pub fn audio_route(&self, input: InputId) -> Option<NativeAudioRoute> {
+        self.audio_routes.get(&input).copied()
+    }
+
+    #[must_use]
+    pub fn scene_order(&self) -> impl ExactSizeIterator<Item = SceneId> + '_ {
+        self.scenes.iter().map(|scene| scene.id)
+    }
+
+    #[must_use]
+    pub fn active_layer_count(&self) -> usize {
+        self.scenes
+            .iter()
+            .map(|scene| scene.composition.layers().len())
+            .sum()
+    }
+
+    #[must_use]
+    pub const fn transient_rgba16f_bytes(&self) -> u64 {
+        self.transient_rgba16f_bytes
+    }
+
+    fn silent_audio_inputs(&self) -> impl Iterator<Item = InputId> + '_ {
+        self.audio_routes
+            .iter()
+            .filter_map(|(input, route)| (*route == NativeAudioRoute::Silence).then_some(*input))
+    }
+}
+
+fn resolve_scene_source(
+    source: SourceRef,
+    inputs: &BTreeMap<InputId, &fm_model::Input>,
+    scenes: &BTreeMap<SceneId, &fm_model::Scene>,
+) -> Result<NativeSceneSource, NativeProjectPlanError> {
+    match source {
+        SourceRef::Input(input) => match &inputs
+            .get(&input)
+            .ok_or(NativeProjectPlanError::MissingInput(input))?
+            .kind
+        {
+            InputKind::Scene { scene_id, .. } => {
+                if !scenes.contains_key(scene_id) {
+                    return Err(NativeProjectPlanError::MissingScene(*scene_id));
+                }
+                Ok(NativeSceneSource::Scene(*scene_id))
+            }
+            _ => Ok(NativeSceneSource::Leaf(input)),
+        },
+        SourceRef::Scene(scene) => {
+            if !scenes.contains_key(&scene) {
+                return Err(NativeProjectPlanError::MissingScene(scene));
+            }
+            Ok(NativeSceneSource::Scene(scene))
+        }
+    }
+}
+
+fn visit_native_scene(
+    scene: SceneId,
+    inputs: &BTreeMap<InputId, &fm_model::Input>,
+    scenes: &BTreeMap<SceneId, &fm_model::Scene>,
+    visiting: &mut BTreeSet<SceneId>,
+    visited: &mut BTreeSet<SceneId>,
+    order: &mut Vec<SceneId>,
+) -> Result<(), NativeProjectPlanError> {
+    if visited.contains(&scene) {
+        return Ok(());
+    }
+    if !visiting.insert(scene) {
+        return Err(NativeProjectPlanError::SceneCycle { scene });
+    }
+    let model = scenes
+        .get(&scene)
+        .ok_or(NativeProjectPlanError::MissingScene(scene))?;
+    let dependencies = model
+        .layers
+        .iter()
+        .filter(|layer| layer.enabled)
+        .map(|layer| resolve_scene_source(layer.source, inputs, scenes))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    for dependency in dependencies {
+        if let NativeSceneSource::Scene(dependency) = dependency {
+            visit_native_scene(dependency, inputs, scenes, visiting, visited, order)?;
+        }
+    }
+    visiting.remove(&scene);
+    visited.insert(scene);
+    order.push(scene);
+    Ok(())
+}
+
+fn resolve_audio_route(
+    input: InputId,
+    inputs: &BTreeMap<InputId, &fm_model::Input>,
+    resolved: &mut BTreeMap<InputId, NativeAudioRoute>,
+    visiting: &mut BTreeSet<InputId>,
+) -> Result<NativeAudioRoute, NativeProjectPlanError> {
+    if let Some(route) = resolved.get(&input) {
+        return Ok(*route);
+    }
+    if !visiting.insert(input) {
+        return Err(NativeProjectPlanError::AudioCycle { input });
+    }
+    let model = inputs
+        .get(&input)
+        .ok_or(NativeProjectPlanError::MissingInput(input))?;
+    let route = match model.kind {
+        InputKind::Scene {
+            audio_source: Some(source),
+            ..
+        } => resolve_audio_route(source, inputs, resolved, visiting)?,
+        InputKind::Scene {
+            audio_source: None, ..
+        } => NativeAudioRoute::Silence,
+        _ => NativeAudioRoute::Leaf(input),
+    };
+    visiting.remove(&input);
+    resolved.insert(input, route);
+    Ok(route)
+}
 
 struct ThreadWaker(thread::Thread);
 
@@ -109,6 +598,7 @@ pub enum NativeMediaError {
     Ffmpeg(fm_codec_ffmpeg::Error),
     Gpu(NativeGpuError),
     Color(NativeImportError),
+    SceneCompositor(NativeCompositionError),
     Compositor(NativeTransitionError),
 }
 
@@ -118,6 +608,9 @@ impl fmt::Display for NativeMediaError {
             Self::Ffmpeg(error) => write!(formatter, "local media decode failed: {error}"),
             Self::Gpu(error) => write!(formatter, "native GPU setup or diagnostic failed: {error}"),
             Self::Color(error) => write!(formatter, "native color normalization failed: {error}"),
+            Self::SceneCompositor(error) => {
+                write!(formatter, "native scene composition failed: {error}")
+            }
             Self::Compositor(error) => write!(formatter, "native composition failed: {error}"),
         }
     }
@@ -129,6 +622,7 @@ impl Error for NativeMediaError {
             Self::Ffmpeg(error) => Some(error),
             Self::Gpu(error) => Some(error),
             Self::Color(error) => Some(error),
+            Self::SceneCompositor(error) => Some(error),
             Self::Compositor(error) => Some(error),
         }
     }
@@ -155,6 +649,12 @@ impl From<NativeImportError> for NativeMediaError {
 impl From<NativeTransitionError> for NativeMediaError {
     fn from(value: NativeTransitionError) -> Self {
         Self::Compositor(value)
+    }
+}
+
+impl From<NativeCompositionError> for NativeMediaError {
+    fn from(value: NativeCompositionError) -> Self {
+        Self::SceneCompositor(value)
     }
 }
 
@@ -471,6 +971,7 @@ pub enum NativeSourceRenderError {
     MissingTransitionKind,
     UnsupportedTransition(SwitcherTransitionKind),
     InvalidMix(TransitionError),
+    SceneCompositor(NativeCompositionError),
     Compositor(NativeTransitionError),
 }
 
@@ -495,6 +996,9 @@ impl fmt::Display for NativeSourceRenderError {
                 write!(formatter, "native transition {kind:?} is not supported")
             }
             Self::InvalidMix(error) => write!(formatter, "program-frame mix is invalid: {error}"),
+            Self::SceneCompositor(error) => {
+                write!(formatter, "native scene composition failed: {error}")
+            }
             Self::Compositor(error) => write!(formatter, "native composition failed: {error}"),
         }
     }
@@ -504,6 +1008,7 @@ impl Error for NativeSourceRenderError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::InvalidMix(error) => Some(error),
+            Self::SceneCompositor(error) => Some(error),
             Self::Compositor(error) => Some(error),
             Self::MissingSource { .. }
             | Self::DimensionMismatch { .. }
@@ -760,6 +1265,9 @@ pub enum NativeMasterError {
     DecodeContract {
         input: InputId,
     },
+    MissingAudioRoute {
+        input: InputId,
+    },
     UnexpectedFrame {
         expected: u64,
         actual: u64,
@@ -807,6 +1315,9 @@ impl fmt::Display for NativeMasterError {
                     formatter,
                     "source {input} violated the native audio decode contract"
                 )
+            }
+            Self::MissingAudioRoute { input } => {
+                write!(formatter, "input {input} has no native project audio route")
             }
             Self::UnexpectedFrame { expected, actual } => write!(
                 formatter,
@@ -1191,6 +1702,51 @@ impl NativeMasterRuntime {
         })
     }
 
+    /// Preflights physical leaf audio and registers plan-routed explicit
+    /// silence without opening scene inputs as media sources.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same bounded setup failures as [`Self::preflight_local_blocking`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn preflight_project_local_blocking(
+        adapter: Option<&Adapter>,
+        resolved: &[NativeResolvedSource],
+        project: &NativeProjectPlan,
+        format: &AudioFormat,
+        frame_rate: FrameRate,
+        clock_domain: ClockDomainId,
+        expected_next_frame: u64,
+        limits: NativeAudioLimits,
+    ) -> Result<Self, NativeMasterError> {
+        let mut runtime = Self::preflight_local_blocking(
+            adapter,
+            resolved,
+            format.clone(),
+            frame_rate,
+            clock_domain,
+            expected_next_frame,
+            limits,
+        )?;
+        let map = ChannelMap::identity(format.channels.channels().len())?;
+        for input in project.silent_audio_inputs() {
+            if runtime.sources.contains_key(&input) {
+                continue;
+            }
+            runtime.mixer.add_input(
+                input,
+                format.clone(),
+                map.clone(),
+                InputState {
+                    follow_video: true,
+                    ..InputState::default()
+                },
+            )?;
+            runtime.sources.insert(input, NativeAudioSource::silence());
+        }
+        Ok(runtime)
+    }
+
     #[must_use]
     pub const fn expected_next_frame(&self) -> u64 {
         self.expected_next_frame
@@ -1472,6 +2028,29 @@ impl NativeMasterRuntime {
             return Err(NativeMasterError::Failed);
         }
         let result = self.render_frame_audio_inner(frame);
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+
+    /// Routes schema scene audio to its terminal leaf or explicit silence
+    /// before applying the existing native transition mix plan.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sticky route, readiness, mix, timing, sink, or resource failure.
+    pub fn render_project_frame_audio(
+        &mut self,
+        frame: &FrameResult,
+        project: &NativeProjectPlan,
+    ) -> Result<AudioBlock, NativeMasterError> {
+        if self.failed {
+            return Err(NativeMasterError::Failed);
+        }
+        let mut routed = frame.clone();
+        routed.program = route_program_audio(frame.program, project)?;
+        let result = self.render_frame_audio_inner(&routed);
         if result.is_err() {
             self.failed = true;
         }
@@ -1844,6 +2423,48 @@ struct NativeAudioMixPlan {
     primary: InputId,
     primary_gain: SourceGain,
     secondary: Option<(InputId, SourceGain)>,
+}
+
+fn route_program_audio(
+    mut program: ProgramFrame,
+    project: &NativeProjectPlan,
+) -> Result<ProgramFrame, NativeMasterError> {
+    let primary_route =
+        project
+            .audio_route(program.primary)
+            .ok_or(NativeMasterError::MissingAudioRoute {
+                input: program.primary,
+            })?;
+    let primary = match primary_route {
+        NativeAudioRoute::Leaf(input) => input,
+        NativeAudioRoute::Silence => program.primary,
+    };
+    let Some(secondary_input) = program.secondary else {
+        program.primary = primary;
+        return Ok(program);
+    };
+    let secondary_route =
+        project
+            .audio_route(secondary_input)
+            .ok_or(NativeMasterError::MissingAudioRoute {
+                input: secondary_input,
+            })?;
+    if primary_route == secondary_route {
+        program.primary = primary;
+        program.secondary = None;
+        program.transition_kind = None;
+        program.mix_numerator = 0;
+        program.mix_denominator = 1;
+        program.mix_start_numerator = 0;
+        program.mix_end_numerator = 0;
+        return Ok(program);
+    }
+    program.primary = primary;
+    program.secondary = Some(match secondary_route {
+        NativeAudioRoute::Leaf(input) => input,
+        NativeAudioRoute::Silence => secondary_input,
+    });
+    Ok(program)
 }
 
 fn native_audio_mix_plan(
@@ -2265,10 +2886,30 @@ fn registered_source<T>(
         .ok_or(NativeSourceRenderError::MissingSource { input })
 }
 
+fn project_texture<'a>(
+    registry: &'a NativeSourceRegistry,
+    project: &NativeProjectPlan,
+    scene_outputs: &'a BTreeMap<SceneId, (SourceId, NativeTexture)>,
+    input: InputId,
+    deadline: ClockTime,
+) -> Result<&'a NativeTexture, NativeSourceRenderError> {
+    match project.video_route(input) {
+        Some(NativeVideoRoute::Leaf(leaf)) => {
+            Ok(registry_frame(registry, leaf, deadline)?.texture())
+        }
+        Some(NativeVideoRoute::Scene(scene)) => scene_outputs
+            .get(&scene)
+            .map(|(_, texture)| texture)
+            .ok_or(NativeSourceRenderError::MissingSource { input }),
+        None => Err(NativeSourceRenderError::MissingSource { input }),
+    }
+}
+
 /// One native context shared by the import and Cut/Fade executors.
 pub struct NativeMediaRuntime {
     context: NativeContext,
     normalizer: NativeImportNormalizer,
+    composition_renderer: NativeCompositionRenderer,
     renderer: NativeTransitionRenderer,
 }
 
@@ -2338,10 +2979,12 @@ impl NativeMediaRuntime {
     /// Returns a typed color-pipeline or compositor-pipeline failure.
     pub async fn from_context(context: NativeContext) -> Result<Self, NativeMediaError> {
         let normalizer = NativeImportNormalizer::new(&context).await?;
+        let composition_renderer = NativeCompositionRenderer::new(&context).await?;
         let renderer = NativeTransitionRenderer::new(&context).await?;
         Ok(Self {
             context,
             normalizer,
+            composition_renderer,
             renderer,
         })
     }
@@ -3141,6 +3784,69 @@ impl NativeMediaRuntime {
             .map_err(NativeSourceRenderError::Compositor)
     }
 
+    /// Renders every reachable scene exactly once in dependency-first order,
+    /// then applies the authoritative Cut, Fade, or Wipe to the routed inputs.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed missing source, scene-composition, or transition failure.
+    pub async fn render_project_frame_result(
+        &self,
+        registry: &NativeSourceRegistry,
+        project: &NativeProjectPlan,
+        frame: &FrameResult,
+    ) -> Result<NativeTexture, NativeSourceRenderError> {
+        let mut scene_outputs: BTreeMap<SceneId, (SourceId, NativeTexture)> = BTreeMap::new();
+        for scene in &project.scenes {
+            let sources = scene
+                .sources
+                .iter()
+                .map(|(token, source)| {
+                    let texture = match source {
+                        NativeSceneSource::Leaf(input) => {
+                            registry_frame(registry, *input, frame.deadline)?.texture()
+                        }
+                        NativeSceneSource::Scene(dependency) => {
+                            &scene_outputs
+                                .get(dependency)
+                                .ok_or(NativeSourceRenderError::MissingSource {
+                                    input: frame.program.primary,
+                                })?
+                                .1
+                        }
+                    };
+                    Ok(NativeSourceFrame::new(*token, texture))
+                })
+                .collect::<Result<Vec<_>, NativeSourceRenderError>>()?;
+            let output = self
+                .composition_renderer
+                .render(&self.context, &scene.composition, &sources)
+                .await
+                .map_err(NativeSourceRenderError::SceneCompositor)?;
+            scene_outputs.insert(scene.id, (scene.output, output));
+        }
+
+        let plan = native_mix_plan(frame.program)?;
+        let primary = project_texture(
+            registry,
+            project,
+            &scene_outputs,
+            plan.primary,
+            frame.deadline,
+        )?;
+        let secondary = project_texture(
+            registry,
+            project,
+            &scene_outputs,
+            plan.secondary,
+            frame.deadline,
+        )?;
+        self.renderer
+            .render(&self.context, plan.transition, primary, secondary)
+            .await
+            .map_err(NativeSourceRenderError::Compositor)
+    }
+
     /// Synchronous daemon wrapper for one authoritative program render.
     ///
     /// # Errors
@@ -3152,6 +3858,20 @@ impl NativeMediaRuntime {
         frame: &FrameResult,
     ) -> Result<NativeTexture, NativeSourceRenderError> {
         block_on(self.render_frame_result(registry, frame))
+    }
+
+    /// Synchronous daemon wrapper for scene realization followed by Program transition.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed project route, source, scene-composition, or transition failure.
+    pub fn render_project_frame_result_blocking(
+        &self,
+        registry: &NativeSourceRegistry,
+        project: &NativeProjectPlan,
+        frame: &FrameResult,
+    ) -> Result<NativeTexture, NativeSourceRenderError> {
+        block_on(self.render_project_frame_result(registry, project, frame))
     }
 
     /// Renders a GPU-resident Cut, Fade, or Wipe between canonical RGBA16-float
@@ -3293,15 +4013,93 @@ mod tests {
         NormalizedTimestamp, OriginalTimestamp, PixelFormat, SampleRate, SequenceNumber, TimeBase,
         VideoDimensions,
     };
+    use fm_model::{
+        Input, Layer, LayerGeometry, ProjectSettings, Rgba8 as ModelRgba8, Scene as ModelScene,
+        SimulatedAudio, SimulatedInput, SimulatedVideo,
+    };
     use fm_scheduler::FrameNumber;
     use fm_switcher::{
         SwitcherCommand, SwitcherState, TBarPosition, TransitionKind as SwitcherTransitionKind,
     };
+    use fm_types::{ColorMetadata as ModelColorMetadata, ProjectId, ScanMode, VideoFormat};
 
     use super::*;
 
     fn input(value: u128) -> InputId {
         InputId::new(NonZeroU128::new(value).unwrap())
+    }
+
+    fn scene(value: u128) -> SceneId {
+        SceneId::new(NonZeroU128::new(value).unwrap())
+    }
+
+    fn native_plan_project(width: u32, height: u32) -> Project {
+        let frame_rate = FrameRate::new(30, 1).unwrap();
+        Project::new(
+            ProjectId::new(NonZeroU128::new(1).unwrap()),
+            "native plan",
+            ProjectSettings {
+                frame_rate,
+                video: VideoFormat {
+                    dimensions: VideoDimensions::new(width, height).unwrap(),
+                    frame_rate,
+                    pixel_format: PixelFormat::Rgba8,
+                    scan: ScanMode::Progressive,
+                    color: ModelColorMetadata::default(),
+                },
+                audio: mono_audio_format(),
+            },
+        )
+    }
+
+    fn add_leaf(project: &mut Project, id: InputId) {
+        project.add_input(Input {
+            id,
+            name: format!("leaf {id}"),
+            kind: InputKind::Simulated(SimulatedInput::new(
+                SimulatedVideo::Bars,
+                SimulatedAudio::Silence,
+            )),
+            required_capabilities: Vec::new(),
+        });
+    }
+
+    fn add_scene_input(
+        project: &mut Project,
+        id: InputId,
+        scene_id: SceneId,
+        audio_source: Option<InputId>,
+    ) {
+        project.add_input(Input {
+            id,
+            name: format!("scene input {id}"),
+            kind: InputKind::Scene {
+                scene_id,
+                audio_source,
+            },
+            required_capabilities: Vec::new(),
+        });
+    }
+
+    fn layer(source: SourceRef, z_order: i32) -> Layer {
+        Layer {
+            name: "layer".into(),
+            source,
+            enabled: true,
+            geometry: LayerGeometry::new(0, 0, 4, 2, Rotation::Deg0),
+            crop: None,
+            opacity: u8::MAX,
+            z_order,
+        }
+    }
+
+    fn add_scene(project: &mut Project, id: SceneId, layers: Vec<Layer>) {
+        project.add_scene(ModelScene {
+            id,
+            name: format!("scene {id}"),
+            background: ModelRgba8::OPAQUE_BLACK,
+            layers,
+        });
     }
 
     fn assert_sample_exact(actual: f32, expected: f32) {
@@ -3517,6 +4315,305 @@ mod tests {
             },
             failed: false,
         }
+    }
+
+    #[test]
+    fn native_project_plan_accepts_empty_scene_and_ignores_unreachable_scene() {
+        let mut project = native_plan_project(4, 2);
+        add_scene_input(&mut project, input(1), scene(10), None);
+        add_scene(&mut project, scene(10), Vec::new());
+        add_scene(&mut project, scene(99), Vec::new());
+
+        let plan = NativeProjectPlan::compile(&project, NativeProjectLimits::default()).unwrap();
+
+        assert_eq!(plan.scene_order().collect::<Vec<_>>(), vec![scene(10)]);
+        assert_eq!(plan.active_layer_count(), 0);
+        assert_eq!(plan.transient_rgba16f_bytes(), 4 * 2 * 8);
+        assert_eq!(
+            plan.video_route(input(1)),
+            Some(NativeVideoRoute::Scene(scene(10)))
+        );
+        assert_eq!(plan.audio_route(input(1)), Some(NativeAudioRoute::Silence));
+    }
+
+    #[test]
+    fn native_project_plan_orders_nested_shared_scenes_dependency_first() {
+        let mut project = native_plan_project(4, 2);
+        add_leaf(&mut project, input(1));
+        add_scene_input(&mut project, input(2), scene(20), Some(input(1)));
+        add_scene_input(&mut project, input(3), scene(30), Some(input(1)));
+        add_scene(
+            &mut project,
+            scene(10),
+            vec![layer(SourceRef::Input(input(1)), 0)],
+        );
+        add_scene(
+            &mut project,
+            scene(20),
+            vec![layer(SourceRef::Scene(scene(10)), 0)],
+        );
+        add_scene(
+            &mut project,
+            scene(30),
+            vec![
+                layer(SourceRef::Scene(scene(10)), 0),
+                layer(SourceRef::Scene(scene(10)), 1),
+            ],
+        );
+
+        let plan = NativeProjectPlan::compile(&project, NativeProjectLimits::default()).unwrap();
+
+        assert_eq!(
+            plan.scene_order().collect::<Vec<_>>(),
+            vec![scene(10), scene(20), scene(30)]
+        );
+        assert_eq!(plan.active_layer_count(), 4);
+    }
+
+    #[test]
+    fn native_project_plan_source_tokens_do_not_narrow_high_u128_ids() {
+        let low = input(7);
+        let high = input((1_u128 << 64) + 7);
+        let mut project = native_plan_project(4, 2);
+        add_leaf(&mut project, low);
+        add_leaf(&mut project, high);
+        add_scene_input(&mut project, input(3), scene(10), Some(low));
+        add_scene(
+            &mut project,
+            scene(10),
+            vec![
+                layer(SourceRef::Input(low), 0),
+                layer(SourceRef::Input(high), 1),
+            ],
+        );
+
+        let plan = NativeProjectPlan::compile(&project, NativeProjectLimits::default()).unwrap();
+        let sources = &plan.scenes[0].sources;
+
+        assert_eq!(sources.len(), 2);
+        assert!(
+            sources
+                .iter()
+                .any(|(_, source)| *source == NativeSceneSource::Leaf(low))
+        );
+        assert!(
+            sources
+                .iter()
+                .any(|(_, source)| *source == NativeSceneSource::Leaf(high))
+        );
+        assert_ne!(sources[0].0, sources[1].0);
+        assert_eq!(plan.video_route(low), Some(NativeVideoRoute::Leaf(low)));
+        assert_eq!(plan.video_route(high), Some(NativeVideoRoute::Leaf(high)));
+    }
+
+    #[test]
+    fn native_project_plan_maps_scene_visual_model_exactly() {
+        let mut project = native_plan_project(4, 2);
+        add_leaf(&mut project, input(1));
+        add_scene_input(&mut project, input(2), scene(10), Some(input(1)));
+        project.add_scene(ModelScene {
+            id: scene(10),
+            name: "mapped".into(),
+            background: ModelRgba8::new(12, 24, 36, 48),
+            layers: vec![Layer {
+                name: "mapped layer".into(),
+                source: SourceRef::Input(input(1)),
+                enabled: true,
+                geometry: LayerGeometry::new(-7, 9, 3, 2, Rotation::Deg270),
+                crop: Some(fm_model::CropRect::new(1, 0, 2, 2)),
+                opacity: 123,
+                z_order: -4,
+            }],
+        });
+
+        let plan = NativeProjectPlan::compile(&project, NativeProjectLimits::default()).unwrap();
+        let composition = &plan.scenes[0].composition;
+        let mapped = &composition.layers()[0];
+
+        assert_eq!(
+            composition.background(),
+            CompositorRgba8::new(12, 24, 36, 48)
+        );
+        assert_eq!(mapped.z(), -4);
+        assert_eq!(
+            mapped.transform(),
+            Transform::new(-7, 9, 3, 2, CompositorRotation::Deg270)
+        );
+        assert_eq!(
+            mapped.crop(),
+            Some(fm_compositor::CropRect::new(1, 0, 2, 2))
+        );
+        assert_eq!(mapped.opacity(), 123);
+    }
+
+    #[test]
+    fn native_project_plan_rejects_65_total_active_layers() {
+        let mut project = native_plan_project(4, 2);
+        add_leaf(&mut project, input(1));
+        add_scene_input(&mut project, input(2), scene(10), Some(input(1)));
+        add_scene(
+            &mut project,
+            scene(10),
+            (0_i32..65)
+                .map(|z| layer(SourceRef::Input(input(1)), z))
+                .collect(),
+        );
+
+        assert_eq!(
+            NativeProjectPlan::compile(&project, NativeProjectLimits::default()),
+            Err(NativeProjectPlanError::TooManyActiveLayers {
+                actual: 65,
+                maximum: 64,
+            })
+        );
+    }
+
+    #[test]
+    fn native_project_plan_routes_recursive_audio_and_collapses_shared_terminal() {
+        let mut project = native_plan_project(4, 2);
+        add_leaf(&mut project, input(1));
+        add_scene_input(&mut project, input(2), scene(20), Some(input(1)));
+        add_scene_input(&mut project, input(3), scene(30), Some(input(2)));
+        add_scene_input(&mut project, input(4), scene(40), None);
+        for id in [20, 30, 40] {
+            add_scene(&mut project, scene(id), Vec::new());
+        }
+        let plan = NativeProjectPlan::compile(&project, NativeProjectLimits::default()).unwrap();
+
+        assert_eq!(
+            plan.audio_route(input(3)),
+            Some(NativeAudioRoute::Leaf(input(1)))
+        );
+        assert_eq!(plan.audio_route(input(4)), Some(NativeAudioRoute::Silence));
+        let routed = route_program_audio(
+            ProgramFrame {
+                primary: input(3),
+                secondary: Some(input(2)),
+                transition_kind: Some(SwitcherTransitionKind::Fade),
+                mix_numerator: 1,
+                mix_denominator: 2,
+                mix_start_numerator: 0,
+                mix_end_numerator: 1,
+            },
+            &plan,
+        )
+        .unwrap();
+        assert_eq!(routed.primary, input(1));
+        assert_eq!(routed.secondary, None);
+
+        let silence = route_program_audio(
+            ProgramFrame {
+                primary: input(4),
+                secondary: None,
+                transition_kind: None,
+                mix_numerator: 0,
+                mix_denominator: 1,
+                mix_start_numerator: 0,
+                mix_end_numerator: 0,
+            },
+            &plan,
+        )
+        .unwrap();
+        assert_eq!(silence.primary, input(4));
+    }
+
+    #[test]
+    fn native_project_explicit_silence_renders_without_a_physical_source() {
+        let mut project = native_plan_project(4, 2);
+        add_scene_input(&mut project, input(1), scene(10), None);
+        add_scene(&mut project, scene(10), Vec::new());
+        let plan = NativeProjectPlan::compile(&project, NativeProjectLimits::default()).unwrap();
+        let mut master = NativeMasterRuntime::preflight_project_local_blocking(
+            None,
+            &[],
+            &plan,
+            &mono_audio_format(),
+            FrameRate::new(30, 1).unwrap(),
+            ClockDomainId::new(NonZeroU128::new(9).unwrap()),
+            0,
+            NativeAudioLimits::default(),
+        )
+        .unwrap();
+        assert!(master.service_next_frame().unwrap());
+
+        let block = master
+            .render_project_frame_audio(&frame_result(0, input(1), None), &plan)
+            .unwrap();
+
+        assert_eq!(block.sample_count(), 1_600);
+        assert!(block.planes()[0].iter().all(|sample| *sample == 0.0));
+    }
+
+    #[test]
+    fn native_project_plan_reports_scene_cycles_missing_resources_and_bounds() {
+        let mut cyclic = native_plan_project(4, 2);
+        add_scene_input(&mut cyclic, input(1), scene(10), None);
+        add_scene(
+            &mut cyclic,
+            scene(10),
+            vec![layer(SourceRef::Scene(scene(20)), 0)],
+        );
+        add_scene(
+            &mut cyclic,
+            scene(20),
+            vec![layer(SourceRef::Scene(scene(10)), 0)],
+        );
+        assert!(matches!(
+            NativeProjectPlan::compile(&cyclic, NativeProjectLimits::default()),
+            Err(NativeProjectPlanError::SceneCycle { .. })
+        ));
+
+        let mut missing = native_plan_project(4, 2);
+        add_scene_input(&mut missing, input(1), scene(10), None);
+        add_scene(
+            &mut missing,
+            scene(10),
+            vec![layer(SourceRef::Input(input(99)), 0)],
+        );
+        assert_eq!(
+            NativeProjectPlan::compile(&missing, NativeProjectLimits::default()),
+            Err(NativeProjectPlanError::MissingInput(input(99)))
+        );
+
+        let mut audio_cycle = native_plan_project(4, 2);
+        add_scene_input(&mut audio_cycle, input(1), scene(10), Some(input(2)));
+        add_scene_input(&mut audio_cycle, input(2), scene(20), Some(input(1)));
+        add_scene(&mut audio_cycle, scene(10), Vec::new());
+        add_scene(&mut audio_cycle, scene(20), Vec::new());
+        assert!(matches!(
+            NativeProjectPlan::compile(&audio_cycle, NativeProjectLimits::default()),
+            Err(NativeProjectPlanError::AudioCycle { .. })
+        ));
+
+        let mut bounded = native_plan_project(4, 2);
+        add_scene_input(&mut bounded, input(1), scene(10), None);
+        add_scene(&mut bounded, scene(10), Vec::new());
+        assert_eq!(
+            NativeProjectPlan::compile(
+                &bounded,
+                NativeProjectLimits {
+                    max_reachable_scenes: 0,
+                    ..NativeProjectLimits::default()
+                },
+            ),
+            Err(NativeProjectPlanError::TooManyReachableScenes {
+                actual: 1,
+                maximum: 0,
+            })
+        );
+        assert_eq!(
+            NativeProjectPlan::compile(
+                &bounded,
+                NativeProjectLimits {
+                    max_transient_rgba16f_bytes: 63,
+                    ..NativeProjectLimits::default()
+                },
+            ),
+            Err(NativeProjectPlanError::TransientBytesExceeded {
+                required: 64,
+                maximum: 63,
+            })
+        );
     }
 
     #[test]

@@ -95,7 +95,8 @@ use fm_sim::{Rgba8, SimulatedVideoSource, SourcePattern};
 #[cfg(feature = "native-media")]
 use freemixd::native_media::{
     NativeAudioLimits, NativeMasterError, NativeMasterRuntime, NativeMediaRuntime,
-    NativeProgramReadback, NativeResolvedSource, NativeSourceLimits, NativeSourceRenderError,
+    NativeProgramReadback, NativeProjectLimits, NativeProjectPlan, NativeResolvedSource,
+    NativeSourceLimits, NativeSourceRenderError,
 };
 
 const DEFAULT_LISTEN: &str = "127.0.0.1:0";
@@ -231,6 +232,7 @@ struct NativeDaemon {
     origin: Instant,
     latest_output: Option<NativeTexture>,
     master: NativeMasterRuntime,
+    project_plan: NativeProjectPlan,
     playback: freemixd::native_media::NativeSourcePlayback,
     runtime: NativeMediaRuntime,
     recorder: Option<NativeProgramRecorder>,
@@ -1566,6 +1568,8 @@ impl NativeDaemon {
         context: Option<NativeContext>,
         camera_helper: Option<&Path>,
     ) -> AppResult<Self> {
+        let project_plan =
+            NativeProjectPlan::compile(stored.project(), NativeProjectLimits::default())?;
         validate_native_audio_modes(stored)?;
         let mut resolution = resolve_native_sources(store, stored, camera_helper)?;
         let sources = resolution.sources;
@@ -1593,10 +1597,11 @@ impl NativeDaemon {
             }
         }
 
-        let master = NativeMasterRuntime::preflight_local_blocking(
+        let master = NativeMasterRuntime::preflight_project_local_blocking(
             adapter.as_ref(),
             &sources,
-            stored.project().settings().audio.clone(),
+            &project_plan,
+            &stored.project().settings().audio,
             stored.project().settings().frame_rate,
             native_clock_domain(),
             stored.position().frames_rendered,
@@ -1616,7 +1621,11 @@ impl NativeDaemon {
         #[cfg(target_os = "macos")]
         resolution.cameras.mark_preflight_frames_ingested();
         let expected = stored.project().settings().video.dimensions;
-        if playback.registry().dimensions() != Some((expected.width(), expected.height())) {
+        if playback
+            .registry()
+            .dimensions()
+            .is_some_and(|dimensions| dimensions != (expected.width(), expected.height()))
+        {
             return Err(AppFailure(format!(
                 "native media source dimensions must match project output {}x{}",
                 expected.width(),
@@ -1638,6 +1647,7 @@ impl NativeDaemon {
             origin,
             latest_output: None,
             master,
+            project_plan,
             playback,
             runtime,
             recorder: None,
@@ -1784,14 +1794,15 @@ impl NativeDaemon {
         let runtime = &self.runtime;
         let registry = self.playback.registry();
         let master = &mut self.master;
+        let project_plan = &self.project_plan;
         let latest_output = &mut self.latest_output;
         let mut audio = None;
         let outcome = control.tick_with_realizer(server, |frame| {
             let output = runtime
-                .render_frame_result_blocking(registry, frame)
+                .render_project_frame_result_blocking(registry, project_plan, frame)
                 .map_err(NativeRealizationError::Video)?;
             let block = master
-                .render_frame_audio(frame)
+                .render_project_frame_audio(frame, project_plan)
                 .map_err(NativeRealizationError::Audio)?;
             *latest_output = Some(output);
             audio = Some(block);
@@ -2077,14 +2088,9 @@ fn resolve_native_sources(
                 input.id
             ))
             .into()),
-            InputKind::Device { .. } => continue,
+            InputKind::Device { .. } | InputKind::Scene { .. } => continue,
             InputKind::Network { .. } => Err(AppFailure(format!(
                 "native network input {} is not supported by this playback mode",
-                input.id
-            ))
-            .into()),
-            InputKind::Scene { .. } => Err(AppFailure(format!(
-                "native scene input {} is not supported because scene compositor realization is not implemented",
                 input.id
             ))
             .into()),
@@ -5520,16 +5526,12 @@ mod tests {
 
     #[cfg(feature = "native-media")]
     #[test]
-    fn native_source_extraction_rejects_unrealized_scene_inputs_clearly() {
+    fn native_source_extraction_keeps_scene_inputs_out_of_physical_sources() {
         let store = ProjectStore::new("unloaded-test-project.freemix").unwrap();
-        let error = resolve_native_sources(&store, &scene_test_project(), None)
-            .err()
-            .unwrap();
+        let resolution = resolve_native_sources(&store, &scene_test_project(), None).unwrap();
 
-        assert_eq!(
-            error.to_string(),
-            "native scene input 1 is not supported because scene compositor realization is not implemented"
-        );
+        assert_eq!(resolution.sources.len(), 1);
+        assert_eq!(resolution.sources[0].input(), test_input_id(2));
     }
 
     #[cfg(all(feature = "native-media", target_os = "macos"))]

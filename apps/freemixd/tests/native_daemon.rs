@@ -22,8 +22,8 @@ use std::{
 #[cfg(target_os = "macos")]
 use fm_io_macos::{CameraIdKind, deterministic_camera_id};
 use fm_model::{
-    Input, InputKind, MainMix, Project, ProjectSettings, SimulatedAudio, SimulatedInput,
-    SimulatedVideo, SolidColor,
+    Input, InputKind, Layer, LayerGeometry, MainMix, Project, ProjectSettings, Rgba8, Rotation,
+    Scene, SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef,
 };
 use fm_persistence::{ProjectPosition, ProjectStore, RuntimeRouting, StoredProject};
 #[cfg(target_os = "macos")]
@@ -34,7 +34,7 @@ use fm_protocol::{
 };
 use fm_types::{
     AudioFormat, ChannelLayout, ColorMetadata, FrameRate, InputId, PixelFormat, ProjectId,
-    SampleFormat, SampleRate, ScanMode, VideoDimensions, VideoFormat,
+    SampleFormat, SampleRate, ScanMode, SceneId, VideoDimensions, VideoFormat,
 };
 use freemixd::ReadinessRecord;
 
@@ -404,6 +404,50 @@ fn native_generator_daemon_requires_neither_assets_nor_ffmpeg_tools() {
         persisted.runtime_routing().realized_program_id,
         Some(input(2))
     );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires a native macOS Metal adapter"]
+fn native_scene_daemon_checkpoints_and_restarts_from_scene_routes() {
+    let _hardware_lock = NATIVE_MEDIA_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let directory = tempfile::tempdir().unwrap();
+    let project_path = directory.path().join("native-scenes.freemix");
+    save_scene_generator_project(&project_path);
+
+    let mut previous_frames = 0;
+    for _ in 0..2 {
+        let Some(daemon) = require_native(NativeDaemonProcess::start_without_tools(
+            &project_path,
+            true,
+        )) else {
+            return;
+        };
+        thread::sleep(Duration::from_millis(100));
+        let mut client = StudioClient::connect(daemon.address);
+        let snapshot = client.handshake();
+        assert_snapshot_routing(&snapshot, 0, input(3), input(4));
+        drop(client);
+        let output = daemon.wait();
+        assert!(
+            output.status.success(),
+            "scene daemon failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let persisted = ProjectStore::new(&project_path).unwrap().load().unwrap();
+        assert!(persisted.position().frames_rendered > previous_frames);
+        previous_frames = persisted.position().frames_rendered;
+        assert_eq!(
+            persisted.runtime_routing().realized_program_id,
+            Some(input(3))
+        );
+        assert_eq!(
+            persisted.runtime_routing().realized_preview_id,
+            Some(input(4))
+        );
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1820,6 +1864,112 @@ fn save_generator_project_with_position(path: &Path, rate: FrameRate, frames_ren
     )
     .unwrap();
     ProjectStore::new(path).unwrap().save(&stored).unwrap();
+}
+
+fn save_scene_generator_project(path: &Path) {
+    let rate = FrameRate::new(25, 1).unwrap();
+    let mut project = Project::new(
+        ProjectId::new(NonZeroU128::new(7_003).unwrap()),
+        "Native scene daemon test",
+        ProjectSettings {
+            frame_rate: rate,
+            video: VideoFormat {
+                dimensions: VideoDimensions::new(64, 48).unwrap(),
+                frame_rate: rate,
+                pixel_format: PixelFormat::Rgba8,
+                scan: ScanMode::Progressive,
+                color: ColorMetadata::default(),
+            },
+            audio: AudioFormat {
+                sample_rate: SampleRate::new(48_000).unwrap(),
+                sample_format: SampleFormat::F32,
+                channels: ChannelLayout::stereo(),
+            },
+        },
+    );
+    for (id, video) in [
+        (input(1), SimulatedVideo::Bars),
+        (
+            input(2),
+            SimulatedVideo::Solid(SolidColor::new(24, 80, 160, 255)),
+        ),
+    ] {
+        project.add_input(Input {
+            id,
+            name: format!("Generator {id}"),
+            kind: InputKind::Simulated(SimulatedInput::new(video, SimulatedAudio::Silence)),
+            required_capabilities: Vec::new(),
+        });
+    }
+    project.add_input(Input {
+        id: input(3),
+        name: "Nested scene".into(),
+        kind: InputKind::Scene {
+            scene_id: scene_id(20),
+            audio_source: Some(input(1)),
+        },
+        required_capabilities: Vec::new(),
+    });
+    project.add_input(Input {
+        id: input(4),
+        name: "Silent scene".into(),
+        kind: InputKind::Scene {
+            scene_id: scene_id(30),
+            audio_source: None,
+        },
+        required_capabilities: Vec::new(),
+    });
+    project.add_scene(Scene {
+        id: scene_id(10),
+        name: "Leaf scene".into(),
+        background: Rgba8::OPAQUE_BLACK,
+        layers: vec![scene_layer(SourceRef::Input(input(1)), 0)],
+    });
+    project.add_scene(Scene {
+        id: scene_id(20),
+        name: "Nested scene".into(),
+        background: Rgba8::OPAQUE_BLACK,
+        layers: vec![scene_layer(SourceRef::Scene(scene_id(10)), 0)],
+    });
+    project.add_scene(Scene {
+        id: scene_id(30),
+        name: "Shared scene".into(),
+        background: Rgba8::OPAQUE_BLACK,
+        layers: vec![
+            scene_layer(SourceRef::Scene(scene_id(10)), 0),
+            scene_layer(SourceRef::Input(input(2)), 1),
+        ],
+    });
+    project.set_main_mix(MainMix::new(input(3), input(4)));
+    let stored = StoredProject::from_project(
+        project,
+        RuntimeRouting {
+            desired_program_id: Some(input(3)),
+            realized_program_id: Some(input(3)),
+            desired_preview_id: Some(input(4)),
+            realized_preview_id: Some(input(4)),
+        },
+        ProjectPosition::default(),
+        Vec::new(),
+    )
+    .unwrap();
+    ProjectStore::new(path).unwrap().save(&stored).unwrap();
+}
+
+fn scene_layer(source: SourceRef, z_order: i32) -> Layer {
+    Layer {
+        name: "layer".into(),
+        source,
+        enabled: true,
+        geometry: LayerGeometry::new(0, 0, 64, 48, Rotation::Deg0),
+        crop: None,
+        opacity: u8::MAX,
+        z_order,
+    }
+}
+
+fn scene_id(value: u128) -> SceneId {
+    SceneId::new(NonZeroU128::new(value).unwrap())
 }
 
 fn input(value: u128) -> InputId {
