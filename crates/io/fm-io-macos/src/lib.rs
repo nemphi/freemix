@@ -52,6 +52,7 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(target_os = "macos")]
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const SIGNAL_LOSS_TIMEOUT: Duration = Duration::from_secs(2);
+const RECOVERY_FRAME_TIMEOUT: Duration = Duration::from_secs(2);
 const CAMERA_STABLE_KEY_PREFIX: &str = "macos.avfoundation.camera.v1.";
 #[cfg(target_os = "macos")]
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -572,6 +573,7 @@ pub struct CameraTelemetry {
     pub received: u64,
     pub dropped: u64,
     pub native_dropped: u64,
+    pub continuity_rejected: u64,
     pub current: usize,
     pub peak: usize,
 }
@@ -581,6 +583,7 @@ struct QueueState {
     frames: VecDeque<CpuVideoFrame>,
     capacity: usize,
     telemetry: CameraTelemetry,
+    native_dropped_base: u64,
     sticky_failure: Option<String>,
     #[cfg(target_os = "macos")]
     stderr: Vec<u8>,
@@ -596,7 +599,9 @@ struct RecoveryContinuity {
 impl QueueState {
     fn push(&mut self, frame: CpuVideoFrame, native_dropped_total: u64) {
         self.telemetry.received = self.telemetry.received.saturating_add(1);
-        self.telemetry.native_dropped = native_dropped_total;
+        self.telemetry.native_dropped = self
+            .native_dropped_base
+            .saturating_add(native_dropped_total);
         if self.frames.len() >= self.capacity {
             self.frames.pop_front();
             self.telemetry.dropped = self.telemetry.dropped.saturating_add(1);
@@ -639,6 +644,8 @@ pub struct CameraVideoSource {
     resume_running: bool,
     last_delivered: Option<CpuVideoFrame>,
     pending_recovery: Option<RecoveryContinuity>,
+    recovery_deadline: Option<Instant>,
+    map_recovery_sequences: bool,
     #[cfg(target_os = "macos")]
     capture: Option<CaptureProcess>,
 }
@@ -658,6 +665,8 @@ impl CameraVideoSource {
             resume_running: false,
             last_delivered: None,
             pending_recovery: None,
+            recovery_deadline: None,
+            map_recovery_sequences: false,
             #[cfg(target_os = "macos")]
             capture: None,
         }
@@ -740,6 +749,116 @@ impl CameraVideoSource {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
+    fn start_capture(&mut self, preserve_telemetry: bool) -> Result<(), IoError> {
+        if self.lifecycle != LifecycleState::Open {
+            return Err(invalid_state("start", self.lifecycle));
+        }
+        self.shutdown()?;
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.frames.clear();
+            if preserve_telemetry {
+                state.telemetry.current = 0;
+                state.native_dropped_base = state.telemetry.native_dropped;
+            } else {
+                state.telemetry = CameraTelemetry::default();
+                state.native_dropped_base = 0;
+            }
+            state.sticky_failure = None;
+            #[cfg(target_os = "macos")]
+            state.stderr.clear();
+            state.last_activity = None;
+        }
+        self.last_delivered = None;
+        self.pending_recovery = None;
+        self.recovery_deadline = None;
+        self.map_recovery_sequences = false;
+
+        #[cfg(target_os = "macos")]
+        {
+            let (capture, startup) = self.spawn_capture()?;
+            self.capture = Some(capture);
+            let startup_result = match startup.recv_timeout(STARTUP_TIMEOUT) {
+                Ok(result) => result,
+                Err(RecvTimeoutError::Timeout) => {
+                    Err("camera helper did not emit capture magic within 10 seconds".to_owned())
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    Err("camera helper startup worker disconnected".to_owned())
+                }
+            };
+            if let Err(detail) = startup_result {
+                let cleanup = self.shutdown();
+                return Err(match cleanup {
+                    Ok(()) => adapter_failure(detail),
+                    Err(error) => {
+                        adapter_failure(format!("{detail}; startup cleanup also failed: {error}"))
+                    }
+                });
+            }
+            let worker_failure = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .sticky_failure
+                .clone();
+            let (signal_lost_exit, child_exit) = if let Some(capture) = &mut self.capture {
+                match capture.child.try_wait() {
+                    Ok(Some(status)) if status.code() == Some(20) => (true, None),
+                    Ok(Some(status)) => (
+                        false,
+                        Some(format!("camera helper exited during startup: {status}")),
+                    ),
+                    Ok(None) => (false, None),
+                    Err(error) => (
+                        false,
+                        Some(format!("camera helper startup status failed: {error}")),
+                    ),
+                }
+            } else {
+                (
+                    false,
+                    Some("camera helper startup ownership was lost".to_owned()),
+                )
+            };
+            if signal_lost_exit {
+                self.lifecycle = LifecycleState::Running;
+                self.transition_to_signal_lost(
+                    "camera helper reported source signal loss during startup".to_owned(),
+                );
+                let policy = self
+                    .options
+                    .as_ref()
+                    .map_or(SignalLossPolicy::Stop, |options| options.signal_loss);
+                return Err(IoError::SignalLost { policy });
+            }
+            if let Some(detail) = worker_failure.or(child_exit) {
+                let cleanup = self.shutdown();
+                return Err(match cleanup {
+                    Ok(()) => adapter_failure(detail),
+                    Err(error) => {
+                        adapter_failure(format!("{detail}; startup cleanup also failed: {error}"))
+                    }
+                });
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        self.spawn_capture()?;
+
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .last_activity = Some(Instant::now());
+        self.resume_running = false;
+        self.lifecycle = LifecycleState::Running;
+        self.health = EndpointHealth::HEALTHY;
+        Ok(())
+    }
+
     fn sticky_error(&mut self) -> Option<IoError> {
         #[cfg(target_os = "macos")]
         {
@@ -790,6 +909,8 @@ impl CameraVideoSource {
             if self.lifecycle == LifecycleState::Running {
                 self.resume_running = true;
             }
+            self.pending_recovery = None;
+            self.recovery_deadline = None;
             self.lifecycle = LifecycleState::Lost;
             self.set_failed_health(detail.clone());
             IoError::AdapterFailure {
@@ -1023,6 +1144,8 @@ impl CameraVideoSource {
 
     fn transition_to_signal_lost(&mut self, detail: String) {
         self.resume_running = true;
+        self.pending_recovery = None;
+        self.recovery_deadline = None;
         self.lifecycle = LifecycleState::Lost;
         self.health = EndpointHealth {
             state: EndpointHealthState::SignalLost,
@@ -1098,6 +1221,9 @@ impl CameraVideoSource {
                 ));
             }
         }
+        if !recovering && !self.map_recovery_sequences {
+            return Ok(frame);
+        }
 
         let sequence = match self.last_delivered.as_ref() {
             Some(previous) => previous
@@ -1145,6 +1271,54 @@ impl CameraVideoSource {
             .last_activity = Some(Instant::now());
         self.last_delivered = Some(frame.clone());
         MediaTransfer::Live(frame)
+    }
+
+    fn recovery_timeout_transfer(
+        &mut self,
+    ) -> Result<Option<MediaTransfer<CpuVideoFrame>>, IoError> {
+        let cleanup = self.shutdown();
+        self.pending_recovery = None;
+        self.recovery_deadline = None;
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.frames.clear();
+            state.telemetry.current = 0;
+            state.sticky_failure = None;
+        }
+        self.transition_to_signal_lost(
+            "camera recovery produced no valid frame before the deadline".to_owned(),
+        );
+        if let Err(error) = cleanup {
+            self.set_failed_health(format!(
+                "camera recovery timed out; cleanup failed: {error}"
+            ));
+        }
+        self.lost_transfer()
+    }
+
+    fn terminal_capture_error(&mut self, error: &IoError) -> IoError {
+        let detail = match self.shutdown() {
+            Ok(()) => error.to_string(),
+            Err(cleanup) => format!("{error}; capture cleanup also failed: {cleanup}"),
+        };
+        self.pending_recovery = None;
+        self.recovery_deadline = None;
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.frames.clear();
+            state.telemetry.current = 0;
+            state.sticky_failure = None;
+        }
+        self.resume_running = true;
+        self.lifecycle = LifecycleState::Lost;
+        self.set_failed_health(detail.clone());
+        adapter_failure(detail)
     }
 
     #[cfg(test)]
@@ -1200,6 +1374,7 @@ impl MediaSource for CameraVideoSource {
         state.capacity = options.queue_capacity.get();
         state.frames.clear();
         state.telemetry = CameraTelemetry::default();
+        state.native_dropped_base = 0;
         state.sticky_failure = None;
         #[cfg(target_os = "macos")]
         state.stderr.clear();
@@ -1208,6 +1383,8 @@ impl MediaSource for CameraVideoSource {
         self.options = Some(options);
         self.last_delivered = None;
         self.pending_recovery = None;
+        self.recovery_deadline = None;
+        self.map_recovery_sequences = false;
         self.resume_running = false;
         self.lifecycle = LifecycleState::Open;
         self.health = EndpointHealth::HEALTHY;
@@ -1215,117 +1392,40 @@ impl MediaSource for CameraVideoSource {
     }
 
     fn start(&mut self) -> Result<(), IoError> {
-        if self.lifecycle != LifecycleState::Open {
-            return Err(invalid_state("start", self.lifecycle));
+        self.start_capture(false)
+    }
+
+    fn stop(&mut self) -> Result<(), IoError> {
+        if !matches!(
+            self.lifecycle,
+            LifecycleState::Running | LifecycleState::Recovering | LifecycleState::Lost
+        ) {
+            return Err(invalid_state("stop", self.lifecycle));
         }
         self.shutdown()?;
-        {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state.frames.clear();
-            state.telemetry = CameraTelemetry::default();
-            state.sticky_failure = None;
-            #[cfg(target_os = "macos")]
-            state.stderr.clear();
-            state.last_activity = None;
-        }
-        self.last_delivered = None;
-        self.pending_recovery = None;
-
-        #[cfg(target_os = "macos")]
-        {
-            let (capture, startup) = self.spawn_capture()?;
-            self.capture = Some(capture);
-            let startup_result = match startup.recv_timeout(STARTUP_TIMEOUT) {
-                Ok(result) => result,
-                Err(RecvTimeoutError::Timeout) => {
-                    Err("camera helper did not emit capture magic within 10 seconds".to_owned())
-                }
-                Err(RecvTimeoutError::Disconnected) => {
-                    Err("camera helper startup worker disconnected".to_owned())
-                }
-            };
-            if let Err(detail) = startup_result {
-                let cleanup = self.shutdown();
-                return Err(match cleanup {
-                    Ok(()) => adapter_failure(detail),
-                    Err(error) => {
-                        adapter_failure(format!("{detail}; startup cleanup also failed: {error}"))
-                    }
-                });
-            }
-            let worker_failure = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .sticky_failure
-                .clone();
-            let (signal_lost_exit, child_exit) = if let Some(capture) = &mut self.capture {
-                match capture.child.try_wait() {
-                    Ok(Some(status)) if status.code() == Some(20) => (true, None),
-                    Ok(Some(status)) => (
-                        false,
-                        Some(format!("camera helper exited during startup: {status}")),
-                    ),
-                    Ok(None) => (false, None),
-                    Err(error) => (
-                        false,
-                        Some(format!("camera helper startup status failed: {error}")),
-                    ),
-                }
-            } else {
-                (
-                    false,
-                    Some("camera helper startup ownership was lost".to_owned()),
-                )
-            };
-            if signal_lost_exit {
-                self.lifecycle = LifecycleState::Running;
-                self.transition_to_signal_lost(
-                    "camera helper reported source signal loss during startup".to_owned(),
-                );
-                let policy = self
-                    .options
-                    .as_ref()
-                    .map_or(SignalLossPolicy::Stop, |options| options.signal_loss);
-                return Err(IoError::SignalLost { policy });
-            }
-            if let Some(detail) = worker_failure.or(child_exit) {
-                let cleanup = self.shutdown();
-                return Err(match cleanup {
-                    Ok(()) => adapter_failure(detail),
-                    Err(error) => {
-                        adapter_failure(format!("{detail}; startup cleanup also failed: {error}"))
-                    }
-                });
-            }
-        }
-        #[cfg(not(target_os = "macos"))]
-        self.spawn_capture()?;
-
-        self.state
+        let mut state = self
+            .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .last_activity = Some(Instant::now());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.frames.clear();
+        state.telemetry.current = 0;
+        state.sticky_failure = None;
+        state.last_activity = None;
+        drop(state);
+        self.pending_recovery = None;
+        self.recovery_deadline = None;
         self.resume_running = false;
-        self.lifecycle = LifecycleState::Running;
+        self.map_recovery_sequences = false;
+        self.lifecycle = LifecycleState::Open;
         self.health = EndpointHealth::HEALTHY;
         Ok(())
     }
 
-    fn stop(&mut self) -> Result<(), IoError> {
-        if self.lifecycle != LifecycleState::Running {
-            return Err(invalid_state("stop", self.lifecycle));
-        }
-        self.shutdown()?;
-        self.lifecycle = LifecycleState::Open;
-        Ok(())
-    }
-
     fn close(&mut self) -> Result<(), IoError> {
-        if !matches!(self.lifecycle, LifecycleState::Open | LifecycleState::Lost) {
+        if !matches!(
+            self.lifecycle,
+            LifecycleState::Open | LifecycleState::Lost | LifecycleState::Recovering
+        ) {
             return Err(invalid_state("close", self.lifecycle));
         }
         self.shutdown()?;
@@ -1341,7 +1441,9 @@ impl MediaSource for CameraVideoSource {
         self.options = None;
         self.last_delivered = None;
         self.pending_recovery = None;
+        self.recovery_deadline = None;
         self.resume_running = false;
+        self.map_recovery_sequences = false;
         self.lifecycle = LifecycleState::Closed;
         Ok(())
     }
@@ -1351,6 +1453,8 @@ impl MediaSource for CameraVideoSource {
             return Err(invalid_state("begin recovery", self.lifecycle));
         }
         self.shutdown()?;
+        self.pending_recovery = None;
+        self.recovery_deadline = None;
         self.lifecycle = LifecycleState::Recovering;
         Ok(())
     }
@@ -1367,6 +1471,7 @@ impl MediaSource for CameraVideoSource {
         }
         let held_frame = self.last_delivered.clone();
         let recovery_health = self.health.clone();
+        let map_recovery_sequences = self.map_recovery_sequences;
         let pending_recovery = RecoveryContinuity {
             clock: self
                 .options
@@ -1378,8 +1483,9 @@ impl MediaSource for CameraVideoSource {
                 .map(|frame| frame.timing().presentation_timestamp().as_nanos()),
         };
         self.lifecycle = LifecycleState::Open;
-        if let Err(error) = self.start() {
+        if let Err(error) = self.start_capture(true) {
             self.last_delivered = held_frame;
+            self.map_recovery_sequences = map_recovery_sequences;
             self.state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1394,6 +1500,8 @@ impl MediaSource for CameraVideoSource {
         }
         self.last_delivered = held_frame;
         self.pending_recovery = Some(pending_recovery);
+        self.recovery_deadline = Some(Instant::now() + RECOVERY_FRAME_TIMEOUT);
+        self.map_recovery_sequences = true;
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1421,6 +1529,12 @@ impl MediaSource for CameraVideoSource {
             if self.pending_recovery.is_none() {
                 return self.lost_transfer();
             }
+            if self
+                .recovery_deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                return self.recovery_timeout_transfer();
+            }
             let frame = self
                 .state
                 .lock()
@@ -1431,10 +1545,26 @@ impl MediaSource for CameraVideoSource {
             };
             let frame = match self.prepare_frame(frame, true) {
                 Ok(frame) => frame,
-                Err(IoError::MalformedTimestamp(_)) => return self.lost_transfer(),
-                Err(error) => return Err(error),
+                Err(IoError::MalformedTimestamp(_)) => {
+                    let mut state = self
+                        .state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    state.telemetry.continuity_rejected =
+                        state.telemetry.continuity_rejected.saturating_add(1);
+                    drop(state);
+                    if self
+                        .recovery_deadline
+                        .is_some_and(|deadline| Instant::now() >= deadline)
+                    {
+                        return self.recovery_timeout_transfer();
+                    }
+                    return self.lost_transfer();
+                }
+                Err(error) => return Err(self.terminal_capture_error(&error)),
             };
             self.pending_recovery = None;
+            self.recovery_deadline = None;
             self.resume_running = false;
             self.lifecycle = LifecycleState::Running;
             self.health = EndpointHealth::HEALTHY;
@@ -1457,7 +1587,10 @@ impl MediaSource for CameraVideoSource {
             (state.pop(), state.last_activity)
         };
         if let Some(frame) = frame {
-            let frame = self.prepare_frame(frame, false)?;
+            let frame = match self.prepare_frame(frame, false) {
+                Ok(frame) => frame,
+                Err(error) => return Err(self.terminal_capture_error(&error)),
+            };
             return Ok(Some(self.accept_frame(frame)));
         }
         if last_activity.is_some_and(|activity| activity.elapsed() >= SIGNAL_LOSS_TIMEOUT) {
@@ -1826,10 +1959,14 @@ mod tests {
     }
 
     fn capture_frame(sequence: u64, pts: i64) -> Vec<u8> {
+        capture_frame_with_drops(sequence, 0, pts)
+    }
+
+    fn capture_frame_with_drops(sequence: u64, native_dropped: u64, pts: i64) -> Vec<u8> {
         let mut stream = b"FMCAMF3\0".to_vec();
         stream.extend_from_slice(&62_u32.to_le_bytes());
         stream.extend_from_slice(&sequence.to_le_bytes());
-        stream.extend_from_slice(&0_u64.to_le_bytes());
+        stream.extend_from_slice(&native_dropped.to_le_bytes());
         stream.extend_from_slice(&pts.to_le_bytes());
         stream.extend_from_slice(&1_000_i32.to_le_bytes());
         stream.extend_from_slice(&1_i64.to_le_bytes());
@@ -1839,7 +1976,7 @@ mod tests {
         stream.extend_from_slice(&4_u32.to_le_bytes());
         stream.extend_from_slice(&4_u32.to_le_bytes());
         stream.extend_from_slice(&[1, 1]);
-        stream.extend_from_slice(&[u8::try_from(sequence).unwrap(), 0, 0, 255]);
+        stream.extend_from_slice(&[u8::try_from(sequence).unwrap_or(0), 0, 0, 255]);
         stream
     }
 
@@ -2046,6 +2183,7 @@ mod tests {
                 received: 3,
                 dropped: 1,
                 native_dropped: 5,
+                continuity_rejected: 0,
                 current: 2,
                 peak: 2,
             }
@@ -2074,7 +2212,7 @@ mod tests {
                 Some(MediaTransfer::Fallback {
                     kind: FallbackKind::Hold,
                     media,
-                }) if media.timing().sequence().get() == 0
+                }) if media.timing().sequence().get() == 7
             ));
             assert_eq!(source.lifecycle(), LifecycleState::Lost);
         }
@@ -2095,7 +2233,7 @@ mod tests {
             Some(MediaTransfer::Live(frame)) => frame,
             result => panic!("unexpected anchor transfer: {result:?}"),
         };
-        assert_eq!(anchor.timing().sequence().get(), 0);
+        assert_eq!(anchor.timing().sequence().get(), 7);
         source.expire_activity_for_test();
         assert!(matches!(
             source.try_receive().unwrap(),
@@ -2109,6 +2247,7 @@ mod tests {
             clock,
             previous_pts_nanos: Some(anchor.timing().presentation_timestamp().as_nanos()),
         });
+        source.map_recovery_sequences = true;
         source
             .state
             .lock()
@@ -2132,6 +2271,10 @@ mod tests {
             assert_eq!(source.health().state, EndpointHealthState::SignalLost);
             assert!(source.pending_recovery.is_some());
             assert_eq!(source.last_delivered.as_ref().unwrap(), &anchor);
+            assert_eq!(
+                source.telemetry().continuity_rejected,
+                helper_sequence.saturating_add(1)
+            );
             assert!(
                 source
                     .state
@@ -2151,7 +2294,7 @@ mod tests {
             Some(MediaTransfer::Live(frame)) => frame,
             result => panic!("unexpected recovered transfer: {result:?}"),
         };
-        assert_eq!(recovered.timing().sequence().get(), 1);
+        assert_eq!(recovered.timing().sequence().get(), 8);
         assert!(
             recovered
                 .timing()
@@ -2171,8 +2314,75 @@ mod tests {
             Some(MediaTransfer::Live(frame)) => frame,
             result => panic!("unexpected second recovered transfer: {result:?}"),
         };
-        assert_eq!(second.timing().sequence().get(), 2);
+        assert_eq!(second.timing().sequence().get(), 9);
         assert!(!second.timing().flags().contains(MediaFlags::DISCONTINUITY));
+    }
+
+    #[test]
+    fn recovery_sequence_overflow_becomes_stoppable_loss() {
+        let mut source = source_with_policy(SignalLossPolicy::Hold);
+        source.start_without_helper_for_test();
+        let clock = source.options.as_ref().unwrap().clock_domain;
+        source
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(test_frame_at(u64::MAX, 1_000, clock), 0);
+        let anchor = match source.try_receive().unwrap() {
+            Some(MediaTransfer::Live(frame)) => frame,
+            result => panic!("unexpected overflow anchor: {result:?}"),
+        };
+        assert_eq!(anchor.timing().sequence().get(), u64::MAX);
+        source.expire_activity_for_test();
+        assert!(matches!(
+            source.try_receive().unwrap(),
+            Some(MediaTransfer::Fallback {
+                kind: FallbackKind::Hold,
+                ..
+            })
+        ));
+        source.begin_recovery().unwrap();
+        source.pending_recovery = Some(RecoveryContinuity {
+            clock,
+            previous_pts_nanos: Some(anchor.timing().presentation_timestamp().as_nanos()),
+        });
+        source.map_recovery_sequences = true;
+        source
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(test_frame_at(0, 2_000, clock), 0);
+
+        assert!(matches!(
+            source.try_receive(),
+            Err(IoError::AdapterFailure { .. })
+        ));
+        assert_eq!(source.lifecycle(), LifecycleState::Lost);
+        assert_eq!(source.health().state, EndpointHealthState::Failed);
+        assert!(source.pending_recovery.is_none());
+        source.stop().unwrap();
+        assert_eq!(source.lifecycle(), LifecycleState::Open);
+        source.close().unwrap();
+    }
+
+    #[test]
+    fn recovering_and_lost_sources_can_be_stopped_or_closed() {
+        let mut recovering = source_with_policy(SignalLossPolicy::Hold);
+        recovering.lifecycle = LifecycleState::Recovering;
+        recovering.stop().unwrap();
+        assert_eq!(recovering.lifecycle(), LifecycleState::Open);
+        recovering.close().unwrap();
+
+        let mut closing_recovery = source_with_policy(SignalLossPolicy::Hold);
+        closing_recovery.lifecycle = LifecycleState::Recovering;
+        closing_recovery.close().unwrap();
+        assert_eq!(closing_recovery.lifecycle(), LifecycleState::Closed);
+
+        let mut lost = source_with_policy(SignalLossPolicy::Hold);
+        lost.lifecycle = LifecycleState::Lost;
+        lost.stop().unwrap();
+        assert_eq!(lost.lifecycle(), LifecycleState::Open);
+        lost.close().unwrap();
     }
 
     #[test]
@@ -2377,17 +2587,17 @@ mod tests {
         let pid_file = helper.with_extension("pids");
         let invalid_marker = helper.with_extension("invalid");
         let script = format!(
-            "#!/bin/sh\ncount=0\nif [ -f '{}' ]; then count=$(cat '{}'); fi\ncount=$((count + 1))\nprintf '%s' \"$count\" > '{}'\nprintf '%s\\n' \"$$\" >> '{}'\ncase \"$count\" in\n  1) printf '{}'; sleep 0.2; exit 20;;\n  2) printf 'BADMAGIC'; exit 91;;\n  3) printf '\\106\\115\\103\\101\\115\\106\\063\\000'; sleep 0.1; printf '{}'; sleep 0.1; printf '{}'; touch '{}'; sleep 0.5; printf '{}'; printf '{}'; exec sleep 30;;\n  *) exit 90;;\nesac\n",
+            "#!/bin/sh\ncount=0\nif [ -f '{}' ]; then count=$(cat '{}'); fi\ncount=$((count + 1))\nprintf '%s' \"$count\" > '{}'\nprintf '%s\\n' \"$$\" >> '{}'\ncase \"$count\" in\n  1) printf '{}'; sleep 0.2; exit 20;;\n  2) printf 'BADMAGIC'; exit 91;;\n  3) printf '\\106\\115\\103\\101\\115\\106\\063\\000'; sleep 0.1; printf '{}'; sleep 0.1; printf '{}'; touch '{}'; sleep 0.5; printf '{}'; printf '{}'; exec sleep 30;;\n  4) printf '\\106\\115\\103\\101\\115\\106\\063\\000'; exec sleep 30;;\n  *) exit 90;;\nesac\n",
             count_file.display(),
             count_file.display(),
             count_file.display(),
             pid_file.display(),
-            shell_octal(&capture_frame(7, 1_000)),
-            shell_octal(&capture_frame(0, 500)[8..]),
-            shell_octal(&capture_frame(1, 1_000)[8..]),
+            shell_octal(&capture_frame_with_drops(7, 3, 1_000)),
+            shell_octal(&capture_frame_with_drops(0, 1, 500)[8..]),
+            shell_octal(&capture_frame_with_drops(1, 1, 1_000)[8..]),
             invalid_marker.display(),
-            shell_octal(&capture_frame(2, 2_000)[8..]),
-            shell_octal(&capture_frame(3, 2_033)[8..]),
+            shell_octal(&capture_frame_with_drops(2, 2, 2_000)[8..]),
+            shell_octal(&capture_frame_with_drops(3, 2, 2_033)[8..]),
         );
         fs::write(&helper, script).unwrap();
         let mut permissions = fs::metadata(&helper).unwrap().permissions();
@@ -2423,7 +2633,9 @@ mod tests {
                 None => panic!("initial helper frame was not delivered"),
             }
         };
-        assert_eq!(first.timing().sequence().get(), 0);
+        assert_eq!(first.timing().sequence().get(), 7);
+        assert_eq!(source.telemetry().received, 1);
+        assert_eq!(source.telemetry().native_dropped, 3);
 
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
@@ -2510,7 +2722,7 @@ mod tests {
                 result => panic!("unexpected recovered transfer: {result:?}"),
             }
         };
-        assert_eq!(recovered.timing().sequence().get(), 1);
+        assert_eq!(recovered.timing().sequence().get(), 8);
         assert_eq!(
             recovered.timing().clock_domain(),
             first.timing().clock_domain()
@@ -2532,12 +2744,42 @@ mod tests {
                 result => panic!("unexpected second recovered transfer: {result:?}"),
             }
         };
-        assert_eq!(second.timing().sequence().get(), 2);
+        assert_eq!(second.timing().sequence().get(), 9);
         assert!(!second.timing().flags().contains(MediaFlags::DISCONTINUITY));
+        assert_eq!(source.telemetry().received, 5);
+        assert_eq!(source.telemetry().native_dropped, 5);
+        assert_eq!(source.telemetry().continuity_rejected, 2);
         assert_eq!(source.descriptor().id, expected_id);
         assert_eq!(source.descriptor().stable_key, expected_key);
 
+        source.transition_to_signal_lost("injected post-recovery loss".to_owned());
+        source.begin_recovery().unwrap();
+        source.finish_recovery().unwrap();
+        assert_eq!(source.lifecycle(), LifecycleState::Recovering);
+        let installed_deadline = source.recovery_deadline.unwrap();
+        assert!(installed_deadline > Instant::now());
+        assert!(installed_deadline <= Instant::now() + RECOVERY_FRAME_TIMEOUT);
+        source.recovery_deadline = Some(
+            Instant::now()
+                .checked_sub(Duration::from_millis(1))
+                .unwrap_or_else(Instant::now),
+        );
+        assert!(matches!(
+            source.try_receive().unwrap(),
+            Some(MediaTransfer::Fallback {
+                kind: FallbackKind::Hold,
+                media,
+            }) if media == second
+        ));
+        assert_eq!(source.lifecycle(), LifecycleState::Lost);
+        assert_eq!(source.health().state, EndpointHealthState::SignalLost);
+        assert!(source.capture.is_none());
+        assert_eq!(source.telemetry().received, 5);
+        assert_eq!(source.telemetry().native_dropped, 5);
+        source.begin_recovery().unwrap();
+        assert_eq!(source.lifecycle(), LifecycleState::Recovering);
         source.stop().unwrap();
+        assert_eq!(source.lifecycle(), LifecycleState::Open);
         source.close().unwrap();
         for pid in fs::read_to_string(&pid_file).unwrap().lines() {
             assert!(
