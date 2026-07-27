@@ -6,18 +6,22 @@ use std::{
     num::NonZeroU128,
     process::{ChildStdout, Command, ExitStatus, Stdio},
     str::FromStr,
+    sync::mpsc::{self, RecvTimeoutError},
     thread::{self, JoinHandle},
     time::Duration,
 };
 
 use command_group::{CommandGroup, GroupChild};
 use fm_types::ProjectId;
+#[cfg(unix)]
+use nix::{errno::Errno, sys::signal::killpg, unistd::Pid};
 
 use crate::SupervisedConfig;
 
 const READY_PREFIX: &str = "FREEMIXD_READY";
 const READY_VERSION: u8 = 1;
 const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const PROCESS_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RestartPolicy {
@@ -239,26 +243,35 @@ impl DaemonSupervisor {
         self.restarts
     }
 
-    /// Non-blockingly refreshes child exit state. `try_wait` also reaps an exited child.
+    /// Non-blockingly refreshes leader exit state. An exited leader is reaped,
+    /// then remaining group descendants are terminated with bounded cleanup.
     ///
     /// # Errors
     ///
     /// Returns an operating-system process error.
     pub fn poll(&mut self) -> Result<SupervisorState, SupervisorError> {
-        if let Some(child) = &mut self.child
-            && let Some(status) = child.try_wait().map_err(SupervisorError::Process)?
+        let leader_status = self
+            .child
+            .as_mut()
+            .map(|child| child.inner().try_wait())
+            .transpose()
+            .map_err(SupervisorError::Process)?
+            .flatten();
+        if let Some(status) = leader_status
+            && let Some(child) = self.child.take()
         {
-            self.child.take();
             self.stdout.take();
             self.state = SupervisorState::Exited {
                 code: status.code(),
             };
+            terminate_local_child(child).map_err(SupervisorError::Process)?;
         }
         Ok(self.state)
     }
 
-    /// Waits for the current child to exit and reaps it. This is useful when an
-    /// external event already establishes that shutdown is expected.
+    /// Waits for the current group leader to exit, reaps it, then terminates
+    /// remaining group descendants with bounded cleanup. This is useful when
+    /// an external event already establishes that shutdown is expected.
     ///
     /// # Errors
     ///
@@ -267,11 +280,18 @@ impl DaemonSupervisor {
         let Some(mut child) = self.child.take() else {
             return Ok(self.state);
         };
-        let status = child.wait().map_err(SupervisorError::Process)?;
+        let status = match child.inner().wait() {
+            Ok(status) => status,
+            Err(error) => {
+                reap_local_child(child);
+                return Err(SupervisorError::Process(error));
+            }
+        };
         self.stdout.take();
         self.state = SupervisorState::Exited {
             code: status.code(),
         };
+        terminate_local_child(child).map_err(SupervisorError::Process)?;
         Ok(self.state)
     }
 
@@ -336,33 +356,33 @@ impl DaemonSupervisor {
             .arg(self.config.listen.to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped());
-        let mut child = command.group_spawn().map_err(SupervisorError::Spawn)?;
+        let mut child = spawn_group(&mut command).map_err(SupervisorError::Spawn)?;
         let Some(stdout) = child.inner().stdout.take() else {
-            reap_local_child(&mut child);
+            reap_local_child(child);
             return Err(SupervisorError::MissingStdout);
         };
         let reader = match spawn_readiness_reader(stdout) {
             Ok(reader) => reader,
             Err(error) => {
-                reap_local_child(&mut child);
+                reap_local_child(child);
                 return Err(SupervisorError::ReadinessIo(error));
             }
         };
         while !reader.is_finished() {
             if cancelled() {
-                terminate_local_child(&mut child).map_err(SupervisorError::Process)?;
+                terminate_local_child(child).map_err(SupervisorError::Process)?;
                 drop(join_readiness_reader(reader)?);
                 return Err(SupervisorError::ReadinessCancelled);
             }
             match child.inner().try_wait() {
                 Ok(Some(status)) => {
-                    terminate_local_child(&mut child).map_err(SupervisorError::Process)?;
+                    terminate_local_child(child).map_err(SupervisorError::Process)?;
                     drop(join_readiness_reader(reader)?);
                     return Err(SupervisorError::ExitedBeforeReady { status });
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    reap_local_child(&mut child);
+                    reap_local_child(child);
                     drop(join_readiness_reader(reader)?);
                     return Err(SupervisorError::Process(error));
                 }
@@ -372,26 +392,29 @@ impl DaemonSupervisor {
         let read = match join_readiness_reader(reader) {
             Ok(read) => read,
             Err(error) => {
-                reap_local_child(&mut child);
+                reap_local_child(child);
                 return Err(error);
             }
         };
         let (stdout, line, bytes) = match read {
             (stdout, line, Ok(bytes)) => (stdout, line, bytes),
             (_, _, Err(error)) => {
-                reap_local_child(&mut child);
+                reap_local_child(child);
                 return Err(SupervisorError::ReadinessIo(error));
             }
         };
         if bytes == 0 {
-            return match child.try_wait() {
-                Ok(Some(status)) => Err(SupervisorError::ExitedBeforeReady { status }),
+            return match child.inner().try_wait() {
+                Ok(Some(status)) => {
+                    reap_local_child(child);
+                    Err(SupervisorError::ExitedBeforeReady { status })
+                }
                 Ok(None) => {
-                    reap_local_child(&mut child);
+                    reap_local_child(child);
                     Err(SupervisorError::MissingReadiness)
                 }
                 Err(error) => {
-                    reap_local_child(&mut child);
+                    reap_local_child(child);
                     Err(SupervisorError::Process(error))
                 }
             };
@@ -399,18 +422,18 @@ impl DaemonSupervisor {
         let readiness = match line.parse::<ReadinessRecord>() {
             Ok(readiness) => readiness,
             Err(error) => {
-                reap_local_child(&mut child);
+                reap_local_child(child);
                 return Err(SupervisorError::InvalidReadiness(error));
             }
         };
         if !readiness.address.ip().is_loopback() {
-            reap_local_child(&mut child);
+            reap_local_child(child);
             return Err(SupervisorError::NonLoopbackReadiness(readiness.address));
         }
         if let Some(expected) = self.stable_project_id
             && readiness.project_id != expected
         {
-            reap_local_child(&mut child);
+            reap_local_child(child);
             return Err(SupervisorError::ProjectIdentityChanged {
                 expected,
                 received: readiness.project_id,
@@ -426,8 +449,8 @@ impl DaemonSupervisor {
 
     fn terminate_and_reap(&mut self) -> Result<(), SupervisorError> {
         self.stdout.take();
-        if let Some(mut child) = self.child.take() {
-            terminate_local_child(&mut child).map_err(SupervisorError::Process)?;
+        if let Some(child) = self.child.take() {
+            terminate_local_child(child).map_err(SupervisorError::Process)?;
         }
         Ok(())
     }
@@ -460,16 +483,112 @@ impl Drop for DaemonSupervisor {
     }
 }
 
-fn reap_local_child(child: &mut GroupChild) {
+#[cfg(unix)]
+fn spawn_group(command: &mut Command) -> io::Result<GroupChild> {
+    command.group().spawn()
+}
+
+#[cfg(windows)]
+fn spawn_group(command: &mut Command) -> io::Result<GroupChild> {
+    command.group().kill_on_drop(true).spawn()
+}
+
+fn reap_local_child(child: GroupChild) {
     let _ = terminate_local_child(child);
 }
 
-fn terminate_local_child(child: &mut GroupChild) -> io::Result<()> {
-    if let Err(error) = child.kill()
-        && error.kind() != io::ErrorKind::InvalidInput
-    {
-        return Err(error);
+fn terminate_local_child(mut child: GroupChild) -> io::Result<()> {
+    let group_id = child.id();
+    let kill_error = child
+        .kill()
+        .err()
+        .filter(|error| !process_group_is_gone(error));
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::Builder::new()
+        .name("freemixd-cleanup".to_owned())
+        .spawn(move || {
+            let _ = sender.send(child.wait().map(drop));
+        })?;
+    finish_process_cleanup(&receiver, group_id, kill_error)
+}
+
+#[cfg(unix)]
+fn finish_process_cleanup(
+    receiver: &mpsc::Receiver<io::Result<()>>,
+    group_id: u32,
+    kill_error: Option<io::Error>,
+) -> io::Result<()> {
+    let process_group =
+        Pid::from_raw(i32::try_from(group_id).expect("process group ID exceeds i32"));
+    let deadline = std::time::Instant::now() + PROCESS_CLEANUP_TIMEOUT;
+    loop {
+        match killpg(process_group, None) {
+            Err(Errno::ESRCH) => break,
+            // Darwin can report EPERM while killed group members await final teardown.
+            Ok(()) | Err(Errno::EPERM) => {}
+            Err(error) => return Err(io::Error::from_raw_os_error(error as i32)),
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(cleanup_timeout(kill_error));
+        }
+        thread::sleep(Duration::from_millis(10).min(remaining));
     }
-    child.wait()?;
-    Ok(())
+    receive_cleanup_result(
+        receiver,
+        deadline.saturating_duration_since(std::time::Instant::now()),
+        kill_error,
+    )
+}
+
+#[cfg(windows)]
+fn finish_process_cleanup(
+    receiver: &mpsc::Receiver<io::Result<()>>,
+    _group_id: u32,
+    kill_error: Option<io::Error>,
+) -> io::Result<()> {
+    receive_cleanup_result(receiver, PROCESS_CLEANUP_TIMEOUT, kill_error)
+}
+
+fn receive_cleanup_result(
+    receiver: &mpsc::Receiver<io::Result<()>>,
+    timeout: Duration,
+    kill_error: Option<io::Error>,
+) -> io::Result<()> {
+    match receiver.recv_timeout(timeout) {
+        Ok(wait_result) => {
+            wait_result?;
+            if let Some(error) = kill_error {
+                return Err(error);
+            }
+            Ok(())
+        }
+        Err(RecvTimeoutError::Timeout) => Err(cleanup_timeout(kill_error)),
+        Err(RecvTimeoutError::Disconnected) => Err(io::Error::other(
+            "freemixd process cleanup worker disconnected",
+        )),
+    }
+}
+
+fn cleanup_timeout(kill_error: Option<io::Error>) -> io::Error {
+    kill_error.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "timed out cleaning up freemixd process group",
+        )
+    })
+}
+
+fn process_group_is_gone(error: &io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::InvalidInput | io::ErrorKind::NotFound
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    if error.raw_os_error() == Some(Errno::ESRCH as i32) {
+        return true;
+    }
+    false
 }

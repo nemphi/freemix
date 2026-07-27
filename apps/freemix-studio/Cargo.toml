@@ -13,5 +13,8 @@ fm-protocol = { path = "../../crates/foundation/fm-protocol" }
 fm-types = { path = "../../crates/foundation/fm-types" }
 fm-ui-egui = { path = "../../crates/ui/fm-ui-egui" }
 
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.27.1", default-features = false, features = ["signal"] }
+
 [lints]
 workspace = true

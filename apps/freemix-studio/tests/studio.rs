@@ -357,6 +357,9 @@ fn helper(directory: &TestDirectory, behavior: &str) -> PathBuf {
             "#!/bin/sh\nsleep 30 &\nprintf '%s\\n' \"$!\" > \"$2.descendant.pid\"\nexit 7\n"
                 .to_owned()
         }
+        "ready-exit-with-descendant" => format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$2.leader.pid\"\nsleep 30 </dev/null >/dev/null 2>&1 &\nprintf '%s\\n' \"$!\" > \"$2.descendant.pid\"\nprintf 'FREEMIXD_READY\\tv=1\\taddress=127.0.0.1:32123\\tproject_id={PROJECT_VALUE}\\n'\nsleep 0.1\nexit 7\n"
+        ),
         _ => unreachable!(),
     };
     fs::write(&path, body).unwrap();
@@ -372,6 +375,54 @@ fn supervised(directory: &TestDirectory, executable: &Path) -> SupervisedConfig 
         project_bundle: directory.path("show.freemix"),
         daemon_executable: executable.to_owned(),
         listen: "127.0.0.1:0".parse().unwrap(),
+    }
+}
+
+#[cfg(unix)]
+fn descendant_pid(directory: &TestDirectory) -> String {
+    fs::read_to_string(
+        directory
+            .path("show.freemix")
+            .with_extension("freemix.descendant.pid"),
+    )
+    .unwrap()
+}
+
+#[cfg(unix)]
+fn process_exists(pid: &str) -> bool {
+    ProcessCommand::new("/bin/kill")
+        .args(["-0", pid.trim()])
+        .stderr(Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+}
+
+#[cfg(unix)]
+fn assert_descendant_stopped(pid: &str) {
+    assert!(
+        !process_exists(pid),
+        "supervised descendant survived cleanup"
+    );
+}
+
+#[cfg(unix)]
+fn wait_for_process_exit(pid: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let output = ProcessCommand::new("/bin/ps")
+            .args(["-o", "state=", "-p", pid.trim()])
+            .output()
+            .unwrap();
+        let state = String::from_utf8(output.stdout).unwrap();
+        if !output.status.success() || state.trim_start().starts_with('Z') {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "supervised leader did not exit"
+        );
+        thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -494,6 +545,77 @@ fn supervisor_cleans_descendants_before_joining_readiness_after_direct_exit() {
             .success(),
         "direct-exit descendant survived readiness cleanup"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn supervisor_poll_cleans_descendants_after_ready_leader_exit() {
+    let directory = TestDirectory::new("ready-exit-descendant-poll");
+    let executable = helper(&directory, "ready-exit-with-descendant");
+    let mut supervisor = DaemonSupervisor::launch(
+        supervised(&directory, &executable),
+        RestartPolicy::default(),
+    )
+    .unwrap();
+    let pid = descendant_pid(&directory);
+    let started = std::time::Instant::now();
+
+    loop {
+        match supervisor.poll().unwrap() {
+            SupervisorState::Ready(_) => thread::sleep(Duration::from_millis(10)),
+            SupervisorState::Exited { code: Some(7) } => break,
+            state => panic!("unexpected supervisor state: {state:?}"),
+        }
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert_descendant_stopped(&pid);
+}
+
+#[cfg(unix)]
+#[test]
+fn supervisor_wait_cleans_descendants_after_ready_leader_exit() {
+    let directory = TestDirectory::new("ready-exit-descendant-wait");
+    let executable = helper(&directory, "ready-exit-with-descendant");
+    let mut supervisor = DaemonSupervisor::launch(
+        supervised(&directory, &executable),
+        RestartPolicy::default(),
+    )
+    .unwrap();
+    let pid = descendant_pid(&directory);
+    let started = std::time::Instant::now();
+
+    assert_eq!(
+        supervisor.wait_for_exit().unwrap(),
+        SupervisorState::Exited { code: Some(7) }
+    );
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert_descendant_stopped(&pid);
+}
+
+#[cfg(unix)]
+#[test]
+fn supervisor_drop_cleans_descendants_after_ready_leader_exit() {
+    let directory = TestDirectory::new("ready-exit-descendant-drop");
+    let executable = helper(&directory, "ready-exit-with-descendant");
+    let supervisor = DaemonSupervisor::launch(
+        supervised(&directory, &executable),
+        RestartPolicy::default(),
+    )
+    .unwrap();
+    let pid = descendant_pid(&directory);
+    let leader_pid = fs::read_to_string(
+        directory
+            .path("show.freemix")
+            .with_extension("freemix.leader.pid"),
+    )
+    .unwrap();
+    wait_for_process_exit(&leader_pid);
+    let started = std::time::Instant::now();
+
+    drop(supervisor);
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert_descendant_stopped(&pid);
 }
 
 #[test]

@@ -1285,6 +1285,7 @@ dependencies = [
  "fm-protocol",
  "fm-types",
  "fm-ui-egui",
+ "nix 0.27.1",
 ]
 
 [[package]]
