@@ -6,7 +6,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::num::NonZeroU128;
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fm_client::{
     Client, ClientConfig, ClientError, CommandStatus, ConnectionState, DisconnectCause, Intake,
@@ -457,4 +457,111 @@ fn wrong_first_record_and_wrong_project_reject_current_handshake() {
     ));
     assert_eq!(wrong_project.reconnect_backoff().unwrap().attempt, 1);
     wrong_project_thread.join().unwrap();
+}
+
+#[test]
+fn silent_handshake_can_be_cancelled_without_waiting_for_peer_eof() {
+    let (request_tx, request_rx) = mpsc::channel();
+    let (address, server_thread) = spawn_server(move |listener| {
+        let mut peer = Peer::accept(&listener);
+        assert!(matches!(peer.receive(), WireMessage::HandshakeRequest(_)));
+        request_tx.send(()).unwrap();
+        assert_eq!(peer.stream.read(&mut [0_u8; 1]).unwrap(), 0);
+    });
+
+    let mut session = TcpSession::new(client(2));
+    let mut polls = 0;
+    let started = Instant::now();
+    let result =
+        session.connect_cancellable(address, CONNECT_TIMEOUT, Duration::from_millis(10), || {
+            polls += 1;
+            polls >= 3
+        });
+    request_rx.recv().unwrap();
+    assert!(matches!(
+        result,
+        Err(TcpSessionError::Cancelled { backoff })
+            if backoff.attempt == 1 && backoff.delay_ms == 10
+    ));
+    assert!(started.elapsed() < Duration::from_secs(1));
+    server_thread.join().unwrap();
+}
+
+#[test]
+fn silent_command_response_can_be_cancelled_and_retried() {
+    let (command_tx, command_rx) = mpsc::channel();
+    let (address, server_thread) = spawn_server(move |listener| {
+        let mut peer = Peer::accept(&listener);
+        accept_snapshot(&mut peer, 4);
+        assert!(matches!(peer.receive(), WireMessage::Command(_)));
+        command_tx.send(()).unwrap();
+        assert_eq!(peer.stream.read(&mut [0_u8; 1]).unwrap(), 0);
+    });
+
+    let mut session = TcpSession::new(client(2));
+    session.connect(address, CONNECT_TIMEOUT).unwrap();
+    session
+        .queue_command(CommandPayload::Cut, "silent-command", Some(4), None)
+        .unwrap();
+    session.flush().unwrap();
+    command_rx.recv().unwrap();
+
+    let mut polls = 0;
+    assert!(matches!(
+        session.receive_cancellable(Duration::from_millis(10), || {
+            polls += 1;
+            polls >= 3
+        }),
+        Err(TcpSessionError::Cancelled { backoff })
+            if backoff.attempt == 1 && backoff.delay_ms == 10
+    ));
+    assert_eq!(session.in_flight_len(), 1);
+    assert_eq!(session.reconnect_backoff().unwrap().attempt, 1);
+    server_thread.join().unwrap();
+}
+
+#[test]
+fn cancellable_receive_preserves_a_partial_framed_record() {
+    let (address, server_thread) = spawn_server(move |listener| {
+        let mut peer = Peer::accept(&listener);
+        accept_snapshot(&mut peer, 4);
+        let WireMessage::Command(command) = peer.receive() else {
+            panic!("expected command")
+        };
+        let encoded = encode_line(&WireMessage::CommandResult(CommandResult::Accepted {
+            id: command.id,
+            revision: 4,
+            scheduled_frame: None,
+        }))
+        .unwrap();
+        let split = encoded.len() / 2;
+        peer.stream.write_all(&encoded.as_bytes()[..split]).unwrap();
+        peer.stream.flush().unwrap();
+        thread::sleep(Duration::from_millis(40));
+        peer.stream.write_all(&encoded.as_bytes()[split..]).unwrap();
+        peer.stream.flush().unwrap();
+    });
+
+    let mut session = TcpSession::new(client(2));
+    session.connect(address, CONNECT_TIMEOUT).unwrap();
+    let command = session
+        .queue_command(CommandPayload::Cut, "partial-result", Some(4), None)
+        .unwrap();
+    session.flush().unwrap();
+
+    let mut polls = 0;
+    assert!(matches!(
+        session
+            .receive_cancellable(Duration::from_millis(5), || {
+                polls += 1;
+                false
+            })
+            .unwrap(),
+        SessionEvent::CommandResult {
+            result: CommandResult::Accepted { ref id, .. },
+            ..
+        } if id == &command.id
+    ));
+    assert!(polls > 1, "partial record did not span polling cycles");
+    server_thread.join().unwrap();
 }

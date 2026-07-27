@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fm_protocol::{
     CodecError, CommandPayload, CommandResult, DurableGap, ErrorMessage, EventMessage,
@@ -12,6 +12,12 @@ use fm_protocol::{
 use crate::{Client, ClientError, CommandStatus, Intake, Outbound, ReconnectBackoff, SyncMode};
 
 const READ_BUFFER_BYTES: usize = 8 * 1024;
+
+#[derive(Debug)]
+struct ReceiveStatus {
+    message: Option<WireMessage>,
+    timed_out: bool,
+}
 
 /// An error from the raw newline-delimited TCP connection.
 #[derive(Debug)]
@@ -119,17 +125,76 @@ impl TcpConnection {
     /// Returns an I/O error for a socket failure or a codec error for an
     /// invalid, oversized, or incomplete protocol record.
     pub fn receive(&mut self) -> Result<Option<WireMessage>, TcpConnectionError> {
+        self.reader.set_read_timeout(None)?;
+        let status = self.receive_until(None)?;
+        debug_assert!(!status.timed_out, "blocking receive cannot time out");
+        Ok(status.message)
+    }
+
+    fn receive_timeout(&mut self, timeout: Duration) -> Result<ReceiveStatus, TcpConnectionError> {
+        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "TCP receive timeout is too large",
+            )
+        })?;
+        let result = self.receive_until(Some(deadline));
+        let reset = self.reader.set_read_timeout(None);
+        match (result, reset) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error.into()),
+            (Ok(status), Ok(())) => Ok(status),
+        }
+    }
+
+    fn receive_until(
+        &mut self,
+        deadline: Option<Instant>,
+    ) -> Result<ReceiveStatus, TcpConnectionError> {
         loop {
             if let Some(message) = self.decoded.pop_front() {
-                return Ok(Some(message));
+                return Ok(ReceiveStatus {
+                    message: Some(message),
+                    timed_out: false,
+                });
+            }
+
+            if let Some(deadline) = deadline {
+                let timeout = deadline.saturating_duration_since(Instant::now());
+                if timeout.is_zero() {
+                    return Ok(ReceiveStatus {
+                        message: None,
+                        timed_out: true,
+                    });
+                }
+                self.reader.set_read_timeout(Some(timeout))?;
             }
 
             let mut buffer = [0_u8; READ_BUFFER_BYTES];
-            let read = self.reader.read(&mut buffer)?;
+            let read = match self.reader.read(&mut buffer) {
+                Ok(read) => read,
+                Err(error)
+                    if deadline.is_some()
+                        && matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        ) =>
+                {
+                    return Ok(ReceiveStatus {
+                        message: None,
+                        timed_out: true,
+                    });
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error.into()),
+            };
             if read == 0 {
                 let decoder = std::mem::take(&mut self.decoder);
                 decoder.finish()?;
-                return Ok(None);
+                return Ok(ReceiveStatus {
+                    message: None,
+                    timed_out: false,
+                });
             }
             self.decoded.extend(self.decoder.push(&buffer[..read])?);
         }
@@ -188,6 +253,9 @@ pub enum TcpSessionError {
     UnexpectedMessage,
     NotConnected,
     AlreadyConnected,
+    Cancelled {
+        backoff: ReconnectBackoff,
+    },
 }
 
 impl fmt::Display for TcpSessionError {
@@ -206,6 +274,11 @@ impl fmt::Display for TcpSessionError {
             Self::UnexpectedMessage => formatter.write_str("unexpected TCP session message"),
             Self::NotConnected => formatter.write_str("TCP session is not connected"),
             Self::AlreadyConnected => formatter.write_str("TCP session is already connected"),
+            Self::Cancelled { backoff } => write!(
+                formatter,
+                "TCP session wait cancelled; reconnect attempt {} after {} ms",
+                backoff.attempt, backoff.delay_ms
+            ),
         }
     }
 }
@@ -219,7 +292,8 @@ impl std::error::Error for TcpSessionError {
             | Self::ExpectedHandshake
             | Self::UnexpectedMessage
             | Self::NotConnected
-            | Self::AlreadyConnected => None,
+            | Self::AlreadyConnected
+            | Self::Cancelled { .. } => None,
         }
     }
 }
@@ -294,6 +368,35 @@ impl TcpSession {
         address: SocketAddr,
         connect_timeout: Duration,
     ) -> Result<SessionEvent, TcpSessionError> {
+        self.connect_with(address, connect_timeout, Self::read_wire)
+    }
+
+    /// Connects and synchronizes while polling for caller-requested cancellation.
+    /// A cancelled wait closes the transport and enters reconnect backoff. Partial
+    /// framed reads remain intact between polls until completion or cancellation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::connect`], or
+    /// [`TcpSessionError::Cancelled`] when `cancelled` returns `true`.
+    pub fn connect_cancellable(
+        &mut self,
+        address: SocketAddr,
+        connect_timeout: Duration,
+        poll_interval: Duration,
+        mut cancelled: impl FnMut() -> bool,
+    ) -> Result<SessionEvent, TcpSessionError> {
+        self.connect_with(address, connect_timeout, |session| {
+            session.read_wire_cancellable(poll_interval, &mut cancelled)
+        })
+    }
+
+    fn connect_with(
+        &mut self,
+        address: SocketAddr,
+        connect_timeout: Duration,
+        mut read: impl FnMut(&mut Self) -> Result<Option<WireMessage>, TcpSessionError>,
+    ) -> Result<SessionEvent, TcpSessionError> {
         if self.connection.is_some() {
             return Err(TcpSessionError::AlreadyConnected);
         }
@@ -311,7 +414,7 @@ impl TcpSession {
         self.send_wire(&WireMessage::HandshakeRequest(request))?;
         self.flush_wire()?;
 
-        let Some(first) = self.read_wire()? else {
+        let Some(first) = read(self)? else {
             return Err(self.disconnected(DisconnectCause::Eof));
         };
         let WireMessage::HandshakeResponse(response) = first else {
@@ -330,7 +433,7 @@ impl TcpSession {
         }
 
         while self.client.state() != &crate::ConnectionState::Ready {
-            let Some(message) = self.read_wire()? else {
+            let Some(message) = read(self)? else {
                 return Err(self.disconnected(DisconnectCause::Eof));
             };
             if let Err(error) = self.client.intake(message) {
@@ -422,7 +525,31 @@ impl TcpSession {
     /// Returns an error when disconnected, decoding or I/O fails, the server
     /// sends an unexpected record, or the owned client rejects a record.
     pub fn receive(&mut self) -> Result<SessionEvent, TcpSessionError> {
-        let Some(message) = self.read_wire()? else {
+        let message = self.read_wire()?;
+        self.handle_received(message)
+    }
+
+    /// Waits for one post-handshake event while polling for cancellation.
+    /// Cancellation closes the current transport and enters reconnect backoff.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::receive`], or
+    /// [`TcpSessionError::Cancelled`] when `cancelled` returns `true`.
+    pub fn receive_cancellable(
+        &mut self,
+        poll_interval: Duration,
+        mut cancelled: impl FnMut() -> bool,
+    ) -> Result<SessionEvent, TcpSessionError> {
+        let message = self.read_wire_cancellable(poll_interval, &mut cancelled)?;
+        self.handle_received(message)
+    }
+
+    fn handle_received(
+        &mut self,
+        message: Option<WireMessage>,
+    ) -> Result<SessionEvent, TcpSessionError> {
+        let Some(message) = message else {
             let backoff = self.transition_disconnect();
             return Ok(SessionEvent::Disconnected {
                 cause: DisconnectCause::Eof,
@@ -543,6 +670,40 @@ impl TcpSession {
             Err(TcpConnectionError::Codec(error)) => {
                 self.transition_disconnect();
                 Err(TcpSessionError::Codec(error))
+            }
+        }
+    }
+
+    fn read_wire_cancellable(
+        &mut self,
+        poll_interval: Duration,
+        cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<Option<WireMessage>, TcpSessionError> {
+        loop {
+            if cancelled() {
+                let backoff = self.transition_disconnect();
+                return Err(TcpSessionError::Cancelled { backoff });
+            }
+            let result = self
+                .connection
+                .as_mut()
+                .ok_or(TcpSessionError::NotConnected)?
+                .receive_timeout(poll_interval);
+            match result {
+                Ok(ReceiveStatus {
+                    message,
+                    timed_out: false,
+                }) => return Ok(message),
+                Ok(ReceiveStatus {
+                    timed_out: true, ..
+                }) => {}
+                Err(TcpConnectionError::Io(error)) => {
+                    return Err(self.disconnected(DisconnectCause::Io(error.kind())));
+                }
+                Err(TcpConnectionError::Codec(error)) => {
+                    self.transition_disconnect();
+                    return Err(TcpSessionError::Codec(error));
+                }
             }
         }
     }

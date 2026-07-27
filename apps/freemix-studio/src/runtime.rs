@@ -186,6 +186,28 @@ impl StudioRuntime {
         Ok(self.session.connect(self.address(), connect_timeout)?)
     }
 
+    /// Connects and synchronizes while polling a caller-owned cancellation source.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport, handshake, synchronization, cancellation, or supervisor error.
+    pub fn connect_cancellable(
+        &mut self,
+        connect_timeout: Duration,
+        poll_interval: Duration,
+        cancelled: impl FnMut() -> bool,
+    ) -> Result<SessionEvent, StudioError> {
+        if let Some(supervisor) = &mut self.supervisor {
+            supervisor.poll()?;
+        }
+        Ok(self.session.connect_cancellable(
+            self.address(),
+            connect_timeout,
+            poll_interval,
+            cancelled,
+        )?)
+    }
+
     /// Reconnects only after the caller reports that the client-selected backoff elapsed.
     /// If the owned daemon has exited, one bounded restart is performed first.
     ///
@@ -212,6 +234,35 @@ impl StudioRuntime {
             self.address = supervisor.restart()?.address;
         }
         self.connect(connect_timeout)
+    }
+
+    /// Reconnects after backoff while polling a caller-owned cancellation source.
+    ///
+    /// # Errors
+    ///
+    /// Rejects insufficient elapsed backoff and propagates restart/session errors.
+    pub fn reconnect_cancellable(
+        &mut self,
+        elapsed_backoff: Duration,
+        connect_timeout: Duration,
+        poll_interval: Duration,
+        cancelled: impl FnMut() -> bool,
+    ) -> Result<SessionEvent, StudioError> {
+        if let Some(backoff) = self.session.reconnect_backoff() {
+            let required = Duration::from_millis(backoff.delay_ms);
+            if elapsed_backoff < required {
+                return Err(StudioError::BackoffNotElapsed {
+                    required,
+                    supplied: elapsed_backoff,
+                });
+            }
+        }
+        if let Some(supervisor) = &mut self.supervisor
+            && matches!(supervisor.poll()?, SupervisorState::Exited { .. })
+        {
+            self.address = supervisor.restart()?.address;
+        }
+        self.connect_cancellable(connect_timeout, poll_interval, cancelled)
     }
 
     /// Explicitly restarts the owned daemon after disconnecting the session.
@@ -275,5 +326,18 @@ impl StudioRuntime {
     /// Propagates transport, codec, and client intake errors.
     pub fn receive(&mut self) -> Result<SessionEvent, StudioError> {
         Ok(self.session.receive()?)
+    }
+
+    /// Waits for one session event while polling a caller-owned cancellation source.
+    ///
+    /// # Errors
+    ///
+    /// Propagates transport, codec, client intake, and cancellation errors.
+    pub fn receive_cancellable(
+        &mut self,
+        poll_interval: Duration,
+        cancelled: impl FnMut() -> bool,
+    ) -> Result<SessionEvent, StudioError> {
+        Ok(self.session.receive_cancellable(poll_interval, cancelled)?)
     }
 }
