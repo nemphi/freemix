@@ -401,6 +401,41 @@ fn complete_deterministic_mvp_contract() {
     fs::remove_dir_all(context.root).unwrap();
 }
 
+#[test]
+fn local_wipe_preserves_duration_and_idempotency_contract() {
+    let context = ContractContext::new();
+    assert_success(&invoke(&["new", context.project_path()]));
+
+    let wipe = invoke(&[
+        "wipe",
+        context.project_path(),
+        "3",
+        "--key",
+        "wipe-three",
+        "--expect",
+        "0",
+    ]);
+    assert_success(&wipe);
+    let wipe_status = stdout(&wipe);
+    assert_status(&wipe_status, 1, 3, 2, 2, 1, 1);
+    let wipe_manifest = manifest(&context.project);
+
+    let duplicate = invoke(&[
+        "wipe",
+        context.project_path(),
+        "99",
+        "--key",
+        "wipe-three",
+        "--expect",
+        "0",
+    ]);
+    assert_success(&duplicate);
+    assert_eq!(stdout(&duplicate), wipe_status);
+    assert_eq!(manifest(&context.project), wipe_manifest);
+
+    fs::remove_dir_all(context.root).unwrap();
+}
+
 struct ContractContext {
     root: PathBuf,
     project: PathBuf,

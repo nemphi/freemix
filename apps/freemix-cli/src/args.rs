@@ -26,6 +26,12 @@ pub enum Command {
         key: Option<String>,
         expected_revision: Option<u64>,
     },
+    Wipe {
+        path: PathBuf,
+        frames: u32,
+        key: Option<String>,
+        expected_revision: Option<u64>,
+    },
     RemoteStatus {
         address: SocketAddr,
     },
@@ -41,6 +47,12 @@ pub enum Command {
         expected_revision: Option<u64>,
     },
     RemoteFade {
+        address: SocketAddr,
+        frames: u32,
+        key: Option<String>,
+        expected_revision: Option<u64>,
+    },
+    RemoteWipe {
         address: SocketAddr,
         frames: u32,
         key: Option<String>,
@@ -143,10 +155,22 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
                 expected_revision,
             })
         }
+        "wipe" => {
+            let path = required_path(&mut arguments, "project path")?;
+            let frames = number(&required(&mut arguments, "frames")?, "frames")?;
+            let (key, expected_revision) = command_options(arguments)?;
+            Ok(Command::Wipe {
+                path,
+                frames,
+                key,
+                expected_revision,
+            })
+        }
         "remote-status" => parse_remote_status(arguments),
         "remote-preview" => parse_remote_preview(arguments),
         "remote-cut" => parse_remote_cut(arguments),
         "remote-fade" => parse_remote_fade(arguments),
+        "remote-wipe" => parse_remote_wipe(arguments),
         "render" => {
             let path = required_path(&mut arguments, "project path")?;
             let output = required_path(&mut arguments, "output path")?;
@@ -214,6 +238,18 @@ fn parse_remote_fade(mut arguments: impl Iterator<Item = String>) -> Result<Comm
     let frames = number(&required(&mut arguments, "frames")?, "frames")?;
     let (key, expected_revision) = command_options(arguments)?;
     Ok(Command::RemoteFade {
+        address,
+        frames,
+        key,
+        expected_revision,
+    })
+}
+
+fn parse_remote_wipe(mut arguments: impl Iterator<Item = String>) -> Result<Command, ArgsError> {
+    let address = socket_address(&required(&mut arguments, "address")?)?;
+    let frames = number(&required(&mut arguments, "frames")?, "frames")?;
+    let (key, expected_revision) = command_options(arguments)?;
+    Ok(Command::RemoteWipe {
         address,
         frames,
         key,
@@ -307,6 +343,42 @@ mod tests {
                 frames: 30,
                 key: Some("take-1".into()),
                 expected_revision: Some(4),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_local_and_remote_wipe() {
+        assert_eq!(
+            parse(strings(&[
+                "wipe",
+                "show.freemix",
+                "45",
+                "--key",
+                "wipe-1",
+                "--expect",
+                "4",
+            ])),
+            Ok(Command::Wipe {
+                path: "show.freemix".into(),
+                frames: 45,
+                key: Some("wipe-1".into()),
+                expected_revision: Some(4),
+            })
+        );
+        assert_eq!(
+            parse(strings(&[
+                "remote-wipe",
+                "127.0.0.1:9123",
+                "12",
+                "--key",
+                "remote-wipe",
+            ])),
+            Ok(Command::RemoteWipe {
+                address: "127.0.0.1:9123".parse().unwrap(),
+                frames: 12,
+                key: Some("remote-wipe".into()),
+                expected_revision: None,
             })
         );
     }

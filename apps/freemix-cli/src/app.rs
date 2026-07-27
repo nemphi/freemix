@@ -41,6 +41,7 @@ struct ProjectEngine {
     engine: Engine,
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn run(command: Command) -> AppResult<()> {
     match command {
         Command::New { path, name } => {
@@ -90,6 +91,20 @@ pub fn run(command: Command) -> AppResult<()> {
             key,
             expected_revision,
         )?,
+        Command::Wipe {
+            path,
+            frames,
+            key,
+            expected_revision,
+        } => mutate(
+            &path,
+            EngineCommand::Wipe {
+                duration_frames: frames,
+            },
+            frames,
+            key,
+            expected_revision,
+        )?,
         Command::RemoteStatus { address } => remote::status(address)?,
         Command::RemotePreview {
             address,
@@ -125,6 +140,19 @@ pub fn run(command: Command) -> AppResult<()> {
         } => remote::execute(
             address,
             fm_protocol::CommandPayload::Fade {
+                duration_frames: frames,
+            },
+            key,
+            expected_revision,
+        )?,
+        Command::RemoteWipe {
+            address,
+            frames,
+            key,
+            expected_revision,
+        } => remote::execute(
+            address,
+            fm_protocol::CommandPayload::Wipe {
                 duration_frames: frames,
             },
             key,
@@ -559,10 +587,12 @@ Usage:
   freemix-cli preview <show.freemix> <input> [--key <key>] [--expect <revision>]
   freemix-cli cut <show.freemix> [--key <key>] [--expect <revision>]
   freemix-cli fade <show.freemix> <frames> [--key <key>] [--expect <revision>]
+  freemix-cli wipe <show.freemix> <frames> [--key <key>] [--expect <revision>]
   freemix-cli remote-status <127.0.0.1:port>
   freemix-cli remote-preview <127.0.0.1:port> <input> [--key <key>] [--expect <revision>]
   freemix-cli remote-cut <127.0.0.1:port> [--key <key>] [--expect <revision>]
   freemix-cli remote-fade <127.0.0.1:port> <frames> [--key <key>] [--expect <revision>]
+  freemix-cli remote-wipe <127.0.0.1:port> <frames> [--key <key>] [--expect <revision>]
   freemix-cli render <show.freemix> <output.ppm> [--width <px>] [--height <px>]
   freemix-cli demo <show.freemix> [output.ppm]"
     );
