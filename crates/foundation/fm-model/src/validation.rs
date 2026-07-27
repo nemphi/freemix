@@ -1,7 +1,7 @@
 use fm_types::{BusId, InputId, OutputId, SceneId};
 
 use crate::{
-    InputKind, Project, ProjectSettings, RestartPolicy, Scene, SimulatedAudio, SourceRef,
+    InputKind, Project, ProjectSettings, RestartPolicy, SimulatedAudio, SourceRef,
     cycles::{mark_audio_input_cycles, mark_bus_cycles, mark_scene_cycles},
 };
 
@@ -264,13 +264,6 @@ fn validate_scenes(project: &Project, errors: &mut Vec<ValidationError>) {
             errors.push(ValidationError {
                 entity,
                 field: "background",
-                kind: ValidationErrorKind::OutOfRange,
-            });
-        }
-        if scene.layers.len() > Scene::MAX_LAYERS {
-            errors.push(ValidationError {
-                entity,
-                field: "layers",
                 kind: ValidationErrorKind::OutOfRange,
             });
         }

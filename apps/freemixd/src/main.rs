@@ -1441,6 +1441,11 @@ fn resolve_native_sources(
                 input.id
             ))
             .into()),
+            InputKind::Scene { .. } => Err(AppFailure(format!(
+                "native scene input {} is not supported because scene compositor realization is not implemented",
+                input.id
+            ))
+            .into()),
         }?;
         sources.push(source);
     }
@@ -2501,8 +2506,8 @@ fn load_migrate_recover(store: &ProjectStore) -> AppResult<StoredProject> {
             found, ..
         })) => {
             match found {
-                1 => store.migrate_v1()?,
                 2 => store.migrate_v2()?,
+                3 => store.migrate_v3()?,
                 _ => {
                     return Err(StoreError::Validation(
                         ProjectValidationError::UnsupportedSchema {
@@ -3479,12 +3484,12 @@ mod tests {
     #[cfg(all(feature = "native-media", target_os = "macos"))]
     use fm_io_macos::{CameraIdKind, deterministic_camera_id};
     use fm_model::{
-        Input, InputKind, Project, ProjectSettings, SimulatedAudio, SimulatedInput, SimulatedVideo,
-        SolidColor,
+        Input, InputKind, Project, ProjectSettings, Rgba8 as ModelRgba8, Scene, SimulatedAudio,
+        SimulatedInput, SimulatedVideo, SolidColor,
     };
     use fm_types::{
         AudioFormat, ChannelLayout, ColorMetadata, FrameRate, PixelFormat, SampleFormat,
-        SampleRate, ScanMode, VideoDimensions, VideoFormat,
+        SampleRate, ScanMode, SceneId, VideoDimensions, VideoFormat,
     };
     #[cfg(feature = "native-media")]
     use image::{ExtendedColorType, ImageEncoder, codecs::png::PngEncoder};
@@ -4373,6 +4378,20 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "native-media")]
+    #[test]
+    fn native_source_extraction_rejects_unrealized_scene_inputs_clearly() {
+        let store = ProjectStore::new("unloaded-test-project.freemix").unwrap();
+        let error = resolve_native_sources(&store, &scene_test_project(), None)
+            .err()
+            .unwrap();
+
+        assert_eq!(
+            error.to_string(),
+            "native scene input 1 is not supported because scene compositor realization is not implemented"
+        );
+    }
+
     #[cfg(all(feature = "native-media", target_os = "macos"))]
     #[test]
     fn macos_camera_resolution_is_exact_non_prompting_and_reaps_helper() {
@@ -4891,6 +4910,54 @@ mod tests {
                 required_capabilities: Vec::new(),
             });
         }
+        project.set_main_mix(MainMix::new(test_input_id(1), test_input_id(2)));
+        StoredProject::from_project(
+            project,
+            RuntimeRouting {
+                desired_program_id: Some(test_input_id(1)),
+                realized_program_id: Some(test_input_id(1)),
+                desired_preview_id: Some(test_input_id(2)),
+                realized_preview_id: Some(test_input_id(2)),
+            },
+            ProjectPosition::default(),
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
+    #[cfg(feature = "native-media")]
+    fn scene_test_project() -> StoredProject {
+        let baseline = test_project();
+        let mut project = Project::new(
+            baseline.project().id(),
+            "Scene Unit Test",
+            baseline.project().settings().clone(),
+        );
+        let scene_id = SceneId::new(NonZeroU128::new(1).unwrap());
+        project.add_input(Input {
+            id: test_input_id(1),
+            name: "Scene".into(),
+            kind: InputKind::Scene {
+                scene_id,
+                audio_source: Some(test_input_id(2)),
+            },
+            required_capabilities: Vec::new(),
+        });
+        project.add_input(Input {
+            id: test_input_id(2),
+            name: "Audio".into(),
+            kind: InputKind::Simulated(SimulatedInput::new(
+                SimulatedVideo::Bars,
+                SimulatedAudio::Silence,
+            )),
+            required_capabilities: Vec::new(),
+        });
+        project.add_scene(Scene {
+            id: scene_id,
+            name: "Program".into(),
+            background: ModelRgba8::OPAQUE_BLACK,
+            layers: Vec::new(),
+        });
         project.set_main_mix(MainMix::new(test_input_id(1), test_input_id(2)));
         StoredProject::from_project(
             project,

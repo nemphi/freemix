@@ -2,15 +2,8 @@ use std::{fs::File, io::Read};
 
 use crate::{CURRENT_SCHEMA_VERSION, MAX_MANIFEST_BYTES, ProjectStore, StoreError, json};
 
-const V1_SCHEMA_VERSION: u32 = 1;
 const V2_SCHEMA_VERSION: u32 = 2;
 const V3_SCHEMA_VERSION: u32 = 3;
-const V1_DEFAULTS: [&str; 4] = [
-    "frames_rendered=0",
-    "runtime_generation=0",
-    "clock_time_nanos=0",
-    "idempotency_receipts=[]",
-];
 const V3_DEFAULTS: [&str; 8] = [
     "settings.frame_rate=60000/1001",
     "settings.video=1920x1080/nv12/progressive/bt709",
@@ -55,27 +48,6 @@ impl MigrationReport {
 }
 
 impl ProjectStore {
-    /// Explicitly migrates a schema-v1 manifest through v2 to canonical v4.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for malformed data, the wrong schema, validation,
-    /// size-limit, or filesystem failures.
-    pub fn migrate_v1(&self) -> Result<MigrationReport, StoreError> {
-        let source = self.read_legacy_manifest()?;
-        let project = json::decode_v1(&source).map_err(StoreError::from_decode)?;
-        self.save(&project)?;
-        Ok(MigrationReport {
-            from_schema: V1_SCHEMA_VERSION,
-            to_schema: CURRENT_SCHEMA_VERSION,
-            defaulted_fields: V1_DEFAULTS
-                .into_iter()
-                .chain(V3_DEFAULTS)
-                .chain(V4_DEFAULTS)
-                .collect(),
-        })
-    }
-
     /// Explicitly migrates a schema-v2 manifest to canonical v4.
     ///
     /// # Errors

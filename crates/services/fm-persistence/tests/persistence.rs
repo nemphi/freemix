@@ -418,8 +418,8 @@ fn strict_parser_rejects_receipt_variant_fields() {
 }
 
 #[test]
-fn golden_v1_manifest_migrates_explicitly_with_deterministic_defaults() {
-    let temp = TestDirectory::new("migration");
+fn schema_v1_is_deliberately_outside_the_supported_window() {
+    let temp = TestDirectory::new("unsupported-v1");
     let root = temp.project_path("show");
     write_manifest(&root, include_str!("fixtures/schema-v1.json"));
     let store = ProjectStore::new(root).unwrap();
@@ -427,30 +427,12 @@ fn golden_v1_manifest_migrates_explicitly_with_deterministic_defaults() {
     assert!(matches!(
         store.load(),
         Err(StoreError::Validation(
-            ProjectValidationError::UnsupportedSchema { found: 1, .. }
+            ProjectValidationError::UnsupportedSchema {
+                found: 1,
+                supported: CURRENT_SCHEMA_VERSION
+            }
         ))
     ));
-    let report = store.migrate_v1().unwrap();
-    let migrated = store.load().unwrap();
-
-    assert_eq!(report.from_schema(), 1);
-    assert_eq!(report.to_schema(), CURRENT_SCHEMA_VERSION);
-    assert_eq!(
-        &report.defaulted_fields()[..4],
-        [
-            "frames_rendered=0",
-            "runtime_generation=0",
-            "clock_time_nanos=0",
-            "idempotency_receipts=[]",
-        ]
-    );
-    assert_eq!(migrated.schema_version(), CURRENT_SCHEMA_VERSION);
-    assert_eq!(migrated.show_name(), "Golden V1 Show");
-    assert_eq!(migrated.position().revision, 17);
-    assert_eq!(migrated.position().frames_rendered, 0);
-    assert_eq!(migrated.position().runtime_generation, 0);
-    assert_eq!(migrated.position().clock_time_nanos, 0);
-    assert!(migrated.idempotency_receipts().is_empty());
 }
 
 #[test]

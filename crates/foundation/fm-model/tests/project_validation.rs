@@ -392,7 +392,7 @@ fn scene_input_missing_scene_and_audio_references_are_reported() {
 }
 
 #[test]
-fn scene_composition_bounds_and_premultiplication_are_validated() {
+fn scene_composition_value_bounds_and_premultiplication_are_validated() {
     let mut project = Project::new(project_id(10), "Bounds", settings());
     project.add_input(Input {
         id: input_id(1),
@@ -403,21 +403,39 @@ fn scene_composition_bounds_and_premultiplication_are_validated() {
     let mut invalid_layer = layer("Source", SourceRef::Input(input_id(1)));
     invalid_layer.geometry.width = 0;
     invalid_layer.crop = Some(CropRect::new(1919, 0, 2, 1));
-    let mut layers = vec![invalid_layer];
-    while layers.len() <= Scene::MAX_LAYERS {
-        layers.push(layer("extra", SourceRef::Input(input_id(1))));
-    }
     project.add_scene(Scene {
         id: scene_id(1),
         name: "Invalid".into(),
         background: Rgba8::new(2, 0, 0, 1),
-        layers,
+        layers: vec![invalid_layer],
     });
 
     let errors = project.validate().unwrap_err();
-    for field in ["background", "layers", "layers.geometry", "layers.crop"] {
+    for field in ["background", "layers.geometry", "layers.crop"] {
         assert!(errors.iter().any(|error| error.field == field));
     }
+}
+
+#[test]
+fn persisted_scenes_can_exceed_the_renderer_execution_limit() {
+    let mut project = Project::new(project_id(11), "Large stored scene", settings());
+    project.add_input(Input {
+        id: input_id(1),
+        name: "Source".into(),
+        kind: InputKind::Color,
+        required_capabilities: Vec::new(),
+    });
+    let layers = (0..=Scene::MAX_RENDERED_LAYERS)
+        .map(|index| layer(&format!("Layer {index}"), SourceRef::Input(input_id(1))))
+        .collect();
+    project.add_scene(Scene {
+        id: scene_id(1),
+        name: "Preserved".into(),
+        background: Rgba8::OPAQUE_BLACK,
+        layers,
+    });
+
+    assert_eq!(project.validate(), Ok(()));
 }
 
 #[test]

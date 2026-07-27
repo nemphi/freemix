@@ -943,6 +943,50 @@ fn supported_legacy_manifest_is_migrated_before_cli_load() {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn schema_v3_manifest_is_migrated_before_cli_load() {
+    let root = unique_test_root();
+    let project = root.join("v3.freemix");
+    fs::create_dir_all(&project).unwrap();
+    fs::write(
+        project.join("project.json"),
+        include_str!("../../../crates/services/fm-persistence/tests/fixtures/schema-v3.json")
+            .replace("\"revision\": 7", "\"revision\": 0")
+            .replace("\"event_sequence\": 9", "\"event_sequence\": 0")
+            .replace("\"frames_rendered\": 240", "\"frames_rendered\": 0")
+            .replace("\"runtime_generation\": 3", "\"runtime_generation\": 0")
+            .replace("\"clock_time_nanos\": 10000000", "\"clock_time_nanos\": 0"),
+    )
+    .unwrap();
+
+    let migrated_status = status(&project);
+    assert!(migrated_status.contains("show=\"Frozen V3 Scene\""));
+    let migrated = manifest(&project);
+    assert!(migrated.starts_with("{\n  \"schema_version\": 4,"));
+    assert!(migrated.contains(r#""background": {"red": 0, "green": 0, "blue": 0, "alpha": 255}"#));
+    assert!(migrated.contains(
+        r#""geometry": {"translation_x": 0, "translation_y": 0, "width": 3840, "height": 2160, "rotation": "deg0"}"#
+    ));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn schema_v1_manifest_is_rejected_without_mutation() {
+    let root = unique_test_root();
+    let project = root.join("v1.freemix");
+    fs::create_dir_all(&project).unwrap();
+    let original =
+        include_str!("../../../crates/services/fm-persistence/tests/fixtures/schema-v1.json");
+    fs::write(project.join("project.json"), original).unwrap();
+
+    let result = invoke(&["status", project.to_str().unwrap()]);
+
+    assert_failure_contains(&result, "unsupported schema 1; expected 4");
+    assert_eq!(manifest(&project), original);
+    fs::remove_dir_all(root).unwrap();
+}
+
 fn invoke(arguments: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_freemix-cli"))
         .args(arguments)

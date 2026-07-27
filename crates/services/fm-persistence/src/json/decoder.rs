@@ -24,7 +24,6 @@ use super::{
     reader::{Reader, Value},
 };
 
-const V1_SCHEMA_VERSION: u32 = 1;
 const V2_SCHEMA_VERSION: u32 = 2;
 const V3_SCHEMA_VERSION: u32 = 3;
 
@@ -46,12 +45,8 @@ pub(crate) fn decode(source: &str) -> Result<StoredProject, DecodeError> {
         .map_err(DecodeError::Validation)
 }
 
-pub(crate) fn decode_v1(source: &str) -> Result<StoredProject, DecodeError> {
-    LegacyDto::parse(source, V1_SCHEMA_VERSION)?.into_current()
-}
-
 pub(crate) fn decode_v2(source: &str) -> Result<StoredProject, DecodeError> {
-    LegacyDto::parse(source, V2_SCHEMA_VERSION)?.into_current()
+    LegacyDto::parse(source)?.into_current()
 }
 
 pub(crate) fn decode_v3(source: &str) -> Result<StoredProject, DecodeError> {
@@ -589,14 +584,14 @@ struct LegacyDto {
 }
 
 impl LegacyDto {
-    fn parse(source: &str, expected_schema: u32) -> Result<Self, DecodeError> {
+    fn parse(source: &str) -> Result<Self, DecodeError> {
         let mut object = Object::new(Reader::new(source).document()?, "legacy manifest")?;
         let schema = object.u32("schema_version")?;
-        if schema != expected_schema {
+        if schema != V2_SCHEMA_VERSION {
             return Err(DecodeError::Validation(
                 ProjectValidationError::UnsupportedSchema {
                     found: schema,
-                    supported: expected_schema,
+                    supported: V2_SCHEMA_VERSION,
                 },
             ));
         }
@@ -614,21 +609,14 @@ impl LegacyDto {
         let revision = object.u64("revision")?;
         let state_epoch = object.u64("state_epoch")?;
         let event_sequence = object.u64("event_sequence")?;
-        let (frames_rendered, runtime_generation, clock_time_nanos, receipts) =
-            if schema == V1_SCHEMA_VERSION {
-                (0, 0, 0, Vec::new())
-            } else {
-                (
-                    object.u64("frames_rendered")?,
-                    object.u64("runtime_generation")?,
-                    object.u64("clock_time_nanos")?,
-                    parse_array(
-                        object.take("idempotency_receipts")?,
-                        "idempotency_receipts",
-                        parse_receipt,
-                    )?,
-                )
-            };
+        let frames_rendered = object.u64("frames_rendered")?;
+        let runtime_generation = object.u64("runtime_generation")?;
+        let clock_time_nanos = object.u64("clock_time_nanos")?;
+        let receipts = parse_array(
+            object.take("idempotency_receipts")?,
+            "idempotency_receipts",
+            parse_receipt,
+        )?;
         object.finish()?;
         Ok(Self {
             project_id,

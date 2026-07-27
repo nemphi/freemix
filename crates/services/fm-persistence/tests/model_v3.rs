@@ -509,3 +509,38 @@ fn frozen_v3_manifest_migrates_with_composition_defaults_only() {
         fs::read(second.manifest_path()).unwrap()
     );
 }
+
+#[test]
+fn v3_migration_preserves_scenes_above_the_renderer_execution_limit() {
+    let temp = TestDirectory::new("v3-large-scene");
+    let store = temp.store("show");
+    fs::create_dir_all(store.root()).unwrap();
+    let source = include_str!("fixtures/schema-v3.json");
+    let layers_start_marker = "        \"layers\": [\n";
+    let layers_end_marker = "\n        ]\n      }\n    ],\n    \"audio_buses\"";
+    let layers_start = source.find(layers_start_marker).unwrap() + layers_start_marker.len();
+    let layers_end = source.find(layers_end_marker).unwrap();
+    let layers = (0..=Scene::MAX_RENDERED_LAYERS)
+        .map(|index| {
+            format!(
+                "          {{\"name\": \"Layer {index}\", \"source\": {{\"type\": \"input\", \"id\": 18446744073709551717}}, \"enabled\": true}}"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",\n");
+    let source = format!(
+        "{}{}{}",
+        &source[..layers_start],
+        layers,
+        &source[layers_end..]
+    );
+    fs::write(store.manifest_path(), source).unwrap();
+
+    store.migrate_v3().unwrap();
+    let migrated = store.load().unwrap();
+
+    assert_eq!(
+        migrated.project().scenes()[0].layers.len(),
+        Scene::MAX_RENDERED_LAYERS + 1
+    );
+}

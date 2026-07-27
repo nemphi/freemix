@@ -450,15 +450,15 @@ fn load_stored_project(path: &Path) -> AppResult<StoredProject> {
     match store.load() {
         Ok(project) => Ok(project),
         Err(StoreError::Validation(ProjectValidationError::UnsupportedSchema {
-            found: 1, ..
-        })) => {
-            store.migrate_v1()?;
-            Ok(store.load()?)
-        }
-        Err(StoreError::Validation(ProjectValidationError::UnsupportedSchema {
             found: 2, ..
         })) => {
             store.migrate_v2()?;
+            Ok(store.load()?)
+        }
+        Err(StoreError::Validation(ProjectValidationError::UnsupportedSchema {
+            found: 3, ..
+        })) => {
+            store.migrate_v3()?;
             Ok(store.load()?)
         }
         Err(error) => Err(error.into()),

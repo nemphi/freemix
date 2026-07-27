@@ -498,6 +498,67 @@ fn v2_project_migrates_and_serves() {
 }
 
 #[test]
+fn v3_project_migrates_and_serves() {
+    let directory = TestDirectory::new("v3-migration");
+    let project_path = directory.project_path();
+    fs::create_dir(&project_path).unwrap();
+    fs::write(
+        project_path.join("project.json"),
+        include_str!("../../../crates/services/fm-persistence/tests/fixtures/schema-v3.json")
+            .replace("\"revision\": 7", "\"revision\": 0")
+            .replace("\"event_sequence\": 9", "\"event_sequence\": 0")
+            .replace("\"frames_rendered\": 240", "\"frames_rendered\": 0")
+            .replace("\"runtime_generation\": 3", "\"runtime_generation\": 0")
+            .replace("\"clock_time_nanos\": 10000000", "\"clock_time_nanos\": 0"),
+    )
+    .unwrap();
+
+    let daemon = Daemon::start(&project_path);
+    let mut client = daemon.connect();
+    assert_eq!(client.handshake(None).current_revision, 0);
+    assert!(matches!(client.receive(), WireMessage::Snapshot(_)));
+    drop(client);
+    daemon.wait_success();
+
+    let migrated = ProjectStore::new(project_path).unwrap().load().unwrap();
+    assert_eq!(migrated.schema_version(), 4);
+    assert_eq!(migrated.project().name(), "Frozen V3 Scene");
+    let scene = &migrated.project().scenes()[0];
+    assert_eq!(scene.background, Rgba8::OPAQUE_BLACK);
+    assert_eq!(
+        scene.layers[0].geometry,
+        LayerGeometry::new(0, 0, 3_840, 2_160, Rotation::Deg0)
+    );
+}
+
+#[test]
+fn v1_project_is_rejected_as_unsupported() {
+    let directory = TestDirectory::new("v1-unsupported");
+    let project_path = directory.project_path();
+    fs::create_dir(&project_path).unwrap();
+    fs::write(
+        project_path.join("project.json"),
+        include_str!("../../../crates/services/fm-persistence/tests/fixtures/schema-v1.json"),
+    )
+    .unwrap();
+
+    let output = ProcessCommand::new(env!("CARGO_BIN_EXE_freemixd"))
+        .arg("serve")
+        .arg(&project_path)
+        .arg("--once")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8(output.stdout).unwrap().is_empty());
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("unsupported schema 1; expected 4")
+    );
+}
+
+#[test]
 fn incompatible_handshake_returns_protocol_error() {
     let directory = TestDirectory::new("incompatible");
     let project_path = directory.project_path();

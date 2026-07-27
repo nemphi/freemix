@@ -361,7 +361,12 @@ pub struct Scene {
 }
 
 impl Scene {
-    pub const MAX_LAYERS: usize = 64;
+    /// Maximum layers accepted by the compositor for one execution plan.
+    ///
+    /// Persisted scenes are intentionally not bounded by this value: schema v3
+    /// allowed larger scene lists, so storage and migration must preserve them.
+    /// Rendering code must enforce this limit when realizing a scene.
+    pub const MAX_RENDERED_LAYERS: usize = 64;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
