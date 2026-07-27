@@ -33,13 +33,13 @@ use std::{
 };
 
 use fm_capabilities::StableId;
-use fm_frame::{ClockDomainId, CpuVideoFrame};
+use fm_frame::{ClockDomainId, CpuVideoFrame, MediaFlags};
 use fm_io_api::{
     ClockCapability, DeviceId, Discovery, DiscoveryEvent, DiscoveryEventKind, DiscoverySnapshot,
     DriverState, EndpointCapabilities, EndpointHealth, EndpointHealthState, FallbackKind,
     FormatDescriptor, IoError, LifecycleState, MediaSource, MediaTransfer, MemoryDomain,
     OpenOptions, PermissionState, Remediation, SignalLossPolicy, SourceDescriptor, SourceId,
-    TimestampCapabilities, TimestampQuality, TransferLimits,
+    TimestampCapabilities, TimestampQuality, TimestampValidationError, TransferLimits,
 };
 use fm_types::FrameRate;
 
@@ -587,6 +587,12 @@ struct QueueState {
     last_activity: Option<Instant>,
 }
 
+#[derive(Clone, Copy)]
+struct RecoveryContinuity {
+    clock: ClockDomainId,
+    previous_pts_nanos: Option<i64>,
+}
+
 impl QueueState {
     fn push(&mut self, frame: CpuVideoFrame, native_dropped_total: u64) {
         self.telemetry.received = self.telemetry.received.saturating_add(1);
@@ -633,6 +639,7 @@ pub struct CameraVideoSource {
     state: Arc<Mutex<QueueState>>,
     resume_running: bool,
     last_delivered: Option<CpuVideoFrame>,
+    pending_recovery: Option<RecoveryContinuity>,
     #[cfg(target_os = "macos")]
     capture: Option<CaptureProcess>,
 }
@@ -651,6 +658,7 @@ impl CameraVideoSource {
             state: Arc::new(Mutex::new(QueueState::default())),
             resume_running: false,
             last_delivered: None,
+            pending_recovery: None,
             #[cfg(target_os = "macos")]
             capture: None,
         }
@@ -1061,6 +1069,52 @@ impl CameraVideoSource {
         };
     }
 
+    fn apply_recovery_continuity(
+        &mut self,
+        frame: CpuVideoFrame,
+    ) -> Result<CpuVideoFrame, IoError> {
+        let Some(pending) = self.pending_recovery else {
+            return Ok(frame);
+        };
+        let timing = frame.timing();
+        if timing.clock_domain() != pending.clock {
+            return Err(IoError::MalformedTimestamp(
+                TimestampValidationError::WrongClock {
+                    expected: pending.clock,
+                    actual: timing.clock_domain(),
+                },
+            ));
+        }
+        let actual_nanos = timing.presentation_timestamp().as_nanos();
+        if let Some(previous_nanos) = pending.previous_pts_nanos
+            && actual_nanos <= previous_nanos
+        {
+            return Err(IoError::MalformedTimestamp(
+                TimestampValidationError::NonMonotonic {
+                    previous_nanos,
+                    actual_nanos,
+                },
+            ));
+        }
+
+        let metadata = frame.metadata();
+        let frame = CpuVideoFrame::new(
+            timing.with_flags(timing.flags() | MediaFlags::DISCONTINUITY),
+            frame.into_payload(),
+        );
+        let frame = if let Some(metadata) = metadata {
+            frame.with_metadata(metadata).map_err(|error| {
+                adapter_failure(format!(
+                    "recovered camera frame metadata is invalid: {error}"
+                ))
+            })?
+        } else {
+            frame
+        };
+        self.pending_recovery = None;
+        Ok(frame)
+    }
+
     #[cfg(test)]
     fn start_without_helper_for_test(&mut self) {
         let mut state = self
@@ -1121,6 +1175,7 @@ impl MediaSource for CameraVideoSource {
         drop(state);
         self.options = Some(options);
         self.last_delivered = None;
+        self.pending_recovery = None;
         self.resume_running = false;
         self.lifecycle = LifecycleState::Open;
         self.health = EndpointHealth::HEALTHY;
@@ -1145,6 +1200,7 @@ impl MediaSource for CameraVideoSource {
             state.last_activity = None;
         }
         self.last_delivered = None;
+        self.pending_recovery = None;
 
         #[cfg(target_os = "macos")]
         {
@@ -1252,6 +1308,7 @@ impl MediaSource for CameraVideoSource {
         drop(state);
         self.options = None;
         self.last_delivered = None;
+        self.pending_recovery = None;
         self.resume_running = false;
         self.lifecycle = LifecycleState::Closed;
         Ok(())
@@ -1276,8 +1333,24 @@ impl MediaSource for CameraVideoSource {
             self.resume_running = false;
             return Ok(());
         }
+        let held_frame = self.last_delivered.clone();
+        let pending_recovery = RecoveryContinuity {
+            clock: self
+                .options
+                .as_ref()
+                .expect("a recovering source remains open")
+                .clock_domain,
+            previous_pts_nanos: held_frame
+                .as_ref()
+                .map(|frame| frame.timing().presentation_timestamp().as_nanos()),
+        };
         self.lifecycle = LifecycleState::Open;
         if let Err(error) = self.start() {
+            self.last_delivered = held_frame;
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .sticky_failure = None;
             let detail = error.to_string();
             self.lifecycle = LifecycleState::Lost;
             self.resume_running = true;
@@ -1286,6 +1359,8 @@ impl MediaSource for CameraVideoSource {
             }
             return Err(error);
         }
+        self.last_delivered = held_frame;
+        self.pending_recovery = Some(pending_recovery);
         self.resume_running = false;
         Ok(())
     }
@@ -1314,6 +1389,7 @@ impl MediaSource for CameraVideoSource {
             (state.pop(), state.last_activity)
         };
         if let Some(frame) = frame {
+            let frame = self.apply_recovery_continuity(frame)?;
             self.last_delivered = Some(frame.clone());
             return Ok(Some(MediaTransfer::Live(frame)));
         }
@@ -1682,12 +1758,12 @@ mod tests {
         bytes
     }
 
-    fn test_frame(sequence: u64) -> CpuVideoFrame {
+    fn capture_frame(sequence: u64, pts: i64) -> Vec<u8> {
         let mut stream = b"FMCAMF3\0".to_vec();
         stream.extend_from_slice(&62_u32.to_le_bytes());
         stream.extend_from_slice(&sequence.to_le_bytes());
         stream.extend_from_slice(&0_u64.to_le_bytes());
-        stream.extend_from_slice(&i64::try_from(sequence).unwrap().to_le_bytes());
+        stream.extend_from_slice(&pts.to_le_bytes());
         stream.extend_from_slice(&1_000_i32.to_le_bytes());
         stream.extend_from_slice(&1_i64.to_le_bytes());
         stream.extend_from_slice(&1_000_i32.to_le_bytes());
@@ -1697,11 +1773,34 @@ mod tests {
         stream.extend_from_slice(&4_u32.to_le_bytes());
         stream.extend_from_slice(&[1, 1]);
         stream.extend_from_slice(&[u8::try_from(sequence).unwrap(), 0, 0, 255]);
-        protocol::FrameReader::new(Cursor::new(stream), coremedia_clock().domain)
+        stream
+    }
+
+    fn test_frame_at(sequence: u64, pts: i64, clock: ClockDomainId) -> CpuVideoFrame {
+        protocol::FrameReader::new(Cursor::new(capture_frame(sequence, pts)), clock)
             .unwrap()
             .read_frame()
             .unwrap()
             .unwrap()
+    }
+
+    fn test_frame(sequence: u64) -> CpuVideoFrame {
+        test_frame_at(
+            sequence,
+            i64::try_from(sequence).unwrap(),
+            coremedia_clock().domain,
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    fn shell_octal(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+
+        let mut output = String::new();
+        for byte in bytes {
+            write!(output, "\\{byte:03o}").unwrap();
+        }
+        output
     }
 
     fn source_with_policy(policy: SignalLossPolicy) -> CameraVideoSource {
@@ -1916,6 +2015,73 @@ mod tests {
     }
 
     #[test]
+    fn recovery_continuity_is_transactional_and_allows_sequence_reset() {
+        let mut source = source_with_policy(SignalLossPolicy::Hold);
+        source.start_without_helper_for_test();
+        let clock = source.options.as_ref().unwrap().clock_domain;
+        source
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(test_frame_at(7, 1_000, clock), 0);
+        let anchor = match source.try_receive().unwrap() {
+            Some(MediaTransfer::Live(frame)) => frame,
+            result => panic!("unexpected anchor transfer: {result:?}"),
+        };
+        source.pending_recovery = Some(RecoveryContinuity {
+            clock,
+            previous_pts_nanos: Some(anchor.timing().presentation_timestamp().as_nanos()),
+        });
+
+        let wrong_clock = ClockDomainId::new(NonZeroU128::new(999).unwrap());
+        source
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(test_frame_at(0, 2_000, wrong_clock), 0);
+        assert!(matches!(
+            source.try_receive(),
+            Err(IoError::MalformedTimestamp(
+                TimestampValidationError::WrongClock { .. }
+            ))
+        ));
+        assert!(source.pending_recovery.is_some());
+        assert_eq!(source.last_delivered.as_ref().unwrap(), &anchor);
+
+        source
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(test_frame_at(0, 1_000, clock), 0);
+        assert!(matches!(
+            source.try_receive(),
+            Err(IoError::MalformedTimestamp(
+                TimestampValidationError::NonMonotonic { .. }
+            ))
+        ));
+        assert!(source.pending_recovery.is_some());
+        assert_eq!(source.last_delivered.as_ref().unwrap(), &anchor);
+
+        source
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(test_frame_at(0, 2_000, clock), 0);
+        let recovered = match source.try_receive().unwrap() {
+            Some(MediaTransfer::Live(frame)) => frame,
+            result => panic!("unexpected recovered transfer: {result:?}"),
+        };
+        assert_eq!(recovered.timing().sequence().get(), 0);
+        assert!(
+            recovered
+                .timing()
+                .flags()
+                .contains(MediaFlags::DISCONTINUITY)
+        );
+        assert!(source.pending_recovery.is_none());
+    }
+
+    #[test]
     fn no_frame_loss_stays_lost_and_returns_stop_policy() {
         let mut source = source_with_policy(SignalLossPolicy::Stop);
         source.start_without_helper_for_test();
@@ -2087,5 +2253,140 @@ mod tests {
         );
         source.close().unwrap();
         fs::remove_file(helper).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn recovery_restarts_helper_preserves_hold_and_keeps_identity() {
+        use std::{
+            fs,
+            os::unix::fs::PermissionsExt,
+            process::Command,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let helper = std::env::temp_dir().join(format!("fm-camera-recovery-{suffix}.sh"));
+        let count_file = helper.with_extension("count");
+        let pid_file = helper.with_extension("pids");
+        let script = format!(
+            "#!/bin/sh\ncount=0\nif [ -f '{}' ]; then count=$(cat '{}'); fi\ncount=$((count + 1))\nprintf '%s' \"$count\" > '{}'\nprintf '%s\\n' \"$$\" >> '{}'\ncase \"$count\" in\n  1) printf '{}'; sleep 0.2; exit 20;;\n  2) printf 'BADMAGIC'; exit 91;;\n  3) printf '{}'; exec sleep 30;;\n  *) exit 90;;\nesac\n",
+            count_file.display(),
+            count_file.display(),
+            count_file.display(),
+            pid_file.display(),
+            shell_octal(&capture_frame(7, 1_000)),
+            shell_octal(&capture_frame(0, 2_000)),
+        );
+        fs::write(&helper, script).unwrap();
+        let mut permissions = fs::metadata(&helper).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&helper, permissions).unwrap();
+
+        let adapter = MacosCameraAdapter::from_discovery_with_helper(
+            &discovery(0, &[("stable-native-id", "Camera", &[(1, 1, 30, 1)])]),
+            helper.clone(),
+        )
+        .unwrap();
+        let descriptor = adapter.snapshot().sources[0].clone();
+        let expected_id = descriptor.id;
+        let expected_key = descriptor.stable_key.clone();
+        let mut source = adapter.open_video_source(descriptor.id).unwrap();
+        source
+            .open(OpenOptions {
+                format: descriptor.capabilities.formats[0].clone(),
+                clock_domain: descriptor.capabilities.clocks[0].domain,
+                memory_domain: MemoryDomain::Cpu,
+                queue_capacity: NonZeroUsize::new(2).unwrap(),
+                signal_loss: SignalLossPolicy::Hold,
+            })
+            .unwrap();
+        source.start().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let first = loop {
+            match source.try_receive().unwrap() {
+                Some(MediaTransfer::Live(frame)) => break frame,
+                Some(MediaTransfer::Fallback { .. }) => panic!("camera entered Hold before live"),
+                None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+                None => panic!("initial helper frame was not delivered"),
+            }
+        };
+        assert_eq!(first.timing().sequence().get(), 7);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match source.try_receive().unwrap() {
+                Some(MediaTransfer::Fallback {
+                    kind: FallbackKind::Hold,
+                    media,
+                }) => {
+                    assert_eq!(media, first);
+                    break;
+                }
+                None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+                result => panic!("unexpected initial loss transfer: {result:?}"),
+            }
+        }
+
+        source.begin_recovery().unwrap();
+        assert!(matches!(
+            source.finish_recovery(),
+            Err(IoError::AdapterFailure { .. })
+        ));
+        assert!(matches!(
+            source.try_receive().unwrap(),
+            Some(MediaTransfer::Fallback {
+                kind: FallbackKind::Hold,
+                media,
+            }) if media == first
+        ));
+
+        source.begin_recovery().unwrap();
+        source.finish_recovery().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let recovered = loop {
+            match source.try_receive().unwrap() {
+                Some(MediaTransfer::Live(frame)) => break frame,
+                None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+                result => panic!("unexpected recovered transfer: {result:?}"),
+            }
+        };
+        assert_eq!(recovered.timing().sequence().get(), 0);
+        assert_eq!(
+            recovered.timing().clock_domain(),
+            first.timing().clock_domain()
+        );
+        assert!(
+            recovered.timing().presentation_timestamp() > first.timing().presentation_timestamp()
+        );
+        assert!(
+            recovered
+                .timing()
+                .flags()
+                .contains(MediaFlags::DISCONTINUITY)
+        );
+        assert_eq!(source.descriptor().id, expected_id);
+        assert_eq!(source.descriptor().stable_key, expected_key);
+
+        source.stop().unwrap();
+        source.close().unwrap();
+        for pid in fs::read_to_string(&pid_file).unwrap().lines() {
+            assert!(
+                !Command::new("kill")
+                    .args(["-0", pid])
+                    .status()
+                    .unwrap()
+                    .success(),
+                "camera helper {pid} was not reaped"
+            );
+        }
+        fs::remove_file(helper).unwrap();
+        fs::remove_file(count_file).unwrap();
+        fs::remove_file(pid_file).unwrap();
     }
 }
