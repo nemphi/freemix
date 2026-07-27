@@ -576,6 +576,10 @@ pub struct CameraTelemetry {
     pub continuity_rejected: u64,
     pub recovery_timeout_discarded: u64,
     pub terminal_error_discarded: u64,
+    pub terminal_trigger_discarded: u64,
+    pub ready_delivery_depth: u64,
+    pub ready_delivery_discarded: u64,
+    pub cancellation_discarded: u64,
     pub current: usize,
     pub peak: usize,
 }
@@ -806,6 +810,10 @@ impl CameraVideoSource {
             return Err(invalid_state("start", self.lifecycle));
         }
         self.shutdown()?;
+        self.discard_ready_delivery();
+        if preserve_telemetry {
+            self.discard_queued_for_cancellation();
+        }
         {
             let mut state = self
                 .state
@@ -831,7 +839,6 @@ impl CameraVideoSource {
         self.recovery_deadline = None;
         self.map_recovery_sequences = false;
         self.recovery_sequence_offset = None;
-        self.ready_delivery = None;
 
         #[cfg(target_os = "macos")]
         {
@@ -1420,6 +1427,7 @@ impl CameraVideoSource {
         };
         self.pending_recovery = None;
         self.recovery_deadline = None;
+        self.discard_ready_delivery();
         {
             let mut state = self
                 .state
@@ -1443,11 +1451,71 @@ impl CameraVideoSource {
         }
     }
 
+    fn terminal_frame_error(&mut self, error: &IoError) -> IoError {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.telemetry.terminal_trigger_discarded =
+            state.telemetry.terminal_trigger_discarded.saturating_add(1);
+        drop(state);
+        self.terminal_capture_error(error)
+    }
+
+    fn set_ready_delivery(&mut self, frame: CpuVideoFrame) {
+        debug_assert!(self.ready_delivery.is_none());
+        self.ready_delivery = Some(frame);
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .telemetry
+            .ready_delivery_depth = 1;
+    }
+
+    fn take_ready_delivery(&mut self) -> Option<CpuVideoFrame> {
+        let frame = self.ready_delivery.take();
+        if frame.is_some() {
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .telemetry
+                .ready_delivery_depth = 0;
+        }
+        frame
+    }
+
+    fn discard_ready_delivery(&mut self) {
+        if self.ready_delivery.take().is_none() {
+            return;
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.telemetry.ready_delivery_depth = 0;
+        state.telemetry.ready_delivery_discarded =
+            state.telemetry.ready_delivery_discarded.saturating_add(1);
+    }
+
+    fn discard_queued_for_cancellation(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let discarded = u64::try_from(state.frames.len()).unwrap_or(u64::MAX);
+        state.telemetry.cancellation_discarded = state
+            .telemetry
+            .cancellation_discarded
+            .saturating_add(discarded);
+        state.frames.clear();
+        state.telemetry.current = 0;
+    }
+
     fn wait_for_recovery_completion(&mut self) -> Result<(), IoError> {
         loop {
             match self.try_receive() {
                 Ok(Some(MediaTransfer::Live(frame))) => {
-                    self.ready_delivery = Some(frame);
+                    self.set_ready_delivery(frame);
                     return Ok(());
                 }
                 Ok(Some(MediaTransfer::Fallback { .. }) | None) => {}
@@ -1551,6 +1619,7 @@ impl MediaSource for CameraVideoSource {
             return Err(invalid_state("stop", self.lifecycle));
         }
         self.shutdown()?;
+        self.discard_queued_for_cancellation();
         let mut state = self
             .state
             .lock()
@@ -1565,7 +1634,7 @@ impl MediaSource for CameraVideoSource {
         self.resume_running = false;
         self.map_recovery_sequences = false;
         self.recovery_sequence_offset = None;
-        self.ready_delivery = None;
+        self.discard_ready_delivery();
         self.lifecycle = LifecycleState::Open;
         self.health = EndpointHealth::HEALTHY;
         Ok(())
@@ -1579,6 +1648,7 @@ impl MediaSource for CameraVideoSource {
             return Err(invalid_state("close", self.lifecycle));
         }
         self.shutdown()?;
+        self.discard_queued_for_cancellation();
         let mut state = self
             .state
             .lock()
@@ -1595,7 +1665,7 @@ impl MediaSource for CameraVideoSource {
         self.resume_running = false;
         self.map_recovery_sequences = false;
         self.recovery_sequence_offset = None;
-        self.ready_delivery = None;
+        self.discard_ready_delivery();
         self.lifecycle = LifecycleState::Closed;
         Ok(())
     }
@@ -1703,7 +1773,7 @@ impl MediaSource for CameraVideoSource {
                                 state.telemetry.continuity_rejected.saturating_add(1);
                             continue;
                         }
-                        Err(error) => return Err(self.terminal_capture_error(&error)),
+                        Err(error) => return Err(self.terminal_frame_error(&error)),
                     };
                     if let Some(offset) = new_offset {
                         self.recovery_sequence_offset = Some(offset);
@@ -1727,7 +1797,7 @@ impl MediaSource for CameraVideoSource {
         if self.lifecycle != LifecycleState::Running {
             return Err(invalid_state("receive", self.lifecycle));
         }
-        if let Some(frame) = self.ready_delivery.take() {
+        if let Some(frame) = self.take_ready_delivery() {
             return Ok(Some(MediaTransfer::Live(frame)));
         }
         if let Some(error) = self.sticky_error() {
@@ -1746,7 +1816,7 @@ impl MediaSource for CameraVideoSource {
         if let Some(frame) = frame {
             let (frame, new_offset) = match self.prepare_frame(frame, false) {
                 Ok(prepared) => prepared,
-                Err(error) => return Err(self.terminal_capture_error(&error)),
+                Err(error) => return Err(self.terminal_frame_error(&error)),
             };
             if let Some(offset) = new_offset {
                 self.recovery_sequence_offset = Some(offset);
@@ -2346,6 +2416,10 @@ mod tests {
                 continuity_rejected: 0,
                 recovery_timeout_discarded: 0,
                 terminal_error_discarded: 0,
+                terminal_trigger_discarded: 0,
+                ready_delivery_depth: 0,
+                ready_delivery_discarded: 0,
+                cancellation_discarded: 0,
                 current: 2,
                 peak: 2,
             }
@@ -2522,12 +2596,64 @@ mod tests {
 
         source.wait_for_recovery_completion().unwrap();
         assert_eq!(source.lifecycle(), LifecycleState::Running);
+        assert_eq!(source.telemetry().ready_delivery_depth, 1);
         let recovered = match source.try_receive().unwrap() {
             Some(MediaTransfer::Live(frame)) => frame,
             result => panic!("queued recovery frame was not accepted: {result:?}"),
         };
         assert_eq!(recovered.timing().sequence().get(), 8);
+        assert_eq!(source.telemetry().ready_delivery_depth, 0);
         assert_eq!(source.telemetry().recovery_timeout_discarded, 0);
+    }
+
+    #[test]
+    fn recovery_ready_delivery_cancellation_is_explicit_and_exact() {
+        let mut source = source_with_policy(SignalLossPolicy::Stop);
+        source.start_without_helper_for_test();
+        let clock = source.options.as_ref().unwrap().clock_domain;
+        source.lifecycle = LifecycleState::Recovering;
+        source.pending_recovery = Some(RecoveryContinuity {
+            clock,
+            previous_pts_nanos: None,
+        });
+        source.recovery_deadline = Some(Instant::now() + Duration::from_secs(1));
+        source
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(test_frame_at(0, 2_000, clock), 0);
+        source
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(test_frame_at(1, 2_033, clock), 0);
+
+        source.wait_for_recovery_completion().unwrap();
+        let pending = source.telemetry();
+        assert_eq!(pending.received, 2);
+        assert_eq!(pending.current, 1);
+        assert_eq!(pending.ready_delivery_depth, 1);
+        assert_eq!(pending.ready_delivery_discarded, 0);
+        assert_eq!(
+            pending.received,
+            u64::try_from(pending.current)
+                .unwrap()
+                .saturating_add(pending.ready_delivery_depth)
+        );
+
+        source.stop().unwrap();
+        let cancelled = source.telemetry();
+        assert_eq!(cancelled.received, 2);
+        assert_eq!(cancelled.ready_delivery_depth, 0);
+        assert_eq!(cancelled.ready_delivery_discarded, 1);
+        assert_eq!(cancelled.cancellation_discarded, 1);
+        assert_eq!(
+            cancelled.received,
+            cancelled
+                .ready_delivery_discarded
+                .saturating_add(cancelled.cancellation_discarded)
+        );
+        source.close().unwrap();
     }
 
     #[test]
@@ -2766,6 +2892,12 @@ mod tests {
             source.try_receive(),
             Err(IoError::AdapterFailure { .. })
         ));
+        let telemetry = source.telemetry();
+        assert_eq!(telemetry.received, 2);
+        assert_eq!(telemetry.current, 0);
+        assert_eq!(telemetry.terminal_error_discarded, 0);
+        assert_eq!(telemetry.terminal_trigger_discarded, 1);
+        assert_eq!(telemetry.received, 1 + telemetry.terminal_trigger_discarded);
         assert_eq!(source.lifecycle(), LifecycleState::Lost);
         assert_eq!(source.health().state, EndpointHealthState::Failed);
         assert!(source.pending_recovery.is_none());
@@ -2862,6 +2994,10 @@ mod tests {
         assert_eq!(telemetry.continuity_rejected, 0);
         assert_eq!(telemetry.recovery_timeout_discarded, 0);
         assert_eq!(telemetry.terminal_error_discarded, 2);
+        assert_eq!(telemetry.terminal_trigger_discarded, 0);
+        assert_eq!(telemetry.ready_delivery_depth, 0);
+        assert_eq!(telemetry.ready_delivery_discarded, 0);
+        assert_eq!(telemetry.cancellation_discarded, 0);
         assert_eq!(telemetry.current, 0);
         assert_eq!(
             telemetry.received,
@@ -2870,6 +3006,10 @@ mod tests {
                 .saturating_add(telemetry.continuity_rejected)
                 .saturating_add(telemetry.recovery_timeout_discarded)
                 .saturating_add(telemetry.terminal_error_discarded)
+                .saturating_add(telemetry.terminal_trigger_discarded)
+                .saturating_add(telemetry.ready_delivery_depth)
+                .saturating_add(telemetry.ready_delivery_discarded)
+                .saturating_add(telemetry.cancellation_discarded)
                 .saturating_add(u64::try_from(telemetry.current).unwrap())
         );
     }

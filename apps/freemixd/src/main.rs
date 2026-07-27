@@ -260,6 +260,8 @@ struct NativeCameraInput {
     recovery_policy: CameraRecoveryPolicy,
     ingested_frames: u64,
     ingest_failed: u64,
+    preflight_depth: u64,
+    preflight_discarded: u64,
     last_ingested_sequence: Option<u64>,
     last_ingested_discontinuity: bool,
 }
@@ -537,9 +539,15 @@ impl NativeCameraInputs {
                     continuity_rejected: snapshot.telemetry.continuity_rejected,
                     recovery_timeout_discarded: snapshot.telemetry.recovery_timeout_discarded,
                     terminal_error_discarded: snapshot.telemetry.terminal_error_discarded,
+                    terminal_trigger_discarded: snapshot.telemetry.terminal_trigger_discarded,
+                    ready_delivery_depth: snapshot.telemetry.ready_delivery_depth,
+                    ready_delivery_discarded: snapshot.telemetry.ready_delivery_discarded,
+                    cancellation_discarded: snapshot.telemetry.cancellation_discarded,
                     supervisor_slot_replaced: state.frame.replacements,
                     supervisor_slot_depth: u64::from(state.frame.frame.is_some()),
                     ingest_failed: camera.ingest_failed,
+                    preflight_depth: camera.preflight_depth,
+                    preflight_discarded: camera.preflight_discarded,
                     recovery_attempts: snapshot.recovery_attempts,
                     recovery_successes: snapshot.recovery_successes,
                     recovery_exhausted: snapshot.recovery_exhausted,
@@ -564,9 +572,21 @@ impl NativeCameraInputs {
         Some(sources)
     }
 
-    fn mark_initial_frames_ingested(&mut self) {
+    fn mark_preflight_frames_ingested(&mut self) {
         for camera in &mut self.inputs {
-            camera.ingested_frames = 1;
+            camera.ingested_frames = camera
+                .ingested_frames
+                .saturating_add(camera.preflight_depth);
+            camera.preflight_depth = 0;
+        }
+    }
+
+    fn discard_preflight_frames(&mut self) {
+        for camera in &mut self.inputs {
+            camera.preflight_discarded = camera
+                .preflight_discarded
+                .saturating_add(camera.preflight_depth);
+            camera.preflight_depth = 0;
         }
     }
 
@@ -839,9 +859,15 @@ struct NativeCameraTelemetry {
     continuity_rejected: u64,
     recovery_timeout_discarded: u64,
     terminal_error_discarded: u64,
+    terminal_trigger_discarded: u64,
+    ready_delivery_depth: u64,
+    ready_delivery_discarded: u64,
+    cancellation_discarded: u64,
     supervisor_slot_replaced: u64,
     supervisor_slot_depth: u64,
     ingest_failed: u64,
+    preflight_depth: u64,
+    preflight_discarded: u64,
     recovery_attempts: u64,
     recovery_successes: u64,
     recovery_exhausted: u64,
@@ -863,9 +889,15 @@ struct NativeCameraSourceTelemetry {
     continuity_rejected: u64,
     recovery_timeout_discarded: u64,
     terminal_error_discarded: u64,
+    terminal_trigger_discarded: u64,
+    ready_delivery_depth: u64,
+    ready_delivery_discarded: u64,
+    cancellation_discarded: u64,
     supervisor_slot_replaced: u64,
     supervisor_slot_depth: u64,
     ingest_failed: u64,
+    preflight_depth: u64,
+    preflight_discarded: u64,
     recovery_attempts: u64,
     recovery_successes: u64,
     recovery_exhausted: u64,
@@ -877,7 +909,7 @@ struct NativeCameraSourceTelemetry {
 impl NativeCameraSourceTelemetry {
     fn diagnostic(self) -> String {
         format!(
-            "FREEMIXD_CAMERA_SOURCE\tv=1\tclassification=diagnostic-not-certification\tinput_id={}\tsample_phase=pre_cleanup\tsample_lifecycle={}\thealth={}\tframes_received={}\tframes_ingested={}\tnative_dropped={}\tqueue_depth={}\tqueue_peak_depth={}\tqueue_dropped={}\tcontinuity_rejected={}\trecovery_timeout_discarded={}\tterminal_error_discarded={}\tsupervisor_slot_replaced={}\tsupervisor_slot_depth={}\tingest_failed={}\trecovery_attempts={}\trecovery_successes={}\trecovery_exhausted={}\trecovery_worker_failures={}\trecovery_outcome={}",
+            "FREEMIXD_CAMERA_SOURCE\tv=1\tclassification=diagnostic-not-certification\tinput_id={}\tsample_phase=pre_cleanup\tsample_lifecycle={}\thealth={}\tframes_received={}\tframes_ingested={}\tnative_dropped={}\tqueue_depth={}\tqueue_peak_depth={}\tqueue_dropped={}\tcontinuity_rejected={}\trecovery_timeout_discarded={}\tterminal_error_discarded={}\tterminal_trigger_discarded={}\tready_delivery_depth={}\tready_delivery_discarded={}\tcancellation_discarded={}\tsupervisor_slot_replaced={}\tsupervisor_slot_depth={}\tingest_failed={}\tpreflight_depth={}\tpreflight_discarded={}\trecovery_attempts={}\trecovery_successes={}\trecovery_exhausted={}\trecovery_worker_failures={}\trecovery_outcome={}",
             self.input,
             lifecycle_label(self.lifecycle),
             health_label(self.health),
@@ -890,15 +922,40 @@ impl NativeCameraSourceTelemetry {
             self.continuity_rejected,
             self.recovery_timeout_discarded,
             self.terminal_error_discarded,
+            self.terminal_trigger_discarded,
+            self.ready_delivery_depth,
+            self.ready_delivery_discarded,
+            self.cancellation_discarded,
             self.supervisor_slot_replaced,
             self.supervisor_slot_depth,
             self.ingest_failed,
+            self.preflight_depth,
+            self.preflight_discarded,
             self.recovery_attempts,
             self.recovery_successes,
             self.recovery_exhausted,
             self.recovery_worker_failures,
             recovery_outcome_label(self.recovery_outcome),
         )
+    }
+
+    #[cfg(test)]
+    fn accounted_frames(self) -> u64 {
+        self.frames_ingested
+            .saturating_add(self.queue_dropped)
+            .saturating_add(self.continuity_rejected)
+            .saturating_add(self.recovery_timeout_discarded)
+            .saturating_add(self.terminal_error_discarded)
+            .saturating_add(self.terminal_trigger_discarded)
+            .saturating_add(self.ready_delivery_depth)
+            .saturating_add(self.ready_delivery_discarded)
+            .saturating_add(self.cancellation_discarded)
+            .saturating_add(self.supervisor_slot_replaced)
+            .saturating_add(self.queue_depth)
+            .saturating_add(self.supervisor_slot_depth)
+            .saturating_add(self.ingest_failed)
+            .saturating_add(self.preflight_depth)
+            .saturating_add(self.preflight_discarded)
     }
 }
 
@@ -932,6 +989,18 @@ fn aggregate_camera_telemetry(sources: &[NativeCameraSourceTelemetry]) -> Native
         aggregate.terminal_error_discarded = aggregate
             .terminal_error_discarded
             .saturating_add(source.terminal_error_discarded);
+        aggregate.terminal_trigger_discarded = aggregate
+            .terminal_trigger_discarded
+            .saturating_add(source.terminal_trigger_discarded);
+        aggregate.ready_delivery_depth = aggregate
+            .ready_delivery_depth
+            .saturating_add(source.ready_delivery_depth);
+        aggregate.ready_delivery_discarded = aggregate
+            .ready_delivery_discarded
+            .saturating_add(source.ready_delivery_discarded);
+        aggregate.cancellation_discarded = aggregate
+            .cancellation_discarded
+            .saturating_add(source.cancellation_discarded);
         aggregate.supervisor_slot_replaced = aggregate
             .supervisor_slot_replaced
             .saturating_add(source.supervisor_slot_replaced);
@@ -939,6 +1008,12 @@ fn aggregate_camera_telemetry(sources: &[NativeCameraSourceTelemetry]) -> Native
             .supervisor_slot_depth
             .saturating_add(source.supervisor_slot_depth);
         aggregate.ingest_failed = aggregate.ingest_failed.saturating_add(source.ingest_failed);
+        aggregate.preflight_depth = aggregate
+            .preflight_depth
+            .saturating_add(source.preflight_depth);
+        aggregate.preflight_discarded = aggregate
+            .preflight_discarded
+            .saturating_add(source.preflight_discarded);
         aggregate.recovery_attempts = aggregate
             .recovery_attempts
             .saturating_add(source.recovery_attempts);
@@ -996,6 +1071,7 @@ const fn health_label(state: EndpointHealthState) -> &'static str {
 #[cfg(all(feature = "native-media", target_os = "macos"))]
 impl Drop for NativeCameraInputs {
     fn drop(&mut self) {
+        self.discard_preflight_frames();
         let _ = self.emit_source_telemetry();
         let _ = self.shutdown();
     }
@@ -1129,7 +1205,7 @@ impl NativeRuntimeTelemetry {
         let presentation_active = presentation.is_some();
         let presentation = presentation.unwrap_or_default();
         format!(
-            "FREEMIXD_TELEMETRY\tv=3\thost_lateness_samples_total={}\thost_lateness_samples_retained={}\thost_lateness_metric_samples_dropped={}\thost_lateness_p50_ms={}\thost_lateness_p95_ms={}\thost_lateness_p99_ms={}\taudio_retained_blocks={}\taudio_observed_peak_retained_blocks={}\taudio_retained_samples={}\taudio_observed_peak_retained_samples={}\taudio_sink_depth={}\taudio_sink_peak_depth={}\taudio_sink_dropped={}\tcamera_configured_sources={}\tcamera_frames_received={}\tcamera_frames_ingested={}\tcamera_native_dropped={}\tcamera_queue_depth={}\tcamera_queue_peak_depth={}\tcamera_queue_dropped={}\tcamera_continuity_rejected={}\tcamera_recovery_timeout_discarded={}\tcamera_terminal_error_discarded={}\tcamera_supervisor_slot_replaced={}\tcamera_supervisor_slot_depth={}\tcamera_ingest_failed={}\tcamera_recovery_attempts={}\tcamera_recovery_successes={}\tcamera_recovery_exhausted={}\tcamera_recovery_worker_failures={}\tpresentation_active={}\tpresentation_pending_depth={}\tpresentation_peak_pending_depth={}\tpresentation_dropped={}\trecorder_configured={}\trecorder_outstanding_pairs={}\trecorder_observed_peak_outstanding_pairs={}\trecorder_retained_bytes={}\trecorder_observed_peak_retained_bytes={}\tgpu_backend={:?}\tgpu_adapter={}\tgpu_timing={:?}\tgpu_pass_samples_total={}\tgpu_pass_samples_retained={}\tgpu_pass_metric_samples_dropped={}\tgpu_pass_p50_ms={}\tgpu_pass_p95_ms={}\tgpu_pass_p99_ms={}\tgpu_samples_pending={}\tgpu_samples_dropped={}\tgpu_samples_unavailable={}\tmetric_errors={}\tmetric_samples_dropped={}",
+            "FREEMIXD_TELEMETRY\tv=3\thost_lateness_samples_total={}\thost_lateness_samples_retained={}\thost_lateness_metric_samples_dropped={}\thost_lateness_p50_ms={}\thost_lateness_p95_ms={}\thost_lateness_p99_ms={}\taudio_retained_blocks={}\taudio_observed_peak_retained_blocks={}\taudio_retained_samples={}\taudio_observed_peak_retained_samples={}\taudio_sink_depth={}\taudio_sink_peak_depth={}\taudio_sink_dropped={}\tcamera_configured_sources={}\tcamera_frames_received={}\tcamera_frames_ingested={}\tcamera_native_dropped={}\tcamera_queue_depth={}\tcamera_queue_peak_depth={}\tcamera_queue_dropped={}\tcamera_continuity_rejected={}\tcamera_recovery_timeout_discarded={}\tcamera_terminal_error_discarded={}\tcamera_terminal_trigger_discarded={}\tcamera_ready_delivery_depth={}\tcamera_ready_delivery_discarded={}\tcamera_cancellation_discarded={}\tcamera_supervisor_slot_replaced={}\tcamera_supervisor_slot_depth={}\tcamera_ingest_failed={}\tcamera_preflight_depth={}\tcamera_preflight_discarded={}\tcamera_recovery_attempts={}\tcamera_recovery_successes={}\tcamera_recovery_exhausted={}\tcamera_recovery_worker_failures={}\tpresentation_active={}\tpresentation_pending_depth={}\tpresentation_peak_pending_depth={}\tpresentation_dropped={}\trecorder_configured={}\trecorder_outstanding_pairs={}\trecorder_observed_peak_outstanding_pairs={}\trecorder_retained_bytes={}\trecorder_observed_peak_retained_bytes={}\tgpu_backend={:?}\tgpu_adapter={}\tgpu_timing={:?}\tgpu_pass_samples_total={}\tgpu_pass_samples_retained={}\tgpu_pass_metric_samples_dropped={}\tgpu_pass_p50_ms={}\tgpu_pass_p95_ms={}\tgpu_pass_p99_ms={}\tgpu_samples_pending={}\tgpu_samples_dropped={}\tgpu_samples_unavailable={}\tmetric_errors={}\tmetric_samples_dropped={}",
             host.count,
             host.retained_samples,
             host.dropped_samples,
@@ -1153,9 +1229,15 @@ impl NativeRuntimeTelemetry {
             self.camera.continuity_rejected,
             self.camera.recovery_timeout_discarded,
             self.camera.terminal_error_discarded,
+            self.camera.terminal_trigger_discarded,
+            self.camera.ready_delivery_depth,
+            self.camera.ready_delivery_discarded,
+            self.camera.cancellation_discarded,
             self.camera.supervisor_slot_replaced,
             self.camera.supervisor_slot_depth,
             self.camera.ingest_failed,
+            self.camera.preflight_depth,
+            self.camera.preflight_discarded,
             self.camera.recovery_attempts,
             self.camera.recovery_successes,
             self.camera.recovery_exhausted,
@@ -1485,7 +1567,7 @@ impl NativeDaemon {
         camera_helper: Option<&Path>,
     ) -> AppResult<Self> {
         validate_native_audio_modes(stored)?;
-        let resolution = resolve_native_sources(store, stored, camera_helper)?;
+        let mut resolution = resolve_native_sources(store, stored, camera_helper)?;
         let sources = resolution.sources;
         let requires_ffmpeg = sources
             .iter()
@@ -1531,6 +1613,8 @@ impl NativeDaemon {
             StreamSelector::Best,
             NativeSourceLimits::default(),
         )?;
+        #[cfg(target_os = "macos")]
+        resolution.cameras.mark_preflight_frames_ingested();
         let expected = stored.project().settings().video.dimensions;
         if playback.registry().dimensions() != Some((expected.width(), expected.height())) {
             return Err(AppFailure(format!(
@@ -1560,11 +1644,7 @@ impl NativeDaemon {
             telemetry,
             telemetry_emitted: false,
             #[cfg(target_os = "macos")]
-            cameras: {
-                let mut cameras = resolution.cameras;
-                cameras.mark_initial_frames_ingested();
-                cameras
-            },
+            cameras: resolution.cameras,
             #[cfg(target_os = "macos")]
             camera_telemetry_frozen: false,
             #[cfg(all(feature = "macos-program-surface", target_os = "macos"))]
@@ -2134,6 +2214,8 @@ fn resolve_macos_camera_sources_with_policy(
             recovery_policy,
             ingested_frames: 0,
             ingest_failed: 0,
+            preflight_depth: 0,
+            preflight_discarded: 0,
             last_ingested_sequence: None,
             last_ingested_discontinuity: false,
         });
@@ -2189,12 +2271,17 @@ fn resolve_macos_camera_sources_with_policy(
             if initial_frames.contains_key(&camera.input) {
                 continue;
             }
-            let transfer = match camera
-                .source
-                .as_mut()
-                .expect("camera source is configured")
-                .try_receive()
-            {
+            let transfer = {
+                let source = camera.source.as_mut().expect("camera source is configured");
+                let transfer = source.try_receive();
+                let mut state = camera
+                    .supervisor
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                update_camera_worker_snapshot_inner(&mut state.snapshot, source);
+                transfer
+            };
+            let transfer = match transfer {
                 Ok(transfer) => transfer,
                 Err(error) => {
                     let detail = format!(
@@ -2206,6 +2293,7 @@ fn resolve_macos_camera_sources_with_policy(
             };
             match transfer {
                 Some(MediaTransfer::Live(frame)) => {
+                    camera.preflight_depth = 1;
                     initial_frames.insert(camera.input, frame);
                 }
                 Some(MediaTransfer::Fallback { .. }) => {
@@ -2247,6 +2335,7 @@ fn resolve_macos_camera_sources_with_policy(
 
 #[cfg(all(feature = "native-media", target_os = "macos"))]
 fn camera_startup_failure(cameras: &mut NativeCameraInputs, mut detail: String) -> Box<dyn Error> {
+    cameras.discard_preflight_frames();
     if cameras
         .cleanup_startup_sources(CAMERA_STARTUP_CLEANUP_TIMEOUT)
         .is_err()
@@ -4959,6 +5048,38 @@ mod tests {
     }
 
     #[cfg(all(feature = "native-media", target_os = "macos"))]
+    fn camera_source_test_telemetry() -> NativeCameraSourceTelemetry {
+        NativeCameraSourceTelemetry {
+            input: test_input_id(1),
+            lifecycle: LifecycleState::Running,
+            health: EndpointHealthState::Healthy,
+            frames_received: 20,
+            frames_ingested: 6,
+            native_dropped: 2,
+            queue_dropped: 1,
+            queue_depth: 1,
+            queue_peak_depth: 2,
+            continuity_rejected: 0,
+            recovery_timeout_discarded: 0,
+            terminal_error_discarded: 1,
+            terminal_trigger_discarded: 1,
+            ready_delivery_depth: 1,
+            ready_delivery_discarded: 1,
+            cancellation_discarded: 1,
+            supervisor_slot_replaced: 3,
+            supervisor_slot_depth: 1,
+            ingest_failed: 1,
+            preflight_depth: 1,
+            preflight_discarded: 1,
+            recovery_attempts: 2,
+            recovery_successes: 1,
+            recovery_exhausted: 0,
+            recovery_worker_failures: 0,
+            recovery_outcome: CameraRecoveryOutcome::Recovered,
+        }
+    }
+
+    #[cfg(all(feature = "native-media", target_os = "macos"))]
     #[test]
     fn camera_source_diagnostics_are_stable_bounded_and_saturating() {
         assert_eq!(lifecycle_label(LifecycleState::Closed), "closed");
@@ -4971,28 +5092,7 @@ mod tests {
         assert_eq!(health_label(EndpointHealthState::SignalLost), "signal_lost");
         assert_eq!(health_label(EndpointHealthState::Failed), "failed");
 
-        let source = NativeCameraSourceTelemetry {
-            input: test_input_id(1),
-            lifecycle: LifecycleState::Running,
-            health: EndpointHealthState::Healthy,
-            frames_received: 14,
-            frames_ingested: 6,
-            native_dropped: 2,
-            queue_dropped: 1,
-            queue_depth: 1,
-            queue_peak_depth: 2,
-            continuity_rejected: 0,
-            recovery_timeout_discarded: 0,
-            terminal_error_discarded: 1,
-            supervisor_slot_replaced: 3,
-            supervisor_slot_depth: 1,
-            ingest_failed: 1,
-            recovery_attempts: 2,
-            recovery_successes: 1,
-            recovery_exhausted: 0,
-            recovery_worker_failures: 0,
-            recovery_outcome: CameraRecoveryOutcome::Recovered,
-        };
+        let source = camera_source_test_telemetry();
         let diagnostic = source.diagnostic();
         assert!(diagnostic.starts_with(
             "FREEMIXD_CAMERA_SOURCE\tv=1\tclassification=diagnostic-not-certification\t"
@@ -5003,22 +5103,16 @@ mod tests {
         assert!(diagnostic.contains("\tsupervisor_slot_replaced=3\t"));
         assert!(diagnostic.contains("\tsupervisor_slot_depth=1\t"));
         assert!(diagnostic.contains("\tterminal_error_discarded=1\t"));
+        assert!(diagnostic.contains("\tterminal_trigger_discarded=1\t"));
+        assert!(diagnostic.contains("\tready_delivery_depth=1\t"));
+        assert!(diagnostic.contains("\tready_delivery_discarded=1\t"));
+        assert!(diagnostic.contains("\tcancellation_discarded=1\t"));
         assert!(diagnostic.contains("\tingest_failed=1\t"));
+        assert!(diagnostic.contains("\tpreflight_depth=1\t"));
+        assert!(diagnostic.contains("\tpreflight_discarded=1\t"));
         assert!(diagnostic.contains("\trecovery_outcome=recovered"));
-        assert!(diagnostic.len() < 576);
-        assert_eq!(
-            source.frames_received,
-            source
-                .frames_ingested
-                .saturating_add(source.queue_dropped)
-                .saturating_add(source.continuity_rejected)
-                .saturating_add(source.recovery_timeout_discarded)
-                .saturating_add(source.terminal_error_discarded)
-                .saturating_add(source.supervisor_slot_replaced)
-                .saturating_add(source.queue_depth)
-                .saturating_add(source.supervisor_slot_depth)
-                .saturating_add(source.ingest_failed)
-        );
+        assert!(diagnostic.len() < 768);
+        assert_eq!(source.frames_received, source.accounted_frames());
 
         let mut second = source;
         second.input = test_input_id(2);
@@ -5039,9 +5133,15 @@ mod tests {
         saturated.continuity_rejected = u64::MAX;
         saturated.recovery_timeout_discarded = u64::MAX;
         saturated.terminal_error_discarded = u64::MAX;
+        saturated.terminal_trigger_discarded = u64::MAX;
+        saturated.ready_delivery_depth = u64::MAX;
+        saturated.ready_delivery_discarded = u64::MAX;
+        saturated.cancellation_discarded = u64::MAX;
         saturated.supervisor_slot_replaced = u64::MAX;
         saturated.supervisor_slot_depth = u64::MAX;
         saturated.ingest_failed = u64::MAX;
+        saturated.preflight_depth = u64::MAX;
+        saturated.preflight_discarded = u64::MAX;
         saturated.recovery_attempts = u64::MAX;
         saturated.recovery_successes = u64::MAX;
         saturated.recovery_exhausted = u64::MAX;
@@ -5057,9 +5157,15 @@ mod tests {
         assert_eq!(aggregate.continuity_rejected, u64::MAX);
         assert_eq!(aggregate.recovery_timeout_discarded, u64::MAX);
         assert_eq!(aggregate.terminal_error_discarded, u64::MAX);
+        assert_eq!(aggregate.terminal_trigger_discarded, u64::MAX);
+        assert_eq!(aggregate.ready_delivery_depth, u64::MAX);
+        assert_eq!(aggregate.ready_delivery_discarded, u64::MAX);
+        assert_eq!(aggregate.cancellation_discarded, u64::MAX);
         assert_eq!(aggregate.supervisor_slot_replaced, u64::MAX);
         assert_eq!(aggregate.supervisor_slot_depth, u64::MAX);
         assert_eq!(aggregate.ingest_failed, u64::MAX);
+        assert_eq!(aggregate.preflight_depth, u64::MAX);
+        assert_eq!(aggregate.preflight_discarded, u64::MAX);
         assert_eq!(aggregate.recovery_attempts, u64::MAX);
         assert_eq!(aggregate.recovery_successes, u64::MAX);
         assert_eq!(aggregate.recovery_exhausted, u64::MAX);
@@ -5116,6 +5222,8 @@ mod tests {
                 recovery_policy: test_camera_recovery_policy(1, Duration::from_millis(10)),
                 ingested_frames: 0,
                 ingest_failed: 0,
+                preflight_depth: 0,
+                preflight_discarded: 0,
                 last_ingested_sequence: None,
                 last_ingested_discontinuity: false,
             }],
@@ -5132,19 +5240,7 @@ mod tests {
         assert_eq!(telemetry.ingest_failed, 1);
         assert_eq!(telemetry.queue_depth, 0);
         assert_eq!(telemetry.supervisor_slot_depth, 0);
-        assert_eq!(
-            telemetry.frames_received,
-            telemetry
-                .frames_ingested
-                .saturating_add(telemetry.queue_dropped)
-                .saturating_add(telemetry.continuity_rejected)
-                .saturating_add(telemetry.recovery_timeout_discarded)
-                .saturating_add(telemetry.terminal_error_discarded)
-                .saturating_add(telemetry.supervisor_slot_replaced)
-                .saturating_add(telemetry.queue_depth)
-                .saturating_add(telemetry.supervisor_slot_depth)
-                .saturating_add(telemetry.ingest_failed)
-        );
+        assert_eq!(telemetry.frames_received, telemetry.accounted_frames());
     }
 
     #[cfg(feature = "native-media")]
@@ -5447,7 +5543,7 @@ mod tests {
         let capture_marker = PathBuf::from(format!("{}.capture", helper.display()));
         let pid_file = PathBuf::from(format!("{}.pid", helper.display()));
         let permission_marker = PathBuf::from(format!("{}.permission", helper.display()));
-        let (sources, cameras) =
+        let (sources, mut cameras) =
             resolve_macos_camera_sources(&camera_test_project(&stable_key), Some(helper.as_path()))
                 .unwrap();
         assert_eq!(sources.len(), 1);
@@ -5465,6 +5561,18 @@ mod tests {
             frame.metadata().unwrap().color().transfer,
             fm_types::TransferFunction::Bt709
         );
+        let pending = cameras.source_telemetry()[0];
+        assert_eq!(pending.frames_received, 1);
+        assert_eq!(pending.frames_ingested, 0);
+        assert_eq!(pending.preflight_depth, 1);
+        assert_eq!(pending.preflight_discarded, 0);
+        assert_eq!(pending.frames_received, pending.preflight_depth);
+        drop(sources);
+        cameras.discard_preflight_frames();
+        let discarded = cameras.source_telemetry()[0];
+        assert_eq!(discarded.preflight_depth, 0);
+        assert_eq!(discarded.preflight_discarded, 1);
+        assert_eq!(discarded.frames_received, discarded.preflight_discarded);
         assert_eq!(
             fs::read_to_string(&capture_marker).unwrap(),
             "capture\nfake-camera\n1\n1\n30000\n1001\n"
@@ -5591,7 +5699,12 @@ mod tests {
                 NativeSourceLimits::default(),
             )
             .unwrap();
-        cameras.mark_initial_frames_ingested();
+        cameras.mark_preflight_frames_ingested();
+        let committed = cameras.source_telemetry()[0];
+        assert_eq!(committed.frames_ingested, 1);
+        assert_eq!(committed.preflight_depth, 0);
+        assert_eq!(committed.preflight_discarded, 0);
+        assert_eq!(committed.frames_received, committed.accounted_frames());
 
         let mut control = test_control(&project);
         let server = test_server(&control);
@@ -5620,16 +5733,7 @@ mod tests {
         assert_eq!(telemetry[0].recovery_worker_failures, 0);
         assert_eq!(
             telemetry[0].frames_received,
-            telemetry[0]
-                .frames_ingested
-                .saturating_add(telemetry[0].queue_dropped)
-                .saturating_add(telemetry[0].continuity_rejected)
-                .saturating_add(telemetry[0].recovery_timeout_discarded)
-                .saturating_add(telemetry[0].terminal_error_discarded)
-                .saturating_add(telemetry[0].supervisor_slot_replaced)
-                .saturating_add(telemetry[0].queue_depth)
-                .saturating_add(telemetry[0].supervisor_slot_depth)
-                .saturating_add(telemetry[0].ingest_failed)
+            telemetry[0].accounted_frames()
         );
         assert_eq!(
             telemetry[0].recovery_outcome,
@@ -5811,6 +5915,8 @@ mod tests {
                 recovery_policy: test_camera_recovery_policy(1, Duration::from_millis(10)),
                 ingested_frames: 0,
                 ingest_failed: 0,
+                preflight_depth: 0,
+                preflight_discarded: 0,
                 last_ingested_sequence: None,
                 last_ingested_discontinuity: false,
             }],
