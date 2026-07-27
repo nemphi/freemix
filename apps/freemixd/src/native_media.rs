@@ -3261,7 +3261,11 @@ impl NativeMediaRuntime {
 mod tests {
     use std::num::NonZeroU128;
 
-    use fm_command::{Revision, RuntimeGeneration};
+    use fm_clock::ClockDomainId as EngineClockDomainId;
+    use fm_command::{
+        CommandEnvelope, EventSequence, IdempotencyKey, Revision, RuntimeGeneration, StateEpoch,
+    };
+    use fm_engine::{Engine, EngineCommand, EngineRestoreState, ShowState};
     #[cfg(target_os = "macos")]
     use fm_frame::{
         AlphaMode, ChromaLocation, ColorMetadata, ColorPrimaries, MatrixCoefficients, SignalRange,
@@ -3273,11 +3277,18 @@ mod tests {
         VideoDimensions,
     };
     use fm_scheduler::FrameNumber;
+    use fm_switcher::{
+        SwitcherCommand, SwitcherState, TBarPosition, TransitionKind as SwitcherTransitionKind,
+    };
 
     use super::*;
 
     fn input(value: u128) -> InputId {
         InputId::new(NonZeroU128::new(value).unwrap())
+    }
+
+    fn assert_sample_exact(actual: f32, expected: f32) {
+        assert_eq!(actual.to_bits(), expected.to_bits());
     }
 
     fn retained_frame(
@@ -4182,6 +4193,109 @@ mod tests {
     }
 
     #[test]
+    fn engine_ticks_propagate_automatic_and_manual_intervals_to_audio_plans() {
+        let old = input(1);
+        let new = input(2);
+        let inputs = vec![old, new];
+        let frame_rate = FrameRate::new(25, 1).unwrap();
+        let clock_domain = EngineClockDomainId::new(NonZeroU128::new(99).unwrap());
+        let show = || ShowState::new("interval propagation", inputs.clone(), old, new).unwrap();
+
+        let mut fade = Engine::new(show(), frame_rate, clock_domain);
+        fade.execute(
+            CommandEnvelope::new(
+                "fade-command",
+                IdempotencyKey::new("fade-intervals"),
+                EngineCommand::Fade { duration_frames: 2 },
+            ),
+            0,
+        )
+        .unwrap();
+        let first = native_audio_mix_plan(fade.tick().unwrap().program).unwrap();
+        let second = native_audio_mix_plan(fade.tick().unwrap().program).unwrap();
+        let after = native_audio_mix_plan(fade.tick().unwrap().program).unwrap();
+        assert_eq!(
+            first,
+            NativeAudioMixPlan {
+                primary: old,
+                primary_gain: SourceGain::new(2, 1, 2).unwrap(),
+                secondary: Some((new, SourceGain::new(0, 1, 2).unwrap())),
+            }
+        );
+        assert_eq!(
+            second,
+            NativeAudioMixPlan {
+                primary: old,
+                primary_gain: SourceGain::new(1, 0, 2).unwrap(),
+                secondary: Some((new, SourceGain::new(1, 2, 2).unwrap())),
+            }
+        );
+        assert_eq!(
+            after,
+            NativeAudioMixPlan {
+                primary: new,
+                primary_gain: SourceGain::UNITY,
+                secondary: None,
+            }
+        );
+
+        let t_bar_frame = |end: u16| {
+            let mut realized = SwitcherState::new(inputs.clone(), old, new).unwrap();
+            realized
+                .apply(SwitcherCommand::StartTBar {
+                    kind: SwitcherTransitionKind::Fade,
+                })
+                .unwrap();
+            realized
+                .apply(SwitcherCommand::SetTBarPosition(
+                    TBarPosition::new(8_000).unwrap(),
+                ))
+                .unwrap();
+            assert_eq!(realized.advance_frame(), None);
+            realized
+                .apply(SwitcherCommand::SetTBarPosition(
+                    TBarPosition::new(end).unwrap(),
+                ))
+                .unwrap();
+            let mut engine = Engine::restore_persisted(
+                show(),
+                realized,
+                frame_rate,
+                clock_domain,
+                EngineRestoreState {
+                    state_epoch: StateEpoch::new(1),
+                    revision: Revision::new(0),
+                    event_sequence: EventSequence::new(0),
+                    runtime_generation: RuntimeGeneration::new(0),
+                    clock_time: ClockTime::ZERO,
+                    frame_cursor: FrameNumber::new(0),
+                    receipts: Vec::new(),
+                },
+            )
+            .unwrap();
+            engine.tick().unwrap()
+        };
+        let held = native_audio_mix_plan(t_bar_frame(8_000).program).unwrap();
+        let reversed = native_audio_mix_plan(t_bar_frame(2_500).program).unwrap();
+        assert_eq!(
+            held,
+            NativeAudioMixPlan {
+                primary: old,
+                primary_gain: SourceGain::new(2_000, 2_000, 10_000).unwrap(),
+                secondary: Some((new, SourceGain::new(8_000, 8_000, 10_000).unwrap())),
+            }
+        );
+        assert_eq!(
+            reversed,
+            NativeAudioMixPlan {
+                primary: old,
+                primary_gain: SourceGain::new(2_000, 7_500, 10_000).unwrap(),
+                secondary: Some((new, SourceGain::new(8_000, 2_500, 10_000).unwrap())),
+            }
+        );
+    }
+
+    #[test]
     fn identical_fade_sources_render_once_at_unity_without_poisoning_runtime() {
         let source = input(1);
         let mut master = audio_test_master(&[(source, 0.25)], 2);
@@ -4198,13 +4312,9 @@ mod tests {
                 u32::MAX,
             ))
             .unwrap();
-        assert!(
-            output
-                .plane(0)
-                .unwrap()
-                .iter()
-                .all(|sample| *sample == 0.25)
-        );
+        for sample in output.plane(0).unwrap() {
+            assert_sample_exact(*sample, 0.25);
+        }
         assert_eq!(master.expected_next_frame(), 1);
 
         assert!(master.service_next_frame().unwrap());
@@ -4232,7 +4342,9 @@ mod tests {
                 7_500,
             ))
             .unwrap();
-        assert!(held.plane(0).unwrap().iter().all(|sample| *sample == -0.5));
+        for sample in held.plane(0).unwrap() {
+            assert_sample_exact(*sample, -0.5);
+        }
 
         assert!(master.service_next_frame().unwrap());
         let reversed = master
@@ -4248,7 +4360,7 @@ mod tests {
             .unwrap();
         let reversed = reversed.plane(0).unwrap();
         assert!((reversed[0] - (-0.5 + 1.0 / 1_920.0)).abs() < 1.0e-6);
-        assert_eq!(reversed[1_919], 0.5);
+        assert_sample_exact(reversed[1_919], 0.5);
 
         assert!(master.service_next_frame().unwrap());
         let irregular = master
@@ -4289,10 +4401,10 @@ mod tests {
         let cut = cut.plane(0).unwrap();
         let step = 1.0 / 1_920.0;
         assert!((first[0] - (1.0 - step)).abs() < 1.0e-6);
-        assert_eq!(first[1_919], 0.0);
+        assert_sample_exact(first[1_919], 0.0);
         assert!((second[0] + step).abs() < 1.0e-6);
-        assert_eq!(second[1_919], -1.0);
-        assert_eq!(cut[0], -1.0);
+        assert_sample_exact(second[1_919], -1.0);
+        assert_sample_exact(cut[0], -1.0);
         assert!((second[0] - first[1_919] + step).abs() < 1.0e-6);
     }
 
@@ -4320,10 +4432,10 @@ mod tests {
         assert_eq!(second.sample_count(), 1_602);
         assert_eq!(cut.sample_count(), 1_601);
         assert!((first.plane(0).unwrap()[0] - (1.0 - 1.0 / 1_601.0)).abs() < 1.0e-6);
-        assert_eq!(first.plane(0).unwrap()[1_600], 0.0);
+        assert_sample_exact(first.plane(0).unwrap()[1_600], 0.0);
         assert!((second.plane(0).unwrap()[0] + 1.0 / 1_602.0).abs() < 1.0e-6);
-        assert_eq!(second.plane(0).unwrap()[1_601], -1.0);
-        assert_eq!(cut.plane(0).unwrap()[0], -1.0);
+        assert_sample_exact(second.plane(0).unwrap()[1_601], -1.0);
+        assert_sample_exact(cut.plane(0).unwrap()[0], -1.0);
     }
 
     #[test]
