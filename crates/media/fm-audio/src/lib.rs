@@ -12,10 +12,10 @@ use fm_types::{AudioFormat, ChannelLayout, FrameRate, InputId, SampleFormat, Sam
 mod synchronizer;
 
 pub use synchronizer::{
-    AudioSynchronizerError, AudioSynchronizerLimits, AudioSynchronizerTelemetry, BufferLimit,
-    ClockMappedAudioSynchronizer, MAX_SYNCHRONIZER_BLOCKS, MAX_SYNCHRONIZER_BYTES,
-    MAX_SYNCHRONIZER_OUTPUT_SAMPLES, MAX_SYNCHRONIZER_SAMPLES, MasterAudioInterval,
-    SynchronizerDiscontinuity, SynchronizerLimit,
+    AudioCadenceOrigin, AudioSynchronizerError, AudioSynchronizerLimits,
+    AudioSynchronizerTelemetry, BufferLimit, ClockMappedAudioSynchronizer, MAX_SYNCHRONIZER_BLOCKS,
+    MAX_SYNCHRONIZER_BYTES, MAX_SYNCHRONIZER_OUTPUT_SAMPLES, MAX_SYNCHRONIZER_SAMPLES,
+    MasterAudioInterval, SynchronizerDiscontinuity, SynchronizerLimit,
 };
 
 /// Maximum number of channels accepted by a block or mixer.

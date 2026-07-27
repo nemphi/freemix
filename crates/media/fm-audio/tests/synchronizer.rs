@@ -3,9 +3,10 @@
 use std::num::NonZeroU128;
 
 use fm_audio::{
-    AudioSynchronizerError, AudioSynchronizerLimits, BufferLimit, ClockMappedAudioSynchronizer,
-    MAX_SYNCHRONIZER_BLOCKS, MAX_SYNCHRONIZER_BYTES, MAX_SYNCHRONIZER_OUTPUT_SAMPLES,
-    MAX_SYNCHRONIZER_SAMPLES, MasterAudioInterval, SynchronizerDiscontinuity, SynchronizerLimit,
+    AudioCadenceOrigin, AudioSynchronizerError, AudioSynchronizerLimits, BufferLimit,
+    ClockMappedAudioSynchronizer, MAX_SYNCHRONIZER_BLOCKS, MAX_SYNCHRONIZER_BYTES,
+    MAX_SYNCHRONIZER_OUTPUT_SAMPLES, MAX_SYNCHRONIZER_SAMPLES, MasterAudioInterval,
+    SynchronizerDiscontinuity, SynchronizerLimit,
 };
 use fm_clock::{ClockDomainId, ClockMapping, ClockSnapshot, ClockTime};
 use fm_frame::{
@@ -48,6 +49,10 @@ fn rate(hertz: u32) -> SampleRate {
     SampleRate::new(hertz).unwrap()
 }
 
+fn origin(timestamp: i64, sample_index: u64) -> AudioCadenceOrigin {
+    AudioCadenceOrigin::new(NormalizedTimestamp::from_nanos(timestamp), sample_index)
+}
+
 fn limits(
     blocks: usize,
     samples: usize,
@@ -67,6 +72,18 @@ fn duration(first_sample: u64, samples: u64, sample_rate: SampleRate) -> u64 {
 fn timestamp(origin: i64, sample: u64, sample_rate: SampleRate) -> i64 {
     let offset = u128::from(sample) * NANOS_PER_SECOND / u128::from(sample_rate.hertz());
     origin + i64::try_from(offset).unwrap()
+}
+
+fn coordinate_timestamp(
+    origin_timestamp: i64,
+    origin_sample: u64,
+    sample: u64,
+    sample_rate: SampleRate,
+) -> i64 {
+    let origin_boundary =
+        u128::from(origin_sample) * NANOS_PER_SECOND / u128::from(sample_rate.hertz());
+    let sample_boundary = u128::from(sample) * NANOS_PER_SECOND / u128::from(sample_rate.hertz());
+    origin_timestamp + i64::try_from(sample_boundary - origin_boundary).unwrap()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -110,11 +127,23 @@ fn synchronizer(
     output_rate: SampleRate,
     map: ClockMapping,
 ) -> ClockMappedAudioSynchronizer {
+    synchronizer_at(source_rate, output_rate, map, origin(0, 0), origin(0, 0))
+}
+
+fn synchronizer_at(
+    source_rate: SampleRate,
+    output_rate: SampleRate,
+    map: ClockMapping,
+    source_origin: AudioCadenceOrigin,
+    master_origin: AudioCadenceOrigin,
+) -> ClockMappedAudioSynchronizer {
     ClockMappedAudioSynchronizer::new(
         source_rate,
         output_rate,
         mono(),
         map,
+        source_origin,
+        master_origin,
         limits(8, 128, 128 * 4, 64),
     )
     .unwrap()
@@ -202,6 +231,193 @@ fn resamples_44_1_to_48_deterministically() {
 }
 
 #[test]
+fn absolute_44_1k_sample_one_uses_exact_source_and_master_endpoints() {
+    let sample_rate = rate(44_100);
+    let sample_index = 1;
+    let sample_timestamp = timestamp(0, sample_index, sample_rate);
+    assert_eq!(sample_timestamp, 22_675);
+    assert_eq!(duration(sample_index, 1, sample_rate), 22_676);
+    let cadence_origin = origin(sample_timestamp, sample_index);
+    let mut sync = synchronizer_at(
+        sample_rate,
+        sample_rate,
+        mapping(0, 0, 0),
+        cadence_origin,
+        cadence_origin,
+    );
+
+    let locally_rebased = block(
+        sample_rate,
+        mono(),
+        1,
+        0,
+        sample_timestamp,
+        duration(0, 1, sample_rate),
+        vec![vec![1.0]],
+        MediaFlags::NONE,
+    );
+    assert_eq!(
+        sync.push(&locally_rebased),
+        Err(AudioSynchronizerError::SourceDurationMismatch {
+            expected_nanos: 22_676,
+            actual_nanos: 22_675,
+        })
+    );
+    assert_eq!(sync.telemetry().buffered_samples(), 0);
+    sync.push(&block(
+        sample_rate,
+        mono(),
+        1,
+        0,
+        sample_timestamp,
+        duration(sample_index, 2, sample_rate),
+        vec![vec![1.0, 2.0]],
+        MediaFlags::NONE,
+    ))
+    .unwrap();
+
+    let wrong_interval = MasterAudioInterval::new(
+        ClockDomainId::new(nonzero(2)),
+        NormalizedTimestamp::from_nanos(sample_timestamp),
+        NormalizedDuration::from_nanos(22_675).unwrap(),
+    );
+    let mut output = [9.0];
+    assert_eq!(
+        sync.render_into(wrong_interval, &mut [&mut output]),
+        Err(AudioSynchronizerError::MasterDurationMismatch {
+            expected_nanos: 22_676,
+            actual_nanos: 22_675,
+        })
+    );
+    assert_eq!(output, [9.0]);
+    sync.render_into(
+        interval(sample_timestamp, sample_index, 1, sample_rate),
+        &mut [&mut output],
+    )
+    .unwrap();
+    assert_eq!(output, [1.0]);
+}
+
+#[test]
+fn reset_rearms_independent_arbitrary_absolute_cadences() {
+    let sample_rate = rate(44_100);
+    let mut sync = synchronizer(sample_rate, sample_rate, mapping(0, 0, 0));
+    let source_sample = 1_000_001;
+    let master_sample = 9_000_007;
+    let shared_timestamp = -5_000_000;
+    let source_origin = origin(shared_timestamp, source_sample);
+    let master_origin = origin(shared_timestamp, master_sample);
+    sync.reset(source_origin, master_origin);
+    assert_eq!(sync.source_origin(), source_origin);
+    assert_eq!(sync.master_origin(), master_origin);
+
+    sync.push(&block(
+        sample_rate,
+        mono(),
+        1,
+        40,
+        shared_timestamp,
+        duration(source_sample, 1, sample_rate),
+        vec![vec![3.0]],
+        MediaFlags::NONE,
+    ))
+    .unwrap();
+    sync.push(&block(
+        sample_rate,
+        mono(),
+        1,
+        41,
+        coordinate_timestamp(
+            shared_timestamp,
+            source_sample,
+            source_sample + 1,
+            sample_rate,
+        ),
+        duration(source_sample + 1, 2, sample_rate),
+        vec![vec![4.0, 5.0]],
+        MediaFlags::NONE,
+    ))
+    .unwrap();
+
+    let mut first = [-1.0];
+    sync.render_into(
+        interval(shared_timestamp, master_sample, 1, sample_rate),
+        &mut [&mut first],
+    )
+    .unwrap();
+    assert_eq!(first, [3.0]);
+    let mut rest = [-1.0; 2];
+    sync.render_into(
+        interval(
+            coordinate_timestamp(
+                shared_timestamp,
+                master_sample,
+                master_sample + 1,
+                sample_rate,
+            ),
+            master_sample + 1,
+            2,
+            sample_rate,
+        ),
+        &mut [&mut rest],
+    )
+    .unwrap();
+    assert_eq!(rest, [4.0, 5.0]);
+    assert_eq!(sync.telemetry().resets(), 1);
+}
+
+#[test]
+fn long_absolute_cadence_keeps_split_blocks_and_phase_exact() {
+    let sample_rate = rate(44_100);
+    let first_sample = u64::MAX - 16;
+    let anchor_timestamp = -123_456;
+    let cadence_origin = origin(anchor_timestamp, first_sample);
+    let mut sync = synchronizer_at(
+        sample_rate,
+        sample_rate,
+        mapping(0, 0, 0),
+        cadence_origin,
+        cadence_origin,
+    );
+    sync.push(&block(
+        sample_rate,
+        mono(),
+        1,
+        70,
+        anchor_timestamp,
+        duration(first_sample, 4, sample_rate),
+        vec![vec![0.0, 1.0, 2.0, 3.0]],
+        MediaFlags::NONE,
+    ))
+    .unwrap();
+    sync.push(&block(
+        sample_rate,
+        mono(),
+        1,
+        71,
+        coordinate_timestamp(
+            anchor_timestamp,
+            first_sample,
+            first_sample + 4,
+            sample_rate,
+        ),
+        duration(first_sample + 4, 4, sample_rate),
+        vec![vec![4.0, 5.0, 6.0, 7.0]],
+        MediaFlags::NONE,
+    ))
+    .unwrap();
+
+    let mut output = [-1.0; 8];
+    sync.render_into(
+        interval(anchor_timestamp, first_sample, 8, sample_rate),
+        &mut [&mut output],
+    )
+    .unwrap();
+    assert_eq!(output, [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+    assert_eq!(sync.telemetry().buffered_samples(), 0);
+}
+
+#[test]
 fn interpolation_phase_continues_across_a_block_seam() {
     let source_rate = rate(32_000);
     let output_rate = rate(48_000);
@@ -260,7 +476,13 @@ fn positive_and_negative_clock_offsets_select_the_mapped_samples() {
         .unwrap();
     assert_eq!(output, [2.0]);
 
-    let mut negative = synchronizer(sample_rate, sample_rate, mapping(0, 200_000_000, 0));
+    let mut negative = synchronizer_at(
+        sample_rate,
+        sample_rate,
+        mapping(0, 200_000_000, 0),
+        origin(-200_000_000, 0),
+        origin(0, 0),
+    );
     negative
         .push(&block(
             sample_rate,
@@ -278,7 +500,13 @@ fn positive_and_negative_clock_offsets_select_the_mapped_samples() {
         .unwrap();
     assert_eq!(output, [0.0]);
 
-    let mut positive_drift = synchronizer(sample_rate, sample_rate, mapping(0, 0, 1_000_000_000));
+    let mut positive_drift = synchronizer_at(
+        sample_rate,
+        sample_rate,
+        mapping(0, 0, 1_000_000_000),
+        origin(0, 0),
+        origin(200_000_000, 0),
+    );
     positive_drift
         .push(&block(
             sample_rate,
@@ -296,7 +524,13 @@ fn positive_and_negative_clock_offsets_select_the_mapped_samples() {
         .unwrap();
     assert_eq!(output, [1.0]);
 
-    let mut negative_drift = synchronizer(sample_rate, sample_rate, mapping(0, 0, -500_000_000));
+    let mut negative_drift = synchronizer_at(
+        sample_rate,
+        sample_rate,
+        mapping(0, 0, -500_000_000),
+        origin(0, 0),
+        origin(100_000_000, 0),
+    );
     negative_drift
         .push(&block(
             sample_rate,
@@ -317,13 +551,16 @@ fn positive_and_negative_clock_offsets_select_the_mapped_samples() {
 
 #[test]
 fn mapping_before_anchors_uses_floor_rounding() {
-    let source_rate = rate(768_000);
+    let source_rate = rate(44_100);
     let output_rate = rate(1);
-    let source_origin = 998_698;
-    let mut sync = synchronizer(
+    let source_sample = 1;
+    let source_origin = 989_999;
+    let mut sync = synchronizer_at(
         source_rate,
         output_rate,
         mapping(1_000_000, 1_000_000, 500_000_000),
+        origin(source_origin, source_sample),
+        origin(999_999, 1),
     );
     sync.push(&block(
         source_rate,
@@ -331,23 +568,29 @@ fn mapping_before_anchors_uses_floor_rounding() {
         1,
         0,
         source_origin,
-        duration(0, 2, source_rate),
+        duration(source_sample, 2, source_rate),
         vec![vec![0.0, 1.0]],
         MediaFlags::NONE,
     ))
     .unwrap();
 
     let mut output = [-1.0];
-    sync.render_into(interval(999_999, 0, 1, output_rate), &mut [&mut output])
+    sync.render_into(interval(999_999, 1, 1, output_rate), &mut [&mut output])
         .unwrap();
-    assert_close(output[0], 1301.0 / 1302.0, 0.000_001);
+    assert_close(output[0], 10_000.0 / 22_676.0, 0.000_001);
 }
 
 #[test]
 fn missing_lookahead_leaves_output_and_cursors_unchanged() {
     let source_rate = rate(10);
     let output_rate = rate(20);
-    let mut sync = synchronizer(source_rate, output_rate, mapping(0, 0, 0));
+    let mut sync = synchronizer_at(
+        source_rate,
+        output_rate,
+        mapping(0, 0, 0),
+        origin(0, 0),
+        origin(50_000_000, 0),
+    );
     sync.push(&block(
         source_rate,
         mono(),
@@ -460,6 +703,8 @@ fn rejects_configuration_format_domain_and_continuity_errors_transactionally() {
             rate(48_000),
             mono(),
             mapping(0, 0, 0),
+            origin(0, 0),
+            origin(0, 0),
             limits(1, 1, 4, 1),
         ),
         Err(AudioSynchronizerError::SourceRateOutOfRange(_))
@@ -471,6 +716,8 @@ fn rejects_configuration_format_domain_and_continuity_errors_transactionally() {
             rate(48_000),
             duplicate,
             mapping(0, 0, 0),
+            origin(0, 0),
+            origin(0, 0),
             limits(1, 1, 8, 1),
         ),
         Err(AudioSynchronizerError::DuplicateChannel)
@@ -481,6 +728,8 @@ fn rejects_configuration_format_domain_and_continuity_errors_transactionally() {
             rate(48_000),
             stereo(),
             mapping(0, 0, 0),
+            origin(0, 0),
+            origin(0, 0),
             limits(1, 1, 4, 1),
         ),
         Err(AudioSynchronizerError::ByteCapacityTooSmall { .. })
@@ -647,6 +896,8 @@ fn enforces_each_buffer_and_output_bound() {
         sample_rate,
         mono(),
         mapping(0, 0, 0),
+        origin(0, 0),
+        origin(0, 0),
         limits(1, 8, 32, 4),
     )
     .unwrap();
@@ -673,6 +924,8 @@ fn enforces_each_buffer_and_output_bound() {
         sample_rate,
         mono(),
         mapping(0, 0, 0),
+        origin(0, 0),
+        origin(0, 0),
         limits(4, 2, 32, 4),
     )
     .unwrap();
@@ -698,6 +951,8 @@ fn enforces_each_buffer_and_output_bound() {
         sample_rate,
         mono(),
         mapping(0, 0, 0),
+        origin(0, 0),
+        origin(0, 0),
         limits(4, 8, 8, 4),
     )
     .unwrap();
@@ -735,6 +990,8 @@ fn enforces_each_buffer_and_output_bound() {
         sample_rate,
         stereo(),
         mapping(0, 0, 0),
+        origin(0, 0),
+        origin(0, 0),
         limits(2, 4, 32, 4),
     )
     .unwrap();
@@ -808,7 +1065,7 @@ fn reset_rearms_continuity_and_extreme_arithmetic_is_transactional() {
         MediaFlags::NONE,
     ))
     .unwrap();
-    sync.reset();
+    sync.reset(origin(-2_000_000_000, 0), origin(i64::MAX, 0));
     sync.push(&block(
         sample_rate,
         mono(),
@@ -836,7 +1093,7 @@ fn reset_rearms_continuity_and_extreme_arithmetic_is_transactional() {
     assert_eq!(output, [7.0]);
     assert_eq!(sync.telemetry().buffered_samples(), 2);
 
-    sync.reset();
+    sync.reset(origin(0, 0), origin(0, 0));
     let maximum_sequence = block(
         sample_rate,
         mono(),

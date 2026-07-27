@@ -310,6 +310,37 @@ impl Default for AudioSynchronizerLimits {
     }
 }
 
+/// A known sample boundary on an absolute audio cadence.
+///
+/// `timestamp` is the normalized time at the start of `sample_index`. Keeping
+/// the absolute index preserves floor-rounded endpoint durations and phase when
+/// a stream starts or resets away from cadence sample zero.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AudioCadenceOrigin {
+    timestamp: NormalizedTimestamp,
+    sample_index: u64,
+}
+
+impl AudioCadenceOrigin {
+    #[must_use]
+    pub const fn new(timestamp: NormalizedTimestamp, sample_index: u64) -> Self {
+        Self {
+            timestamp,
+            sample_index,
+        }
+    }
+
+    #[must_use]
+    pub const fn timestamp(self) -> NormalizedTimestamp {
+        self.timestamp
+    }
+
+    #[must_use]
+    pub const fn sample_index(self) -> u64 {
+        self.sample_index
+    }
+}
+
 /// One non-empty interval on the configured Master clock.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MasterAudioInterval {
@@ -446,15 +477,13 @@ struct BufferedBlock {
 
 #[derive(Clone, Copy, Debug)]
 struct InputCursor {
-    origin: NormalizedTimestamp,
     next_sequence: SequenceNumber,
-    accepted_samples: u64,
+    next_sample: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct OutputCursor {
-    origin: NormalizedTimestamp,
-    rendered_samples: u64,
+    next_sample: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -482,6 +511,8 @@ pub struct ClockMappedAudioSynchronizer {
     output_rate: SampleRate,
     channel_layout: ChannelLayout,
     mapping: ClockMapping,
+    source_origin: AudioCadenceOrigin,
+    master_origin: AudioCadenceOrigin,
     limits: AudioSynchronizerLimits,
     bytes_per_sample_frame: usize,
     sample_capacity: usize,
@@ -499,6 +530,8 @@ pub struct ClockMappedAudioSynchronizer {
 
 impl ClockMappedAudioSynchronizer {
     /// Preallocates a synchronizer for one source format and affine clock map.
+    /// `source_origin` and `master_origin` identify the first accepted sample
+    /// boundaries on their independent absolute cadences.
     ///
     /// # Errors
     ///
@@ -509,6 +542,8 @@ impl ClockMappedAudioSynchronizer {
         output_rate: SampleRate,
         channel_layout: ChannelLayout,
         mapping: ClockMapping,
+        source_origin: AudioCadenceOrigin,
+        master_origin: AudioCadenceOrigin,
         limits: AudioSynchronizerLimits,
     ) -> Result<Self, AudioSynchronizerError> {
         validate_rate(source_rate, true)?;
@@ -548,6 +583,8 @@ impl ClockMappedAudioSynchronizer {
             output_rate,
             channel_layout,
             mapping,
+            source_origin,
+            master_origin,
             limits,
             bytes_per_sample_frame,
             sample_capacity,
@@ -555,7 +592,7 @@ impl ClockMappedAudioSynchronizer {
             phases: vec![SamplePhase::default(); limits.max_output_samples],
             blocks: VecDeque::with_capacity(limits.max_blocks),
             read_position: 0,
-            first_sample_index: 0,
+            first_sample_index: source_origin.sample_index,
             buffered_samples: 0,
             buffered_bytes: 0,
             input_cursor: None,
@@ -585,6 +622,16 @@ impl ClockMappedAudioSynchronizer {
     }
 
     #[must_use]
+    pub const fn source_origin(&self) -> AudioCadenceOrigin {
+        self.source_origin
+    }
+
+    #[must_use]
+    pub const fn master_origin(&self) -> AudioCadenceOrigin {
+        self.master_origin
+    }
+
+    #[must_use]
     pub const fn limits(&self) -> AudioSynchronizerLimits {
         self.limits
     }
@@ -595,6 +642,7 @@ impl ClockMappedAudioSynchronizer {
     }
 
     /// Validates and copies one contiguous canonical source block atomically.
+    /// The first block must begin at the configured source cadence origin.
     ///
     /// # Errors
     ///
@@ -633,6 +681,7 @@ impl ClockMappedAudioSynchronizer {
     }
 
     /// Renders one exact, contiguous Master interval into caller-owned planes.
+    /// The first interval must begin at the configured Master cadence origin.
     ///
     /// Every output plane must have the same non-zero length. Validation,
     /// mapping, lookahead, and post-render cursor arithmetic are preflighted
@@ -687,16 +736,18 @@ impl ClockMappedAudioSynchronizer {
         Ok(())
     }
 
-    /// Drops buffered media and both continuity cursors without reallocating.
+    /// Drops buffered media and rearms both absolute cadences without reallocating.
     /// Cumulative telemetry is retained and the reset count increments.
-    pub fn reset(&mut self) {
+    pub fn reset(&mut self, source_origin: AudioCadenceOrigin, master_origin: AudioCadenceOrigin) {
         self.blocks.clear();
         self.read_position = 0;
-        self.first_sample_index = 0;
+        self.first_sample_index = source_origin.sample_index;
         self.buffered_samples = 0;
         self.buffered_bytes = 0;
         self.input_cursor = None;
         self.output_cursor = None;
+        self.source_origin = source_origin;
+        self.master_origin = master_origin;
         self.telemetry.resets = self.telemetry.resets.saturating_add(1);
         self.update_occupancy_telemetry();
     }
@@ -741,7 +792,7 @@ impl ClockMappedAudioSynchronizer {
 
         let sample_count = u64::try_from(block.sample_count())
             .map_err(|_| AudioSynchronizerError::ArithmeticOverflow)?;
-        let (origin, sample_offset, next_sequence) = if let Some(cursor) = self.input_cursor {
+        let (first_sample, next_sequence) = if let Some(cursor) = self.input_cursor {
             if timing.sequence() != cursor.next_sequence {
                 return Err(AudioSynchronizerError::Discontinuity(
                     SynchronizerDiscontinuity::Sequence {
@@ -751,7 +802,7 @@ impl ClockMappedAudioSynchronizer {
                 ));
             }
             let expected_pts =
-                sample_timestamp(cursor.origin, cursor.accepted_samples, self.source_rate)?;
+                cadence_timestamp(self.source_origin, cursor.next_sample, self.source_rate)?;
             if timing.presentation_timestamp() != expected_pts {
                 return Err(AudioSynchronizerError::Discontinuity(
                     SynchronizerDiscontinuity::SourcePts {
@@ -764,16 +815,28 @@ impl ClockMappedAudioSynchronizer {
                 .sequence()
                 .checked_next()
                 .ok_or(AudioSynchronizerError::ArithmeticOverflow)?;
-            (cursor.origin, cursor.accepted_samples, next)
+            (cursor.next_sample, next)
         } else {
+            let expected_pts = cadence_timestamp(
+                self.source_origin,
+                self.source_origin.sample_index,
+                self.source_rate,
+            )?;
+            if timing.presentation_timestamp() != expected_pts {
+                return Err(AudioSynchronizerError::Discontinuity(
+                    SynchronizerDiscontinuity::SourcePts {
+                        expected: expected_pts,
+                        actual: timing.presentation_timestamp(),
+                    },
+                ));
+            }
             let next = timing
                 .sequence()
                 .checked_next()
                 .ok_or(AudioSynchronizerError::ArithmeticOverflow)?;
-            (timing.presentation_timestamp(), 0, next)
+            (self.source_origin.sample_index, next)
         };
-        let expected_duration =
-            sample_span_duration(sample_offset, sample_count, self.source_rate)?;
+        let expected_duration = sample_span_duration(first_sample, sample_count, self.source_rate)?;
         if timing.duration().as_nanos() != expected_duration {
             return Err(AudioSynchronizerError::SourceDurationMismatch {
                 expected_nanos: expected_duration,
@@ -803,14 +866,13 @@ impl ClockMappedAudioSynchronizer {
             block_bytes,
             self.limits.max_bytes,
         )?;
-        let accepted_samples = sample_offset
+        let next_sample = first_sample
             .checked_add(sample_count)
             .ok_or(AudioSynchronizerError::ArithmeticOverflow)?;
         Ok((
             InputCursor {
-                origin,
                 next_sequence,
-                accepted_samples,
+                next_sample,
             },
             block_bytes,
         ))
@@ -873,9 +935,9 @@ impl ClockMappedAudioSynchronizer {
             });
         }
 
-        let (origin, first_output_sample) = if let Some(cursor) = self.output_cursor {
+        let first_output_sample = if let Some(cursor) = self.output_cursor {
             let expected_start =
-                sample_timestamp(cursor.origin, cursor.rendered_samples, self.output_rate)?;
+                cadence_timestamp(self.master_origin, cursor.next_sample, self.output_rate)?;
             if interval.start != expected_start {
                 return Err(AudioSynchronizerError::Discontinuity(
                     SynchronizerDiscontinuity::MasterPts {
@@ -884,9 +946,22 @@ impl ClockMappedAudioSynchronizer {
                     },
                 ));
             }
-            (cursor.origin, cursor.rendered_samples)
+            cursor.next_sample
         } else {
-            (interval.start, 0)
+            let expected_start = cadence_timestamp(
+                self.master_origin,
+                self.master_origin.sample_index,
+                self.output_rate,
+            )?;
+            if interval.start != expected_start {
+                return Err(AudioSynchronizerError::Discontinuity(
+                    SynchronizerDiscontinuity::MasterPts {
+                        expected: expected_start,
+                        actual: interval.start,
+                    },
+                ));
+            }
+            self.master_origin.sample_index
         };
         let output_samples_u64 = u64::try_from(output_samples)
             .map_err(|_| AudioSynchronizerError::ArithmeticOverflow)?;
@@ -920,8 +995,7 @@ impl ClockMappedAudioSynchronizer {
             let output_sample = first_output_sample
                 .checked_add(offset)
                 .ok_or(AudioSynchronizerError::ArithmeticOverflow)?;
-            let (source_sample, remainder, denominator) =
-                self.source_phase(origin, output_sample)?;
+            let (source_sample, remainder, denominator) = self.source_phase(output_sample)?;
             let source_sample = self.require_source_sample(source_sample, remainder != 0)?;
             let phase_index =
                 usize::try_from(offset).map_err(|_| AudioSynchronizerError::ArithmeticOverflow)?;
@@ -930,7 +1004,7 @@ impl ClockMappedAudioSynchronizer {
                 fraction: fraction_as_f64(remainder, denominator),
             };
         }
-        let (next_source_sample, _, _) = self.source_phase(origin, next_output_sample)?;
+        let (next_source_sample, _, _) = self.source_phase(next_output_sample)?;
         let discard_before = if next_source_sample <= 0 {
             0
         } else {
@@ -939,8 +1013,7 @@ impl ClockMappedAudioSynchronizer {
         };
         Ok(PreparedRender {
             cursor: OutputCursor {
-                origin,
-                rendered_samples: next_output_sample,
+                next_sample: next_output_sample,
             },
             output_samples,
             discard_before,
@@ -949,48 +1022,44 @@ impl ClockMappedAudioSynchronizer {
 
     fn source_phase(
         &self,
-        output_origin: NormalizedTimestamp,
         output_sample: u64,
     ) -> Result<(i128, i128, i128), AudioSynchronizerError> {
-        let input_origin = self
-            .input_cursor
-            .ok_or(AudioSynchronizerError::NeedMoreInput {
-                required_sample: 0,
-                buffered_end_sample: self.first_sample_index,
-            })?
-            .origin;
         let source_rate = i128::from(self.source_rate.hertz());
-        let master_timestamp = sample_timestamp(output_origin, output_sample, self.output_rate)?;
+        let master_timestamp =
+            cadence_timestamp(self.master_origin, output_sample, self.output_rate)?;
         let source_timestamp = self
             .mapping
             .source_nanos_at_master(master_timestamp.as_nanos())
             .map_err(|_| AudioSynchronizerError::ArithmeticOverflow)?;
         let elapsed = i128::from(source_timestamp)
-            .checked_sub(i128::from(input_origin.as_nanos()))
+            .checked_sub(i128::from(self.source_origin.timestamp.as_nanos()))
+            .ok_or(AudioSynchronizerError::ArithmeticOverflow)?;
+        let source_origin_boundary = cadence_boundary(
+            i128::from(self.source_origin.sample_index),
+            self.source_rate,
+        )?;
+        let absolute_position = elapsed
+            .checked_add(source_origin_boundary)
             .ok_or(AudioSynchronizerError::ArithmeticOverflow)?;
         // This is the signed counterpart of "latest cadence boundary at or
         // before time" and preserves floor behavior on both sides of zero.
-        let sample_numerator = elapsed
+        let sample_numerator = absolute_position
             .checked_add(1)
             .and_then(|value| value.checked_mul(source_rate))
             .and_then(|value| value.checked_sub(1))
             .ok_or(AudioSynchronizerError::ArithmeticOverflow)?;
         let (source_sample, _, _) = floor_div_rem(sample_numerator, NANOS_PER_SECOND)?;
-        let source_boundary = floor_div_rem(
-            source_sample
-                .checked_mul(NANOS_PER_SECOND)
-                .ok_or(AudioSynchronizerError::ArithmeticOverflow)?,
-            source_rate,
-        )?
-        .0;
-        let next_boundary = floor_div_rem(
+        let source_boundary = cadence_boundary(source_sample, self.source_rate)?
+            .checked_sub(source_origin_boundary)
+            .ok_or(AudioSynchronizerError::ArithmeticOverflow)?;
+        let next_boundary = cadence_boundary(
             source_sample
                 .checked_add(1)
-                .and_then(|sample| sample.checked_mul(NANOS_PER_SECOND))
                 .ok_or(AudioSynchronizerError::ArithmeticOverflow)?,
-            source_rate,
+            self.source_rate,
         )?
-        .0;
+        .checked_sub(source_origin_boundary)
+        .ok_or(AudioSynchronizerError::ArithmeticOverflow)?;
         let remainder = elapsed
             .checked_sub(source_boundary)
             .ok_or(AudioSynchronizerError::ArithmeticOverflow)?;
@@ -1122,22 +1191,32 @@ fn validate_rate(rate: SampleRate, source: bool) -> Result<(), AudioSynchronizer
     Ok(())
 }
 
-fn sample_timestamp(
-    origin: NormalizedTimestamp,
+fn cadence_timestamp(
+    origin: AudioCadenceOrigin,
     sample: u64,
     rate: SampleRate,
 ) -> Result<NormalizedTimestamp, AudioSynchronizerError> {
-    let offset = u128::from(sample)
-        .checked_mul(NANOS_PER_SECOND.cast_unsigned())
-        .ok_or(AudioSynchronizerError::ArithmeticOverflow)?
-        / u128::from(rate.hertz());
-    let offset = i128::try_from(offset).map_err(|_| AudioSynchronizerError::ArithmeticOverflow)?;
-    let timestamp = i128::from(origin.as_nanos())
+    let origin_boundary = cadence_boundary(i128::from(origin.sample_index), rate)?;
+    let sample_boundary = cadence_boundary(i128::from(sample), rate)?;
+    let offset = sample_boundary
+        .checked_sub(origin_boundary)
+        .ok_or(AudioSynchronizerError::ArithmeticOverflow)?;
+    let timestamp = i128::from(origin.timestamp.as_nanos())
         .checked_add(offset)
         .ok_or(AudioSynchronizerError::ArithmeticOverflow)?;
     Ok(NormalizedTimestamp::from_nanos(
         i64::try_from(timestamp).map_err(|_| AudioSynchronizerError::ArithmeticOverflow)?,
     ))
+}
+
+fn cadence_boundary(sample: i128, rate: SampleRate) -> Result<i128, AudioSynchronizerError> {
+    floor_div_rem(
+        sample
+            .checked_mul(NANOS_PER_SECOND)
+            .ok_or(AudioSynchronizerError::ArithmeticOverflow)?,
+        i128::from(rate.hertz()),
+    )
+    .map(|(boundary, _, _)| boundary)
 }
 
 fn sample_span_duration(
