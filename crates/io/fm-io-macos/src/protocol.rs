@@ -32,17 +32,27 @@ const AUDIO_CAPTURE_MAGIC: &[u8; 8] = b"FMAUDF1\0";
 const AUDIO_BLOCK_METADATA_BYTES: usize = 41;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProtocolError(String);
+pub struct ProtocolError {
+    detail: String,
+    malformed: bool,
+}
 
 impl ProtocolError {
     fn malformed(detail: impl Into<String>) -> Self {
-        Self(detail.into())
+        Self {
+            detail: detail.into(),
+            malformed: true,
+        }
+    }
+
+    pub(crate) const fn is_malformed(&self) -> bool {
+        self.malformed
     }
 }
 
 impl fmt::Display for ProtocolError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
+        formatter.write_str(&self.detail)
     }
 }
 
@@ -50,7 +60,10 @@ impl std::error::Error for ProtocolError {}
 
 impl From<std::io::Error> for ProtocolError {
     fn from(error: std::io::Error) -> Self {
-        Self(format!("camera helper I/O failed: {error}"))
+        Self {
+            detail: format!("camera helper I/O failed: {error}"),
+            malformed: false,
+        }
     }
 }
 
@@ -354,7 +367,13 @@ impl<R: Read> FrameReader<R> {
         }
 
         let mut metadata = [0; FRAME_METADATA_BYTES];
-        self.reader.read_exact(&mut metadata)?;
+        self.reader.read_exact(&mut metadata).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                ProtocolError::malformed("truncated frame metadata")
+            } else {
+                error.into()
+            }
+        })?;
         let mut cursor = Cursor::new(&metadata);
         let sequence = cursor.u64()?;
         let native_dropped_total = cursor.u64()?;
@@ -487,7 +506,13 @@ impl<R: Read> FrameReader<R> {
             .map_err(|error| ProtocolError::malformed(format!("invalid duration: {error}")))?;
 
         let mut payload = vec![0; payload_len];
-        self.reader.read_exact(&mut payload)?;
+        self.reader.read_exact(&mut payload).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                ProtocolError::malformed("truncated frame payload")
+            } else {
+                error.into()
+            }
+        })?;
         if payload.chunks_exact(stride).any(|row| {
             row[..minimum_stride]
                 .chunks_exact(4)
@@ -798,7 +823,13 @@ fn read_optional_u32(reader: &mut impl Read) -> Result<Option<u32>, ProtocolErro
             Err(error) => return Err(error.into()),
         }
     }
-    reader.read_exact(&mut bytes[1..])?;
+    reader.read_exact(&mut bytes[1..]).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::UnexpectedEof {
+            ProtocolError::malformed("truncated frame record length")
+        } else {
+            error.into()
+        }
+    })?;
     Ok(Some(u32::from_le_bytes(bytes)))
 }
 

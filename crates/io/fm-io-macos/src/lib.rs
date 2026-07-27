@@ -587,10 +587,39 @@ struct QueueState {
     native_dropped_base: u64,
     accepting_frames: bool,
     capture_sequence_origin: Option<u64>,
-    sticky_failure: Option<String>,
+    sticky_failure: Option<CaptureFailure>,
     #[cfg(target_os = "macos")]
     stderr: Vec<u8>,
     last_activity: Option<Instant>,
+}
+
+#[derive(Clone)]
+struct CaptureFailure {
+    detail: String,
+    remediation: Option<Remediation>,
+}
+
+impl CaptureFailure {
+    fn runtime(detail: impl Into<String>) -> Self {
+        Self {
+            detail: detail.into(),
+            remediation: Some(Remediation::RestartAdapter),
+        }
+    }
+
+    fn contract(detail: impl Into<String>) -> Self {
+        Self {
+            detail: detail.into(),
+            remediation: None,
+        }
+    }
+
+    fn into_error(self) -> IoError {
+        IoError::AdapterFailure {
+            detail: self.detail,
+            remediation: self.remediation,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -630,9 +659,9 @@ impl QueueState {
         true
     }
 
-    fn fail(&mut self, detail: impl Into<String>) {
+    fn fail(&mut self, failure: CaptureFailure) {
         if self.sticky_failure.is_none() {
-            self.sticky_failure = Some(detail.into());
+            self.sticky_failure = Some(failure);
         }
     }
 }
@@ -809,20 +838,21 @@ impl CameraVideoSource {
             self.capture = Some(capture);
             let startup_result = match startup.recv_timeout(STARTUP_TIMEOUT) {
                 Ok(result) => result,
-                Err(RecvTimeoutError::Timeout) => {
-                    Err("camera helper did not emit capture magic within 10 seconds".to_owned())
-                }
-                Err(RecvTimeoutError::Disconnected) => {
-                    Err("camera helper startup worker disconnected".to_owned())
-                }
+                Err(RecvTimeoutError::Timeout) => Err(CaptureFailure::runtime(
+                    "camera helper did not emit capture magic within 10 seconds",
+                )),
+                Err(RecvTimeoutError::Disconnected) => Err(CaptureFailure::runtime(
+                    "camera helper startup worker disconnected",
+                )),
             };
-            if let Err(detail) = startup_result {
+            if let Err(failure) = startup_result {
                 let cleanup = self.shutdown();
                 return Err(match cleanup {
-                    Ok(()) => adapter_failure(detail),
-                    Err(error) => {
-                        adapter_failure(format!("{detail}; startup cleanup also failed: {error}"))
-                    }
+                    Ok(()) => failure.into_error(),
+                    Err(error) => IoError::AdapterFailure {
+                        detail: format!("{}; startup cleanup also failed: {error}", failure.detail),
+                        remediation: failure.remediation,
+                    },
                 });
             }
             let worker_failure = self
@@ -861,13 +891,16 @@ impl CameraVideoSource {
                     .map_or(SignalLossPolicy::Stop, |options| options.signal_loss);
                 return Err(IoError::SignalLost { policy });
             }
-            if let Some(detail) = worker_failure.or(child_exit) {
+            if let Some(failure) =
+                worker_failure.or_else(|| child_exit.map(CaptureFailure::runtime))
+            {
                 let cleanup = self.shutdown();
                 return Err(match cleanup {
-                    Ok(()) => adapter_failure(detail),
-                    Err(error) => {
-                        adapter_failure(format!("{detail}; startup cleanup also failed: {error}"))
-                    }
+                    Ok(()) => failure.into_error(),
+                    Err(error) => IoError::AdapterFailure {
+                        detail: format!("{}; startup cleanup also failed: {error}", failure.detail),
+                        remediation: failure.remediation,
+                    },
                 });
             }
         }
@@ -920,28 +953,27 @@ impl CameraVideoSource {
                 self.state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .fail(detail);
+                    .fail(CaptureFailure::runtime(detail));
             }
         }
 
-        let detail = self
+        let failure = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .sticky_failure
             .take();
-        detail.map(|detail| {
-            let error = IoError::AdapterFailure {
-                detail,
-                remediation: Some(Remediation::RestartAdapter),
-            };
+        failure.map(|failure| {
+            let error = failure.into_error();
             self.terminal_capture_error(&error)
         })
     }
 
     #[cfg(target_os = "macos")]
     #[allow(clippy::too_many_lines)]
-    fn spawn_capture(&self) -> Result<(CaptureProcess, Receiver<Result<(), String>>), IoError> {
+    fn spawn_capture(
+        &self,
+    ) -> Result<(CaptureProcess, Receiver<Result<(), CaptureFailure>>), IoError> {
         let options = self
             .options
             .as_ref()
@@ -984,13 +1016,21 @@ impl CameraVideoSource {
                         reader
                     }
                     Err(error) => {
-                        let detail = format!("camera helper startup failed: {error}");
-                        let _ = startup_sender.send(Err(detail.clone()));
+                        let failure = if error.is_malformed() {
+                            CaptureFailure::contract(format!(
+                                "camera helper startup failed: {error}"
+                            ))
+                        } else {
+                            CaptureFailure::runtime(format!(
+                                "camera helper startup failed: {error}"
+                            ))
+                        };
+                        let _ = startup_sender.send(Err(failure.clone()));
                         if !worker_stop.load(Ordering::Acquire) {
                             state
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .fail(detail);
+                                .fail(failure);
                         }
                         return;
                     }
@@ -1008,10 +1048,19 @@ impl CameraVideoSource {
                     }
                 };
                 if !worker_stop.load(Ordering::Acquire) {
+                    let failure = if error.is_malformed() {
+                        CaptureFailure::contract(format!(
+                            "camera helper frame stream failed: {error}"
+                        ))
+                    } else {
+                        CaptureFailure::runtime(format!(
+                            "camera helper frame stream failed: {error}"
+                        ))
+                    };
                     state
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .fail(format!("camera helper frame stream failed: {error}"));
+                        .fail(failure);
                 }
             });
         let stdout_worker = match stdout_worker {
@@ -1053,7 +1102,9 @@ impl CameraVideoSource {
                                 state
                                     .lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                    .fail(format!("camera helper stderr failed: {error}"));
+                                    .fail(CaptureFailure::runtime(format!(
+                                        "camera helper stderr failed: {error}"
+                                    )));
                             }
                             break;
                         }
@@ -1190,12 +1241,9 @@ impl CameraVideoSource {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .sticky_failure
             .clone();
-        if let Some(detail) = sticky_failure {
-            self.set_failed_health(detail.clone());
-            return Err(IoError::AdapterFailure {
-                detail,
-                remediation: Some(Remediation::RestartAdapter),
-            });
+        if let Some(failure) = sticky_failure {
+            self.set_failed_health(failure.detail.clone(), failure.remediation.clone());
+            return Err(failure.into_error());
         }
         let policy = self
             .options
@@ -1212,11 +1260,11 @@ impl CameraVideoSource {
         Err(IoError::SignalLost { policy })
     }
 
-    fn set_failed_health(&mut self, detail: String) {
+    fn set_failed_health(&mut self, detail: String, remediation: Option<Remediation>) {
         self.health = EndpointHealth {
             state: EndpointHealthState::Failed,
             detail: Some(detail),
-            remediation: Some(Remediation::RestartAdapter),
+            remediation,
         };
     }
 
@@ -1350,7 +1398,7 @@ impl CameraVideoSource {
             let detail = format!("camera recovery timed out; cleanup failed: {error}");
             self.resume_running = true;
             self.lifecycle = LifecycleState::Lost;
-            self.set_failed_health(detail.clone());
+            self.set_failed_health(detail.clone(), Some(Remediation::RestartAdapter));
             return Err(adapter_failure(detail));
         }
         self.transition_to_signal_lost(
@@ -1360,6 +1408,11 @@ impl CameraVideoSource {
     }
 
     fn terminal_capture_error(&mut self, error: &IoError) -> IoError {
+        let remediation = match error {
+            IoError::AdapterFailure { remediation, .. } => remediation.clone(),
+            IoError::MalformedTimestamp(_) => None,
+            _ => Some(Remediation::RestartAdapter),
+        };
         let detail = match self.shutdown() {
             Ok(()) => error.to_string(),
             Err(cleanup) => format!("{error}; capture cleanup also failed: {cleanup}"),
@@ -1377,8 +1430,11 @@ impl CameraVideoSource {
         }
         self.resume_running = true;
         self.lifecycle = LifecycleState::Lost;
-        self.set_failed_health(detail.clone());
-        adapter_failure(detail)
+        self.set_failed_health(detail.clone(), remediation.clone());
+        IoError::AdapterFailure {
+            detail,
+            remediation,
+        }
     }
 
     fn wait_for_recovery_completion(&mut self) -> Result<(), IoError> {
@@ -1587,7 +1643,7 @@ impl MediaSource for CameraVideoSource {
             self.lifecycle = LifecycleState::Lost;
             self.resume_running = true;
             if !matches!(&error, IoError::SignalLost { .. }) {
-                self.set_failed_health(detail);
+                self.set_failed_health(detail, Some(Remediation::RestartAdapter));
             }
             return Err(error);
         }
@@ -2748,7 +2804,7 @@ mod tests {
     }
 
     #[test]
-    fn sticky_failure_promotes_existing_signal_loss_to_failed_health() {
+    fn contract_failure_promotes_signal_loss_without_restart_remediation() {
         let mut source = source_with_policy(SignalLossPolicy::Stop);
         source.start_without_helper_for_test();
         source.expire_activity_for_test();
@@ -2760,16 +2816,16 @@ mod tests {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .fail("injected protocol failure");
+            .fail(CaptureFailure::contract("injected protocol failure"));
         assert!(matches!(
             source.try_receive(),
-            Err(IoError::AdapterFailure { .. })
+            Err(IoError::AdapterFailure {
+                remediation: None,
+                ..
+            })
         ));
         assert_eq!(source.health().state, EndpointHealthState::Failed);
-        assert_eq!(
-            source.health().remediation,
-            Some(Remediation::RestartAdapter)
-        );
+        assert_eq!(source.health().remediation, None);
     }
 
     #[test]
