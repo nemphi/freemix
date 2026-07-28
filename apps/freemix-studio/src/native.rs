@@ -15,8 +15,9 @@ use fm_client::{
 };
 use fm_protocol::{
     ALPHA_FADE_PROTOCOL_VERSION, CommandPayload, CommandResult, DurableGap,
-    FADE_TO_BLACK_PROTOCOL_VERSION, MANUAL_TRANSITION_PROTOCOL_VERSION, ProtocolVersion,
-    WIPE_PROTOCOL_VERSION, WireInputId, WireMessage,
+    FADE_TO_BLACK_PROTOCOL_VERSION, MANUAL_ALPHA_FADE_PROTOCOL_VERSION,
+    MANUAL_TRANSITION_PROTOCOL_VERSION, ProtocolVersion, WIPE_PROTOCOL_VERSION, WireInputId,
+    WireMessage,
 };
 use fm_ui_egui::{StudioConnectionStatus, StudioIntent, StudioShell, StudioUiState};
 
@@ -1260,6 +1261,10 @@ fn runtime_state(runtime: &mut StudioRuntime, error: Option<String>) -> StudioUi
         session.protocol.major == MANUAL_TRANSITION_PROTOCOL_VERSION.major
             && session.protocol.minor >= MANUAL_TRANSITION_PROTOCOL_VERSION.minor
     });
+    let supports_manual_alpha_fade = client.session().is_some_and(|session| {
+        session.protocol.major == MANUAL_ALPHA_FADE_PROTOCOL_VERSION.major
+            && session.protocol.minor >= MANUAL_ALPHA_FADE_PROTOCOL_VERSION.minor
+    });
     let supports_fade_to_black = client.session().is_some_and(|session| {
         session.protocol.major == FADE_TO_BLACK_PROTOCOL_VERSION.major
             && session.protocol.minor >= FADE_TO_BLACK_PROTOCOL_VERSION.minor
@@ -1269,6 +1274,7 @@ fn runtime_state(runtime: &mut StudioRuntime, error: Option<String>) -> StudioUi
         .with_wipe_support(supports_wipe)
         .with_alpha_fade_support(supports_alpha_fade)
         .with_manual_transition_support(supports_manual_transition)
+        .with_manual_alpha_fade_support(supports_manual_alpha_fade)
         .with_fade_to_black_support(supports_fade_to_black);
     if connection_status == StudioConnectionStatus::Ready {
         state.view = client.model().view();
@@ -1482,6 +1488,14 @@ mod tests {
                 kind: fm_protocol::ManualTransitionKind::Wipe,
             }
         );
+        assert_eq!(
+            intent_payload(StudioIntent::StartManualTransition {
+                kind: fm_protocol::ManualTransitionKind::AlphaFade,
+            }),
+            CommandPayload::StartManualTransition {
+                kind: fm_protocol::ManualTransitionKind::AlphaFade,
+            }
+        );
         for position in [
             fm_protocol::ManualTransitionPosition::START,
             fm_protocol::ManualTransitionPosition::new(2_500).unwrap(),
@@ -1649,6 +1663,31 @@ mod tests {
         );
         assert_eq!(
             pop_supported_deferred_intent(&mut deferred, Some(ALPHA_FADE_PROTOCOL_VERSION)),
+            Some(StudioIntent::Cut)
+        );
+    }
+
+    #[test]
+    fn unsupported_head_manual_alpha_fade_blocks_fifo_until_protocol_1_7() {
+        let manual_alpha_fade = StudioIntent::StartManualTransition {
+            kind: ManualTransitionKind::AlphaFade,
+        };
+        let mut deferred = VecDeque::from([manual_alpha_fade, StudioIntent::Cut]);
+
+        assert_eq!(
+            pop_supported_deferred_intent(&mut deferred, Some(ALPHA_FADE_PROTOCOL_VERSION)),
+            None
+        );
+        assert_eq!(
+            deferred,
+            VecDeque::from([manual_alpha_fade, StudioIntent::Cut])
+        );
+        assert_eq!(
+            pop_supported_deferred_intent(&mut deferred, Some(MANUAL_ALPHA_FADE_PROTOCOL_VERSION)),
+            Some(manual_alpha_fade)
+        );
+        assert_eq!(
+            pop_supported_deferred_intent(&mut deferred, Some(MANUAL_ALPHA_FADE_PROTOCOL_VERSION)),
             Some(StudioIntent::Cut)
         );
     }
@@ -2086,12 +2125,20 @@ mod tests {
     fn serve_worker_manual_t_bar(listener: &TcpListener) {
         let mut peer = accept_worker_snapshot_version_at(
             listener,
-            MANUAL_TRANSITION_PROTOCOL_VERSION,
+            MANUAL_ALPHA_FADE_PROTOCOL_VERSION,
             4,
             2,
             2,
         );
         let steps = [
+            (
+                CommandPayload::StartManualTransition {
+                    kind: ManualTransitionKind::AlphaFade,
+                },
+                Some((ManualTransitionKind::AlphaFade, 0, 0)),
+                (1, 2),
+            ),
+            (CommandPayload::CancelManualTransition, None, (1, 2)),
             (
                 CommandPayload::StartManualTransition {
                     kind: ManualTransitionKind::Wipe,
@@ -2136,7 +2183,7 @@ mod tests {
                 panic!("expected manual T-bar command");
             };
             let revision = 5 + u64::try_from(offset).unwrap();
-            assert_eq!(command.protocol, MANUAL_TRANSITION_PROTOCOL_VERSION);
+            assert_eq!(command.protocol, MANUAL_ALPHA_FADE_PROTOCOL_VERSION);
             assert_eq!(command.expected_revision, Some(revision - 1));
             assert_eq!(command.payload, payload);
             peer.send(&WireMessage::CommandResult(CommandResult::Accepted {
@@ -2158,7 +2205,7 @@ mod tests {
                     manual_transition: Some(
                         desired_manual_transition.unwrap_or(ManualTransitionStatus::Inactive),
                     ),
-                    fade_to_black: None,
+                    fade_to_black: fade_to_black_projection(MANUAL_ALPHA_FADE_PROTOCOL_VERSION),
                 },
             }));
             let realized_manual_transition =
@@ -2173,7 +2220,7 @@ mod tests {
                     manual_transition: Some(
                         realized_manual_transition.unwrap_or(ManualTransitionStatus::Inactive),
                     ),
-                    fade_to_black: None,
+                    fade_to_black: fade_to_black_projection(MANUAL_ALPHA_FADE_PROTOCOL_VERSION),
                 },
             }));
         }
@@ -2621,6 +2668,42 @@ mod tests {
         server.join().unwrap();
     }
 
+    fn wait_for_manual_worker_state(
+        states: &Receiver<StudioUiState>,
+        revision: u64,
+        expected: Option<(ManualTransitionKind, u16)>,
+    ) -> StudioUiState {
+        loop {
+            let state = states.recv_timeout(Duration::from_secs(3)).unwrap();
+            assert_eq!(state.error, None, "manual worker state: {state:?}");
+            let Some(view) = state.view.as_ref() else {
+                continue;
+            };
+            if state.pending_commands != 0 || view.cursor.revision.get() != revision {
+                continue;
+            }
+            let desired_matches = match (view.switcher.desired_manual_transition, expected) {
+                (fm_ui_model::ManualTransitionStatus::Active(active), Some((kind, position))) => {
+                    active.kind == kind && active.position.basis_points() == position
+                }
+                (fm_ui_model::ManualTransitionStatus::Inactive, None) => true,
+                _ => false,
+            };
+            let realized_matches = match (view.switcher.realized_manual_transition, expected) {
+                (fm_ui_model::ManualTransitionStatus::Active(active), Some((kind, position))) => {
+                    active.kind == kind
+                        && active.interval_start.basis_points() == position
+                        && active.position.basis_points() == position
+                }
+                (fm_ui_model::ManualTransitionStatus::Inactive, None) => true,
+                _ => false,
+            };
+            if desired_matches && realized_matches {
+                return state;
+            }
+        }
+    }
+
     #[test]
     fn worker_manual_t_bar_flow_observes_hold_reverse_cancel_and_commit_from_model() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2633,87 +2716,64 @@ mod tests {
                 break state;
             }
         };
-        assert!(ready.transition_protocol.manual);
+        assert!(ready.transition_protocol.manual.base);
+        assert!(ready.transition_protocol.manual.alpha_fade);
 
         let steps = [
             (
                 StudioIntent::StartManualTransition {
-                    kind: ManualTransitionKind::Wipe,
+                    kind: ManualTransitionKind::AlphaFade,
                 },
                 5,
+                Some((ManualTransitionKind::AlphaFade, 0)),
+            ),
+            (StudioIntent::CancelManualTransition, 6, None),
+            (
+                StudioIntent::StartManualTransition {
+                    kind: ManualTransitionKind::Wipe,
+                },
+                7,
                 Some((ManualTransitionKind::Wipe, 0)),
             ),
             (
                 StudioIntent::SetManualTransitionPosition {
                     position: ManualTransitionPosition::END,
                 },
-                6,
+                8,
                 Some((ManualTransitionKind::Wipe, 10_000)),
             ),
             (
                 StudioIntent::SetManualTransitionPosition {
                     position: ManualTransitionPosition::new(2_500).unwrap(),
                 },
-                7,
+                9,
                 Some((ManualTransitionKind::Wipe, 2_500)),
             ),
-            (StudioIntent::CancelManualTransition, 8, None),
+            (StudioIntent::CancelManualTransition, 10, None),
             (
                 StudioIntent::StartManualTransition {
                     kind: ManualTransitionKind::Fade,
                 },
-                9,
+                11,
                 Some((ManualTransitionKind::Fade, 0)),
             ),
             (
                 StudioIntent::SetManualTransitionPosition {
                     position: ManualTransitionPosition::END,
                 },
-                10,
+                12,
                 Some((ManualTransitionKind::Fade, 10_000)),
             ),
-            (StudioIntent::CommitManualTransition, 11, None),
+            (StudioIntent::CommitManualTransition, 13, None),
         ];
 
         for (intent, revision, expected) in steps {
             try_enqueue(&requests, WorkerRequest::Intent(intent)).unwrap();
-            loop {
-                let state = states.recv_timeout(Duration::from_secs(3)).unwrap();
-                assert_eq!(state.error, None, "manual worker state: {state:?}");
-                let Some(view) = state.view.as_ref() else {
-                    continue;
-                };
-                if state.pending_commands != 0 || view.cursor.revision.get() != revision {
-                    continue;
-                }
-                let desired_matches = match (view.switcher.desired_manual_transition, expected) {
-                    (
-                        fm_ui_model::ManualTransitionStatus::Active(active),
-                        Some((kind, position)),
-                    ) => active.kind == kind && active.position.basis_points() == position,
-                    (fm_ui_model::ManualTransitionStatus::Inactive, None) => true,
-                    _ => false,
-                };
-                let realized_matches = match (view.switcher.realized_manual_transition, expected) {
-                    (
-                        fm_ui_model::ManualTransitionStatus::Active(active),
-                        Some((kind, position)),
-                    ) => {
-                        active.kind == kind
-                            && active.interval_start.basis_points() == position
-                            && active.position.basis_points() == position
-                    }
-                    (fm_ui_model::ManualTransitionStatus::Inactive, None) => true,
-                    _ => false,
-                };
-                if !desired_matches || !realized_matches {
-                    continue;
-                }
-                if revision == 11 {
-                    assert_eq!(view.switcher.realized.program, wire_input(2).to_domain());
-                    assert_eq!(view.switcher.realized.preview, wire_input(1).to_domain());
-                }
-                break;
+            let state = wait_for_manual_worker_state(&states, revision, expected);
+            if revision == 13 {
+                let view = state.view.expect("matched state carries a view");
+                assert_eq!(view.switcher.realized.program, wire_input(2).to_domain());
+                assert_eq!(view.switcher.realized.preview, wire_input(1).to_domain());
             }
         }
 
@@ -2756,7 +2816,7 @@ mod tests {
         runtime.connect(CONNECT_TIMEOUT).unwrap();
         let current = runtime_state(&mut runtime, None);
         assert!(current.transition_protocol.automatic.wipe);
-        assert!(current.transition_protocol.manual);
+        assert!(current.transition_protocol.manual.base);
         assert!(current.transition_protocol.fade_to_black);
         assert!(current.can_transition);
         runtime.session_mut().disconnect().unwrap();
@@ -2765,7 +2825,7 @@ mod tests {
             .unwrap();
         let downgraded = runtime_state(&mut runtime, None);
         assert!(downgraded.transition_protocol.automatic.wipe);
-        assert!(downgraded.transition_protocol.manual);
+        assert!(downgraded.transition_protocol.manual.base);
         assert!(!downgraded.transition_protocol.fade_to_black);
         assert!(downgraded.can_transition, "Cut/Fade permission was lost");
         server.join().unwrap();
@@ -2810,6 +2870,54 @@ mod tests {
         assert!(!downgraded.transition_protocol.automatic.alpha_fade);
         assert!(downgraded.transition_protocol.fade_to_black);
         assert!(downgraded.can_transition, "Cut/Fade permission was lost");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn runtime_state_hides_manual_alpha_fade_after_protocol_1_7_downgrade() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut first = accept_worker_snapshot_version_at(
+                &listener,
+                MANUAL_ALPHA_FADE_PROTOCOL_VERSION,
+                4,
+                2,
+                2,
+            );
+            assert_eq!(first.stream.read(&mut [0_u8; 1]).unwrap(), 0);
+            accept_worker_reconnect_snapshot_version(
+                &listener,
+                ALPHA_FADE_PROTOCOL_VERSION,
+                4,
+                (1, 2),
+                (1, 2),
+            );
+        });
+        let config = StudioConfig {
+            connection: ConnectionConfig::Existing(ExistingConfig {
+                address,
+                expected_project_id: test_project_id(),
+            }),
+            client_id: "manual-alpha-support-change".to_owned(),
+            desired_role: Role::Operator,
+            restart_policy: RestartPolicy::default(),
+        };
+        let mut runtime = StudioRuntime::new(config).unwrap();
+        runtime.connect(CONNECT_TIMEOUT).unwrap();
+        let current = runtime_state(&mut runtime, None);
+        assert!(current.transition_protocol.manual.base);
+        assert!(current.transition_protocol.manual.alpha_fade);
+        assert!(current.transition_protocol.automatic.alpha_fade);
+        runtime.session_mut().disconnect().unwrap();
+        runtime
+            .reconnect(Duration::from_millis(250), CONNECT_TIMEOUT)
+            .unwrap();
+        let downgraded = runtime_state(&mut runtime, None);
+        assert!(downgraded.transition_protocol.manual.base);
+        assert!(!downgraded.transition_protocol.manual.alpha_fade);
+        assert!(downgraded.transition_protocol.automatic.alpha_fade);
+        assert!(downgraded.can_transition);
         server.join().unwrap();
     }
 
@@ -2868,7 +2976,7 @@ mod tests {
         runtime.connect(CONNECT_TIMEOUT).unwrap();
         let state = runtime_state(&mut runtime, None);
         assert_eq!(state.connection_status, StudioConnectionStatus::Ready);
-        assert!(state.transition_protocol.manual);
+        assert!(state.transition_protocol.manual.base);
         assert!(state.transition_protocol.fade_to_black);
         assert!(!state.can_transition);
         server.join().unwrap();
@@ -3050,7 +3158,7 @@ mod tests {
                 assert!(saw_pending_incompatible);
                 assert!(state.notice.is_none());
                 assert!(state.transition_protocol.automatic.wipe);
-                assert!(state.transition_protocol.manual);
+                assert!(state.transition_protocol.manual.base);
                 break;
             }
         }

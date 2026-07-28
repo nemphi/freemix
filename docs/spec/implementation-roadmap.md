@@ -677,8 +677,10 @@ restored held state. CLI manual AlphaFade start is available locally and
 remotely, including protocol 1.7 downgrade rejection and local restart-safe
 idempotent replay. The Web semantic control surface advertises protocol 1.7,
 exposes a manual AlphaFade start control only for compatible sessions, and
-preserves authoritative AlphaFade projections. Studio manual AlphaFade controls
-remain absent.
+preserves authoritative AlphaFade projections. Studio advertises protocol 1.7,
+gates its manual AlphaFade start button independently from the existing manual
+controls, and carries AlphaFade intents through the worker into authoritative
+desired and realized presentation.
 
 The remaining AlphaFade manual operator controls, stinger, Slide/Zoom, other
 transition families, cross-platform/fullscreen evidence, and complete `SW-004`

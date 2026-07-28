@@ -41,7 +41,7 @@ pub enum StudioIntent {
     Wipe { duration_frames: u32 },
     /// Fades realized Program video and audio to black or back to live.
     FadeToBlack { active: bool, duration_frames: u32 },
-    /// Starts a held manual Fade or Wipe transition.
+    /// Starts a held manual Fade, Wipe, or `AlphaFade` transition.
     StartManualTransition { kind: ManualTransitionKind },
     /// Sets the exact manual-transition position in basis points.
     SetManualTransitionPosition { position: ManualTransitionPosition },
@@ -164,7 +164,14 @@ impl StudioUiState {
     /// Publishes whether the negotiated protocol carries manual T-bar state and commands.
     #[must_use]
     pub const fn with_manual_transition_support(mut self, supported: bool) -> Self {
-        self.transition_protocol.manual = supported;
+        self.transition_protocol.manual.base = supported;
+        self
+    }
+
+    /// Publishes whether the negotiated protocol carries manual `AlphaFade` starts.
+    #[must_use]
+    pub const fn with_manual_alpha_fade_support(mut self, supported: bool) -> Self {
+        self.transition_protocol.manual.alpha_fade = supported;
         self
     }
 
@@ -180,15 +187,29 @@ impl StudioUiState {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TransitionProtocolSupport {
     pub automatic: AutomaticTransitionProtocolSupport,
-    pub manual: bool,
+    pub manual: ManualTransitionProtocolSupport,
     pub fade_to_black: bool,
 }
 
 impl TransitionProtocolSupport {
     pub const NONE: Self = Self {
         automatic: AutomaticTransitionProtocolSupport::NONE,
-        manual: false,
+        manual: ManualTransitionProtocolSupport::NONE,
         fade_to_black: false,
+    };
+}
+
+/// Additive manual-transition features carried by the negotiated protocol.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ManualTransitionProtocolSupport {
+    pub base: bool,
+    pub alpha_fade: bool,
+}
+
+impl ManualTransitionProtocolSupport {
+    pub const NONE: Self = Self {
+        base: false,
+        alpha_fade: false,
     };
 }
 
@@ -247,6 +268,7 @@ impl TransitionGate {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ManualTransitionAvailability {
     pub start: bool,
+    pub alpha_fade_start_exposed: bool,
     pub active_controls: bool,
 }
 
@@ -256,7 +278,7 @@ pub struct ManualTransitionGate {
     pub connection_status: StudioConnectionStatus,
     pub has_view: bool,
     pub can_transition: bool,
-    pub protocol_supported: bool,
+    pub protocol_support: ManualTransitionProtocolSupport,
 }
 
 impl ManualTransitionGate {
@@ -266,7 +288,7 @@ impl ManualTransitionGate {
             connection_status: state.connection_status,
             has_view: state.view.is_some(),
             can_transition: state.can_transition,
-            protocol_supported: state.transition_protocol.manual,
+            protocol_support: state.transition_protocol.manual,
         }
     }
 }
@@ -291,9 +313,10 @@ pub fn manual_transition_availability(
     let base = gate.connection_status.controls_enabled()
         && gate.has_view
         && gate.can_transition
-        && gate.protocol_supported;
+        && gate.protocol_support.base;
     ManualTransitionAvailability {
         start: base && !active,
+        alpha_fade_start_exposed: gate.protocol_support.base && gate.protocol_support.alpha_fade,
         active_controls: base && active,
     }
 }
@@ -523,13 +546,23 @@ fn draw_manual_transition_controls(
     intents: &mut Vec<StudioIntent>,
 ) {
     ui.horizontal_wrapped(|ui| {
-        draw_manual_start_buttons(ui, availability.start, intents);
+        draw_manual_start_buttons(
+            ui,
+            availability.start,
+            availability.alpha_fade_start_exposed,
+            intents,
+        );
         draw_manual_position(ui, desired, availability.active_controls, intents);
         draw_manual_terminal_buttons(ui, availability.active_controls, intents);
     });
 }
 
-fn draw_manual_start_buttons(ui: &mut Ui, enabled: bool, intents: &mut Vec<StudioIntent>) {
+fn draw_manual_start_buttons(
+    ui: &mut Ui,
+    enabled: bool,
+    alpha_fade_exposed: bool,
+    intents: &mut Vec<StudioIntent>,
+) {
     for (label, kind, tooltip) in [
         (
             "START FADE T-BAR",
@@ -547,6 +580,19 @@ fn draw_manual_start_buttons(ui: &mut Ui, enabled: bool, intents: &mut Vec<Studi
             .on_hover_text(tooltip);
         if response.clicked() {
             intents.push(StudioIntent::StartManualTransition { kind });
+        }
+    }
+    if alpha_fade_exposed {
+        let response = ui
+            .add_enabled(
+                enabled,
+                Button::new(RichText::new("START ALPHA FADE T-BAR").strong()),
+            )
+            .on_hover_text("Start a reversible manual AlphaFade transition");
+        if response.clicked() {
+            intents.push(StudioIntent::StartManualTransition {
+                kind: ManualTransitionKind::AlphaFade,
+            });
         }
     }
 }
@@ -1147,12 +1193,16 @@ mod tests {
             connection_status: StudioConnectionStatus::Ready,
             has_view: true,
             can_transition: true,
-            protocol_supported: true,
+            protocol_support: ManualTransitionProtocolSupport {
+                base: true,
+                alpha_fade: true,
+            },
         };
         assert_eq!(
             manual_transition_availability(available, false),
             ManualTransitionAvailability {
                 start: true,
+                alpha_fade_start_exposed: true,
                 active_controls: false,
             }
         );
@@ -1160,6 +1210,7 @@ mod tests {
             manual_transition_availability(available, true),
             ManualTransitionAvailability {
                 start: false,
+                alpha_fade_start_exposed: true,
                 active_controls: true,
             }
         );
@@ -1177,7 +1228,7 @@ mod tests {
                 ..available
             },
             ManualTransitionGate {
-                protocol_supported: false,
+                protocol_support: ManualTransitionProtocolSupport::NONE,
                 ..available
             },
         ] {
@@ -1185,10 +1236,27 @@ mod tests {
                 manual_transition_availability(gate, true),
                 ManualTransitionAvailability {
                     start: false,
+                    alpha_fade_start_exposed: gate.protocol_support.base,
                     active_controls: false,
                 }
             );
         }
+
+        let legacy_manual = ManualTransitionGate {
+            protocol_support: ManualTransitionProtocolSupport {
+                base: true,
+                alpha_fade: false,
+            },
+            ..available
+        };
+        assert_eq!(
+            manual_transition_availability(legacy_manual, false),
+            ManualTransitionAvailability {
+                start: true,
+                alpha_fade_start_exposed: false,
+                active_controls: false,
+            }
+        );
     }
 
     #[test]
@@ -1202,6 +1270,17 @@ mod tests {
         });
         assert_eq!(desired_manual_position(active).basis_points(), 2_500);
         assert_eq!(manual_transition_label(active), "WIPE 1->2 @ 2500 BP");
+        let alpha_fade = ManualTransitionStatus::Active(ActiveManualTransition {
+            kind: ManualTransitionKind::AlphaFade,
+            from: input(1),
+            to: input(2),
+            interval_start: ManualTransitionPosition::new(8_000).unwrap(),
+            position: ManualTransitionPosition::new(2_500).unwrap(),
+        });
+        assert_eq!(
+            manual_transition_label(alpha_fade),
+            "ALPHA FADE 1->2 @ 2500 BP"
+        );
         assert_eq!(
             desired_manual_position(ManualTransitionStatus::Inactive),
             ManualTransitionPosition::START
