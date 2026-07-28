@@ -1,6 +1,7 @@
 use fm_client::{ConnectionState, Session};
 use fm_protocol::{
     ALPHA_FADE_PROTOCOL_VERSION, CommandPayload, SLIDE_PROTOCOL_VERSION, WIPE_PROTOCOL_VERSION,
+    ZOOM_PROTOCOL_VERSION,
 };
 
 /// A transition control represented by the semantic presentation model.
@@ -10,6 +11,7 @@ pub enum TransitionControl {
     Auto,
     AlphaFade,
     Slide,
+    Zoom,
     Wipe,
     Duration,
 }
@@ -23,6 +25,7 @@ impl TransitionControl {
             Self::Auto => "Transition Preview to Program",
             Self::AlphaFade => "Alpha fade Preview to Program",
             Self::Slide => "Slide Preview to Program",
+            Self::Zoom => "Zoom Preview to Program",
             Self::Wipe => "Wipe Preview to Program",
             Self::Duration => "Transition duration",
         }
@@ -98,6 +101,10 @@ impl TransitionControls {
         {
             return TransitionControlState::Hidden;
         }
+        if matches!(control, TransitionControl::Zoom) && !session.is_some_and(session_supports_zoom)
+        {
+            return TransitionControlState::Hidden;
+        }
 
         if matches!(connection_state, ConnectionState::Ready)
             && session.is_some_and(session_can_transition)
@@ -132,6 +139,9 @@ impl TransitionControls {
                 duration_frames: self.duration_frames,
             }),
             TransitionControl::Slide => Some(CommandPayload::Slide {
+                duration_frames: self.duration_frames,
+            }),
+            TransitionControl::Zoom => Some(CommandPayload::Zoom {
                 duration_frames: self.duration_frames,
             }),
             TransitionControl::Wipe => Some(CommandPayload::Wipe {
@@ -170,6 +180,11 @@ fn session_supports_alpha_fade(session: &Session) -> bool {
 fn session_supports_slide(session: &Session) -> bool {
     session.protocol.major == SLIDE_PROTOCOL_VERSION.major
         && session.protocol.minor >= SLIDE_PROTOCOL_VERSION.minor
+}
+
+fn session_supports_zoom(session: &Session) -> bool {
+    session.protocol.major == ZOOM_PROTOCOL_VERSION.major
+        && session.protocol.minor >= ZOOM_PROTOCOL_VERSION.minor
 }
 
 #[cfg(test)]
@@ -262,6 +277,67 @@ mod tests {
                 duration_frames: 45
             })
         );
+    }
+
+    #[test]
+    fn protocol_1_9_exposes_zoom_and_preserves_exact_duration() {
+        let mut controls = TransitionControls::default();
+        controls.set_duration_frames(45);
+        let session = session(ZOOM_PROTOCOL_VERSION, &["transition"]);
+
+        assert_eq!(
+            controls.control_state(
+                TransitionControl::Zoom,
+                &ConnectionState::Ready,
+                Some(&session)
+            ),
+            TransitionControlState::Enabled
+        );
+        assert_eq!(
+            controls.command_payload(
+                TransitionControl::Zoom,
+                &ConnectionState::Ready,
+                Some(&session)
+            ),
+            Some(CommandPayload::Zoom {
+                duration_frames: 45
+            })
+        );
+    }
+
+    #[test]
+    fn protocol_1_8_hides_zoom_without_hiding_older_transitions() {
+        let controls = TransitionControls::default();
+        let session = session(SLIDE_PROTOCOL_VERSION, &["transition"]);
+
+        assert_eq!(
+            controls.control_state(
+                TransitionControl::Zoom,
+                &ConnectionState::Ready,
+                Some(&session)
+            ),
+            TransitionControlState::Hidden
+        );
+        assert_eq!(
+            controls.command_payload(
+                TransitionControl::Zoom,
+                &ConnectionState::Ready,
+                Some(&session)
+            ),
+            None
+        );
+        for control in [
+            TransitionControl::AlphaFade,
+            TransitionControl::Slide,
+            TransitionControl::Wipe,
+            TransitionControl::Auto,
+        ] {
+            assert!(
+                controls
+                    .control_state(control, &ConnectionState::Ready, Some(&session))
+                    .is_enabled()
+            );
+        }
     }
 
     #[test]
@@ -367,13 +443,14 @@ mod tests {
     #[test]
     fn transition_permission_gates_all_supported_automatic_controls() {
         let controls = TransitionControls::default();
-        let session = session(SLIDE_PROTOCOL_VERSION, &["view_status"]);
+        let session = session(ZOOM_PROTOCOL_VERSION, &["view_status"]);
 
         for control in [
             TransitionControl::Cut,
             TransitionControl::Auto,
             TransitionControl::AlphaFade,
             TransitionControl::Slide,
+            TransitionControl::Zoom,
             TransitionControl::Wipe,
         ] {
             assert_eq!(
@@ -464,6 +541,17 @@ mod tests {
                 Some(&slide_session)
             ),
             Some(CommandPayload::Slide {
+                duration_frames: 45
+            })
+        );
+        let zoom_session = session(ZOOM_PROTOCOL_VERSION, &["transition"]);
+        assert_eq!(
+            controls.command_payload(
+                TransitionControl::Zoom,
+                &ConnectionState::Ready,
+                Some(&zoom_session)
+            ),
+            Some(CommandPayload::Zoom {
                 duration_frames: 45
             })
         );
@@ -607,6 +695,52 @@ mod tests {
             controls
                 .control_state(
                     TransitionControl::AlphaFade,
+                    &ConnectionState::Ready,
+                    Some(&downgraded)
+                )
+                .is_enabled()
+        );
+    }
+
+    #[test]
+    fn reconnect_hides_zoom_until_protocol_1_9_is_ready() {
+        let controls = TransitionControls::default();
+        let current = session(ZOOM_PROTOCOL_VERSION, &["transition"]);
+        assert!(
+            controls
+                .control_state(
+                    TransitionControl::Zoom,
+                    &ConnectionState::Ready,
+                    Some(&current)
+                )
+                .is_enabled()
+        );
+
+        assert_eq!(
+            controls.control_state(
+                TransitionControl::Zoom,
+                &ConnectionState::Backoff(ReconnectBackoff {
+                    attempt: 1,
+                    delay_ms: 250,
+                }),
+                None
+            ),
+            TransitionControlState::Hidden
+        );
+
+        let downgraded = session(SLIDE_PROTOCOL_VERSION, &["transition"]);
+        assert_eq!(
+            controls.control_state(
+                TransitionControl::Zoom,
+                &ConnectionState::Ready,
+                Some(&downgraded)
+            ),
+            TransitionControlState::Hidden
+        );
+        assert!(
+            controls
+                .control_state(
+                    TransitionControl::Slide,
                     &ConnectionState::Ready,
                     Some(&downgraded)
                 )
