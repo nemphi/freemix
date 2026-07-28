@@ -219,7 +219,7 @@ impl Remote {
             }
             let realized = matches!(
                 &runtime.event,
-                RuntimeLifecycleEvent::Realized { domain } if domain == "switcher"
+                RuntimeLifecycleEvent::Realized { domain, .. } if domain == "switcher"
             );
             self.client.intake(WireMessage::RuntimeEvent(runtime))?;
             if realized {

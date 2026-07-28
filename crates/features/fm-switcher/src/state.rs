@@ -84,6 +84,23 @@ impl SwitcherState {
         self.t_bar
     }
 
+    /// Restores an active manual transition into an otherwise idle switcher.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a transition is already active, an endpoint is
+    /// unavailable, or the saved endpoints do not match Program and Preview.
+    pub fn restore_t_bar(&mut self, t_bar: TBarState) -> Result<(), SwitcherError> {
+        self.require_idle()?;
+        self.require_input(t_bar.from())?;
+        self.require_input(t_bar.to())?;
+        if t_bar.from() != self.program || t_bar.to() != self.preview {
+            return Err(SwitcherError::InvalidManualTransitionRoute);
+        }
+        self.t_bar = Some(t_bar);
+        Ok(())
+    }
+
     #[must_use]
     pub const fn fade_to_black(&self) -> bool {
         self.fade_to_black

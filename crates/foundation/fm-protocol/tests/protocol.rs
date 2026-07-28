@@ -8,11 +8,12 @@ use fm_protocol::{
     EventCursor, EventMessage, EventPayload, FieldIssue, HandshakeOutcome, HandshakeRequest,
     HandshakeResponse, HeartbeatMessage, LineDecoder, MANUAL_TRANSITION_PROTOCOL_VERSION,
     MAX_FIELD_VALUE_BYTES, MAX_FIELDS_PER_MESSAGE, MAX_LINE_BYTES, MAX_LIST_ITEMS,
-    MAX_MESSAGES_PER_PUSH, ManualTransitionKind, ManualTransitionPosition, ProtocolVersion,
-    ResumeCursor, Role, RuntimeDomainBoundary, RuntimeEventMessage, RuntimeFailureDisposition,
-    RuntimeLifecycleEvent, ServerHello, ServerIdentity, SnapshotMessage, SnapshotReason,
-    StructuredError, WIPE_PROTOCOL_VERSION, WireInputId, WireMessage, choose_handshake_outcome,
-    decode_line, encode_line, negotiate_version,
+    MAX_MESSAGES_PER_PUSH, ManualTransitionKind, ManualTransitionPosition, ManualTransitionState,
+    ManualTransitionStatus, ProtocolVersion, ResumeCursor, Role, RuntimeDomainBoundary,
+    RuntimeEventMessage, RuntimeFailureDisposition, RuntimeLifecycleEvent, ServerHello,
+    ServerIdentity, SnapshotMessage, SnapshotReason, StructuredError, WIPE_PROTOCOL_VERSION,
+    WireInputId, WireMessage, choose_handshake_outcome, decode_line, encode_line,
+    negotiate_version,
 };
 
 fn input(value: u128) -> WireInputId {
@@ -179,12 +180,15 @@ fn every_message_variant_round_trips() {
             desired_preview: input(1),
             realized_program: input(1),
             realized_preview: input(2),
+            desired_manual_transition: None,
+            realized_manual_transition: None,
         }),
         WireMessage::Event(EventMessage {
             cursor: cursor(),
             payload: EventPayload::DesiredSwitcher {
                 program: input(2),
                 preview: input(1),
+                manual_transition: None,
             },
         }),
     ];
@@ -227,6 +231,96 @@ fn manual_transition_commands_have_stable_exact_wire_forms() {
         assert_eq!(encode_line(&message).unwrap(), fixture);
         assert_eq!(decode_line(fixture).unwrap(), message);
     }
+}
+
+#[test]
+fn manual_transition_snapshot_and_events_have_stable_exact_wire_forms() {
+    let desired = ManualTransitionStatus::Active(ManualTransitionState {
+        kind: ManualTransitionKind::Wipe,
+        from: input(1),
+        to: input(2),
+        interval_start: ManualTransitionPosition::START,
+        position: ManualTransitionPosition::new(6_250).unwrap(),
+    });
+    let realized = ManualTransitionStatus::Active(ManualTransitionState {
+        kind: ManualTransitionKind::Wipe,
+        from: input(1),
+        to: input(2),
+        interval_start: ManualTransitionPosition::new(6_250).unwrap(),
+        position: ManualTransitionPosition::new(6_250).unwrap(),
+    });
+    let messages = [
+        (
+            include_str!("fixtures/snapshot_manual.wire"),
+            WireMessage::Snapshot(SnapshotMessage {
+                engine: identity(),
+                revision: 1_842,
+                show_name: "Manual".into(),
+                inputs: vec![input(1), input(2)],
+                desired_program: input(1),
+                desired_preview: input(2),
+                realized_program: input(1),
+                realized_preview: input(2),
+                desired_manual_transition: Some(desired),
+                realized_manual_transition: Some(realized),
+            }),
+        ),
+        (
+            include_str!("fixtures/event_manual.wire"),
+            WireMessage::Event(EventMessage {
+                cursor: cursor(),
+                payload: EventPayload::DesiredSwitcher {
+                    program: input(1),
+                    preview: input(2),
+                    manual_transition: Some(desired),
+                },
+            }),
+        ),
+        (
+            include_str!("fixtures/runtime_event_manual.wire"),
+            WireMessage::RuntimeEvent(RuntimeEventMessage {
+                server: server_identity(),
+                revision: 1_842,
+                generation: 12,
+                sequence: 1,
+                event: RuntimeLifecycleEvent::Realized {
+                    domain: "switcher".into(),
+                    manual_transition: Some(realized),
+                },
+            }),
+        ),
+    ];
+    for (fixture, message) in messages {
+        assert_eq!(encode_line(&message).unwrap(), fixture);
+        assert_eq!(decode_line(fixture).unwrap(), message);
+    }
+}
+
+#[test]
+fn protocol_1_3_projection_omits_manual_transition_extensions() {
+    let message = WireMessage::Event(EventMessage {
+        cursor: cursor(),
+        payload: EventPayload::DesiredSwitcher {
+            program: input(1),
+            preview: input(2),
+            manual_transition: Some(ManualTransitionStatus::Inactive),
+        },
+    });
+
+    let compatible = message.compatible_with(WIPE_PROTOCOL_VERSION);
+    let encoded = encode_line(&compatible).unwrap();
+
+    assert!(!encoded.contains("manual_"));
+    assert!(matches!(
+        compatible,
+        WireMessage::Event(EventMessage {
+            payload: EventPayload::DesiredSwitcher {
+                manual_transition: None,
+                ..
+            },
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -567,6 +661,7 @@ fn runtime_lifecycle_variants_use_the_independent_runtime_sequence() {
         },
         RuntimeLifecycleEvent::Realized {
             domain: "video".to_owned(),
+            manual_transition: None,
         },
         RuntimeLifecycleEvent::Failed {
             error: structured_error(),

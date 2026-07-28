@@ -423,7 +423,7 @@ fn golden_v2_manifest_migrates_with_cli_defaults_and_main_mix() {
     let report = store.migrate_v2().unwrap();
     let migrated = store.load().unwrap();
 
-    assert_eq!((report.from_schema(), report.to_schema()), (2, 4));
+    assert_eq!((report.from_schema(), report.to_schema()), (2, 5));
     assert_eq!(
         migrated.project().settings().frame_rate,
         FrameRate::new(60_000, 1_001).unwrap()
@@ -469,7 +469,7 @@ fn frozen_v3_manifest_migrates_with_composition_defaults_only() {
     second.migrate_v3().unwrap();
     let migrated = store.load().unwrap();
 
-    assert_eq!((report.from_schema(), report.to_schema()), (3, 4));
+    assert_eq!((report.from_schema(), report.to_schema()), (3, 5));
     assert_eq!(
         report.defaulted_fields(),
         [
@@ -478,6 +478,7 @@ fn frozen_v3_manifest_migrates_with_composition_defaults_only() {
             "scenes.layers.crop=null",
             "scenes.layers.opacity=255",
             "scenes.layers.z_order=0",
+            "runtime.manual_transitions=inactive",
         ]
     );
     let scene = &migrated.project().scenes()[0];

@@ -6,9 +6,10 @@ use std::{
 };
 
 use fm_persistence::{
-    CURRENT_SCHEMA_VERSION, IdempotencyReceipt, JournalError, MAX_MANIFEST_BYTES, MutationBatch,
-    ProjectPosition, ProjectRouting, ProjectStore, ProjectValidationError, ReceiptOutcome,
-    ReferenceField, StoreError, StoredProject,
+    CURRENT_SCHEMA_VERSION, IdempotencyReceipt, JournalError, MAX_MANIFEST_BYTES,
+    ManualTransitionKind, ManualTransitionState, MutationBatch, ProjectPosition, ProjectRouting,
+    ProjectStore, ProjectValidationError, ReceiptOutcome, ReferenceField, RuntimeManualTransitions,
+    StoreError, StoredProject,
 };
 
 static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -115,6 +116,69 @@ fn round_trip_preserves_typed_project() {
 }
 
 #[test]
+fn round_trip_preserves_exact_desired_and_realized_manual_transition_state() {
+    let temp = TestDirectory::new("manual-transition");
+    let store = ProjectStore::new(temp.project_path("show")).unwrap();
+    let base = project("Manual", 11);
+    let routing = base.runtime_routing();
+    let desired = ManualTransitionState::new(
+        ManualTransitionKind::Wipe,
+        routing.desired_program_id.unwrap(),
+        routing.desired_preview_id.unwrap(),
+        0,
+        6_250,
+    )
+    .unwrap();
+    let realized = ManualTransitionState::new(
+        ManualTransitionKind::Wipe,
+        routing.realized_program_id.unwrap(),
+        routing.realized_preview_id.unwrap(),
+        6_250,
+        6_250,
+    )
+    .unwrap();
+    let expected = StoredProject::from_project_with_manual_transitions(
+        base.project().clone(),
+        routing,
+        RuntimeManualTransitions {
+            desired: Some(desired),
+            realized: Some(realized),
+        },
+        base.position(),
+        base.idempotency_receipts().to_vec(),
+    )
+    .unwrap();
+
+    store.save(&expected).unwrap();
+
+    assert_eq!(store.load().unwrap(), expected);
+    let encoded = fs::read_to_string(store.manifest_path()).unwrap();
+    assert!(encoded.contains("\"interval_start_basis_points\": 6250"));
+    assert!(encoded.contains("\"position_basis_points\": 6250"));
+}
+
+#[test]
+fn schema_v4_migrates_with_inactive_manual_transition_defaults() {
+    let temp = TestDirectory::new("schema-v4");
+    let root = temp.project_path("show");
+    write_manifest(&root, include_str!("fixtures/schema-v4.json"));
+    let store = ProjectStore::new(root).unwrap();
+
+    let report = store.migrate_v4().unwrap();
+    let migrated = store.load().unwrap();
+
+    assert_eq!((report.from_schema(), report.to_schema()), (4, 5));
+    assert_eq!(
+        report.defaulted_fields(),
+        ["runtime.manual_transitions=inactive"]
+    );
+    assert_eq!(
+        migrated.runtime_manual_transitions(),
+        RuntimeManualTransitions::default()
+    );
+}
+
+#[test]
 fn json_escaping_round_trips_quotes_slashes_controls_and_unicode() {
     let temp = TestDirectory::new("escaping");
     let store = ProjectStore::new(temp.project_path("escape")).unwrap();
@@ -217,8 +281,8 @@ fn explicit_unsupported_schema_is_reported_before_missing_current_fields() {
 fn strict_parser_rejects_unknown_duplicate_and_wrong_typed_fields() {
     let temp = TestDirectory::new("strict");
     for (name, manifest) in [
-        ("unknown", "{\"schema_version\":4,\"unknown\":true}"),
-        ("duplicate", "{\"schema_version\":4,\"schema_version\":4}"),
+        ("unknown", "{\"schema_version\":5,\"unknown\":true}"),
+        ("duplicate", "{\"schema_version\":5,\"schema_version\":5}"),
         ("wrong-type", "{\"schema_version\":\"1\"}"),
         ("object-trailing-comma", "{\"schema_version\":2,}"),
         (

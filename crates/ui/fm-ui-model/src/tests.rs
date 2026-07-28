@@ -32,6 +32,8 @@ fn snapshot(project_id: ProjectId, revision: u64) -> ProjectSnapshot {
         switcher: SwitcherState {
             desired: BusSelection::new(input(1), input(2)),
             realized: BusSelection::new(input(1), input(2)),
+            desired_manual_transition: ManualTransitionStatus::Inactive,
+            realized_manual_transition: ManualTransitionStatus::Inactive,
             runtime_generation: Some(4),
         },
     }
@@ -66,6 +68,14 @@ fn realization(
         revision: Revision::new(revision),
         generation,
         sequence,
+        manual_transition: None,
+    }
+}
+
+fn desired(selection: BusSelection) -> DurableChange {
+    DurableChange::DesiredSwitcher {
+        selection,
+        manual_transition: ManualTransitionStatus::Inactive,
     }
 }
 
@@ -109,7 +119,7 @@ fn applies_contiguous_events_and_tracks_desired_separately_from_realized() {
             project_id,
             identity.clone(),
             8,
-            DurableChange::DesiredSwitcher(BusSelection::new(input(2), input(3))),
+            desired(BusSelection::new(input(2), input(3))),
         ))
         .unwrap();
     let after_desired = model.state().unwrap().switcher();
@@ -137,7 +147,7 @@ fn ignores_exact_duplicates_but_rejects_conflicting_ones() {
         project_id,
         identity.clone(),
         2,
-        DurableChange::DesiredSwitcher(BusSelection::new(input(2), input(1))),
+        desired(BusSelection::new(input(2), input(1))),
     );
 
     assert!(matches!(
@@ -150,7 +160,7 @@ fn ignores_exact_duplicates_but_rejects_conflicting_ones() {
         project_id,
         identity,
         2,
-        DurableChange::DesiredSwitcher(BusSelection::new(input(3), input(1))),
+        desired(BusSelection::new(input(3), input(1))),
     );
     assert!(matches!(
         model.apply_event(conflict),
@@ -165,7 +175,7 @@ fn rejects_gaps_without_advancing_and_recovers_when_missing_event_arrives() {
     let mut model = ClientModel::new(project_id);
     model.install_snapshot(snapshot(project_id, 4)).unwrap();
     let identity = model.reconnect_cursor().unwrap().engine.clone();
-    let change = DurableChange::DesiredSwitcher(BusSelection::new(input(2), input(1)));
+    let change = desired(BusSelection::new(input(2), input(1)));
 
     assert_eq!(
         model.apply_event(event(project_id, identity.clone(), 6, change)),
@@ -189,7 +199,7 @@ fn rejects_project_and_engine_identity_changes() {
     let project_id = project(10);
     let mut model = ClientModel::new(project_id);
     model.install_snapshot(snapshot(project_id, 4)).unwrap();
-    let change = DurableChange::DesiredSwitcher(BusSelection::new(input(2), input(1)));
+    let change = desired(BusSelection::new(input(2), input(1)));
 
     assert!(matches!(
         model.apply_event(event(
@@ -242,7 +252,7 @@ fn optimistic_accept_remains_until_accepted_revision_is_applied() {
             project_id,
             identity,
             2,
-            DurableChange::DesiredSwitcher(BusSelection::new(input(1), input(3))),
+            desired(BusSelection::new(input(1), input(3))),
         ))
         .unwrap();
     assert_eq!(
@@ -302,7 +312,7 @@ fn reconnect_cursor_advances_only_for_contiguous_authoritative_events() {
             project_id,
             initial.engine.clone(),
             21,
-            DurableChange::DesiredSwitcher(BusSelection::new(input(2), input(3))),
+            desired(BusSelection::new(input(2), input(3))),
         ))
         .unwrap();
     let reconnect = model.reconnect_cursor().unwrap();
@@ -357,20 +367,10 @@ fn runtime_realization_can_use_current_or_retained_desired_revision() {
     let retained = BusSelection::new(input(2), input(3));
     let current = BusSelection::new(input(3), input(1));
     model
-        .apply_event(event(
-            project_id,
-            identity.clone(),
-            8,
-            DurableChange::DesiredSwitcher(retained),
-        ))
+        .apply_event(event(project_id, identity.clone(), 8, desired(retained)))
         .unwrap();
     model
-        .apply_event(event(
-            project_id,
-            identity.clone(),
-            9,
-            DurableChange::DesiredSwitcher(current),
-        ))
+        .apply_event(event(project_id, identity.clone(), 9, desired(current)))
         .unwrap();
 
     model
@@ -398,7 +398,7 @@ fn runtime_realization_ordering_is_scoped_to_generation() {
             project_id,
             identity.clone(),
             8,
-            DurableChange::DesiredSwitcher(BusSelection::new(input(2), input(3))),
+            desired(BusSelection::new(input(2), input(3))),
         ))
         .unwrap();
 
@@ -482,7 +482,7 @@ fn runtime_revision_errors_are_separate_from_durable_gaps() {
             project_id,
             identity,
             6,
-            DurableChange::DesiredSwitcher(BusSelection::new(input(2), input(1))),
+            desired(BusSelection::new(input(2), input(1))),
         )),
         Err(ModelError::RevisionGap { .. })
     ));

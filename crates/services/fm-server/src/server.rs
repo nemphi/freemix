@@ -1,7 +1,9 @@
 use std::{error::Error, fmt};
 
 use fm_auth::{Permission, Policy, Principal, PrincipalKind, Role as AuthRole};
-use fm_protocol::{ClientHello, EventCursor, Role as ProtocolRole, ServerHello, negotiate_version};
+use fm_protocol::{
+    ClientHello, EventCursor, Role as ProtocolRole, ServerHello, WireMessage, negotiate_version,
+};
 
 use crate::{
     AuthenticationMode, ConfigError, ControlPlane, InitialSync, ReadinessState, ServerConfig,
@@ -132,6 +134,7 @@ impl<C: ControlPlane> Server<C> {
             .flatten()
             .map(|permission| permission_name(*permission).to_owned())
             .collect();
+        let sync = compatible_sync(initial.payload, negotiated);
         let server_hello = ServerHello {
             negotiated,
             granted_role: hello.desired_role,
@@ -139,7 +142,7 @@ impl<C: ControlPlane> Server<C> {
             capabilities_digest: self.config.capabilities_digest.clone(),
             engine: initial.engine.clone(),
             current_revision: initial.current_revision,
-            resume: initial.payload.is_resume(),
+            resume: sync.is_resume(),
         };
         let session = Session::new(
             negotiated,
@@ -152,9 +155,35 @@ impl<C: ControlPlane> Server<C> {
         );
         Ok(HandshakeOutcome {
             server_hello,
-            sync: initial.payload,
+            sync,
             session,
         })
+    }
+}
+
+fn compatible_sync(payload: SyncPayload, negotiated: fm_protocol::ProtocolVersion) -> SyncPayload {
+    match payload {
+        SyncPayload::Snapshot(snapshot) => {
+            let WireMessage::Snapshot(snapshot) =
+                WireMessage::Snapshot(*snapshot).compatible_with(negotiated)
+            else {
+                unreachable!("snapshot compatibility preserves message type");
+            };
+            SyncPayload::Snapshot(Box::new(snapshot))
+        }
+        SyncPayload::Resume(events) => SyncPayload::Resume(
+            events
+                .into_iter()
+                .map(|event| {
+                    let WireMessage::Event(event) =
+                        WireMessage::Event(event).compatible_with(negotiated)
+                    else {
+                        unreachable!("event compatibility preserves message type");
+                    };
+                    event
+                })
+                .collect(),
+        ),
     }
 }
 

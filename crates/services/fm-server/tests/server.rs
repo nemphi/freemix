@@ -4,8 +4,8 @@ use fm_auth::{Principal, Role as AuthRole, SessionId, UserId};
 use fm_protocol::{
     CURRENT_PROTOCOL_VERSION, ClientHello, ClientType, CommandMessage, CommandPayload,
     EngineIdentity, EventCursor, EventMessage, EventPayload, MANUAL_TRANSITION_PROTOCOL_VERSION,
-    ManualTransitionKind, ProtocolVersion, Role, SnapshotMessage, WIPE_PROTOCOL_VERSION,
-    WireInputId,
+    ManualTransitionKind, ManualTransitionStatus, ProtocolVersion, Role, SnapshotMessage,
+    WIPE_PROTOCOL_VERSION, WireInputId,
 };
 use fm_server::{
     AuthenticationMode, ConfigError, ControlPlane, DisconnectReason, HandshakeError, HealthState,
@@ -35,7 +35,7 @@ impl ControlPlane for FakeControl {
                     .collect(),
             )
         } else {
-            SyncPayload::Snapshot(self.snapshot.clone())
+            SyncPayload::Snapshot(Box::new(self.snapshot.clone()))
         };
         Ok(InitialSync {
             engine: self.engine.clone(),
@@ -68,6 +68,8 @@ fn control() -> FakeControl {
         desired_preview: input(2),
         realized_program: input(1),
         realized_preview: input(2),
+        desired_manual_transition: Some(ManualTransitionStatus::Inactive),
+        realized_manual_transition: Some(ManualTransitionStatus::Inactive),
     };
     let events = [3, 4]
         .map(|revision| EventMessage {
@@ -78,6 +80,7 @@ fn control() -> FakeControl {
             payload: EventPayload::DesiredSwitcher {
                 program: input(1),
                 preview: input(2),
+                manual_transition: Some(ManualTransitionStatus::Inactive),
             },
         })
         .to_vec();
@@ -322,6 +325,18 @@ fn protocol_1_3_peer_cannot_admit_manual_transition() {
         .handshake(&old_hello, &principal(AuthRole::Operator), 0)
         .unwrap();
     assert_eq!(outcome.server_hello.negotiated, WIPE_PROTOCOL_VERSION);
+    assert!(matches!(
+        &outcome.sync,
+        SyncPayload::Snapshot(snapshot)
+            if matches!(
+                snapshot.as_ref(),
+                SnapshotMessage {
+            desired_manual_transition: None,
+            realized_manual_transition: None,
+            ..
+                }
+            )
+    ));
     let mut session = outcome.session;
     let mut manual = command(CommandPayload::StartManualTransition {
         kind: ManualTransitionKind::Fade,

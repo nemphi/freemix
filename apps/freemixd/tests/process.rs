@@ -16,11 +16,15 @@ use fm_model::{
     RestartPolicy, Rgba8, Rotation, Scene, SimulatedAudio, SimulatedInput, SimulatedVideo,
     SolidColor, SourceRef, StartupPolicy,
 };
-use fm_persistence::{ProjectPosition, ProjectStore, RuntimeRouting, StoredProject};
+use fm_persistence::{
+    ManualTransitionKind as PersistedManualTransitionKind, ProjectPosition, ProjectStore,
+    RuntimeRouting, StoredProject,
+};
 use fm_protocol::{
-    ClientHello, ClientType, CommandMessage, CommandPayload, CommandResult, EventCursor,
-    HandshakeOutcome, ProtocolVersion, Role, RuntimeLifecycleEvent, ServerHello, SnapshotReason,
-    WireInputId, WireMessage, decode_line, encode_line,
+    CURRENT_PROTOCOL_VERSION, ClientHello, ClientType, CommandMessage, CommandPayload,
+    CommandResult, EventCursor, HandshakeOutcome, ManualTransitionKind, ManualTransitionPosition,
+    ManualTransitionStatus, ProtocolVersion, Role, RuntimeLifecycleEvent, ServerHello,
+    SnapshotReason, WireInputId, WireMessage, decode_line, encode_line,
 };
 use fm_types::{
     AudioFormat, BusId, ChannelLayout, ColorMetadata, FrameRate, InputId, OutputId, PixelFormat,
@@ -155,8 +159,16 @@ impl Client {
     }
 
     fn handshake(&mut self, cursor: Option<EventCursor>) -> ServerHello {
+        self.handshake_version(ProtocolVersion::new(1, 0), cursor)
+    }
+
+    fn handshake_version(
+        &mut self,
+        version: ProtocolVersion,
+        cursor: Option<EventCursor>,
+    ) -> ServerHello {
         self.send(&WireMessage::ClientHello(ClientHello {
-            versions: vec![ProtocolVersion::new(1, 0)],
+            versions: vec![version],
             build: "process-test".into(),
             client_type: ClientType::Integration,
             desired_role: Role::Operator,
@@ -219,7 +231,7 @@ fn assert_fade_runtime_round_trip(protocol_client: &mut ProtocolClient, transpor
     assert_eq!(runtime.sequence, 1);
     assert!(matches!(
         &runtime.event,
-        RuntimeLifecycleEvent::Realized { domain } if domain == "switcher"
+        RuntimeLifecycleEvent::Realized { domain, .. } if domain == "switcher"
     ));
     assert_eq!(
         protocol_client.intake(runtime_event).unwrap(),
@@ -369,7 +381,12 @@ fn old_client_wipe_is_rejected_before_durable_acceptance() {
     let mut client = daemon.connect();
     let hello = client.handshake(None);
     assert_eq!(hello.negotiated, ProtocolVersion::new(1, 0));
-    assert!(matches!(client.receive(), WireMessage::Snapshot(_)));
+    assert!(matches!(
+        client.receive(),
+        WireMessage::Snapshot(snapshot)
+            if snapshot.desired_manual_transition.is_none()
+                && snapshot.realized_manual_transition.is_none()
+    ));
 
     client.send(&command(
         "unsupported-wipe",
@@ -493,6 +510,144 @@ fn commands_survive_restart_resume_and_duplicate_replay() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
+fn manual_transition_state_and_receipts_survive_restart_through_commit_and_cancel() {
+    for (name, terminal, swaps_routes) in [
+        (
+            "manual-commit-restart",
+            CommandPayload::CommitManualTransition,
+            true,
+        ),
+        (
+            "manual-cancel-restart",
+            CommandPayload::CancelManualTransition,
+            false,
+        ),
+    ] {
+        let directory = TestDirectory::new(name);
+        let project_path = directory.project_path();
+        create_project(&project_path);
+
+        let daemon = Daemon::start(&project_path);
+        let mut client = daemon.connect();
+        let hello = client.handshake_version(CURRENT_PROTOCOL_VERSION, None);
+        assert_eq!(hello.negotiated, CURRENT_PROTOCOL_VERSION);
+        assert!(matches!(client.receive(), WireMessage::Snapshot(_)));
+
+        client.send(&command_version(
+            CURRENT_PROTOCOL_VERSION,
+            "manual-start",
+            "manual-start-key",
+            CommandPayload::StartManualTransition {
+                kind: ManualTransitionKind::Wipe,
+            },
+        ));
+        assert!(matches!(
+            client.next_result(),
+            CommandResult::Accepted { revision: 1, .. }
+        ));
+        client.send(&command_version(
+            CURRENT_PROTOCOL_VERSION,
+            "manual-set",
+            "manual-set-key",
+            CommandPayload::SetManualTransitionPosition {
+                position: ManualTransitionPosition::new(6_250).unwrap(),
+            },
+        ));
+        assert!(matches!(
+            client.next_result(),
+            CommandResult::Accepted { revision: 2, .. }
+        ));
+        drop(client);
+        daemon.wait_success();
+
+        let store = ProjectStore::new(&project_path).unwrap();
+        let checkpoint = store.load().unwrap();
+        let manual = checkpoint.runtime_manual_transitions();
+        let desired = manual
+            .desired
+            .expect("desired manual state must be durable");
+        let realized = manual
+            .realized
+            .expect("realized manual state must be durable");
+        assert_eq!(desired.kind, PersistedManualTransitionKind::Wipe);
+        assert_eq!(desired.interval_start_basis_points, 0);
+        assert_eq!(desired.position_basis_points, 6_250);
+        assert_eq!(realized.interval_start_basis_points, 6_250);
+        assert_eq!(realized.position_basis_points, 6_250);
+        assert_eq!(checkpoint.idempotency_receipts().len(), 2);
+
+        let daemon = Daemon::start(&project_path);
+        let mut client = daemon.connect();
+        let hello = client.handshake_version(CURRENT_PROTOCOL_VERSION, None);
+        assert_eq!(hello.current_revision, 2);
+        let WireMessage::Snapshot(snapshot) = client.receive() else {
+            panic!("restart must return a snapshot");
+        };
+        assert!(matches!(
+            snapshot.desired_manual_transition,
+            Some(ManualTransitionStatus::Active(state))
+                if state.kind == ManualTransitionKind::Wipe
+                    && state.interval_start == ManualTransitionPosition::START
+                    && state.position.basis_points() == 6_250
+        ));
+        assert!(matches!(
+            snapshot.realized_manual_transition,
+            Some(ManualTransitionStatus::Active(state))
+                if state.interval_start.basis_points() == 6_250
+                    && state.position.basis_points() == 6_250
+        ));
+
+        client.send(&command_version(
+            CURRENT_PROTOCOL_VERSION,
+            "manual-replay-different-command",
+            "manual-set-key",
+            CommandPayload::CancelManualTransition,
+        ));
+        assert!(matches!(
+            client.next_result(),
+            CommandResult::Accepted {
+                id,
+                revision: 2,
+                ..
+            } if id == "manual-set"
+        ));
+        client.send(&command_version(
+            CURRENT_PROTOCOL_VERSION,
+            "manual-terminal",
+            "manual-terminal-key",
+            terminal,
+        ));
+        assert!(matches!(
+            client.next_result(),
+            CommandResult::Accepted { revision: 3, .. }
+        ));
+        drop(client);
+        daemon.wait_success();
+
+        let final_state = store.load().unwrap();
+        assert_eq!(final_state.runtime_manual_transitions().desired, None);
+        assert_eq!(final_state.runtime_manual_transitions().realized, None);
+        assert_eq!(final_state.idempotency_receipts().len(), 3);
+        let routing = final_state.runtime_routing();
+        let expected_program = if swaps_routes {
+            domain_input(2)
+        } else {
+            domain_input(1)
+        };
+        let expected_preview = if swaps_routes {
+            domain_input(1)
+        } else {
+            domain_input(2)
+        };
+        assert_eq!(routing.desired_program_id, Some(expected_program));
+        assert_eq!(routing.realized_program_id, Some(expected_program));
+        assert_eq!(routing.desired_preview_id, Some(expected_preview));
+        assert_eq!(routing.realized_preview_id, Some(expected_preview));
+    }
+}
+
+#[test]
 fn v2_project_migrates_and_serves() {
     let directory = TestDirectory::new("v2-migration");
     let project_path = directory.project_path();
@@ -527,7 +682,7 @@ fn v2_project_migrates_and_serves() {
     daemon.wait_success();
 
     let migrated = ProjectStore::new(project_path).unwrap().load().unwrap();
-    assert_eq!(migrated.schema_version(), 4);
+    assert_eq!(migrated.schema_version(), 5);
     assert_eq!(migrated.project().name(), "Legacy V2");
 }
 
@@ -555,7 +710,7 @@ fn v3_project_migrates_and_serves() {
     daemon.wait_success();
 
     let migrated = ProjectStore::new(project_path).unwrap().load().unwrap();
-    assert_eq!(migrated.schema_version(), 4);
+    assert_eq!(migrated.schema_version(), 5);
     assert_eq!(migrated.project().name(), "Frozen V3 Scene");
     let scene = &migrated.project().scenes()[0];
     assert_eq!(scene.background, Rgba8::OPAQUE_BLACK);
@@ -778,8 +933,17 @@ fn canonical_project() -> Project {
 }
 
 fn command(id: &str, key: &str, payload: CommandPayload) -> WireMessage {
+    command_version(ProtocolVersion::new(1, 0), id, key, payload)
+}
+
+fn command_version(
+    protocol: ProtocolVersion,
+    id: &str,
+    key: &str,
+    payload: CommandPayload,
+) -> WireMessage {
     WireMessage::Command(CommandMessage {
-        protocol: ProtocolVersion::new(1, 0),
+        protocol,
         id: id.into(),
         idempotency_key: key.into(),
         expected_revision: None,

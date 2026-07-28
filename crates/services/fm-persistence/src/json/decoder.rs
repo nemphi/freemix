@@ -15,8 +15,9 @@ use fm_types::{
 };
 
 use crate::{
-    CURRENT_SCHEMA_VERSION, IdempotencyReceipt, ProjectPosition, ProjectRouting,
-    ProjectValidationError, RuntimeRouting, StoredProject,
+    CURRENT_SCHEMA_VERSION, IdempotencyReceipt, ManualTransitionKind, ManualTransitionState,
+    ProjectPosition, ProjectRouting, ProjectValidationError, RuntimeManualTransitions,
+    RuntimeRouting, StoredProject,
 };
 
 use super::{
@@ -26,6 +27,7 @@ use super::{
 
 const V2_SCHEMA_VERSION: u32 = 2;
 const V3_SCHEMA_VERSION: u32 = 3;
+const V4_SCHEMA_VERSION: u32 = 4;
 
 pub(crate) fn decode(source: &str) -> Result<StoredProject, DecodeError> {
     let mut root = Object::new(Reader::new(source).document()?, "manifest")?;
@@ -39,10 +41,17 @@ pub(crate) fn decode(source: &str) -> Result<StoredProject, DecodeError> {
         ));
     }
     let project = ProjectDto::parse(root.take("project")?, false)?.into_domain();
-    let (routing, position, receipts) = parse_runtime(root.take("runtime")?)?;
+    let (routing, manual_transitions, position, receipts) =
+        parse_runtime(root.take("runtime")?, true)?;
     root.finish()?;
-    StoredProject::from_project(project, routing, position, receipts)
-        .map_err(DecodeError::Validation)
+    StoredProject::from_project_with_manual_transitions(
+        project,
+        routing,
+        manual_transitions,
+        position,
+        receipts,
+    )
+    .map_err(DecodeError::Validation)
 }
 
 pub(crate) fn decode_v2(source: &str) -> Result<StoredProject, DecodeError> {
@@ -61,7 +70,25 @@ pub(crate) fn decode_v3(source: &str) -> Result<StoredProject, DecodeError> {
         ));
     }
     let project = ProjectDto::parse(root.take("project")?, true)?.into_domain();
-    let (routing, position, receipts) = parse_runtime(root.take("runtime")?)?;
+    let (routing, _, position, receipts) = parse_runtime(root.take("runtime")?, false)?;
+    root.finish()?;
+    StoredProject::from_project(project, routing, position, receipts)
+        .map_err(DecodeError::Validation)
+}
+
+pub(crate) fn decode_v4(source: &str) -> Result<StoredProject, DecodeError> {
+    let mut root = Object::new(Reader::new(source).document()?, "manifest")?;
+    let schema = root.u32("schema_version")?;
+    if schema != V4_SCHEMA_VERSION {
+        return Err(DecodeError::Validation(
+            ProjectValidationError::UnsupportedSchema {
+                found: schema,
+                supported: V4_SCHEMA_VERSION,
+            },
+        ));
+    }
+    let project = ProjectDto::parse(root.take("project")?, false)?.into_domain();
+    let (routing, _, position, receipts) = parse_runtime(root.take("runtime")?, false)?;
     root.finish()?;
     StoredProject::from_project(project, routing, position, receipts)
         .map_err(DecodeError::Validation)
@@ -510,9 +537,23 @@ fn parse_restart_policy(value: Value) -> Result<RestartPolicy, DecodeError> {
 
 fn parse_runtime(
     value: Value,
-) -> Result<(RuntimeRouting, ProjectPosition, Vec<IdempotencyReceipt>), DecodeError> {
+    has_manual_transitions: bool,
+) -> Result<
+    (
+        RuntimeRouting,
+        RuntimeManualTransitions,
+        ProjectPosition,
+        Vec<IdempotencyReceipt>,
+    ),
+    DecodeError,
+> {
     let mut object = Object::new(value, "runtime")?;
     let routing = parse_routing(object.take("routing")?)?;
+    let manual_transitions = if has_manual_transitions {
+        parse_manual_transitions(object.take("manual_transitions")?)?
+    } else {
+        RuntimeManualTransitions::default()
+    };
     let position = parse_position(object.take("position")?)?;
     let receipts = parse_array(
         object.take("idempotency_receipts")?,
@@ -520,7 +561,39 @@ fn parse_runtime(
         parse_receipt,
     )?;
     object.finish()?;
-    Ok((routing, position, receipts))
+    Ok((routing, manual_transitions, position, receipts))
+}
+
+fn parse_manual_transitions(value: Value) -> Result<RuntimeManualTransitions, DecodeError> {
+    let mut object = Object::new(value, "manual transitions")?;
+    let transitions = RuntimeManualTransitions {
+        desired: parse_optional(object.take("desired")?, parse_manual_transition)?,
+        realized: parse_optional(object.take("realized")?, parse_manual_transition)?,
+    };
+    object.finish()?;
+    Ok(transitions)
+}
+
+fn parse_manual_transition(value: Value) -> Result<ManualTransitionState, DecodeError> {
+    let mut object = Object::new(value, "manual transition")?;
+    let kind = match object.string("kind")?.as_str() {
+        "fade" => ManualTransitionKind::Fade,
+        "wipe" => ManualTransitionKind::Wipe,
+        value => return Err(unknown_enum("manual transition kind", value)),
+    };
+    let from_id = InputId::new(object.nonzero_u128("from_id")?);
+    let to_id = InputId::new(object.nonzero_u128("to_id")?);
+    let interval_start_basis_points = object.u16("interval_start_basis_points")?;
+    let position_basis_points = object.u16("position_basis_points")?;
+    object.finish()?;
+    ManualTransitionState::new(
+        kind,
+        from_id,
+        to_id,
+        interval_start_basis_points,
+        position_basis_points,
+    )
+    .ok_or_else(|| syntax("manual transition position must not exceed 10000 basis points"))
 }
 
 fn parse_routing(value: Value) -> Result<RuntimeRouting, DecodeError> {
@@ -698,6 +771,11 @@ impl Object {
     fn u32(&mut self, field: &str) -> Result<u32, DecodeError> {
         u32::try_from(self.number(field)?)
             .map_err(|_| syntax(format!("field `{field}` exceeds u32")))
+    }
+
+    fn u16(&mut self, field: &str) -> Result<u16, DecodeError> {
+        u16::try_from(self.number(field)?)
+            .map_err(|_| syntax(format!("field `{field}` exceeds u16")))
     }
 
     fn i32(&mut self, field: &str) -> Result<i32, DecodeError> {

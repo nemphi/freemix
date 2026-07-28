@@ -12,7 +12,9 @@ use std::collections::{HashMap, HashSet};
 use fm_command::{CommandId, Revision};
 use fm_protocol::{
     CommandResult, EngineIdentity, EventCursor, EventMessage, EventPayload, FieldIssue,
-    ResumeCursor, ServerHello, ServerIdentity, SnapshotMessage,
+    ManualTransitionKind, ManualTransitionPosition,
+    ManualTransitionStatus as ProtocolManualTransitionStatus, ResumeCursor, ServerHello,
+    ServerIdentity, SnapshotMessage,
 };
 use fm_types::{InputId, ProjectId};
 
@@ -96,7 +98,40 @@ impl BusSelection {
 pub struct SwitcherState {
     pub desired: BusSelection,
     pub realized: BusSelection,
+    pub desired_manual_transition: ManualTransitionStatus,
+    pub realized_manual_transition: ManualTransitionStatus,
     pub runtime_generation: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ActiveManualTransition {
+    pub kind: ManualTransitionKind,
+    pub from: InputId,
+    pub to: InputId,
+    pub interval_start: ManualTransitionPosition,
+    pub position: ManualTransitionPosition,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManualTransitionStatus {
+    Inactive,
+    Active(ActiveManualTransition),
+}
+
+impl ManualTransitionStatus {
+    #[must_use]
+    pub const fn from_protocol(status: ProtocolManualTransitionStatus) -> Self {
+        match status {
+            ProtocolManualTransitionStatus::Inactive => Self::Inactive,
+            ProtocolManualTransitionStatus::Active(state) => Self::Active(ActiveManualTransition {
+                kind: state.kind,
+                from: state.from.to_domain(),
+                to: state.to.to_domain(),
+                interval_start: state.interval_start,
+                position: state.position,
+            }),
+        }
+    }
 }
 
 /// An authoritative project snapshot suitable for the UI reducer.
@@ -133,6 +168,12 @@ impl ProjectSnapshot {
                     message.realized_program.to_domain(),
                     message.realized_preview.to_domain(),
                 ),
+                desired_manual_transition: manual_status_from_protocol(
+                    message.desired_manual_transition,
+                ),
+                realized_manual_transition: manual_status_from_protocol(
+                    message.realized_manual_transition,
+                ),
                 runtime_generation: None,
             },
         }
@@ -142,7 +183,10 @@ impl ProjectSnapshot {
 /// A UI-owned durable desired-state change.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DurableChange {
-    DesiredSwitcher(BusSelection),
+    DesiredSwitcher {
+        selection: BusSelection,
+        manual_transition: ManualTransitionStatus,
+    },
 }
 
 /// One globally ordered project event.
@@ -157,9 +201,14 @@ impl DurableProjectEvent {
     #[must_use]
     pub fn from_protocol(project_id: ProjectId, message: EventMessage) -> Self {
         let change = match message.payload {
-            EventPayload::DesiredSwitcher { program, preview } => DurableChange::DesiredSwitcher(
-                BusSelection::new(program.to_domain(), preview.to_domain()),
-            ),
+            EventPayload::DesiredSwitcher {
+                program,
+                preview,
+                manual_transition,
+            } => DurableChange::DesiredSwitcher {
+                selection: BusSelection::new(program.to_domain(), preview.to_domain()),
+                manual_transition: manual_status_from_protocol(manual_transition),
+            },
         };
         Self {
             cursor: ProjectCursor {
@@ -203,6 +252,7 @@ pub struct RuntimeRealization {
     pub revision: Revision,
     pub generation: u64,
     pub sequence: u64,
+    pub manual_transition: Option<ManualTransitionStatus>,
 }
 
 /// Authoritative project data at the last applied cursor.
@@ -410,6 +460,7 @@ pub enum ModelError {
     RevisionExhausted,
     DuplicateInput(InputId),
     UnknownInput(InputId),
+    InvalidManualTransitionRouting,
     DuplicateCommand(CommandId),
     UnknownCommand(CommandId),
     StateUnavailable,
@@ -471,6 +522,8 @@ impl fmt::Display for ModelError {
             Self::RevisionExhausted => formatter.write_str("revision counter is exhausted"),
             Self::DuplicateInput(input) => write!(formatter, "snapshot repeats input {input}"),
             Self::UnknownInput(input) => write!(formatter, "unknown input {input}"),
+            Self::InvalidManualTransitionRouting => formatter
+                .write_str("manual transition endpoints do not match Program and Preview routing"),
             Self::DuplicateCommand(id) => write!(formatter, "command {id} is already pending"),
             Self::UnknownCommand(id) => write!(formatter, "command {id} is not pending"),
             Self::StateUnavailable => formatter.write_str("no project snapshot is installed"),
@@ -488,7 +541,7 @@ pub struct ClientModel {
     expected_engine: Option<EngineIdentity>,
     state: Option<ProjectState>,
     applied_events: HashMap<Revision, DurableProjectEvent>,
-    desired_by_revision: HashMap<Revision, BusSelection>,
+    desired_by_revision: HashMap<Revision, (BusSelection, ManualTransitionStatus)>,
     last_runtime_realization: Option<RuntimeRealization>,
     pending: Vec<PendingCommand>,
     last_rejection: Option<RejectedCommand>,
@@ -695,8 +748,13 @@ impl ClientModel {
             self.desired_by_revision.clear();
             self.last_runtime_realization = None;
         }
-        self.desired_by_revision
-            .insert(snapshot.cursor.revision, snapshot.switcher.desired);
+        self.desired_by_revision.insert(
+            snapshot.cursor.revision,
+            (
+                snapshot.switcher.desired,
+                snapshot.switcher.desired_manual_transition,
+            ),
+        );
         self.expected_engine = Some(snapshot.cursor.engine.clone());
         self.known_revision = Some(snapshot.cursor.revision);
         self.cursor = Some(snapshot.cursor);
@@ -776,8 +834,13 @@ impl ClientModel {
         apply_change(&mut state.switcher, event.change);
 
         let revision = event.cursor.revision;
-        self.desired_by_revision
-            .insert(revision, state.switcher.desired);
+        self.desired_by_revision.insert(
+            revision,
+            (
+                state.switcher.desired,
+                state.switcher.desired_manual_transition,
+            ),
+        );
         self.cursor = Some(event.cursor.clone());
         self.applied_events.insert(revision, event);
         let reconciled_commands = self.reconcile_through(revision);
@@ -848,7 +911,7 @@ impl ClientModel {
                 },
             }
         }
-        let desired = self
+        let (desired, desired_manual_transition) = self
             .desired_by_revision
             .get(&realization.revision)
             .copied()
@@ -857,6 +920,9 @@ impl ClientModel {
             })?;
         let state = self.state.as_mut().ok_or(ModelError::StateUnavailable)?;
         state.switcher.realized = desired;
+        state.switcher.realized_manual_transition = realization
+            .manual_transition
+            .unwrap_or(desired_manual_transition);
         state.switcher.runtime_generation = Some(realization.generation);
         self.last_runtime_realization = Some(realization);
         Ok(RuntimeRealizationApplied::Applied)
@@ -1056,20 +1122,33 @@ fn validate_snapshot_inputs(snapshot: &ProjectSnapshot) -> Result<(), ModelError
             return Err(ModelError::UnknownInput(input));
         }
     }
+    validate_manual_transition(
+        snapshot.switcher.desired_manual_transition,
+        snapshot.switcher.desired,
+        &inputs,
+    )?;
+    validate_manual_transition(
+        snapshot.switcher.realized_manual_transition,
+        snapshot.switcher.realized,
+        &inputs,
+    )?;
     Ok(())
 }
 
 fn validate_change(change: &DurableChange, inputs: &[InputId]) -> Result<(), ModelError> {
-    let required = match *change {
-        DurableChange::DesiredSwitcher(selection) => {
-            [Some(selection.program), Some(selection.preview)]
-        }
+    let (selection, manual_transition) = match *change {
+        DurableChange::DesiredSwitcher {
+            selection,
+            manual_transition,
+        } => (selection, manual_transition),
     };
-    for input in required.into_iter().flatten() {
+    for input in [selection.program, selection.preview] {
         if !inputs.contains(&input) {
             return Err(ModelError::UnknownInput(input));
         }
     }
+    let input_set = inputs.iter().copied().collect();
+    validate_manual_transition(manual_transition, selection, &input_set)?;
     Ok(())
 }
 
@@ -1084,8 +1163,42 @@ fn validate_optimistic(change: OptimisticChange, inputs: &[InputId]) -> Result<(
 
 fn apply_change(switcher: &mut SwitcherState, change: DurableChange) {
     match change {
-        DurableChange::DesiredSwitcher(selection) => switcher.desired = selection,
+        DurableChange::DesiredSwitcher {
+            selection,
+            manual_transition,
+        } => {
+            switcher.desired = selection;
+            switcher.desired_manual_transition = manual_transition;
+        }
     }
+}
+
+fn manual_status_from_protocol(
+    status: Option<ProtocolManualTransitionStatus>,
+) -> ManualTransitionStatus {
+    status.map_or(
+        ManualTransitionStatus::Inactive,
+        ManualTransitionStatus::from_protocol,
+    )
+}
+
+fn validate_manual_transition(
+    status: ManualTransitionStatus,
+    selection: BusSelection,
+    inputs: &HashSet<InputId>,
+) -> Result<(), ModelError> {
+    let ManualTransitionStatus::Active(state) = status else {
+        return Ok(());
+    };
+    for input in [state.from, state.to] {
+        if !inputs.contains(&input) {
+            return Err(ModelError::UnknownInput(input));
+        }
+    }
+    if state.from != selection.program || state.to != selection.preview {
+        return Err(ModelError::InvalidManualTransitionRouting);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

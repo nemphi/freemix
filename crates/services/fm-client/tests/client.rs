@@ -7,11 +7,13 @@ use fm_client::{
 use fm_protocol::{
     CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, ClientType, CommandPayload, CommandResult,
     EngineIdentity, EventCursor, EventMessage, EventPayload, HandshakeOutcome, HandshakeResponse,
-    MANUAL_TRANSITION_PROTOCOL_VERSION, ManualTransitionKind, ProtocolVersion, ResumeCursor, Role,
+    MANUAL_TRANSITION_PROTOCOL_VERSION, ManualTransitionKind, ManualTransitionPosition,
+    ManualTransitionState, ManualTransitionStatus, ProtocolVersion, ResumeCursor, Role,
     RuntimeEventMessage, RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage, SnapshotReason,
     WIPE_PROTOCOL_VERSION, WireInputId, WireMessage,
 };
 use fm_types::ProjectId;
+use fm_ui_model::ManualTransitionStatus as ModelManualTransitionStatus;
 
 fn input(value: u128) -> WireInputId {
     WireInputId::new(NonZeroU128::new(value).unwrap())
@@ -94,6 +96,8 @@ fn snapshot(revision: u64) -> SnapshotMessage {
         desired_preview: input(2),
         realized_program: input(1),
         realized_preview: input(2),
+        desired_manual_transition: Some(ManualTransitionStatus::Inactive),
+        realized_manual_transition: Some(ManualTransitionStatus::Inactive),
     }
 }
 
@@ -108,6 +112,16 @@ fn ready_client(capacity: usize) -> Client {
     let mut client = Client::new(config(capacity)).unwrap();
     connect_snapshot(&mut client, 4);
     client
+}
+
+fn active_manual(interval_start: u16, position: u16) -> ManualTransitionStatus {
+    ManualTransitionStatus::Active(ManualTransitionState {
+        kind: ManualTransitionKind::Wipe,
+        from: input(1),
+        to: input(2),
+        interval_start: ManualTransitionPosition::new(interval_start).unwrap(),
+        position: ManualTransitionPosition::new(position).unwrap(),
+    })
 }
 
 fn complete_cut(client: &mut Client, key: String) -> fm_protocol::CommandMessage {
@@ -177,6 +191,7 @@ fn connect_snapshot_resume_and_reconnect_are_deterministic() {
             payload: EventPayload::DesiredSwitcher {
                 program: input(2),
                 preview: input(1),
+                manual_transition: Some(ManualTransitionStatus::Inactive),
             },
         })
         .unwrap();
@@ -654,6 +669,7 @@ fn event_gap_requests_snapshot_resync() {
             payload: EventPayload::DesiredSwitcher {
                 program: input(2),
                 preview: input(1),
+                manual_transition: Some(ManualTransitionStatus::Inactive),
             },
         })
         .unwrap_err();
@@ -685,6 +701,7 @@ fn same_revision_runtime_realization_does_not_move_durable_cursor() {
                 1,
                 RuntimeLifecycleEvent::Realized {
                     domain: "switcher".to_owned(),
+                    manual_transition: Some(ManualTransitionStatus::Inactive),
                 },
             )))
             .unwrap(),
@@ -704,6 +721,74 @@ fn same_revision_runtime_realization_does_not_move_durable_cursor() {
 }
 
 #[test]
+fn reconnecting_second_client_reduces_exact_desired_and_realized_manual_state() {
+    let mut first = Client::new(config(4)).unwrap();
+    first.start_connect().unwrap();
+    first.transport_connected().unwrap();
+    first.accept_handshake(handshake(4, None)).unwrap();
+    let mut initial = snapshot(4);
+    initial.desired_manual_transition = Some(active_manual(0, 6_250));
+    initial.realized_manual_transition = Some(active_manual(6_250, 6_250));
+    first.apply_snapshot(initial.clone()).unwrap();
+
+    let mut second = Client::new(config(4)).unwrap();
+    second.start_connect().unwrap();
+    second.transport_connected().unwrap();
+    second.accept_handshake(handshake(4, None)).unwrap();
+    second.apply_snapshot(initial).unwrap();
+    let switcher = second.model().state().unwrap().switcher();
+    assert!(matches!(
+        switcher.desired_manual_transition,
+        ModelManualTransitionStatus::Active(state)
+            if state.interval_start.basis_points() == 0
+                && state.position.basis_points() == 6_250
+    ));
+    assert!(matches!(
+        switcher.realized_manual_transition,
+        ModelManualTransitionStatus::Active(state)
+            if state.interval_start.basis_points() == 6_250
+                && state.position.basis_points() == 6_250
+    ));
+
+    second
+        .apply_event(EventMessage {
+            cursor: EventCursor {
+                engine: engine(),
+                revision: 5,
+            },
+            payload: EventPayload::DesiredSwitcher {
+                program: input(1),
+                preview: input(2),
+                manual_transition: Some(active_manual(0, 2_500)),
+            },
+        })
+        .unwrap();
+    second
+        .apply_runtime_event(runtime_event(
+            5,
+            5,
+            1,
+            RuntimeLifecycleEvent::Realized {
+                domain: "switcher".into(),
+                manual_transition: Some(active_manual(2_500, 2_500)),
+            },
+        ))
+        .unwrap();
+    let switcher = second.model().state().unwrap().switcher();
+    assert!(matches!(
+        switcher.desired_manual_transition,
+        ModelManualTransitionStatus::Active(state)
+            if state.position.basis_points() == 2_500
+    ));
+    assert!(matches!(
+        switcher.realized_manual_transition,
+        ModelManualTransitionStatus::Active(state)
+            if state.interval_start.basis_points() == 2_500
+                && state.position.basis_points() == 2_500
+    ));
+}
+
+#[test]
 fn runtime_lifecycle_sequence_is_recorded_without_durable_reduction() {
     let mut client = ready_client(2);
     client
@@ -716,6 +801,7 @@ fn runtime_lifecycle_sequence_is_recorded_without_durable_reduction() {
             2,
             RuntimeLifecycleEvent::Realized {
                 domain: "audio".to_owned(),
+                manual_transition: Some(ManualTransitionStatus::Inactive),
             },
         ))
         .unwrap();
@@ -781,6 +867,7 @@ fn runtime_sequence_gap_does_not_request_durable_resync() {
             payload: EventPayload::DesiredSwitcher {
                 program: input(2),
                 preview: input(1),
+                manual_transition: Some(ManualTransitionStatus::Inactive),
             },
         })
         .unwrap();

@@ -1,0 +1,1 @@
+event	engine_id=engine-a	state_epoch=7	log_id=log-a	revision=1842	event=desired_switcher	program=1	preview=2	?manual_active=1	?manual_kind=wipe	?manual_from=1	?manual_to=2	?manual_interval_start_basis_points=0	?manual_position_basis_points=6250

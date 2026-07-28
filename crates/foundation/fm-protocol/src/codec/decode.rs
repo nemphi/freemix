@@ -5,7 +5,8 @@ use crate::{
     CapabilityReportMessage, CapabilityReportSummary, ClientHello, CodecError, CommandMessage,
     CommandPayload, CommandResult, DurableEventBatch, DurableGap, EngineIdentity, ErrorMessage,
     EventCursor, EventMessage, EventPayload, HandshakeOutcome, HandshakeRequest, HandshakeResponse,
-    HeartbeatMessage, ResumeCursor, RuntimeEventMessage, RuntimeFailureDisposition,
+    HeartbeatMessage, ManualTransitionKind, ManualTransitionPosition, ManualTransitionState,
+    ManualTransitionStatus, ResumeCursor, RuntimeEventMessage, RuntimeFailureDisposition,
     RuntimeLifecycleEvent, ServerHello, ServerIdentity, SnapshotMessage, SnapshotReason,
     StructuredError, WireInputId, WireMessage,
 };
@@ -192,6 +193,16 @@ impl Fields {
             "1" => Ok(true),
             _ => Err(CodecError::InvalidField { field: name, value }),
         }
+    }
+
+    fn boolean_optional(&mut self, name: &'static str) -> Result<Option<bool>, CodecError> {
+        self.optional(name)
+            .map(|value| match value.as_str() {
+                "0" => Ok(false),
+                "1" => Ok(true),
+                _ => Err(CodecError::InvalidField { field: name, value }),
+            })
+            .transpose()
     }
 
     fn input(&mut self, name: &'static str) -> Result<WireInputId, CodecError> {
@@ -386,6 +397,8 @@ fn decode_snapshot(fields: &mut Fields) -> Result<SnapshotMessage, CodecError> {
         desired_preview: fields.input("desired_preview")?,
         realized_program: fields.input("realized_program")?,
         realized_preview: fields.input("realized_preview")?,
+        desired_manual_transition: decode_manual_status(fields, ManualStatusFields::Desired)?,
+        realized_manual_transition: decode_manual_status(fields, ManualStatusFields::Realized)?,
     })
 }
 
@@ -395,6 +408,7 @@ fn decode_event(fields: &mut Fields) -> Result<EventMessage, CodecError> {
         "desired_switcher" => EventPayload::DesiredSwitcher {
             program: fields.input("program")?,
             preview: fields.input("preview")?,
+            manual_transition: decode_manual_status(fields, ManualStatusFields::Unqualified)?,
         },
         _ => {
             return Err(CodecError::InvalidField {
@@ -597,6 +611,7 @@ fn decode_runtime_event(fields: &mut Fields) -> Result<RuntimeEventMessage, Code
         },
         "realized" => RuntimeLifecycleEvent::Realized {
             domain: fields.required("domain")?,
+            manual_transition: decode_manual_status(fields, ManualStatusFields::Unqualified)?,
         },
         "failed" => {
             let disposition_value = fields.required("disposition")?;
@@ -627,6 +642,93 @@ fn decode_runtime_event(fields: &mut Fields) -> Result<RuntimeEventMessage, Code
         sequence,
         event,
     })
+}
+
+#[derive(Clone, Copy)]
+enum ManualStatusFields {
+    Desired,
+    Realized,
+    Unqualified,
+}
+
+fn decode_manual_status(
+    fields: &mut Fields,
+    names: ManualStatusFields,
+) -> Result<Option<ManualTransitionStatus>, CodecError> {
+    let (active, kind, from, to, interval_start, position) = match names {
+        ManualStatusFields::Desired => (
+            "?desired_manual_active",
+            "?desired_manual_kind",
+            "?desired_manual_from",
+            "?desired_manual_to",
+            "?desired_manual_interval_start_basis_points",
+            "?desired_manual_position_basis_points",
+        ),
+        ManualStatusFields::Realized => (
+            "?realized_manual_active",
+            "?realized_manual_kind",
+            "?realized_manual_from",
+            "?realized_manual_to",
+            "?realized_manual_interval_start_basis_points",
+            "?realized_manual_position_basis_points",
+        ),
+        ManualStatusFields::Unqualified => (
+            "?manual_active",
+            "?manual_kind",
+            "?manual_from",
+            "?manual_to",
+            "?manual_interval_start_basis_points",
+            "?manual_position_basis_points",
+        ),
+    };
+    let Some(active_value) = fields.boolean_optional(active)? else {
+        return Ok(None);
+    };
+    if !active_value {
+        return Ok(Some(ManualTransitionStatus::Inactive));
+    }
+    let kind_value = fields.required(kind)?;
+    let kind = match kind_value.as_str() {
+        "fade" => ManualTransitionKind::Fade,
+        "wipe" => ManualTransitionKind::Wipe,
+        _ => {
+            return Err(CodecError::InvalidField {
+                field: kind,
+                value: kind_value,
+            });
+        }
+    };
+    let from_value = fields.required(from)?;
+    let from_input = parse_input(&from_value).ok_or(CodecError::InvalidField {
+        field: from,
+        value: from_value,
+    })?;
+    let to_value = fields.required(to)?;
+    let to_input = parse_input(&to_value).ok_or(CodecError::InvalidField {
+        field: to,
+        value: to_value,
+    })?;
+    let interval_value: u16 = fields.parse_required(interval_start)?;
+    let interval_start_position =
+        ManualTransitionPosition::new(interval_value).ok_or(CodecError::InvalidField {
+            field: interval_start,
+            value: interval_value.to_string(),
+        })?;
+    let position_value: u16 = fields.parse_required(position)?;
+    let exact_position =
+        ManualTransitionPosition::new(position_value).ok_or(CodecError::InvalidField {
+            field: position,
+            value: position_value.to_string(),
+        })?;
+    Ok(Some(ManualTransitionStatus::Active(
+        ManualTransitionState {
+            kind,
+            from: from_input,
+            to: to_input,
+            interval_start: interval_start_position,
+            position: exact_position,
+        },
+    )))
 }
 
 fn decode_heartbeat(fields: &mut Fields) -> Result<HeartbeatMessage, CodecError> {

@@ -57,6 +57,24 @@ impl TBarState {
         }
     }
 
+    /// Reconstructs exact manual-transition state from a validated checkpoint.
+    #[must_use]
+    pub const fn restore(
+        kind: TransitionKind,
+        from: InputId,
+        to: InputId,
+        interval_start: TBarPosition,
+        position: TBarPosition,
+    ) -> Self {
+        Self {
+            kind,
+            from,
+            to,
+            interval_start,
+            position,
+        }
+    }
+
     #[must_use]
     pub const fn kind(self) -> TransitionKind {
         self.kind

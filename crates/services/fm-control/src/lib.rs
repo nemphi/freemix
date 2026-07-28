@@ -19,12 +19,13 @@ use fm_auth::{AuthorizationDenial, CommandClass, Policy, Principal};
 use fm_command::{CommandReceipt, DurableEvent, IdempotencyKey, RejectionCode};
 use fm_engine::{
     Engine, EngineAcceptance, EngineCommand, EngineCommandOutcome, EngineError, EngineEvent,
-    EngineManualTransitionKind, EngineManualTransitionPosition, EnginePrepareOutcome,
-    EngineSnapshot, FrameResult, PreparedEngineExecution, SnapshotError,
+    EngineManualTransitionKind, EngineManualTransitionPosition, EngineManualTransitionState,
+    EnginePrepareOutcome, EngineSnapshot, FrameResult, PreparedEngineExecution, SnapshotError,
 };
 use fm_protocol::{
     CommandMessage, CommandPayload, CommandResult, EngineIdentity, EventCursor, EventMessage,
-    EventPayload, FieldIssue, ManualTransitionKind, RuntimeEventMessage, RuntimeLifecycleEvent,
+    EventPayload, FieldIssue, ManualTransitionKind, ManualTransitionPosition,
+    ManualTransitionState, ManualTransitionStatus, RuntimeEventMessage, RuntimeLifecycleEvent,
     ServerIdentity, SnapshotMessage, WireInputId, WireMessage,
 };
 
@@ -947,6 +948,9 @@ impl<A: AuthorizationHook> ControlService<A> {
             sequence: self.runtime_sequence,
             event: RuntimeLifecycleEvent::Realized {
                 domain: "switcher".to_owned(),
+                manual_transition: Some(protocol_manual_status(
+                    self.engine.realized_manual_transition(),
+                )),
             },
         })
     }
@@ -1031,6 +1035,7 @@ fn engine_submission(
             payload: EventPayload::DesiredSwitcher {
                 program: WireInputId::from_domain(engine.show().desired_switcher().program()),
                 preview: WireInputId::from_domain(engine.show().desired_switcher().preview()),
+                manual_transition: Some(protocol_manual_status(engine.desired_manual_transition())),
             },
         }]
     } else {
@@ -1077,6 +1082,10 @@ fn snapshot_record(engine: &Engine, identity: &EngineIdentity) -> SnapshotRecord
         desired_preview: WireInputId::from_domain(engine.show().desired_switcher().preview()),
         realized_program: WireInputId::from_domain(engine.realized_switcher().program()),
         realized_preview: WireInputId::from_domain(engine.realized_switcher().preview()),
+        desired_manual_transition: Some(protocol_manual_status(engine.desired_manual_transition())),
+        realized_manual_transition: Some(protocol_manual_status(
+            engine.realized_manual_transition(),
+        )),
     };
     SnapshotRecord {
         cursor: EventCursor {
@@ -1085,6 +1094,25 @@ fn snapshot_record(engine: &Engine, identity: &EngineIdentity) -> SnapshotRecord
         },
         snapshot,
     }
+}
+
+fn protocol_manual_status(state: Option<EngineManualTransitionState>) -> ManualTransitionStatus {
+    let Some(state) = state else {
+        return ManualTransitionStatus::Inactive;
+    };
+    let kind = match state.kind {
+        EngineManualTransitionKind::Fade => ManualTransitionKind::Fade,
+        EngineManualTransitionKind::Wipe => ManualTransitionKind::Wipe,
+    };
+    ManualTransitionStatus::Active(ManualTransitionState {
+        kind,
+        from: WireInputId::from_domain(state.from),
+        to: WireInputId::from_domain(state.to),
+        interval_start: ManualTransitionPosition::new(state.interval_start.basis_points())
+            .expect("engine manual transition positions are bounded"),
+        position: ManualTransitionPosition::new(state.position.basis_points())
+            .expect("engine manual transition positions are bounded"),
+    })
 }
 
 #[cfg(test)]

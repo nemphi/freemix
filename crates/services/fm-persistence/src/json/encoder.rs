@@ -8,7 +8,10 @@ use fm_types::{
     ScanMode, SignalRange, TransferFunction,
 };
 
-use crate::{CURRENT_SCHEMA_VERSION, IdempotencyReceipt, ReceiptOutcome, StoredProject};
+use crate::{
+    CURRENT_SCHEMA_VERSION, IdempotencyReceipt, ManualTransitionKind, ManualTransitionState,
+    ReceiptOutcome, StoredProject,
+};
 
 pub(crate) fn encode(stored: &StoredProject) -> String {
     let mut output = String::new();
@@ -113,10 +116,16 @@ fn write_runtime(output: &mut String, stored: &StoredProject) {
         routing.realized_preview_id,
         false,
     );
+    let manual = stored.runtime_manual_transitions();
+    output.push_str("    },\n    \"manual_transitions\": {\n      \"desired\": ");
+    write_manual_transition(output, manual.desired);
+    output.push_str(",\n      \"realized\": ");
+    write_manual_transition(output, manual.realized);
+    output.push_str("\n    },\n");
     let position = stored.position();
     write!(
         output,
-        "    }},\n    \"position\": {{\n      \"revision\": {},\n      \"state_epoch\": {},\n      \"event_sequence\": {},\n      \"frames_rendered\": {},\n      \"runtime_generation\": {},\n      \"clock_time_nanos\": {}\n    }},\n    \"idempotency_receipts\": [",
+        "    \"position\": {{\n      \"revision\": {},\n      \"state_epoch\": {},\n      \"event_sequence\": {},\n      \"frames_rendered\": {},\n      \"runtime_generation\": {},\n      \"clock_time_nanos\": {}\n    }},\n    \"idempotency_receipts\": [",
         position.revision,
         position.state_epoch,
         position.event_sequence,
@@ -130,6 +139,26 @@ fn write_runtime(output: &mut String, stored: &StoredProject) {
     }
     array_end(output, stored.idempotency_receipts().is_empty(), 4);
     output.push_str("\n  }");
+}
+
+fn write_manual_transition(output: &mut String, transition: Option<ManualTransitionState>) {
+    let Some(transition) = transition else {
+        output.push_str("null");
+        return;
+    };
+    let kind = match transition.kind {
+        ManualTransitionKind::Fade => "fade",
+        ManualTransitionKind::Wipe => "wipe",
+    };
+    write!(
+        output,
+        "{{\"kind\": \"{kind}\", \"from_id\": {}, \"to_id\": {}, \"interval_start_basis_points\": {}, \"position_basis_points\": {}}}",
+        transition.from_id,
+        transition.to_id,
+        transition.interval_start_basis_points,
+        transition.position_basis_points,
+    )
+    .expect("writing to a string cannot fail");
 }
 
 fn write_project_collections(output: &mut String, project: &fm_model::Project) {

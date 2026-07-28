@@ -18,11 +18,13 @@ use fm_model::{
     SimulatedVideo, SolidColor,
 };
 use fm_persistence::{
-    IdempotencyReceipt, ProjectPosition, ProjectStore, ProjectValidationError, ReceiptOutcome,
-    RuntimeRouting, StoreError, StoredProject,
+    IdempotencyReceipt, ManualTransitionKind as PersistedManualTransitionKind,
+    ManualTransitionState as PersistedManualTransitionState, ProjectPosition, ProjectStore,
+    ProjectValidationError, ReceiptOutcome, RuntimeManualTransitions, RuntimeRouting, StoreError,
+    StoredProject,
 };
 use fm_sim::{Rgba8, SimulatedPipeline, SimulatedSource, SourcePattern};
-use fm_switcher::SwitcherState;
+use fm_switcher::{SwitcherState, TBarPosition, TBarState, TransitionKind};
 use fm_types::{
     AudioFormat, ChannelLayout, ColorMetadata, FrameRate, InputId, PixelFormat, ProjectId,
     SampleFormat, SampleRate, ScanMode, VideoDimensions, VideoFormat,
@@ -405,13 +407,17 @@ fn save_engine(path: &Path, project_engine: &ProjectEngine) -> AppResult<()> {
     let realized = snapshot.realized_switcher();
     let mut project = project_engine.project.clone();
     project.set_main_mix(MainMix::new(desired.program(), desired.preview()));
-    let stored = StoredProject::from_project(
+    let stored = StoredProject::from_project_with_manual_transitions(
         project,
         RuntimeRouting {
             desired_program_id: Some(desired.program()),
             realized_program_id: Some(realized.program()),
             desired_preview_id: Some(desired.preview()),
             realized_preview_id: Some(realized.preview()),
+        },
+        RuntimeManualTransitions {
+            desired: desired.t_bar().map(persisted_t_bar),
+            realized: realized.t_bar().map(persisted_t_bar),
         },
         ProjectPosition {
             revision: snapshot.revision().get(),
@@ -443,13 +449,20 @@ fn load_engine(path: &Path) -> AppResult<ProjectEngine> {
     let routing = stored.runtime_routing();
     let realized_program = required_routing(routing.realized_program_id, "realized program")?;
     let realized_preview = required_routing(routing.realized_preview_id, "realized preview")?;
-    let show = ShowState::new(
+    let mut show = ShowState::new(
         project.name(),
         inputs.clone(),
         main_mix.desired_program,
         main_mix.desired_preview,
     )?;
-    let realized = SwitcherState::new(inputs, realized_program, realized_preview)?;
+    let mut realized = SwitcherState::new(inputs, realized_program, realized_preview)?;
+    let manual = stored.runtime_manual_transitions();
+    if let Some(state) = manual.desired {
+        show.restore_manual_transition(restored_t_bar(state)?)?;
+    }
+    if let Some(state) = manual.realized {
+        realized.restore_t_bar(restored_t_bar(state)?)?;
+    }
     let position = stored.position();
     let engine = Engine::restore_persisted(
         show,
@@ -473,6 +486,40 @@ fn load_engine(path: &Path) -> AppResult<ProjectEngine> {
     Ok(ProjectEngine { project, engine })
 }
 
+fn persisted_t_bar(state: TBarState) -> PersistedManualTransitionState {
+    let kind = match state.kind() {
+        TransitionKind::Fade => PersistedManualTransitionKind::Fade,
+        TransitionKind::Wipe => PersistedManualTransitionKind::Wipe,
+        _ => unreachable!("engine manual transitions are fade or wipe"),
+    };
+    PersistedManualTransitionState::new(
+        kind,
+        state.from(),
+        state.to(),
+        state.interval_start().basis_points(),
+        state.position().basis_points(),
+    )
+    .expect("engine manual transition positions are bounded")
+}
+
+fn restored_t_bar(state: PersistedManualTransitionState) -> AppResult<TBarState> {
+    let kind = match state.kind {
+        PersistedManualTransitionKind::Fade => TransitionKind::Fade,
+        PersistedManualTransitionKind::Wipe => TransitionKind::Wipe,
+    };
+    let interval_start = TBarPosition::new(state.interval_start_basis_points)
+        .ok_or_else(|| AppFailure("invalid persisted manual-transition interval start".into()))?;
+    let position = TBarPosition::new(state.position_basis_points)
+        .ok_or_else(|| AppFailure("invalid persisted manual-transition position".into()))?;
+    Ok(TBarState::restore(
+        kind,
+        state.from_id,
+        state.to_id,
+        interval_start,
+        position,
+    ))
+}
+
 fn load_stored_project(path: &Path) -> AppResult<StoredProject> {
     let store = ProjectStore::new(path)?;
     match store.load() {
@@ -487,6 +534,12 @@ fn load_stored_project(path: &Path) -> AppResult<StoredProject> {
             found: 3, ..
         })) => {
             store.migrate_v3()?;
+            Ok(store.load()?)
+        }
+        Err(StoreError::Validation(ProjectValidationError::UnsupportedSchema {
+            found: 4, ..
+        })) => {
+            store.migrate_v4()?;
             Ok(store.load()?)
         }
         Err(error) => Err(error.into()),

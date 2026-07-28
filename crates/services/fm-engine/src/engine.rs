@@ -51,6 +51,15 @@ impl EngineManualTransitionPosition {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EngineManualTransitionState {
+    pub kind: EngineManualTransitionKind,
+    pub from: InputId,
+    pub to: InputId,
+    pub interval_start: EngineManualTransitionPosition,
+    pub position: EngineManualTransitionPosition,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EngineCommand {
     SelectPreview(InputId),
     Cut,
@@ -210,6 +219,19 @@ impl EngineSnapshot {
     }
 
     #[must_use]
+    pub fn desired_manual_transition(&self) -> Option<EngineManualTransitionState> {
+        self.show()
+            .desired_switcher()
+            .t_bar()
+            .map(engine_manual_state)
+    }
+
+    #[must_use]
+    pub fn realized_manual_transition(&self) -> Option<EngineManualTransitionState> {
+        self.realized_switcher.t_bar().map(engine_manual_state)
+    }
+
+    #[must_use]
     pub const fn state_epoch(&self) -> StateEpoch {
         self.state_epoch
     }
@@ -293,6 +315,19 @@ impl Engine {
     #[must_use]
     pub const fn realized_switcher(&self) -> &SwitcherState {
         &self.realized_switcher
+    }
+
+    #[must_use]
+    pub fn desired_manual_transition(&self) -> Option<EngineManualTransitionState> {
+        self.show()
+            .desired_switcher()
+            .t_bar()
+            .map(engine_manual_state)
+    }
+
+    #[must_use]
+    pub fn realized_manual_transition(&self) -> Option<EngineManualTransitionState> {
+        self.realized_switcher.t_bar().map(engine_manual_state)
     }
 
     #[must_use]
@@ -643,6 +678,15 @@ fn validate_idle_restore(
     {
         return Err(SnapshotError::MismatchedSwitcherRouting);
     }
+    match (show.desired_switcher().t_bar(), realized_switcher.t_bar()) {
+        (None, None) => {}
+        (Some(desired), Some(realized))
+            if desired.kind() == realized.kind()
+                && desired.from() == realized.from()
+                && desired.to() == realized.to()
+                && desired.position() == realized.position() => {}
+        _ => return Err(SnapshotError::MismatchedManualTransition),
+    }
 
     let cursor = restore_state.frame_cursor.get();
     let pacer = fm_scheduler::FramePacer::new(frame_rate, 0);
@@ -789,11 +833,29 @@ const fn manual_transition_kind(kind: EngineManualTransitionKind) -> TransitionK
     }
 }
 
+fn engine_manual_state(state: fm_switcher::TBarState) -> EngineManualTransitionState {
+    EngineManualTransitionState {
+        kind: match state.kind() {
+            TransitionKind::Fade => EngineManualTransitionKind::Fade,
+            TransitionKind::Wipe => EngineManualTransitionKind::Wipe,
+            _ => unreachable!("engine manual transitions are fade or wipe"),
+        },
+        from: state.from(),
+        to: state.to(),
+        interval_start: EngineManualTransitionPosition::new(state.interval_start().basis_points())
+            .expect("switcher manual transition positions are bounded"),
+        position: EngineManualTransitionPosition::new(state.position().basis_points())
+            .expect("switcher manual transition positions are bounded"),
+    }
+}
+
 fn switcher_rejection(error: SwitcherError) -> Rejection {
     let code = match error {
         SwitcherError::UnknownInput(_) => RejectionCode::NotFound,
         SwitcherError::TransitionInProgress => RejectionCode::Conflict,
-        SwitcherError::ZeroDuration => RejectionCode::InvalidCommand,
+        SwitcherError::InvalidManualTransitionRoute | SwitcherError::ZeroDuration => {
+            RejectionCode::InvalidCommand
+        }
     };
     Rejection::new(code, error.to_string())
 }

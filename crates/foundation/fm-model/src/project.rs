@@ -2,10 +2,11 @@ use fm_types::{AudioFormat, BusId, FrameRate, InputId, OutputId, ProjectId, Scen
 
 use crate::{ValidationError, validation::validate_project};
 
-pub const CURRENT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(4);
+pub const CURRENT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(5);
 pub const OLDEST_SUPPORTED_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(2);
-pub const SUPPORTED_SCHEMA_VERSIONS: [SchemaVersion; 3] = [
+pub const SUPPORTED_SCHEMA_VERSIONS: [SchemaVersion; 4] = [
     CURRENT_SCHEMA_VERSION,
+    SchemaVersion::new(4),
     SchemaVersion::new(3),
     OLDEST_SUPPORTED_SCHEMA_VERSION,
 ];

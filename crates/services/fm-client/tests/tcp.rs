@@ -105,6 +105,8 @@ fn snapshot(revision: u64) -> SnapshotMessage {
         desired_preview: input(2),
         realized_program: input(1),
         realized_preview: input(2),
+        desired_manual_transition: None,
+        realized_manual_transition: None,
     }
 }
 
@@ -117,6 +119,7 @@ fn event(revision: u64) -> EventMessage {
         payload: EventPayload::DesiredSwitcher {
             program: input(2),
             preview: input(1),
+            manual_transition: None,
         },
     }
 }
@@ -129,6 +132,7 @@ fn runtime_event(revision: u64) -> RuntimeEventMessage {
         sequence: 1,
         event: RuntimeLifecycleEvent::Realized {
             domain: "switcher".to_owned(),
+            manual_transition: None,
         },
     }
 }
@@ -1001,6 +1005,7 @@ fn model_error_forces_snapshot_and_preserves_unresolved_command() {
             payload: EventPayload::DesiredSwitcher {
                 program: input(1),
                 preview: input(99),
+                manual_transition: None,
             },
         }));
         assert_eq!(first.stream.read(&mut [0_u8; 1]).unwrap(), 0);

@@ -2,9 +2,9 @@ use crate::{
     CapabilityReportMessage, CapabilityReportSummary, ClientHello, CommandMessage, CommandPayload,
     CommandResult, DurableEventBatch, DurableGap, EngineIdentity, ErrorMessage, EventCursor,
     EventMessage, EventPayload, HandshakeOutcome, HandshakeRequest, HandshakeResponse,
-    HeartbeatMessage, ResumeCursor, RuntimeEventMessage, RuntimeFailureDisposition,
-    RuntimeLifecycleEvent, ServerHello, ServerIdentity, SnapshotMessage, SnapshotReason,
-    StructuredError, WireMessage,
+    HeartbeatMessage, ManualTransitionKind, ManualTransitionStatus, ResumeCursor,
+    RuntimeEventMessage, RuntimeFailureDisposition, RuntimeLifecycleEvent, ServerHello,
+    ServerIdentity, SnapshotMessage, SnapshotReason, StructuredError, WireMessage,
 };
 
 use super::value::{
@@ -255,17 +255,32 @@ fn encode_snapshot(record: &mut Record, message: &SnapshotMessage) -> Result<(),
     record.field("desired_program", message.desired_program)?;
     record.field("desired_preview", message.desired_preview)?;
     record.field("realized_program", message.realized_program)?;
-    record.field("realized_preview", message.realized_preview)
+    record.field("realized_preview", message.realized_preview)?;
+    encode_manual_status(
+        record,
+        message.desired_manual_transition,
+        ManualStatusFields::Desired,
+    )?;
+    encode_manual_status(
+        record,
+        message.realized_manual_transition,
+        ManualStatusFields::Realized,
+    )
 }
 
 fn encode_event(record: &mut Record, message: &EventMessage) -> Result<(), CodecError> {
     record.kind("event");
     encode_cursor(record, &message.cursor)?;
     match message.payload {
-        EventPayload::DesiredSwitcher { program, preview } => {
+        EventPayload::DesiredSwitcher {
+            program,
+            preview,
+            manual_transition,
+        } => {
             record.field("event", "desired_switcher")?;
             record.field("program", program)?;
             record.field("preview", preview)?;
+            encode_manual_status(record, manual_transition, ManualStatusFields::Unqualified)?;
         }
     }
     Ok(())
@@ -415,9 +430,13 @@ fn encode_runtime_event(
             record.field("event", "scheduled")?;
             record.field_string("domains", runtime_domains(domains)?)?;
         }
-        RuntimeLifecycleEvent::Realized { domain } => {
+        RuntimeLifecycleEvent::Realized {
+            domain,
+            manual_transition,
+        } => {
             record.field("event", "realized")?;
             record.field_str("domain", domain)?;
+            encode_manual_status(record, *manual_transition, ManualStatusFields::Unqualified)?;
         }
         RuntimeLifecycleEvent::Failed { error, disposition } => {
             record.field("event", "failed")?;
@@ -430,6 +449,66 @@ fn encode_runtime_event(
         }
     }
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum ManualStatusFields {
+    Desired,
+    Realized,
+    Unqualified,
+}
+
+fn encode_manual_status(
+    record: &mut Record,
+    status: Option<ManualTransitionStatus>,
+    fields: ManualStatusFields,
+) -> Result<(), CodecError> {
+    let Some(status) = status else {
+        return Ok(());
+    };
+    let (active, kind, from, to, interval_start, position) = match fields {
+        ManualStatusFields::Desired => (
+            "?desired_manual_active",
+            "?desired_manual_kind",
+            "?desired_manual_from",
+            "?desired_manual_to",
+            "?desired_manual_interval_start_basis_points",
+            "?desired_manual_position_basis_points",
+        ),
+        ManualStatusFields::Realized => (
+            "?realized_manual_active",
+            "?realized_manual_kind",
+            "?realized_manual_from",
+            "?realized_manual_to",
+            "?realized_manual_interval_start_basis_points",
+            "?realized_manual_position_basis_points",
+        ),
+        ManualStatusFields::Unqualified => (
+            "?manual_active",
+            "?manual_kind",
+            "?manual_from",
+            "?manual_to",
+            "?manual_interval_start_basis_points",
+            "?manual_position_basis_points",
+        ),
+    };
+    match status {
+        ManualTransitionStatus::Inactive => record.field(active, 0),
+        ManualTransitionStatus::Active(state) => {
+            record.field(active, 1)?;
+            record.field(
+                kind,
+                match state.kind {
+                    ManualTransitionKind::Fade => "fade",
+                    ManualTransitionKind::Wipe => "wipe",
+                },
+            )?;
+            record.field(from, state.from)?;
+            record.field(to, state.to)?;
+            record.field(interval_start, state.interval_start.basis_points())?;
+            record.field(position, state.position.basis_points())
+        }
+    }
 }
 
 fn encode_heartbeat(record: &mut Record, message: &HeartbeatMessage) -> Result<(), CodecError> {

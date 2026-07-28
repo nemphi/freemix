@@ -150,6 +150,7 @@ fn serve_premature_event(listener: &TcpListener, kind: PrematureEvent) {
             payload: EventPayload::DesiredSwitcher {
                 program: input(2),
                 preview: input(1),
+                manual_transition: None,
             },
         }),
         PrematureEvent::Runtime => WireMessage::RuntimeEvent(RuntimeEventMessage {
@@ -159,6 +160,7 @@ fn serve_premature_event(listener: &TcpListener, kind: PrematureEvent) {
             sequence: 1,
             event: RuntimeLifecycleEvent::Realized {
                 domain: "switcher".into(),
+                manual_transition: None,
             },
         }),
     };
@@ -217,6 +219,8 @@ fn write_handshake(writer: &mut TcpStream, engine: &EngineIdentity, revision: u6
             desired_preview: preview,
             realized_program: input(1),
             realized_preview: preview,
+            desired_manual_transition: None,
+            realized_manual_transition: None,
         }),
     );
 }
@@ -251,6 +255,7 @@ fn write_command_events(
             payload: EventPayload::DesiredSwitcher {
                 program: input(1),
                 preview: input(1),
+                manual_transition: None,
             },
         }),
     );
@@ -286,6 +291,7 @@ fn write_command_events(
             sequence,
             event: RuntimeLifecycleEvent::Realized {
                 domain: "switcher".into(),
+                manual_transition: None,
             },
         }),
     );

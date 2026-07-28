@@ -234,6 +234,23 @@ impl ManualTransitionPosition {
     }
 }
 
+/// Exact active manual-transition state at one frame boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ManualTransitionState {
+    pub kind: ManualTransitionKind,
+    pub from: WireInputId,
+    pub to: WireInputId,
+    pub interval_start: ManualTransitionPosition,
+    pub position: ManualTransitionPosition,
+}
+
+/// Versioned additive projection of manual-transition state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManualTransitionStatus {
+    Inactive,
+    Active(ManualTransitionState),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CommandPayload {
     SelectPreview { input: WireInputId },
@@ -342,6 +359,10 @@ pub struct SnapshotMessage {
     pub desired_preview: WireInputId,
     pub realized_program: WireInputId,
     pub realized_preview: WireInputId,
+    /// `None` means the protocol extension was omitted for an older peer.
+    pub desired_manual_transition: Option<ManualTransitionStatus>,
+    /// `None` means the protocol extension was omitted for an older peer.
+    pub realized_manual_transition: Option<ManualTransitionStatus>,
 }
 
 /// A durable state change. Runtime progress uses [`RuntimeEventMessage`].
@@ -350,6 +371,8 @@ pub enum EventPayload {
     DesiredSwitcher {
         program: WireInputId,
         preview: WireInputId,
+        /// `None` means the protocol extension was omitted for an older peer.
+        manual_transition: Option<ManualTransitionStatus>,
     },
 }
 
@@ -405,6 +428,8 @@ pub enum RuntimeLifecycleEvent {
     },
     Realized {
         domain: String,
+        /// `None` means the protocol extension was omitted for an older peer.
+        manual_transition: Option<ManualTransitionStatus>,
     },
     Failed {
         error: StructuredError,
@@ -465,4 +490,39 @@ pub enum WireMessage {
     Heartbeat(HeartbeatMessage),
     CapabilityReport(CapabilityReportMessage),
     Error(ErrorMessage),
+}
+
+impl WireMessage {
+    /// Returns the projection safe to send to one negotiated peer.
+    #[must_use]
+    pub fn compatible_with(&self, version: ProtocolVersion) -> Self {
+        let mut message = self.clone();
+        if version.major == MANUAL_TRANSITION_PROTOCOL_VERSION.major
+            && version.minor >= MANUAL_TRANSITION_PROTOCOL_VERSION.minor
+        {
+            return message;
+        }
+        match &mut message {
+            Self::Snapshot(snapshot) => {
+                snapshot.desired_manual_transition = None;
+                snapshot.realized_manual_transition = None;
+            }
+            Self::Event(EventMessage {
+                payload:
+                    EventPayload::DesiredSwitcher {
+                        manual_transition, ..
+                    },
+                ..
+            })
+            | Self::RuntimeEvent(RuntimeEventMessage {
+                event:
+                    RuntimeLifecycleEvent::Realized {
+                        manual_transition, ..
+                    },
+                ..
+            }) => *manual_transition = None,
+            _ => {}
+        }
+        message
+    }
 }

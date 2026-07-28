@@ -37,8 +37,10 @@ use fm_control::{
 use fm_engine::{Engine, EngineAcceptance, EngineRestoreState, EngineSnapshot, ShowState};
 use fm_model::MainMix;
 use fm_persistence::{
-    IdempotencyReceipt, ProjectPosition, ProjectStore, ProjectValidationError, ReceiptOutcome,
-    RuntimeRouting, StoreError, StoredProject,
+    IdempotencyReceipt, ManualTransitionKind as PersistedManualTransitionKind,
+    ManualTransitionState as PersistedManualTransitionState, ProjectPosition, ProjectStore,
+    ProjectValidationError, ReceiptOutcome, RuntimeManualTransitions, RuntimeRouting, StoreError,
+    StoredProject,
 };
 use fm_protocol::{
     CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, ClientHello, CommandMessage, CommandPayload,
@@ -51,7 +53,7 @@ use fm_server::{
     AuthenticationMode, ControlPlane, HandshakeError, Heartbeat, InitialSync, Server, ServerConfig,
     ServerMode, Session, SessionError, SyncPayload,
 };
-use fm_switcher::SwitcherState;
+use fm_switcher::{SwitcherState, TBarPosition, TBarState, TransitionKind};
 use fm_types::{InputId, ProjectId};
 use freemixd::ReadinessRecord;
 
@@ -2633,9 +2635,11 @@ impl ControlPlane for ControlHandle {
         let payload = match cursor {
             Some(cursor) => match control.resume(cursor) {
                 ResumeDecision::Events(events) => SyncPayload::Resume(events),
-                ResumeDecision::Snapshot(record) => SyncPayload::Snapshot(record.snapshot),
+                ResumeDecision::Snapshot(record) => {
+                    SyncPayload::Snapshot(Box::new(record.snapshot))
+                }
             },
-            None => SyncPayload::Snapshot(control.snapshot().snapshot.clone()),
+            None => SyncPayload::Snapshot(Box::new(control.snapshot().snapshot.clone())),
         };
         let diagnostics = control.diagnostics();
         Ok(InitialSync {
@@ -3287,6 +3291,7 @@ fn load_migrate_recover(store: &ProjectStore) -> AppResult<StoredProject> {
             match found {
                 2 => store.migrate_v2()?,
                 3 => store.migrate_v3()?,
+                4 => store.migrate_v4()?,
                 _ => {
                     return Err(StoreError::Validation(
                         ProjectValidationError::UnsupportedSchema {
@@ -3327,13 +3332,20 @@ fn restore_engine(project: &StoredProject) -> AppResult<Engine> {
     let routing = project.runtime_routing();
     let realized_program = required_routing(routing.realized_program_id, "realized program")?;
     let realized_preview = required_routing(routing.realized_preview_id, "realized preview")?;
-    let show = ShowState::new(
+    let mut show = ShowState::new(
         canonical.name(),
         inputs.clone(),
         main_mix.desired_program,
         main_mix.desired_preview,
     )?;
-    let realized = SwitcherState::new(inputs, realized_program, realized_preview)?;
+    let mut realized = SwitcherState::new(inputs, realized_program, realized_preview)?;
+    let manual = project.runtime_manual_transitions();
+    if let Some(state) = manual.desired {
+        show.restore_manual_transition(restored_t_bar(state)?)?;
+    }
+    if let Some(state) = manual.realized {
+        realized.restore_t_bar(restored_t_bar(state)?)?;
+    }
     let position = project.position();
     Ok(Engine::restore_persisted(
         show,
@@ -3436,7 +3448,7 @@ fn handle_client(
     write_session_message(&mut writer, &mut session, &response)?;
     match handshake.sync {
         SyncPayload::Snapshot(snapshot) => {
-            write_session_message(&mut writer, &mut session, &WireMessage::Snapshot(snapshot))?;
+            write_session_message(&mut writer, &mut session, &WireMessage::Snapshot(*snapshot))?;
         }
         SyncPayload::Resume(events) => {
             for event in events {
@@ -3906,13 +3918,17 @@ fn stored_project_with_receipts(
     let realized = snapshot.realized_switcher();
     let mut project = durable.project().clone();
     project.set_main_mix(MainMix::new(desired.program(), desired.preview()));
-    StoredProject::from_project(
+    StoredProject::from_project_with_manual_transitions(
         project,
         RuntimeRouting {
             desired_program_id: Some(desired.program()),
             realized_program_id: Some(realized.program()),
             desired_preview_id: Some(desired.preview()),
             realized_preview_id: Some(realized.preview()),
+        },
+        RuntimeManualTransitions {
+            desired: desired.t_bar().map(persisted_t_bar),
+            realized: realized.t_bar().map(persisted_t_bar),
         },
         ProjectPosition {
             revision: snapshot.revision().get(),
@@ -3925,6 +3941,40 @@ fn stored_project_with_receipts(
         receipts,
     )
     .map_err(Into::into)
+}
+
+fn persisted_t_bar(state: TBarState) -> PersistedManualTransitionState {
+    let kind = match state.kind() {
+        TransitionKind::Fade => PersistedManualTransitionKind::Fade,
+        TransitionKind::Wipe => PersistedManualTransitionKind::Wipe,
+        _ => unreachable!("engine manual transitions are fade or wipe"),
+    };
+    PersistedManualTransitionState::new(
+        kind,
+        state.from(),
+        state.to(),
+        state.interval_start().basis_points(),
+        state.position().basis_points(),
+    )
+    .expect("engine manual transition positions are bounded")
+}
+
+fn restored_t_bar(state: PersistedManualTransitionState) -> AppResult<TBarState> {
+    let kind = match state.kind {
+        PersistedManualTransitionKind::Fade => TransitionKind::Fade,
+        PersistedManualTransitionKind::Wipe => TransitionKind::Wipe,
+    };
+    let interval_start = TBarPosition::new(state.interval_start_basis_points)
+        .ok_or_else(|| AppFailure("invalid persisted manual-transition interval start".into()))?;
+    let position = TBarPosition::new(state.position_basis_points)
+        .ok_or_else(|| AppFailure("invalid persisted manual-transition position".into()))?;
+    Ok(TBarState::restore(
+        kind,
+        state.from_id,
+        state.to_id,
+        interval_start,
+        position,
+    ))
 }
 
 fn persisted_engine_receipt(
@@ -4071,7 +4121,8 @@ fn write_session_message(
     session: &mut Session,
     message: &WireMessage,
 ) -> AppResult<()> {
-    let line = encode_line(message)?;
+    let compatible = message.compatible_with(session.negotiated_version());
+    let line = encode_line(&compatible)?;
     session.queue_outbound(line.len(), now_millis()?)?;
     write_client_bytes(writer, line.as_bytes())?;
     session.outbound_delivered()?;
@@ -4272,12 +4323,16 @@ mod tests {
     #[cfg(all(feature = "native-media", target_os = "macos"))]
     use fm_io_macos::{CameraIdKind, deterministic_camera_id};
     use fm_model::{
-        Input, InputKind, Project, ProjectSettings, Rgba8 as ModelRgba8, Scene, SimulatedAudio,
-        SimulatedInput, SimulatedVideo, SolidColor,
+        Input, InputKind, Project, ProjectSettings, SimulatedAudio, SimulatedInput, SimulatedVideo,
+        SolidColor,
     };
+    #[cfg(feature = "native-media")]
+    use fm_model::{Rgba8 as ModelRgba8, Scene};
+    #[cfg(feature = "native-media")]
+    use fm_types::SceneId;
     use fm_types::{
         AudioFormat, ChannelLayout, ColorMetadata, FrameRate, PixelFormat, SampleFormat,
-        SampleRate, ScanMode, SceneId, VideoDimensions, VideoFormat,
+        SampleRate, ScanMode, VideoDimensions, VideoFormat,
     };
     #[cfg(feature = "native-media")]
     use image::{ExtendedColorType, ImageEncoder, codecs::png::PngEncoder};
@@ -6244,6 +6299,69 @@ mod tests {
             .prepared()
             .expect("failed save must not install a receipt");
         prepared.abort();
+    }
+
+    #[test]
+    fn failed_manual_position_save_preserves_restart_state_and_retryability() {
+        let mut durable = test_project();
+        let mut control = test_control(&durable);
+        let server = test_server(&control);
+        execute_durable_command(
+            &mut control,
+            &CountingSaver::default(),
+            &mut durable,
+            &operator(),
+            &server,
+            &test_command(
+                "manual-start",
+                "manual-start-key",
+                CommandPayload::StartManualTransition {
+                    kind: fm_protocol::ManualTransitionKind::Wipe,
+                },
+            ),
+            0,
+        )
+        .unwrap();
+        let before_durable = durable.clone();
+        let before_engine = control.idle_engine_snapshot().unwrap();
+        let position_command = test_command(
+            "manual-position",
+            "manual-position-key",
+            CommandPayload::SetManualTransitionPosition {
+                position: fm_protocol::ManualTransitionPosition::new(6_250).unwrap(),
+            },
+        );
+
+        let error = execute_durable_command(
+            &mut control,
+            &FailingSaver,
+            &mut durable,
+            &operator(),
+            &server,
+            &position_command,
+            0,
+        )
+        .err()
+        .expect("save failure must abort the manual position command");
+
+        assert_eq!(error.to_string(), "injected save failure");
+        assert_eq!(durable, before_durable);
+        assert_eq!(control.idle_engine_snapshot().unwrap(), before_engine);
+
+        execute_durable_command(
+            &mut control,
+            &CountingSaver::default(),
+            &mut durable,
+            &operator(),
+            &server,
+            &position_command,
+            0,
+        )
+        .unwrap();
+        let manual = durable.runtime_manual_transitions();
+        assert_eq!(manual.desired.unwrap().position_basis_points, 6_250);
+        assert_eq!(manual.realized.unwrap().interval_start_basis_points, 6_250);
+        assert_eq!(durable.idempotency_receipts().len(), 2);
     }
 
     #[test]

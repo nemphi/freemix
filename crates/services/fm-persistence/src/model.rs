@@ -25,6 +25,56 @@ pub struct RuntimeRouting {
     pub realized_preview_id: Option<InputId>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManualTransitionKind {
+    Fade,
+    Wipe,
+}
+
+/// Exact state of one active manual transition at a frame boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ManualTransitionState {
+    pub kind: ManualTransitionKind,
+    pub from_id: InputId,
+    pub to_id: InputId,
+    pub interval_start_basis_points: u16,
+    pub position_basis_points: u16,
+}
+
+impl ManualTransitionState {
+    pub const MAX_POSITION: u16 = 10_000;
+
+    #[must_use]
+    pub const fn new(
+        kind: ManualTransitionKind,
+        from_id: InputId,
+        to_id: InputId,
+        interval_start_basis_points: u16,
+        position_basis_points: u16,
+    ) -> Option<Self> {
+        if interval_start_basis_points <= Self::MAX_POSITION
+            && position_basis_points <= Self::MAX_POSITION
+        {
+            Some(Self {
+                kind,
+                from_id,
+                to_id,
+                interval_start_basis_points,
+                position_basis_points,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// Desired and realized manual-transition state persisted independently.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeManualTransitions {
+    pub desired: Option<ManualTransitionState>,
+    pub realized: Option<ManualTransitionState>,
+}
+
 /// Legacy 64-bit routing view retained while existing applications migrate.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ProjectRouting {
@@ -139,6 +189,7 @@ impl IdempotencyReceipt {
 pub struct StoredProject {
     project: Project,
     routing: RuntimeRouting,
+    manual_transitions: RuntimeManualTransitions,
     position: ProjectPosition,
     idempotency_receipts: Vec<IdempotencyReceipt>,
 }
@@ -154,12 +205,35 @@ impl StoredProject {
         project: Project,
         routing: RuntimeRouting,
         position: ProjectPosition,
+        idempotency_receipts: Vec<IdempotencyReceipt>,
+    ) -> Result<Self, ProjectValidationError> {
+        Self::from_project_with_manual_transitions(
+            project,
+            routing,
+            RuntimeManualTransitions::default(),
+            position,
+            idempotency_receipts,
+        )
+    }
+
+    /// Creates a manifest with exact desired and realized manual-transition state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectValidationError`] when the domain project or runtime
+    /// metadata is inconsistent.
+    pub fn from_project_with_manual_transitions(
+        project: Project,
+        routing: RuntimeRouting,
+        manual_transitions: RuntimeManualTransitions,
+        position: ProjectPosition,
         mut idempotency_receipts: Vec<IdempotencyReceipt>,
     ) -> Result<Self, ProjectValidationError> {
         idempotency_receipts.sort_by(|left, right| left.key.cmp(&right.key));
         let stored = Self {
             project,
             routing,
+            manual_transitions,
             position,
             idempotency_receipts,
         };
@@ -238,6 +312,30 @@ impl StoredProject {
             }
         }
 
+        for (state, program, preview) in [
+            (
+                self.manual_transitions.desired,
+                self.routing.desired_program_id,
+                self.routing.desired_preview_id,
+            ),
+            (
+                self.manual_transitions.realized,
+                self.routing.realized_program_id,
+                self.routing.realized_preview_id,
+            ),
+        ] {
+            if let Some(state) = state {
+                if state.interval_start_basis_points > ManualTransitionState::MAX_POSITION
+                    || state.position_basis_points > ManualTransitionState::MAX_POSITION
+                {
+                    return Err(ProjectValidationError::InvalidManualTransitionPosition);
+                }
+                if Some(state.from_id) != program || Some(state.to_id) != preview {
+                    return Err(ProjectValidationError::ManualTransitionRoutingMismatch);
+                }
+            }
+        }
+
         let mut keys = BTreeSet::new();
         for receipt in &self.idempotency_receipts {
             if receipt.key.trim().is_empty() {
@@ -292,6 +390,11 @@ impl StoredProject {
     #[must_use]
     pub const fn runtime_routing(&self) -> RuntimeRouting {
         self.routing
+    }
+
+    #[must_use]
+    pub const fn runtime_manual_transitions(&self) -> RuntimeManualTransitions {
+        self.manual_transitions
     }
 
     /// Returns the legacy project ID view.
@@ -449,6 +552,8 @@ pub enum ProjectValidationError {
         field: ReferenceField,
         id: InputId,
     },
+    InvalidManualTransitionPosition,
+    ManualTransitionRoutingMismatch,
     EmptyIdempotencyKey,
     EmptyCommandId {
         key: String,
@@ -481,6 +586,12 @@ impl fmt::Display for ProjectValidationError {
             Self::MissingInputReference { field, id } => {
                 write!(formatter, "{field} references missing input ID {id}")
             }
+            Self::InvalidManualTransitionPosition => {
+                formatter.write_str("manual transition position exceeds 10000 basis points")
+            }
+            Self::ManualTransitionRoutingMismatch => formatter.write_str(
+                "manual transition from/to routes do not match persisted program/preview routing",
+            ),
             Self::EmptyIdempotencyKey => formatter.write_str("idempotency key is blank"),
             Self::EmptyCommandId { key } => {
                 write!(formatter, "command ID for idempotency key `{key}` is blank")

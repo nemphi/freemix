@@ -31,6 +31,7 @@ pub enum SnapshotError {
     WorkInFlight,
     IncompatibleSwitcher,
     MismatchedSwitcherRouting,
+    MismatchedManualTransition,
     InvalidFrameCounter,
     ClockTimeMismatch {
         expected_ns: u64,
@@ -58,6 +59,9 @@ impl fmt::Display for SnapshotError {
                 .write_str("persisted realized switcher inputs do not match the durable show"),
             Self::MismatchedSwitcherRouting => formatter.write_str(
                 "persisted desired and realized switcher routing must match for an idle restore",
+            ),
+            Self::MismatchedManualTransition => formatter.write_str(
+                "persisted desired and realized manual transitions must describe the same active mix",
             ),
             Self::InvalidFrameCounter => {
                 formatter.write_str("snapshot frame counter cannot be restored")

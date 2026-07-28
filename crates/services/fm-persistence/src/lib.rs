@@ -13,7 +13,8 @@ pub use journal::{
 };
 pub use migration::MigrationReport;
 pub use model::{
-    CURRENT_SCHEMA_VERSION, IdempotencyReceipt, ProjectPosition, ProjectRouting,
-    ProjectValidationError, ReceiptOutcome, ReferenceField, RuntimeRouting, StoredProject,
+    CURRENT_SCHEMA_VERSION, IdempotencyReceipt, ManualTransitionKind, ManualTransitionState,
+    ProjectPosition, ProjectRouting, ProjectValidationError, ReceiptOutcome, ReferenceField,
+    RuntimeManualTransitions, RuntimeRouting, StoredProject,
 };
 pub use store::{MAX_MANIFEST_BYTES, ProjectStore, StoreError};

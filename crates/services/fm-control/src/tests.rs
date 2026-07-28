@@ -5,8 +5,8 @@ use fm_clock::ClockDomainId;
 use fm_engine::{Engine, ShowState};
 use fm_protocol::{
     CommandMessage, CommandPayload, CommandResult, EngineIdentity, EventCursor,
-    ManualTransitionKind, ManualTransitionPosition, ProtocolVersion, RuntimeLifecycleEvent,
-    ServerIdentity, WireInputId, WireMessage,
+    ManualTransitionKind, ManualTransitionPosition, ManualTransitionStatus, ProtocolVersion,
+    RuntimeLifecycleEvent, ServerIdentity, WireInputId, WireMessage,
 };
 use fm_types::{FrameRate, InputId};
 
@@ -181,6 +181,7 @@ fn manual_transition_is_authorized_durable_reversible_and_replay_safe() {
             .basis_points(),
         2_500
     );
+    assert_manual_snapshot(&control, 2_500);
     assert!(control.idle_engine_snapshot().is_ok());
 
     control
@@ -196,8 +197,43 @@ fn manual_transition_is_authorized_durable_reversible_and_replay_safe() {
         .unwrap();
     control.tick(&server_identity()).unwrap();
     assert!(control.engine.realized_switcher().t_bar().is_none());
+    assert_eq!(
+        control.snapshot().snapshot.desired_manual_transition,
+        Some(ManualTransitionStatus::Inactive)
+    );
+    assert_eq!(
+        control.snapshot().snapshot.realized_manual_transition,
+        Some(ManualTransitionStatus::Inactive)
+    );
     assert_eq!(control.engine.realized_switcher().program(), input(1));
     assert_eq!(control.diagnostics().current_revision, 4);
+}
+
+fn assert_manual_snapshot(control: &ControlService<Policy>, position: u16) {
+    let desired = control
+        .snapshot()
+        .snapshot
+        .desired_manual_transition
+        .expect("protocol 1.4 snapshot must carry desired manual state");
+    let realized = control
+        .snapshot()
+        .snapshot
+        .realized_manual_transition
+        .expect("protocol 1.4 snapshot must carry realized manual state");
+    assert!(matches!(
+        desired,
+        ManualTransitionStatus::Active(state)
+            if state.kind == ManualTransitionKind::Wipe
+                && state.interval_start == ManualTransitionPosition::START
+                && state.position.basis_points() == position
+    ));
+    assert!(matches!(
+        realized,
+        ManualTransitionStatus::Active(state)
+            if state.kind == ManualTransitionKind::Wipe
+                && state.interval_start.basis_points() == position
+                && state.position.basis_points() == position
+    ));
 }
 
 #[test]
@@ -647,6 +683,7 @@ fn command_result_is_represented_before_its_events() {
         EventPayload::DesiredSwitcher {
             program: WireInputId::from_domain(input(2)),
             preview: WireInputId::from_domain(input(1)),
+            manual_transition: Some(fm_protocol::ManualTransitionStatus::Inactive),
         }
     );
 }
@@ -884,7 +921,7 @@ fn runtime_ordering_is_independent_per_generation() {
     assert_eq!(first.runtime_events[0].server, server);
     assert!(matches!(
         second.runtime_events[0].event,
-        RuntimeLifecycleEvent::Realized { ref domain } if domain == "switcher"
+        RuntimeLifecycleEvent::Realized { ref domain, .. } if domain == "switcher"
     ));
 }
 

@@ -1,7 +1,7 @@
 use core::fmt;
 use std::collections::HashSet;
 
-use fm_switcher::SwitcherState;
+use fm_switcher::{SwitcherState, TBarState};
 use fm_types::InputId;
 
 use crate::ShowError;
@@ -59,6 +59,18 @@ impl ShowState {
     #[must_use]
     pub const fn desired_switcher(&self) -> &SwitcherState {
         &self.desired_switcher
+    }
+
+    /// Restores exact desired manual-transition state from a checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShowError::Switcher`] when the checkpoint is inconsistent
+    /// with the desired Program/Preview routing.
+    pub fn restore_manual_transition(&mut self, state: TBarState) -> Result<(), ShowError> {
+        self.desired_switcher
+            .restore_t_bar(state)
+            .map_err(ShowError::Switcher)
     }
 
     pub(crate) const fn desired_switcher_mut(&mut self) -> &mut SwitcherState {

@@ -15,13 +15,14 @@ use fm_command::{CommandId, Revision};
 use fm_protocol::{
     ClientType, CommandMessage, CommandPayload, CommandResult, DurableGap, EngineIdentity,
     EventMessage, HandshakeOutcome, HandshakeRequest, HandshakeResponse, HeartbeatMessage,
-    ProtocolVersion, ResumeCursor, Role, RuntimeEventMessage, RuntimeLifecycleEvent, ServerHello,
-    ServerIdentity, SnapshotMessage, StructuredError, WireMessage, negotiate_version,
+    MANUAL_TRANSITION_PROTOCOL_VERSION, ProtocolVersion, ResumeCursor, Role, RuntimeEventMessage,
+    RuntimeLifecycleEvent, ServerHello, ServerIdentity, SnapshotMessage, StructuredError,
+    WireMessage, negotiate_version,
 };
 use fm_types::ProjectId;
 use fm_ui_model::{
-    ClientModel, DurableProjectEvent, ModelError, OptimisticChange, ProjectSnapshot,
-    RuntimeRealization,
+    ClientModel, DurableProjectEvent, ManualTransitionStatus as ModelManualTransitionStatus,
+    ModelError, OptimisticChange, ProjectSnapshot, RuntimeRealization,
 };
 
 /// Default number of recent completed command statuses retained locally.
@@ -703,6 +704,14 @@ impl Client {
                 "snapshot revision does not match the handshake",
             ));
         }
+        if supports_manual_state(session.protocol)
+            && (snapshot.desired_manual_transition.is_none()
+                || snapshot.realized_manual_transition.is_none())
+        {
+            return Err(ClientError::InvalidSnapshot(
+                "protocol 1.4 snapshot omitted manual-transition state",
+            ));
+        }
         self.model.install_snapshot(ProjectSnapshot::from_protocol(
             self.config.project_id,
             snapshot,
@@ -729,6 +738,24 @@ impl Client {
             .model
             .reconnect_cursor()
             .ok_or(ClientError::InvalidSnapshot("event has no base snapshot"))?;
+        let protocol = self
+            .session
+            .as_ref()
+            .ok_or(ClientError::InvalidSnapshot("event has no session"))?
+            .protocol;
+        if supports_manual_state(protocol)
+            && matches!(
+                event.payload,
+                fm_protocol::EventPayload::DesiredSwitcher {
+                    manual_transition: None,
+                    ..
+                }
+            )
+        {
+            return Err(ClientError::InvalidSnapshot(
+                "protocol 1.4 event omitted manual-transition state",
+            ));
+        }
         let expected_revision = current
             .revision
             .get()
@@ -819,17 +846,34 @@ impl Client {
                 received_sequence: event.sequence,
             });
         }
+        if supports_manual_state(session.protocol)
+            && matches!(
+                &event.event,
+                RuntimeLifecycleEvent::Realized {
+                    domain,
+                    manual_transition: None,
+                } if domain == "switcher"
+            )
+        {
+            return Err(ClientError::InvalidSnapshot(
+                "protocol 1.4 runtime event omitted manual-transition state",
+            ));
+        }
 
-        if matches!(
-            &event.event,
-            RuntimeLifecycleEvent::Realized { domain } if domain == "switcher"
-        ) {
+        if let RuntimeLifecycleEvent::Realized {
+            domain,
+            manual_transition,
+        } = &event.event
+            && domain == "switcher"
+        {
             self.model.apply_runtime_realization(RuntimeRealization {
                 project_id: self.config.project_id,
                 engine: engine_identity(&event.server),
                 revision: Revision::new(event.revision),
                 generation: event.generation,
                 sequence: event.sequence,
+                manual_transition: manual_transition
+                    .map(ModelManualTransitionStatus::from_protocol),
             })?;
         }
         self.runtime_server = Some(event.server);
@@ -1200,6 +1244,11 @@ impl Client {
             state: self.state.clone(),
         }
     }
+}
+
+const fn supports_manual_state(version: ProtocolVersion) -> bool {
+    version.major == MANUAL_TRANSITION_PROTOCOL_VERSION.major
+        && version.minor >= MANUAL_TRANSITION_PROTOCOL_VERSION.minor
 }
 
 fn engine_identity(server: &ServerIdentity) -> EngineIdentity {

@@ -22,7 +22,7 @@ pub struct InitialSync {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SyncPayload {
-    Snapshot(SnapshotMessage),
+    Snapshot(Box<SnapshotMessage>),
     Resume(Vec<EventMessage>),
 }
 
