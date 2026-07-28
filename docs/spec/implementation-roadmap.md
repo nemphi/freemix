@@ -591,14 +591,14 @@ local and remote CLI commands, `fm-control`, `EngineCommand`, the switcher,
 negotiated peer before durable acceptance or control/engine mutation. Exact
 rational progress selects `floor(width * numerator / denominator)` replacement
 columns and preserves identical start/end frames, with exact CPU and Metal
-coverage of endpoints and pixel boundaries. `freemix-studio` now negotiates
-protocol 1.4 and exposes a Wipe button only when both transition permission and
-the negotiated protocol allow it; Fade and Wipe share one bounded duration.
+coverage of endpoints and pixel boundaries. `freemix-studio` now advertises
+protocol 1.5 and enables its Wipe button only when both transition permission
+and the negotiated protocol allow it; Fade and Wipe share one bounded duration.
 Recovery preserves strict intent FIFO across a tested protocol downgrade, so an
 unresolved Wipe is neither sent to 1.2 nor bypassed by later commands. Bounded
 terminal history, collision-triggered authoritative resync, and Studio's sticky
 terminal-uncertainty ledger cover ambiguous replay receipts. `freemix-web`
-declares protocol 1.4 support in its client configuration. Its transport-free
+declares protocol 1.5 support in its client configuration. Its transport-free
 semantic presentation model preserves permission- and protocol-gated
 Cut/Fade/Wipe and adds manual Fade/Wipe Start, exact basis-point Position,
 Commit, and Cancel controls derived from separate authoritative desired and
@@ -612,7 +612,7 @@ cover replay-safe restart through commit and cancel. The CLI exposes local and
 remote Start, integer `0..=10_000` basis-point position, Commit, and Cancel
 commands; local command processes restore/mutate/save the engine checkpoint,
 and remote commands cannot cross a protocol 1.3 session. Studio advertises
-protocol 1.4 and presents replicated desired and realized kind, routing, and
+protocol 1.5 and presents replicated desired and realized kind, routing, and
 exact position without treating widget state as engine truth. Its manual
 controls require Ready state, transition permission, and negotiated 1.4.
 Reconnect tests preserve strict worker FIFO: an unresolved manual head and
@@ -622,10 +622,9 @@ retains the manual controls and adds FTB live/black actions, a bounded duration,
 exact separate desired and realized state, reversal through the opposite target,
 and protocol/permission/readiness/completeness gates. It still has no browser
 renderer or network runtime. There is no protocol-driven native-media
-end-to-end or hardware evidence for the manual path. FTB controls in Studio,
-AlphaFade, stinger, Slide/Zoom, the remaining transition families, and `SW-004`
-acceptance remain pending; parity therefore stays planned. Item 5 and RC-007
-remain planned.
+end-to-end or hardware evidence for the manual path. AlphaFade, stinger,
+Slide/Zoom, the remaining transition families, and `SW-004` acceptance remain
+pending; parity therefore stays planned. Item 5 and RC-007 remain planned.
 
 FTB groundwork now includes a switcher-owned bounded automatic control core
 alongside the compositor plan. The controller moves from its current exact
@@ -670,9 +669,16 @@ exposes explicit local and remote `ftb ... <live|black> <frames>` commands,
 settles and persists local moves, rejects the remote command below protocol 1.5
 before transmission, and prints separate exact desired and realized target and
 position state. Web has the corresponding protocol-1.5 transport-free semantic
-model, but no renderer or network runtime. Studio still exposes no FTB operator
-control. Configured-output routing and full end-to-end hardware acceptance
-evidence are also absent, so Phase 3 item 5 and `SW-004` remain planned.
+model, but no renderer or network runtime. Studio now advertises protocol 1.5
+and presents a dedicated native panel with exact separate desired and realized
+target/position labels, a separately bounded duration, and live/black actions
+gated by Ready state, transition permission, negotiated protocol, and replicated
+state. The desired target action is disabled while the opposite action remains
+available for reversal. Its worker maps the typed intent to the version-gated
+command, preserves FIFO compatibility behavior, and a loopback protocol test
+observes exact black then live desired and realized state. Configured-output
+routing and full end-to-end hardware acceptance evidence are still absent, so
+Phase 3 item 5 and `SW-004` remain planned.
 
 Exit: `P0` switcher, composition, audio, display, record, and control rows pass.
 

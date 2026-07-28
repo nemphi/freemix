@@ -14,8 +14,9 @@ use fm_client::{
     ClientError, CommandStatus, CommandUncertainty, SessionEvent, SyncMode, TcpSessionError,
 };
 use fm_protocol::{
-    CommandPayload, CommandResult, DurableGap, MANUAL_TRANSITION_PROTOCOL_VERSION, ProtocolVersion,
-    WIPE_PROTOCOL_VERSION, WireInputId, WireMessage,
+    CommandPayload, CommandResult, DurableGap, FADE_TO_BLACK_PROTOCOL_VERSION,
+    MANUAL_TRANSITION_PROTOCOL_VERSION, ProtocolVersion, WIPE_PROTOCOL_VERSION, WireInputId,
+    WireMessage,
 };
 use fm_ui_egui::{StudioConnectionStatus, StudioIntent, StudioShell, StudioUiState};
 
@@ -1170,6 +1171,13 @@ const fn intent_payload(intent: StudioIntent) -> CommandPayload {
         StudioIntent::Cut => CommandPayload::Cut,
         StudioIntent::Fade { duration_frames } => CommandPayload::Fade { duration_frames },
         StudioIntent::Wipe { duration_frames } => CommandPayload::Wipe { duration_frames },
+        StudioIntent::FadeToBlack {
+            active,
+            duration_frames,
+        } => CommandPayload::FadeToBlack {
+            active,
+            duration_frames,
+        },
         StudioIntent::StartManualTransition { kind } => {
             CommandPayload::StartManualTransition { kind }
         }
@@ -1245,10 +1253,15 @@ fn runtime_state(runtime: &mut StudioRuntime, error: Option<String>) -> StudioUi
         session.protocol.major == MANUAL_TRANSITION_PROTOCOL_VERSION.major
             && session.protocol.minor >= MANUAL_TRANSITION_PROTOCOL_VERSION.minor
     });
+    let supports_fade_to_black = client.session().is_some_and(|session| {
+        session.protocol.major == FADE_TO_BLACK_PROTOCOL_VERSION.major
+            && session.protocol.minor >= FADE_TO_BLACK_PROTOCOL_VERSION.minor
+    });
     let mut state = StudioUiState::new(connection_status)
         .with_switcher_permissions(can_select_preview, can_transition)
         .with_wipe_support(supports_wipe)
-        .with_manual_transition_support(supports_manual_transition);
+        .with_manual_transition_support(supports_manual_transition)
+        .with_fade_to_black_support(supports_fade_to_black);
     if connection_status == StudioConnectionStatus::Ready {
         state.view = client.model().view();
     }
@@ -1302,6 +1315,8 @@ const fn intent_label(intent: StudioIntent) -> &'static str {
         StudioIntent::Cut => "Cut",
         StudioIntent::Fade { .. } => "Fade",
         StudioIntent::Wipe { .. } => "Wipe",
+        StudioIntent::FadeToBlack { active: true, .. } => "Fade to Black",
+        StudioIntent::FadeToBlack { active: false, .. } => "Fade to Live",
         StudioIntent::StartManualTransition { .. } => "T-bar Start",
         StudioIntent::SetManualTransitionPosition { .. } => "T-bar Position",
         StudioIntent::CommitManualTransition => "T-bar Commit",
@@ -1346,10 +1361,10 @@ mod tests {
     use fm_client::ReconnectBackoff;
     use fm_protocol::{
         CapabilityReportSummary, EngineIdentity, EventCursor, EventMessage, EventPayload,
-        HandshakeOutcome, HandshakeResponse, LineDecoder, ManualTransitionKind,
-        ManualTransitionPosition, ManualTransitionState, ManualTransitionStatus, ProtocolVersion,
-        Role, RuntimeEventMessage, RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage,
-        SnapshotReason, WireMessage, encode_line,
+        FadeToBlackPosition, FadeToBlackState, HandshakeOutcome, HandshakeResponse, LineDecoder,
+        ManualTransitionKind, ManualTransitionPosition, ManualTransitionState,
+        ManualTransitionStatus, ProtocolVersion, Role, RuntimeEventMessage, RuntimeLifecycleEvent,
+        ServerIdentity, SnapshotMessage, SnapshotReason, WireMessage, encode_line,
     };
     use fm_types::{InputId, ProjectId};
 
@@ -1430,6 +1445,16 @@ mod tests {
             }),
             CommandPayload::Wipe {
                 duration_frames: u32::MAX,
+            }
+        );
+        assert_eq!(
+            intent_payload(StudioIntent::FadeToBlack {
+                active: true,
+                duration_frames: 45,
+            }),
+            CommandPayload::FadeToBlack {
+                active: true,
+                duration_frames: 45,
             }
         );
         assert_eq!(
@@ -1566,6 +1591,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn unsupported_head_fade_to_black_blocks_fifo_until_protocol_1_5() {
+        let fade_to_black = StudioIntent::FadeToBlack {
+            active: true,
+            duration_frames: 60,
+        };
+        let mut deferred = VecDeque::from([fade_to_black, StudioIntent::Cut]);
+
+        assert_eq!(
+            pop_supported_deferred_intent(&mut deferred, Some(MANUAL_TRANSITION_PROTOCOL_VERSION),),
+            None
+        );
+        assert_eq!(deferred, VecDeque::from([fade_to_black, StudioIntent::Cut]));
+        assert_eq!(
+            pop_supported_deferred_intent(&mut deferred, Some(FADE_TO_BLACK_PROTOCOL_VERSION),),
+            Some(fade_to_black)
+        );
+        assert_eq!(
+            pop_supported_deferred_intent(&mut deferred, Some(FADE_TO_BLACK_PROTOCOL_VERSION),),
+            Some(StudioIntent::Cut)
+        );
+    }
+
     struct FakePeer {
         stream: TcpStream,
         decoder: LineDecoder,
@@ -1651,6 +1699,15 @@ mod tests {
             .then_some(ManualTransitionStatus::Inactive)
     }
 
+    fn fade_to_black_projection(negotiated: ProtocolVersion) -> Option<FadeToBlackState> {
+        (negotiated.major == FADE_TO_BLACK_PROTOCOL_VERSION.major
+            && negotiated.minor >= FADE_TO_BLACK_PROTOCOL_VERSION.minor)
+            .then_some(FadeToBlackState {
+                target_active: false,
+                position: FadeToBlackPosition::LIVE,
+            })
+    }
+
     fn accept_worker_snapshot(listener: &TcpListener) -> FakePeer {
         accept_worker_snapshot_at(listener, 4, 2, 2)
     }
@@ -1710,8 +1767,8 @@ mod tests {
             realized_preview: wire_input(realized_preview),
             desired_manual_transition: manual_projection(negotiated),
             realized_manual_transition: manual_projection(negotiated),
-            desired_fade_to_black: None,
-            realized_fade_to_black: None,
+            desired_fade_to_black: fade_to_black_projection(negotiated),
+            realized_fade_to_black: fade_to_black_projection(negotiated),
         }));
         peer
     }
@@ -1790,8 +1847,8 @@ mod tests {
             realized_preview: wire_input(realized.1),
             desired_manual_transition: manual_projection(negotiated),
             realized_manual_transition: manual_projection(negotiated),
-            desired_fade_to_black: None,
-            realized_fade_to_black: None,
+            desired_fade_to_black: fade_to_black_projection(negotiated),
+            realized_fade_to_black: fade_to_black_projection(negotiated),
         }));
         peer
     }
@@ -1930,6 +1987,62 @@ mod tests {
                 fade_to_black: None,
             },
         }));
+    }
+
+    fn serve_worker_fade_to_black(listener: &TcpListener) {
+        let mut peer =
+            accept_worker_snapshot_version_at(listener, FADE_TO_BLACK_PROTOCOL_VERSION, 4, 2, 2);
+        for (revision, active, duration_frames, position) in [
+            (5, true, 45, FadeToBlackPosition::BLACK),
+            (6, false, 20, FadeToBlackPosition::LIVE),
+        ] {
+            let WireMessage::Command(command) = peer.receive() else {
+                panic!("expected Fade-to-Black command");
+            };
+            assert_eq!(command.protocol, FADE_TO_BLACK_PROTOCOL_VERSION);
+            assert_eq!(
+                command.payload,
+                CommandPayload::FadeToBlack {
+                    active,
+                    duration_frames,
+                }
+            );
+            assert_eq!(command.expected_revision, Some(revision - 1));
+            assert_eq!(command.deadline_ms, None);
+            assert!(!command.idempotency_key.is_empty());
+            peer.send(&WireMessage::CommandResult(CommandResult::Accepted {
+                id: command.id,
+                revision,
+                scheduled_frame: Some(revision),
+            }));
+            let fade_to_black = FadeToBlackState {
+                target_active: active,
+                position,
+            };
+            peer.send(&WireMessage::Event(EventMessage {
+                cursor: EventCursor {
+                    engine: test_engine(),
+                    revision,
+                },
+                payload: EventPayload::DesiredSwitcher {
+                    program: wire_input(1),
+                    preview: wire_input(2),
+                    manual_transition: Some(ManualTransitionStatus::Inactive),
+                    fade_to_black: Some(fade_to_black),
+                },
+            }));
+            peer.send(&WireMessage::RuntimeEvent(RuntimeEventMessage {
+                server: test_server(),
+                revision,
+                generation: 1,
+                sequence: revision - 4,
+                event: RuntimeLifecycleEvent::Realized {
+                    domain: "switcher".to_owned(),
+                    manual_transition: Some(ManualTransitionStatus::Inactive),
+                    fade_to_black: Some(fade_to_black),
+                },
+            }));
+        }
     }
 
     fn serve_worker_manual_t_bar(listener: &TcpListener) {
@@ -2363,6 +2476,61 @@ mod tests {
     }
 
     #[test]
+    fn worker_fade_to_black_flow_observes_black_and_live_realization() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || serve_worker_fade_to_black(&listener));
+        let (requests, states, worker) = spawn_test_worker(address);
+        let ready = loop {
+            let state = states.recv_timeout(Duration::from_secs(3)).unwrap();
+            if state.connection_status == StudioConnectionStatus::Ready {
+                break state;
+            }
+        };
+        assert!(ready.transition_protocol.fade_to_black);
+
+        for (revision, active, duration_frames, position) in [
+            (5, true, 45, FadeToBlackPosition::BLACK),
+            (6, false, 20, FadeToBlackPosition::LIVE),
+        ] {
+            try_enqueue(
+                &requests,
+                WorkerRequest::Intent(StudioIntent::FadeToBlack {
+                    active,
+                    duration_frames,
+                }),
+            )
+            .unwrap();
+            loop {
+                let state = states.recv_timeout(Duration::from_secs(3)).unwrap();
+                assert_eq!(state.error, None, "FTB worker state: {state:?}");
+                let Some(view) = state.view.as_ref() else {
+                    continue;
+                };
+                if state.pending_commands == 0
+                    && view.cursor.revision.get() == revision
+                    && view.switcher.desired_fade_to_black
+                        == (FadeToBlackState {
+                            target_active: active,
+                            position,
+                        })
+                    && view.switcher.realized_fade_to_black
+                        == (FadeToBlackState {
+                            target_active: active,
+                            position,
+                        })
+                {
+                    break;
+                }
+            }
+        }
+
+        try_enqueue(&requests, WorkerRequest::Shutdown).unwrap();
+        worker.join().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
     fn worker_manual_t_bar_flow_observes_hold_reverse_cancel_and_commit_from_model() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -2464,13 +2632,13 @@ mod tests {
     }
 
     #[test]
-    fn runtime_state_hides_manual_controls_after_protocol_1_4_downgrade() {
+    fn runtime_state_hides_fade_to_black_after_protocol_1_5_downgrade() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
             let mut first = accept_worker_snapshot_version_at(
                 &listener,
-                MANUAL_TRANSITION_PROTOCOL_VERSION,
+                FADE_TO_BLACK_PROTOCOL_VERSION,
                 4,
                 2,
                 2,
@@ -2478,7 +2646,7 @@ mod tests {
             assert_eq!(first.stream.read(&mut [0_u8; 1]).unwrap(), 0);
             accept_worker_reconnect_snapshot_version(
                 &listener,
-                WIPE_PROTOCOL_VERSION,
+                MANUAL_TRANSITION_PROTOCOL_VERSION,
                 4,
                 (1, 2),
                 (1, 2),
@@ -2498,6 +2666,7 @@ mod tests {
         let current = runtime_state(&mut runtime, None);
         assert!(current.transition_protocol.wipe);
         assert!(current.transition_protocol.manual);
+        assert!(current.transition_protocol.fade_to_black);
         assert!(current.can_transition);
         runtime.session_mut().disconnect().unwrap();
         runtime
@@ -2505,13 +2674,14 @@ mod tests {
             .unwrap();
         let downgraded = runtime_state(&mut runtime, None);
         assert!(downgraded.transition_protocol.wipe);
-        assert!(!downgraded.transition_protocol.manual);
+        assert!(downgraded.transition_protocol.manual);
+        assert!(!downgraded.transition_protocol.fade_to_black);
         assert!(downgraded.can_transition, "Cut/Fade permission was lost");
         server.join().unwrap();
     }
 
     #[test]
-    fn runtime_state_keeps_manual_transition_permission_separate_from_protocol_support() {
+    fn runtime_state_keeps_transition_permission_separate_from_protocol_support() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
@@ -2521,7 +2691,7 @@ mod tests {
             };
             assert_eq!(request.resume_cursor, None);
             peer.send(&WireMessage::HandshakeResponse(HandshakeResponse {
-                negotiated: MANUAL_TRANSITION_PROTOCOL_VERSION,
+                negotiated: FADE_TO_BLACK_PROTOCOL_VERSION,
                 granted_role: Role::Operator,
                 permissions: vec!["view_status".to_owned()],
                 capabilities: CapabilityReportSummary {
@@ -2548,8 +2718,8 @@ mod tests {
                 realized_preview: wire_input(2),
                 desired_manual_transition: Some(ManualTransitionStatus::Inactive),
                 realized_manual_transition: Some(ManualTransitionStatus::Inactive),
-                desired_fade_to_black: None,
-                realized_fade_to_black: None,
+                desired_fade_to_black: fade_to_black_projection(FADE_TO_BLACK_PROTOCOL_VERSION),
+                realized_fade_to_black: fade_to_black_projection(FADE_TO_BLACK_PROTOCOL_VERSION),
             }));
         });
         let config = StudioConfig {
@@ -2566,6 +2736,7 @@ mod tests {
         let state = runtime_state(&mut runtime, None);
         assert_eq!(state.connection_status, StudioConnectionStatus::Ready);
         assert!(state.transition_protocol.manual);
+        assert!(state.transition_protocol.fade_to_black);
         assert!(!state.can_transition);
         server.join().unwrap();
     }

@@ -10,6 +10,10 @@ use fm_protocol::{ManualTransitionKind, ManualTransitionPosition};
 use fm_types::InputId;
 use fm_ui_model::{ClientView, ManualTransitionStatus, SwitcherState};
 
+mod fade_to_black;
+
+pub use fade_to_black::{FadeToBlackAvailability, FadeToBlackGate, fade_to_black_availability};
+
 const GRAPHITE: Color32 = Color32::from_rgb(13, 15, 17);
 const GRAPHITE_RAISED: Color32 = Color32::from_rgb(24, 27, 30);
 const MONITOR_BLACK: Color32 = Color32::from_rgb(4, 5, 6);
@@ -33,6 +37,8 @@ pub enum StudioIntent {
     Fade { duration_frames: u32 },
     /// Performs a Wipe transition with a duration in frames.
     Wipe { duration_frames: u32 },
+    /// Fades realized Program video and audio to black or back to live.
+    FadeToBlack { active: bool, duration_frames: u32 },
     /// Starts a held manual Fade or Wipe transition.
     StartManualTransition { kind: ManualTransitionKind },
     /// Sets the exact manual-transition position in basis points.
@@ -152,6 +158,13 @@ impl StudioUiState {
         self.transition_protocol.manual = supported;
         self
     }
+
+    /// Publishes whether the negotiated protocol carries Fade-to-Black state and commands.
+    #[must_use]
+    pub const fn with_fade_to_black_support(mut self, supported: bool) -> Self {
+        self.transition_protocol.fade_to_black = supported;
+        self
+    }
 }
 
 /// Additive transition features carried by the negotiated protocol.
@@ -159,12 +172,14 @@ impl StudioUiState {
 pub struct TransitionProtocolSupport {
     pub wipe: bool,
     pub manual: bool,
+    pub fade_to_black: bool,
 }
 
 impl TransitionProtocolSupport {
     pub const NONE: Self = Self {
         wipe: false,
         manual: false,
+        fade_to_black: false,
     };
 }
 
@@ -337,6 +352,7 @@ pub const fn tally_state(input: InputId, switcher: SwitcherState) -> TallyState 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StudioShell {
     transition_duration_frames: u32,
+    fade_to_black_duration_frames: u32,
 }
 
 impl StudioShell {
@@ -358,6 +374,20 @@ impl StudioShell {
         );
     }
 
+    /// Returns the current Fade-to-Black duration in frames.
+    #[must_use]
+    pub const fn fade_to_black_duration_frames(&self) -> u32 {
+        self.fade_to_black_duration_frames
+    }
+
+    /// Sets and clamps the Fade-to-Black duration to the supported frame range.
+    pub fn set_fade_to_black_duration_frames(&mut self, duration_frames: u32) {
+        self.fade_to_black_duration_frames = duration_frames.clamp(
+            Self::MIN_TRANSITION_DURATION_FRAMES,
+            Self::MAX_TRANSITION_DURATION_FRAMES,
+        );
+    }
+
     /// Draws one complete shell frame and returns operator intents in UI order.
     ///
     /// The UI must belong to an active `egui` pass, as is customary for
@@ -365,6 +395,7 @@ impl StudioShell {
     pub fn draw(&mut self, ui: &mut Ui, state: &StudioUiState) -> Vec<StudioIntent> {
         apply_console_visuals(ui.ctx());
         self.set_transition_duration_frames(self.transition_duration_frames);
+        self.set_fade_to_black_duration_frames(self.fade_to_black_duration_frames);
 
         let mut intents = Vec::new();
         Frame::new()
@@ -377,6 +408,14 @@ impl StudioShell {
                 draw_monitors(ui, state.view.as_ref());
                 ui.add_space(8.0);
                 draw_transition_row(ui, self, state, &mut intents);
+                ui.add_space(8.0);
+                fade_to_black::draw_fade_to_black(
+                    ui,
+                    &mut self.fade_to_black_duration_frames,
+                    state,
+                    &mut intents,
+                );
+                self.set_fade_to_black_duration_frames(self.fade_to_black_duration_frames);
                 ui.add_space(8.0);
                 draw_manual_transition(ui, state, &mut intents);
                 ui.add_space(8.0);
@@ -546,6 +585,7 @@ impl Default for StudioShell {
     fn default() -> Self {
         Self {
             transition_duration_frames: Self::DEFAULT_TRANSITION_DURATION_FRAMES,
+            fade_to_black_duration_frames: Self::DEFAULT_TRANSITION_DURATION_FRAMES,
         }
     }
 }
@@ -973,6 +1013,20 @@ mod tests {
             shell.transition_duration_frames(),
             StudioShell::MAX_TRANSITION_DURATION_FRAMES
         );
+        assert_eq!(
+            shell.fade_to_black_duration_frames(),
+            StudioShell::DEFAULT_TRANSITION_DURATION_FRAMES
+        );
+        shell.set_fade_to_black_duration_frames(0);
+        assert_eq!(
+            shell.fade_to_black_duration_frames(),
+            StudioShell::MIN_TRANSITION_DURATION_FRAMES
+        );
+        shell.set_fade_to_black_duration_frames(u32::MAX);
+        assert_eq!(
+            shell.fade_to_black_duration_frames(),
+            StudioShell::MAX_TRANSITION_DURATION_FRAMES
+        );
     }
 
     #[test]
@@ -1086,6 +1140,16 @@ mod tests {
             },
             StudioIntent::Wipe {
                 duration_frames: 30
+            }
+        );
+        assert_ne!(
+            StudioIntent::FadeToBlack {
+                active: true,
+                duration_frames: 30,
+            },
+            StudioIntent::FadeToBlack {
+                active: false,
+                duration_frames: 30,
             }
         );
         assert_eq!(
