@@ -904,6 +904,13 @@ fn deep_audio_pages_and_restored_cursors_match_linear_decode() {
             assert_eq!(position.next_sample, target_sample);
             let restored_page = restored.decode_up_to(NonZeroU32::new(5).unwrap()).unwrap();
             assert_same_audio(&restored_page.blocks, expected);
+            let telemetry = restored.metadata_index_telemetry();
+            assert_eq!(telemetry.origin_probe_calls, 1);
+            assert!(telemetry.resumed_probe_calls > 0);
+            assert!(telemetry.peak_packet_budget <= 257);
+            assert!(
+                telemetry.packet_budget <= u64::try_from(target_block.saturating_mul(4)).unwrap()
+            );
         }
     }
 }
@@ -954,6 +961,11 @@ fn default_limits_bound_high_rate_deep_page_diagnostics_and_match_linear_oracle(
         interleaved_audio_bytes(&page.blocks),
         linear_audio_oracle(&path, target_sample, sample_count)
     );
+    let telemetry = cursor.metadata_index_telemetry();
+    assert_eq!(telemetry.origin_probe_calls, 1);
+    assert!(telemetry.resumed_probe_calls > 0);
+    assert!(telemetry.peak_packet_budget <= 257);
+    assert!(telemetry.packet_budget <= u64::try_from(target_block.saturating_mul(4)).unwrap());
 }
 
 #[test]
@@ -1210,10 +1222,16 @@ fn audio_full_final_eos_is_sticky() {
         48_000
     );
 
-    std::fs::remove_file(&path).unwrap();
     let sticky = full.decode_up_to(NonZeroU32::new(1).unwrap()).unwrap();
     assert!(sticky.blocks.is_empty());
     assert!(sticky.end_of_stream);
+
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(
+        full.decode_up_to(NonZeroU32::new(1).unwrap()),
+        Err(Error::SourceChanged)
+    );
+    assert_eq!(full.metadata_index_telemetry().invalidations, 1);
 }
 
 #[test]

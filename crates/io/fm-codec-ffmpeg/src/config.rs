@@ -25,6 +25,16 @@ pub struct Limits {
     pub max_audio_blocks: u32,
     /// Maximum selected per-channel audio sample frames in one decode or cursor page.
     pub max_audio_samples: usize,
+    /// Maximum audio frame records retained by one sequential cursor index.
+    pub max_audio_metadata_records: usize,
+    /// Maximum estimated bytes retained by one sequential audio metadata index.
+    pub max_audio_metadata_bytes: usize,
+    /// Maximum exact resume checkpoints retained by one sequential audio index.
+    pub max_audio_metadata_checkpoints: usize,
+    /// Number of newly discovered audio blocks between exact resume checkpoints.
+    pub audio_metadata_checkpoint_interval: usize,
+    /// Maximum older checkpoints attempted when ffprobe cannot reproduce the latest one.
+    pub max_audio_metadata_resume_attempts: usize,
     /// Maximum decoded output bytes in one decode or cursor page.
     ///
     /// A decode requesting both media types applies this to their combined output.
@@ -50,6 +60,11 @@ impl Default for Limits {
             max_video_frames: 120,
             max_audio_blocks: 256,
             max_audio_samples: 1_048_576,
+            max_audio_metadata_records: 1_024,
+            max_audio_metadata_bytes: 256 * 1_024,
+            max_audio_metadata_checkpoints: 32,
+            audio_metadata_checkpoint_interval: 64,
+            max_audio_metadata_resume_attempts: 4,
             max_total_decoded_bytes: 256 * 1024 * 1024,
             max_version_stdout_bytes: 64 * 1024,
             max_probe_stdout_bytes: 4 * 1024 * 1024,
@@ -95,6 +110,20 @@ pub(crate) fn validate_limits(limits: Limits) -> bool {
         && limits.max_video_frames > 0
         && limits.max_audio_blocks > 0
         && limits.max_audio_samples > 0
+        && limits.max_audio_metadata_records
+            >= usize::try_from(limits.max_audio_blocks)
+                .unwrap_or(usize::MAX)
+                .saturating_add(limits.audio_metadata_checkpoint_interval)
+                .saturating_add(2)
+        && limits.max_audio_metadata_bytes
+            >= limits
+                .max_audio_metadata_records
+                .saturating_add(limits.max_audio_metadata_checkpoints)
+                .saturating_mul(128)
+        && limits.max_audio_metadata_checkpoints > 0
+        && limits.audio_metadata_checkpoint_interval > 0
+        && limits.max_audio_metadata_resume_attempts > 0
+        && limits.max_audio_metadata_resume_attempts <= limits.max_audio_metadata_checkpoints
         && limits.max_total_decoded_bytes > 0
         && limits.max_version_stdout_bytes > 0
         && limits.max_probe_stdout_bytes > 0

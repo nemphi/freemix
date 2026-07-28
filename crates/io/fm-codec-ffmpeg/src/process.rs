@@ -428,6 +428,10 @@ mod tests {
             .lines()
             .filter(|line| line.contains(" kind=decode "))
             .count();
+        let frame_attempt = previous
+            .lines()
+            .filter(|line| line.contains(" kind=frames "))
+            .count();
         let kind = if args.iter().any(|argument| argument == "-show_format") {
             "probe"
         } else if args.iter().any(|argument| argument == "-show_frames") {
@@ -439,13 +443,17 @@ mod tests {
             .windows(2)
             .find(|pair| pair[0] == "-ss")
             .map_or("none", |pair| pair[1].as_str());
+        let interval = args
+            .windows(2)
+            .find(|pair| pair[0] == "-read_intervals")
+            .map_or("none", |pair| pair[1].as_str());
         writeln!(
             OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(&state)
                 .unwrap(),
-            "tool={tool} kind={kind} timeout_nanos={timeout_nanos} seek={seek}"
+            "tool={tool} kind={kind} timeout_nanos={timeout_nanos} seek={seek} interval={interval}"
         )
         .unwrap();
 
@@ -456,27 +464,10 @@ mod tests {
                     r#"{{"format":{{"format_name":"nut","start_time":"0.000000"}},"streams":[{{"index":0,"codec_type":"audio","codec_name":"flac","time_base":"1/48000","sample_rate":"48000","channels":2,"channel_layout":"stereo","disposition":{{"default":1,"attached_pic":0}}}}]}}"#
                 );
             }
-            "frames" => {
-                let packet_budget = args
-                    .iter()
-                    .find_map(|argument| argument.strip_prefix("%+#"))
-                    .unwrap()
-                    .parse::<usize>()
-                    .unwrap();
-                let frames = (0..32)
-                    .map(|index| {
-                        format!(
-                            r#"{{"stream_index":0,"best_effort_timestamp":{},"duration":1024,"nb_samples":1024}}"#,
-                            index * 1_024
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(",");
-                std::io::stdout().write_all(b"FM_TEST_PAYLOAD\0").unwrap();
-                print!(
-                    r#"{{"frames":[{frames}],"streams":[{{"index":0,"nb_read_packets":"{packet_budget}"}}]}}"#
-                );
+            "frames" if scenario == "metadata-timeout-once" && frame_attempt == 0 => {
+                std::thread::sleep(Duration::from_millis(250));
             }
+            "frames" => write_audio_frame_metadata(&args, interval),
             "decode" if scenario == "anchor-retry" => {
                 assert_ne!(
                     seek, "none",
@@ -508,5 +499,36 @@ mod tests {
         std::io::stdout().flush().unwrap();
         std::io::stderr().flush().unwrap();
         std::process::exit(0);
+    }
+
+    fn write_audio_frame_metadata(args: &[String], interval: &str) {
+        let packet_budget = args
+            .iter()
+            .find_map(|argument| argument.rsplit_once("%+#").map(|(_, budget)| budget))
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
+        let start = interval
+            .split_once("%+#")
+            .and_then(|(start, _)| (!start.is_empty()).then_some(start))
+            .map_or(0, |start| {
+                let microseconds =
+                    crate::audio_seek::parse_input_start_microseconds(Some(start)).unwrap();
+                let samples = i128::from(microseconds) * 48_000 / 1_000_000;
+                (usize::try_from(samples).unwrap() / 1_024).saturating_sub(1)
+            });
+        let frames = (start..start + packet_budget)
+            .map(|index| {
+                format!(
+                    r#"{{"stream_index":0,"best_effort_timestamp":{},"duration":1024,"nb_samples":1024}}"#,
+                    index * 1_024
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        std::io::stdout().write_all(b"FM_TEST_PAYLOAD\0").unwrap();
+        print!(
+            r#"{{"frames":[{frames}],"streams":[{{"index":0,"nb_read_packets":"{packet_budget}"}}]}}"#
+        );
     }
 }

@@ -153,13 +153,24 @@ transactional sequential local-audio cursor with global block sequence,
 sample-contiguous timing, sticky EOS, and explicit per-page operation
 block/sample/byte limits. Cursor progress no longer spends prior pages against
 those limits, and bounded metadata-only positioning can skip complete blocks to
-a restored sample without decoding their PCM prefix. FFmpeg audio metadata
-enumeration still scans from the start, however, and each audio decode still
-starts from the beginning and trims to the requested sample window. Later pages
-and deep restores therefore grow progressively more expensive. Native restore
-allows at most 4,096 skipped blocks, while fixed metadata-output and decoded-
-output bounds plus metadata/decode subprocess timeouts can make deep playback or
-restore fail transactionally.
+a restored sample without decoding their PCM prefix. The sequential cursor now
+keeps a source-fingerprint- and stream-bound metadata suffix with cumulative
+sample offsets plus periodic exact checkpoints. Each extension asks ffprobe to
+resume at an absolute checkpoint PTS, accepts it only after the checkpoint and
+retained overlap reproduce exactly, and uses a packet budget bounded by the
+checkpoint interval, page size, and fixed preroll slack. Retained records,
+estimated bytes, checkpoints, and resume attempts have explicit limits and
+expose probe, packet-budget, reuse, recomputation, eviction, and invalidation
+telemetry. This makes metadata discovery amortized O(total blocks) on demuxers
+that honor a reproducible interval seek. FFprobe does not guarantee that for
+every container: when none of the bounded retained checkpoints can be
+reproduced, the operation returns incomplete metadata transactionally rather
+than restarting an ordinal-sized prefix scan. PCM decoding separately uses a
+bounded from-start correction or a fixed validated seek-anchor stack; source
+changes and process failures leave both cursor and index content coherent.
+Native restore still allows at most 4,096 skipped blocks, and fixed
+metadata-output/decode bounds plus subprocess timeouts can reject deep playback
+or restore transactionally.
 
 `fm-audio` provides a deterministic reference Master with planar F32 mapping,
 gain/mute/follow-video, meters, timed canonical blocks, sample-count timing

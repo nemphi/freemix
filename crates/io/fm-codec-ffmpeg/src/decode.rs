@@ -12,6 +12,7 @@ use fm_frame::{
 };
 use serde_json::{Map, Value};
 
+use crate::audio_index::{AudioMetadataIndex, AudioProbePlan};
 use crate::audio_seek::{
     AudioSeek, parse_input_start_microseconds, sample_pts as audio_sample_pts,
     timestamp_microseconds_floor, validate_diagnostic as validate_seek_diagnostic,
@@ -87,17 +88,18 @@ pub struct LocalAudioDecoder {
     ordinal: usize,
     absolute_sample_position: usize,
     end_of_stream: bool,
+    metadata_index: AudioMetadataIndex,
 }
 
-#[derive(Clone, Debug)]
-struct FrameRecord {
-    pts: i64,
-    duration: Option<i64>,
-    width: Option<u32>,
-    height: Option<u32>,
-    pixel_format: Option<String>,
-    interlaced: Option<bool>,
-    sample_count: Option<usize>,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FrameRecord {
+    pub pts: i64,
+    pub duration: Option<i64>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub pixel_format: Option<String>,
+    pub interlaced: Option<bool>,
+    pub sample_count: Option<usize>,
 }
 
 struct PreparedVideo {
@@ -154,6 +156,23 @@ struct AudioWindowRequest {
     input_start_microseconds: Option<i64>,
     max_samples: usize,
     max_decoded_bytes: usize,
+}
+
+#[derive(Clone, Copy)]
+struct AudioIndexFormat {
+    sample_rate: u32,
+    time_base: TimeBase,
+}
+
+#[derive(Clone, Copy)]
+struct IndexedSeekRequest {
+    start: usize,
+    start_sample: usize,
+    format: AudioIndexFormat,
+    input_start_microseconds: Option<i64>,
+    limits: crate::Limits,
+    selected_samples: usize,
+    channels: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -221,6 +240,7 @@ impl Adapter {
             ordinal: 0,
             absolute_sample_position: 0,
             end_of_stream: false,
+            metadata_index: AudioMetadataIndex::new(self.limits),
         })
     }
 
@@ -561,6 +581,225 @@ impl Adapter {
         })
     }
 
+    fn prepare_indexed_audio_window(
+        &self,
+        source: &Source,
+        stream: StreamInfo,
+        index: &mut AudioMetadataIndex,
+        request: AudioWindowRequest,
+    ) -> Result<PreparedAudio, Error> {
+        let AudioWindowRequest {
+            start,
+            count: requested_count,
+            requirement,
+            input_start_microseconds,
+            max_samples,
+            max_decoded_bytes,
+        } = request;
+        let sample_rate = stream.sample_rate.ok_or(Error::MalformedProbe)?;
+        let channels = stream.channels.ok_or(Error::MalformedProbe)?;
+        let (layout_name, layout) = map_layout(stream.channel_layout.as_deref(), channels)?;
+        let channels = usize::try_from(channels).map_err(|_| Error::MalformedProbe)?;
+        let time_base = stream.time_base.ok_or(Error::MalformedProbe)?;
+        let required_end = start
+            .checked_add(requested_count)
+            .and_then(|value| value.checked_add(1))
+            .ok_or(Error::InvalidConfig)?;
+
+        self.ensure_audio_index(
+            source,
+            stream.index,
+            index,
+            start,
+            required_end,
+            AudioIndexFormat {
+                sample_rate,
+                time_base,
+            },
+        )?;
+        let indexed = index.records_from(start, requested_count.saturating_add(1));
+        let records = indexed
+            .iter()
+            .map(|record| record.frame.clone())
+            .collect::<Vec<_>>();
+        let count = resolved_count(
+            &records,
+            requested_count,
+            requirement,
+            index.end_of_stream(),
+        )?;
+        validate_timeline(&records, count)?;
+        let start_sample = index
+            .sample_at(start)
+            .ok_or(Error::IncompleteFrameMetadata)?;
+        let end_sample = indexed
+            .get(count)
+            .map(|record| record.start_sample)
+            .or_else(|| {
+                indexed.get(count.checked_sub(1)?).and_then(|record| {
+                    record
+                        .frame
+                        .sample_count
+                        .and_then(|samples| record.start_sample.checked_add(samples))
+                })
+            })
+            .unwrap_or(start_sample);
+        let total_samples = end_sample
+            .checked_sub(start_sample)
+            .ok_or(Error::InvalidTimeline)?;
+        let total_bytes =
+            check_audio_window_limits(total_samples, channels, max_samples, max_decoded_bytes)?;
+
+        let seek_limits = crate::Limits {
+            max_audio_samples: max_samples,
+            max_total_decoded_bytes: max_decoded_bytes,
+            ..self.limits()
+        };
+        let seeks = indexed_audio_seek_plan(
+            index,
+            &IndexedSeekRequest {
+                start,
+                start_sample,
+                format: AudioIndexFormat {
+                    sample_rate,
+                    time_base,
+                },
+                input_start_microseconds,
+                limits: seek_limits,
+                selected_samples: total_samples,
+                channels,
+            },
+        )?;
+        if seeks.is_empty() {
+            return Err(Error::Unsupported(Unsupported::AudioSeek));
+        }
+        Ok(PreparedAudio {
+            stream,
+            records,
+            count,
+            sample_rate,
+            layout_name,
+            layout,
+            channels,
+            total_samples,
+            total_bytes,
+            start,
+            end_sample,
+            seeks,
+            end_of_stream: index.end_of_stream() && start + count == index.next_ordinal(),
+        })
+    }
+
+    fn ensure_audio_index(
+        &self,
+        source: &Source,
+        stream_index: u32,
+        index: &mut AudioMetadataIndex,
+        start: usize,
+        required_end: usize,
+        format: AudioIndexFormat,
+    ) -> Result<(), Error> {
+        self.check_source(source)?;
+        let deadline = Instant::now()
+            .checked_add(self.limits().frame_metadata_timeout)
+            .ok_or(Error::InvalidConfig)?;
+        while !index.contains(start, required_end) {
+            let plans = index.probe_plans(required_end, FRAME_PACKET_SLACK)?;
+            let mut last_resume_error = None;
+            let previous_frontier = index.next_ordinal();
+            for plan in plans {
+                let remaining = deadline
+                    .checked_duration_since(Instant::now())
+                    .filter(|remaining| !remaining.is_zero())
+                    .ok_or(Error::ProcessTimedOut {
+                        tool: Tool::Ffprobe,
+                    })?;
+                match self.extend_audio_index(source, stream_index, index, &plan, format, remaining)
+                {
+                    Ok(()) => {
+                        last_resume_error = None;
+                        break;
+                    }
+                    Err(error @ (Error::IncompleteFrameMetadata | Error::InvalidTimeline))
+                        if plan.checkpoint.is_some() =>
+                    {
+                        last_resume_error = Some(error);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            if let Some(error) = last_resume_error {
+                return Err(error);
+            }
+            if index.next_ordinal() == previous_frontier && !index.end_of_stream() {
+                return Err(Error::IncompleteFrameMetadata);
+            }
+        }
+        self.check_source(source)
+    }
+
+    fn extend_audio_index(
+        &self,
+        source: &Source,
+        stream_index: u32,
+        index: &mut AudioMetadataIndex,
+        plan: &AudioProbePlan,
+        format: AudioIndexFormat,
+        timeout: std::time::Duration,
+    ) -> Result<(), Error> {
+        let interval_start = plan
+            .checkpoint
+            .as_ref()
+            .map(|checkpoint| {
+                let value = timestamp_microseconds_floor(checkpoint.frame.pts, format.time_base)?;
+                (value >= 0)
+                    .then_some(value)
+                    .ok_or(Error::IncompleteFrameMetadata)
+            })
+            .transpose()?;
+        let args = audio_frame_probe_args(
+            &source.path,
+            stream_index,
+            plan.packet_budget,
+            interval_start,
+        );
+        index.note_probe(plan);
+        let output = self.run_source(
+            source,
+            Tool::Ffprobe,
+            &args,
+            timeout,
+            self.limits().max_frame_metadata_stdout_bytes,
+        )?;
+        let metadata = parse_frame_records(
+            &output.stdout,
+            stream_index,
+            plan.packet_budget,
+            plan.packet_budget,
+        )?;
+        validate_pts_order(&metadata.records)?;
+        for (position, record) in metadata.records.iter().enumerate() {
+            let samples = record.sample_count.ok_or(Error::MalformedProbe)?;
+            if samples == 0 {
+                return Err(Error::InvalidTimeline);
+            }
+            validate_audio_span(record, samples, format.sample_rate, format.time_base)?;
+            if let Some(next) = metadata.records.get(position + 1) {
+                validate_audio_continuity(
+                    record,
+                    next,
+                    samples,
+                    format.sample_rate,
+                    format.time_base,
+                )?;
+            }
+        }
+        let mut candidate = index.clone();
+        candidate.commit(plan, &metadata.records, metadata.end_of_stream)?;
+        *index = candidate;
+        Ok(())
+    }
+
     fn frame_records(
         &self,
         source: &Source,
@@ -862,6 +1101,53 @@ impl LocalVideoDecoder {
 }
 
 impl LocalAudioDecoder {
+    /// Returns bounded metadata-index work and retention telemetry.
+    #[must_use]
+    pub fn metadata_index_telemetry(&self) -> crate::AudioMetadataIndexTelemetry {
+        self.metadata_index.telemetry()
+    }
+
+    fn check_source_identity(&mut self) -> Result<(), Error> {
+        match self.adapter.check_source(&self.source) {
+            Ok(()) => Ok(()),
+            Err(error @ Error::SourceChanged) => {
+                self.metadata_index.invalidate();
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn prepare_indexed_window(
+        &mut self,
+        start: usize,
+        count: usize,
+        max_samples: usize,
+        max_decoded_bytes: usize,
+    ) -> Result<PreparedAudio, Error> {
+        let prepared = self.adapter.prepare_indexed_audio_window(
+            &self.source,
+            self.stream.clone(),
+            &mut self.metadata_index,
+            AudioWindowRequest {
+                start,
+                count,
+                requirement: CountRequirement::CursorUpTo,
+                input_start_microseconds: Some(self.input_start_microseconds),
+                max_samples,
+                max_decoded_bytes,
+            },
+        );
+        match prepared {
+            Ok(prepared) => Ok(prepared),
+            Err(error @ Error::SourceChanged) => {
+                self.metadata_index.invalidate();
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Skips complete audio blocks ending at or before `target_sample` without
     /// decoding their PCM. The block containing the target remains next.
     ///
@@ -881,6 +1167,7 @@ impl LocalAudioDecoder {
         if max_skip_blocks == 0 {
             return Err(Error::InvalidConfig);
         }
+        self.check_source_identity()?;
         if target_sample <= self.absolute_sample_position || self.end_of_stream {
             return Ok(AudioCursorPosition {
                 skipped_blocks: 0,
@@ -903,17 +1190,11 @@ impl LocalAudioDecoder {
         while sample < target_sample && ordinal - initial_ordinal < max_skip_blocks {
             let remaining = max_skip_blocks - (ordinal - initial_ordinal);
             let requested = remaining.min(per_probe);
-            let prepared = self.adapter.prepare_audio_window(
-                &self.source,
-                self.stream.clone(),
-                AudioWindowRequest {
-                    start: ordinal,
-                    count: requested,
-                    requirement: CountRequirement::CursorUpTo,
-                    input_start_microseconds: Some(self.input_start_microseconds),
-                    max_samples: self.adapter.limits().max_audio_samples,
-                    max_decoded_bytes: self.adapter.limits().max_total_decoded_bytes,
-                },
+            let prepared = self.prepare_indexed_window(
+                ordinal,
+                requested,
+                self.adapter.limits().max_audio_samples,
+                self.adapter.limits().max_total_decoded_bytes,
             )?;
             let prepared_start_sample = prepared
                 .end_sample
@@ -961,6 +1242,7 @@ impl LocalAudioDecoder {
                 maximum: u64::try_from(max_skip_blocks).unwrap_or(u64::MAX),
             });
         }
+        self.check_source_identity()?;
         self.ordinal = ordinal;
         self.absolute_sample_position = sample;
         self.end_of_stream = end_of_stream;
@@ -1009,6 +1291,7 @@ impl LocalAudioDecoder {
         if max_page_samples == 0 || max_page_decoded_bytes == 0 {
             return Err(Error::InvalidConfig);
         }
+        self.check_source_identity()?;
         if self.end_of_stream {
             return Ok(DecodedAudioWindow {
                 blocks: Vec::new(),
@@ -1028,18 +1311,11 @@ impl LocalAudioDecoder {
             .checked_add(requested)
             .ok_or(Error::InvalidTimeline)?;
 
-        let prepared = self.adapter.prepare_audio_window(
-            &self.source,
-            self.stream.clone(),
-            AudioWindowRequest {
-                start: self.ordinal,
-                count: requested,
-                requirement: CountRequirement::CursorUpTo,
-                input_start_microseconds: Some(self.input_start_microseconds),
-                max_samples: max_page_samples.min(self.adapter.limits().max_audio_samples),
-                max_decoded_bytes: max_page_decoded_bytes
-                    .min(self.adapter.limits().max_total_decoded_bytes),
-            },
+        let prepared = self.prepare_indexed_window(
+            self.ordinal,
+            requested,
+            max_page_samples.min(self.adapter.limits().max_audio_samples),
+            max_page_decoded_bytes.min(self.adapter.limits().max_total_decoded_bytes),
         )?;
         let prepared_start_sample = prepared
             .end_sample
@@ -1056,9 +1332,17 @@ impl LocalAudioDecoder {
             return Err(Error::InvalidTimeline);
         }
         let end_of_stream = prepared.end_of_stream;
-        let blocks = self
+        let blocks = match self
             .adapter
-            .decode_audio(&self.source, &prepared, self.clock_domain)?;
+            .decode_audio(&self.source, &prepared, self.clock_domain)
+        {
+            Ok(blocks) => blocks,
+            Err(error @ Error::SourceChanged) => {
+                self.metadata_index.invalidate();
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
         let next_ordinal = self
             .ordinal
             .checked_add(blocks.len())
@@ -1075,6 +1359,34 @@ impl LocalAudioDecoder {
 }
 
 fn frame_probe_args(path: &Path, stream_index: u32, packet_budget: usize) -> Vec<OsString> {
+    frame_probe_args_with_interval(path, stream_index, packet_budget, None)
+}
+
+fn audio_frame_probe_args(
+    path: &Path,
+    stream_index: u32,
+    packet_budget: usize,
+    start_microseconds: Option<i64>,
+) -> Vec<OsString> {
+    frame_probe_args_with_interval(path, stream_index, packet_budget, start_microseconds)
+}
+
+fn frame_probe_args_with_interval(
+    path: &Path,
+    stream_index: u32,
+    packet_budget: usize,
+    start_microseconds: Option<i64>,
+) -> Vec<OsString> {
+    let interval = start_microseconds.map_or_else(
+        || format!("%+#{packet_budget}"),
+        |microseconds| {
+            format!(
+                "{}.{:06}%+#{packet_budget}",
+                microseconds / 1_000_000,
+                microseconds % 1_000_000
+            )
+        },
+    );
     [
         OsString::from("-v"),
         OsString::from("error"),
@@ -1090,7 +1402,7 @@ fn frame_probe_args(path: &Path, stream_index: u32, packet_budget: usize) -> Vec
             "frame=stream_index,best_effort_timestamp,pts,duration,pkt_duration,nb_samples,width,height,pix_fmt,interlaced_frame:stream=index,nb_read_packets",
         ),
         OsString::from("-read_intervals"),
-        OsString::from(format!("%+#{packet_budget}")),
+        OsString::from(interval),
         OsString::from("-of"),
         OsString::from("json"),
         path.as_os_str().to_owned(),
@@ -1339,6 +1651,59 @@ fn audio_seek_plan(
     } else {
         Ok(seeks)
     }
+}
+
+fn indexed_audio_seek_plan(
+    index: &AudioMetadataIndex,
+    request: &IndexedSeekRequest,
+) -> Result<Vec<AudioSeek>, Error> {
+    let &IndexedSeekRequest {
+        start,
+        start_sample,
+        format,
+        input_start_microseconds,
+        limits,
+        selected_samples,
+        channels,
+    } = request;
+    let anchors = index.records_through(start, usize::MAX);
+    let records = anchors
+        .iter()
+        .map(|record| record.frame.clone())
+        .collect::<Vec<_>>();
+    let sample_positions = anchors
+        .iter()
+        .map(|record| record.start_sample)
+        .chain(std::iter::once(
+            anchors
+                .last()
+                .and_then(|record| {
+                    record
+                        .frame
+                        .sample_count
+                        .and_then(|samples| record.start_sample.checked_add(samples))
+                })
+                .unwrap_or(start_sample),
+        ))
+        .collect::<Vec<_>>();
+    let local_start = anchors
+        .iter()
+        .position(|record| record.ordinal == start)
+        .ok_or(Error::IncompleteFrameMetadata)?;
+    audio_seek_plan(
+        AudioSeekTimeline {
+            records: &records,
+            sample_positions: &sample_positions,
+            start: local_start,
+            start_sample,
+            sample_rate: format.sample_rate,
+            time_base: format.time_base,
+            input_start_microseconds,
+        },
+        limits,
+        selected_samples,
+        channels,
+    )
 }
 
 fn audio_anchor_indices(
@@ -2151,8 +2516,8 @@ mod tests {
                 .filter(|line| line.contains(" kind=decode "))
                 .collect::<Vec<_>>();
             assert_eq!(attempts.len(), 2, "runner log:\n{log}");
-            assert!(attempts[0].ends_with("seek=170666us"));
-            assert!(attempts[1].ends_with("seek=192000us"));
+            assert!(attempts[0].contains("seek=170666us"));
+            assert!(attempts[1].contains("seek=192000us"));
             let first_timeout = runner_timeout_nanos(attempts[0]);
             let second_timeout = runner_timeout_nanos(attempts[1]);
             assert!(first_timeout <= Duration::from_millis(300).as_nanos());
@@ -2218,11 +2583,169 @@ mod tests {
             .filter(|line| line.contains(" kind=decode "))
             .collect::<Vec<_>>();
         assert_eq!(attempts.len(), 2, "runner log:\n{log}");
-        assert!(
-            attempts
-                .iter()
-                .all(|attempt| attempt.ends_with("seek=none"))
+        assert!(attempts.iter().all(|attempt| attempt.contains("seek=none")));
+    }
+
+    #[test]
+    fn audio_metadata_index_resumes_with_constant_packet_budgets() {
+        let directory = tempdir().unwrap();
+        let source_path = directory.path().join("source.nut");
+        let state_path = directory.path().join("runner.log");
+        fs::write(&source_path, b"test media").unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let adapter = Adapter::new(crate::Config {
+            ffmpeg: crate::Executable::Explicit(executable.clone()),
+            ffprobe: crate::Executable::Explicit(executable),
+            allowed_root: Some(directory.path().to_owned()),
+            limits: crate::Limits {
+                max_audio_blocks: 32,
+                max_audio_metadata_records: 64,
+                max_audio_metadata_bytes: 16 * 1_024,
+                max_audio_metadata_checkpoints: 4,
+                audio_metadata_checkpoint_interval: 16,
+                max_audio_metadata_resume_attempts: 2,
+                ..crate::Limits::default()
+            },
+        })
+        .unwrap();
+        let clock = ClockDomainId::new(NonZeroU128::new(72).unwrap());
+
+        crate::process::with_test_command_shim("metadata-index", &state_path, || {
+            let mut cursor = adapter
+                .open_local_audio(&source_path, clock, StreamSelector::Best)
+                .unwrap();
+            cursor
+                .skip_complete_blocks_to_sample_bounded(80 * 1_024, 80)
+                .unwrap();
+            cursor
+                .skip_complete_blocks_to_sample_bounded(160 * 1_024, 80)
+                .unwrap();
+            let telemetry = cursor.metadata_index_telemetry();
+            assert_eq!(telemetry.origin_probe_calls, 1);
+            assert_eq!(telemetry.resumed_probe_calls, 3);
+            assert!(telemetry.peak_packet_budget <= 113);
+            assert!(telemetry.reused_records > 0);
+            assert!(telemetry.retained_records <= 64);
+            assert!(telemetry.retained_bytes <= 16 * 1_024);
+            assert!(telemetry.retained_checkpoints <= 4);
+        });
+
+        let frames = fs::read_to_string(state_path)
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains(" kind=frames "))
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let intervals = frames
+            .iter()
+            .map(|line| {
+                line.split_whitespace()
+                    .find_map(|field| field.strip_prefix("interval="))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            intervals,
+            ["%+#113", "1.024000%+#97", "1.706666%+#113", "2.730666%+#97"],
+            "unexpected metadata discovery commands: {frames:?}"
         );
+    }
+
+    #[test]
+    fn audio_metadata_eviction_keeps_deep_position_exact_and_source_change_invalidates() {
+        let directory = tempdir().unwrap();
+        let source_path = directory.path().join("source.nut");
+        let state_path = directory.path().join("runner.log");
+        fs::write(&source_path, b"test media").unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let adapter = Adapter::new(crate::Config {
+            ffmpeg: crate::Executable::Explicit(executable.clone()),
+            ffprobe: crate::Executable::Explicit(executable),
+            allowed_root: Some(directory.path().to_owned()),
+            limits: crate::Limits {
+                max_audio_blocks: 32,
+                max_audio_metadata_records: 42,
+                max_audio_metadata_bytes: 16 * 1_024,
+                max_audio_metadata_checkpoints: 2,
+                audio_metadata_checkpoint_interval: 8,
+                max_audio_metadata_resume_attempts: 2,
+                ..crate::Limits::default()
+            },
+        })
+        .unwrap();
+        let clock = ClockDomainId::new(NonZeroU128::new(73).unwrap());
+
+        crate::process::with_test_command_shim("metadata-index", &state_path, || {
+            let mut cursor = adapter
+                .open_local_audio(&source_path, clock, StreamSelector::Best)
+                .unwrap();
+            let position = cursor
+                .skip_complete_blocks_to_sample_bounded(200 * 1_024, 200)
+                .unwrap();
+            assert_eq!(position.next_block, 200);
+            assert_eq!(position.next_sample, 200 * 1_024);
+            let telemetry = cursor.metadata_index_telemetry();
+            assert!(telemetry.evicted_records > 0);
+            assert!(telemetry.evicted_checkpoints > 0);
+            assert!(telemetry.retained_records <= 42);
+            assert!(telemetry.retained_checkpoints <= 2);
+
+            fs::write(&source_path, b"changed media identity").unwrap();
+            assert_eq!(
+                cursor.skip_complete_blocks_to_sample_bounded(201 * 1_024, 1),
+                Err(Error::SourceChanged)
+            );
+            assert_eq!(cursor.ordinal, 200);
+            assert_eq!(cursor.absolute_sample_position, 200 * 1_024);
+            assert_eq!(cursor.metadata_index_telemetry().invalidations, 1);
+            assert_eq!(cursor.metadata_index_telemetry().retained_records, 0);
+        });
+    }
+
+    #[test]
+    fn audio_metadata_timeout_leaves_index_and_cursor_retryable() {
+        let directory = tempdir().unwrap();
+        let source_path = directory.path().join("source.nut");
+        let state_path = directory.path().join("runner.log");
+        fs::write(&source_path, b"test media").unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let adapter = Adapter::new(crate::Config {
+            ffmpeg: crate::Executable::Explicit(executable.clone()),
+            ffprobe: crate::Executable::Explicit(executable),
+            allowed_root: Some(directory.path().to_owned()),
+            limits: crate::Limits {
+                frame_metadata_timeout: Duration::from_millis(50),
+                kill_timeout: Duration::from_millis(50),
+                ..crate::Limits::default()
+            },
+        })
+        .unwrap();
+        let clock = ClockDomainId::new(NonZeroU128::new(74).unwrap());
+
+        crate::process::with_test_command_shim("metadata-timeout-once", &state_path, || {
+            let mut cursor = adapter
+                .open_local_audio(&source_path, clock, StreamSelector::Best)
+                .unwrap();
+            assert_eq!(
+                cursor.skip_complete_blocks_to_sample_bounded(10 * 1_024, 10),
+                Err(Error::ProcessTimedOut {
+                    tool: Tool::Ffprobe
+                })
+            );
+            assert_eq!(cursor.ordinal, 0);
+            assert_eq!(cursor.absolute_sample_position, 0);
+            assert_eq!(cursor.metadata_index_telemetry().retained_records, 0);
+
+            let recovered = cursor
+                .skip_complete_blocks_to_sample_bounded(10 * 1_024, 10)
+                .unwrap();
+            assert_eq!(recovered.next_block, 10);
+            assert_eq!(recovered.next_sample, 10 * 1_024);
+            let telemetry = cursor.metadata_index_telemetry();
+            assert_eq!(telemetry.probe_calls, 2);
+            assert_eq!(telemetry.origin_probe_calls, 2);
+            assert!(telemetry.retained_records >= 11);
+        });
     }
 
     fn runner_timeout_nanos(line: &str) -> u128 {

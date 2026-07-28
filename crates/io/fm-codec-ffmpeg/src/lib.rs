@@ -14,11 +14,15 @@
 //!
 //! Cursor decode limits apply independently to each requested page, not to the
 //! cursor's lifetime output. Audio sample limits count selected per-channel
-//! sample frames. Audio cursors still scan and sum a bounded metadata prefix
-//! from the start of the stream for each page. PCM decode uses that metadata to
-//! choose a bounded from-start correction or a fixed number of validated seek
-//! anchors. This metadata work is therefore O(cursor depth).
+//! sample frames. Audio cursors retain a bounded, source-bound metadata suffix
+//! and periodic exact checkpoints. Discovery resumes through ffprobe only when
+//! the checkpoint and retained overlap reproduce exactly; demuxers that cannot
+//! do so fail transactionally instead of falling back to an unbounded prefix
+//! scan. On resumable inputs, metadata traversal is amortized O(total blocks).
+//! PCM decode uses the index to choose a bounded from-start correction or a
+//! fixed number of validated seek anchors.
 
+mod audio_index;
 mod audio_seek;
 mod config;
 mod decode;
@@ -38,6 +42,7 @@ use std::os::unix::fs::MetadataExt;
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
 
+pub use audio_index::AudioMetadataIndexTelemetry;
 pub use config::{Config, Executable, Limits};
 pub use decode::{
     AudioCursorPosition, DecodeRequest, DecodedAudioWindow, DecodedSequence, DecodedVideoWindow,
