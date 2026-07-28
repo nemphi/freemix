@@ -1,7 +1,7 @@
 use fm_client::{ConnectionState, Session};
 use fm_protocol::{CommandPayload, WIPE_PROTOCOL_VERSION};
 
-/// A live transition control rendered as a semantic form control.
+/// A transition control represented by the semantic presentation model.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransitionControl {
     Cut,
@@ -11,7 +11,7 @@ pub enum TransitionControl {
 }
 
 impl TransitionControl {
-    /// Screen-reader label for this transition control.
+    /// Accessibility label exposed by the presentation model.
     #[must_use]
     pub const fn accessibility_label(self) -> &'static str {
         match self {
@@ -23,7 +23,7 @@ impl TransitionControl {
     }
 }
 
-/// Whether a semantic transition control is present and interactive.
+/// Whether the presentation model exposes a semantic transition control as interactive.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransitionControlState {
     Hidden,
@@ -32,18 +32,20 @@ pub enum TransitionControlState {
 }
 
 impl TransitionControlState {
+    /// Whether the presentation model includes the control.
     #[must_use]
     pub const fn is_rendered(self) -> bool {
         !matches!(self, Self::Hidden)
     }
 
+    /// Whether the presentation model permits the control to issue a command.
     #[must_use]
     pub const fn is_enabled(self) -> bool {
         matches!(self, Self::Enabled)
     }
 }
 
-/// Stateful transition controls shared by the semantic web renderers.
+/// Transport-free transition state for semantic presentation consumers.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransitionControls {
     duration_frames: u32,
@@ -59,7 +61,7 @@ impl TransitionControls {
         self.duration_frames
     }
 
-    /// Sets the Fade/Wipe duration, bounded to the range accepted by the UI.
+    /// Sets the Fade/Wipe duration, bounded to the range accepted by the control model.
     pub fn set_duration_frames(&mut self, duration_frames: u32) {
         self.duration_frames =
             duration_frames.clamp(Self::MIN_DURATION_FRAMES, Self::MAX_DURATION_FRAMES);
@@ -161,7 +163,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_1_3_renders_and_enables_wipe_for_transition_operators() {
+    fn protocol_1_3_exposes_and_enables_wipe_for_transition_operators() {
         let controls = TransitionControls::default();
         let session = session(WIPE_PROTOCOL_VERSION, &["transition"]);
 
@@ -176,7 +178,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_1_2_neither_renders_nor_builds_wipe() {
+    fn protocol_1_2_neither_exposes_nor_builds_wipe() {
         let controls = TransitionControls::default();
         let session = session(ProtocolVersion::new(1, 2), &["transition"]);
 
