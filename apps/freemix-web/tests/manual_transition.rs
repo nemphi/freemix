@@ -3,8 +3,8 @@ use core::num::NonZeroU128;
 use fm_client::{ConnectionState, ReconnectBackoff, Session};
 use fm_protocol::{
     ALPHA_FADE_PROTOCOL_VERSION, CommandPayload, FADE_TO_BLACK_PROTOCOL_VERSION,
-    MANUAL_TRANSITION_PROTOCOL_VERSION, ManualTransitionKind, ManualTransitionPosition,
-    ProtocolVersion, Role, ServerIdentity,
+    MANUAL_ALPHA_FADE_PROTOCOL_VERSION, MANUAL_TRANSITION_PROTOCOL_VERSION, ManualTransitionKind,
+    ManualTransitionPosition, ProtocolVersion, Role, ServerIdentity,
 };
 use fm_types::InputId;
 use fm_ui_model::{ActiveManualTransition, BusSelection, ManualTransitionStatus, SwitcherState};
@@ -52,12 +52,19 @@ fn active(
 }
 
 fn ready_session() -> Session {
-    session(FADE_TO_BLACK_PROTOCOL_VERSION, &["transition"])
+    session(MANUAL_ALPHA_FADE_PROTOCOL_VERSION, &["transition"])
 }
 
 #[test]
-fn web_handshake_advertises_only_protocol_1_6() {
-    assert_eq!(SUPPORTED_PROTOCOL_VERSIONS, [ALPHA_FADE_PROTOCOL_VERSION]);
+fn web_handshake_advertises_only_protocol_1_7() {
+    assert_eq!(
+        SUPPORTED_PROTOCOL_VERSIONS,
+        [MANUAL_ALPHA_FADE_PROTOCOL_VERSION]
+    );
+    assert_eq!(
+        MANUAL_ALPHA_FADE_PROTOCOL_VERSION,
+        ProtocolVersion::new(1, 7)
+    );
     assert_eq!(ALPHA_FADE_PROTOCOL_VERSION, ProtocolVersion::new(1, 6));
     assert_eq!(FADE_TO_BLACK_PROTOCOL_VERSION, ProtocolVersion::new(1, 5));
     assert_eq!(
@@ -77,6 +84,10 @@ fn controls_have_stable_accessible_labels() {
         "Start manual Wipe transition"
     );
     assert_eq!(
+        ManualTransitionControl::StartAlphaFade.accessibility_label(),
+        "Start manual AlphaFade transition"
+    );
+    assert_eq!(
         ManualTransitionControl::Position(ManualTransitionPosition::END).accessibility_label(),
         "Manual transition position in basis points"
     );
@@ -91,7 +102,7 @@ fn controls_have_stable_accessible_labels() {
 }
 
 #[test]
-fn idle_model_emits_both_start_kinds_and_no_active_commands() {
+fn idle_model_emits_all_start_kinds_and_no_active_commands() {
     let model = ManualTransitionModel::new(
         Some(ManualTransitionStatus::Inactive),
         Some(ManualTransitionStatus::Inactive),
@@ -116,6 +127,16 @@ fn idle_model_emits_both_start_kinds_and_no_active_commands() {
         ),
         Some(CommandPayload::StartManualTransition {
             kind: ManualTransitionKind::Wipe,
+        })
+    );
+    assert_eq!(
+        model.command_payload(
+            ManualTransitionControl::StartAlphaFade,
+            &ConnectionState::Ready,
+            Some(&session),
+        ),
+        Some(CommandPayload::StartManualTransition {
+            kind: ManualTransitionKind::AlphaFade,
         })
     );
     for control in [
@@ -175,6 +196,7 @@ fn active_model_emits_exact_boundary_positions_commit_and_cancel() {
     for control in [
         ManualTransitionControl::StartFade,
         ManualTransitionControl::StartWipe,
+        ManualTransitionControl::StartAlphaFade,
     ] {
         assert_eq!(
             model.command_payload(control, &ConnectionState::Ready, Some(&session)),
@@ -234,6 +256,7 @@ fn terminal_lag_waits_for_realized_inactive_before_enabling_start() {
     for control in [
         ManualTransitionControl::StartFade,
         ManualTransitionControl::StartWipe,
+        ManualTransitionControl::StartAlphaFade,
         ManualTransitionControl::Position(ManualTransitionPosition::START),
         ManualTransitionControl::Commit,
         ManualTransitionControl::Cancel,
@@ -250,6 +273,50 @@ fn terminal_lag_waits_for_realized_inactive_before_enabling_start() {
             Some(&session),
         ),
         TransitionControlState::Enabled
+    );
+}
+
+#[test]
+fn protocol_1_6_hides_manual_alpha_fade_without_hiding_existing_manual_controls() {
+    let model = ManualTransitionModel::new(
+        Some(ManualTransitionStatus::Inactive),
+        Some(ManualTransitionStatus::Inactive),
+    );
+    let session = session(ALPHA_FADE_PROTOCOL_VERSION, &["transition"]);
+
+    assert_eq!(
+        model.control_state(
+            ManualTransitionControl::StartAlphaFade,
+            &ConnectionState::Ready,
+            Some(&session),
+        ),
+        TransitionControlState::Hidden
+    );
+    assert_eq!(
+        model.command_payload(
+            ManualTransitionControl::StartAlphaFade,
+            &ConnectionState::Ready,
+            Some(&session),
+        ),
+        None
+    );
+    assert_eq!(
+        model.control_state(
+            ManualTransitionControl::StartFade,
+            &ConnectionState::Ready,
+            Some(&session),
+        ),
+        TransitionControlState::Enabled
+    );
+    assert_eq!(
+        model.command_payload(
+            ManualTransitionControl::StartWipe,
+            &ConnectionState::Ready,
+            Some(&session),
+        ),
+        Some(CommandPayload::StartManualTransition {
+            kind: ManualTransitionKind::Wipe,
+        })
     );
 }
 
@@ -333,6 +400,7 @@ fn reconnect_and_protocol_downgrade_hide_every_manual_control_and_emit_nothing()
     let controls = [
         ManualTransitionControl::StartFade,
         ManualTransitionControl::StartWipe,
+        ManualTransitionControl::StartAlphaFade,
         ManualTransitionControl::Position(ManualTransitionPosition::END),
         ManualTransitionControl::Commit,
         ManualTransitionControl::Cancel,
@@ -386,8 +454,8 @@ fn replicated_switcher_conversion_preserves_both_authoritative_projections() {
     let switcher = SwitcherState {
         desired: BusSelection::new(input(1), input(2)),
         realized: BusSelection::new(input(1), input(2)),
-        desired_manual_transition: active(ManualTransitionKind::Wipe, 1, 2, 8_000, 2_500),
-        realized_manual_transition: active(ManualTransitionKind::Wipe, 1, 2, 2_500, 2_500),
+        desired_manual_transition: active(ManualTransitionKind::AlphaFade, 1, 2, 8_000, 2_500),
+        realized_manual_transition: active(ManualTransitionKind::AlphaFade, 1, 2, 2_500, 2_500),
         desired_fade_to_black: fm_protocol::FadeToBlackState {
             target_active: false,
             position: fm_protocol::FadeToBlackPosition::LIVE,
@@ -403,7 +471,8 @@ fn replicated_switcher_conversion_preserves_both_authoritative_projections() {
     assert!(matches!(
         model.desired(),
         ManualTransitionProjection::Active(state)
-            if state.interval_start.basis_points() == 8_000
+            if state.kind == ManualTransitionKind::AlphaFade
+                && state.interval_start.basis_points() == 8_000
                 && state.position.basis_points() == 2_500
     ));
     assert!(matches!(

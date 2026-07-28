@@ -1,7 +1,7 @@
 use fm_client::{ConnectionState, Session};
 use fm_protocol::{
-    CommandPayload, MANUAL_TRANSITION_PROTOCOL_VERSION, ManualTransitionKind,
-    ManualTransitionPosition,
+    CommandPayload, MANUAL_ALPHA_FADE_PROTOCOL_VERSION, MANUAL_TRANSITION_PROTOCOL_VERSION,
+    ManualTransitionKind, ManualTransitionPosition,
 };
 use fm_types::InputId;
 use fm_ui_model::{ManualTransitionStatus, SwitcherState};
@@ -13,6 +13,7 @@ use crate::TransitionControlState;
 pub enum ManualTransitionControl {
     StartFade,
     StartWipe,
+    StartAlphaFade,
     Position(ManualTransitionPosition),
     Commit,
     Cancel,
@@ -25,6 +26,7 @@ impl ManualTransitionControl {
         match self {
             Self::StartFade => "Start manual Fade transition",
             Self::StartWipe => "Start manual Wipe transition",
+            Self::StartAlphaFade => "Start manual AlphaFade transition",
             Self::Position(_) => "Manual transition position in basis points",
             Self::Commit => "Commit manual transition",
             Self::Cancel => "Cancel manual transition",
@@ -96,7 +98,7 @@ impl ManualTransitionProjection {
     }
 }
 
-/// Transport-free semantic model for manual Fade/Wipe controls and presentation.
+/// Transport-free semantic model for manual Fade/Wipe/AlphaFade controls and presentation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ManualTransitionModel {
     desired: ManualTransitionProjection,
@@ -145,12 +147,18 @@ impl ManualTransitionModel {
         connection_state: &ConnectionState,
         session: Option<&Session>,
     ) -> TransitionControlState {
-        if !session.is_some_and(session_supports_manual_transition) {
+        let Some(session) = session else {
+            return TransitionControlState::Hidden;
+        };
+        if !session_supports_manual_transition(session)
+            || matches!(control, ManualTransitionControl::StartAlphaFade)
+                && !session_supports_manual_alpha_fade(session)
+        {
             return TransitionControlState::Hidden;
         }
 
         if !matches!(connection_state, ConnectionState::Ready)
-            || !session.is_some_and(session_can_transition)
+            || !session_can_transition(session)
             || matches!(self.desired, ManualTransitionProjection::Missing)
             || matches!(self.realized, ManualTransitionProjection::Missing)
         {
@@ -198,6 +206,9 @@ impl ManualTransitionModel {
             ManualTransitionControl::StartWipe => CommandPayload::StartManualTransition {
                 kind: ManualTransitionKind::Wipe,
             },
+            ManualTransitionControl::StartAlphaFade => CommandPayload::StartManualTransition {
+                kind: ManualTransitionKind::AlphaFade,
+            },
             ManualTransitionControl::Position(position) => {
                 CommandPayload::SetManualTransitionPosition { position }
             }
@@ -223,4 +234,9 @@ fn session_can_transition(session: &Session) -> bool {
 fn session_supports_manual_transition(session: &Session) -> bool {
     session.protocol.major == MANUAL_TRANSITION_PROTOCOL_VERSION.major
         && session.protocol.minor >= MANUAL_TRANSITION_PROTOCOL_VERSION.minor
+}
+
+fn session_supports_manual_alpha_fade(session: &Session) -> bool {
+    session.protocol.major == MANUAL_ALPHA_FADE_PROTOCOL_VERSION.major
+        && session.protocol.minor >= MANUAL_ALPHA_FADE_PROTOCOL_VERSION.minor
 }

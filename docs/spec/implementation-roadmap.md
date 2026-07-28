@@ -675,7 +675,10 @@ inactive. Schema v9 persists the kind with lossless schema-v8 migration, and a
 daemon restart acceptance verifies replay-safe commit and cancel from the
 restored held state. CLI manual AlphaFade start is available locally and
 remotely, including protocol 1.7 downgrade rejection and local restart-safe
-idempotent replay. Web and Studio manual AlphaFade controls remain absent.
+idempotent replay. The Web semantic control surface advertises protocol 1.7,
+exposes a manual AlphaFade start control only for compatible sessions, and
+preserves authoritative AlphaFade projections. Studio manual AlphaFade controls
+remain absent.
 
 The remaining AlphaFade manual operator controls, stinger, Slide/Zoom, other
 transition families, cross-platform/fullscreen evidence, and complete `SW-004`
