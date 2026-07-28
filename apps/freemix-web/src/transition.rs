@@ -34,11 +34,14 @@ pub enum TransitionControlState {
 impl TransitionControlState {
     /// Whether the presentation model includes the control.
     #[must_use]
-    pub const fn is_rendered(self) -> bool {
+    pub const fn is_exposed(self) -> bool {
         !matches!(self, Self::Hidden)
     }
 
-    /// Whether the presentation model permits the control to issue a command.
+    /// Whether the control is interactive in the semantic presentation model.
+    ///
+    /// Interactive input controls such as Duration update local model state instead of issuing
+    /// command payloads.
     #[must_use]
     pub const fn is_enabled(self) -> bool {
         matches!(self, Self::Enabled)
@@ -89,7 +92,7 @@ impl TransitionControls {
         }
     }
 
-    /// Builds a command only when the corresponding control is currently enabled.
+    /// Builds a command for an enabled command-emitting control.
     #[must_use]
     pub fn command_payload(
         &self,
@@ -187,7 +190,7 @@ mod tests {
             &ConnectionState::Ready,
             Some(&session),
         );
-        assert!(!state.is_rendered());
+        assert!(!state.is_exposed());
         assert_eq!(
             controls.command_payload(
                 TransitionControl::Wipe,
@@ -227,6 +230,30 @@ mod tests {
                 None
             );
         }
+    }
+
+    #[test]
+    fn duration_is_an_enabled_input_without_a_command_payload() {
+        let controls = TransitionControls::default();
+        let session = session(WIPE_PROTOCOL_VERSION, &["transition"]);
+
+        assert!(
+            controls
+                .control_state(
+                    TransitionControl::Duration,
+                    &ConnectionState::Ready,
+                    Some(&session)
+                )
+                .is_enabled()
+        );
+        assert_eq!(
+            controls.command_payload(
+                TransitionControl::Duration,
+                &ConnectionState::Ready,
+                Some(&session)
+            ),
+            None
+        );
     }
 
     #[test]

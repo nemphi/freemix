@@ -108,10 +108,10 @@ capped, and supervised daemon shutdown or restart performs bounded
 process-group/job and descendant cleanup. Project input names and video frames
 are not present in the replicated client contract, so tiles use ordinal/ID
 labels and monitor wells state that real preview delivery remains pending.
-`freemix-web` now advertises protocol 1.3, and its transport-free semantic
-presentation model exposes permission- and protocol-gated Wipe with Fade's
-bounded 1-to-3,600-frame duration. No browser renderer or network runtime
-exists; item 5 and RC-007 remain planned.
+`freemix-web` now declares protocol 1.3 support in its client configuration,
+and its transport-free semantic presentation model exposes permission- and
+protocol-gated Wipe with Fade's bounded 1-to-3,600-frame duration. No browser
+renderer or network runtime exists; item 5 and RC-007 remain planned.
 
 Current implementation boundary for item 6: `fm-frame` defines a bounded,
 portable local-preview contract for shared-image versus encoded fallback,
@@ -510,11 +510,12 @@ Recovery preserves strict intent FIFO across a tested protocol downgrade, so an
 unresolved Wipe is neither sent to 1.2 nor bypassed by later commands. Bounded
 terminal history, collision-triggered authoritative resync, and Studio's sticky
 terminal-uncertainty ledger cover ambiguous replay receipts. `freemix-web` now
-advertises protocol 1.3, and its transport-free semantic presentation model
-exposes permission- and protocol-gated Wipe with Fade's bounded
-1-to-3,600-frame duration. No browser renderer or network runtime exists.
-Public T-bar command exposure and AlphaFade, FTB, stinger, Slide/Zoom, and other
-transition families remain pending. Item 5 and RC-007 remain planned.
+declares protocol 1.3 support in its client configuration, and its
+transport-free semantic presentation model exposes permission- and
+protocol-gated Wipe with Fade's bounded 1-to-3,600-frame duration. No browser
+renderer or network runtime exists. Public T-bar command exposure and
+AlphaFade, FTB, stinger, Slide/Zoom, and other transition families remain
+pending. Item 5 and RC-007 remain planned.
 
 Exit: `P0` switcher, composition, audio, display, record, and control rows pass.
 
