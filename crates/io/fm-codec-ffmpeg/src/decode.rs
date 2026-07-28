@@ -1804,7 +1804,11 @@ fn u64_value(object: &Map<String, Value>, key: &str) -> Result<Option<u64>, Erro
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::num::NonZeroU128;
+    use std::time::Duration;
+
+    use tempfile::tempdir;
 
     use super::*;
 
@@ -2090,6 +2094,143 @@ mod tests {
             ),
             Err(Error::Unsupported(Unsupported::NegativeAudioAnchor))
         );
+    }
+
+    #[test]
+    fn audio_seek_retries_ordered_anchors_with_one_deadline_and_caller_bounds() {
+        let directory = tempdir().unwrap();
+        let source_path = directory.path().join("source.nut");
+        fs::write(&source_path, b"test media").unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let adapter = Adapter::new(crate::Config {
+            ffmpeg: crate::Executable::Explicit(executable.clone()),
+            ffprobe: crate::Executable::Explicit(executable),
+            allowed_root: Some(directory.path().to_owned()),
+            limits: crate::Limits {
+                max_audio_samples: 100_000,
+                max_total_decoded_bytes: 800_000,
+                decode_timeout: Duration::from_millis(300),
+                ..crate::Limits::default()
+            },
+        })
+        .unwrap();
+        let clock = ClockDomainId::new(NonZeroU128::new(70).unwrap());
+
+        for (name, max_page_samples, max_page_decoded_bytes) in [
+            ("sample-bound.log", 3_072, 800_000),
+            ("byte-bound.log", 100_000, 24_576),
+        ] {
+            let state_path = directory.path().join(name);
+            crate::process::with_test_command_shim("anchor-retry", &state_path, || {
+                let mut cursor = adapter
+                    .open_local_audio(&source_path, clock, StreamSelector::Best)
+                    .unwrap();
+                assert_eq!(
+                    cursor
+                        .skip_complete_blocks_to_sample_bounded(10 * 1_024, 10)
+                        .unwrap(),
+                    AudioCursorPosition {
+                        skipped_blocks: 10,
+                        skipped_samples: 10 * 1_024,
+                        next_block: 10,
+                        next_sample: 10 * 1_024,
+                        end_of_stream: false,
+                    }
+                );
+
+                let page = cursor
+                    .decode_up_to_bounded(NonZeroU32::MIN, max_page_samples, max_page_decoded_bytes)
+                    .unwrap();
+                assert_eq!(page.blocks.len(), 1);
+                assert_eq!(page.blocks[0].timing().sequence().get(), 10);
+            });
+
+            let log = fs::read_to_string(state_path).unwrap();
+            let attempts = log
+                .lines()
+                .filter(|line| line.contains(" kind=decode "))
+                .collect::<Vec<_>>();
+            assert_eq!(attempts.len(), 2, "runner log:\n{log}");
+            assert!(attempts[0].ends_with("seek=170666us"));
+            assert!(attempts[1].ends_with("seek=192000us"));
+            let first_timeout = runner_timeout_nanos(attempts[0]);
+            let second_timeout = runner_timeout_nanos(attempts[1]);
+            assert!(first_timeout <= Duration::from_millis(300).as_nanos());
+            assert!(
+                second_timeout + Duration::from_millis(50).as_nanos() < first_timeout,
+                "retry did not consume the shared deadline: {attempts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn from_start_process_failure_is_exact_and_cursor_retry_is_transactional() {
+        let directory = tempdir().unwrap();
+        let source_path = directory.path().join("source.nut");
+        let state_path = directory.path().join("runner.log");
+        fs::write(&source_path, b"test media").unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let adapter = Adapter::new(crate::Config {
+            ffmpeg: crate::Executable::Explicit(executable.clone()),
+            ffprobe: crate::Executable::Explicit(executable),
+            allowed_root: Some(directory.path().to_owned()),
+            limits: crate::Limits {
+                max_audio_samples: 100_000,
+                max_total_decoded_bytes: 800_000,
+                decode_timeout: Duration::from_millis(300),
+                ..crate::Limits::default()
+            },
+        })
+        .unwrap();
+        let clock = ClockDomainId::new(NonZeroU128::new(71).unwrap());
+
+        crate::process::with_test_command_shim("from-start-failure", &state_path, || {
+            let mut cursor = adapter
+                .open_local_audio(&source_path, clock, StreamSelector::Best)
+                .unwrap();
+            cursor
+                .skip_complete_blocks_to_sample_bounded(2 * 1_024, 2)
+                .unwrap();
+
+            assert_eq!(
+                cursor.decode_up_to_bounded(NonZeroU32::MIN, 3_072, 24_576),
+                Err(Error::ProcessFailed {
+                    tool: Tool::Ffmpeg,
+                    status: Some(23),
+                    stderr: "from-start sentinel".to_owned(),
+                })
+            );
+            assert_eq!(cursor.ordinal, 2);
+            assert_eq!(cursor.absolute_sample_position, 2 * 1_024);
+            assert!(!cursor.end_of_stream);
+
+            let recovered = cursor
+                .decode_up_to_bounded(NonZeroU32::MIN, 3_072, 24_576)
+                .unwrap();
+            assert_eq!(recovered.blocks.len(), 1);
+            assert_eq!(recovered.blocks[0].timing().sequence().get(), 2);
+            assert!(!recovered.end_of_stream);
+        });
+
+        let log = fs::read_to_string(state_path).unwrap();
+        let attempts = log
+            .lines()
+            .filter(|line| line.contains(" kind=decode "))
+            .collect::<Vec<_>>();
+        assert_eq!(attempts.len(), 2, "runner log:\n{log}");
+        assert!(
+            attempts
+                .iter()
+                .all(|attempt| attempt.ends_with("seek=none"))
+        );
+    }
+
+    fn runner_timeout_nanos(line: &str) -> u128 {
+        line.split_whitespace()
+            .find_map(|field| field.strip_prefix("timeout_nanos="))
+            .unwrap()
+            .parse()
+            .unwrap()
     }
 
     #[test]

@@ -14,6 +14,14 @@ use tempfile::tempdir;
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(15);
 static FFMPEG_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+fn test_limits() -> fm_codec_ffmpeg::Limits {
+    fm_codec_ffmpeg::Limits {
+        discovery_timeout: Duration::from_secs(10),
+        frame_metadata_timeout: Duration::from_mins(1),
+        ..fm_codec_ffmpeg::Limits::default()
+    }
+}
+
 fn ffmpeg_test_guard() -> MutexGuard<'static, ()> {
     FFMPEG_TEST_LOCK
         .lock()
@@ -24,6 +32,7 @@ fn require_ffmpeg() -> Option<Adapter> {
     let directory = tempdir().expect("temporary discovery root");
     let adapter = Adapter::new(Config {
         allowed_root: Some(directory.path().to_owned()),
+        limits: test_limits(),
         ..Config::default()
     })
     .expect("valid adapter configuration");
@@ -31,7 +40,13 @@ fn require_ffmpeg() -> Option<Adapter> {
     let available = matches!(capabilities.ffmpeg, ToolAvailability::Available { .. })
         && matches!(capabilities.ffprobe, ToolAvailability::Available { .. });
     if available {
-        Some(Adapter::new(Config::default()).expect("valid adapter configuration"))
+        Some(
+            Adapter::new(Config {
+                limits: test_limits(),
+                ..Config::default()
+            })
+            .expect("valid adapter configuration"),
+        )
     } else if std::env::var("FM_REQUIRE_FFMPEG").as_deref() == Ok("1") {
         panic!("FM_REQUIRE_FFMPEG=1 but FFmpeg tools are unavailable: {capabilities:?}");
     } else {
@@ -429,6 +444,7 @@ fn probes_and_decodes_three_video_frames_and_audio_blocks() {
     generate_asset(&path);
     let adapter = Adapter::new(Config {
         allowed_root: Some(directory.path().to_owned()),
+        limits: test_limits(),
         ..Config::default()
     })
     .unwrap();
@@ -490,6 +506,7 @@ fn decodes_nonempty_prefixes_through_end_of_stream_without_weakening_exact_count
     generate_asset(&path);
     let adapter = Adapter::new(Config {
         allowed_root: Some(directory.path().to_owned()),
+        limits: test_limits(),
         ..Config::default()
     })
     .unwrap();
@@ -572,7 +589,7 @@ fn enforces_input_output_request_and_selector_bounds() {
 
     let limits = fm_codec_ffmpeg::Limits {
         max_input_bytes: 1,
-        ..fm_codec_ffmpeg::Limits::default()
+        ..test_limits()
     };
     let input_adapter = Adapter::new(Config {
         allowed_root: Some(directory.path().to_owned()),
@@ -590,7 +607,7 @@ fn enforces_input_output_request_and_selector_bounds() {
 
     let limits = fm_codec_ffmpeg::Limits {
         max_total_decoded_bytes: 100,
-        ..fm_codec_ffmpeg::Limits::default()
+        ..test_limits()
     };
     let output_adapter = Adapter::new(Config {
         allowed_root: Some(directory.path().to_owned()),
@@ -609,7 +626,7 @@ fn enforces_input_output_request_and_selector_bounds() {
 
     let limits = fm_codec_ffmpeg::Limits {
         max_video_frames: 2,
-        ..fm_codec_ffmpeg::Limits::default()
+        ..test_limits()
     };
     let request_adapter = Adapter::new(Config {
         allowed_root: Some(directory.path().to_owned()),
@@ -629,7 +646,7 @@ fn enforces_input_output_request_and_selector_bounds() {
         ffmpeg: Executable::SearchPath,
         ffprobe: Executable::SearchPath,
         allowed_root: Some(directory.path().to_owned()),
-        ..Config::default()
+        limits: test_limits(),
     })
     .unwrap();
     let invalid = DecodeRequest {
@@ -657,6 +674,7 @@ fn sequential_video_windows_match_leading_decode_and_have_sticky_eos() {
     generate_asset(&path);
     let adapter = Adapter::new(Config {
         allowed_root: Some(directory.path().to_owned()),
+        limits: test_limits(),
         ..Config::default()
     })
     .unwrap();
@@ -707,6 +725,7 @@ fn video_cursor_limits_apply_per_page_and_fail_transactionally() {
 
     let adapter = Adapter::new(Config {
         allowed_root: Some(directory.path().to_owned()),
+        limits: test_limits(),
         ..Config::default()
     })
     .unwrap();
@@ -721,7 +740,7 @@ fn video_cursor_limits_apply_per_page_and_fail_transactionally() {
         allowed_root: Some(directory.path().to_owned()),
         limits: fm_codec_ffmpeg::Limits {
             max_video_frames: 2,
-            ..fm_codec_ffmpeg::Limits::default()
+            ..test_limits()
         },
         ..Config::default()
     })
@@ -750,7 +769,7 @@ fn video_cursor_limits_apply_per_page_and_fail_transactionally() {
         allowed_root: Some(directory.path().to_owned()),
         limits: fm_codec_ffmpeg::Limits {
             max_total_decoded_bytes: frame_bytes,
-            ..fm_codec_ffmpeg::Limits::default()
+            ..test_limits()
         },
         ..Config::default()
     })
@@ -790,6 +809,7 @@ fn sequential_audio_windows_match_leading_decode_and_keep_global_timing() {
     generate_asset(&path);
     let adapter = Adapter::new(Config {
         allowed_root: Some(directory.path().to_owned()),
+        limits: test_limits(),
         ..Config::default()
     })
     .unwrap();
@@ -841,6 +861,7 @@ fn deep_audio_pages_and_restored_cursors_match_linear_decode() {
         generate_deep_audio_asset(&path, sample_rate);
         let adapter = Adapter::new(Config {
             allowed_root: Some(directory.path().to_owned()),
+            limits: test_limits(),
             ..Config::default()
         })
         .unwrap();
@@ -936,7 +957,7 @@ fn default_limits_bound_high_rate_deep_page_diagnostics_and_match_linear_oracle(
 }
 
 #[test]
-fn raw_flac_large_block_exact_boundary_uses_bounded_from_start_fallback() {
+fn raw_flac_large_blocks_match_linear_oracle_across_real_demuxer_seek_paths() {
     let _guard = ffmpeg_test_guard();
     let Some(_) = require_ffmpeg() else {
         return;
@@ -946,6 +967,7 @@ fn raw_flac_large_block_exact_boundary_uses_bounded_from_start_fallback() {
     generate_large_block_flac(&path);
     let adapter = Adapter::new(Config {
         allowed_root: Some(directory.path().to_owned()),
+        limits: test_limits(),
         ..Config::default()
     })
     .unwrap();
@@ -968,27 +990,29 @@ fn raw_flac_large_block_exact_boundary_uses_bounded_from_start_fallback() {
         linear_audio_oracle(&path, target_sample, 65_535)
     );
 
-    let seek_only = Adapter::new(Config {
+    // This real-tool check covers demuxer output at both correction depths.
+    // Deterministic child-process tests cover anchor retry control flow.
+    let seek_bounded = Adapter::new(Config {
         allowed_root: Some(directory.path().to_owned()),
         limits: fm_codec_ffmpeg::Limits {
             max_audio_samples: 200_000,
-            ..fm_codec_ffmpeg::Limits::default()
+            ..test_limits()
         },
         ..Config::default()
     })
     .unwrap();
-    let mut alternate_anchor = seek_only
+    let mut seek_cursor = seek_bounded
         .open_local_audio(&path, clock, StreamSelector::Best)
         .unwrap();
-    alternate_anchor
+    seek_cursor
         .skip_complete_blocks_to_sample_bounded(2 * 65_535, 2)
         .unwrap();
-    alternate_anchor
+    seek_cursor
         .skip_complete_blocks_to_sample_bounded(target_sample, 2)
         .unwrap();
-    let alternate_page = alternate_anchor.decode_up_to(NonZeroU32::MIN).unwrap();
+    let seek_page = seek_cursor.decode_up_to(NonZeroU32::MIN).unwrap();
     assert_eq!(
-        interleaved_audio_bytes(&alternate_page.blocks),
+        interleaved_audio_bytes(&seek_page.blocks),
         linear_audio_oracle(&path, target_sample, 65_535)
     );
 }
@@ -1005,6 +1029,7 @@ fn negative_start_flac_mka_decodes_bounded_prefix_and_rejects_deep_anchor_transa
     let clock = ClockDomainId::new(NonZeroU128::new(57).unwrap());
     let adapter = Adapter::new(Config {
         allowed_root: Some(directory.path().to_owned()),
+        limits: test_limits(),
         ..Config::default()
     })
     .unwrap();
@@ -1034,7 +1059,7 @@ fn negative_start_flac_mka_decodes_bounded_prefix_and_rejects_deep_anchor_transa
         allowed_root: Some(directory.path().to_owned()),
         limits: fm_codec_ffmpeg::Limits {
             max_audio_samples: 20_000,
-            ..fm_codec_ffmpeg::Limits::default()
+            ..test_limits()
         },
         ..Config::default()
     })
@@ -1065,6 +1090,7 @@ fn bounded_audio_window_rejects_before_decode_without_advancing() {
     generate_asset(&path);
     let adapter = Adapter::new(Config {
         allowed_root: Some(directory.path().to_owned()),
+        limits: test_limits(),
         ..Config::default()
     })
     .unwrap();
@@ -1107,6 +1133,7 @@ fn bounded_audio_cursor_position_skips_pcm_and_is_transactional() {
     generate_asset(&path);
     let adapter = Adapter::new(Config {
         allowed_root: Some(directory.path().to_owned()),
+        limits: test_limits(),
         ..Config::default()
     })
     .unwrap();
@@ -1157,6 +1184,7 @@ fn audio_full_final_eos_is_sticky() {
 
     let adapter = Adapter::new(Config {
         allowed_root: Some(directory.path().to_owned()),
+        limits: test_limits(),
         ..Config::default()
     })
     .unwrap();
@@ -1205,7 +1233,7 @@ fn audio_cursor_limits_apply_per_page_and_fail_transactionally() {
         clock,
         fm_codec_ffmpeg::Limits {
             max_audio_blocks: 2,
-            ..fm_codec_ffmpeg::Limits::default()
+            ..test_limits()
         },
         LimitKind::AudioBlocks,
         3,
@@ -1217,7 +1245,7 @@ fn audio_cursor_limits_apply_per_page_and_fail_transactionally() {
         clock,
         fm_codec_ffmpeg::Limits {
             max_audio_samples: 2 * 1024,
-            ..fm_codec_ffmpeg::Limits::default()
+            ..test_limits()
         },
         LimitKind::AudioSamples,
         3 * 1024,
@@ -1229,7 +1257,7 @@ fn audio_cursor_limits_apply_per_page_and_fail_transactionally() {
         clock,
         fm_codec_ffmpeg::Limits {
             max_total_decoded_bytes: 2 * 1024 * 2 * size_of::<f32>(),
-            ..fm_codec_ffmpeg::Limits::default()
+            ..test_limits()
         },
         LimitKind::DecodedBytes,
         u64::try_from(3 * 1024 * 2 * size_of::<f32>()).unwrap(),
