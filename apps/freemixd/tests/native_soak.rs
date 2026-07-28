@@ -558,6 +558,21 @@ struct AudioTelemetry {
     peak_retained_blocks: u64,
     retained_samples: u64,
     peak_retained_samples: u64,
+    retained_bytes: u64,
+    peak_retained_bytes: u64,
+    reservation_requests: u64,
+    reserved_blocks: u64,
+    peak_reserved_blocks: u64,
+    reserved_samples: u64,
+    peak_reserved_samples: u64,
+    reserved_bytes: u64,
+    peak_reserved_bytes: u64,
+    source_stalls: u64,
+    positioned_blocks: u64,
+    positioned_samples: u64,
+    leading_silence_samples: u64,
+    eos_padding_blocks: u64,
+    eos_padding_samples: u64,
     sink_depth: u64,
     sink_peak_depth: u64,
     sink_dropped: u64,
@@ -1268,6 +1283,41 @@ fn parse_required_flag(name: &str, value: Option<&str>) -> Result<bool, String> 
     }
 }
 
+fn parse_audio_telemetry(
+    fields: &BTreeMap<&str, &str>,
+    record: &str,
+) -> Result<AudioTelemetry, String> {
+    let field = |key| -> Result<u64, String> {
+        telemetry_field(fields, key)?
+            .parse::<u64>()
+            .map_err(|error| format!("invalid telemetry {key}: {error}; {record}"))
+    };
+    Ok(AudioTelemetry {
+        retained_blocks: field("audio_retained_blocks")?,
+        peak_retained_blocks: field("audio_observed_peak_retained_blocks")?,
+        retained_samples: field("audio_retained_samples")?,
+        peak_retained_samples: field("audio_observed_peak_retained_samples")?,
+        retained_bytes: field("audio_retained_bytes")?,
+        peak_retained_bytes: field("audio_observed_peak_retained_bytes")?,
+        reservation_requests: field("audio_reservation_requests")?,
+        reserved_blocks: field("audio_reserved_blocks")?,
+        peak_reserved_blocks: field("audio_observed_peak_reserved_blocks")?,
+        reserved_samples: field("audio_reserved_samples")?,
+        peak_reserved_samples: field("audio_observed_peak_reserved_samples")?,
+        reserved_bytes: field("audio_reserved_bytes")?,
+        peak_reserved_bytes: field("audio_observed_peak_reserved_bytes")?,
+        source_stalls: field("audio_source_stalls")?,
+        positioned_blocks: field("audio_positioned_blocks")?,
+        positioned_samples: field("audio_positioned_samples")?,
+        leading_silence_samples: field("audio_leading_silence_samples")?,
+        eos_padding_blocks: field("audio_eos_padding_blocks")?,
+        eos_padding_samples: field("audio_eos_padding_samples")?,
+        sink_depth: field("audio_sink_depth")?,
+        sink_peak_depth: field("audio_sink_peak_depth")?,
+        sink_dropped: field("audio_sink_dropped")?,
+    })
+}
+
 fn parse_telemetry(stderr: &str) -> Result<Telemetry, String> {
     let records = stderr
         .lines()
@@ -1289,8 +1339,8 @@ fn parse_telemetry(stderr: &str) -> Result<Telemetry, String> {
             return Err(format!("duplicate telemetry field {key}: {record}"));
         }
     }
-    if fields.get("v") != Some(&"3") {
-        return Err(format!("telemetry is not v=3: {record}"));
+    if fields.get("v") != Some(&"4") {
+        return Err(format!("telemetry is not v=4: {record}"));
     }
     let u64_field = |key| -> Result<u64, String> {
         telemetry_field(&fields, key)?
@@ -1314,15 +1364,7 @@ fn parse_telemetry(stderr: &str) -> Result<Telemetry, String> {
             retained: u64_field("host_lateness_samples_retained")?,
             dropped: u64_field("host_lateness_metric_samples_dropped")?,
         },
-        audio: AudioTelemetry {
-            retained_blocks: u64_field("audio_retained_blocks")?,
-            peak_retained_blocks: u64_field("audio_observed_peak_retained_blocks")?,
-            retained_samples: u64_field("audio_retained_samples")?,
-            peak_retained_samples: u64_field("audio_observed_peak_retained_samples")?,
-            sink_depth: u64_field("audio_sink_depth")?,
-            sink_peak_depth: u64_field("audio_sink_peak_depth")?,
-            sink_dropped: u64_field("audio_sink_dropped")?,
-        },
+        audio: parse_audio_telemetry(&fields, record)?,
         camera: CameraTelemetry {
             configured_sources: u64_field("camera_configured_sources")?,
             frames_received: u64_field("camera_frames_received")?,
@@ -1555,14 +1597,49 @@ fn protocol_line_reader_is_bounded_and_requires_utf8_newline() {
     assert!(read_protocol_line(&mut oversized).is_err());
 }
 
+fn expected_audio_telemetry() -> AudioTelemetry {
+    AudioTelemetry {
+        retained_blocks: 3,
+        peak_retained_blocks: 4,
+        retained_samples: 5,
+        peak_retained_samples: 6,
+        retained_bytes: 20,
+        peak_retained_bytes: 21,
+        reservation_requests: 22,
+        reserved_blocks: 23,
+        peak_reserved_blocks: 24,
+        reserved_samples: 25,
+        peak_reserved_samples: 26,
+        reserved_bytes: 27,
+        peak_reserved_bytes: 28,
+        source_stalls: 29,
+        positioned_blocks: 30,
+        positioned_samples: 31,
+        leading_silence_samples: 32,
+        eos_padding_blocks: 33,
+        eos_padding_samples: 34,
+        sink_depth: 1,
+        sink_peak_depth: 2,
+        sink_dropped: 7,
+    }
+}
+
 #[test]
-fn telemetry_parser_requires_one_v3_record_and_extracts_soak_fields() {
+fn telemetry_parser_requires_one_v4_record_and_extracts_soak_fields() {
     let line = concat!(
-        "FREEMIXD_TELEMETRY\tv=3",
+        "FREEMIXD_TELEMETRY\tv=4",
         "\thost_lateness_samples_total=42\thost_lateness_samples_retained=40",
         "\thost_lateness_metric_samples_dropped=2",
         "\taudio_retained_blocks=3\taudio_observed_peak_retained_blocks=4",
         "\taudio_retained_samples=5\taudio_observed_peak_retained_samples=6",
+        "\taudio_retained_bytes=20\taudio_observed_peak_retained_bytes=21",
+        "\taudio_reservation_requests=22\taudio_reserved_blocks=23",
+        "\taudio_observed_peak_reserved_blocks=24\taudio_reserved_samples=25",
+        "\taudio_observed_peak_reserved_samples=26\taudio_reserved_bytes=27",
+        "\taudio_observed_peak_reserved_bytes=28\taudio_source_stalls=29",
+        "\taudio_positioned_blocks=30\taudio_positioned_samples=31",
+        "\taudio_leading_silence_samples=32\taudio_eos_padding_blocks=33",
+        "\taudio_eos_padding_samples=34",
         "\taudio_sink_depth=1\taudio_sink_peak_depth=2\taudio_sink_dropped=7",
         "\tcamera_configured_sources=2\tcamera_frames_received=30",
         "\tcamera_frames_ingested=27\tcamera_native_dropped=3",
@@ -1586,15 +1663,7 @@ fn telemetry_parser_requires_one_v3_record_and_extracts_soak_fields() {
                 retained: 40,
                 dropped: 2,
             },
-            audio: AudioTelemetry {
-                retained_blocks: 3,
-                peak_retained_blocks: 4,
-                retained_samples: 5,
-                peak_retained_samples: 6,
-                sink_depth: 1,
-                sink_peak_depth: 2,
-                sink_dropped: 7,
-            },
+            audio: expected_audio_telemetry(),
             camera: CameraTelemetry {
                 configured_sources: 2,
                 frames_received: 30,
@@ -1635,5 +1704,5 @@ fn telemetry_parser_requires_one_v3_record_and_extracts_soak_fields() {
         })
     );
     assert!(parse_telemetry(&format!("{line}\n{line}")).is_err());
-    assert!(parse_telemetry(&line.replacen("v=3", "v=2", 1)).is_err());
+    assert!(parse_telemetry(&line.replacen("v=4", "v=3", 1)).is_err());
 }

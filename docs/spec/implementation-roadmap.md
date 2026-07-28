@@ -384,13 +384,15 @@ continues; if no valid frame arrives before the first-frame deadline, timeout
 returns to daemon retry. Daemon shutdown requests cancellation for all workers
 before waiting against one aggregate deadline.
 
-`FREEMIXD_TELEMETRY` v3 and `FREEMIXD_CAMERA_SOURCE` v1 now include recovery
+`FREEMIXD_TELEMETRY` v4 and `FREEMIXD_CAMERA_SOURCE` v1 include recovery
 attempt/success/exhaustion/failure state, adapter queue and ready-delivery state,
 terminal/cancellation discards, latest-slot replacement/depth, preflight state,
 ingest failures, and successful live GPU ingests. Per-source tests assert exact
 conservation of every adapter-received frame across ingestion, explicit discard
 or replacement classes, and instantaneous outstanding slots; daemon aggregates
-are folded from the same snapshots. Diagnostics remain local
+are folded from the same snapshots. Telemetry v4 additionally exposes native
+audio reservation pressure, stalls, positioning, EOS padding, and retained-byte
+counters. Diagnostics remain local
 `diagnostic-not-certification` records and omit hardware identifiers, names,
 stable keys, paths, health details, clocks, and media.
 

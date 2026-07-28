@@ -1,8 +1,13 @@
-use core::{fmt, num::NonZeroU128};
+use core::{
+    fmt,
+    num::{NonZeroU128, NonZeroUsize},
+};
 use std::collections::VecDeque;
 
 use fm_clock::{ClockDomainId as MappingClockDomainId, ClockMapping};
-use fm_frame::{AudioBlock, MediaFlags, NormalizedDuration, NormalizedTimestamp, SequenceNumber};
+use fm_frame::{
+    AudioBlock, MediaFlags, MediaTiming, NormalizedDuration, NormalizedTimestamp, SequenceNumber,
+};
 use fm_types::{ChannelLayout, SampleRate};
 
 const NANOS_PER_SECOND: i128 = 1_000_000_000;
@@ -496,6 +501,33 @@ pub struct AudioRenderPlan {
     generation: u64,
 }
 
+/// One timing-bearing silence span copied into preallocated synchronizer storage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AudioSilenceSpan {
+    timing: MediaTiming,
+    sample_count: NonZeroUsize,
+}
+
+impl AudioSilenceSpan {
+    #[must_use]
+    pub const fn new(timing: MediaTiming, sample_count: NonZeroUsize) -> Self {
+        Self {
+            timing,
+            sample_count,
+        }
+    }
+
+    #[must_use]
+    pub const fn timing(self) -> MediaTiming {
+        self.timing
+    }
+
+    #[must_use]
+    pub const fn sample_count(self) -> usize {
+        self.sample_count.get()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct SamplePhase {
     source_sample: u64,
@@ -732,6 +764,95 @@ impl ClockMappedAudioSynchronizer {
         Ok(())
     }
 
+    /// Validates contiguous silence metadata without changing buffered media.
+    ///
+    /// # Errors
+    ///
+    /// Returns a timing, continuity, capacity, or arithmetic error.
+    pub fn preflight_push_silence_batch(
+        &self,
+        spans: &[AudioSilenceSpan],
+    ) -> Result<(), AudioSynchronizerError> {
+        let mut cursor = self.input_cursor;
+        let mut block_count = self.blocks.len();
+        let mut samples = self.buffered_samples;
+        let mut bytes = self.buffered_bytes;
+        for span in spans {
+            let (next_cursor, block_bytes) = self.validate_push_timing_at(
+                span.timing,
+                span.sample_count(),
+                cursor,
+                block_count,
+                samples,
+                bytes,
+            )?;
+            cursor = Some(next_cursor);
+            block_count = block_count
+                .checked_add(1)
+                .ok_or(AudioSynchronizerError::ArithmeticOverflow)?;
+            samples = samples
+                .checked_add(span.sample_count())
+                .ok_or(AudioSynchronizerError::ArithmeticOverflow)?;
+            bytes = bytes
+                .checked_add(block_bytes)
+                .ok_or(AudioSynchronizerError::ArithmeticOverflow)?;
+        }
+        Ok(())
+    }
+
+    /// Atomically writes contiguous silence into preallocated PCM and block storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::preflight_push_silence_batch`].
+    pub fn push_silence_batch(
+        &mut self,
+        spans: &[AudioSilenceSpan],
+    ) -> Result<(), AudioSynchronizerError> {
+        if let Err(error) = self.preflight_push_silence_batch(spans) {
+            self.telemetry.rejected_blocks = self
+                .telemetry
+                .rejected_blocks
+                .saturating_add(u64::try_from(spans.len()).unwrap_or(u64::MAX));
+            return Err(error);
+        }
+        for span in spans {
+            let result = self.validate_push_timing_at(
+                span.timing,
+                span.sample_count(),
+                self.input_cursor,
+                self.blocks.len(),
+                self.buffered_samples,
+                self.buffered_bytes,
+            );
+            let Ok((next_cursor, block_bytes)) = result else {
+                unreachable!("unchanged synchronizer passed silence batch preflight");
+            };
+            let write_position =
+                (self.read_position + self.buffered_samples) % self.sample_capacity;
+            let first = span
+                .sample_count()
+                .min(self.sample_capacity - write_position);
+            for plane in &mut self.planes {
+                plane[write_position..write_position + first].fill(0.0);
+                plane[..span.sample_count() - first].fill(0.0);
+            }
+            self.blocks.push_back(BufferedBlock {
+                remaining_samples: span.sample_count(),
+            });
+            self.buffered_samples += span.sample_count();
+            self.buffered_bytes += block_bytes;
+            self.input_cursor = Some(next_cursor);
+            self.telemetry.accepted_blocks = self.telemetry.accepted_blocks.saturating_add(1);
+            self.telemetry.accepted_samples = self
+                .telemetry
+                .accepted_samples
+                .saturating_add(u64::try_from(span.sample_count()).unwrap_or(u64::MAX));
+        }
+        self.update_occupancy_telemetry();
+        Ok(())
+    }
+
     /// Renders one exact, contiguous Master interval into caller-owned planes.
     /// The first interval must begin at the configured Master cadence origin.
     ///
@@ -945,6 +1066,32 @@ impl ClockMappedAudioSynchronizer {
             return Err(AudioSynchronizerError::ChannelLayoutMismatch);
         }
         let timing = block.timing();
+        for (channel, plane) in block.planes().iter().enumerate() {
+            if let Some(sample) = plane.iter().position(|sample| !sample.is_finite()) {
+                return Err(AudioSynchronizerError::NonFiniteSample { channel, sample });
+            }
+        }
+
+        self.validate_push_timing_at(
+            timing,
+            block.sample_count(),
+            input_cursor,
+            buffered_blocks,
+            buffered_samples,
+            buffered_bytes,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn validate_push_timing_at(
+        &self,
+        timing: MediaTiming,
+        sample_count: usize,
+        input_cursor: Option<InputCursor>,
+        buffered_blocks: usize,
+        buffered_samples: usize,
+        buffered_bytes: usize,
+    ) -> Result<(InputCursor, usize), AudioSynchronizerError> {
         let expected_clock = self.mapping.source_domain().get();
         let actual_clock = timing.clock_domain().get();
         if actual_clock != expected_clock {
@@ -962,14 +1109,8 @@ impl ClockMappedAudioSynchronizer {
             return Err(AudioSynchronizerError::CorruptedInput);
         }
 
-        for (channel, plane) in block.planes().iter().enumerate() {
-            if let Some(sample) = plane.iter().position(|sample| !sample.is_finite()) {
-                return Err(AudioSynchronizerError::NonFiniteSample { channel, sample });
-            }
-        }
-
-        let sample_count = u64::try_from(block.sample_count())
-            .map_err(|_| AudioSynchronizerError::ArithmeticOverflow)?;
+        let sample_count_u64 =
+            u64::try_from(sample_count).map_err(|_| AudioSynchronizerError::ArithmeticOverflow)?;
         let (first_sample, next_sequence) = if let Some(cursor) = input_cursor {
             if timing.sequence() != cursor.next_sequence {
                 return Err(AudioSynchronizerError::Discontinuity(
@@ -1014,7 +1155,8 @@ impl ClockMappedAudioSynchronizer {
                 .ok_or(AudioSynchronizerError::ArithmeticOverflow)?;
             (self.source_origin.sample_index, next)
         };
-        let expected_duration = sample_span_duration(first_sample, sample_count, self.source_rate)?;
+        let expected_duration =
+            sample_span_duration(first_sample, sample_count_u64, self.source_rate)?;
         if timing.duration().as_nanos() != expected_duration {
             return Err(AudioSynchronizerError::SourceDurationMismatch {
                 expected_nanos: expected_duration,
@@ -1022,8 +1164,7 @@ impl ClockMappedAudioSynchronizer {
             });
         }
 
-        let block_bytes = block
-            .sample_count()
+        let block_bytes = sample_count
             .checked_mul(self.bytes_per_sample_frame)
             .ok_or(AudioSynchronizerError::ArithmeticOverflow)?;
         Self::check_buffer_limit(
@@ -1035,7 +1176,7 @@ impl ClockMappedAudioSynchronizer {
         Self::check_buffer_limit(
             BufferLimit::Samples,
             buffered_samples,
-            block.sample_count(),
+            sample_count,
             self.limits.max_samples,
         )?;
         Self::check_buffer_limit(
@@ -1045,7 +1186,7 @@ impl ClockMappedAudioSynchronizer {
             self.limits.max_bytes,
         )?;
         let next_sample = first_sample
-            .checked_add(sample_count)
+            .checked_add(sample_count_u64)
             .ok_or(AudioSynchronizerError::ArithmeticOverflow)?;
         Ok((
             InputCursor {
@@ -1155,18 +1296,37 @@ impl ClockMappedAudioSynchronizer {
         let next_output_sample = first_output_sample
             .checked_add(output_samples_u64)
             .ok_or(AudioSynchronizerError::ArithmeticOverflow)?;
+        let mut required_source_sample = None;
         for offset in 0..output_samples_u64 {
             let output_sample = first_output_sample
                 .checked_add(offset)
                 .ok_or(AudioSynchronizerError::ArithmeticOverflow)?;
             let (source_sample, remainder, denominator) = self.source_phase(output_sample)?;
-            let source_sample = self.require_source_sample(source_sample, remainder != 0)?;
+            let (source_sample, required_sample) =
+                self.source_sample_requirement(source_sample, remainder != 0)?;
+            required_source_sample = Some(
+                required_source_sample
+                    .map_or(required_sample, |current: u64| current.max(required_sample)),
+            );
             let phase_index =
                 usize::try_from(offset).map_err(|_| AudioSynchronizerError::ArithmeticOverflow)?;
             self.phases[phase_index] = SamplePhase {
                 source_sample,
                 fraction: fraction_as_f64(remainder, denominator),
             };
+        }
+        let buffered_end_sample = self
+            .first_sample_index
+            .checked_add(
+                u64::try_from(self.buffered_samples)
+                    .map_err(|_| AudioSynchronizerError::ArithmeticOverflow)?,
+            )
+            .ok_or(AudioSynchronizerError::ArithmeticOverflow)?;
+        if required_source_sample.is_some_and(|required| required >= buffered_end_sample) {
+            return Err(AudioSynchronizerError::NeedMoreInput {
+                required_sample: required_source_sample.expect("checked as present"),
+                buffered_end_sample,
+            });
         }
         let (next_source_sample, _, _) = self.source_phase(next_output_sample)?;
         let discard_before = if next_source_sample <= 0 {
@@ -1272,11 +1432,11 @@ impl ClockMappedAudioSynchronizer {
         Ok((source_sample, remainder, denominator))
     }
 
-    fn require_source_sample(
+    fn source_sample_requirement(
         &self,
         source_sample: i128,
         requires_lookahead: bool,
-    ) -> Result<u64, AudioSynchronizerError> {
+    ) -> Result<(u64, u64), AudioSynchronizerError> {
         if source_sample < i128::from(self.first_sample_index) {
             return Err(AudioSynchronizerError::Discontinuity(
                 SynchronizerDiscontinuity::RequestedBeforeBuffer {
@@ -1294,20 +1454,7 @@ impl ClockMappedAudioSynchronizer {
         } else {
             source_sample
         };
-        let buffered_end_sample = self
-            .first_sample_index
-            .checked_add(
-                u64::try_from(self.buffered_samples)
-                    .map_err(|_| AudioSynchronizerError::ArithmeticOverflow)?,
-            )
-            .ok_or(AudioSynchronizerError::ArithmeticOverflow)?;
-        if required_sample >= buffered_end_sample {
-            return Err(AudioSynchronizerError::NeedMoreInput {
-                required_sample,
-                buffered_end_sample,
-            });
-        }
-        Ok(source_sample)
+        Ok((source_sample, required_sample))
     }
 
     fn buffered_sample(&self, channel: usize, absolute_sample: u64) -> f32 {
@@ -1471,4 +1618,95 @@ fn fraction_as_f64(remainder: i128, denominator: i128) -> f64 {
 #[allow(clippy::cast_possible_truncation)]
 fn interpolated_sample(value: f64) -> f32 {
     value as f32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fm_clock::{ClockSnapshot, ClockTime};
+    use fm_frame::{ClockDomainId, MediaTimestamp, OriginalTimestamp, TimeBase};
+    use fm_types::Channel;
+
+    fn silence_timing(sequence: u64, start: u64, samples: usize) -> MediaTiming {
+        let rate = SampleRate::new(48_000).unwrap();
+        MediaTiming::new(
+            OriginalTimestamp::new(
+                MediaTimestamp::new(i64::try_from(start).unwrap()),
+                TimeBase::new(1, rate.hertz()).unwrap(),
+            ),
+            cadence_timestamp(
+                AudioCadenceOrigin::new(NormalizedTimestamp::from_nanos(0), 0),
+                start,
+                rate,
+            )
+            .unwrap(),
+            NormalizedDuration::from_nanos(
+                sample_span_duration(start, u64::try_from(samples).unwrap(), rate).unwrap(),
+            )
+            .unwrap(),
+            ClockDomainId::new(NonZeroU128::new(1).unwrap()),
+            SequenceNumber::new(sequence),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn silence_batch_reuses_preallocated_pcm_and_block_storage() {
+        let source_domain = MappingClockDomainId::new(NonZeroU128::new(1).unwrap());
+        let master_domain = MappingClockDomainId::new(NonZeroU128::new(2).unwrap());
+        let mapping = ClockMapping::new(
+            ClockSnapshot::new(source_domain, ClockTime::ZERO),
+            ClockSnapshot::new(master_domain, ClockTime::ZERO),
+            0,
+        )
+        .unwrap();
+        let rate = SampleRate::new(48_000).unwrap();
+        let mut synchronizer = ClockMappedAudioSynchronizer::new(
+            rate,
+            rate,
+            ChannelLayout::new(vec![Channel::Mono]).unwrap(),
+            mapping,
+            AudioCadenceOrigin::new(NormalizedTimestamp::from_nanos(0), 0),
+            AudioCadenceOrigin::new(NormalizedTimestamp::from_nanos(0), 0),
+            AudioSynchronizerLimits::new(4, 8, 8 * size_of::<f32>(), 4).unwrap(),
+        )
+        .unwrap();
+        let pcm_pointer = synchronizer.planes[0].as_ptr();
+        let pcm_capacity = synchronizer.planes[0].capacity();
+        let block_capacity = synchronizer.blocks.capacity();
+        let spans = [
+            AudioSilenceSpan::new(silence_timing(0, 0, 2), NonZeroUsize::new(2).unwrap()),
+            AudioSilenceSpan::new(silence_timing(1, 2, 2), NonZeroUsize::new(2).unwrap()),
+        ];
+        let interval = MasterAudioInterval::new(
+            master_domain,
+            NormalizedTimestamp::from_nanos(0),
+            NormalizedDuration::from_nanos(sample_span_duration(0, 4, rate).unwrap()).unwrap(),
+        );
+        assert!(matches!(
+            synchronizer.plan_render(interval, 4),
+            Err(AudioSynchronizerError::NeedMoreInput {
+                required_sample: 3,
+                buffered_end_sample: 0,
+            })
+        ));
+
+        synchronizer.push_silence_batch(&spans).unwrap();
+        let plan = synchronizer.plan_render(interval, 4).unwrap();
+        let mut output = [1.0; 4];
+        synchronizer
+            .render_planned_into(plan, &mut [&mut output])
+            .unwrap();
+
+        assert_eq!(synchronizer.planes[0].as_ptr(), pcm_pointer);
+        assert_eq!(synchronizer.planes[0].capacity(), pcm_capacity);
+        assert_eq!(synchronizer.blocks.capacity(), block_capacity);
+        assert_eq!(synchronizer.telemetry().buffered_samples(), 4);
+        assert!(output.iter().all(|sample| sample.abs() < f32::EPSILON));
+        assert!(
+            synchronizer.planes[0][..4]
+                .iter()
+                .all(|sample| sample.abs() < f32::EPSILON)
+        );
+    }
 }

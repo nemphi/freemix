@@ -1094,6 +1094,21 @@ struct NativeRuntimeTelemetry {
     audio_peak_retained_blocks: u64,
     audio_retained_samples: u64,
     audio_peak_retained_samples: u64,
+    audio_retained_bytes: u64,
+    audio_peak_retained_bytes: u64,
+    audio_reservation_requests: u64,
+    audio_reserved_blocks: u64,
+    audio_peak_reserved_blocks: u64,
+    audio_reserved_samples: u64,
+    audio_peak_reserved_samples: u64,
+    audio_reserved_bytes: u64,
+    audio_peak_reserved_bytes: u64,
+    audio_source_stalls: u64,
+    audio_positioned_blocks: u64,
+    audio_positioned_samples: u64,
+    audio_leading_silence_samples: u64,
+    audio_eos_padding_blocks: u64,
+    audio_eos_padding_samples: u64,
     audio_sink_depth: u64,
     audio_sink_peak_depth: u64,
     audio_sink_dropped: u64,
@@ -1124,6 +1139,21 @@ impl NativeRuntimeTelemetry {
             audio_peak_retained_blocks: 0,
             audio_retained_samples: 0,
             audio_peak_retained_samples: 0,
+            audio_retained_bytes: 0,
+            audio_peak_retained_bytes: 0,
+            audio_reservation_requests: 0,
+            audio_reserved_blocks: 0,
+            audio_peak_reserved_blocks: 0,
+            audio_reserved_samples: 0,
+            audio_peak_reserved_samples: 0,
+            audio_reserved_bytes: 0,
+            audio_peak_reserved_bytes: 0,
+            audio_source_stalls: 0,
+            audio_positioned_blocks: 0,
+            audio_positioned_samples: 0,
+            audio_leading_silence_samples: 0,
+            audio_eos_padding_blocks: 0,
+            audio_eos_padding_samples: 0,
             audio_sink_depth: 0,
             audio_sink_peak_depth: 0,
             audio_sink_dropped: 0,
@@ -1162,20 +1192,35 @@ impl NativeRuntimeTelemetry {
     }
 
     fn observe_audio(&mut self, master: &NativeMasterRuntime) {
+        let audio = master.audio_telemetry();
         self.audio_retained_blocks = saturating_u64(master.retained_blocks());
         self.audio_peak_retained_blocks = self
             .audio_peak_retained_blocks
             .max(self.audio_retained_blocks)
-            .max(saturating_u64(
-                master.audio_telemetry().peak_retained_blocks,
-            ));
+            .max(saturating_u64(audio.peak_retained_blocks));
         self.audio_retained_samples = saturating_u64(master.retained_samples());
         self.audio_peak_retained_samples = self
             .audio_peak_retained_samples
             .max(self.audio_retained_samples)
-            .max(saturating_u64(
-                master.audio_telemetry().peak_retained_samples,
-            ));
+            .max(saturating_u64(audio.peak_retained_samples));
+        self.audio_retained_bytes = saturating_u64(master.retained_bytes());
+        self.audio_peak_retained_bytes = self
+            .audio_peak_retained_bytes
+            .max(self.audio_retained_bytes)
+            .max(saturating_u64(audio.peak_retained_bytes));
+        self.audio_reservation_requests = audio.reservation_requests;
+        self.audio_reserved_blocks = saturating_u64(audio.reserved_blocks);
+        self.audio_peak_reserved_blocks = saturating_u64(audio.peak_reserved_blocks);
+        self.audio_reserved_samples = saturating_u64(audio.reserved_samples);
+        self.audio_peak_reserved_samples = saturating_u64(audio.peak_reserved_samples);
+        self.audio_reserved_bytes = saturating_u64(audio.reserved_bytes);
+        self.audio_peak_reserved_bytes = saturating_u64(audio.peak_reserved_bytes);
+        self.audio_source_stalls = audio.source_stalls;
+        self.audio_positioned_blocks = audio.positioned_blocks;
+        self.audio_positioned_samples = audio.positioned_samples;
+        self.audio_leading_silence_samples = audio.leading_silence_samples;
+        self.audio_eos_padding_blocks = audio.eos_padding_blocks;
+        self.audio_eos_padding_samples = audio.eos_padding_samples;
         self.audio_sink_depth = saturating_u64(master.sink_len());
         let sink = master.sink_telemetry();
         self.audio_sink_peak_depth = saturating_u64(sink.high_watermark());
@@ -1213,7 +1258,7 @@ impl NativeRuntimeTelemetry {
         let presentation_active = presentation.is_some();
         let presentation = presentation.unwrap_or_default();
         format!(
-            "FREEMIXD_TELEMETRY\tv=3\thost_lateness_samples_total={}\thost_lateness_samples_retained={}\thost_lateness_metric_samples_dropped={}\thost_lateness_p50_ms={}\thost_lateness_p95_ms={}\thost_lateness_p99_ms={}\taudio_retained_blocks={}\taudio_observed_peak_retained_blocks={}\taudio_retained_samples={}\taudio_observed_peak_retained_samples={}\taudio_sink_depth={}\taudio_sink_peak_depth={}\taudio_sink_dropped={}\tcamera_configured_sources={}\tcamera_frames_received={}\tcamera_frames_ingested={}\tcamera_native_dropped={}\tcamera_queue_depth={}\tcamera_queue_peak_depth={}\tcamera_queue_dropped={}\tcamera_continuity_rejected={}\tcamera_recovery_timeout_discarded={}\tcamera_terminal_error_discarded={}\tcamera_terminal_trigger_discarded={}\tcamera_ready_delivery_depth={}\tcamera_ready_delivery_discarded={}\tcamera_cancellation_discarded={}\tcamera_supervisor_slot_replaced={}\tcamera_supervisor_slot_depth={}\tcamera_ingest_failed={}\tcamera_preflight_depth={}\tcamera_preflight_discarded={}\tcamera_recovery_attempts={}\tcamera_recovery_successes={}\tcamera_recovery_exhausted={}\tcamera_recovery_worker_failures={}\tpresentation_active={}\tpresentation_pending_depth={}\tpresentation_peak_pending_depth={}\tpresentation_dropped={}\trecorder_configured={}\trecorder_outstanding_pairs={}\trecorder_observed_peak_outstanding_pairs={}\trecorder_retained_bytes={}\trecorder_observed_peak_retained_bytes={}\tgpu_backend={:?}\tgpu_adapter={}\tgpu_timing={:?}\tgpu_pass_samples_total={}\tgpu_pass_samples_retained={}\tgpu_pass_metric_samples_dropped={}\tgpu_pass_p50_ms={}\tgpu_pass_p95_ms={}\tgpu_pass_p99_ms={}\tgpu_samples_pending={}\tgpu_samples_dropped={}\tgpu_samples_unavailable={}\tmetric_errors={}\tmetric_samples_dropped={}",
+            "FREEMIXD_TELEMETRY\tv=4\thost_lateness_samples_total={}\thost_lateness_samples_retained={}\thost_lateness_metric_samples_dropped={}\thost_lateness_p50_ms={}\thost_lateness_p95_ms={}\thost_lateness_p99_ms={}\taudio_retained_blocks={}\taudio_observed_peak_retained_blocks={}\taudio_retained_samples={}\taudio_observed_peak_retained_samples={}\taudio_retained_bytes={}\taudio_observed_peak_retained_bytes={}\taudio_reservation_requests={}\taudio_reserved_blocks={}\taudio_observed_peak_reserved_blocks={}\taudio_reserved_samples={}\taudio_observed_peak_reserved_samples={}\taudio_reserved_bytes={}\taudio_observed_peak_reserved_bytes={}\taudio_source_stalls={}\taudio_positioned_blocks={}\taudio_positioned_samples={}\taudio_leading_silence_samples={}\taudio_eos_padding_blocks={}\taudio_eos_padding_samples={}\taudio_sink_depth={}\taudio_sink_peak_depth={}\taudio_sink_dropped={}\tcamera_configured_sources={}\tcamera_frames_received={}\tcamera_frames_ingested={}\tcamera_native_dropped={}\tcamera_queue_depth={}\tcamera_queue_peak_depth={}\tcamera_queue_dropped={}\tcamera_continuity_rejected={}\tcamera_recovery_timeout_discarded={}\tcamera_terminal_error_discarded={}\tcamera_terminal_trigger_discarded={}\tcamera_ready_delivery_depth={}\tcamera_ready_delivery_discarded={}\tcamera_cancellation_discarded={}\tcamera_supervisor_slot_replaced={}\tcamera_supervisor_slot_depth={}\tcamera_ingest_failed={}\tcamera_preflight_depth={}\tcamera_preflight_discarded={}\tcamera_recovery_attempts={}\tcamera_recovery_successes={}\tcamera_recovery_exhausted={}\tcamera_recovery_worker_failures={}\tpresentation_active={}\tpresentation_pending_depth={}\tpresentation_peak_pending_depth={}\tpresentation_dropped={}\trecorder_configured={}\trecorder_outstanding_pairs={}\trecorder_observed_peak_outstanding_pairs={}\trecorder_retained_bytes={}\trecorder_observed_peak_retained_bytes={}\tgpu_backend={:?}\tgpu_adapter={}\tgpu_timing={:?}\tgpu_pass_samples_total={}\tgpu_pass_samples_retained={}\tgpu_pass_metric_samples_dropped={}\tgpu_pass_p50_ms={}\tgpu_pass_p95_ms={}\tgpu_pass_p99_ms={}\tgpu_samples_pending={}\tgpu_samples_dropped={}\tgpu_samples_unavailable={}\tmetric_errors={}\tmetric_samples_dropped={}",
             host.count,
             host.retained_samples,
             host.dropped_samples,
@@ -1224,6 +1269,21 @@ impl NativeRuntimeTelemetry {
             self.audio_peak_retained_blocks,
             self.audio_retained_samples,
             self.audio_peak_retained_samples,
+            self.audio_retained_bytes,
+            self.audio_peak_retained_bytes,
+            self.audio_reservation_requests,
+            self.audio_reserved_blocks,
+            self.audio_peak_reserved_blocks,
+            self.audio_reserved_samples,
+            self.audio_peak_reserved_samples,
+            self.audio_reserved_bytes,
+            self.audio_peak_reserved_bytes,
+            self.audio_source_stalls,
+            self.audio_positioned_blocks,
+            self.audio_positioned_samples,
+            self.audio_leading_silence_samples,
+            self.audio_eos_padding_blocks,
+            self.audio_eos_padding_samples,
             self.audio_sink_depth,
             self.audio_sink_peak_depth,
             self.audio_sink_dropped,
@@ -5028,6 +5088,21 @@ mod tests {
             backend: NativeBackend::Metal,
         };
         let mut telemetry = NativeRuntimeTelemetry::new(origin, &adapter);
+        telemetry.audio_retained_bytes = 10;
+        telemetry.audio_peak_retained_bytes = 11;
+        telemetry.audio_reservation_requests = 12;
+        telemetry.audio_reserved_blocks = 13;
+        telemetry.audio_peak_reserved_blocks = 14;
+        telemetry.audio_reserved_samples = 15;
+        telemetry.audio_peak_reserved_samples = 16;
+        telemetry.audio_reserved_bytes = 17;
+        telemetry.audio_peak_reserved_bytes = 18;
+        telemetry.audio_source_stalls = 19;
+        telemetry.audio_positioned_blocks = 20;
+        telemetry.audio_positioned_samples = 21;
+        telemetry.audio_leading_silence_samples = 22;
+        telemetry.audio_eos_padding_blocks = 23;
+        telemetry.audio_eos_padding_samples = 24;
         let deadline = origin
             .checked_sub(Duration::from_millis(10))
             .expect("test deadline is representable");
@@ -5039,10 +5114,25 @@ mod tests {
             ..fm_gpu::PresentationTelemetry::default()
         }));
 
-        assert!(diagnostic.starts_with("FREEMIXD_TELEMETRY\tv=3\t"));
+        assert!(diagnostic.starts_with("FREEMIXD_TELEMETRY\tv=4\t"));
         assert!(diagnostic.contains("\thost_lateness_samples_total=1\t"));
         assert!(diagnostic.contains("\thost_lateness_samples_retained=1\t"));
         assert!(diagnostic.contains("\thost_lateness_p50_ms=10.000\t"));
+        assert!(diagnostic.contains("\taudio_retained_bytes=10\t"));
+        assert!(diagnostic.contains("\taudio_observed_peak_retained_bytes=11\t"));
+        assert!(diagnostic.contains("\taudio_reservation_requests=12\t"));
+        assert!(diagnostic.contains("\taudio_reserved_blocks=13\t"));
+        assert!(diagnostic.contains("\taudio_observed_peak_reserved_blocks=14\t"));
+        assert!(diagnostic.contains("\taudio_reserved_samples=15\t"));
+        assert!(diagnostic.contains("\taudio_observed_peak_reserved_samples=16\t"));
+        assert!(diagnostic.contains("\taudio_reserved_bytes=17\t"));
+        assert!(diagnostic.contains("\taudio_observed_peak_reserved_bytes=18\t"));
+        assert!(diagnostic.contains("\taudio_source_stalls=19\t"));
+        assert!(diagnostic.contains("\taudio_positioned_blocks=20\t"));
+        assert!(diagnostic.contains("\taudio_positioned_samples=21\t"));
+        assert!(diagnostic.contains("\taudio_leading_silence_samples=22\t"));
+        assert!(diagnostic.contains("\taudio_eos_padding_blocks=23\t"));
+        assert!(diagnostic.contains("\taudio_eos_padding_samples=24\t"));
         assert!(diagnostic.contains("\tpresentation_active=true\t"));
         assert!(diagnostic.contains("\tpresentation_pending_depth=1\t"));
         assert!(diagnostic.contains("\tpresentation_dropped=2\t"));
