@@ -130,7 +130,13 @@ transactional sequential local-audio cursor with global block sequence,
 sample-contiguous timing, sticky EOS, and explicit per-page operation
 block/sample/byte limits. Cursor progress no longer spends prior pages against
 those limits, and bounded metadata-only positioning can skip complete blocks to
-a restored sample without decoding their PCM prefix.
+a restored sample without decoding their PCM prefix. FFmpeg audio metadata
+enumeration still scans from the start, however, and each audio decode still
+starts from the beginning and trims to the requested sample window. Later pages
+and deep restores therefore grow progressively more expensive. Native restore
+allows at most 4,096 skipped blocks, while fixed metadata-output and decoded-
+output bounds plus metadata/decode subprocess timeouts can make deep playback or
+restore fail transactionally.
 
 `fm-audio` provides a deterministic reference Master with planar F32 mapping,
 gain/mute/follow-video, meters, timed canonical blocks, sample-count timing
@@ -150,10 +156,11 @@ reserve capacity before nonblocking dispatch, prioritize uncovered sources, and
 commit a completed batch only after every returned page validates. EOS silence
 is staged and preflighted across all affected sources before any cursor changes;
 render preflights every source commit and sink admission before advancing the
-absolute frame cursor. Reusable source, discard, mix, plan, and EOS staging
-scratch is preallocated; only the canonical returned block and bounded fake-sink
-clone allocate per frame. Exact source channel layout is enforced across pages
-and must map by matching labels to Master; there is no channel conversion.
+absolute frame cursor. Synchronizer/source PCM buffers and EOS staging scratch
+are preallocated. The canonical returned block and bounded fake-sink clone still
+allocate per frame; event-bearing `FrameResult`s and other control-path
+allocations can also remain. Exact source channel layout is enforced across
+pages and must map by matching labels to Master; there is no channel conversion.
 
 Scene inputs recursively route audio through explicit `audio_source` links to a
 physical leaf or explicit silence. Cut keeps one source at unity; Fade and Wipe
@@ -163,19 +170,31 @@ Automatic Fade and held or reversed Fade T-bar movement propagate exact
 endpoints, although T-bar control remains internal rather than exposed by
 `EngineCommand`, protocol, or UI. Missing local audio, stills, scene silence,
 and configured simulated silence produce silence; unsupported simulated sine
-audio is rejected.
+audio is rejected. At decoded EOS, the daemon synthesizes continuing silence for
+subsequent Master intervals. It exposes no media-completion/end trigger and has
+no stop, loop, or operator-selectable EOS policy.
 
 `FREEMIXD_TELEMETRY` v4 reports current and observed-peak retained
 blocks/samples/bytes; reservation requests and current/peak reserved
 blocks/samples/bytes; source stalls; positioned blocks/samples; leading-silence
 samples; EOS-padding blocks/samples; and fake-sink current depth, peak depth, and
-drops. Native daemon, deep-restore FFmpeg, 44.1-to-48 kHz Metal recording, and
-restart/soak evidence exercise this path. It remains a fixed-clock linear
-diagnostic resampler feeding a fake sink: there is no drift estimator, device
-clock or OS audio device, channel conversion, persisted buses/output routing or
-strip controls, DSP, or externally delivered audio. Dedicated Wipe audio-policy
-testing and broader transition policies remain incomplete. Item 7 and the
-related parity rows therefore remain incomplete and planned.
+drops. Evidence is split by media type. The simulated-silence
+`phase2_native_diagnostic_soak` exercises Master cadence, fake-sink pressure,
+checkpoint/restart, and telemetry only; it does not exercise decoded-audio
+resampling, refill, positioning, or EOS. Dedicated ignored integrations
+separately cover daemon refill/checkpoint
+(`native_media_daemon_refills_beyond_startup_prefix_and_checkpoints_once`),
+44.1-to-48 kHz recording
+(`native_44_1k_local_audio_resamples_to_48k_master_recording`), and deep restored
+FFmpeg positioning/resampling
+(`deep_restored_44_1k_nonzero_pts_positions_without_pcm_prefix_and_preserves_phase`);
+deterministic native-runtime tests cover EOS padding. The path remains a
+fixed-clock linear diagnostic resampler feeding a fake sink: there is no drift
+estimator, device clock or OS audio device, channel conversion, persisted
+buses/output routing or strip controls, DSP, or externally delivered audio.
+Dedicated Wipe audio-policy testing and broader transition policies remain
+incomplete. Item 7 and the related parity rows therefore remain incomplete and
+planned.
 
 Current implementation boundary for item 8: `fm-gpu` provides a portable,
 bounded latest-frame presentation policy plus opaque, context-bound native
@@ -262,20 +281,22 @@ normal cooperative checkpoint and telemetry path. The ignored
 inputs with silent audio, alternates Cut and four-frame Fade commands, validates
 accepted command targets plus durable and runtime events, and then checks
 bounded telemetry, persisted receipts/routing/clock progress, and continued
-rendering after restart. Its default duration is 60 seconds; environment flags
-can require native startup and GPU timestamps, and its report is explicitly
-classified `diagnostic-not-certification` with `basic_show_complete=false`. A
-required local 60-second macOS/Metal run rendered all 1,500 requested frames,
-completed 59 commands, reported 1,333 lifetime GPU timing samples, resumed to
-1,575 total frames after a separate three-second restart, and exposed 1,492
-bounded fake audio-sink drops rather than hiding them. This is useful lifecycle
-and pressure evidence, not the universal Basic Show scenario. That scenario
-requires four cameras, two clips, a title, a browser source, a two-box scene,
-streaming, and recording for one hour on every Tier-1 OS. Cameras and persisted
-scenes are scheduled for Phase 3, streaming for Phase 4, and title/browser inputs
-for Phase 5; no Windows/DX12 or Linux/Vulkan one-hour evidence exists. Item 10 is
-therefore incomplete and is structurally blocked by capabilities scheduled
-after Phase 2.
+rendering after restart. Because its audio is simulated silence, it exercises
+Master cadence, the fake sink, checkpoint/restart, and telemetry, not decoded
+resampling, refill, positioning, or EOS. Its default duration is 60 seconds;
+environment flags can require native startup and GPU timestamps, and its report
+is explicitly classified `diagnostic-not-certification` with
+`basic_show_complete=false`. A required local 60-second macOS/Metal run rendered
+all 1,500 requested frames, completed 59 commands, reported 1,333 lifetime GPU
+timing samples, resumed to 1,575 total frames after a separate three-second
+restart, and exposed 1,492 bounded fake audio-sink drops rather than hiding them.
+This is useful lifecycle and pressure evidence, not the universal Basic Show
+scenario. That scenario requires four cameras, two clips, a title, a browser
+source, a two-box scene, streaming, and recording for one hour on every Tier-1
+OS. Cameras and persisted scenes are scheduled for Phase 3, streaming for Phase
+4, and title/browser inputs for Phase 5; no Windows/DX12 or Linux/Vulkan one-hour
+evidence exists. Item 10 is therefore incomplete and is structurally blocked by
+capabilities scheduled after Phase 2.
 
 Exit: a useful offline/file-based switcher, with no engine dependency on UI
 lifecycle.
