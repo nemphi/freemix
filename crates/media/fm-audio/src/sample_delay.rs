@@ -122,6 +122,16 @@ pub struct SampleDelay {
 }
 
 impl SampleDelay {
+    pub(crate) fn zero(channels: usize) -> Self {
+        debug_assert!((1..=MAX_CHANNELS).contains(&channels));
+        Self {
+            channels,
+            delay_samples: 0,
+            cursor: 0,
+            ring: Vec::new(),
+        }
+    }
+
     /// Creates a delay with leading-silence state.
     ///
     /// # Errors
@@ -151,6 +161,10 @@ impl SampleDelay {
     #[must_use]
     pub const fn delay_samples(&self) -> usize {
         self.delay_samples
+    }
+
+    pub(crate) const fn retained_bytes(&self) -> usize {
+        self.ring.len() * BYTES_PER_SAMPLE
     }
 
     /// Delays one exact-size planar block into caller-owned output.

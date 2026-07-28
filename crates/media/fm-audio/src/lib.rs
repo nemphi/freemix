@@ -97,13 +97,6 @@ pub enum AudioError {
         end_numerator: u32,
         denominator: u32,
     },
-    SampleDelay(SampleDelayError),
-    MixerDelayByteCountOverflow,
-    MixerDelayBudgetExceeded {
-        requested: usize,
-        retained: usize,
-        maximum: usize,
-    },
     CadenceBlockTooLarge(u128),
 }
 
@@ -184,18 +177,6 @@ impl fmt::Display for AudioError {
                 formatter,
                 "source gain {start_numerator}/{denominator}..{end_numerator}/{denominator} is outside 0.0..=1.0"
             ),
-            Self::SampleDelay(error) => write!(formatter, "input sample delay error: {error}"),
-            Self::MixerDelayByteCountOverflow => {
-                formatter.write_str("Master mixer delay byte accounting overflow")
-            }
-            Self::MixerDelayBudgetExceeded {
-                requested,
-                retained,
-                maximum,
-            } => write!(
-                formatter,
-                "input sample delay needs {requested} bytes with {retained} already retained; Master mixer limit is {maximum} bytes"
-            ),
             Self::CadenceBlockTooLarge(samples) => write!(
                 formatter,
                 "video cadence requires up to {samples} audio samples in one block"
@@ -209,7 +190,6 @@ impl std::error::Error for AudioError {
         match self {
             Self::AudioBlock(error) => Some(error),
             Self::ChannelMapping(error) => Some(error),
-            Self::SampleDelay(error) => Some(error),
             _ => None,
         }
     }
@@ -227,7 +207,50 @@ impl From<ChannelMappingError> for AudioError {
     }
 }
 
-impl From<SampleDelayError> for AudioError {
+/// Errors returned while configuring retained per-input Master delay.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum MasterMixerDelayError {
+    UnknownInput(InputId),
+    SampleDelay(SampleDelayError),
+    ByteCountOverflow,
+    BudgetExceeded {
+        requested: usize,
+        retained: usize,
+        maximum: usize,
+    },
+}
+
+impl fmt::Display for MasterMixerDelayError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownInput(id) => write!(formatter, "unknown audio input {id}"),
+            Self::SampleDelay(error) => write!(formatter, "input sample delay error: {error}"),
+            Self::ByteCountOverflow => {
+                formatter.write_str("Master mixer delay byte accounting overflow")
+            }
+            Self::BudgetExceeded {
+                requested,
+                retained,
+                maximum,
+            } => write!(
+                formatter,
+                "input sample delay needs {requested} bytes with {retained} already retained; Master mixer limit is {maximum} bytes"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MasterMixerDelayError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::SampleDelay(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<SampleDelayError> for MasterMixerDelayError {
     fn from(value: SampleDelayError) -> Self {
         Self::SampleDelay(value)
     }
@@ -918,7 +941,7 @@ impl MasterMixer {
             return Err(AudioError::MappingLayoutMismatch);
         }
         let channels = format.channels.channels().len();
-        let delay = SampleDelay::new(channels, 0)?;
+        let delay = SampleDelay::zero(channels);
         let ramp = GainRamp::immediate(state.gain);
         self.inputs.insert(
             id,
@@ -963,14 +986,11 @@ impl MasterMixer {
     /// Returns [`AudioError::UnknownInput`] when `id` is not configured.
     pub fn remove_input(&mut self, id: InputId) -> Result<(), AudioError> {
         let strip = self.inputs.get(&id).ok_or(AudioError::UnknownInput(id))?;
-        let released = delay_bytes(
-            strip.format.channels.channels().len(),
-            strip.delay.delay_samples(),
-        )?;
+        let released = strip.delay.retained_bytes();
         let retained = self
             .retained_delay_bytes
             .checked_sub(released)
-            .ok_or(AudioError::MixerDelayByteCountOverflow)?;
+            .ok_or(AudioError::FormatMismatch)?;
         let Some(_) = self.inputs.remove(&id) else {
             return Err(AudioError::UnknownInput(id));
         };
@@ -1005,8 +1025,15 @@ impl MasterMixer {
     ///
     /// Returns an error for an unknown input, an out-of-range delay, allocation
     /// failure, byte-accounting overflow, or mixer delay-budget exhaustion.
-    pub fn set_input_delay(&mut self, id: InputId, delay_samples: usize) -> Result<(), AudioError> {
-        let strip = self.inputs.get(&id).ok_or(AudioError::UnknownInput(id))?;
+    pub fn set_input_delay(
+        &mut self,
+        id: InputId,
+        delay_samples: usize,
+    ) -> Result<(), MasterMixerDelayError> {
+        let strip = self
+            .inputs
+            .get(&id)
+            .ok_or(MasterMixerDelayError::UnknownInput(id))?;
         if strip.delay.delay_samples() == delay_samples {
             return Ok(());
         }
@@ -1017,9 +1044,9 @@ impl MasterMixer {
             .retained_delay_bytes
             .checked_sub(current)
             .and_then(|retained| retained.checked_add(requested))
-            .ok_or(AudioError::MixerDelayByteCountOverflow)?;
+            .ok_or(MasterMixerDelayError::ByteCountOverflow)?;
         if retained > MAX_MASTER_MIXER_DELAY_BYTES {
-            return Err(AudioError::MixerDelayBudgetExceeded {
+            return Err(MasterMixerDelayError::BudgetExceeded {
                 requested,
                 retained: self.retained_delay_bytes - current,
                 maximum: MAX_MASTER_MIXER_DELAY_BYTES,
@@ -1027,7 +1054,7 @@ impl MasterMixer {
         }
         let delay = SampleDelay::new(channels, delay_samples)?;
         let Some(strip) = self.inputs.get_mut(&id) else {
-            return Err(AudioError::UnknownInput(id));
+            return Err(MasterMixerDelayError::UnknownInput(id));
         };
         strip.delay = delay;
         self.retained_delay_bytes = retained;
@@ -1481,7 +1508,7 @@ fn validate_sample_count(samples: usize) -> Result<(), AudioError> {
     Ok(())
 }
 
-fn delay_bytes(channels: usize, delay_samples: usize) -> Result<usize, AudioError> {
+fn delay_bytes(channels: usize, delay_samples: usize) -> Result<usize, MasterMixerDelayError> {
     if delay_samples > MAX_SAMPLE_DELAY_SAMPLES {
         return Err(SampleDelayError::DelayOutOfRange {
             actual: delay_samples,
@@ -1492,7 +1519,7 @@ fn delay_bytes(channels: usize, delay_samples: usize) -> Result<usize, AudioErro
     channels
         .checked_mul(delay_samples)
         .and_then(|samples| samples.checked_mul(size_of::<f32>()))
-        .ok_or(AudioError::MixerDelayByteCountOverflow)
+        .ok_or(MasterMixerDelayError::ByteCountOverflow)
 }
 
 fn validate_finite_sample_prefix(planes: &[Vec<f32>], samples: usize) -> Result<(), AudioError> {

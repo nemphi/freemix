@@ -5,7 +5,7 @@ use std::num::NonZeroU128;
 use fm_audio::{
     AudioBlock, AudioError, ChannelMapping, ChannelMappingRoute, ClippingPolicy, Gain, InputState,
     MAX_MASTER_MIXER_DELAY_BYTES, MAX_SAMPLE_DELAY_SAMPLES, MAX_SAMPLES_PER_BLOCK, MasterMixer,
-    PlanarAudioSource, SourceGain,
+    MasterMixerDelayError, PlanarAudioSource, SourceGain,
 };
 use fm_frame::{
     ClockDomainId, MediaTiming, NormalizedDuration, NormalizedTimestamp, OriginalTimestamp,
@@ -414,7 +414,7 @@ fn delay_budget_rejection_rolls_back_and_remove_reclaims_exact_bytes() {
         .unwrap();
     assert_eq!(
         mixer.set_input_delay(candidate, MAX_SAMPLE_DELAY_SAMPLES),
-        Err(AudioError::MixerDelayBudgetExceeded {
+        Err(MasterMixerDelayError::BudgetExceeded {
             requested: bytes_per_strip,
             retained,
             maximum: MAX_MASTER_MIXER_DELAY_BYTES,
@@ -596,7 +596,7 @@ fn delay_bounds_and_empty_legacy_intervals_are_exact() {
         .unwrap();
     assert_eq!(
         mixer.set_input_delay(id, MAX_SAMPLE_DELAY_SAMPLES + 1),
-        Err(AudioError::SampleDelay(
+        Err(MasterMixerDelayError::SampleDelay(
             fm_audio::SampleDelayError::DelayOutOfRange {
                 actual: MAX_SAMPLE_DELAY_SAMPLES + 1,
                 maximum: MAX_SAMPLE_DELAY_SAMPLES,
@@ -605,6 +605,17 @@ fn delay_bounds_and_empty_legacy_intervals_are_exact() {
     );
     assert_eq!(mixer.retained_delay_bytes(), 0);
     assert_eq!(mixer.input_delay_samples(id), Some(0));
+    assert_eq!(
+        mixer.set_input_delay(input(2), 1),
+        Err(MasterMixerDelayError::UnknownInput(input(2)))
+    );
+    let error = mixer
+        .set_input_delay(id, MAX_SAMPLE_DELAY_SAMPLES + 1)
+        .unwrap_err();
+    assert!(
+        std::error::Error::source(&error)
+            .is_some_and(|source| source.to_string().contains("exceeds the limit"))
+    );
 
     mixer.set_input_delay(id, MAX_SAMPLE_DELAY_SAMPLES).unwrap();
     let before = mixer.retained_delay_bytes();
