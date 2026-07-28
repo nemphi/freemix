@@ -804,6 +804,86 @@ fn native_generator_program_recording_is_playable_and_checkpointed() {
     // is covered by fm-codec-ffmpeg's `forced_child_kill_leaves_a_playable_fragmented_prefix`.
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires FFmpeg with libx264/AAC, ffprobe, and a native macOS Metal adapter"]
+fn protocol_fade_to_black_reaches_configured_program_recording() {
+    let _hardware_lock = NATIVE_MEDIA_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let directory = tempfile::tempdir().unwrap();
+    if require_recording_tools().is_none() {
+        return;
+    }
+    let project_path = directory.path().join("record-ftb.freemix");
+    let output_path = directory.path().join("program-ftb.mp4");
+    if !prepare_native_project(&project_path) {
+        return;
+    }
+
+    let Some(mut daemon) = require_native_recorder(NativeDaemonProcess::start_recording(
+        &project_path,
+        &output_path,
+    )) else {
+        return;
+    };
+    let mut client = StudioClient::connect(daemon.address);
+    let initial = client.handshake();
+    assert_snapshot_routing(&initial, 0, input(1), input(2));
+    thread::sleep(Duration::from_millis(250));
+
+    let black = client.command(
+        "record-ftb-black",
+        "record-ftb-black-key",
+        CommandPayload::FadeToBlack {
+            active: true,
+            duration_frames: 4,
+        },
+    );
+    assert_eq!(black.revision, 1);
+    thread::sleep(Duration::from_millis(350));
+
+    let live = client.command(
+        "record-ftb-live",
+        "record-ftb-live-key",
+        CommandPayload::FadeToBlack {
+            active: false,
+            duration_frames: 4,
+        },
+    );
+    assert_eq!(live.revision, 2);
+    thread::sleep(Duration::from_millis(250));
+    daemon.signal_terminate();
+
+    let output = daemon.wait_for(RECORDING_PROCESS_TIMEOUT);
+    drop(client);
+    assert!(
+        output.status.success(),
+        "FTB recording daemon failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let luma = recording_average_luma(&output_path).unwrap();
+    let (first_black, last_black) = assert_ordered_live_black_live(&luma);
+    let black_start = f64::from(u32::try_from(first_black).unwrap()) / 25.0;
+    let black_end = f64::from(u32::try_from(last_black + 1).unwrap()) / 25.0;
+    let silence = recording_audio_silence_intervals(&output_path).unwrap();
+    assert!(
+        silence
+            .iter()
+            .any(|(start, end)| { end.min(black_end) - start.max(black_start) >= 0.10 }),
+        "recorded Master silence {silence:?} does not overlap recorded black interval \
+         {black_start:.3}..{black_end:.3}"
+    );
+    decode_recording(&output_path).unwrap();
+
+    let persisted = ProjectStore::new(&project_path).unwrap().load().unwrap();
+    assert_eq!(persisted.position().revision, 2);
+    assert_eq!(
+        persisted.runtime_fade_to_black(),
+        fm_persistence::RuntimeFadeToBlack::default()
+    );
+}
+
 #[cfg(all(target_os = "macos", feature = "macos-program-surface"))]
 #[test]
 #[ignore = "opens a fullscreen macOS Program surface and requires a Metal adapter"]
@@ -1339,6 +1419,131 @@ fn decode_recording(path: &Path) -> Result<(), String> {
             String::from_utf8_lossy(&output.stderr)
         ))
     }
+}
+
+#[cfg(target_os = "macos")]
+fn recording_average_luma(path: &Path) -> Result<Vec<u8>, String> {
+    let child = Command::new("ffmpeg")
+        .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-i"])
+        .arg(path)
+        .args([
+            "-map",
+            "0:v:0",
+            "-vf",
+            "scale=1:1:flags=area",
+            "-pix_fmt",
+            "gray",
+            "-f",
+            "rawvideo",
+            "-",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("cannot spawn FFmpeg luma decoder: {error}"))?;
+    let output = wait_bounded(child, PROCESS_TIMEOUT);
+    if output.status.success() {
+        Ok(output.stdout)
+    } else {
+        Err(format!(
+            "recording luma decode failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn assert_ordered_live_black_live(luma: &[u8]) -> (usize, usize) {
+    const BLACK_MAX: u8 = 24;
+    const LIVE_MIN: u8 = 64;
+    const REQUIRED_FRAMES: usize = 3;
+
+    let first_black = luma
+        .iter()
+        .position(|value| *value <= BLACK_MAX)
+        .unwrap_or_else(|| panic!("recording contains no black frame: {luma:?}"));
+    let last_black = luma
+        .iter()
+        .rposition(|value| *value <= BLACK_MAX)
+        .expect("first black frame was present");
+    assert!(
+        luma[..first_black]
+            .iter()
+            .filter(|value| **value >= LIVE_MIN)
+            .count()
+            >= REQUIRED_FRAMES,
+        "recording has no stable live interval before black: {luma:?}"
+    );
+    assert!(
+        luma[first_black..=last_black]
+            .iter()
+            .filter(|value| **value <= BLACK_MAX)
+            .count()
+            >= REQUIRED_FRAMES,
+        "recording has no stable black interval: {luma:?}"
+    );
+    assert!(
+        luma[last_black + 1..]
+            .iter()
+            .filter(|value| **value >= LIVE_MIN)
+            .count()
+            >= REQUIRED_FRAMES,
+        "recording has no stable live interval after black: {luma:?}"
+    );
+    (first_black, last_black)
+}
+
+#[cfg(target_os = "macos")]
+fn recording_audio_silence_intervals(path: &Path) -> Result<Vec<(f64, f64)>, String> {
+    let child = Command::new("ffmpeg")
+        .args(["-nostdin", "-hide_banner", "-loglevel", "info", "-i"])
+        .arg(path)
+        .args([
+            "-map",
+            "0:a:0",
+            "-af",
+            "silencedetect=noise=-45dB:duration=0.15",
+            "-f",
+            "null",
+            "-",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("cannot spawn FFmpeg silence detector: {error}"))?;
+    let output = wait_bounded(child, PROCESS_TIMEOUT);
+    if !output.status.success() {
+        return Err(format!(
+            "recording silence detection failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let diagnostic = String::from_utf8_lossy(&output.stderr);
+    let mut start = None;
+    let mut intervals = Vec::new();
+    for line in diagnostic.lines() {
+        if let Some(value) = diagnostic_seconds(line, "silence_start:") {
+            start = Some(value);
+        }
+        if let Some(end) = diagnostic_seconds(line, "silence_end:")
+            && let Some(start) = start.take()
+        {
+            intervals.push((start, end));
+        }
+    }
+    Ok(intervals)
+}
+
+#[cfg(target_os = "macos")]
+fn diagnostic_seconds(line: &str, label: &str) -> Option<f64> {
+    line.split_once(label)?
+        .1
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
 }
 
 #[cfg(target_os = "macos")]

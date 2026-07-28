@@ -676,9 +676,14 @@ gated by Ready state, transition permission, negotiated protocol, and replicated
 state. The desired target action is disabled while the opposite action remains
 available for reversal. Its worker maps the typed intent to the version-gated
 command, preserves FIFO compatibility behavior, and a loopback protocol test
-observes exact black then live desired and realized state. Configured-output
-routing and full end-to-end hardware acceptance evidence are still absent, so
-Phase 3 item 5 and `SW-004` remain planned.
+observes exact black then live desired and realized state. A hardware-gated
+macOS daemon acceptance now sends protocol 1.5 live-to-black and black-to-live
+commands while Program recording is configured, decodes the H.264/AAC result,
+requires ordered live/black/live video plus a sustained Master-audio silence
+interval, and verifies the final live checkpoint. This proves the native FTB
+path reaches one configured output on the exercised Metal/FFmpeg host. It does
+not cover fullscreen presentation, Windows/Linux adapters, or a protocol-driven
+native T-bar path, so Phase 3 item 5 and `SW-004` remain planned.
 
 Exit: `P0` switcher, composition, audio, display, record, and control rows pass.
 
