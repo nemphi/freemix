@@ -620,9 +620,9 @@ later commands remain blocked through a 1.3 downgrade and resume unchanged only
 on 1.4. Web now has only a protocol-1.4 transport-free semantic manual-control
 model; it still has no browser renderer or network runtime. There is no
 protocol-driven native-media end-to-end or hardware evidence for the manual
-path. FTB output realization and operator controls, AlphaFade, stinger,
-Slide/Zoom, the remaining transition families, and `SW-004` acceptance remain
-pending; parity therefore stays planned. Item 5 and RC-007 remain planned.
+path. FTB operator controls beyond the CLI, AlphaFade, stinger, Slide/Zoom, the
+remaining transition families, and `SW-004` acceptance remain pending; parity
+therefore stays planned. Item 5 and RC-007 remain planned.
 
 FTB groundwork now includes a switcher-owned bounded automatic control core
 alongside the compositor plan. The controller moves from its current exact
@@ -662,10 +662,13 @@ ramps the inverse fixed-rational position across the same sample interval after
 the complete Program mix. Native project planning accounts for that additional
 in-flight target. Unit coverage exercises forward, reverse, held-black, and
 post-Master behavior, and focused Metal tests validate both the compositor
-oracle and the scene/transition/FTB ordering on a real adapter. Studio/Web/CLI
-still expose no FTB operator control. Configured-output routing and full
-end-to-end hardware acceptance evidence are also absent, so Phase 3 item 5 and
-`SW-004` remain planned.
+oracle and the scene/transition/FTB ordering on a real adapter. The CLI now
+exposes explicit local and remote `ftb ... <live|black> <frames>` commands,
+settles and persists local moves, rejects the remote command below protocol 1.5
+before transmission, and prints separate exact desired and realized target and
+position state. Studio and Web still expose no FTB operator control.
+Configured-output routing and full end-to-end hardware acceptance evidence are
+also absent, so Phase 3 item 5 and `SW-004` remain planned.
 
 Exit: `P0` switcher, composition, audio, display, record, and control rows pass.
 

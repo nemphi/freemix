@@ -14,6 +14,19 @@ pub enum TBarAction {
     Cancel,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FadeToBlackTarget {
+    Live,
+    Black,
+}
+
+impl FadeToBlackTarget {
+    #[must_use]
+    pub const fn active(self) -> bool {
+        matches!(self, Self::Black)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Command {
     New {
@@ -52,6 +65,13 @@ pub enum Command {
         key: Option<String>,
         expected_revision: Option<u64>,
     },
+    FadeToBlack {
+        path: PathBuf,
+        target: FadeToBlackTarget,
+        frames: u32,
+        key: Option<String>,
+        expected_revision: Option<u64>,
+    },
     RemoteStatus {
         address: SocketAddr,
     },
@@ -81,6 +101,13 @@ pub enum Command {
     RemoteTBar {
         address: SocketAddr,
         action: TBarAction,
+        key: Option<String>,
+        expected_revision: Option<u64>,
+    },
+    RemoteFadeToBlack {
+        address: SocketAddr,
+        target: FadeToBlackTarget,
+        frames: u32,
         key: Option<String>,
         expected_revision: Option<u64>,
     },
@@ -207,6 +234,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
         "tbar-start" | "tbar-position" | "tbar-commit" | "tbar-cancel" => {
             parse_local_t_bar(&command, arguments)
         }
+        "ftb" => parse_local_fade_to_black(arguments),
         "remote-status" => parse_remote_status(arguments),
         "remote-preview" => parse_remote_preview(arguments),
         "remote-cut" => parse_remote_cut(arguments),
@@ -216,6 +244,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
         | "remote-tbar-position"
         | "remote-tbar-commit"
         | "remote-tbar-cancel" => parse_remote_t_bar(&command, arguments),
+        "remote-ftb" => parse_remote_fade_to_black(arguments),
         "render" => {
             let path = required_path(&mut arguments, "project path")?;
             let output = required_path(&mut arguments, "output path")?;
@@ -287,6 +316,38 @@ fn parse_remote_t_bar(
     Ok(Command::RemoteTBar {
         address,
         action,
+        key,
+        expected_revision,
+    })
+}
+
+fn parse_local_fade_to_black(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Command, ArgsError> {
+    let path = required_path(&mut arguments, "project path")?;
+    let target = fade_to_black_target(&required(&mut arguments, "FTB target")?)?;
+    let frames = number(&required(&mut arguments, "frames")?, "frames")?;
+    let (key, expected_revision) = command_options(arguments)?;
+    Ok(Command::FadeToBlack {
+        path,
+        target,
+        frames,
+        key,
+        expected_revision,
+    })
+}
+
+fn parse_remote_fade_to_black(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Command, ArgsError> {
+    let address = socket_address(&required(&mut arguments, "address")?)?;
+    let target = fade_to_black_target(&required(&mut arguments, "FTB target")?)?;
+    let frames = number(&required(&mut arguments, "frames")?, "frames")?;
+    let (key, expected_revision) = command_options(arguments)?;
+    Ok(Command::RemoteFadeToBlack {
+        address,
+        target,
+        frames,
         key,
         expected_revision,
     })
@@ -433,6 +494,17 @@ fn manual_kind(value: &str) -> Result<ManualTransitionKind, ArgsError> {
     }
 }
 
+fn fade_to_black_target(value: &str) -> Result<FadeToBlackTarget, ArgsError> {
+    match value {
+        "live" => Ok(FadeToBlackTarget::Live),
+        "black" => Ok(FadeToBlackTarget::Black),
+        _ => Err(ArgsError::InvalidChoice {
+            field: "FTB target",
+            value: value.to_owned(),
+        }),
+    }
+}
+
 fn basis_points(value: &str) -> Result<u16, ArgsError> {
     let position = number(value, "basis points")?;
     if position <= 10_000 {
@@ -569,6 +641,46 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn parses_local_and_remote_fade_to_black_targets() {
+        assert_eq!(
+            parse(strings(&[
+                "ftb",
+                "show.freemix",
+                "black",
+                "45",
+                "--key",
+                "blackout",
+                "--expect",
+                "7",
+            ])),
+            Ok(Command::FadeToBlack {
+                path: "show.freemix".into(),
+                target: FadeToBlackTarget::Black,
+                frames: 45,
+                key: Some("blackout".into()),
+                expected_revision: Some(7),
+            })
+        );
+        assert_eq!(
+            parse(strings(&["remote-ftb", "127.0.0.1:9123", "live", "30",])),
+            Ok(Command::RemoteFadeToBlack {
+                address: "127.0.0.1:9123".parse().unwrap(),
+                target: FadeToBlackTarget::Live,
+                frames: 30,
+                key: None,
+                expected_revision: None,
+            })
+        );
+        assert_eq!(
+            parse(strings(&["ftb", "show.freemix", "toggle", "10"])),
+            Err(ArgsError::InvalidChoice {
+                field: "FTB target",
+                value: "toggle".into(),
+            })
+        );
     }
 
     #[test]

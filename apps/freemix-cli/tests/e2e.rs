@@ -53,6 +53,20 @@ impl FakeRemoteServer {
         Self { address, worker }
     }
 
+    fn start_old_without_fade_to_black() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || serve_old_daemon_without_fade_to_black(&listener));
+        Self { address, worker }
+    }
+
+    fn start_fade_to_black() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || serve_fade_to_black(&listener));
+        Self { address, worker }
+    }
+
     fn start_manual_position() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -220,6 +234,99 @@ fn serve_old_daemon_without_manual_t_bar(listener: &TcpListener) {
     );
 }
 
+fn serve_old_daemon_without_fade_to_black(listener: &TcpListener) {
+    let engine = EngineIdentity {
+        engine_id: "project-42".into(),
+        state_epoch: 1,
+        log_id: "fake-remote-log".into(),
+    };
+    let (stream, _) = listener.accept().unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(stream);
+    assert_client_hello(read_message(&mut reader));
+    write_handshake_version(&mut writer, &engine, 0, ProtocolVersion::new(1, 4));
+
+    let mut unexpected = String::new();
+    assert_eq!(reader.read_line(&mut unexpected).unwrap(), 0);
+    assert!(
+        unexpected.is_empty(),
+        "protocol 1.5 command reached a 1.4 daemon"
+    );
+}
+
+fn serve_fade_to_black(listener: &TcpListener) {
+    let engine = EngineIdentity {
+        engine_id: "project-42".into(),
+        state_epoch: 1,
+        log_id: "fake-remote-log".into(),
+    };
+    let (stream, _) = listener.accept().unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(stream);
+    assert_client_hello(read_message(&mut reader));
+    write_handshake_version_with_fade_to_black(&mut writer, &engine, 0, live_fade_to_black());
+
+    let WireMessage::Command(command) = read_message(&mut reader) else {
+        panic!("expected remote FTB command");
+    };
+    assert_eq!(
+        command.protocol,
+        fm_protocol::FADE_TO_BLACK_PROTOCOL_VERSION
+    );
+    assert_eq!(
+        command.payload,
+        CommandPayload::FadeToBlack {
+            active: true,
+            duration_frames: 2,
+        }
+    );
+    assert_eq!(command.idempotency_key, "remote-blackout");
+    assert_eq!(command.expected_revision, Some(0));
+    write_message(
+        &mut writer,
+        &WireMessage::CommandResult(CommandResult::Accepted {
+            id: command.id,
+            revision: 1,
+            scheduled_frame: Some(1),
+        }),
+    );
+    write_message(
+        &mut writer,
+        &WireMessage::Event(EventMessage {
+            cursor: EventCursor {
+                engine: engine.clone(),
+                revision: 1,
+            },
+            payload: EventPayload::DesiredSwitcher {
+                program: input(1),
+                preview: input(2),
+                manual_transition: Some(fm_protocol::ManualTransitionStatus::Inactive),
+                fade_to_black: Some(fm_protocol::FadeToBlackState {
+                    target_active: true,
+                    position: fm_protocol::FadeToBlackPosition::LIVE,
+                }),
+            },
+        }),
+    );
+    write_message(
+        &mut writer,
+        &WireMessage::RuntimeEvent(RuntimeEventMessage {
+            server: server_identity(&engine),
+            revision: 1,
+            generation: 1,
+            sequence: 1,
+            event: RuntimeLifecycleEvent::Realized {
+                domain: "switcher".into(),
+                manual_transition: Some(fm_protocol::ManualTransitionStatus::Inactive),
+                fade_to_black: Some(fm_protocol::FadeToBlackState {
+                    target_active: true,
+                    position: fm_protocol::FadeToBlackPosition::BLACK,
+                }),
+            },
+        }),
+    );
+}
+
 fn serve_manual_position(listener: &TcpListener) {
     let engine = EngineIdentity {
         engine_id: "project-42".into(),
@@ -378,6 +485,50 @@ fn write_handshake_version_with_manual(
             realized_fade_to_black: None,
         }),
     );
+}
+
+fn write_handshake_version_with_fade_to_black(
+    writer: &mut TcpStream,
+    engine: &EngineIdentity,
+    revision: u64,
+    fade_to_black: fm_protocol::FadeToBlackState,
+) {
+    write_message(
+        writer,
+        &WireMessage::ServerHello(ServerHello {
+            negotiated: fm_protocol::FADE_TO_BLACK_PROTOCOL_VERSION,
+            granted_role: Role::Operator,
+            permissions: vec!["switcher.write".into()],
+            capabilities_digest: "fake-capabilities".into(),
+            engine: engine.clone(),
+            current_revision: revision,
+            resume: false,
+        }),
+    );
+    write_message(
+        writer,
+        &WireMessage::Snapshot(SnapshotMessage {
+            engine: engine.clone(),
+            revision,
+            show_name: "Remote Contract".into(),
+            inputs: vec![input(1), input(2)],
+            desired_program: input(1),
+            desired_preview: input(2),
+            realized_program: input(1),
+            realized_preview: input(2),
+            desired_manual_transition: Some(fm_protocol::ManualTransitionStatus::Inactive),
+            realized_manual_transition: Some(fm_protocol::ManualTransitionStatus::Inactive),
+            desired_fade_to_black: Some(fade_to_black),
+            realized_fade_to_black: Some(fade_to_black),
+        }),
+    );
+}
+
+fn live_fade_to_black() -> fm_protocol::FadeToBlackState {
+    fm_protocol::FadeToBlackState {
+        target_active: false,
+        position: fm_protocol::FadeToBlackPosition::LIVE,
+    }
 }
 
 fn assert_command(
@@ -582,6 +733,42 @@ fn cli_does_not_send_manual_t_bar_commands_to_a_protocol_1_3_daemon() {
 }
 
 #[test]
+fn cli_does_not_send_fade_to_black_to_a_protocol_1_4_daemon() {
+    let server = FakeRemoteServer::start_old_without_fade_to_black();
+    let output = invoke(&[
+        "remote-ftb",
+        &server.address(),
+        "black",
+        "3",
+        "--key",
+        "unsupported-ftb",
+    ]);
+    assert_failure_contains(
+        &output,
+        "command requires protocol 1.5, but the session negotiated 1.4",
+    );
+    server.finish();
+}
+
+#[test]
+fn remote_fade_to_black_preserves_target_duration_and_replicated_state() {
+    let server = FakeRemoteServer::start_fade_to_black();
+    let output = invoke(&[
+        "remote-ftb",
+        &server.address(),
+        "black",
+        "2",
+        "--key",
+        "remote-blackout",
+        "--expect",
+        "0",
+    ]);
+    assert_success(&output);
+    assert!(stdout(&output).contains("FTB(desired=black@0/65535, realized=black@65535/65535)"));
+    server.finish();
+}
+
+#[test]
 fn remote_t_bar_position_preserves_the_exact_endpoint_and_replicated_status() {
     let server = FakeRemoteServer::start_manual_position();
     let output = invoke(&[
@@ -670,6 +857,63 @@ fn local_wipe_preserves_duration_and_idempotency_contract() {
     assert_success(&duplicate);
     assert_eq!(stdout(&duplicate), wipe_status);
     assert_eq!(manifest(&context.project), wipe_manifest);
+
+    fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
+fn local_fade_to_black_settles_persists_and_reverses() {
+    let context = ContractContext::new();
+    assert_success(&invoke(&["new", context.project_path()]));
+
+    let black = invoke(&[
+        "ftb",
+        context.project_path(),
+        "black",
+        "3",
+        "--key",
+        "local-blackout",
+        "--expect",
+        "0",
+    ]);
+    assert_success(&black);
+    assert_status(&stdout(&black), 1, 3, 1, 1, 2, 2);
+    assert!(stdout(&black).contains("FTB(desired=black@65535/65535, realized=black@65535/65535)"));
+    assert_eq!(status(&context.project), stdout(&black));
+    let stored = manifest(&context.project);
+    assert!(stored.contains(r#""desired": {"target_active": true, "position_numerator": 65535}"#));
+    assert!(stored.contains(r#""realized": {"target_active": true, "position_numerator": 65535}"#));
+
+    let repeated = invoke(&[
+        "ftb",
+        context.project_path(),
+        "black",
+        "99",
+        "--key",
+        "local-blackout-repeat",
+        "--expect",
+        "1",
+    ]);
+    assert_success(&repeated);
+    assert_status(&stdout(&repeated), 2, 4, 1, 1, 2, 2);
+    assert!(
+        stdout(&repeated).contains("FTB(desired=black@65535/65535, realized=black@65535/65535)")
+    );
+
+    let live = invoke(&[
+        "ftb",
+        context.project_path(),
+        "live",
+        "2",
+        "--key",
+        "local-live",
+        "--expect",
+        "2",
+    ]);
+    assert_success(&live);
+    assert_status(&stdout(&live), 3, 6, 1, 1, 2, 2);
+    assert!(stdout(&live).contains("FTB(desired=live@0/65535, realized=live@0/65535)"));
+    assert_eq!(status(&context.project), stdout(&live));
 
     fs::remove_dir_all(context.root).unwrap();
 }

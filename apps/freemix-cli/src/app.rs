@@ -13,7 +13,7 @@ use fm_command::{
     RejectedReceipt, Rejection, RejectionCode, Revision, RuntimeGeneration, StateEpoch,
 };
 use fm_engine::{
-    Engine, EngineAcceptance, EngineCommand, EngineManualTransitionKind,
+    Engine, EngineAcceptance, EngineCommand, EngineFadeToBlackState, EngineManualTransitionKind,
     EngineManualTransitionPosition, EngineRestoreState, ShowState,
 };
 use fm_model::{
@@ -126,6 +126,22 @@ pub fn run(command: Command) -> AppResult<()> {
             key,
             expected_revision,
         )?,
+        Command::FadeToBlack {
+            path,
+            target,
+            frames,
+            key,
+            expected_revision,
+        } => mutate(
+            &path,
+            EngineCommand::FadeToBlack {
+                active: target.active(),
+                duration_frames: frames,
+            },
+            frames,
+            key,
+            expected_revision,
+        )?,
         Command::RemoteStatus { address } => remote::status(address)?,
         Command::RemotePreview {
             address,
@@ -187,6 +203,21 @@ pub fn run(command: Command) -> AppResult<()> {
         } => remote::execute(
             address,
             protocol_t_bar_payload(action),
+            key,
+            expected_revision,
+        )?,
+        Command::RemoteFadeToBlack {
+            address,
+            target,
+            frames,
+            key,
+            expected_revision,
+        } => remote::execute(
+            address,
+            fm_protocol::CommandPayload::FadeToBlack {
+                active: target.active(),
+                duration_frames: frames,
+            },
             key,
             expected_revision,
         )?,
@@ -272,6 +303,14 @@ fn mutate(
     expected_revision: Option<u64>,
 ) -> AppResult<()> {
     let mut project = load_engine(path)?;
+    let ticks = match &command {
+        EngineCommand::FadeToBlack { active, .. }
+            if project.engine.realized_fade_to_black().active == *active =>
+        {
+            1
+        }
+        _ => ticks,
+    };
     let result = execute(&mut project.engine, command, ticks, key, expected_revision)?;
     if result.replayed {
         if let Some(rejection) = result.rejection {
@@ -680,7 +719,7 @@ fn print_status(project: &ProjectEngine) {
     let desired = engine.show().desired_switcher();
     let realized = engine.realized_switcher();
     println!(
-        "project_id={} show={:?} revision={} frame={} Program(desired={}, realized={}) Preview(desired={}, realized={}) TBar(desired={}, realized={})",
+        "project_id={} show={:?} revision={} frame={} Program(desired={}, realized={}) Preview(desired={}, realized={}) TBar(desired={}, realized={}) FTB(desired={}, realized={})",
         project.project.id(),
         engine.show().name(),
         engine.revision(),
@@ -691,7 +730,18 @@ fn print_status(project: &ProjectEngine) {
         realized.preview(),
         format_t_bar(desired.t_bar()),
         format_t_bar(realized.t_bar()),
+        format_fade_to_black(engine.desired_fade_to_black()),
+        format_fade_to_black(engine.realized_fade_to_black()),
     );
+}
+
+fn format_fade_to_black(state: EngineFadeToBlackState) -> String {
+    format!(
+        "{}@{}/{}",
+        if state.active { "black" } else { "live" },
+        state.position.numerator(),
+        state.position.denominator(),
+    )
 }
 
 fn format_t_bar(state: Option<TBarState>) -> String {
@@ -729,6 +779,7 @@ Usage:
   freemix-cli tbar-position <show.freemix> <basis-points:0..=10000> [--key <key>] [--expect <revision>]
   freemix-cli tbar-commit <show.freemix> [--key <key>] [--expect <revision>]
   freemix-cli tbar-cancel <show.freemix> [--key <key>] [--expect <revision>]
+  freemix-cli ftb <show.freemix> <live|black> <frames> [--key <key>] [--expect <revision>]
   freemix-cli remote-status <127.0.0.1:port>
   freemix-cli remote-preview <127.0.0.1:port> <input> [--key <key>] [--expect <revision>]
   freemix-cli remote-cut <127.0.0.1:port> [--key <key>] [--expect <revision>]
@@ -738,6 +789,7 @@ Usage:
   freemix-cli remote-tbar-position <127.0.0.1:port> <basis-points:0..=10000> [--key <key>] [--expect <revision>]
   freemix-cli remote-tbar-commit <127.0.0.1:port> [--key <key>] [--expect <revision>]
   freemix-cli remote-tbar-cancel <127.0.0.1:port> [--key <key>] [--expect <revision>]
+  freemix-cli remote-ftb <127.0.0.1:port> <live|black> <frames> [--key <key>] [--expect <revision>]
   freemix-cli render <show.freemix> <output.ppm> [--width <px>] [--height <px>]
   freemix-cli demo <show.freemix> [output.ppm]"
     );

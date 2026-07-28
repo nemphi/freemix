@@ -9,8 +9,9 @@ use std::{
 use fm_client::{Client, ClientConfig, Intake, Outbound};
 use fm_protocol::{
     CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, ClientHello, ClientType, CommandPayload,
-    CommandResult, EventPayload, HandshakeOutcome, HandshakeResponse, Role, RuntimeLifecycleEvent,
-    ServerHello, ServerIdentity, SnapshotReason, WireMessage, decode_line, encode_line,
+    CommandResult, EventPayload, FadeToBlackState, HandshakeOutcome, HandshakeResponse, Role,
+    RuntimeLifecycleEvent, ServerHello, ServerIdentity, SnapshotReason, WireMessage, decode_line,
+    encode_line,
 };
 use fm_types::ProjectId;
 use fm_ui_model::ManualTransitionStatus;
@@ -243,7 +244,7 @@ impl Remote {
             .ok_or_else(|| RemoteFailure("remote project cursor is unavailable".into()))?;
         let switcher = state.switcher();
         println!(
-            "project_id={} show={:?} revision={} frame=unavailable Program(desired={}, realized={}) Preview(desired={}, realized={}) TBar(desired={}, realized={})",
+            "project_id={} show={:?} revision={} frame=unavailable Program(desired={}, realized={}) Preview(desired={}, realized={}) TBar(desired={}, realized={}) FTB(desired={}, realized={})",
             self.project_id,
             state.show_name(),
             cursor.revision,
@@ -253,6 +254,8 @@ impl Remote {
             switcher.realized.preview,
             format_manual_transition(switcher.desired_manual_transition),
             format_manual_transition(switcher.realized_manual_transition),
+            format_fade_to_black(switcher.desired_fade_to_black),
+            format_fade_to_black(switcher.realized_fade_to_black),
         );
         Ok(())
     }
@@ -271,6 +274,15 @@ impl Remote {
         }
         Ok(decode_line(&line)?)
     }
+}
+
+fn format_fade_to_black(state: FadeToBlackState) -> String {
+    format!(
+        "{}@{}/{}",
+        if state.target_active { "black" } else { "live" },
+        state.position.numerator(),
+        fm_protocol::FadeToBlackPosition::DENOMINATOR,
+    )
 }
 
 fn format_manual_transition(status: ManualTransitionStatus) -> String {
