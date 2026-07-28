@@ -1407,6 +1407,8 @@ pub enum NativeMasterError {
     MissingAudioRoute {
         input: InputId,
     },
+    MissingAudioTransitionKind,
+    UnsupportedAudioTransition(SwitcherTransitionKind),
     UnexpectedFrame {
         expected: u64,
         actual: u64,
@@ -1462,6 +1464,15 @@ impl fmt::Display for NativeMasterError {
             }
             Self::MissingAudioRoute { input } => {
                 write!(formatter, "input {input} has no native project audio route")
+            }
+            Self::MissingAudioTransitionKind => {
+                formatter.write_str("native audio transition kind is missing")
+            }
+            Self::UnsupportedAudioTransition(kind) => {
+                write!(
+                    formatter,
+                    "native audio transition {kind:?} is not supported"
+                )
             }
             Self::UnexpectedFrame { expected, actual } => write!(
                 formatter,
@@ -2638,9 +2649,9 @@ impl NativeMasterRuntime {
     /// owned audio block. A clone is retained in the bounded fake sink so
     /// existing diagnostics remain identical to [`Self::render_frame`].
     ///
-    /// Fade linearly weights both sources across the exact interval; Cut keeps
-    /// one source at unity. This method performs no probe, decode, channel
-    /// mapping, or blocking wait.
+    /// Fade and Wipe linearly weight both sources across the exact interval;
+    /// Cut keeps one source at unity. This method performs no probe, decode,
+    /// channel mapping, or blocking wait.
     ///
     /// # Errors
     ///
@@ -3412,9 +3423,7 @@ fn route_program_audio(
     Ok(program)
 }
 
-fn native_audio_mix_plan(
-    program: ProgramFrame,
-) -> Result<NativeAudioMixPlan, fm_audio::AudioError> {
+fn native_audio_mix_plan(program: ProgramFrame) -> Result<NativeAudioMixPlan, NativeMasterError> {
     let Some(secondary) = program.secondary else {
         return Ok(NativeAudioMixPlan {
             primary: program.primary,
@@ -3429,6 +3438,24 @@ fn native_audio_mix_plan(
             secondary: None,
         });
     }
+    match program.transition_kind {
+        Some(SwitcherTransitionKind::Fade | SwitcherTransitionKind::Wipe) => {
+            sample_linear_audio_mix_plan(program, secondary)
+        }
+        Some(
+            kind @ (SwitcherTransitionKind::Slide
+            | SwitcherTransitionKind::Zoom
+            | SwitcherTransitionKind::AlphaFade
+            | SwitcherTransitionKind::Stinger(_)),
+        ) => Err(NativeMasterError::UnsupportedAudioTransition(kind)),
+        None => Err(NativeMasterError::MissingAudioTransitionKind),
+    }
+}
+
+fn sample_linear_audio_mix_plan(
+    program: ProgramFrame,
+    secondary: InputId,
+) -> Result<NativeAudioMixPlan, NativeMasterError> {
     let secondary_gain = SourceGain::new(
         program.mix_start_numerator,
         program.mix_end_numerator,
@@ -5366,13 +5393,36 @@ mod tests {
         mix_start_numerator: u32,
         mix_end_numerator: u32,
     ) -> FrameResult {
+        frame_result_with_transition_interval(
+            frame,
+            primary,
+            secondary,
+            secondary.map(|_| SwitcherTransitionKind::Fade),
+            mix_numerator,
+            mix_denominator,
+            mix_start_numerator,
+            mix_end_numerator,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn frame_result_with_transition_interval(
+        frame: u64,
+        primary: InputId,
+        secondary: Option<InputId>,
+        transition_kind: Option<SwitcherTransitionKind>,
+        mix_numerator: u32,
+        mix_denominator: u32,
+        mix_start_numerator: u32,
+        mix_end_numerator: u32,
+    ) -> FrameResult {
         FrameResult {
             frame: FrameNumber::new(frame),
             deadline: ClockTime::ZERO,
             program: ProgramFrame {
                 primary,
                 secondary,
-                transition_kind: secondary.map(|_| SwitcherTransitionKind::Fade),
+                transition_kind,
                 mix_numerator,
                 mix_denominator,
                 mix_start_numerator,
@@ -7080,6 +7130,161 @@ mod tests {
     }
 
     #[test]
+    fn wipe_audio_mix_plan_has_explicit_endpoints_and_unity_collapses() {
+        let old = input(1);
+        let new = input(2);
+        let plan = |primary, secondary, start, end, denominator| {
+            native_audio_mix_plan(ProgramFrame {
+                primary,
+                secondary,
+                transition_kind: secondary.map(|_| SwitcherTransitionKind::Wipe),
+                mix_numerator: start,
+                mix_denominator: denominator,
+                mix_start_numerator: start,
+                mix_end_numerator: end,
+            })
+            .unwrap()
+        };
+
+        assert_eq!(
+            plan(old, Some(new), 0, 1, 2),
+            NativeAudioMixPlan {
+                primary: old,
+                primary_gain: SourceGain::new(2, 1, 2).unwrap(),
+                secondary: Some((new, SourceGain::new(0, 1, 2).unwrap())),
+            }
+        );
+        assert_eq!(
+            plan(old, Some(new), 1, 2, 2),
+            NativeAudioMixPlan {
+                primary: old,
+                primary_gain: SourceGain::new(1, 0, 2).unwrap(),
+                secondary: Some((new, SourceGain::new(1, 2, 2).unwrap())),
+            }
+        );
+        assert_eq!(
+            plan(old, Some(old), u32::MAX, u32::MAX, 0),
+            NativeAudioMixPlan {
+                primary: old,
+                primary_gain: SourceGain::UNITY,
+                secondary: None,
+            }
+        );
+        assert_eq!(
+            plan(new, None, u32::MAX, u32::MAX, 0),
+            NativeAudioMixPlan {
+                primary: new,
+                primary_gain: SourceGain::UNITY,
+                secondary: None,
+            }
+        );
+    }
+
+    #[test]
+    fn wipe_t_bar_audio_plan_holds_reverses_and_reaches_manual_endpoints() {
+        let old = input(1);
+        let new = input(2);
+        let mut switcher = SwitcherState::new(vec![old, new], old, new).unwrap();
+        switcher
+            .apply(SwitcherCommand::StartTBar {
+                kind: SwitcherTransitionKind::Wipe,
+            })
+            .unwrap();
+        switcher
+            .apply(SwitcherCommand::SetTBarPosition(
+                TBarPosition::new(8_000).unwrap(),
+            ))
+            .unwrap();
+        assert_eq!(
+            native_audio_mix_plan(switcher.program_frame()).unwrap(),
+            NativeAudioMixPlan {
+                primary: old,
+                primary_gain: SourceGain::new(10_000, 2_000, 10_000).unwrap(),
+                secondary: Some((new, SourceGain::new(0, 8_000, 10_000).unwrap())),
+            }
+        );
+
+        assert_eq!(switcher.advance_frame(), None);
+        assert_eq!(
+            native_audio_mix_plan(switcher.program_frame()).unwrap(),
+            NativeAudioMixPlan {
+                primary: old,
+                primary_gain: SourceGain::new(2_000, 2_000, 10_000).unwrap(),
+                secondary: Some((new, SourceGain::new(8_000, 8_000, 10_000).unwrap())),
+            }
+        );
+
+        switcher
+            .apply(SwitcherCommand::SetTBarPosition(
+                TBarPosition::new(2_500).unwrap(),
+            ))
+            .unwrap();
+        assert_eq!(
+            native_audio_mix_plan(switcher.program_frame()).unwrap(),
+            NativeAudioMixPlan {
+                primary: old,
+                primary_gain: SourceGain::new(2_000, 7_500, 10_000).unwrap(),
+                secondary: Some((new, SourceGain::new(8_000, 2_500, 10_000).unwrap())),
+            }
+        );
+
+        assert_eq!(switcher.advance_frame(), None);
+        switcher
+            .apply(SwitcherCommand::SetTBarPosition(TBarPosition::END))
+            .unwrap();
+        assert_eq!(
+            native_audio_mix_plan(switcher.program_frame()).unwrap(),
+            NativeAudioMixPlan {
+                primary: old,
+                primary_gain: SourceGain::new(7_500, 0, 10_000).unwrap(),
+                secondary: Some((new, SourceGain::new(2_500, 10_000, 10_000).unwrap())),
+            }
+        );
+
+        switcher.apply(SwitcherCommand::CommitTBar).unwrap();
+        assert_eq!(
+            native_audio_mix_plan(switcher.program_frame()).unwrap(),
+            NativeAudioMixPlan {
+                primary: new,
+                primary_gain: SourceGain::UNITY,
+                secondary: None,
+            }
+        );
+    }
+
+    #[test]
+    fn unsupported_two_source_audio_transitions_fail_explicitly() {
+        let old = input(1);
+        let new = input(2);
+        let program = |transition_kind| ProgramFrame {
+            primary: old,
+            secondary: Some(new),
+            transition_kind,
+            mix_numerator: 0,
+            mix_denominator: 1,
+            mix_start_numerator: 0,
+            mix_end_numerator: 1,
+        };
+
+        assert!(matches!(
+            native_audio_mix_plan(program(Some(SwitcherTransitionKind::AlphaFade))),
+            Err(NativeMasterError::UnsupportedAudioTransition(
+                SwitcherTransitionKind::AlphaFade
+            ))
+        ));
+        assert!(matches!(
+            native_audio_mix_plan(program(Some(SwitcherTransitionKind::Slide))),
+            Err(NativeMasterError::UnsupportedAudioTransition(
+                SwitcherTransitionKind::Slide
+            ))
+        ));
+        assert!(matches!(
+            native_audio_mix_plan(program(None)),
+            Err(NativeMasterError::MissingAudioTransitionKind)
+        ));
+    }
+
+    #[test]
     fn engine_ticks_propagate_automatic_and_manual_intervals_to_audio_plans() {
         let old = input(1);
         let new = input(2);
@@ -7293,6 +7498,49 @@ mod tests {
         assert_sample_exact(second[1_919], -1.0);
         assert_sample_exact(cut[0], -1.0);
         assert!((second[0] - first[1_919] + step).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn wipe_master_audio_crossfades_distinct_sources_and_reaches_unity_cut() {
+        let old = input(1);
+        let new = input(2);
+        let mut master = audio_test_master(&[(old, 1.0), (new, -1.0)], 3);
+        let wipe_frame = |frame, primary, secondary, start, end, denominator| {
+            frame_result_with_transition_interval(
+                frame,
+                primary,
+                secondary,
+                secondary.map(|_| SwitcherTransitionKind::Wipe),
+                start,
+                denominator,
+                start,
+                end,
+            )
+        };
+
+        assert!(master.service_next_frame().unwrap());
+        let first = master
+            .render_frame_audio(&wipe_frame(0, old, Some(new), 0, 1, 2))
+            .unwrap();
+        assert!(master.service_next_frame().unwrap());
+        let second = master
+            .render_frame_audio(&wipe_frame(1, old, Some(new), 1, 2, 2))
+            .unwrap();
+        assert!(master.service_next_frame().unwrap());
+        let cut = master
+            .render_frame_audio(&wipe_frame(2, new, None, 0, 0, 1))
+            .unwrap();
+
+        let first = first.plane(0).unwrap();
+        let second = second.plane(0).unwrap();
+        let cut = cut.plane(0).unwrap();
+        let step = 1.0 / 1_920.0;
+        assert!((first[0] - (1.0 - step)).abs() < 1.0e-6);
+        assert_sample_exact(first[1_919], 0.0);
+        assert!((second[0] + step).abs() < 1.0e-6);
+        assert_sample_exact(second[1_919], -1.0);
+        assert_sample_exact(cut[0], -1.0);
+        assert_sample_exact(cut[1_919], -1.0);
     }
 
     #[test]
