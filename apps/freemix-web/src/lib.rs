@@ -4,11 +4,15 @@ use std::fmt;
 use std::net::Ipv6Addr;
 
 use fm_client::ClientConfig;
-use fm_protocol::{ClientType, ProtocolVersion, Role};
+use fm_protocol::{ClientType, ProtocolVersion, Role, WIPE_PROTOCOL_VERSION};
 use fm_types::ProjectId;
 
+mod transition;
+
+pub use transition::{TransitionControl, TransitionControlState, TransitionControls};
+
 /// Protocol versions implemented by this control surface.
-pub const SUPPORTED_PROTOCOL_VERSIONS: [ProtocolVersion; 1] = [ProtocolVersion::new(1, 2)];
+pub const SUPPORTED_PROTOCOL_VERSIONS: [ProtocolVersion; 1] = [WIPE_PROTOCOL_VERSION];
 
 /// A semantic panel that can appear in a role-scoped route.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -180,26 +184,6 @@ fn role_from_slug(slug: &str) -> Option<Role> {
         "operator" => Some(Role::Operator),
         "admin" => Some(Role::Admin),
         _ => None,
-    }
-}
-
-/// A live transition control rendered as a semantic form control.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TransitionControl {
-    Cut,
-    Auto,
-    Duration,
-}
-
-impl TransitionControl {
-    /// Screen-reader label for this transition control.
-    #[must_use]
-    pub const fn accessibility_label(self) -> &'static str {
-        match self {
-            Self::Cut => "Cut Preview to Program",
-            Self::Auto => "Transition Preview to Program",
-            Self::Duration => "Transition duration",
-        }
     }
 }
 
@@ -445,6 +429,10 @@ mod tests {
         assert_eq!(
             TransitionControl::Auto.accessibility_label(),
             "Transition Preview to Program"
+        );
+        assert_eq!(
+            TransitionControl::Wipe.accessibility_label(),
+            "Wipe Preview to Program"
         );
         assert_eq!(
             TransitionControl::Duration.accessibility_label(),
