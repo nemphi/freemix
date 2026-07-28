@@ -157,7 +157,8 @@ impl SampleDelay {
     ///
     /// Blocks may contain any number of samples through
     /// [`MAX_SAMPLES_PER_BLOCK`]. Partitioning a stream across calls does not
-    /// change its output. Successful processing performs no allocation.
+    /// change its output. The concrete borrowed slice views are the same views
+    /// validated and processed. Successful processing performs no allocation.
     ///
     /// # Errors
     ///
@@ -165,26 +166,22 @@ impl SampleDelay {
     /// output planes, unequal input/output sample counts, an oversized block,
     /// or a non-finite input sample. Failure leaves both state and output
     /// unchanged.
-    pub fn process_into<InputPlane, OutputPlane>(
+    pub fn process_into(
         &mut self,
-        input: &[InputPlane],
-        output: &mut [OutputPlane],
-    ) -> Result<(), SampleDelayError>
-    where
-        InputPlane: AsRef<[f32]>,
-        OutputPlane: AsRef<[f32]> + AsMut<[f32]>,
-    {
+        input: &[&[f32]],
+        output: &mut [&mut [f32]],
+    ) -> Result<(), SampleDelayError> {
         let samples = self.validate_operation(input, output)?;
         if self.delay_samples == 0 {
-            for (source, destination) in input.iter().zip(output) {
-                destination.as_mut().copy_from_slice(source.as_ref());
+            for (source, destination) in input.iter().copied().zip(output.iter_mut()) {
+                destination.copy_from_slice(source);
             }
             return Ok(());
         }
 
-        for (channel, (source, destination)) in input.iter().zip(output).enumerate() {
-            let source = source.as_ref();
-            let destination = destination.as_mut();
+        for (channel, (source, destination)) in
+            input.iter().copied().zip(output.iter_mut()).enumerate()
+        {
             let channel_base = channel * self.delay_samples;
             for sample in 0..samples {
                 let ring_index = channel_base + (self.cursor + sample) % self.delay_samples;
@@ -202,19 +199,15 @@ impl SampleDelay {
         self.cursor = 0;
     }
 
-    fn validate_operation<InputPlane, OutputPlane>(
+    fn validate_operation(
         &self,
-        input: &[InputPlane],
-        output: &[OutputPlane],
-    ) -> Result<usize, SampleDelayError>
-    where
-        InputPlane: AsRef<[f32]>,
-        OutputPlane: AsRef<[f32]>,
-    {
+        input: &[&[f32]],
+        output: &[&mut [f32]],
+    ) -> Result<usize, SampleDelayError> {
         validate_plane_count(SampleDelaySide::Input, input.len(), self.channels)?;
         validate_plane_count(SampleDelaySide::Output, output.len(), self.channels)?;
 
-        let samples = input[0].as_ref().len();
+        let samples = input[0].len();
         if samples > MAX_SAMPLES_PER_BLOCK {
             return Err(SampleDelayError::SampleCountOutOfRange {
                 actual: samples,
@@ -222,7 +215,6 @@ impl SampleDelay {
             });
         }
         for (plane, values) in input.iter().enumerate() {
-            let values = values.as_ref();
             if values.len() != samples {
                 return Err(SampleDelayError::PlaneLengthMismatch {
                     side: SampleDelaySide::Input,
@@ -233,7 +225,7 @@ impl SampleDelay {
             }
         }
         for (plane, values) in output.iter().enumerate() {
-            let actual = values.as_ref().len();
+            let actual = values.len();
             if actual != samples {
                 return Err(SampleDelayError::PlaneLengthMismatch {
                     side: SampleDelaySide::Output,
@@ -244,7 +236,7 @@ impl SampleDelay {
             }
         }
         for (channel, plane) in input.iter().enumerate() {
-            if let Some(sample) = plane.as_ref().iter().position(|sample| !sample.is_finite()) {
+            if let Some(sample) = plane.iter().position(|sample| !sample.is_finite()) {
                 return Err(SampleDelayError::NonFiniteInput { channel, sample });
             }
         }
@@ -259,18 +251,18 @@ fn validated_capacity(channels: usize, delay_samples: usize) -> Result<usize, Sa
             maximum: MAX_CHANNELS,
         });
     }
-    let capacity = channels
-        .checked_mul(delay_samples)
-        .ok_or(SampleDelayError::AllocationOverflow)?;
-    capacity
-        .checked_mul(BYTES_PER_SAMPLE)
-        .ok_or(SampleDelayError::AllocationOverflow)?;
     if delay_samples > MAX_SAMPLE_DELAY_SAMPLES {
         return Err(SampleDelayError::DelayOutOfRange {
             actual: delay_samples,
             maximum: MAX_SAMPLE_DELAY_SAMPLES,
         });
     }
+    let capacity = channels
+        .checked_mul(delay_samples)
+        .ok_or(SampleDelayError::AllocationOverflow)?;
+    capacity
+        .checked_mul(BYTES_PER_SAMPLE)
+        .ok_or(SampleDelayError::AllocationOverflow)?;
     Ok(capacity)
 }
 

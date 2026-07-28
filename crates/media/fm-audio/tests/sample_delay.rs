@@ -8,8 +8,18 @@ use fm_audio::{
 fn process(delay: &mut SampleDelay, input: &[Vec<f32>]) -> Vec<Vec<f32>> {
     let samples = input[0].len();
     let mut output = vec![vec![0.0; samples]; input.len()];
-    delay.process_into(input, &mut output).unwrap();
+    process_into(delay, input, &mut output).unwrap();
     output
+}
+
+fn process_into(
+    delay: &mut SampleDelay,
+    input: &[Vec<f32>],
+    output: &mut [Vec<f32>],
+) -> Result<(), SampleDelayError> {
+    let input: Vec<&[f32]> = input.iter().map(Vec::as_slice).collect();
+    let mut output: Vec<&mut [f32]> = output.iter_mut().map(Vec::as_mut_slice).collect();
+    delay.process_into(&input, &mut output)
 }
 
 #[test]
@@ -50,6 +60,41 @@ fn channels_retain_independent_history() {
             vec![0.0, 0.0, -1.0, -2.0],
         ]
     );
+}
+
+#[test]
+fn stable_slice_views_support_varying_block_lengths() {
+    let mut delay = SampleDelay::new(2, 2).unwrap();
+
+    let first_left = [1.0, 2.0, 3.0];
+    let first_right = [10.0, 20.0, 30.0];
+    let first_input: [&[f32]; 2] = [&first_left, &first_right];
+    let mut first_left_output = [9.0; 3];
+    let mut first_right_output = [9.0; 3];
+    let mut first_output: [&mut [f32]; 2] = [&mut first_left_output, &mut first_right_output];
+    delay.process_into(&first_input, &mut first_output).unwrap();
+    assert_eq!(first_left_output, [0.0, 0.0, 1.0]);
+    assert_eq!(first_right_output, [0.0, 0.0, 10.0]);
+
+    let empty_left = [];
+    let empty_right = [];
+    let empty_input: [&[f32]; 2] = [&empty_left, &empty_right];
+    let mut empty_left_output = [];
+    let mut empty_right_output = [];
+    let mut empty_output: [&mut [f32]; 2] = [&mut empty_left_output, &mut empty_right_output];
+    delay.process_into(&empty_input, &mut empty_output).unwrap();
+
+    let second_left = [4.0];
+    let second_right = [40.0];
+    let second_input: [&[f32]; 2] = [&second_left, &second_right];
+    let mut second_left_output = [9.0];
+    let mut second_right_output = [9.0];
+    let mut second_output: [&mut [f32]; 2] = [&mut second_left_output, &mut second_right_output];
+    delay
+        .process_into(&second_input, &mut second_output)
+        .unwrap();
+    assert_eq!(second_left_output, [2.0]);
+    assert_eq!(second_right_output, [20.0]);
 }
 
 #[test]
@@ -110,7 +155,7 @@ fn invalid_operations_leave_state_and_output_unchanged() {
 
     let mut wrong_input_count = vec![vec![7.0; 2]; 2];
     assert_eq!(
-        delay.process_into(&[vec![3.0, 4.0]], &mut wrong_input_count),
+        process_into(&mut delay, &[vec![3.0, 4.0]], &mut wrong_input_count),
         Err(SampleDelayError::PlaneCountMismatch {
             side: SampleDelaySide::Input,
             expected: 2,
@@ -121,7 +166,7 @@ fn invalid_operations_leave_state_and_output_unchanged() {
 
     let mut wrong_output_count = vec![vec![8.0; 2]];
     assert_eq!(
-        delay.process_into(&priming, &mut wrong_output_count),
+        process_into(&mut delay, &priming, &mut wrong_output_count),
         Err(SampleDelayError::PlaneCountMismatch {
             side: SampleDelaySide::Output,
             expected: 2,
@@ -132,7 +177,7 @@ fn invalid_operations_leave_state_and_output_unchanged() {
 
     let mut output = vec![vec![9.0; 2]; 2];
     assert_eq!(
-        delay.process_into(&[vec![3.0, 4.0], vec![5.0]], &mut output),
+        process_into(&mut delay, &[vec![3.0, 4.0], vec![5.0]], &mut output),
         Err(SampleDelayError::PlaneLengthMismatch {
             side: SampleDelaySide::Input,
             plane: 1,
@@ -144,7 +189,7 @@ fn invalid_operations_leave_state_and_output_unchanged() {
 
     let mut short_output = vec![vec![6.0; 2], vec![6.0]];
     assert_eq!(
-        delay.process_into(&priming, &mut short_output),
+        process_into(&mut delay, &priming, &mut short_output),
         Err(SampleDelayError::PlaneLengthMismatch {
             side: SampleDelaySide::Output,
             plane: 1,
@@ -156,7 +201,8 @@ fn invalid_operations_leave_state_and_output_unchanged() {
 
     let mut non_finite_output = vec![vec![5.0; 2]; 2];
     assert_eq!(
-        delay.process_into(
+        process_into(
+            &mut delay,
             &[vec![3.0, f32::NAN], vec![f32::INFINITY, 4.0]],
             &mut non_finite_output,
         ),
@@ -170,7 +216,7 @@ fn invalid_operations_leave_state_and_output_unchanged() {
     let oversized = vec![vec![0.0; MAX_SAMPLES_PER_BLOCK + 1]; 2];
     let mut oversized_output = vec![vec![4.0; MAX_SAMPLES_PER_BLOCK + 1]; 2];
     assert_eq!(
-        delay.process_into(&oversized, &mut oversized_output),
+        process_into(&mut delay, &oversized, &mut oversized_output),
         Err(SampleDelayError::SampleCountOutOfRange {
             actual: MAX_SAMPLES_PER_BLOCK + 1,
             maximum: MAX_SAMPLES_PER_BLOCK,
@@ -191,7 +237,7 @@ fn invalid_operations_leave_state_and_output_unchanged() {
 }
 
 #[test]
-fn construction_enforces_maximums_and_checks_extreme_arithmetic() {
+fn construction_enforces_bounds_before_allocation_arithmetic() {
     assert!(SampleDelay::new(MAX_CHANNELS, MAX_SAMPLE_DELAY_SAMPLES).is_ok());
     assert_eq!(
         SampleDelay::new(0, 0),
@@ -216,6 +262,9 @@ fn construction_enforces_maximums_and_checks_extreme_arithmetic() {
     );
     assert_eq!(
         SampleDelay::new(MAX_CHANNELS, usize::MAX),
-        Err(SampleDelayError::AllocationOverflow)
+        Err(SampleDelayError::DelayOutOfRange {
+            actual: usize::MAX,
+            maximum: MAX_SAMPLE_DELAY_SAMPLES,
+        })
     );
 }
