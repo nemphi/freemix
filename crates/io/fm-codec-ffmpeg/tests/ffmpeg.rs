@@ -76,6 +76,35 @@ fn generate_asset(path: &std::path::Path) {
         "nut",
         "-y",
     ];
+    run_ffmpeg_generator(&args, path);
+}
+
+fn generate_deep_audio_asset(path: &std::path::Path, sample_rate: u32) {
+    let source =
+        format!("aevalsrc=0.30*sin(2*PI*440*t)|0.08*sin(2*PI*997*t):s={sample_rate}:d=30");
+    let args = [
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        source.as_str(),
+        "-af",
+        "asetpts=PTS+5/TB",
+        "-c:a",
+        "flac",
+        "-channel_layout",
+        "stereo",
+        "-f",
+        "nut",
+        "-y",
+    ];
+    run_ffmpeg_generator(&args, path);
+}
+
+fn run_ffmpeg_generator(args: &[&str], path: &std::path::Path) {
     let mut child = Command::new("ffmpeg")
         .args(args)
         .arg(path)
@@ -671,6 +700,68 @@ fn sequential_audio_windows_match_leading_decode_and_keep_global_timing() {
                 + i64::try_from(pair[0].timing().duration().as_nanos()).unwrap(),
             pair[1].timing().presentation_timestamp().as_nanos()
         );
+    }
+}
+
+#[test]
+fn deep_audio_pages_and_restored_cursors_match_linear_decode() {
+    let _guard = ffmpeg_test_guard();
+    let Some(_) = require_ffmpeg() else {
+        return;
+    };
+    let directory = tempdir().unwrap();
+    let clock = ClockDomainId::new(NonZeroU128::new(54).unwrap());
+
+    for sample_rate in [44_100, 48_000] {
+        let path = directory
+            .path()
+            .join(format!("deep-audio-{sample_rate}.nut"));
+        generate_deep_audio_asset(&path, sample_rate);
+        let adapter = Adapter::new(Config {
+            allowed_root: Some(directory.path().to_owned()),
+            ..Config::default()
+        })
+        .unwrap();
+        let linear = adapter
+            .decode_local(&path, audio_request(clock, 220))
+            .unwrap()
+            .audio;
+        assert_eq!(linear[0].sample_rate().hertz(), sample_rate);
+        assert_eq!(
+            linear[0].timing().original_timestamp().timestamp().ticks(),
+            i64::from(sample_rate) * 5
+        );
+
+        let target_block = 200_usize;
+        let target_sample = linear[..target_block]
+            .iter()
+            .map(AudioBlock::sample_count)
+            .sum::<usize>();
+        let expected = &linear[target_block..target_block + 5];
+
+        let mut sequential = adapter
+            .open_local_audio(&path, clock, StreamSelector::Best)
+            .unwrap();
+        sequential
+            .decode_up_to(NonZeroU32::new(u32::try_from(target_block).unwrap()).unwrap())
+            .unwrap();
+        let deep_page = sequential
+            .decode_up_to(NonZeroU32::new(5).unwrap())
+            .unwrap();
+        assert_same_audio(&deep_page.blocks, expected);
+
+        for _ in 0..2 {
+            let mut restored = adapter
+                .open_local_audio(&path, clock, StreamSelector::Best)
+                .unwrap();
+            let position = restored
+                .skip_complete_blocks_to_sample_bounded(target_sample, target_block)
+                .unwrap();
+            assert_eq!(position.skipped_blocks, target_block);
+            assert_eq!(position.next_sample, target_sample);
+            let restored_page = restored.decode_up_to(NonZeroU32::new(5).unwrap()).unwrap();
+            assert_same_audio(&restored_page.blocks, expected);
+        }
     }
 }
 

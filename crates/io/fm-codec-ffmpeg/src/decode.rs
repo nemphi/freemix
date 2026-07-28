@@ -11,9 +11,14 @@ use fm_frame::{
 };
 use serde_json::{Map, Value};
 
+use crate::audio_seek::{
+    AudioSeek, parse_input_start_microseconds, sample_pts as audio_sample_pts,
+    timestamp_microseconds_floor, validate_diagnostic as validate_seek_diagnostic,
+};
 use crate::{Adapter, Error, LimitKind, Source, StreamInfo, StreamSelector, Tool, Unsupported};
 
 const AUDIO_POSITION_PROBE_BLOCKS: usize = 32;
+const AUDIO_SEEK_PREROLL_SECONDS: usize = 1;
 
 /// One selected, non-empty bounded stream sequence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -76,6 +81,7 @@ pub struct LocalAudioDecoder {
     adapter: Adapter,
     source: Source,
     stream: StreamInfo,
+    input_start_microseconds: i64,
     clock_domain: ClockDomainId,
     ordinal: usize,
     absolute_sample_position: usize,
@@ -123,8 +129,8 @@ struct PreparedAudio {
     total_samples: usize,
     total_bytes: usize,
     start: usize,
-    start_sample: usize,
     end_sample: usize,
+    seek: AudioSeek,
     end_of_stream: bool,
 }
 
@@ -182,10 +188,13 @@ impl Adapter {
         let source = self.open_source(path.as_ref())?;
         let probe = self.probe_source(&source)?;
         let stream = probe.select_audio(selector)?.clone();
+        let input_start_microseconds =
+            parse_input_start_microseconds(probe.format.start_time.as_deref())?;
         Ok(LocalAudioDecoder {
             adapter: self.clone(),
             source,
             stream,
+            input_start_microseconds,
             clock_domain,
             ordinal: 0,
             absolute_sample_position: 0,
@@ -415,7 +424,7 @@ impl Adapter {
             });
         }
         let requested_count = usize::try_from(count_u32).map_err(|_| Error::InvalidConfig)?;
-        self.prepare_audio_window(source, stream, 0, requested_count, requirement)
+        self.prepare_audio_window(source, stream, 0, requested_count, requirement, None)
     }
 
     fn prepare_audio_window(
@@ -425,6 +434,7 @@ impl Adapter {
         start: usize,
         requested_count: usize,
         requirement: CountRequirement,
+        input_start_microseconds: Option<i64>,
     ) -> Result<PreparedAudio, Error> {
         let sample_rate = stream.sample_rate.ok_or(Error::MalformedProbe)?;
         let channels = stream.channels.ok_or(Error::MalformedProbe)?;
@@ -451,11 +461,9 @@ impl Adapter {
         let time_base = stream.time_base.ok_or(Error::MalformedProbe)?;
         let selected_end = start.checked_add(count).ok_or(Error::InvalidTimeline)?;
         let mut absolute_sample_position = 0_usize;
-        let mut start_sample = None;
+        let mut sample_positions = Vec::with_capacity(selected_end.saturating_add(1));
         for (index, record) in metadata.records.iter().take(selected_end).enumerate() {
-            if index == start {
-                start_sample = Some(absolute_sample_position);
-            }
+            sample_positions.push(absolute_sample_position);
             let samples = record.sample_count.ok_or(Error::MalformedProbe)?;
             if samples == 0 {
                 return Err(Error::InvalidTimeline);
@@ -468,7 +476,8 @@ impl Adapter {
                 validate_audio_continuity(record, next, samples, sample_rate, time_base)?;
             }
         }
-        let start_sample = start_sample.unwrap_or(absolute_sample_position);
+        sample_positions.push(absolute_sample_position);
+        let start_sample = *sample_positions.get(start).ok_or(Error::InvalidTimeline)?;
         let end_sample = absolute_sample_position;
         let total_samples = end_sample
             .checked_sub(start_sample)
@@ -490,6 +499,24 @@ impl Adapter {
                 self.limits().max_total_decoded_bytes,
             ));
         }
+        let seek = input_start_microseconds.map_or(
+            Ok(AudioSeek {
+                input_microseconds: None,
+                expected_first_pts: None,
+                correction_samples: start_sample,
+            }),
+            |input_start_microseconds| {
+                audio_seek(
+                    &metadata.records,
+                    &sample_positions,
+                    start,
+                    start_sample,
+                    sample_rate,
+                    time_base,
+                    input_start_microseconds,
+                )
+            },
+        )?;
         Ok(PreparedAudio {
             stream,
             records,
@@ -501,8 +528,8 @@ impl Adapter {
             total_samples,
             total_bytes,
             start,
-            start_sample,
             end_sample,
+            seek,
             end_of_stream,
         })
     }
@@ -615,10 +642,10 @@ impl Adapter {
         let args = audio_decode_args(
             &source.path,
             prepared.stream.index,
-            prepared.start_sample,
-            prepared.end_sample,
+            prepared.seek,
+            prepared.total_samples,
             prepared.layout_name,
-        );
+        )?;
         if prepared.count == 0 {
             return Ok(Vec::new());
         }
@@ -629,6 +656,9 @@ impl Adapter {
             self.limits().decode_timeout,
             prepared.total_bytes,
         )?;
+        if let Some(expected_first_pts) = prepared.seek.expected_first_pts {
+            validate_seek_diagnostic(&output.stderr, expected_first_pts, prepared.sample_rate)?;
+        }
         if output.stdout.len() != prepared.total_bytes {
             return Err(Error::OutputMismatch {
                 expected: prepared.total_bytes,
@@ -806,8 +836,13 @@ impl LocalAudioDecoder {
                 ordinal,
                 requested,
                 CountRequirement::CursorUpTo,
+                Some(self.input_start_microseconds),
             )?;
-            if prepared.start_sample != sample {
+            let prepared_start_sample = prepared
+                .end_sample
+                .checked_sub(prepared.total_samples)
+                .ok_or(Error::InvalidTimeline)?;
+            if prepared_start_sample != sample {
                 return Err(Error::InvalidTimeline);
             }
             let mut skipped = 0_usize;
@@ -922,6 +957,7 @@ impl LocalAudioDecoder {
             self.ordinal,
             requested,
             CountRequirement::CursorUpTo,
+            Some(self.input_start_microseconds),
         )?;
         if prepared.total_samples > max_page_samples {
             return Err(Error::LimitExceeded {
@@ -936,7 +972,11 @@ impl LocalAudioDecoder {
                 max_page_decoded_bytes,
             ));
         }
-        if prepared.start_sample != self.absolute_sample_position {
+        let prepared_start_sample = prepared
+            .end_sample
+            .checked_sub(prepared.total_samples)
+            .ok_or(Error::InvalidTimeline)?;
+        if prepared_start_sample != self.absolute_sample_position {
             return Err(Error::InvalidTimeline);
         }
         let next_absolute_sample_position = self
@@ -1029,24 +1069,47 @@ fn video_decode_args(
 fn audio_decode_args(
     path: &Path,
     stream_index: u32,
-    start_sample: usize,
-    end_sample: usize,
+    seek: AudioSeek,
+    sample_count: usize,
     layout: &str,
-) -> Vec<OsString> {
-    [
+) -> Result<Vec<OsString>, Error> {
+    let end_sample = seek
+        .correction_samples
+        .checked_add(sample_count)
+        .ok_or(Error::InvalidTimeline)?;
+    let mut args = vec![
         OsString::from("-nostdin"),
         OsString::from("-hide_banner"),
         OsString::from("-loglevel"),
-        OsString::from("error"),
+        OsString::from(if seek.expected_first_pts.is_some() {
+            "info"
+        } else {
+            "error"
+        }),
         OsString::from("-protocol_whitelist"),
         OsString::from("file"),
+    ];
+    if let Some(input_microseconds) = seek.input_microseconds {
+        args.extend([
+            OsString::from("-copyts"),
+            OsString::from("-ss"),
+            OsString::from(format!("{input_microseconds}us")),
+        ]);
+    }
+    args.extend([
         OsString::from("-i"),
         path.as_os_str().to_owned(),
         OsString::from("-map"),
         OsString::from(format!("0:{stream_index}")),
         OsString::from("-af"),
         OsString::from(format!(
-            "atrim=start_sample={start_sample}:end_sample={end_sample}"
+            "{}atrim=start_sample={}:end_sample={end_sample}",
+            if seek.expected_first_pts.is_some() {
+                "ashowinfo,"
+            } else {
+                ""
+            },
+            seek.correction_samples,
         )),
         OsString::from("-vn"),
         OsString::from("-sn"),
@@ -1058,8 +1121,84 @@ fn audio_decode_args(
         OsString::from("-f"),
         OsString::from("f32le"),
         OsString::from("pipe:1"),
-    ]
-    .into()
+    ]);
+    Ok(args)
+}
+
+fn audio_seek(
+    records: &[FrameRecord],
+    sample_positions: &[usize],
+    start: usize,
+    start_sample: usize,
+    sample_rate: u32,
+    time_base: TimeBase,
+    input_start_microseconds: i64,
+) -> Result<AudioSeek, Error> {
+    if start == 0 {
+        return Ok(AudioSeek {
+            input_microseconds: None,
+            expected_first_pts: None,
+            correction_samples: 0,
+        });
+    }
+
+    let maximum_correction = usize::try_from(sample_rate)
+        .ok()
+        .and_then(|sample_rate| sample_rate.checked_mul(AUDIO_SEEK_PREROLL_SECONDS))
+        .ok_or(Error::InvalidTimeline)?;
+    let mut anchor = start;
+    while anchor > 0 {
+        let candidate = anchor - 1;
+        let candidate_sample = *sample_positions
+            .get(candidate)
+            .ok_or(Error::InvalidTimeline)?;
+        if start_sample
+            .checked_sub(candidate_sample)
+            .ok_or(Error::InvalidTimeline)?
+            > maximum_correction
+        {
+            break;
+        }
+        anchor = candidate;
+    }
+
+    let anchor_sample = *sample_positions.get(anchor).ok_or(Error::InvalidTimeline)?;
+    let correction_samples = start_sample
+        .checked_sub(anchor_sample)
+        .ok_or(Error::InvalidTimeline)?;
+    let anchor_record = records.get(anchor).ok_or(Error::InvalidTimeline)?;
+    let target_record = records.get(start).ok_or(Error::InvalidTimeline)?;
+    let expected_first_pts = audio_sample_pts(anchor_record.pts, sample_rate, time_base)?;
+    let target_pts = audio_sample_pts(target_record.pts, sample_rate, time_base)?;
+    if target_pts
+        .checked_sub(expected_first_pts)
+        .and_then(|samples| usize::try_from(samples).ok())
+        != Some(correction_samples)
+    {
+        return Err(Error::InvalidTimeline);
+    }
+
+    let input_microseconds = timestamp_microseconds_floor(anchor_record.pts, time_base)?
+        .checked_sub(input_start_microseconds)
+        .ok_or(Error::InvalidTimeline)?;
+    if input_microseconds <= 0 {
+        if start_sample > maximum_correction {
+            return Err(Error::InvalidTimeline);
+        }
+        return Ok(AudioSeek {
+            input_microseconds: None,
+            expected_first_pts: None,
+            correction_samples: start_sample,
+        });
+    }
+
+    Ok(AudioSeek {
+        input_microseconds: Some(
+            u64::try_from(input_microseconds).map_err(|_| Error::InvalidTimeline)?,
+        ),
+        expected_first_pts: Some(expected_first_pts),
+        correction_samples,
+    })
 }
 
 fn parse_frame_records(
@@ -1609,18 +1748,85 @@ mod tests {
     }
 
     #[test]
-    fn audio_window_args_trim_checked_sample_ordinals_without_seeking_or_rebasing_pts() {
-        let args = audio_decode_args(Path::new("movie.nut"), 3, 2048, 5120, "stereo")
-            .into_iter()
-            .map(|argument| argument.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
+    fn audio_window_args_seek_before_input_and_bound_the_correction_trim() {
+        let args = audio_decode_args(
+            Path::new("movie.nut"),
+            3,
+            AudioSeek {
+                input_microseconds: Some(12_345_678),
+                expected_first_pts: Some(330_750),
+                correction_samples: 44_032,
+            },
+            3_072,
+            "stereo",
+        )
+        .unwrap()
+        .into_iter()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+        assert!(args.windows(2).any(|pair| pair == ["-ss", "12345678us"]));
         assert!(
-            args.windows(2)
-                .any(|pair| { pair == ["-af", "atrim=start_sample=2048:end_sample=5120",] })
+            args.iter().position(|argument| argument == "-ss")
+                < args.iter().position(|argument| argument == "-i")
         );
-        assert!(!args.iter().any(|argument| argument == "-ss"));
+        assert!(args.iter().any(|argument| argument == "-copyts"));
+        assert!(args.windows(2).any(|pair| {
+            pair == ["-af", "ashowinfo,atrim=start_sample=44032:end_sample=47104"]
+        }));
         assert!(!args.iter().any(|argument| argument == "-frames:a"));
         assert!(!args.iter().any(|argument| argument.contains("asetpts")));
+    }
+
+    #[test]
+    fn leading_audio_window_omits_seek_and_diagnostic_filter() {
+        let args = audio_decode_args(
+            Path::new("movie.nut"),
+            3,
+            AudioSeek {
+                input_microseconds: None,
+                expected_first_pts: None,
+                correction_samples: 0,
+            },
+            3_072,
+            "stereo",
+        )
+        .unwrap()
+        .into_iter()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+        assert!(!args.iter().any(|argument| argument == "-ss"));
+        assert!(!args.iter().any(|argument| argument == "-copyts"));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-af", "atrim=start_sample=0:end_sample=3072"])
+        );
+        assert!(!args.iter().any(|argument| argument.contains("ashowinfo")));
+    }
+
+    #[test]
+    fn audio_seek_anchors_at_most_one_second_before_the_page() {
+        let sample_rate = 44_100;
+        let base = i64::from(sample_rate) * 5;
+        let records = (0..60)
+            .map(|index| record(base + i64::from(index * 1_024), Some(1_024), Some(1_024)))
+            .collect::<Vec<_>>();
+        let sample_positions = (0..=60).map(|index| index * 1_024).collect::<Vec<_>>();
+        assert_eq!(
+            audio_seek(
+                &records,
+                &sample_positions,
+                50,
+                50 * 1_024,
+                sample_rate,
+                TimeBase::new(1, sample_rate).unwrap(),
+                5_000_000,
+            ),
+            Ok(AudioSeek {
+                input_microseconds: Some(162_539),
+                expected_first_pts: Some(base + 7 * 1_024),
+                correction_samples: 43 * 1_024,
+            })
+        );
     }
 
     #[test]

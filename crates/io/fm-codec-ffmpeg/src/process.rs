@@ -24,6 +24,7 @@ pub(crate) struct RunRequest<'a> {
 
 pub(crate) struct RunOutput {
     pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
 }
 
 enum StreamMessage {
@@ -176,7 +177,10 @@ fn finish(
     request: &RunRequest<'_>,
 ) -> Result<RunOutput, Error> {
     if status.success() {
-        Ok(RunOutput { stdout })
+        Ok(RunOutput {
+            stdout,
+            stderr: stderr.to_vec(),
+        })
     } else {
         Err(Error::ProcessFailed {
             tool: request.tool,
