@@ -4,11 +4,16 @@ use core::{
 };
 use std::collections::VecDeque;
 
-use fm_clock::{ClockDomainId as MappingClockDomainId, ClockMapping};
+use fm_clock::{ClockDomainId as MappingClockDomainId, ClockMapping, ClockSnapshot, MappingError};
 use fm_frame::{
     AudioBlock, MediaFlags, MediaTiming, NormalizedDuration, NormalizedTimestamp, SequenceNumber,
 };
 use fm_types::{ChannelLayout, SampleRate};
+
+use crate::{
+    ClockRecalibrationError, ClockRecalibrationPolicy, ClockRecalibrationTelemetry,
+    ClockRecalibrationUpdate, clock_recalibration::ClockRecalibrator,
+};
 
 const NANOS_PER_SECOND: i128 = 1_000_000_000;
 const BYTES_PER_SAMPLE: usize = size_of::<f32>();
@@ -546,6 +551,7 @@ pub struct ClockMappedAudioSynchronizer {
     output_rate: SampleRate,
     channel_layout: ChannelLayout,
     mapping: ClockMapping,
+    clock_recalibrator: ClockRecalibrator,
     source_origin: AudioCadenceOrigin,
     master_origin: AudioCadenceOrigin,
     limits: AudioSynchronizerLimits,
@@ -619,6 +625,7 @@ impl ClockMappedAudioSynchronizer {
             output_rate,
             channel_layout,
             mapping,
+            clock_recalibrator: ClockRecalibrator::disabled(mapping),
             source_origin,
             master_origin,
             limits,
@@ -656,6 +663,71 @@ impl ClockMappedAudioSynchronizer {
     #[must_use]
     pub const fn mapping(&self) -> ClockMapping {
         self.mapping
+    }
+
+    /// Enables bounded clock drift recalibration. Construction remains fixed-map
+    /// until a caller explicitly configures this policy and submits observations.
+    pub fn configure_clock_recalibration(&mut self, policy: ClockRecalibrationPolicy) {
+        self.clock_recalibrator.configure(policy);
+    }
+
+    /// Observes one paired source/Master clock sample and, once sufficiently
+    /// populated, atomically installs a continuity-preserving rate estimate.
+    ///
+    /// Failed observations leave the mapping, observation window, buffered
+    /// media, and stream cursors unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed disabled-policy, domain, monotonicity, outlier, or
+    /// mapping arithmetic error.
+    pub fn observe_clock_pair(
+        &mut self,
+        source: fm_clock::ClockSnapshot,
+        master: fm_clock::ClockSnapshot,
+    ) -> Result<ClockRecalibrationUpdate, ClockRecalibrationError> {
+        let (mapping, update) = self
+            .clock_recalibrator
+            .observe(self.mapping, source, master)?;
+        self.mapping = mapping;
+        if matches!(update, ClockRecalibrationUpdate::Recalibrated { .. }) {
+            self.render_generation = self.render_generation.wrapping_add(1);
+        }
+        Ok(update)
+    }
+
+    #[must_use]
+    pub fn clock_recalibration_telemetry(&self) -> ClockRecalibrationTelemetry {
+        self.clock_recalibrator.telemetry()
+    }
+
+    /// Declares a clock and media discontinuity, atomically re-anchoring the
+    /// current rate before dropping buffered media and rearming both cadences.
+    ///
+    /// The last accepted drift is preserved as the initial rate after the
+    /// discontinuity; new observations start a fresh bounded window.
+    ///
+    /// # Errors
+    ///
+    /// Returns a domain or mapping error without changing any synchronizer
+    /// state.
+    pub fn reset_clock_discontinuity(
+        &mut self,
+        source_anchor: ClockSnapshot,
+        master_anchor: ClockSnapshot,
+        source_origin: AudioCadenceOrigin,
+        master_origin: AudioCadenceOrigin,
+    ) -> Result<(), ClockRecalibrationError> {
+        if source_anchor.domain() != self.mapping.source_domain()
+            || master_anchor.domain() != self.mapping.master_domain()
+        {
+            return Err(MappingError::DomainMismatch.into());
+        }
+        let mapping = ClockMapping::new(source_anchor, master_anchor, self.mapping.drift_ppb())?;
+        self.mapping = mapping;
+        self.clock_recalibrator.reanchor(mapping);
+        self.reset(source_origin, master_origin);
+        Ok(())
     }
 
     #[must_use]
@@ -1026,6 +1098,7 @@ impl ClockMappedAudioSynchronizer {
         self.buffered_bytes = 0;
         self.input_cursor = None;
         self.output_cursor = None;
+        self.clock_recalibrator.clear_observations();
         self.render_generation = self.render_generation.wrapping_add(1);
         self.source_origin = source_origin;
         self.master_origin = master_origin;

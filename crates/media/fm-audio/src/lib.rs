@@ -10,11 +10,16 @@ use std::fmt;
 use fm_types::{AudioFormat, ChannelLayout, FrameRate, InputId, SampleFormat, SampleRate};
 
 mod channel_mapping;
+mod clock_recalibration;
 mod synchronizer;
 
 pub use channel_mapping::{
     ChannelMapping, ChannelMappingError, ChannelMappingRoute, ChannelMappingSide,
     MAX_CHANNEL_MAPPING_BYTES, MAX_CHANNEL_MAPPING_CHANNELS, MAX_CHANNEL_MAPPING_ROUTES,
+};
+pub use clock_recalibration::{
+    ClockRecalibrationError, ClockRecalibrationPolicy, ClockRecalibrationTelemetry,
+    ClockRecalibrationUpdate, MAX_CLOCK_DRIFT_PPM, MAX_CLOCK_RECALIBRATION_OBSERVATIONS,
 };
 pub use synchronizer::{
     AudioCadenceOrigin, AudioRenderPlan, AudioSilenceSpan, AudioSynchronizerError,
