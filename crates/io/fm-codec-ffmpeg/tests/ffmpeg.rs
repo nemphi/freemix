@@ -80,8 +80,7 @@ fn generate_asset(path: &std::path::Path) {
 }
 
 fn generate_deep_audio_asset(path: &std::path::Path, sample_rate: u32) {
-    let source =
-        format!("aevalsrc=0.30*sin(2*PI*440*t)|0.08*sin(2*PI*997*t):s={sample_rate}:d=30");
+    let source = format!("aevalsrc=0.30*sin(2*PI*440*t)|0.08*sin(2*PI*997*t):s={sample_rate}:d=30");
     let args = [
         "-nostdin",
         "-hide_banner",
