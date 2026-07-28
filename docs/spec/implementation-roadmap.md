@@ -55,6 +55,14 @@ Exit:
 Exit: a headless simulated production can be controlled by CLI and client,
 saved, restarted, resumed, and tested deterministically.
 
+Current Phase 1 control boundary: the daemon, protocol, and client exercise a
+versioned raw TCP session with handshake, snapshot/resume, commands, events,
+development authentication, and deterministic model tests. This is useful
+partial evidence for the control plane, but it does not implement or verify the
+RC-008 HTTP/WebSocket API contract, including HTTP resources, WebSocket event
+subscriptions, or transport-level production authentication and rate limits.
+RC-008 therefore remains planned.
+
 ## 4. Phase 2 — GPU playback switcher (10–14 weeks)
 
 1. Build wgpu context, resource pools, shader validation, render graph.
@@ -682,3 +690,9 @@ tests = ["browser-input-html5-audio", "browser-input-css", "browser-input-crash"
 unknown, a phase exit claims an incomplete dependency, or a release includes an
 unwaived applicable row. Named proprietary integrations may be legally blocked
 but cannot be marked parity-complete through a generic substitute.
+
+Acceptance-test evidence progresses from `planned` to `present` to `verified`.
+`present` records local test material and runnable commands without claiming the
+feature contract is complete. A feature may be `verified` only when every
+referenced acceptance test is also `verified` and has both resolvable local test
+paths and runnable test commands.

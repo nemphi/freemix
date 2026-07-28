@@ -15,6 +15,9 @@ const NAMED_INTEGRATIONS: &[&str] = &[
 ];
 const EXACT_INTEGRATION: &str = "exact-authorized-integration-required";
 const GENERIC_EQUIVALENT: &str = "equivalent-behavior-allowed";
+const TEST_PLANNED: &str = "planned";
+const TEST_PRESENT: &str = "present";
+const TEST_VERIFIED: &str = "verified";
 
 #[derive(Clone, Debug)]
 struct Registry {
@@ -253,8 +256,8 @@ fn build_ledger(
     waiver_values: Vec<BTreeMap<String, Value>>,
     feature_values: Vec<BTreeMap<String, Value>>,
 ) -> Result<Ledger, String> {
-    if schema_version != Some(2) {
-        return Err("schema_version must be 2".to_owned());
+    if schema_version != Some(3) {
+        return Err("schema_version must be 3".to_owned());
     }
     let registry = build_registry(registry_values)?;
     let tests = test_values
@@ -557,13 +560,31 @@ fn validate_tests<'a>(
         if tests.insert(test.id.as_str(), test).is_some() {
             return Err(format!("duplicate acceptance test ID {}", test.id));
         }
-        if !matches!(test.state.as_str(), "planned" | "present") {
-            return Err(format!("{} has invalid test state {}", test.id, test.state));
+        if !matches!(
+            test.state.as_str(),
+            TEST_PLANNED | TEST_PRESENT | TEST_VERIFIED
+        ) {
+            return Err(format!(
+                "{} has invalid test state {}; expected planned, present, or verified",
+                test.id, test.state
+            ));
         }
         unique_registry(&test.paths, &format!("{} path", test.id))?;
         unique_registry(&test.commands, &format!("{} command", test.id))?;
-        if test.state == "present" && test.paths.is_empty() && test.commands.is_empty() {
-            return Err(format!("{} is present but has no local evidence", test.id));
+        if matches!(test.state.as_str(), TEST_PRESENT | TEST_VERIFIED)
+            && test.paths.is_empty()
+            && test.commands.is_empty()
+        {
+            return Err(format!(
+                "{} is {} but has no local evidence",
+                test.id, test.state
+            ));
+        }
+        if test.state == TEST_VERIFIED && (test.paths.is_empty() || test.commands.is_empty()) {
+            return Err(format!(
+                "{} is verified but must provide both local test paths and runnable commands",
+                test.id
+            ));
         }
         for path in &test.paths {
             resolve_test_path(root, &test.id, path)?;
@@ -766,10 +787,11 @@ fn validate_feature(
     }
     if feature.status == "verified" {
         for test_id in &feature.tests {
-            if tests[test_id.as_str()].state != "present" {
+            let test_state = &tests[test_id.as_str()].state;
+            if test_state != TEST_VERIFIED {
                 return Err(format!(
-                    "{} is verified but test {test_id} is not present",
-                    feature.id
+                    "{} is verified but acceptance test {test_id} has state {test_state}; expected verified evidence",
+                    feature.id,
                 ));
             }
         }
@@ -956,11 +978,11 @@ fn validate_phase_claim(
                     .tests
                     .iter()
                     .map(|id| tests[id.as_str()])
-                    .find(|test| test.state != "present")
+                    .find(|test| test.state != TEST_VERIFIED)
                 {
                     return Err(format!(
-                        "phase {phase} claim: {} test {} is not present",
-                        feature.id, test.id
+                        "phase {phase} claim: {} acceptance test {} has state {}; expected verified evidence",
+                        feature.id, test.id, test.state
                     ));
                 }
             }
@@ -1328,7 +1350,7 @@ mod tests {
     #[test]
     fn parser_rejects_missing_feature_field() {
         let source = r#"
-            schema_version = 2
+            schema_version = 3
             [registry]
             profiles = ["portable"]
             workstreams = ["media"]
@@ -1345,7 +1367,7 @@ mod tests {
     #[test]
     fn parser_rejects_duplicate_keys() {
         let source = r#"
-            schema_version = 2
+            schema_version = 3
             [registry]
             profiles = ["portable"]
             profiles = ["duplicate"]
@@ -1434,7 +1456,37 @@ mod tests {
     fn rejects_verified_feature_with_planned_test() {
         assert_invalid(
             |ledger| ledger.features[0].status = "verified".to_owned(),
-            "verified but test accept-in-001 is not present",
+            "IN-001 is verified but acceptance test accept-in-001 has state planned; expected verified evidence",
+        );
+    }
+
+    #[test]
+    fn rejects_verified_feature_with_present_test() {
+        assert_invalid(
+            |ledger| {
+                ledger
+                    .features
+                    .iter_mut()
+                    .find(|feature| feature.id == "RC-008")
+                    .unwrap()
+                    .status = "verified".to_owned();
+            },
+            "RC-008 is verified but acceptance test accept-rc-008 has state present; expected verified evidence",
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_test_state() {
+        assert_invalid(
+            |ledger| {
+                ledger
+                    .tests
+                    .iter_mut()
+                    .find(|test| test.id == "accept-rc-008")
+                    .unwrap()
+                    .state = "complete".to_owned();
+            },
+            "accept-rc-008 has invalid test state complete; expected planned, present, or verified",
         );
     }
 
@@ -1497,21 +1549,55 @@ mod tests {
     }
 
     #[test]
-    fn verified_feature_with_present_local_tests_is_accepted() {
+    fn planned_feature_with_present_local_tests_is_accepted() {
         let (ledger, markdown) = loaded();
         let feature = ledger
             .features
             .iter()
             .find(|feature| feature.id == "RC-008")
             .unwrap();
-        assert_eq!(feature.status, "verified");
+        assert_eq!(feature.status, "planned");
         let test = ledger
             .tests
             .iter()
             .find(|test| test.id == "accept-rc-008")
             .unwrap();
         assert_eq!(test.state, "present");
+        validate_ledger(&ledger, &markdown, &workspace_root(), None).unwrap();
+    }
+
+    #[test]
+    fn verified_feature_with_verified_local_tests_is_accepted() {
+        let (mut ledger, markdown) = loaded();
+        ledger
+            .features
+            .iter_mut()
+            .find(|feature| feature.id == "RC-008")
+            .unwrap()
+            .status = "verified".to_owned();
+        ledger
+            .tests
+            .iter_mut()
+            .find(|test| test.id == "accept-rc-008")
+            .unwrap()
+            .state = "verified".to_owned();
         validate_ledger(&ledger, &markdown, &workspace_root(), Some(1)).unwrap();
+    }
+
+    #[test]
+    fn rejects_verified_test_without_complete_local_evidence() {
+        assert_invalid(
+            |ledger| {
+                let test = ledger
+                    .tests
+                    .iter_mut()
+                    .find(|test| test.id == "accept-rc-008")
+                    .unwrap();
+                test.state = "verified".to_owned();
+                test.commands.clear();
+            },
+            "accept-rc-008 is verified but must provide both local test paths and runnable commands",
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-schema_version = 2
+schema_version = 3
 
 [registry]
 profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "browser-control", "profile-a-hd", "profile-b-uhd", "profile-c-replay", "vendor-certified"]
@@ -1352,7 +1352,7 @@ owner = "engine-control-persistence-security"
 dependencies = []
 capability_profiles = ["windows-tier1", "macos-tier1", "linux-tier1", "browser-control"]
 tests = ["accept-rc-008"]
-status = "verified"
+status = "planned"
 substitution_policy = "equivalent-behavior-allowed"
 
 [[features]]
