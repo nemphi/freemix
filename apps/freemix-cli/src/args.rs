@@ -66,6 +66,12 @@ pub enum Command {
         key: Option<String>,
         expected_revision: Option<u64>,
     },
+    Zoom {
+        path: PathBuf,
+        frames: u32,
+        key: Option<String>,
+        expected_revision: Option<u64>,
+    },
     Wipe {
         path: PathBuf,
         frames: u32,
@@ -112,6 +118,12 @@ pub enum Command {
         expected_revision: Option<u64>,
     },
     RemoteSlide {
+        address: SocketAddr,
+        frames: u32,
+        key: Option<String>,
+        expected_revision: Option<u64>,
+    },
+    RemoteZoom {
         address: SocketAddr,
         frames: u32,
         key: Option<String>,
@@ -234,7 +246,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
                 expected_revision,
             })
         }
-        "fade" | "alpha-fade" | "slide" | "wipe" => {
+        "fade" | "alpha-fade" | "slide" | "zoom" | "wipe" => {
             parse_local_timed_transition(&command, arguments)
         }
         "tbar-start" | "tbar-position" | "tbar-commit" | "tbar-cancel" => {
@@ -244,7 +256,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
         "remote-status" => parse_remote_status(arguments),
         "remote-preview" => parse_remote_preview(arguments),
         "remote-cut" => parse_remote_cut(arguments),
-        "remote-fade" | "remote-alpha-fade" | "remote-slide" | "remote-wipe" => {
+        "remote-fade" | "remote-alpha-fade" | "remote-slide" | "remote-zoom" | "remote-wipe" => {
             parse_remote_timed_transition(&command, arguments)
         }
         "remote-tbar-start"
@@ -319,6 +331,12 @@ fn parse_local_timed_transition(
             expected_revision,
         },
         "slide" => Command::Slide {
+            path,
+            frames,
+            key,
+            expected_revision,
+        },
+        "zoom" => Command::Zoom {
             path,
             frames,
             key,
@@ -462,6 +480,12 @@ fn parse_remote_timed_transition(
             expected_revision,
         },
         "remote-slide" => Command::RemoteSlide {
+            address,
+            frames,
+            key,
+            expected_revision,
+        },
+        "remote-zoom" => Command::RemoteZoom {
             address,
             frames,
             key,
@@ -707,6 +731,42 @@ mod tests {
                 address: "127.0.0.1:9123".parse().unwrap(),
                 frames: 12,
                 key: Some("remote-slide".into()),
+                expected_revision: None,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_local_and_remote_zoom() {
+        assert_eq!(
+            parse(strings(&[
+                "zoom",
+                "show.freemix",
+                "45",
+                "--key",
+                "zoom-1",
+                "--expect",
+                "4",
+            ])),
+            Ok(Command::Zoom {
+                path: "show.freemix".into(),
+                frames: 45,
+                key: Some("zoom-1".into()),
+                expected_revision: Some(4),
+            })
+        );
+        assert_eq!(
+            parse(strings(&[
+                "remote-zoom",
+                "127.0.0.1:9123",
+                "12",
+                "--key",
+                "remote-zoom",
+            ])),
+            Ok(Command::RemoteZoom {
+                address: "127.0.0.1:9123".parse().unwrap(),
+                frames: 12,
+                key: Some("remote-zoom".into()),
                 expected_revision: None,
             })
         );

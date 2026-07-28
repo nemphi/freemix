@@ -88,6 +88,20 @@ impl FakeRemoteServer {
         Self { address, worker }
     }
 
+    fn start_old_without_zoom() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || serve_old_daemon_without_zoom(&listener));
+        Self { address, worker }
+    }
+
+    fn start_zoom() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || serve_zoom(&listener));
+        Self { address, worker }
+    }
+
     fn start_fade_to_black() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -427,6 +441,32 @@ fn serve_old_daemon_without_slide(listener: &TcpListener) {
     );
 }
 
+fn serve_old_daemon_without_zoom(listener: &TcpListener) {
+    let engine = EngineIdentity {
+        engine_id: "project-42".into(),
+        state_epoch: 1,
+        log_id: "fake-remote-log".into(),
+    };
+    let (stream, _) = listener.accept().unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(stream);
+    assert_client_hello(read_message(&mut reader));
+    write_handshake_version_with_fade_to_black(
+        &mut writer,
+        &engine,
+        0,
+        fm_protocol::SLIDE_PROTOCOL_VERSION,
+        live_fade_to_black(),
+    );
+
+    let mut unexpected = String::new();
+    assert_eq!(reader.read_line(&mut unexpected).unwrap(), 0);
+    assert!(
+        unexpected.is_empty(),
+        "protocol 1.9 command reached a 1.8 daemon"
+    );
+}
+
 fn serve_alpha_fade(listener: &TcpListener) {
     serve_automatic_transition(
         listener,
@@ -442,6 +482,15 @@ fn serve_slide(listener: &TcpListener) {
         fm_protocol::SLIDE_PROTOCOL_VERSION,
         CommandPayload::Slide { duration_frames: 3 },
         "remote-slide",
+    );
+}
+
+fn serve_zoom(listener: &TcpListener) {
+    serve_automatic_transition(
+        listener,
+        fm_protocol::ZOOM_PROTOCOL_VERSION,
+        CommandPayload::Zoom { duration_frames: 3 },
+        "remote-zoom",
     );
 }
 
@@ -1094,6 +1143,23 @@ fn cli_does_not_send_slide_to_a_protocol_1_7_daemon() {
 }
 
 #[test]
+fn cli_does_not_send_zoom_to_a_protocol_1_8_daemon() {
+    let server = FakeRemoteServer::start_old_without_zoom();
+    let output = invoke(&[
+        "remote-zoom",
+        &server.address(),
+        "3",
+        "--key",
+        "unsupported-zoom",
+    ]);
+    assert_failure_contains(
+        &output,
+        "command requires protocol 1.9, but the session negotiated 1.8",
+    );
+    server.finish();
+}
+
+#[test]
 fn cli_does_not_send_manual_alpha_fade_to_a_protocol_1_6_daemon() {
     let server = FakeRemoteServer::start_old_without_manual_alpha_fade();
     let output = invoke(&[
@@ -1154,6 +1220,22 @@ fn remote_slide_preserves_duration_and_protocol() {
         "3",
         "--key",
         "remote-slide",
+        "--expect",
+        "0",
+    ]);
+    assert_success(&output);
+    server.finish();
+}
+
+#[test]
+fn remote_zoom_preserves_duration_and_protocol() {
+    let server = FakeRemoteServer::start_zoom();
+    let output = invoke(&[
+        "remote-zoom",
+        &server.address(),
+        "3",
+        "--key",
+        "remote-zoom",
         "--expect",
         "0",
     ]);
@@ -1338,6 +1420,41 @@ fn local_slide_settles_and_preserves_idempotency_contract() {
     assert_success(&duplicate);
     assert_eq!(stdout(&duplicate), slide_status);
     assert_eq!(manifest(&context.project), slide_manifest);
+
+    fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
+fn local_zoom_settles_and_preserves_idempotency_contract() {
+    let context = ContractContext::new();
+    assert_success(&invoke(&["new", context.project_path()]));
+
+    let zoom = invoke(&[
+        "zoom",
+        context.project_path(),
+        "3",
+        "--key",
+        "zoom-three",
+        "--expect",
+        "0",
+    ]);
+    assert_success(&zoom);
+    let zoom_status = stdout(&zoom);
+    assert_status(&zoom_status, 1, 3, 2, 2, 1, 1);
+    let zoom_manifest = manifest(&context.project);
+
+    let duplicate = invoke(&[
+        "zoom",
+        context.project_path(),
+        "99",
+        "--key",
+        "zoom-three",
+        "--expect",
+        "0",
+    ]);
+    assert_success(&duplicate);
+    assert_eq!(stdout(&duplicate), zoom_status);
+    assert_eq!(manifest(&context.project), zoom_manifest);
 
     fs::remove_dir_all(context.root).unwrap();
 }

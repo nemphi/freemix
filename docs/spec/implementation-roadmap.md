@@ -734,12 +734,15 @@ it before mutation on older negotiated sessions. Daemon durable execution
 settles every requested frame before checkpointing. Focused unit and process
 restart acceptances restore exact Program/Preview routing, counters, receipt
 history, and resume position, while a protocol 1.8 process acceptance verifies
-rejection without a durable receipt.
+rejection without a durable receipt. CLI now exposes matching local and remote
+`zoom ... <frames>` commands. Local execution settles and saves the bundle with
+replay-safe idempotency; remote execution preserves the exact duration and
+protocol 1.9 envelope, and refuses to transmit after a protocol 1.8 downgrade.
 
-Zoom CLI/Web/Studio controls, configured-output evidence, Stinger, other
-transition families, cross-platform/fullscreen evidence, and complete `SW-004`
-acceptance remain pending; parity therefore stays planned. Item 5 and RC-007
-remain planned.
+Zoom Web/Studio controls, configured-output evidence, Stinger, other transition
+families, cross-platform/fullscreen evidence, and complete `SW-004` acceptance
+remain pending; parity therefore stays planned. Item 5 and RC-007 remain
+planned.
 
 FTB groundwork now includes a switcher-owned bounded automatic control core
 alongside the compositor plan. The controller moves from its current exact
