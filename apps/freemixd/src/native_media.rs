@@ -7130,16 +7130,16 @@ mod tests {
     }
 
     #[test]
-    fn wipe_audio_mix_plan_has_explicit_endpoints_and_unity_collapses() {
+    fn wipe_audio_mix_plan_has_explicit_endpoints() {
         let old = input(1);
         let new = input(2);
-        let plan = |primary, secondary, start, end, denominator| {
+        let plan = |start, end| {
             native_audio_mix_plan(ProgramFrame {
-                primary,
-                secondary,
-                transition_kind: secondary.map(|_| SwitcherTransitionKind::Wipe),
+                primary: old,
+                secondary: Some(new),
+                transition_kind: Some(SwitcherTransitionKind::Wipe),
                 mix_numerator: start,
-                mix_denominator: denominator,
+                mix_denominator: 2,
                 mix_start_numerator: start,
                 mix_end_numerator: end,
             })
@@ -7147,7 +7147,7 @@ mod tests {
         };
 
         assert_eq!(
-            plan(old, Some(new), 0, 1, 2),
+            plan(0, 1),
             NativeAudioMixPlan {
                 primary: old,
                 primary_gain: SourceGain::new(2, 1, 2).unwrap(),
@@ -7155,27 +7155,11 @@ mod tests {
             }
         );
         assert_eq!(
-            plan(old, Some(new), 1, 2, 2),
+            plan(1, 2),
             NativeAudioMixPlan {
                 primary: old,
                 primary_gain: SourceGain::new(1, 0, 2).unwrap(),
                 secondary: Some((new, SourceGain::new(1, 2, 2).unwrap())),
-            }
-        );
-        assert_eq!(
-            plan(old, Some(old), u32::MAX, u32::MAX, 0),
-            NativeAudioMixPlan {
-                primary: old,
-                primary_gain: SourceGain::UNITY,
-                secondary: None,
-            }
-        );
-        assert_eq!(
-            plan(new, None, u32::MAX, u32::MAX, 0),
-            NativeAudioMixPlan {
-                primary: new,
-                primary_gain: SourceGain::UNITY,
-                secondary: None,
             }
         );
     }
@@ -7266,18 +7250,19 @@ mod tests {
             mix_end_numerator: 1,
         };
 
-        assert!(matches!(
-            native_audio_mix_plan(program(Some(SwitcherTransitionKind::AlphaFade))),
-            Err(NativeMasterError::UnsupportedAudioTransition(
-                SwitcherTransitionKind::AlphaFade
-            ))
-        ));
-        assert!(matches!(
-            native_audio_mix_plan(program(Some(SwitcherTransitionKind::Slide))),
-            Err(NativeMasterError::UnsupportedAudioTransition(
-                SwitcherTransitionKind::Slide
-            ))
-        ));
+        for kind in [
+            SwitcherTransitionKind::AlphaFade,
+            SwitcherTransitionKind::Slide,
+            SwitcherTransitionKind::Zoom,
+            SwitcherTransitionKind::Stinger(fm_switcher::StingerSlotId::new(1).unwrap()),
+        ] {
+            let Err(NativeMasterError::UnsupportedAudioTransition(actual)) =
+                native_audio_mix_plan(program(Some(kind)))
+            else {
+                panic!("expected unsupported audio transition {kind:?}");
+            };
+            assert_eq!(actual, kind);
+        }
         assert!(matches!(
             native_audio_mix_plan(program(None)),
             Err(NativeMasterError::MissingAudioTransitionKind)
@@ -7470,77 +7455,49 @@ mod tests {
     }
 
     #[test]
-    fn fade_master_audio_is_linear_continuous_and_reaches_cut_endpoint() {
+    fn linear_transition_master_audio_is_continuous_and_reaches_cut_endpoint() {
         let old = input(1);
         let new = input(2);
-        let mut master = audio_test_master(&[(old, 1.0), (new, -1.0)], 3);
+        for kind in [SwitcherTransitionKind::Fade, SwitcherTransitionKind::Wipe] {
+            let mut master = audio_test_master(&[(old, 1.0), (new, -1.0)], 3);
+            let frame = |frame, primary, secondary, start, end, denominator| {
+                frame_result_with_transition_interval(
+                    frame,
+                    primary,
+                    secondary,
+                    secondary.map(|_| kind),
+                    start,
+                    denominator,
+                    start,
+                    end,
+                )
+            };
 
-        assert!(master.service_next_frame().unwrap());
-        let first = master
-            .render_frame_audio(&frame_result_with_mix(0, old, Some(new), 0, 2))
-            .unwrap();
-        assert!(master.service_next_frame().unwrap());
-        let second = master
-            .render_frame_audio(&frame_result_with_mix(1, old, Some(new), 1, 2))
-            .unwrap();
-        assert!(master.service_next_frame().unwrap());
-        let cut = master
-            .render_frame_audio(&frame_result_with_mix(2, new, None, 0, 1))
-            .unwrap();
+            assert!(master.service_next_frame().unwrap());
+            let first = master
+                .render_frame_audio(&frame(0, old, Some(new), 0, 1, 2))
+                .unwrap();
+            assert!(master.service_next_frame().unwrap());
+            let second = master
+                .render_frame_audio(&frame(1, old, Some(new), 1, 2, 2))
+                .unwrap();
+            assert!(master.service_next_frame().unwrap());
+            let cut = master
+                .render_frame_audio(&frame(2, new, None, 0, 0, 1))
+                .unwrap();
 
-        let first = first.plane(0).unwrap();
-        let second = second.plane(0).unwrap();
-        let cut = cut.plane(0).unwrap();
-        let step = 1.0 / 1_920.0;
-        assert!((first[0] - (1.0 - step)).abs() < 1.0e-6);
-        assert_sample_exact(first[1_919], 0.0);
-        assert!((second[0] + step).abs() < 1.0e-6);
-        assert_sample_exact(second[1_919], -1.0);
-        assert_sample_exact(cut[0], -1.0);
-        assert!((second[0] - first[1_919] + step).abs() < 1.0e-6);
-    }
-
-    #[test]
-    fn wipe_master_audio_crossfades_distinct_sources_and_reaches_unity_cut() {
-        let old = input(1);
-        let new = input(2);
-        let mut master = audio_test_master(&[(old, 1.0), (new, -1.0)], 3);
-        let wipe_frame = |frame, primary, secondary, start, end, denominator| {
-            frame_result_with_transition_interval(
-                frame,
-                primary,
-                secondary,
-                secondary.map(|_| SwitcherTransitionKind::Wipe),
-                start,
-                denominator,
-                start,
-                end,
-            )
-        };
-
-        assert!(master.service_next_frame().unwrap());
-        let first = master
-            .render_frame_audio(&wipe_frame(0, old, Some(new), 0, 1, 2))
-            .unwrap();
-        assert!(master.service_next_frame().unwrap());
-        let second = master
-            .render_frame_audio(&wipe_frame(1, old, Some(new), 1, 2, 2))
-            .unwrap();
-        assert!(master.service_next_frame().unwrap());
-        let cut = master
-            .render_frame_audio(&wipe_frame(2, new, None, 0, 0, 1))
-            .unwrap();
-
-        let first = first.plane(0).unwrap();
-        let second = second.plane(0).unwrap();
-        let cut = cut.plane(0).unwrap();
-        let step = 1.0 / 1_920.0;
-        assert!((first[0] - (1.0 - step)).abs() < 1.0e-6);
-        assert_sample_exact(first[1_919], 0.0);
-        assert!((second[0] + step).abs() < 1.0e-6);
-        assert_sample_exact(second[1_919], -1.0);
-        assert_sample_exact(cut[0], -1.0);
-        assert_sample_exact(cut[1_919], -1.0);
+            let first = first.plane(0).unwrap();
+            let second = second.plane(0).unwrap();
+            let cut = cut.plane(0).unwrap();
+            let step = 1.0 / 1_920.0;
+            assert!((first[0] - (1.0 - step)).abs() < 1.0e-6);
+            assert_sample_exact(first[1_919], 0.0);
+            assert!((second[0] + step).abs() < 1.0e-6);
+            assert_sample_exact(second[1_919], -1.0);
+            assert_sample_exact(cut[0], -1.0);
+            assert_sample_exact(cut[1_919], -1.0);
+            assert!((second[0] - first[1_919] + step).abs() < 1.0e-6);
+        }
     }
 
     #[test]

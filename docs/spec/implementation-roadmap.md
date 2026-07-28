@@ -206,7 +206,9 @@ deterministic native-runtime tests cover EOS padding. The path remains a
 fixed-clock linear diagnostic resampler feeding a fake sink: there is no drift
 estimator, device clock or OS audio device, channel conversion, persisted
 buses/output routing or strip controls, DSP, or externally delivered audio.
-Dedicated Wipe audio-policy testing and broader transition policies remain
+Dedicated Wipe audio-policy tests cover exact interval endpoints, sample-linear
+rendering, unity Cut completion, and held, reversed, and committed manual T-bar
+movement. Broader transition policies and public T-bar exposure remain
 incomplete. Item 7 and the related parity rows therefore remain incomplete and
 planned.
 
