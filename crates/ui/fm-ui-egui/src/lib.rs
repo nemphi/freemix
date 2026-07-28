@@ -37,6 +37,8 @@ pub enum StudioIntent {
     Fade { duration_frames: u32 },
     /// Performs an `AlphaFade` transition with a duration in frames.
     AlphaFade { duration_frames: u32 },
+    /// Performs a horizontal Slide transition with a duration in frames.
+    Slide { duration_frames: u32 },
     /// Performs a Wipe transition with a duration in frames.
     Wipe { duration_frames: u32 },
     /// Fades realized Program video and audio to black or back to live.
@@ -161,6 +163,13 @@ impl StudioUiState {
         self
     }
 
+    /// Publishes whether the negotiated protocol can carry Slide commands.
+    #[must_use]
+    pub const fn with_slide_support(mut self, supported: bool) -> Self {
+        self.transition_protocol.automatic.slide = supported;
+        self
+    }
+
     /// Publishes whether the negotiated protocol carries manual T-bar state and commands.
     #[must_use]
     pub const fn with_manual_transition_support(mut self, supported: bool) -> Self {
@@ -218,28 +227,42 @@ impl ManualTransitionProtocolSupport {
 pub struct AutomaticTransitionProtocolSupport {
     pub wipe: bool,
     pub alpha_fade: bool,
+    pub slide: bool,
 }
 
 impl AutomaticTransitionProtocolSupport {
     pub const NONE: Self = Self {
         wipe: false,
         alpha_fade: false,
+        slide: false,
     };
 }
 
 /// Pure transition-control availability derived from one UI state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransitionAvailability {
-    basic: bool,
+    base: TransitionBaseAvailability,
     pub alpha_fade: bool,
     pub wipe: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TransitionBaseAvailability {
+    basic: bool,
+    slide: bool,
 }
 
 impl TransitionAvailability {
     /// Returns whether protocol-independent Cut and Fade controls are available.
     #[must_use]
     pub const fn basic(self) -> bool {
-        self.basic
+        self.base.basic
+    }
+
+    /// Returns whether automatic Slide is available.
+    #[must_use]
+    pub const fn slide(self) -> bool {
+        self.base.slide
     }
 }
 
@@ -298,7 +321,10 @@ impl ManualTransitionGate {
 pub const fn transition_availability(gate: TransitionGate) -> TransitionAvailability {
     let base = gate.connection_status.controls_enabled() && gate.has_view && gate.can_transition;
     TransitionAvailability {
-        basic: base,
+        base: TransitionBaseAvailability {
+            basic: base,
+            slide: base && gate.protocol_support.slide,
+        },
         alpha_fade: base && gate.protocol_support.alpha_fade,
         wipe: base && gate.protocol_support.wipe,
     }
@@ -828,6 +854,20 @@ fn draw_transition_row(
                 }
                 if ui
                     .add_enabled(
+                        availability.slide(),
+                        Button::new(RichText::new("SLIDE").strong())
+                            .fill(Color32::from_rgb(98, 66, 17))
+                            .min_size(Vec2::new(92.0, 32.0)),
+                    )
+                    .on_hover_text("Slide Preview to Program")
+                    .clicked()
+                {
+                    intents.push(StudioIntent::Slide {
+                        duration_frames: shell.transition_duration_frames,
+                    });
+                }
+                if ui
+                    .add_enabled(
                         availability.basic(),
                         Button::new(RichText::new("CUT").strong())
                             .fill(Color32::from_rgb(98, 66, 17))
@@ -1143,7 +1183,10 @@ mod tests {
         assert_eq!(
             transition_availability(base),
             TransitionAvailability {
-                basic: true,
+                base: TransitionBaseAvailability {
+                    basic: true,
+                    slide: false,
+                },
                 alpha_fade: false,
                 wipe: false,
             }
@@ -1151,6 +1194,7 @@ mod tests {
         let all_protocols = AutomaticTransitionProtocolSupport {
             wipe: true,
             alpha_fade: true,
+            slide: true,
         };
         let supported = transition_availability(TransitionGate {
             protocol_support: all_protocols,
@@ -1158,6 +1202,7 @@ mod tests {
         });
         assert!(supported.wipe);
         assert!(supported.alpha_fade);
+        assert!(supported.slide());
         assert!(supported.basic());
         for gate in [
             TransitionGate {
@@ -1179,7 +1224,10 @@ mod tests {
             assert_eq!(
                 transition_availability(gate),
                 TransitionAvailability {
-                    basic: false,
+                    base: TransitionBaseAvailability {
+                        basic: false,
+                        slide: false,
+                    },
                     alpha_fade: false,
                     wipe: false,
                 }
@@ -1308,6 +1356,14 @@ mod tests {
         );
         assert_ne!(
             StudioIntent::AlphaFade {
+                duration_frames: 30
+            },
+            StudioIntent::Slide {
+                duration_frames: 30
+            }
+        );
+        assert_ne!(
+            StudioIntent::Slide {
                 duration_frames: 30
             },
             StudioIntent::Wipe {
