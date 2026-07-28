@@ -312,6 +312,9 @@ fn decode_command(fields: &mut Fields) -> Result<CommandMessage, CodecError> {
         "alpha_fade" => CommandPayload::AlphaFade {
             duration_frames: fields.parse_required("duration_frames")?,
         },
+        "slide" => CommandPayload::Slide {
+            duration_frames: fields.parse_required("duration_frames")?,
+        },
         "wipe" => CommandPayload::Wipe {
             duration_frames: fields.parse_required("duration_frames")?,
         },

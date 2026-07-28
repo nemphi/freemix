@@ -980,6 +980,7 @@ impl Client {
             CommandPayload::Cut
             | CommandPayload::Fade { .. }
             | CommandPayload::AlphaFade { .. }
+            | CommandPayload::Slide { .. }
             | CommandPayload::Wipe { .. }
             | CommandPayload::FadeToBlack { .. }
             | CommandPayload::StartManualTransition { .. }

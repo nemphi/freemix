@@ -692,13 +692,19 @@ enters from the right at the exact integer offset
 `floor(width * numerator / denominator)`. CPU and simulated paths cover exact
 endpoints and odd-width pixels; a required Metal readback matches the CPU
 oracle. Native planning preserves the Slide kind, and Master audio uses the
-existing sample-linear two-source crossfade. Slide is not yet command-reachable:
-engine/control/protocol/operator paths and configured-output acceptance remain
-absent.
+existing sample-linear two-source crossfade. Automatic Slide is now
+command-reachable through the engine and target-free transition authorization.
+Additive protocol 1.8 carries its exact duration, and client/server admission
+rejects it before mutation on older negotiated sessions. Daemon durable
+execution settles every requested frame before checkpointing; focused unit and
+process restart acceptances restore exact Program/Preview routing, counters,
+receipt history, and resume position. CLI, Web, Studio, and configured-output
+acceptance remain absent.
 
-Stinger, Slide authority, Zoom, other transition families,
-cross-platform/fullscreen evidence, and complete `SW-004` acceptance remain
-pending; parity therefore stays planned. Item 5 and RC-007 remain planned.
+Stinger, Slide operator controls, configured-output Slide evidence, Zoom, other
+transition families, cross-platform/fullscreen evidence, and complete `SW-004`
+acceptance remain pending; parity therefore stays planned. Item 5 and RC-007
+remain planned.
 
 FTB groundwork now includes a switcher-owned bounded automatic control core
 alongside the compositor plan. The controller moves from its current exact

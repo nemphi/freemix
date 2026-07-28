@@ -1016,6 +1016,7 @@ const fn command_class(payload: CommandPayload) -> CommandClass {
         CommandPayload::Cut
         | CommandPayload::Fade { .. }
         | CommandPayload::AlphaFade { .. }
+        | CommandPayload::Slide { .. }
         | CommandPayload::Wipe { .. }
         | CommandPayload::FadeToBlack { .. }
         | CommandPayload::StartManualTransition { .. }
@@ -1033,6 +1034,7 @@ fn engine_command(payload: CommandPayload) -> EngineCommand {
         CommandPayload::AlphaFade { duration_frames } => {
             EngineCommand::AlphaFade { duration_frames }
         }
+        CommandPayload::Slide { duration_frames } => EngineCommand::Slide { duration_frames },
         CommandPayload::Wipe { duration_frames } => EngineCommand::Wipe { duration_frames },
         CommandPayload::FadeToBlack {
             active,
@@ -1061,7 +1063,10 @@ fn engine_command(payload: CommandPayload) -> EngineCommand {
 const fn is_program_transition(command: EngineCommand) -> bool {
     matches!(
         command,
-        EngineCommand::Fade { .. } | EngineCommand::AlphaFade { .. } | EngineCommand::Wipe { .. }
+        EngineCommand::Fade { .. }
+            | EngineCommand::AlphaFade { .. }
+            | EngineCommand::Slide { .. }
+            | EngineCommand::Wipe { .. }
     )
 }
 

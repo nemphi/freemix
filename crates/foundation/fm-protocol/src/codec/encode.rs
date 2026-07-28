@@ -180,6 +180,10 @@ fn encode_command(record: &mut Record, message: &CommandMessage) -> Result<(), C
             record.field("payload", "alpha_fade")?;
             record.field("duration_frames", duration_frames)?;
         }
+        CommandPayload::Slide { duration_frames } => {
+            record.field("payload", "slide")?;
+            record.field("duration_frames", duration_frames)?;
+        }
         CommandPayload::Wipe { duration_frames } => {
             record.field("payload", "wipe")?;
             record.field("duration_frames", duration_frames)?;

@@ -514,6 +514,62 @@ fn commands_survive_restart_resume_and_duplicate_replay() {
 }
 
 #[test]
+fn slide_command_settles_and_survives_daemon_restart() {
+    let directory = TestDirectory::new("slide-restart");
+    let project_path = directory.project_path();
+    create_project(&project_path);
+
+    let daemon = Daemon::start(&project_path);
+    let mut client = daemon.connect();
+    let initial = client.handshake_version(CURRENT_PROTOCOL_VERSION, None);
+    assert_eq!(initial.negotiated, CURRENT_PROTOCOL_VERSION);
+    assert!(matches!(client.receive(), WireMessage::Snapshot(_)));
+
+    client.send(&command_version(
+        CURRENT_PROTOCOL_VERSION,
+        "slide-command",
+        "slide-key",
+        CommandPayload::Slide { duration_frames: 3 },
+    ));
+    assert!(matches!(
+        client.next_result(),
+        CommandResult::Accepted { revision: 1, .. }
+    ));
+    drop(client);
+    daemon.wait_success();
+
+    let store = ProjectStore::new(&project_path).unwrap();
+    let persisted = store.load().unwrap();
+    assert_eq!(persisted.position().revision, 1);
+    assert_eq!(persisted.position().event_sequence, 1);
+    assert_eq!(persisted.position().runtime_generation, 1);
+    assert_eq!(persisted.position().frames_rendered, 3);
+    assert_eq!(
+        persisted.runtime_routing().realized_program_id,
+        Some(domain_input(2))
+    );
+    assert_eq!(
+        persisted.runtime_routing().realized_preview_id,
+        Some(domain_input(1))
+    );
+
+    let daemon = Daemon::start(&project_path);
+    let mut client = daemon.connect();
+    let resumed = client.handshake_version(
+        CURRENT_PROTOCOL_VERSION,
+        Some(EventCursor {
+            engine: initial.engine,
+            revision: 1,
+        }),
+    );
+    assert!(resumed.resume);
+    assert_eq!(resumed.current_revision, 1);
+    drop(client);
+    daemon.wait_success();
+    assert_eq!(store.load().unwrap(), persisted);
+}
+
+#[test]
 #[allow(clippy::too_many_lines)]
 fn manual_alpha_fade_state_and_receipts_survive_restart_through_commit_and_cancel() {
     for (name, terminal, swaps_routes) in [

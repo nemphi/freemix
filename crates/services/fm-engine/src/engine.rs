@@ -76,6 +76,9 @@ pub enum EngineCommand {
     AlphaFade {
         duration_frames: u32,
     },
+    Slide {
+        duration_frames: u32,
+    },
     Wipe {
         duration_frames: u32,
     },
@@ -511,6 +514,7 @@ impl Engine {
                     let name = match kind {
                         TransitionKind::Fade => "fade",
                         TransitionKind::AlphaFade => "alpha fade",
+                        TransitionKind::Slide => "slide",
                         TransitionKind::Wipe => "wipe",
                         _ => "timed",
                     };
@@ -533,6 +537,7 @@ impl Engine {
             if let Some(kind) = match command {
                 EngineCommand::Fade { .. } => Some(TransitionKind::Fade),
                 EngineCommand::AlphaFade { .. } => Some(TransitionKind::AlphaFade),
+                EngineCommand::Slide { .. } => Some(TransitionKind::Slide),
                 EngineCommand::Wipe { .. } => Some(TransitionKind::Wipe),
                 EngineCommand::SelectPreview(_)
                 | EngineCommand::Cut
@@ -821,6 +826,10 @@ impl Mutation<ShowState, EngineEvent, EngineAcceptance> for EngineMutation {
                 validate_transition_duration("alpha fade", duration_frames)?;
                 SwitcherCommand::Cut
             }
+            EngineCommand::Slide { duration_frames } => {
+                validate_transition_duration("slide", duration_frames)?;
+                SwitcherCommand::Cut
+            }
             EngineCommand::Wipe { duration_frames } => {
                 validate_transition_duration("wipe", duration_frames)?;
                 SwitcherCommand::Cut
@@ -878,6 +887,10 @@ fn apply_runtime(
         },
         EngineCommand::AlphaFade { duration_frames } => SwitcherCommand::Transition {
             kind: TransitionKind::AlphaFade,
+            duration_frames,
+        },
+        EngineCommand::Slide { duration_frames } => SwitcherCommand::Transition {
+            kind: TransitionKind::Slide,
             duration_frames,
         },
         EngineCommand::Wipe { duration_frames } => SwitcherCommand::Wipe { duration_frames },

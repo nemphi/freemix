@@ -12,9 +12,10 @@ use fm_protocol::{
     MAX_FIELDS_PER_MESSAGE, MAX_LINE_BYTES, MAX_LIST_ITEMS, MAX_MESSAGES_PER_PUSH,
     ManualTransitionKind, ManualTransitionPosition, ManualTransitionState, ManualTransitionStatus,
     ProtocolVersion, ResumeCursor, Role, RuntimeDomainBoundary, RuntimeEventMessage,
-    RuntimeFailureDisposition, RuntimeLifecycleEvent, ServerHello, ServerIdentity, SnapshotMessage,
-    SnapshotReason, StructuredError, WIPE_PROTOCOL_VERSION, WireInputId, WireMessage,
-    choose_handshake_outcome, decode_line, encode_line, negotiate_version,
+    RuntimeFailureDisposition, RuntimeLifecycleEvent, SLIDE_PROTOCOL_VERSION, ServerHello,
+    ServerIdentity, SnapshotMessage, SnapshotReason, StructuredError, WIPE_PROTOCOL_VERSION,
+    WireInputId, WireMessage, choose_handshake_outcome, decode_line, encode_line,
+    negotiate_version,
 };
 
 fn input(value: u128) -> WireInputId {
@@ -129,6 +130,20 @@ fn additive_alpha_fade_command_has_a_stable_wire_form() {
 }
 
 #[test]
+fn additive_slide_command_has_a_stable_wire_form() {
+    let fixture = include_str!("fixtures/command_slide.wire");
+    let message = WireMessage::Command(CommandMessage {
+        protocol: SLIDE_PROTOCOL_VERSION,
+        payload: CommandPayload::Slide {
+            duration_frames: 45,
+        },
+        ..command()
+    });
+    assert_eq!(encode_line(&message).unwrap(), fixture);
+    assert_eq!(decode_line(fixture).unwrap(), message);
+}
+
+#[test]
 fn golden_client_hello_fixture_is_stable() {
     let fixture = include_str!("fixtures/client_hello.wire");
     let message = WireMessage::ClientHello(ClientHello {
@@ -167,6 +182,11 @@ fn every_message_variant_round_trips() {
         WireMessage::Command(CommandMessage {
             protocol: CURRENT_PROTOCOL_VERSION,
             payload: CommandPayload::AlphaFade { duration_frames: 9 },
+            ..command()
+        }),
+        WireMessage::Command(CommandMessage {
+            protocol: CURRENT_PROTOCOL_VERSION,
+            payload: CommandPayload::Slide { duration_frames: 9 },
             ..command()
         }),
         WireMessage::Command(CommandMessage {
@@ -530,7 +550,15 @@ fn command_minimum_versions_gate_additive_transitions() {
     );
     assert!(!manual_alpha_fade.is_supported_by(ALPHA_FADE_PROTOCOL_VERSION));
     assert!(manual_alpha_fade.is_supported_by(CURRENT_PROTOCOL_VERSION));
-    assert_eq!(CURRENT_PROTOCOL_VERSION, MANUAL_ALPHA_FADE_PROTOCOL_VERSION);
+
+    let slide = CommandPayload::Slide {
+        duration_frames: 25,
+    };
+    assert_eq!(SLIDE_PROTOCOL_VERSION, ProtocolVersion::new(1, 8));
+    assert_eq!(slide.minimum_protocol_version(), SLIDE_PROTOCOL_VERSION);
+    assert!(!slide.is_supported_by(MANUAL_ALPHA_FADE_PROTOCOL_VERSION));
+    assert!(slide.is_supported_by(CURRENT_PROTOCOL_VERSION));
+    assert_eq!(CURRENT_PROTOCOL_VERSION, SLIDE_PROTOCOL_VERSION);
 }
 
 #[test]

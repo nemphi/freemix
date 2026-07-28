@@ -3863,6 +3863,7 @@ fn command_ticks(command: &CommandMessage) -> u32 {
     match command.payload {
         CommandPayload::Fade { duration_frames }
         | CommandPayload::AlphaFade { duration_frames }
+        | CommandPayload::Slide { duration_frames }
         | CommandPayload::Wipe { duration_frames }
         | CommandPayload::FadeToBlack {
             duration_frames, ..
@@ -6479,6 +6480,40 @@ mod tests {
                 "settled-alpha-fade",
                 "settled-alpha-fade-key",
                 CommandPayload::AlphaFade { duration_frames: 3 },
+            ),
+            0,
+        )
+        .unwrap();
+
+        let restored = restore_engine(&durable).unwrap().snapshot().unwrap();
+        assert_eq!(live_engine_snapshot(&mut control), restored);
+        assert_eq!(durable.position().frames_rendered, 3);
+        assert_eq!(durable.position().runtime_generation, 1);
+        assert_eq!(
+            (
+                restored.realized_switcher().program(),
+                restored.realized_switcher().preview(),
+            ),
+            (test_input_id(2), test_input_id(1))
+        );
+    }
+
+    #[test]
+    fn slide_settles_before_checkpoint_and_restores_exact_routing() {
+        let mut durable = test_project();
+        let mut control = test_control(&durable);
+        let server = test_server(&control);
+
+        execute_durable_command(
+            &mut control,
+            &CountingSaver::default(),
+            &mut durable,
+            &operator(),
+            &server,
+            &test_command(
+                "settled-slide",
+                "settled-slide-key",
+                CommandPayload::Slide { duration_frames: 3 },
             ),
             0,
         )

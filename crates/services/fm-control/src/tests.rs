@@ -410,6 +410,54 @@ fn alpha_fade_propagates_with_exact_runtime_kind_and_endpoints() {
 }
 
 #[test]
+fn slide_propagates_with_exact_runtime_kind_and_endpoints() {
+    let mut control = service(8, 8);
+    let accepted = control
+        .submit(
+            &principal(Role::Operator),
+            command(
+                "slide",
+                "slide-key",
+                CommandPayload::Slide { duration_frames: 3 },
+            ),
+            0,
+        )
+        .unwrap();
+    assert!(matches!(
+        accepted.output.result,
+        CommandResult::Accepted {
+            revision: 1,
+            scheduled_frame: Some(0),
+            ..
+        }
+    ));
+
+    for (start, end) in [(0, 1), (1, 2), (2, 3)] {
+        let tick = control.tick(&server_identity()).unwrap();
+        assert_eq!(
+            tick.frame
+                .program
+                .transition_kind
+                .map(|kind| format!("{kind:?}")),
+            Some("Slide".to_owned())
+        );
+        assert_eq!(
+            (
+                tick.frame.program.mix_start_numerator,
+                tick.frame.program.mix_end_numerator,
+            ),
+            (start, end)
+        );
+        assert_eq!(tick.runtime_events.len(), usize::from(end == 3));
+    }
+
+    let endpoint = control.tick(&server_identity()).unwrap();
+    assert_eq!(endpoint.frame.program.primary, input(2));
+    assert_eq!(endpoint.frame.program.secondary, None);
+    assert_eq!(endpoint.frame.program.transition_kind, None);
+}
+
+#[test]
 fn fade_to_black_is_authorized_reversible_and_runtime_ordered_with_program() {
     let mut control = service(16, 8);
     let operator = principal(Role::Operator);

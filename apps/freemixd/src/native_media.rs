@@ -6774,7 +6774,7 @@ mod tests {
     }
 
     #[test]
-    fn program_frame_maps_exactly_to_cut_fade_wipe_or_slide() {
+    fn program_frame_maps_exactly_to_cut_fade_or_wipe() {
         let primary = input(1);
         let secondary = input((1_u128 << 64) + 1);
         let cut = native_mix_plan(ProgramFrame {
@@ -6852,7 +6852,12 @@ mod tests {
         assert_eq!(wipe.transition.kind(), TransitionKind::Wipe);
         assert_eq!(wipe.transition.numerator(), 1);
         assert_eq!(wipe.transition.denominator(), 2);
+    }
 
+    #[test]
+    fn program_frame_preserves_slide_and_rejects_unsupported_transitions() {
+        let primary = input(1);
+        let secondary = input((1_u128 << 64) + 1);
         let slide = native_mix_plan(ProgramFrame {
             primary,
             secondary: Some(secondary),
