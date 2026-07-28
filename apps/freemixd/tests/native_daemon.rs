@@ -539,7 +539,6 @@ fn native_camera_daemon_renders_checkpoints_and_reaps_helper() {
         "running"
     );
     assert_eq!(diagnostic_value(source_telemetry, "health"), "healthy");
-    assert_eq!(diagnostic_value(telemetry, "v"), "3");
     assert_eq!(diagnostic_value(telemetry, "metric_errors"), "0");
     assert_eq!(
         diagnostic_value(telemetry, "camera_configured_sources"),
@@ -1248,10 +1247,12 @@ fn diagnostic_value<'a>(diagnostic: &'a str, key: &str) -> &'a str {
 #[cfg(target_os = "macos")]
 fn telemetry_diagnostic(stderr: &str) -> &str {
     assert_eq!(stderr.matches("FREEMIXD_TELEMETRY\t").count(), 1);
-    stderr
+    let diagnostic = stderr
         .lines()
         .find(|line| line.starts_with("FREEMIXD_TELEMETRY\t"))
-        .unwrap_or_else(|| panic!("missing telemetry diagnostic: {stderr}"))
+        .unwrap_or_else(|| panic!("missing telemetry diagnostic: {stderr}"));
+    assert_eq!(diagnostic_value(diagnostic, "v"), "4");
+    diagnostic
 }
 
 #[cfg(target_os = "macos")]
