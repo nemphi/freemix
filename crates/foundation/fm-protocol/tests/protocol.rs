@@ -2,18 +2,19 @@ use core::{fmt::Write, num::NonZeroU128};
 
 use fm_command::{Deadline, Revision, StateEpoch};
 use fm_protocol::{
-    BASE_PROTOCOL_VERSION, CURRENT_PROTOCOL_VERSION, CapabilityReportMessage,
-    CapabilityReportSummary, ClientHello, ClientType, CodecError, CommandMessage, CommandPayload,
-    CommandResult, DurableEvent, DurableEventBatch, DurableGap, EngineIdentity, ErrorMessage,
-    EventCursor, EventMessage, EventPayload, FADE_TO_BLACK_PROTOCOL_VERSION, FadeToBlackPosition,
-    FadeToBlackState, FieldIssue, HandshakeOutcome, HandshakeRequest, HandshakeResponse,
-    HeartbeatMessage, LineDecoder, MANUAL_TRANSITION_PROTOCOL_VERSION, MAX_FIELD_VALUE_BYTES,
-    MAX_FIELDS_PER_MESSAGE, MAX_LINE_BYTES, MAX_LIST_ITEMS, MAX_MESSAGES_PER_PUSH,
-    ManualTransitionKind, ManualTransitionPosition, ManualTransitionState, ManualTransitionStatus,
-    ProtocolVersion, ResumeCursor, Role, RuntimeDomainBoundary, RuntimeEventMessage,
-    RuntimeFailureDisposition, RuntimeLifecycleEvent, ServerHello, ServerIdentity, SnapshotMessage,
-    SnapshotReason, StructuredError, WIPE_PROTOCOL_VERSION, WireInputId, WireMessage,
-    choose_handshake_outcome, decode_line, encode_line, negotiate_version,
+    ALPHA_FADE_PROTOCOL_VERSION, BASE_PROTOCOL_VERSION, CURRENT_PROTOCOL_VERSION,
+    CapabilityReportMessage, CapabilityReportSummary, ClientHello, ClientType, CodecError,
+    CommandMessage, CommandPayload, CommandResult, DurableEvent, DurableEventBatch, DurableGap,
+    EngineIdentity, ErrorMessage, EventCursor, EventMessage, EventPayload,
+    FADE_TO_BLACK_PROTOCOL_VERSION, FadeToBlackPosition, FadeToBlackState, FieldIssue,
+    HandshakeOutcome, HandshakeRequest, HandshakeResponse, HeartbeatMessage, LineDecoder,
+    MANUAL_TRANSITION_PROTOCOL_VERSION, MAX_FIELD_VALUE_BYTES, MAX_FIELDS_PER_MESSAGE,
+    MAX_LINE_BYTES, MAX_LIST_ITEMS, MAX_MESSAGES_PER_PUSH, ManualTransitionKind,
+    ManualTransitionPosition, ManualTransitionState, ManualTransitionStatus, ProtocolVersion,
+    ResumeCursor, Role, RuntimeDomainBoundary, RuntimeEventMessage, RuntimeFailureDisposition,
+    RuntimeLifecycleEvent, ServerHello, ServerIdentity, SnapshotMessage, SnapshotReason,
+    StructuredError, WIPE_PROTOCOL_VERSION, WireInputId, WireMessage, choose_handshake_outcome,
+    decode_line, encode_line, negotiate_version,
 };
 
 fn input(value: u128) -> WireInputId {
@@ -114,6 +115,20 @@ fn additive_wipe_command_has_a_stable_wire_form_without_changing_existing_bytes(
 }
 
 #[test]
+fn additive_alpha_fade_command_has_a_stable_wire_form() {
+    let fixture = include_str!("fixtures/command_alpha_fade.wire");
+    let message = WireMessage::Command(CommandMessage {
+        protocol: ALPHA_FADE_PROTOCOL_VERSION,
+        payload: CommandPayload::AlphaFade {
+            duration_frames: 45,
+        },
+        ..command()
+    });
+    assert_eq!(encode_line(&message).unwrap(), fixture);
+    assert_eq!(decode_line(fixture).unwrap(), message);
+}
+
+#[test]
 fn golden_client_hello_fixture_is_stable() {
     let fixture = include_str!("fixtures/client_hello.wire");
     let message = WireMessage::ClientHello(ClientHello {
@@ -147,6 +162,11 @@ fn every_message_variant_round_trips() {
         }),
         WireMessage::Command(CommandMessage {
             payload: CommandPayload::Fade { duration_frames: 9 },
+            ..command()
+        }),
+        WireMessage::Command(CommandMessage {
+            protocol: CURRENT_PROTOCOL_VERSION,
+            payload: CommandPayload::AlphaFade { duration_frames: 9 },
             ..command()
         }),
         WireMessage::Command(CommandMessage {
@@ -394,7 +414,7 @@ fn protocol_1_3_projection_omits_manual_transition_extensions() {
 }
 
 #[test]
-fn command_minimum_versions_gate_wipe_and_manual_transitions() {
+fn command_minimum_versions_gate_additive_transitions() {
     for payload in [
         CommandPayload::SelectPreview { input: input(1) },
         CommandPayload::Cut,
@@ -429,13 +449,24 @@ fn command_minimum_versions_gate_wipe_and_manual_transitions() {
         duration_frames: 25,
     };
     assert_eq!(FADE_TO_BLACK_PROTOCOL_VERSION, ProtocolVersion::new(1, 5));
-    assert_eq!(CURRENT_PROTOCOL_VERSION, FADE_TO_BLACK_PROTOCOL_VERSION);
     assert_eq!(
         fade_to_black.minimum_protocol_version(),
         FADE_TO_BLACK_PROTOCOL_VERSION
     );
     assert!(!fade_to_black.is_supported_by(MANUAL_TRANSITION_PROTOCOL_VERSION));
     assert!(fade_to_black.is_supported_by(CURRENT_PROTOCOL_VERSION));
+
+    let alpha_fade = CommandPayload::AlphaFade {
+        duration_frames: 25,
+    };
+    assert_eq!(ALPHA_FADE_PROTOCOL_VERSION, ProtocolVersion::new(1, 6));
+    assert_eq!(CURRENT_PROTOCOL_VERSION, ALPHA_FADE_PROTOCOL_VERSION);
+    assert_eq!(
+        alpha_fade.minimum_protocol_version(),
+        ALPHA_FADE_PROTOCOL_VERSION
+    );
+    assert!(!alpha_fade.is_supported_by(FADE_TO_BLACK_PROTOCOL_VERSION));
+    assert!(alpha_fade.is_supported_by(CURRENT_PROTOCOL_VERSION));
 }
 
 #[test]

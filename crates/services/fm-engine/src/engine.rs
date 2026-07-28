@@ -72,6 +72,9 @@ pub enum EngineCommand {
     Fade {
         duration_frames: u32,
     },
+    AlphaFade {
+        duration_frames: u32,
+    },
     Wipe {
         duration_frames: u32,
     },
@@ -506,6 +509,7 @@ impl Engine {
                 {
                     let name = match kind {
                         TransitionKind::Fade => "fade",
+                        TransitionKind::AlphaFade => "alpha fade",
                         TransitionKind::Wipe => "wipe",
                         _ => "timed",
                     };
@@ -527,6 +531,7 @@ impl Engine {
             self.pending_actions += 1;
             if let Some(kind) = match command {
                 EngineCommand::Fade { .. } => Some(TransitionKind::Fade),
+                EngineCommand::AlphaFade { .. } => Some(TransitionKind::AlphaFade),
                 EngineCommand::Wipe { .. } => Some(TransitionKind::Wipe),
                 EngineCommand::SelectPreview(_)
                 | EngineCommand::Cut
@@ -808,37 +813,15 @@ impl Mutation<ShowState, EngineEvent, EngineAcceptance> for EngineMutation {
             EngineCommand::SelectPreview(input) => SwitcherCommand::SelectPreview(input),
             EngineCommand::Cut => SwitcherCommand::Cut,
             EngineCommand::Fade { duration_frames } => {
-                if duration_frames == 0 {
-                    return Err(Rejection::new(
-                        RejectionCode::InvalidCommand,
-                        "fade duration must be nonzero",
-                    ));
-                }
-                if duration_frames > MAX_TRANSITION_DURATION_FRAMES {
-                    return Err(Rejection::new(
-                        RejectionCode::InvalidCommand,
-                        format!(
-                            "fade duration must not exceed {MAX_TRANSITION_DURATION_FRAMES} frames"
-                        ),
-                    ));
-                }
+                validate_transition_duration("fade", duration_frames)?;
+                SwitcherCommand::Cut
+            }
+            EngineCommand::AlphaFade { duration_frames } => {
+                validate_transition_duration("alpha fade", duration_frames)?;
                 SwitcherCommand::Cut
             }
             EngineCommand::Wipe { duration_frames } => {
-                if duration_frames == 0 {
-                    return Err(Rejection::new(
-                        RejectionCode::InvalidCommand,
-                        "wipe duration must be nonzero",
-                    ));
-                }
-                if duration_frames > MAX_TRANSITION_DURATION_FRAMES {
-                    return Err(Rejection::new(
-                        RejectionCode::InvalidCommand,
-                        format!(
-                            "wipe duration must not exceed {MAX_TRANSITION_DURATION_FRAMES} frames"
-                        ),
-                    ));
-                }
+                validate_transition_duration("wipe", duration_frames)?;
                 SwitcherCommand::Cut
             }
             EngineCommand::FadeToBlack {
@@ -892,6 +875,10 @@ fn apply_runtime(
             kind: TransitionKind::Fade,
             duration_frames,
         },
+        EngineCommand::AlphaFade { duration_frames } => SwitcherCommand::Transition {
+            kind: TransitionKind::AlphaFade,
+            duration_frames,
+        },
         EngineCommand::Wipe { duration_frames } => SwitcherCommand::Wipe { duration_frames },
         EngineCommand::FadeToBlack { .. } => {
             unreachable!("Fade-to-Black commands return before switcher command mapping")
@@ -931,6 +918,22 @@ fn validate_fade_to_black_duration(duration_frames: u32) -> Result<(), Rejection
     } else {
         Ok(())
     }
+}
+
+fn validate_transition_duration(name: &str, duration_frames: u32) -> Result<(), Rejection> {
+    if duration_frames == 0 {
+        return Err(Rejection::new(
+            RejectionCode::InvalidCommand,
+            format!("{name} duration must be nonzero"),
+        ));
+    }
+    if duration_frames > MAX_TRANSITION_DURATION_FRAMES {
+        return Err(Rejection::new(
+            RejectionCode::InvalidCommand,
+            format!("{name} duration must not exceed {MAX_TRANSITION_DURATION_FRAMES} frames"),
+        ));
+    }
+    Ok(())
 }
 
 const fn manual_transition_kind(kind: EngineManualTransitionKind) -> TransitionKind {

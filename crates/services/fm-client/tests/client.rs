@@ -5,9 +5,10 @@ use fm_client::{
     DEFAULT_COMPLETED_COMMAND_CAPACITY, Intake, MAX_COMPLETED_COMMAND_CAPACITY, Outbound, SyncMode,
 };
 use fm_protocol::{
-    CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, ClientType, CommandPayload, CommandResult,
-    EngineIdentity, EventCursor, EventMessage, EventPayload, FadeToBlackPosition, FadeToBlackState,
-    HandshakeOutcome, HandshakeResponse, MANUAL_TRANSITION_PROTOCOL_VERSION, ManualTransitionKind,
+    ALPHA_FADE_PROTOCOL_VERSION, CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, ClientType,
+    CommandPayload, CommandResult, EngineIdentity, EventCursor, EventMessage, EventPayload,
+    FADE_TO_BLACK_PROTOCOL_VERSION, FadeToBlackPosition, FadeToBlackState, HandshakeOutcome,
+    HandshakeResponse, MANUAL_TRANSITION_PROTOCOL_VERSION, ManualTransitionKind,
     ManualTransitionPosition, ManualTransitionState, ManualTransitionStatus, ProtocolVersion,
     ResumeCursor, Role, RuntimeEventMessage, RuntimeLifecycleEvent, ServerIdentity,
     SnapshotMessage, SnapshotReason, WIPE_PROTOCOL_VERSION, WireInputId, WireMessage,
@@ -694,6 +695,49 @@ fn wipe_command_is_queued_with_its_exact_duration() {
         }
     );
     assert!(matches!(client.pop_outbound(), Some(Outbound::Command(queued)) if queued == command));
+}
+
+#[test]
+fn alpha_fade_command_is_queued_only_on_protocol_1_6() {
+    let mut current = ready_client(1);
+    let command = current
+        .queue_command(
+            CommandPayload::AlphaFade {
+                duration_frames: 45,
+            },
+            "alpha-fade-45",
+            Some(4),
+            None,
+        )
+        .unwrap();
+    assert_eq!(command.protocol, ALPHA_FADE_PROTOCOL_VERSION);
+    assert_eq!(
+        command.payload,
+        CommandPayload::AlphaFade {
+            duration_frames: 45,
+        }
+    );
+
+    let mut old = Client::new(config(2)).unwrap();
+    old.start_connect().unwrap();
+    old.transport_connected().unwrap();
+    let mut old_handshake = handshake(4, None);
+    old_handshake.negotiated = FADE_TO_BLACK_PROTOCOL_VERSION;
+    old.accept_handshake(old_handshake).unwrap();
+    old.apply_snapshot(snapshot(4)).unwrap();
+    assert_eq!(
+        old.queue_command(
+            CommandPayload::AlphaFade { duration_frames: 3 },
+            "unsupported-alpha-fade",
+            Some(4),
+            None,
+        ),
+        Err(ClientError::UnsupportedCommandVersion {
+            negotiated: FADE_TO_BLACK_PROTOCOL_VERSION,
+            required: ALPHA_FADE_PROTOCOL_VERSION,
+        })
+    );
+    assert_eq!(old.outbound_len(), 0);
 }
 
 #[test]

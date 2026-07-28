@@ -176,6 +176,10 @@ fn encode_command(record: &mut Record, message: &CommandMessage) -> Result<(), C
             record.field("payload", "fade")?;
             record.field("duration_frames", duration_frames)?;
         }
+        CommandPayload::AlphaFade { duration_frames } => {
+            record.field("payload", "alpha_fade")?;
+            record.field("duration_frames", duration_frames)?;
+        }
         CommandPayload::Wipe { duration_frames } => {
             record.field("payload", "wipe")?;
             record.field("duration_frames", duration_frames)?;

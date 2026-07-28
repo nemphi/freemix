@@ -169,6 +169,7 @@ impl Session {
             CommandPayload::SelectPreview { .. } => CommandClass::SelectPreview,
             CommandPayload::Cut
             | CommandPayload::Fade { .. }
+            | CommandPayload::AlphaFade { .. }
             | CommandPayload::Wipe { .. }
             | CommandPayload::FadeToBlack { .. }
             | CommandPayload::StartManualTransition { .. }

@@ -675,18 +675,10 @@ impl<A: AuthorizationHook> ControlService<A> {
             }));
         }
 
-        let command_class = match message.payload {
-            CommandPayload::SelectPreview { .. } => CommandClass::SelectPreview,
-            CommandPayload::Cut
-            | CommandPayload::Fade { .. }
-            | CommandPayload::Wipe { .. }
-            | CommandPayload::FadeToBlack { .. }
-            | CommandPayload::StartManualTransition { .. }
-            | CommandPayload::SetManualTransitionPosition { .. }
-            | CommandPayload::CommitManualTransition
-            | CommandPayload::CancelManualTransition => CommandClass::Transition,
-        };
-        if let Err(denial) = self.authorizer.authorize(principal, command_class) {
+        if let Err(denial) = self
+            .authorizer
+            .authorize(principal, command_class(message.payload))
+        {
             let result = CommandResult::Rejected {
                 id: message.id,
                 code: RejectionCode::PermissionDenied.as_str().to_owned(),
@@ -711,36 +703,7 @@ impl<A: AuthorizationHook> ControlService<A> {
             }));
         }
 
-        let command = match message.payload {
-            CommandPayload::SelectPreview { input } => {
-                EngineCommand::SelectPreview(input.to_domain())
-            }
-            CommandPayload::Cut => EngineCommand::Cut,
-            CommandPayload::Fade { duration_frames } => EngineCommand::Fade { duration_frames },
-            CommandPayload::Wipe { duration_frames } => EngineCommand::Wipe { duration_frames },
-            CommandPayload::FadeToBlack {
-                active,
-                duration_frames,
-            } => EngineCommand::FadeToBlack {
-                active,
-                duration_frames,
-            },
-            CommandPayload::StartManualTransition { kind } => {
-                EngineCommand::StartManualTransition {
-                    kind: match kind {
-                        ManualTransitionKind::Fade => EngineManualTransitionKind::Fade,
-                        ManualTransitionKind::Wipe => EngineManualTransitionKind::Wipe,
-                    },
-                }
-            }
-            CommandPayload::SetManualTransitionPosition { position } => {
-                EngineCommand::SetManualTransitionPosition {
-                    position: engine_manual_position(position),
-                }
-            }
-            CommandPayload::CommitManualTransition => EngineCommand::CommitManualTransition,
-            CommandPayload::CancelManualTransition => EngineCommand::CancelManualTransition,
-        };
+        let command = engine_command(message.payload);
         match self
             .engine
             .prepare_execute(message.domain_envelope(command), now_millis)?
@@ -894,10 +857,7 @@ impl<A: AuthorizationHook> ControlService<A> {
                 .checked_add(offset)
                 .ok_or(ControlError::RuntimeGenerationOutOfOrder)
                 .map_err(TickWithRealizerError::Tick)?;
-            if matches!(
-                pending.command,
-                EngineCommand::Fade { .. } | EngineCommand::Wipe { .. }
-            ) {
+            if is_program_transition(pending.command) {
                 self.active_transition = Some(ActiveTransition {
                     revision: pending.revision,
                     generation,
@@ -1048,6 +1008,60 @@ impl<A: AuthorizationHook> ControlService<A> {
         }
         failures
     }
+}
+
+const fn command_class(payload: CommandPayload) -> CommandClass {
+    match payload {
+        CommandPayload::SelectPreview { .. } => CommandClass::SelectPreview,
+        CommandPayload::Cut
+        | CommandPayload::Fade { .. }
+        | CommandPayload::AlphaFade { .. }
+        | CommandPayload::Wipe { .. }
+        | CommandPayload::FadeToBlack { .. }
+        | CommandPayload::StartManualTransition { .. }
+        | CommandPayload::SetManualTransitionPosition { .. }
+        | CommandPayload::CommitManualTransition
+        | CommandPayload::CancelManualTransition => CommandClass::Transition,
+    }
+}
+
+fn engine_command(payload: CommandPayload) -> EngineCommand {
+    match payload {
+        CommandPayload::SelectPreview { input } => EngineCommand::SelectPreview(input.to_domain()),
+        CommandPayload::Cut => EngineCommand::Cut,
+        CommandPayload::Fade { duration_frames } => EngineCommand::Fade { duration_frames },
+        CommandPayload::AlphaFade { duration_frames } => {
+            EngineCommand::AlphaFade { duration_frames }
+        }
+        CommandPayload::Wipe { duration_frames } => EngineCommand::Wipe { duration_frames },
+        CommandPayload::FadeToBlack {
+            active,
+            duration_frames,
+        } => EngineCommand::FadeToBlack {
+            active,
+            duration_frames,
+        },
+        CommandPayload::StartManualTransition { kind } => EngineCommand::StartManualTransition {
+            kind: match kind {
+                ManualTransitionKind::Fade => EngineManualTransitionKind::Fade,
+                ManualTransitionKind::Wipe => EngineManualTransitionKind::Wipe,
+            },
+        },
+        CommandPayload::SetManualTransitionPosition { position } => {
+            EngineCommand::SetManualTransitionPosition {
+                position: engine_manual_position(position),
+            }
+        }
+        CommandPayload::CommitManualTransition => EngineCommand::CommitManualTransition,
+        CommandPayload::CancelManualTransition => EngineCommand::CancelManualTransition,
+    }
+}
+
+const fn is_program_transition(command: EngineCommand) -> bool {
+    matches!(
+        command,
+        EngineCommand::Fade { .. } | EngineCommand::AlphaFade { .. } | EngineCommand::Wipe { .. }
+    )
 }
 
 fn engine_manual_position(

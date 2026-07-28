@@ -637,14 +637,22 @@ cover video mapping and continuous Master-audio endpoints, and an opt-in Metal
 test compares AlphaFade output with the CPU linear-frame oracle on a real
 adapter. The current standard Fade uses the same channel-wise reference math, so
 these primitives do not yet prove a visible product distinction between Fade and
-AlphaFade. There is also no AlphaFade `EngineCommand`, protocol command,
-persistence contract, operator surface, or configured-output process
-acceptance.
+AlphaFade.
 
-The remaining AlphaFade product path, stinger, Slide/Zoom, other transition
-families, cross-platform/fullscreen evidence, and complete `SW-004` acceptance
-remain pending; parity therefore stays planned. Item 5 and RC-007 remain
-planned.
+The automatic path now continues through a bounded `EngineCommand`,
+target-free transition authorization, runtime lifecycle tracking, and an
+additive protocol 1.6 `AlphaFade` command. Server admission rejects the command
+from older negotiated peers before control mutation; the client preserves the
+exact duration and applies the same version gate. Daemon durable execution
+projects all requested frames before saving, then a focused checkpoint test
+restores the settled Program/Preview routing and engine counters exactly. CLI,
+Studio, and Web operator controls, manual T-bar AlphaFade, and configured-output
+process acceptance remain absent.
+
+The remaining AlphaFade operator and output path, stinger, Slide/Zoom, other
+transition families, cross-platform/fullscreen evidence, and complete `SW-004`
+acceptance remain pending; parity therefore stays planned. Item 5 and RC-007
+remain planned.
 
 FTB groundwork now includes a switcher-owned bounded automatic control core
 alongside the compositor plan. The controller moves from its current exact

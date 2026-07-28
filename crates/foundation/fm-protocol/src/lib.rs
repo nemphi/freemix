@@ -20,7 +20,7 @@ pub use dto::{
     StructuredError, WireInputId, WireMessage, choose_handshake_outcome,
 };
 pub use version::{
-    BASE_PROTOCOL_VERSION, CURRENT_PROTOCOL_VERSION, FADE_TO_BLACK_PROTOCOL_VERSION,
-    MANUAL_TRANSITION_PROTOCOL_VERSION, NegotiationError, ProtocolVersion, WIPE_PROTOCOL_VERSION,
-    negotiate_version,
+    ALPHA_FADE_PROTOCOL_VERSION, BASE_PROTOCOL_VERSION, CURRENT_PROTOCOL_VERSION,
+    FADE_TO_BLACK_PROTOCOL_VERSION, MANUAL_TRANSITION_PROTOCOL_VERSION, NegotiationError,
+    ProtocolVersion, WIPE_PROTOCOL_VERSION, negotiate_version,
 };

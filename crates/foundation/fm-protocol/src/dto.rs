@@ -4,8 +4,8 @@ use fm_command::{CommandEnvelope, Deadline, Revision, StateEpoch};
 use fm_types::InputId;
 
 use crate::{
-    BASE_PROTOCOL_VERSION, FADE_TO_BLACK_PROTOCOL_VERSION, MANUAL_TRANSITION_PROTOCOL_VERSION,
-    ProtocolVersion, WIPE_PROTOCOL_VERSION,
+    ALPHA_FADE_PROTOCOL_VERSION, BASE_PROTOCOL_VERSION, FADE_TO_BLACK_PROTOCOL_VERSION,
+    MANUAL_TRANSITION_PROTOCOL_VERSION, ProtocolVersion, WIPE_PROTOCOL_VERSION,
 };
 
 /// Stable identity of one project's durable state on one server.
@@ -283,6 +283,7 @@ pub enum CommandPayload {
     SelectPreview { input: WireInputId },
     Cut,
     Fade { duration_frames: u32 },
+    AlphaFade { duration_frames: u32 },
     Wipe { duration_frames: u32 },
     FadeToBlack { active: bool, duration_frames: u32 },
     StartManualTransition { kind: ManualTransitionKind },
@@ -296,6 +297,7 @@ impl CommandPayload {
     pub const fn minimum_protocol_version(self) -> ProtocolVersion {
         match self {
             Self::SelectPreview { .. } | Self::Cut | Self::Fade { .. } => BASE_PROTOCOL_VERSION,
+            Self::AlphaFade { .. } => ALPHA_FADE_PROTOCOL_VERSION,
             Self::Wipe { .. } => WIPE_PROTOCOL_VERSION,
             Self::FadeToBlack { .. } => FADE_TO_BLACK_PROTOCOL_VERSION,
             Self::StartManualTransition { .. }

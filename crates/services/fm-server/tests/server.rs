@@ -2,10 +2,11 @@ use std::{convert::Infallible, net::IpAddr, num::NonZeroU128};
 
 use fm_auth::{Principal, Role as AuthRole, SessionId, UserId};
 use fm_protocol::{
-    CURRENT_PROTOCOL_VERSION, ClientHello, ClientType, CommandMessage, CommandPayload,
-    EngineIdentity, EventCursor, EventMessage, EventPayload, FADE_TO_BLACK_PROTOCOL_VERSION,
-    MANUAL_TRANSITION_PROTOCOL_VERSION, ManualTransitionKind, ManualTransitionStatus,
-    ProtocolVersion, Role, SnapshotMessage, WIPE_PROTOCOL_VERSION, WireInputId,
+    ALPHA_FADE_PROTOCOL_VERSION, CURRENT_PROTOCOL_VERSION, ClientHello, ClientType, CommandMessage,
+    CommandPayload, EngineIdentity, EventCursor, EventMessage, EventPayload,
+    FADE_TO_BLACK_PROTOCOL_VERSION, MANUAL_TRANSITION_PROTOCOL_VERSION, ManualTransitionKind,
+    ManualTransitionStatus, ProtocolVersion, Role, SnapshotMessage, WIPE_PROTOCOL_VERSION,
+    WireInputId,
 };
 use fm_server::{
     AuthenticationMode, ConfigError, ControlPlane, DisconnectReason, HandshakeError, HealthState,
@@ -398,6 +399,41 @@ fn protocol_1_4_peer_cannot_admit_fade_to_black() {
         Err(SessionError::UnsupportedCommandVersion {
             negotiated: MANUAL_TRANSITION_PROTOCOL_VERSION,
             required: FADE_TO_BLACK_PROTOCOL_VERSION,
+        })
+    );
+    assert_eq!(session.accounting().inbound_commands_admitted_total, 0);
+    assert_eq!(session.accounting().inbound_commands_inflight, 0);
+}
+
+#[test]
+fn protocol_1_5_peer_cannot_admit_alpha_fade() {
+    let server = ready_server(ServerConfig::new(
+        ServerMode::Production,
+        AuthenticationMode::Required,
+        IpAddr::from([127, 0, 0, 1]),
+        vec![CURRENT_PROTOCOL_VERSION],
+        "capabilities-v1",
+    ));
+    let mut old_hello = hello(Role::Operator, None);
+    old_hello.versions = vec![FADE_TO_BLACK_PROTOCOL_VERSION];
+    let outcome = server
+        .handshake(&old_hello, &principal(AuthRole::Operator), 0)
+        .unwrap();
+    assert_eq!(
+        outcome.server_hello.negotiated,
+        FADE_TO_BLACK_PROTOCOL_VERSION
+    );
+
+    let mut session = outcome.session;
+    let mut command = command(CommandPayload::AlphaFade {
+        duration_frames: 30,
+    });
+    command.protocol = FADE_TO_BLACK_PROTOCOL_VERSION;
+    assert_eq!(
+        session.admit_command(&command, 10, 0),
+        Err(SessionError::UnsupportedCommandVersion {
+            negotiated: FADE_TO_BLACK_PROTOCOL_VERSION,
+            required: ALPHA_FADE_PROTOCOL_VERSION,
         })
     );
     assert_eq!(session.accounting().inbound_commands_admitted_total, 0);

@@ -150,6 +150,36 @@ fn wipe_duration_is_bounded_before_projection_or_scheduling() {
 }
 
 #[test]
+fn alpha_fade_duration_is_bounded_before_projection_or_scheduling() {
+    for (key, duration, message) in [
+        ("zero-alpha-fade", 0, "alpha fade duration must be nonzero"),
+        (
+            "oversized-alpha-fade",
+            3_601,
+            "alpha fade duration must not exceed 3600 frames",
+        ),
+    ] {
+        let mut engine = engine();
+        let outcome = engine
+            .execute(
+                envelope(
+                    key,
+                    EngineCommand::AlphaFade {
+                        duration_frames: duration,
+                    },
+                ),
+                0,
+            )
+            .unwrap();
+        let rejection = outcome.receipt.rejected().unwrap();
+        assert_eq!(rejection.rejection.code, RejectionCode::InvalidCommand);
+        assert_eq!(rejection.rejection.message, message);
+        assert_eq!(engine.revision(), Revision::new(0));
+        assert!(engine.snapshot().is_ok());
+    }
+}
+
+#[test]
 fn accepted_cut_is_staged_without_changing_the_live_engine() {
     let mut engine = engine();
     let before = engine.snapshot().unwrap();
@@ -695,6 +725,43 @@ fn wipe_is_idempotent_and_realizes_on_exact_frame_boundaries() {
     for (start, end) in [(0, 1), (1, 2), (2, 3)] {
         let frame = engine.tick().unwrap();
         assert_eq!(frame.program.transition_kind, Some(TransitionKind::Wipe));
+        assert_eq!(
+            (
+                frame.program.mix_start_numerator,
+                frame.program.mix_end_numerator
+            ),
+            (start, end)
+        );
+    }
+    let endpoint = engine.tick().unwrap();
+    assert_eq!(endpoint.program.primary, input(2));
+    assert_eq!(endpoint.program.secondary, None);
+    assert_eq!(endpoint.program.transition_kind, None);
+    assert_eq!(engine.runtime_generation(), RuntimeGeneration::new(1));
+}
+
+#[test]
+fn alpha_fade_is_idempotent_and_realizes_on_exact_frame_boundaries() {
+    let mut engine = engine();
+    let command = envelope(
+        "alpha-fade",
+        EngineCommand::AlphaFade { duration_frames: 3 },
+    );
+    let first = engine.execute(command.clone(), 0).unwrap();
+    let duplicate = engine.execute(command, 0).unwrap();
+
+    assert_eq!(first.receipt.accepted().unwrap().revision, Revision::new(1));
+    assert!(duplicate.replayed);
+    assert_eq!(duplicate.receipt, first.receipt);
+    assert_eq!(engine.revision(), Revision::new(1));
+    assert_eq!(engine.event_sequence(), EventSequence::new(1));
+
+    for (start, end) in [(0, 1), (1, 2), (2, 3)] {
+        let frame = engine.tick().unwrap();
+        assert_eq!(
+            frame.program.transition_kind,
+            Some(TransitionKind::AlphaFade)
+        );
         assert_eq!(
             (
                 frame.program.mix_start_numerator,
