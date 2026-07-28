@@ -15,8 +15,9 @@
 //! Cursor decode limits apply independently to each requested page, not to the
 //! cursor's lifetime output. Audio sample limits count selected per-channel
 //! sample frames. Audio cursors still scan and sum a bounded metadata prefix
-//! from the start of the stream for each page; PCM decode seeks to a validated
-//! timestamp anchor and trims at most one second of correction samples.
+//! from the start of the stream for each page. PCM decode uses that metadata to
+//! choose a bounded from-start correction or a fixed number of validated seek
+//! anchors. This metadata work is therefore O(cursor depth).
 
 mod audio_seek;
 mod config;

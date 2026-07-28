@@ -57,6 +57,8 @@ pub enum Unsupported {
     HdrTransfer,
     PixelFormat,
     AudioLayout,
+    AudioSeek,
+    NegativeAudioAnchor,
 }
 
 /// Failure from the process-isolated local-file adapter.

@@ -103,6 +103,75 @@ fn generate_deep_audio_asset(path: &std::path::Path, sample_rate: u32) {
     run_ffmpeg_generator(&args, path);
 }
 
+fn generate_high_rate_pcm_asset(path: &std::path::Path) {
+    let args = [
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "aevalsrc=0.30*sin(2*PI*440*t)|0.08*sin(2*PI*997*t):s=192000:d=8",
+        "-af",
+        "asetpts=PTS+5/TB",
+        "-c:a",
+        "pcm_s16le",
+        "-channel_layout",
+        "stereo",
+        "-f",
+        "nut",
+        "-y",
+    ];
+    run_ffmpeg_generator(&args, path);
+}
+
+fn generate_large_block_flac(path: &std::path::Path) {
+    let args = [
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "aevalsrc=0.30*sin(2*PI*440*t):s=44100:d=10",
+        "-c:a",
+        "flac",
+        "-frame_size",
+        "65535",
+        "-f",
+        "flac",
+        "-y",
+    ];
+    run_ffmpeg_generator(&args, path);
+}
+
+fn generate_negative_start_flac_mka(path: &std::path::Path) {
+    let args = [
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "aevalsrc=0.30*sin(2*PI*440*t)|0.08*sin(2*PI*997*t):s=48000:d=5",
+        "-af",
+        "asetpts=PTS-3/TB",
+        "-c:a",
+        "flac",
+        "-channel_layout",
+        "stereo",
+        "-avoid_negative_ts",
+        "disabled",
+        "-f",
+        "matroska",
+        "-y",
+    ];
+    run_ffmpeg_generator(&args, path);
+}
+
 fn run_ffmpeg_generator(args: &[&str], path: &std::path::Path) {
     let mut child = Command::new("ffmpeg")
         .args(args)
@@ -132,6 +201,60 @@ fn run_ffmpeg_generator(args: &[&str], path: &std::path::Path) {
         }
         thread::sleep(Duration::from_millis(5));
     }
+}
+
+fn linear_audio_oracle(
+    path: &std::path::Path,
+    start_sample: usize,
+    sample_count: usize,
+) -> Vec<u8> {
+    let end_sample = start_sample.checked_add(sample_count).unwrap();
+    let output = Command::new("ffmpeg")
+        .args([
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-protocol_whitelist",
+            "file",
+            "-i",
+        ])
+        .arg(path)
+        .args([
+            "-map",
+            "0:a:0",
+            "-af",
+            &format!("atrim=start_sample={start_sample}:end_sample={end_sample}"),
+            "-vn",
+            "-sn",
+            "-dn",
+            "-c:a",
+            "pcm_f32le",
+            "-f",
+            "f32le",
+            "pipe:1",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run independent linear FFmpeg oracle");
+    assert!(
+        output.status.success(),
+        "linear FFmpeg oracle failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
+}
+
+fn interleaved_audio_bytes(blocks: &[AudioBlock]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for block in blocks {
+        for sample in 0..block.sample_count() {
+            for plane in block.planes() {
+                bytes.extend_from_slice(&plane[sample].to_le_bytes());
+            }
+        }
+    }
+    bytes
 }
 
 fn sequence_request(clock_domain: ClockDomainId) -> DecodeRequest {
@@ -761,6 +884,173 @@ fn deep_audio_pages_and_restored_cursors_match_linear_decode() {
             let restored_page = restored.decode_up_to(NonZeroU32::new(5).unwrap()).unwrap();
             assert_same_audio(&restored_page.blocks, expected);
         }
+    }
+}
+
+#[test]
+fn default_limits_bound_high_rate_deep_page_diagnostics_and_match_linear_oracle() {
+    let _guard = ffmpeg_test_guard();
+    let Some(_) = require_ffmpeg() else {
+        return;
+    };
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("high-rate-deep-page.nut");
+    generate_high_rate_pcm_asset(&path);
+    let adapter = Adapter::new(Config {
+        allowed_root: Some(directory.path().to_owned()),
+        ..Config::default()
+    })
+    .unwrap();
+    let clock = ClockDomainId::new(NonZeroU128::new(55).unwrap());
+    let target_block = 1_200_usize;
+    let target_sample = target_block * 1_024;
+    let mut cursor = adapter
+        .open_local_audio(&path, clock, StreamSelector::Best)
+        .unwrap();
+    let position = cursor
+        .skip_complete_blocks_to_sample_bounded(target_sample, target_block)
+        .unwrap();
+    assert_eq!(position.next_block, target_block);
+    assert_eq!(position.next_sample, target_sample);
+
+    let page = cursor.decode_up_to(NonZeroU32::new(4).unwrap()).unwrap();
+    assert_eq!(page.blocks.len(), 4);
+    assert!(
+        target_sample
+            > fm_codec_ffmpeg::Limits::default().max_audio_samples
+                - page
+                    .blocks
+                    .iter()
+                    .map(AudioBlock::sample_count)
+                    .sum::<usize>()
+    );
+    let sample_count = page
+        .blocks
+        .iter()
+        .map(AudioBlock::sample_count)
+        .sum::<usize>();
+    assert_eq!(
+        interleaved_audio_bytes(&page.blocks),
+        linear_audio_oracle(&path, target_sample, sample_count)
+    );
+}
+
+#[test]
+fn raw_flac_large_block_exact_boundary_uses_bounded_from_start_fallback() {
+    let _guard = ffmpeg_test_guard();
+    let Some(_) = require_ffmpeg() else {
+        return;
+    };
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("large-block.flac");
+    generate_large_block_flac(&path);
+    let adapter = Adapter::new(Config {
+        allowed_root: Some(directory.path().to_owned()),
+        ..Config::default()
+    })
+    .unwrap();
+    let clock = ClockDomainId::new(NonZeroU128::new(56).unwrap());
+    let target_block = 4_usize;
+    let target_sample = target_block * 65_535;
+    let mut cursor = adapter
+        .open_local_audio(&path, clock, StreamSelector::Best)
+        .unwrap();
+    let position = cursor
+        .skip_complete_blocks_to_sample_bounded(target_sample, target_block)
+        .unwrap();
+    assert_eq!(position.next_block, target_block);
+    assert_eq!(position.next_sample, target_sample);
+
+    let page = cursor.decode_up_to(NonZeroU32::MIN).unwrap();
+    assert_eq!(page.blocks[0].sample_count(), 65_535);
+    assert_eq!(
+        interleaved_audio_bytes(&page.blocks),
+        linear_audio_oracle(&path, target_sample, 65_535)
+    );
+
+    let seek_only = Adapter::new(Config {
+        allowed_root: Some(directory.path().to_owned()),
+        limits: fm_codec_ffmpeg::Limits {
+            max_audio_samples: 200_000,
+            ..fm_codec_ffmpeg::Limits::default()
+        },
+        ..Config::default()
+    })
+    .unwrap();
+    let mut alternate_anchor = seek_only
+        .open_local_audio(&path, clock, StreamSelector::Best)
+        .unwrap();
+    alternate_anchor
+        .skip_complete_blocks_to_sample_bounded(2 * 65_535, 2)
+        .unwrap();
+    alternate_anchor
+        .skip_complete_blocks_to_sample_bounded(target_sample, 2)
+        .unwrap();
+    let alternate_page = alternate_anchor.decode_up_to(NonZeroU32::MIN).unwrap();
+    assert_eq!(
+        interleaved_audio_bytes(&alternate_page.blocks),
+        linear_audio_oracle(&path, target_sample, 65_535)
+    );
+}
+
+#[test]
+fn negative_start_flac_mka_decodes_bounded_prefix_and_rejects_deep_anchor_transactionally() {
+    let _guard = ffmpeg_test_guard();
+    let Some(_) = require_ffmpeg() else {
+        return;
+    };
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("negative-start-flac.mka");
+    generate_negative_start_flac_mka(&path);
+    let clock = ClockDomainId::new(NonZeroU128::new(57).unwrap());
+    let adapter = Adapter::new(Config {
+        allowed_root: Some(directory.path().to_owned()),
+        ..Config::default()
+    })
+    .unwrap();
+    let target_block = 4_usize;
+    let target_sample = target_block * 4_608;
+    let mut bounded = adapter
+        .open_local_audio(&path, clock, StreamSelector::Best)
+        .unwrap();
+    bounded
+        .skip_complete_blocks_to_sample_bounded(target_sample, target_block)
+        .unwrap();
+    let page = bounded.decode_up_to(NonZeroU32::MIN).unwrap();
+    assert!(
+        page.blocks[0]
+            .timing()
+            .original_timestamp()
+            .timestamp()
+            .ticks()
+            < 0
+    );
+    assert_eq!(
+        interleaved_audio_bytes(&page.blocks),
+        linear_audio_oracle(&path, target_sample, 4_608)
+    );
+
+    let constrained = Adapter::new(Config {
+        allowed_root: Some(directory.path().to_owned()),
+        limits: fm_codec_ffmpeg::Limits {
+            max_audio_samples: 20_000,
+            ..fm_codec_ffmpeg::Limits::default()
+        },
+        ..Config::default()
+    })
+    .unwrap();
+    let mut deep = constrained
+        .open_local_audio(&path, clock, StreamSelector::Best)
+        .unwrap();
+    deep.skip_complete_blocks_to_sample_bounded(target_sample, target_block)
+        .unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            deep.decode_up_to(NonZeroU32::MIN),
+            Err(Error::Unsupported(
+                fm_codec_ffmpeg::Unsupported::NegativeAudioAnchor
+            ))
+        );
     }
 }
 
