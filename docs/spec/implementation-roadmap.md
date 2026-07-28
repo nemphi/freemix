@@ -104,11 +104,13 @@ this item, so its parity rows remain planned.
 Current implementation boundary for item 5: `freemix-studio` opens a native
 `eframe`/wgpu shell by default with responsive Program/Preview monitor wells,
 stable-ID input tiles, realized/desired tally, and permission-gated Cut/Fade/Wipe
-controls. Studio still advertises protocol 1.3; Wipe additionally requires the
-negotiated protocol capability and shares Fade's bounded 1-to-3,600-frame
-duration control. Bounded worker channels preserve strict operator FIFO while
-recovering: an unresolved or deferred Wipe cannot cross a downgrade to protocol
-1.2, and later supported intents cannot overtake it. `fm-client` retains a
+controls. Studio advertises protocol 1.4; Wipe additionally requires protocol
+1.3, while manual Fade/Wipe T-bar controls require protocol 1.4, transition
+permission, synchronized state, and Ready lifecycle. The manual panel displays
+replicated desired and realized kind, routing, and exact integer basis-point
+position. Bounded worker channels preserve strict operator FIFO while
+recovering: unresolved or deferred versioned commands cannot cross a protocol
+downgrade, and later supported intents cannot overtake them. `fm-client` retains a
 bounded terminal command history (256 by default, configurable through 65,536),
 while replay-receipt collisions mark affected sent commands terminal-uncertain,
 force authoritative snapshot resynchronization, and remain visibly sticky in
@@ -128,8 +130,9 @@ labels and monitor wells state that real preview delivery remains pending.
 `freemix-web` likewise declares protocol 1.3 support in its client configuration,
 and its transport-free semantic presentation model exposes permission- and
 protocol-gated Wipe with Fade's bounded 1-to-3,600-frame duration. No browser
-renderer or network runtime exists. Neither client exposes T-bar controls; item
-5 and RC-007 remain planned.
+renderer or network runtime exists. Web exposes no T-bar controls, and the
+remaining transition families, FTB, and native-media/hardware T-bar evidence
+keep item 5 and RC-007 planned.
 
 Current implementation boundary for item 6: `fm-frame` defines a bounded,
 portable local-preview contract for shared-image versus encoded fallback,
@@ -190,9 +193,12 @@ Automatic Fade and held or reversed Fade and Wipe T-bar movement propagate exact
 endpoints. The manual-transition core is exposed through `EngineCommand` and
 protocol 1.4, and schema v6 preserves exact desired and realized manual state
 across replay-safe daemon restart, including through the explicit v5-to-v6
-no-mask migration. The CLI can load, save, and migrate that
-state, but has no manual-transition commands; Studio and Web remain on protocol
-1.3 without T-bar controls. Missing local audio, stills, scene silence, and
+no-mask migration. The CLI exposes local and remote manual Start, exact integer
+position, Commit, and Cancel commands; its local path restores and saves the
+schema-v6 engine state and its remote path gates the commands at protocol 1.4.
+Studio negotiates protocol 1.4 and exposes permission-gated manual Fade/Wipe
+controls while Ready. Web remains on protocol 1.3 without T-bar controls.
+Missing local audio, stills, scene silence, and
 configured simulated silence produce silence; unsupported simulated sine audio
 is rejected. At decoded EOS, the daemon synthesizes continuing silence for
 subsequent Master intervals. It exposes no media-completion/end trigger and has
@@ -219,8 +225,8 @@ buses/output routing or strip controls, DSP, or externally delivered audio.
 Dedicated Wipe audio-policy tests cover exact interval endpoints, sample-linear
 rendering, unity Cut completion, and held, reversed, and committed manual T-bar
 movement. Protocol-driven native-media end-to-end and hardware evidence for the
-manual path is absent, and operator controls remain incomplete. Item 7 and the
-related parity rows therefore remain incomplete and planned.
+manual path is absent, and the Web operator path remains incomplete. Item 7 and
+the related parity rows therefore remain incomplete and planned.
 
 Current implementation boundary for item 8: `fm-gpu` provides a portable,
 bounded latest-frame presentation policy plus opaque, context-bound native
@@ -538,7 +544,7 @@ negotiated peer before durable acceptance or control/engine mutation. Exact
 rational progress selects `floor(width * numerator / denominator)` replacement
 columns and preserves identical start/end frames, with exact CPU and Metal
 coverage of endpoints and pixel boundaries. `freemix-studio` now negotiates
-protocol 1.3 and exposes a Wipe button only when both transition permission and
+protocol 1.4 and exposes a Wipe button only when both transition permission and
 the negotiated protocol allow it; Fade and Wipe share one bounded duration.
 Recovery preserves strict intent FIFO across a tested protocol downgrade, so an
 unresolved Wipe is neither sent to 1.2 nor bypassed by later commands. Bounded
@@ -551,14 +557,22 @@ renderer or network runtime exists.
 
 The T-bar control core supports Fade and Wipe through `fm-switcher`,
 `EngineCommand`, `fm-control`, and protocol 1.4 with exact held, reversed,
-committed, and cancelled progress. Schema v5 persists distinct desired and
-realized manual state and daemon process tests cover replay-safe restart through
-commit and cancel. The CLI is persistence-compatible but exposes no manual
-commands. Studio and Web remain protocol 1.3 clients without T-bar controls, and
-there is no protocol-driven native-media end-to-end or hardware evidence for the
-manual path. FTB, AlphaFade, stinger, Slide/Zoom, the remaining transition
-families, and `SW-004` acceptance remain pending; parity therefore stays
-planned. Item 5 and RC-007 remain planned.
+committed, and cancelled progress. Schema v6 persists distinct desired and
+realized manual state, including through v5 migration, and daemon process tests
+cover replay-safe restart through commit and cancel. The CLI exposes local and
+remote Start, integer `0..=10_000` basis-point position, Commit, and Cancel
+commands; local command processes restore/mutate/save the engine checkpoint,
+and remote commands cannot cross a protocol 1.3 session. Studio advertises
+protocol 1.4 and presents replicated desired and realized kind, routing, and
+exact position without treating widget state as engine truth. Its manual
+controls require Ready state, transition permission, and negotiated 1.4.
+Reconnect tests preserve strict worker FIFO: an unresolved manual head and
+later commands remain blocked through a 1.3 downgrade and resume unchanged only
+on 1.4. Web remains a protocol 1.3 client without T-bar controls, and there is
+no protocol-driven native-media end-to-end or hardware evidence for the manual
+path. FTB, AlphaFade, stinger, Slide/Zoom, the remaining transition families,
+and `SW-004` acceptance remain pending; parity therefore stays planned. Item 5
+and RC-007 remain planned.
 
 Exit: `P0` switcher, composition, audio, display, record, and control rows pass.
 

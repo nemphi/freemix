@@ -17,11 +17,11 @@ pub use supervisor::{
 };
 
 use fm_client::ClientConfig;
-use fm_protocol::{ClientType, ProtocolVersion, Role, WIPE_PROTOCOL_VERSION};
+use fm_protocol::{ClientType, MANUAL_TRANSITION_PROTOCOL_VERSION, ProtocolVersion, Role};
 use fm_types::ProjectId;
 
 /// Protocol versions implemented by the native Studio.
-pub const SUPPORTED_PROTOCOL_VERSIONS: [ProtocolVersion; 1] = [WIPE_PROTOCOL_VERSION];
+pub const SUPPORTED_PROTOCOL_VERSIONS: [ProtocolVersion; 1] = [MANUAL_TRANSITION_PROTOCOL_VERSION];
 pub const DEFAULT_DAEMON: &str = "freemixd";
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:0";
 

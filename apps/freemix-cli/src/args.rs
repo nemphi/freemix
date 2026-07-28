@@ -1,5 +1,19 @@
 use std::{net::SocketAddr, path::PathBuf};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManualTransitionKind {
+    Fade,
+    Wipe,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TBarAction {
+    Start(ManualTransitionKind),
+    SetPosition(u16),
+    Commit,
+    Cancel,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Command {
     New {
@@ -32,6 +46,12 @@ pub enum Command {
         key: Option<String>,
         expected_revision: Option<u64>,
     },
+    TBar {
+        path: PathBuf,
+        action: TBarAction,
+        key: Option<String>,
+        expected_revision: Option<u64>,
+    },
     RemoteStatus {
         address: SocketAddr,
     },
@@ -58,6 +78,12 @@ pub enum Command {
         key: Option<String>,
         expected_revision: Option<u64>,
     },
+    RemoteTBar {
+        address: SocketAddr,
+        action: TBarAction,
+        key: Option<String>,
+        expected_revision: Option<u64>,
+    },
     Render {
         path: PathBuf,
         output: PathBuf,
@@ -76,7 +102,20 @@ pub enum ArgsError {
     MissingCommand,
     MissingValue(&'static str),
     BlankValue(&'static str),
-    InvalidNumber { field: &'static str, value: String },
+    InvalidNumber {
+        field: &'static str,
+        value: String,
+    },
+    InvalidChoice {
+        field: &'static str,
+        value: String,
+    },
+    OutOfRange {
+        field: &'static str,
+        minimum: u16,
+        maximum: u16,
+        value: u16,
+    },
     UnexpectedArgument(String),
     UnknownOption(String),
     UnknownCommand(String),
@@ -88,9 +127,18 @@ impl core::fmt::Display for ArgsError {
             Self::MissingCommand => formatter.write_str("a command is required"),
             Self::MissingValue(field) => write!(formatter, "missing value for {field}"),
             Self::BlankValue(field) => write!(formatter, "{field} must not be blank"),
-            Self::InvalidNumber { field, value } => {
+            Self::InvalidNumber { field, value } | Self::InvalidChoice { field, value } => {
                 write!(formatter, "invalid {field} value `{value}`")
             }
+            Self::OutOfRange {
+                field,
+                minimum,
+                maximum,
+                value,
+            } => write!(
+                formatter,
+                "{field} must be in {minimum}..={maximum}, got {value}"
+            ),
             Self::UnexpectedArgument(argument) => {
                 write!(formatter, "unexpected argument `{argument}`")
             }
@@ -108,17 +156,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
         return Err(ArgsError::MissingCommand);
     };
     match command.as_str() {
-        "new" => {
-            let path = required_path(&mut arguments, "project path")?;
-            let mut name = "FreeMix Show".to_owned();
-            while let Some(option) = arguments.next() {
-                match option.as_str() {
-                    "--name" => name = required(&mut arguments, "name")?,
-                    _ => return Err(ArgsError::UnknownOption(option)),
-                }
-            }
-            Ok(Command::New { path, name })
-        }
+        "new" => parse_new(arguments),
         "status" => {
             let path = required_path(&mut arguments, "project path")?;
             reject_extra(&mut arguments)?;
@@ -166,11 +204,18 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
                 expected_revision,
             })
         }
+        "tbar-start" | "tbar-position" | "tbar-commit" | "tbar-cancel" => {
+            parse_local_t_bar(&command, arguments)
+        }
         "remote-status" => parse_remote_status(arguments),
         "remote-preview" => parse_remote_preview(arguments),
         "remote-cut" => parse_remote_cut(arguments),
         "remote-fade" => parse_remote_fade(arguments),
         "remote-wipe" => parse_remote_wipe(arguments),
+        "remote-tbar-start"
+        | "remote-tbar-position"
+        | "remote-tbar-commit"
+        | "remote-tbar-cancel" => parse_remote_t_bar(&command, arguments),
         "render" => {
             let path = required_path(&mut arguments, "project path")?;
             let output = required_path(&mut arguments, "output path")?;
@@ -202,6 +247,65 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
         }
         "help" | "--help" | "-h" => Ok(Command::Help),
         _ => Err(ArgsError::UnknownCommand(command)),
+    }
+}
+
+fn parse_new(mut arguments: impl Iterator<Item = String>) -> Result<Command, ArgsError> {
+    let path = required_path(&mut arguments, "project path")?;
+    let mut name = "FreeMix Show".to_owned();
+    while let Some(option) = arguments.next() {
+        match option.as_str() {
+            "--name" => name = required(&mut arguments, "name")?,
+            _ => return Err(ArgsError::UnknownOption(option)),
+        }
+    }
+    Ok(Command::New { path, name })
+}
+
+fn parse_local_t_bar(
+    command: &str,
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Command, ArgsError> {
+    let path = required_path(&mut arguments, "project path")?;
+    let action = parse_t_bar_action(command, &mut arguments)?;
+    let (key, expected_revision) = command_options(arguments)?;
+    Ok(Command::TBar {
+        path,
+        action,
+        key,
+        expected_revision,
+    })
+}
+
+fn parse_remote_t_bar(
+    command: &str,
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Command, ArgsError> {
+    let address = socket_address(&required(&mut arguments, "address")?)?;
+    let action = parse_t_bar_action(command, &mut arguments)?;
+    let (key, expected_revision) = command_options(arguments)?;
+    Ok(Command::RemoteTBar {
+        address,
+        action,
+        key,
+        expected_revision,
+    })
+}
+
+fn parse_t_bar_action(
+    command: &str,
+    arguments: &mut impl Iterator<Item = String>,
+) -> Result<TBarAction, ArgsError> {
+    if command.ends_with("-start") {
+        let kind = manual_kind(&required(arguments, "transition kind")?)?;
+        Ok(TBarAction::Start(kind))
+    } else if command.ends_with("-position") {
+        let position = basis_points(&required(arguments, "basis points")?)?;
+        Ok(TBarAction::SetPosition(position))
+    } else if command.ends_with("-commit") {
+        Ok(TBarAction::Commit)
+    } else {
+        Ok(TBarAction::Cancel)
     }
 }
 
@@ -318,6 +422,31 @@ fn socket_address(value: &str) -> Result<SocketAddr, ArgsError> {
     number(value, "address")
 }
 
+fn manual_kind(value: &str) -> Result<ManualTransitionKind, ArgsError> {
+    match value {
+        "fade" => Ok(ManualTransitionKind::Fade),
+        "wipe" => Ok(ManualTransitionKind::Wipe),
+        _ => Err(ArgsError::InvalidChoice {
+            field: "transition kind",
+            value: value.to_owned(),
+        }),
+    }
+}
+
+fn basis_points(value: &str) -> Result<u16, ArgsError> {
+    let position = number(value, "basis points")?;
+    if position <= 10_000 {
+        Ok(position)
+    } else {
+        Err(ArgsError::OutOfRange {
+            field: "basis points",
+            minimum: 0,
+            maximum: 10_000,
+            value: position,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,6 +508,92 @@ mod tests {
                 frames: 12,
                 key: Some("remote-wipe".into()),
                 expected_revision: None,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_local_and_remote_t_bar_commands_with_exact_endpoints() {
+        assert_eq!(
+            parse(strings(&[
+                "tbar-start",
+                "show.freemix",
+                "wipe",
+                "--key",
+                "manual-start",
+                "--expect",
+                "4",
+            ])),
+            Ok(Command::TBar {
+                path: "show.freemix".into(),
+                action: TBarAction::Start(ManualTransitionKind::Wipe),
+                key: Some("manual-start".into()),
+                expected_revision: Some(4),
+            })
+        );
+        assert_eq!(
+            parse(strings(&["tbar-position", "show.freemix", "0"])),
+            Ok(Command::TBar {
+                path: "show.freemix".into(),
+                action: TBarAction::SetPosition(0),
+                key: None,
+                expected_revision: None,
+            })
+        );
+        assert_eq!(
+            parse(strings(&[
+                "remote-tbar-position",
+                "127.0.0.1:9123",
+                "10000",
+                "--expect",
+                "9",
+            ])),
+            Ok(Command::RemoteTBar {
+                address: "127.0.0.1:9123".parse().unwrap(),
+                action: TBarAction::SetPosition(10_000),
+                key: None,
+                expected_revision: Some(9),
+            })
+        );
+        assert!(matches!(
+            parse(strings(&["tbar-commit", "show.freemix"])),
+            Ok(Command::TBar {
+                action: TBarAction::Commit,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse(strings(&["remote-tbar-cancel", "127.0.0.1:9123"])),
+            Ok(Command::RemoteTBar {
+                action: TBarAction::Cancel,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_non_integer_unknown_and_out_of_range_t_bar_values() {
+        assert!(matches!(
+            parse(strings(&["tbar-position", "show.freemix", "62.50"])),
+            Err(ArgsError::InvalidNumber {
+                field: "basis points",
+                ..
+            })
+        ));
+        assert_eq!(
+            parse(strings(&["tbar-position", "show.freemix", "10001"])),
+            Err(ArgsError::OutOfRange {
+                field: "basis points",
+                minimum: 0,
+                maximum: 10_000,
+                value: 10_001,
+            })
+        );
+        assert_eq!(
+            parse(strings(&["tbar-start", "show.freemix", "slide"])),
+            Err(ArgsError::InvalidChoice {
+                field: "transition kind",
+                value: "slide".into(),
             })
         );
     }

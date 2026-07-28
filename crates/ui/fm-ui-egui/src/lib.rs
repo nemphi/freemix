@@ -6,8 +6,9 @@
 use egui::{
     Button, Color32, DragValue, Frame, Grid, Margin, RichText, ScrollArea, Stroke, Ui, Vec2,
 };
+use fm_protocol::{ManualTransitionKind, ManualTransitionPosition};
 use fm_types::InputId;
-use fm_ui_model::{ClientView, SwitcherState};
+use fm_ui_model::{ClientView, ManualTransitionStatus, SwitcherState};
 
 const GRAPHITE: Color32 = Color32::from_rgb(13, 15, 17);
 const GRAPHITE_RAISED: Color32 = Color32::from_rgb(24, 27, 30);
@@ -32,6 +33,14 @@ pub enum StudioIntent {
     Fade { duration_frames: u32 },
     /// Performs a Wipe transition with a duration in frames.
     Wipe { duration_frames: u32 },
+    /// Starts a held manual Fade or Wipe transition.
+    StartManualTransition { kind: ManualTransitionKind },
+    /// Sets the exact manual-transition position in basis points.
+    SetManualTransitionPosition { position: ManualTransitionPosition },
+    /// Commits the active manual transition at its current direction.
+    CommitManualTransition,
+    /// Cancels the active manual transition and restores its starting routing.
+    CancelManualTransition,
 }
 
 /// Native studio connection lifecycle as presented to an operator.
@@ -89,7 +98,7 @@ pub struct StudioUiState {
     pub view: Option<ClientView>,
     pub can_select_preview: bool,
     pub can_transition: bool,
-    pub supports_wipe: bool,
+    pub transition_protocol: TransitionProtocolSupport,
     pub pending_commands: usize,
     pub notice: Option<String>,
     pub error: Option<String>,
@@ -104,7 +113,7 @@ impl StudioUiState {
             view: None,
             can_select_preview: false,
             can_transition: false,
-            supports_wipe: false,
+            transition_protocol: TransitionProtocolSupport::NONE,
             pending_commands: 0,
             notice: None,
             error: None,
@@ -133,9 +142,30 @@ impl StudioUiState {
     /// Publishes whether the negotiated protocol can carry Wipe commands.
     #[must_use]
     pub const fn with_wipe_support(mut self, supports_wipe: bool) -> Self {
-        self.supports_wipe = supports_wipe;
+        self.transition_protocol.wipe = supports_wipe;
         self
     }
+
+    /// Publishes whether the negotiated protocol carries manual T-bar state and commands.
+    #[must_use]
+    pub const fn with_manual_transition_support(mut self, supported: bool) -> Self {
+        self.transition_protocol.manual = supported;
+        self
+    }
+}
+
+/// Additive transition features carried by the negotiated protocol.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TransitionProtocolSupport {
+    pub wipe: bool,
+    pub manual: bool,
+}
+
+impl TransitionProtocolSupport {
+    pub const NONE: Self = Self {
+        wipe: false,
+        manual: false,
+    };
 }
 
 /// Pure transition-control availability derived from one UI state.
@@ -144,6 +174,34 @@ pub struct TransitionAvailability {
     pub cut: bool,
     pub fade: bool,
     pub wipe: bool,
+}
+
+/// Pure manual T-bar control availability derived from replicated state and session gates.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ManualTransitionAvailability {
+    pub start: bool,
+    pub active_controls: bool,
+}
+
+/// Session and replicated-state gates for manual T-bar controls.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ManualTransitionGate {
+    pub connection_status: StudioConnectionStatus,
+    pub has_view: bool,
+    pub can_transition: bool,
+    pub protocol_supported: bool,
+}
+
+impl ManualTransitionGate {
+    #[must_use]
+    pub const fn from_state(state: &StudioUiState) -> Self {
+        Self {
+            connection_status: state.connection_status,
+            has_view: state.view.is_some(),
+            can_transition: state.can_transition,
+            protocol_supported: state.transition_protocol.manual,
+        }
+    }
 }
 
 /// Computes transition availability without drawing or dispatching intents.
@@ -159,6 +217,22 @@ pub const fn transition_availability(
         cut: base,
         fade: base,
         wipe: base && supports_wipe,
+    }
+}
+
+/// Computes manual T-bar availability without drawing or dispatching intents.
+#[must_use]
+pub fn manual_transition_availability(
+    gate: ManualTransitionGate,
+    active: bool,
+) -> ManualTransitionAvailability {
+    let base = gate.connection_status.controls_enabled()
+        && gate.has_view
+        && gate.can_transition
+        && gate.protocol_supported;
+    ManualTransitionAvailability {
+        start: base && !active,
+        active_controls: base && active,
     }
 }
 
@@ -304,9 +378,167 @@ impl StudioShell {
                 ui.add_space(8.0);
                 draw_transition_row(ui, self, state, &mut intents);
                 ui.add_space(8.0);
+                draw_manual_transition(ui, state, &mut intents);
+                ui.add_space(8.0);
                 draw_inputs(ui, state, &mut intents);
             });
         intents
+    }
+}
+
+fn draw_manual_transition(ui: &mut Ui, state: &StudioUiState, intents: &mut Vec<StudioIntent>) {
+    let desired = state
+        .view
+        .as_ref()
+        .map_or(ManualTransitionStatus::Inactive, |view| {
+            view.switcher.desired_manual_transition
+        });
+    let realized = state
+        .view
+        .as_ref()
+        .map_or(ManualTransitionStatus::Inactive, |view| {
+            view.switcher.realized_manual_transition
+        });
+    let active = matches!(desired, ManualTransitionStatus::Active(_));
+    let availability =
+        manual_transition_availability(ManualTransitionGate::from_state(state), active);
+
+    Frame::new()
+        .fill(GRAPHITE_RAISED)
+        .stroke(Stroke::new(1.0, Color32::from_rgb(67, 61, 44)))
+        .inner_margin(Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            draw_manual_transition_status(ui, desired, realized);
+            ui.add_space(6.0);
+            draw_manual_transition_controls(ui, desired, availability, intents);
+        });
+}
+
+fn draw_manual_transition_status(
+    ui: &mut Ui,
+    desired: ManualTransitionStatus,
+    realized: ManualTransitionStatus,
+) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new("MANUAL T-BAR").small().strong().color(AMBER));
+        ui.label(RichText::new(format!("DESIRED {}", manual_transition_label(desired))).small());
+        ui.label(
+            RichText::new(format!("REALIZED {}", manual_transition_label(realized)))
+                .small()
+                .color(MUTED),
+        );
+    });
+}
+
+fn draw_manual_transition_controls(
+    ui: &mut Ui,
+    desired: ManualTransitionStatus,
+    availability: ManualTransitionAvailability,
+    intents: &mut Vec<StudioIntent>,
+) {
+    ui.horizontal_wrapped(|ui| {
+        draw_manual_start_buttons(ui, availability.start, intents);
+        draw_manual_position(ui, desired, availability.active_controls, intents);
+        draw_manual_terminal_buttons(ui, availability.active_controls, intents);
+    });
+}
+
+fn draw_manual_start_buttons(ui: &mut Ui, enabled: bool, intents: &mut Vec<StudioIntent>) {
+    for (label, kind, tooltip) in [
+        (
+            "START FADE T-BAR",
+            ManualTransitionKind::Fade,
+            "Start a reversible manual Fade transition",
+        ),
+        (
+            "START WIPE T-BAR",
+            ManualTransitionKind::Wipe,
+            "Start a reversible manual Wipe transition",
+        ),
+    ] {
+        let response = ui
+            .add_enabled(enabled, Button::new(RichText::new(label).strong()))
+            .on_hover_text(tooltip);
+        if response.clicked() {
+            intents.push(StudioIntent::StartManualTransition { kind });
+        }
+    }
+}
+
+fn draw_manual_position(
+    ui: &mut Ui,
+    desired: ManualTransitionStatus,
+    enabled: bool,
+    intents: &mut Vec<StudioIntent>,
+) {
+    let position_label = ui.label(
+        RichText::new("POSITION (BASIS POINTS)")
+            .small()
+            .color(MUTED),
+    );
+    let mut position = desired_manual_position(desired).basis_points();
+    let response = ui
+        .add_enabled(
+            enabled,
+            DragValue::new(&mut position).range(
+                ManualTransitionPosition::START.basis_points()
+                    ..=ManualTransitionPosition::END.basis_points(),
+            ),
+        )
+        .labelled_by(position_label.id)
+        .on_hover_text(
+            "Exact T-bar position from 0 through 10000 basis points; lower values reverse",
+        );
+    if response.changed() {
+        intents.push(StudioIntent::SetManualTransitionPosition {
+            position: ManualTransitionPosition::new(position)
+                .expect("DragValue range bounds manual positions"),
+        });
+    }
+}
+
+fn draw_manual_terminal_buttons(ui: &mut Ui, enabled: bool, intents: &mut Vec<StudioIntent>) {
+    for (label, tooltip, intent) in [
+        (
+            "COMMIT T-BAR",
+            "Commit the active manual transition",
+            StudioIntent::CommitManualTransition,
+        ),
+        (
+            "CANCEL T-BAR",
+            "Cancel the active manual transition",
+            StudioIntent::CancelManualTransition,
+        ),
+    ] {
+        let response = ui
+            .add_enabled(enabled, Button::new(RichText::new(label).strong()))
+            .on_hover_text(tooltip);
+        if response.clicked() {
+            intents.push(intent);
+        }
+    }
+}
+
+const fn desired_manual_position(status: ManualTransitionStatus) -> ManualTransitionPosition {
+    match status {
+        ManualTransitionStatus::Inactive => ManualTransitionPosition::START,
+        ManualTransitionStatus::Active(state) => state.position,
+    }
+}
+
+fn manual_transition_label(status: ManualTransitionStatus) -> String {
+    match status {
+        ManualTransitionStatus::Inactive => "INACTIVE".to_owned(),
+        ManualTransitionStatus::Active(state) => format!(
+            "{} {}->{} @ {} BP",
+            match state.kind {
+                ManualTransitionKind::Fade => "FADE",
+                ManualTransitionKind::Wipe => "WIPE",
+            },
+            state.from,
+            state.to,
+            state.position.basis_points(),
+        ),
     }
 }
 
@@ -442,7 +674,7 @@ fn draw_transition_row(
         state.connection_status,
         state.view.is_some(),
         state.can_transition,
-        state.supports_wipe,
+        state.transition_protocol.wipe,
     );
     Frame::new()
         .fill(GRAPHITE_RAISED)
@@ -624,7 +856,7 @@ const fn tally_fill(tally: TallyState) -> Color32 {
 mod tests {
     use core::num::NonZeroU128;
 
-    use fm_ui_model::{BusSelection, ManualTransitionStatus};
+    use fm_ui_model::{ActiveManualTransition, BusSelection};
 
     use super::*;
 
@@ -763,6 +995,77 @@ mod tests {
     }
 
     #[test]
+    fn manual_t_bar_availability_requires_ready_view_permission_protocol_and_active_state() {
+        let available = ManualTransitionGate {
+            connection_status: StudioConnectionStatus::Ready,
+            has_view: true,
+            can_transition: true,
+            protocol_supported: true,
+        };
+        assert_eq!(
+            manual_transition_availability(available, false),
+            ManualTransitionAvailability {
+                start: true,
+                active_controls: false,
+            }
+        );
+        assert_eq!(
+            manual_transition_availability(available, true),
+            ManualTransitionAvailability {
+                start: false,
+                active_controls: true,
+            }
+        );
+        for gate in [
+            ManualTransitionGate {
+                connection_status: StudioConnectionStatus::Connecting,
+                ..available
+            },
+            ManualTransitionGate {
+                has_view: false,
+                ..available
+            },
+            ManualTransitionGate {
+                can_transition: false,
+                ..available
+            },
+            ManualTransitionGate {
+                protocol_supported: false,
+                ..available
+            },
+        ] {
+            assert_eq!(
+                manual_transition_availability(gate, true),
+                ManualTransitionAvailability {
+                    start: false,
+                    active_controls: false,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn manual_t_bar_labels_and_positions_come_from_replicated_model() {
+        let active = ManualTransitionStatus::Active(ActiveManualTransition {
+            kind: ManualTransitionKind::Wipe,
+            from: input(1),
+            to: input(2),
+            interval_start: ManualTransitionPosition::new(8_000).unwrap(),
+            position: ManualTransitionPosition::new(2_500).unwrap(),
+        });
+        assert_eq!(desired_manual_position(active).basis_points(), 2_500);
+        assert_eq!(manual_transition_label(active), "WIPE 1->2 @ 2500 BP");
+        assert_eq!(
+            desired_manual_position(ManualTransitionStatus::Inactive),
+            ManualTransitionPosition::START
+        );
+        assert_eq!(
+            manual_transition_label(ManualTransitionStatus::Inactive),
+            "INACTIVE"
+        );
+    }
+
+    #[test]
     fn intents_are_typed_and_comparable() {
         assert_eq!(
             StudioIntent::SelectPreview(input(9)),
@@ -775,6 +1078,22 @@ mod tests {
             },
             StudioIntent::Wipe {
                 duration_frames: 30
+            }
+        );
+        assert_eq!(
+            StudioIntent::SetManualTransitionPosition {
+                position: ManualTransitionPosition::START,
+            },
+            StudioIntent::SetManualTransitionPosition {
+                position: ManualTransitionPosition::new(0).unwrap(),
+            }
+        );
+        assert_ne!(
+            StudioIntent::SetManualTransitionPosition {
+                position: ManualTransitionPosition::END,
+            },
+            StudioIntent::SetManualTransitionPosition {
+                position: ManualTransitionPosition::new(2_500).unwrap(),
             }
         );
         assert_eq!(

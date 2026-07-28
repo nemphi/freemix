@@ -16,5 +16,8 @@ fm-ui-egui = { path = "../../crates/ui/fm-ui-egui" }
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.27.1", default-features = false, features = ["signal"] }
 
+[dev-dependencies]
+fm-ui-model = { path = "../../crates/ui/fm-ui-model" }
+
 [lints]
 workspace = true

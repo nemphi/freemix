@@ -12,7 +12,10 @@ use fm_command::{
     AcceptedReceipt, CommandEnvelope, CommandId, CommandReceipt, EventSequence, IdempotencyKey,
     RejectedReceipt, Rejection, RejectionCode, Revision, RuntimeGeneration, StateEpoch,
 };
-use fm_engine::{Engine, EngineAcceptance, EngineCommand, EngineRestoreState, ShowState};
+use fm_engine::{
+    Engine, EngineAcceptance, EngineCommand, EngineManualTransitionKind,
+    EngineManualTransitionPosition, EngineRestoreState, ShowState,
+};
 use fm_model::{
     Input, InputKind, MainMix, Project, ProjectSettings, SimulatedAudio, SimulatedInput,
     SimulatedVideo, SolidColor,
@@ -31,7 +34,10 @@ use fm_types::{
 };
 use fm_video::write_ppm;
 
-use crate::{args::Command, remote};
+use crate::{
+    args::{Command, ManualTransitionKind, TBarAction},
+    remote,
+};
 
 type AppResult<T> = Result<T, Box<dyn Error>>;
 static IMPLICIT_KEY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -107,6 +113,18 @@ pub fn run(command: Command) -> AppResult<()> {
             key,
             expected_revision,
         )?,
+        Command::TBar {
+            path,
+            action,
+            key,
+            expected_revision,
+        } => mutate(
+            &path,
+            engine_t_bar_command(action),
+            1,
+            key,
+            expected_revision,
+        )?,
         Command::RemoteStatus { address } => remote::status(address)?,
         Command::RemotePreview {
             address,
@@ -157,6 +175,17 @@ pub fn run(command: Command) -> AppResult<()> {
             fm_protocol::CommandPayload::Wipe {
                 duration_frames: frames,
             },
+            key,
+            expected_revision,
+        )?,
+        Command::RemoteTBar {
+            address,
+            action,
+            key,
+            expected_revision,
+        } => remote::execute(
+            address,
+            protocol_t_bar_payload(action),
             key,
             expected_revision,
         )?,
@@ -623,7 +652,7 @@ fn print_status(project: &ProjectEngine) {
     let desired = engine.show().desired_switcher();
     let realized = engine.realized_switcher();
     println!(
-        "project_id={} show={:?} revision={} frame={} Program(desired={}, realized={}) Preview(desired={}, realized={})",
+        "project_id={} show={:?} revision={} frame={} Program(desired={}, realized={}) Preview(desired={}, realized={}) TBar(desired={}, realized={})",
         project.project.id(),
         engine.show().name(),
         engine.revision(),
@@ -632,7 +661,28 @@ fn print_status(project: &ProjectEngine) {
         realized.program(),
         desired.preview(),
         realized.preview(),
+        format_t_bar(desired.t_bar()),
+        format_t_bar(realized.t_bar()),
     );
+}
+
+fn format_t_bar(state: Option<TBarState>) -> String {
+    state.map_or_else(
+        || "inactive".to_owned(),
+        |state| {
+            format!(
+                "{}:{}->{}@{}",
+                match state.kind() {
+                    TransitionKind::Fade => "fade",
+                    TransitionKind::Wipe => "wipe",
+                    _ => unreachable!("engine manual transitions are fade or wipe"),
+                },
+                state.from(),
+                state.to(),
+                state.position().basis_points(),
+            )
+        },
+    )
 }
 
 fn print_help() {
@@ -647,14 +697,66 @@ Usage:
   freemix-cli cut <show.freemix> [--key <key>] [--expect <revision>]
   freemix-cli fade <show.freemix> <frames> [--key <key>] [--expect <revision>]
   freemix-cli wipe <show.freemix> <frames> [--key <key>] [--expect <revision>]
+  freemix-cli tbar-start <show.freemix> <fade|wipe> [--key <key>] [--expect <revision>]
+  freemix-cli tbar-position <show.freemix> <basis-points:0..=10000> [--key <key>] [--expect <revision>]
+  freemix-cli tbar-commit <show.freemix> [--key <key>] [--expect <revision>]
+  freemix-cli tbar-cancel <show.freemix> [--key <key>] [--expect <revision>]
   freemix-cli remote-status <127.0.0.1:port>
   freemix-cli remote-preview <127.0.0.1:port> <input> [--key <key>] [--expect <revision>]
   freemix-cli remote-cut <127.0.0.1:port> [--key <key>] [--expect <revision>]
   freemix-cli remote-fade <127.0.0.1:port> <frames> [--key <key>] [--expect <revision>]
   freemix-cli remote-wipe <127.0.0.1:port> <frames> [--key <key>] [--expect <revision>]
+  freemix-cli remote-tbar-start <127.0.0.1:port> <fade|wipe> [--key <key>] [--expect <revision>]
+  freemix-cli remote-tbar-position <127.0.0.1:port> <basis-points:0..=10000> [--key <key>] [--expect <revision>]
+  freemix-cli remote-tbar-commit <127.0.0.1:port> [--key <key>] [--expect <revision>]
+  freemix-cli remote-tbar-cancel <127.0.0.1:port> [--key <key>] [--expect <revision>]
   freemix-cli render <show.freemix> <output.ppm> [--width <px>] [--height <px>]
   freemix-cli demo <show.freemix> [output.ppm]"
     );
+}
+
+const fn engine_manual_kind(kind: ManualTransitionKind) -> EngineManualTransitionKind {
+    match kind {
+        ManualTransitionKind::Fade => EngineManualTransitionKind::Fade,
+        ManualTransitionKind::Wipe => EngineManualTransitionKind::Wipe,
+    }
+}
+
+fn engine_t_bar_command(action: TBarAction) -> EngineCommand {
+    match action {
+        TBarAction::Start(kind) => EngineCommand::StartManualTransition {
+            kind: engine_manual_kind(kind),
+        },
+        TBarAction::SetPosition(position) => EngineCommand::SetManualTransitionPosition {
+            position: EngineManualTransitionPosition::new(position)
+                .expect("CLI parser bounds manual positions"),
+        },
+        TBarAction::Commit => EngineCommand::CommitManualTransition,
+        TBarAction::Cancel => EngineCommand::CancelManualTransition,
+    }
+}
+
+const fn protocol_manual_kind(kind: ManualTransitionKind) -> fm_protocol::ManualTransitionKind {
+    match kind {
+        ManualTransitionKind::Fade => fm_protocol::ManualTransitionKind::Fade,
+        ManualTransitionKind::Wipe => fm_protocol::ManualTransitionKind::Wipe,
+    }
+}
+
+fn protocol_t_bar_payload(action: TBarAction) -> fm_protocol::CommandPayload {
+    match action {
+        TBarAction::Start(kind) => fm_protocol::CommandPayload::StartManualTransition {
+            kind: protocol_manual_kind(kind),
+        },
+        TBarAction::SetPosition(position) => {
+            fm_protocol::CommandPayload::SetManualTransitionPosition {
+                position: fm_protocol::ManualTransitionPosition::new(position)
+                    .expect("CLI parser bounds manual positions"),
+            }
+        }
+        TBarAction::Commit => fm_protocol::CommandPayload::CommitManualTransition,
+        TBarAction::Cancel => fm_protocol::CommandPayload::CancelManualTransition,
+    }
 }
 
 fn clock_domain() -> ClockDomainId {

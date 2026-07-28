@@ -1152,6 +1152,7 @@ name = "fm-ui-egui"
 version = "0.1.0"
 dependencies = [
  "egui",
+ "fm-protocol",
  "fm-types",
  "fm-ui-model",
 ]
@@ -1265,6 +1266,7 @@ dependencies = [
  "fm-sim",
  "fm-switcher",
  "fm-types",
+ "fm-ui-model",
  "fm-video",
 ]
 
@@ -1286,6 +1288,7 @@ dependencies = [
  "fm-protocol",
  "fm-types",
  "fm-ui-egui",
+ "fm-ui-model",
  "nix 0.27.1",
 ]
 

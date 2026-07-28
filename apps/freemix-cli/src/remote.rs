@@ -13,6 +13,7 @@ use fm_protocol::{
     ServerHello, ServerIdentity, SnapshotReason, WireMessage, decode_line, encode_line,
 };
 use fm_types::ProjectId;
+use fm_ui_model::ManualTransitionStatus;
 
 type RemoteResult<T> = Result<T, Box<dyn Error>>;
 
@@ -242,7 +243,7 @@ impl Remote {
             .ok_or_else(|| RemoteFailure("remote project cursor is unavailable".into()))?;
         let switcher = state.switcher();
         println!(
-            "project_id={} show={:?} revision={} frame=unavailable Program(desired={}, realized={}) Preview(desired={}, realized={})",
+            "project_id={} show={:?} revision={} frame=unavailable Program(desired={}, realized={}) Preview(desired={}, realized={}) TBar(desired={}, realized={})",
             self.project_id,
             state.show_name(),
             cursor.revision,
@@ -250,6 +251,8 @@ impl Remote {
             switcher.realized.program,
             switcher.desired.preview,
             switcher.realized.preview,
+            format_manual_transition(switcher.desired_manual_transition),
+            format_manual_transition(switcher.realized_manual_transition),
         );
         Ok(())
     }
@@ -267,6 +270,22 @@ impl Remote {
             return Err(RemoteFailure("daemon closed the TCP connection".into()).into());
         }
         Ok(decode_line(&line)?)
+    }
+}
+
+fn format_manual_transition(status: ManualTransitionStatus) -> String {
+    match status {
+        ManualTransitionStatus::Inactive => "inactive".to_owned(),
+        ManualTransitionStatus::Active(state) => format!(
+            "{}:{}->{}@{}",
+            match state.kind {
+                fm_protocol::ManualTransitionKind::Fade => "fade",
+                fm_protocol::ManualTransitionKind::Wipe => "wipe",
+            },
+            state.from,
+            state.to,
+            state.position.basis_points(),
+        ),
     }
 }
 

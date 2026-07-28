@@ -17,9 +17,10 @@ use std::os::unix::fs::PermissionsExt;
 use fm_client::{ClientError, CommandStatus, Intake, SessionEvent, SyncMode, TcpSessionError};
 use fm_protocol::{
     CapabilityReportSummary, CommandPayload, CommandResult, EngineIdentity, EventCursor,
-    EventMessage, EventPayload, HandshakeOutcome, HandshakeResponse, LineDecoder, ProtocolVersion,
-    Role, RuntimeEventMessage, RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage,
-    SnapshotReason, WIPE_PROTOCOL_VERSION, WireInputId, WireMessage, encode_line,
+    EventMessage, EventPayload, HandshakeOutcome, HandshakeResponse, LineDecoder,
+    MANUAL_TRANSITION_PROTOCOL_VERSION, ManualTransitionStatus, ProtocolVersion, Role,
+    RuntimeEventMessage, RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage, SnapshotReason,
+    WireInputId, WireMessage, encode_line,
 };
 use fm_types::ProjectId;
 use freemix_studio::{
@@ -186,7 +187,7 @@ fn serve_snapshot_then_resume(listener: &TcpListener) {
     let WireMessage::HandshakeRequest(request) = first.receive() else {
         panic!("expected modern handshake request");
     };
-    assert_eq!(request.versions, vec![WIPE_PROTOCOL_VERSION]);
+    assert_eq!(request.versions, vec![MANUAL_TRANSITION_PROTOCOL_VERSION]);
     assert_eq!(request.resume_cursor, None);
     first.send(&WireMessage::HandshakeResponse(handshake(
         project_id(),
@@ -335,22 +336,25 @@ fn existing_runtime_rejects_wrong_project_handshake() {
 }
 
 #[test]
-fn existing_runtime_negotiates_wipe_protocol_with_a_1_3_peer() {
+fn existing_runtime_negotiates_manual_transition_protocol_with_a_1_4_peer() {
     let (address, server_thread) = spawn_server(|listener| {
         let mut peer = Peer::accept(&listener);
         let WireMessage::HandshakeRequest(request) = peer.receive() else {
             panic!("expected modern handshake request");
         };
-        assert_eq!(request.versions, vec![WIPE_PROTOCOL_VERSION]);
+        assert_eq!(request.versions, vec![MANUAL_TRANSITION_PROTOCOL_VERSION]);
         peer.send(&WireMessage::HandshakeResponse(handshake_version(
-            WIPE_PROTOCOL_VERSION,
+            MANUAL_TRANSITION_PROTOCOL_VERSION,
             project_id(),
             4,
             HandshakeOutcome::Snapshot {
                 reason: SnapshotReason::NoCursor,
             },
         )));
-        peer.send(&WireMessage::Snapshot(snapshot(4)));
+        let mut initial = snapshot(4);
+        initial.desired_manual_transition = Some(ManualTransitionStatus::Inactive);
+        initial.realized_manual_transition = Some(ManualTransitionStatus::Inactive);
+        peer.send(&WireMessage::Snapshot(initial));
     });
 
     let mut runtime = StudioRuntime::new(existing_config(address, project_id())).unwrap();
@@ -362,7 +366,7 @@ fn existing_runtime_negotiates_wipe_protocol_with_a_1_3_peer() {
     );
     assert_eq!(
         runtime.session().client().session().unwrap().protocol,
-        WIPE_PROTOCOL_VERSION
+        MANUAL_TRANSITION_PROTOCOL_VERSION
     );
     server_thread.join().unwrap();
 }

@@ -14,7 +14,8 @@ use fm_client::{
     ClientError, CommandStatus, CommandUncertainty, SessionEvent, SyncMode, TcpSessionError,
 };
 use fm_protocol::{
-    CommandPayload, CommandResult, DurableGap, WIPE_PROTOCOL_VERSION, WireInputId, WireMessage,
+    CommandPayload, CommandResult, DurableGap, MANUAL_TRANSITION_PROTOCOL_VERSION, ProtocolVersion,
+    WIPE_PROTOCOL_VERSION, WireInputId, WireMessage,
 };
 use fm_ui_egui::{StudioConnectionStatus, StudioIntent, StudioShell, StudioUiState};
 
@@ -539,7 +540,7 @@ fn run_worker(
         if !recovery.active()
             && let Some(intent) = pop_supported_deferred_intent(
                 &mut recovery.deferred_intents,
-                session_supports_wipe(runtime.session()),
+                session_protocol(runtime.session()),
             )
         {
             if !handle_worker_intent(
@@ -1169,32 +1170,40 @@ const fn intent_payload(intent: StudioIntent) -> CommandPayload {
         StudioIntent::Cut => CommandPayload::Cut,
         StudioIntent::Fade { duration_frames } => CommandPayload::Fade { duration_frames },
         StudioIntent::Wipe { duration_frames } => CommandPayload::Wipe { duration_frames },
+        StudioIntent::StartManualTransition { kind } => {
+            CommandPayload::StartManualTransition { kind }
+        }
+        StudioIntent::SetManualTransitionPosition { position } => {
+            CommandPayload::SetManualTransitionPosition { position }
+        }
+        StudioIntent::CommitManualTransition => CommandPayload::CommitManualTransition,
+        StudioIntent::CancelManualTransition => CommandPayload::CancelManualTransition,
     }
 }
 
 fn intent_supported_by_session(session: &fm_client::TcpSession, intent: StudioIntent) -> bool {
-    intent_supported(intent, session_supports_wipe(session))
+    intent_supported(intent, session_protocol(session))
 }
 
-fn session_supports_wipe(session: &fm_client::TcpSession) -> bool {
-    session.client().session().is_some_and(|session| {
-        session.protocol.major == WIPE_PROTOCOL_VERSION.major
-            && session.protocol.minor >= WIPE_PROTOCOL_VERSION.minor
-    })
+fn session_protocol(session: &fm_client::TcpSession) -> Option<ProtocolVersion> {
+    session.client().session().map(|session| session.protocol)
 }
 
-const fn intent_supported(intent: StudioIntent, supports_wipe: bool) -> bool {
-    !matches!(intent, StudioIntent::Wipe { .. }) || supports_wipe
+const fn intent_supported(intent: StudioIntent, protocol: Option<ProtocolVersion>) -> bool {
+    match protocol {
+        Some(protocol) => intent_payload(intent).is_supported_by(protocol),
+        None => false,
+    }
 }
 
 fn pop_supported_deferred_intent(
     deferred: &mut VecDeque<StudioIntent>,
-    supports_wipe: bool,
+    protocol: Option<ProtocolVersion>,
 ) -> Option<StudioIntent> {
     deferred
         .front()
         .copied()
-        .filter(|intent| intent_supported(*intent, supports_wipe))?;
+        .filter(|intent| intent_supported(*intent, protocol))?;
     deferred.pop_front()
 }
 
@@ -1232,9 +1241,14 @@ fn runtime_state(runtime: &mut StudioRuntime, error: Option<String>) -> StudioUi
         session.protocol.major == WIPE_PROTOCOL_VERSION.major
             && session.protocol.minor >= WIPE_PROTOCOL_VERSION.minor
     });
+    let supports_manual_transition = client.session().is_some_and(|session| {
+        session.protocol.major == MANUAL_TRANSITION_PROTOCOL_VERSION.major
+            && session.protocol.minor >= MANUAL_TRANSITION_PROTOCOL_VERSION.minor
+    });
     let mut state = StudioUiState::new(connection_status)
         .with_switcher_permissions(can_select_preview, can_transition)
-        .with_wipe_support(supports_wipe);
+        .with_wipe_support(supports_wipe)
+        .with_manual_transition_support(supports_manual_transition);
     if connection_status == StudioConnectionStatus::Ready {
         state.view = client.model().view();
     }
@@ -1265,18 +1279,34 @@ fn publish_deferred_runtime(
     error: Option<String>,
 ) -> bool {
     let mut state = runtime_state(runtime, error);
-    let incompatible_wipe = deferred
+    let incompatible = deferred
         .front()
-        .is_some_and(|intent| !intent_supported_by_session(runtime.session(), *intent));
-    state.notice = Some(if incompatible_wipe {
+        .copied()
+        .filter(|intent| !intent_supported_by_session(runtime.session(), *intent));
+    state.notice = Some(if let Some(intent) = incompatible {
         format!(
-            "Blocked {} command(s) in operator FIFO; head Wipe requires protocol {WIPE_PROTOCOL_VERSION}",
-            deferred.len()
+            "Blocked {} command(s) in operator FIFO; head {} requires protocol {}",
+            deferred.len(),
+            intent_label(intent),
+            intent_payload(intent).minimum_protocol_version(),
         )
     } else {
         format!("Queued {} command(s) in operator FIFO", deferred.len())
     });
     publisher.publish(state)
+}
+
+const fn intent_label(intent: StudioIntent) -> &'static str {
+    match intent {
+        StudioIntent::SelectPreview(_) => "Select Preview",
+        StudioIntent::Cut => "Cut",
+        StudioIntent::Fade { .. } => "Fade",
+        StudioIntent::Wipe { .. } => "Wipe",
+        StudioIntent::StartManualTransition { .. } => "T-bar Start",
+        StudioIntent::SetManualTransitionPosition { .. } => "T-bar Position",
+        StudioIntent::CommitManualTransition => "T-bar Commit",
+        StudioIntent::CancelManualTransition => "T-bar Cancel",
+    }
 }
 
 fn publish_recovery_runtime(
@@ -1316,8 +1346,9 @@ mod tests {
     use fm_client::ReconnectBackoff;
     use fm_protocol::{
         CapabilityReportSummary, EngineIdentity, EventCursor, EventMessage, EventPayload,
-        HandshakeOutcome, HandshakeResponse, LineDecoder, ProtocolVersion, Role,
-        RuntimeEventMessage, RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage,
+        HandshakeOutcome, HandshakeResponse, LineDecoder, ManualTransitionKind,
+        ManualTransitionPosition, ManualTransitionState, ManualTransitionStatus, ProtocolVersion,
+        Role, RuntimeEventMessage, RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage,
         SnapshotReason, WireMessage, encode_line,
     };
     use fm_types::{InputId, ProjectId};
@@ -1401,6 +1432,32 @@ mod tests {
                 duration_frames: u32::MAX,
             }
         );
+        assert_eq!(
+            intent_payload(StudioIntent::StartManualTransition {
+                kind: fm_protocol::ManualTransitionKind::Wipe,
+            }),
+            CommandPayload::StartManualTransition {
+                kind: fm_protocol::ManualTransitionKind::Wipe,
+            }
+        );
+        for position in [
+            fm_protocol::ManualTransitionPosition::START,
+            fm_protocol::ManualTransitionPosition::new(2_500).unwrap(),
+            fm_protocol::ManualTransitionPosition::END,
+        ] {
+            assert_eq!(
+                intent_payload(StudioIntent::SetManualTransitionPosition { position }),
+                CommandPayload::SetManualTransitionPosition { position }
+            );
+        }
+        assert_eq!(
+            intent_payload(StudioIntent::CommitManualTransition),
+            CommandPayload::CommitManualTransition
+        );
+        assert_eq!(
+            intent_payload(StudioIntent::CancelManualTransition),
+            CommandPayload::CancelManualTransition
+        );
     }
 
     #[test]
@@ -1483,25 +1540,28 @@ mod tests {
         };
         let mut deferred = VecDeque::from([wipe, preview, StudioIntent::Cut, fade]);
 
-        assert_eq!(pop_supported_deferred_intent(&mut deferred, false), None);
+        assert_eq!(
+            pop_supported_deferred_intent(&mut deferred, Some(ProtocolVersion::new(1, 2))),
+            None
+        );
         assert_eq!(
             deferred,
             VecDeque::from([wipe, preview, StudioIntent::Cut, fade])
         );
         assert_eq!(
-            pop_supported_deferred_intent(&mut deferred, true),
+            pop_supported_deferred_intent(&mut deferred, Some(WIPE_PROTOCOL_VERSION)),
             Some(wipe)
         );
         assert_eq!(
-            pop_supported_deferred_intent(&mut deferred, true),
+            pop_supported_deferred_intent(&mut deferred, Some(WIPE_PROTOCOL_VERSION)),
             Some(preview)
         );
         assert_eq!(
-            pop_supported_deferred_intent(&mut deferred, true),
+            pop_supported_deferred_intent(&mut deferred, Some(WIPE_PROTOCOL_VERSION)),
             Some(StudioIntent::Cut)
         );
         assert_eq!(
-            pop_supported_deferred_intent(&mut deferred, true),
+            pop_supported_deferred_intent(&mut deferred, Some(WIPE_PROTOCOL_VERSION)),
             Some(fade)
         );
     }
@@ -1571,6 +1631,26 @@ mod tests {
         }
     }
 
+    fn manual_status(
+        kind: ManualTransitionKind,
+        interval_start: u16,
+        position: u16,
+    ) -> ManualTransitionStatus {
+        ManualTransitionStatus::Active(ManualTransitionState {
+            kind,
+            from: wire_input(1),
+            to: wire_input(2),
+            interval_start: ManualTransitionPosition::new(interval_start).unwrap(),
+            position: ManualTransitionPosition::new(position).unwrap(),
+        })
+    }
+
+    fn manual_projection(negotiated: ProtocolVersion) -> Option<ManualTransitionStatus> {
+        (negotiated.major == MANUAL_TRANSITION_PROTOCOL_VERSION.major
+            && negotiated.minor >= MANUAL_TRANSITION_PROTOCOL_VERSION.minor)
+            .then_some(ManualTransitionStatus::Inactive)
+    }
+
     fn accept_worker_snapshot(listener: &TcpListener) -> FakePeer {
         accept_worker_snapshot_at(listener, 4, 2, 2)
     }
@@ -1628,8 +1708,8 @@ mod tests {
             desired_preview: wire_input(desired_preview),
             realized_program: wire_input(1),
             realized_preview: wire_input(realized_preview),
-            desired_manual_transition: None,
-            realized_manual_transition: None,
+            desired_manual_transition: manual_projection(negotiated),
+            realized_manual_transition: manual_projection(negotiated),
         }));
         peer
     }
@@ -1706,8 +1786,8 @@ mod tests {
             desired_preview: wire_input(desired.1),
             realized_program: wire_input(realized.0),
             realized_preview: wire_input(realized.1),
-            desired_manual_transition: None,
-            realized_manual_transition: None,
+            desired_manual_transition: manual_projection(negotiated),
+            realized_manual_transition: manual_projection(negotiated),
         }));
         peer
     }
@@ -1842,6 +1922,100 @@ mod tests {
                 manual_transition: None,
             },
         }));
+    }
+
+    fn serve_worker_manual_t_bar(listener: &TcpListener) {
+        let mut peer = accept_worker_snapshot_version_at(
+            listener,
+            MANUAL_TRANSITION_PROTOCOL_VERSION,
+            4,
+            2,
+            2,
+        );
+        let steps = [
+            (
+                CommandPayload::StartManualTransition {
+                    kind: ManualTransitionKind::Wipe,
+                },
+                Some((ManualTransitionKind::Wipe, 0, 0)),
+                (1, 2),
+            ),
+            (
+                CommandPayload::SetManualTransitionPosition {
+                    position: ManualTransitionPosition::END,
+                },
+                Some((ManualTransitionKind::Wipe, 0, 10_000)),
+                (1, 2),
+            ),
+            (
+                CommandPayload::SetManualTransitionPosition {
+                    position: ManualTransitionPosition::new(2_500).unwrap(),
+                },
+                Some((ManualTransitionKind::Wipe, 0, 2_500)),
+                (1, 2),
+            ),
+            (CommandPayload::CancelManualTransition, None, (1, 2)),
+            (
+                CommandPayload::StartManualTransition {
+                    kind: ManualTransitionKind::Fade,
+                },
+                Some((ManualTransitionKind::Fade, 0, 0)),
+                (1, 2),
+            ),
+            (
+                CommandPayload::SetManualTransitionPosition {
+                    position: ManualTransitionPosition::END,
+                },
+                Some((ManualTransitionKind::Fade, 0, 10_000)),
+                (1, 2),
+            ),
+            (CommandPayload::CommitManualTransition, None, (2, 1)),
+        ];
+
+        for (offset, (payload, active, routing)) in steps.into_iter().enumerate() {
+            let WireMessage::Command(command) = peer.receive() else {
+                panic!("expected manual T-bar command");
+            };
+            let revision = 5 + u64::try_from(offset).unwrap();
+            assert_eq!(command.protocol, MANUAL_TRANSITION_PROTOCOL_VERSION);
+            assert_eq!(command.expected_revision, Some(revision - 1));
+            assert_eq!(command.payload, payload);
+            peer.send(&WireMessage::CommandResult(CommandResult::Accepted {
+                id: command.id,
+                revision,
+                scheduled_frame: Some(revision),
+            }));
+            let desired_manual_transition = active.map(|(kind, interval_start, position)| {
+                manual_status(kind, interval_start, position)
+            });
+            peer.send(&WireMessage::Event(EventMessage {
+                cursor: EventCursor {
+                    engine: test_engine(),
+                    revision,
+                },
+                payload: EventPayload::DesiredSwitcher {
+                    program: wire_input(routing.0),
+                    preview: wire_input(routing.1),
+                    manual_transition: Some(
+                        desired_manual_transition.unwrap_or(ManualTransitionStatus::Inactive),
+                    ),
+                },
+            }));
+            let realized_manual_transition =
+                active.map(|(kind, _, position)| manual_status(kind, position, position));
+            peer.send(&WireMessage::RuntimeEvent(RuntimeEventMessage {
+                server: test_server(),
+                revision,
+                generation: revision,
+                sequence: 1,
+                event: RuntimeLifecycleEvent::Realized {
+                    domain: "switcher".to_owned(),
+                    manual_transition: Some(
+                        realized_manual_transition.unwrap_or(ManualTransitionStatus::Inactive),
+                    ),
+                },
+            }));
+        }
     }
 
     fn serve_worker_receipt_collision(listener: &TcpListener) {
@@ -2157,7 +2331,7 @@ mod tests {
                         && view.switcher.realized.preview == wire_input(1).to_domain()
                 })
             {
-                assert!(state.supports_wipe);
+                assert!(state.transition_protocol.wipe);
                 assert_eq!(state.error, None);
                 break;
             }
@@ -2169,16 +2343,122 @@ mod tests {
     }
 
     #[test]
-    fn runtime_state_tracks_wipe_support_across_protocol_reconnects() {
+    fn worker_manual_t_bar_flow_observes_hold_reverse_cancel_and_commit_from_model() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || serve_worker_manual_t_bar(&listener));
+        let (requests, states, worker) = spawn_test_worker(address);
+        let ready = loop {
+            let state = states.recv_timeout(Duration::from_secs(3)).unwrap();
+            if state.connection_status == StudioConnectionStatus::Ready {
+                break state;
+            }
+        };
+        assert!(ready.transition_protocol.manual);
+
+        let steps = [
+            (
+                StudioIntent::StartManualTransition {
+                    kind: ManualTransitionKind::Wipe,
+                },
+                5,
+                Some((ManualTransitionKind::Wipe, 0)),
+            ),
+            (
+                StudioIntent::SetManualTransitionPosition {
+                    position: ManualTransitionPosition::END,
+                },
+                6,
+                Some((ManualTransitionKind::Wipe, 10_000)),
+            ),
+            (
+                StudioIntent::SetManualTransitionPosition {
+                    position: ManualTransitionPosition::new(2_500).unwrap(),
+                },
+                7,
+                Some((ManualTransitionKind::Wipe, 2_500)),
+            ),
+            (StudioIntent::CancelManualTransition, 8, None),
+            (
+                StudioIntent::StartManualTransition {
+                    kind: ManualTransitionKind::Fade,
+                },
+                9,
+                Some((ManualTransitionKind::Fade, 0)),
+            ),
+            (
+                StudioIntent::SetManualTransitionPosition {
+                    position: ManualTransitionPosition::END,
+                },
+                10,
+                Some((ManualTransitionKind::Fade, 10_000)),
+            ),
+            (StudioIntent::CommitManualTransition, 11, None),
+        ];
+
+        for (intent, revision, expected) in steps {
+            try_enqueue(&requests, WorkerRequest::Intent(intent)).unwrap();
+            loop {
+                let state = states.recv_timeout(Duration::from_secs(3)).unwrap();
+                assert_eq!(state.error, None, "manual worker state: {state:?}");
+                let Some(view) = state.view.as_ref() else {
+                    continue;
+                };
+                if state.pending_commands != 0 || view.cursor.revision.get() != revision {
+                    continue;
+                }
+                let desired_matches = match (view.switcher.desired_manual_transition, expected) {
+                    (
+                        fm_ui_model::ManualTransitionStatus::Active(active),
+                        Some((kind, position)),
+                    ) => active.kind == kind && active.position.basis_points() == position,
+                    (fm_ui_model::ManualTransitionStatus::Inactive, None) => true,
+                    _ => false,
+                };
+                let realized_matches = match (view.switcher.realized_manual_transition, expected) {
+                    (
+                        fm_ui_model::ManualTransitionStatus::Active(active),
+                        Some((kind, position)),
+                    ) => {
+                        active.kind == kind
+                            && active.interval_start.basis_points() == position
+                            && active.position.basis_points() == position
+                    }
+                    (fm_ui_model::ManualTransitionStatus::Inactive, None) => true,
+                    _ => false,
+                };
+                if !desired_matches || !realized_matches {
+                    continue;
+                }
+                if revision == 11 {
+                    assert_eq!(view.switcher.realized.program, wire_input(2).to_domain());
+                    assert_eq!(view.switcher.realized.preview, wire_input(1).to_domain());
+                }
+                break;
+            }
+        }
+
+        try_enqueue(&requests, WorkerRequest::Shutdown).unwrap();
+        worker.join().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn runtime_state_hides_manual_controls_after_protocol_1_4_downgrade() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
-            let mut first =
-                accept_worker_snapshot_version_at(&listener, WIPE_PROTOCOL_VERSION, 4, 2, 2);
+            let mut first = accept_worker_snapshot_version_at(
+                &listener,
+                MANUAL_TRANSITION_PROTOCOL_VERSION,
+                4,
+                2,
+                2,
+            );
             assert_eq!(first.stream.read(&mut [0_u8; 1]).unwrap(), 0);
             accept_worker_reconnect_snapshot_version(
                 &listener,
-                ProtocolVersion::new(1, 2),
+                WIPE_PROTOCOL_VERSION,
                 4,
                 (1, 2),
                 (1, 2),
@@ -2196,15 +2476,75 @@ mod tests {
         let mut runtime = StudioRuntime::new(config).unwrap();
         runtime.connect(CONNECT_TIMEOUT).unwrap();
         let current = runtime_state(&mut runtime, None);
-        assert!(current.supports_wipe);
+        assert!(current.transition_protocol.wipe);
+        assert!(current.transition_protocol.manual);
         assert!(current.can_transition);
         runtime.session_mut().disconnect().unwrap();
         runtime
             .reconnect(Duration::from_millis(250), CONNECT_TIMEOUT)
             .unwrap();
         let downgraded = runtime_state(&mut runtime, None);
-        assert!(!downgraded.supports_wipe);
+        assert!(downgraded.transition_protocol.wipe);
+        assert!(!downgraded.transition_protocol.manual);
         assert!(downgraded.can_transition, "Cut/Fade permission was lost");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn runtime_state_keeps_manual_transition_permission_separate_from_protocol_support() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut peer = FakePeer::accept(&listener);
+            let WireMessage::HandshakeRequest(request) = peer.receive() else {
+                panic!("expected snapshot handshake request");
+            };
+            assert_eq!(request.resume_cursor, None);
+            peer.send(&WireMessage::HandshakeResponse(HandshakeResponse {
+                negotiated: MANUAL_TRANSITION_PROTOCOL_VERSION,
+                granted_role: Role::Operator,
+                permissions: vec!["view_status".to_owned()],
+                capabilities: CapabilityReportSummary {
+                    digest: "sha256:worker-test".to_owned(),
+                    total: 1,
+                    available: 1,
+                    degraded: 0,
+                    unavailable: 0,
+                },
+                server: test_server(),
+                current_revision: 4,
+                outcome: HandshakeOutcome::Snapshot {
+                    reason: SnapshotReason::NoCursor,
+                },
+            }));
+            peer.send(&WireMessage::Snapshot(SnapshotMessage {
+                engine: test_engine(),
+                revision: 4,
+                show_name: "Permission test".to_owned(),
+                inputs: vec![wire_input(1), wire_input(2)],
+                desired_program: wire_input(1),
+                desired_preview: wire_input(2),
+                realized_program: wire_input(1),
+                realized_preview: wire_input(2),
+                desired_manual_transition: Some(ManualTransitionStatus::Inactive),
+                realized_manual_transition: Some(ManualTransitionStatus::Inactive),
+            }));
+        });
+        let config = StudioConfig {
+            connection: ConnectionConfig::Existing(ExistingConfig {
+                address,
+                expected_project_id: test_project_id(),
+            }),
+            client_id: "permission-test".to_owned(),
+            desired_role: Role::Operator,
+            restart_policy: RestartPolicy::default(),
+        };
+        let mut runtime = StudioRuntime::new(config).unwrap();
+        runtime.connect(CONNECT_TIMEOUT).unwrap();
+        let state = runtime_state(&mut runtime, None);
+        assert_eq!(state.connection_status, StudioConnectionStatus::Ready);
+        assert!(state.transition_protocol.manual);
+        assert!(!state.can_transition);
         server.join().unwrap();
     }
 
@@ -2251,7 +2591,7 @@ mod tests {
                         && view.switcher.realized.preview == wire_input(2).to_domain()
                 })
             {
-                assert!(state.supports_wipe);
+                assert!(state.transition_protocol.wipe);
                 assert!(saw_pending_notice);
                 break;
             }
@@ -2261,91 +2601,128 @@ mod tests {
         server.join().unwrap();
     }
 
+    fn serve_unresolved_manual_downgrade(listener: &TcpListener) {
+        let mut first = accept_worker_snapshot_version_at(
+            listener,
+            MANUAL_TRANSITION_PROTOCOL_VERSION,
+            4,
+            2,
+            2,
+        );
+        let WireMessage::Command(original) = first.receive() else {
+            panic!("expected original manual command");
+        };
+        assert!(matches!(
+            original.payload,
+            CommandPayload::StartManualTransition {
+                kind: ManualTransitionKind::Fade
+            }
+        ));
+        drop(first);
+
+        let (mut downgraded, revision) =
+            accept_worker_resume_version(listener, WIPE_PROTOCOL_VERSION, 4);
+        assert_eq!(revision, 4);
+        assert_eq!(
+            downgraded.stream.read(&mut [0_u8; 1]).unwrap(),
+            0,
+            "protocol 1.4 manual head or later Cut reached protocol 1.3"
+        );
+
+        let mut compatible = accept_worker_reconnect_snapshot_version(
+            listener,
+            MANUAL_TRANSITION_PROTOCOL_VERSION,
+            4,
+            (1, 2),
+            (1, 2),
+        );
+        let WireMessage::Command(retried) = compatible.receive() else {
+            panic!("expected unresolved manual retry");
+        };
+        assert_eq!(retried, original);
+        compatible.send(&WireMessage::CommandResult(CommandResult::Rejected {
+            id: retried.id,
+            code: "conflict".to_owned(),
+            message: "manual transition was not applied".to_owned(),
+            fields: Vec::new(),
+            current_revision: 4,
+            retryable: false,
+        }));
+
+        let WireMessage::Command(cut) = compatible.receive() else {
+            panic!("expected deferred Cut after manual head resolved");
+        };
+        assert_eq!(cut.protocol, MANUAL_TRANSITION_PROTOCOL_VERSION);
+        assert_eq!(cut.payload, CommandPayload::Cut);
+        assert_eq!(cut.expected_revision, Some(4));
+        assert_ne!(cut.idempotency_key, original.idempotency_key);
+        compatible.send(&WireMessage::CommandResult(CommandResult::Accepted {
+            id: cut.id,
+            revision: 5,
+            scheduled_frame: None,
+        }));
+        compatible.send(&WireMessage::Event(EventMessage {
+            cursor: EventCursor {
+                engine: test_engine(),
+                revision: 5,
+            },
+            payload: EventPayload::DesiredSwitcher {
+                program: wire_input(2),
+                preview: wire_input(1),
+                manual_transition: Some(ManualTransitionStatus::Inactive),
+            },
+        }));
+        compatible.send(&WireMessage::RuntimeEvent(RuntimeEventMessage {
+            server: test_server(),
+            revision: 5,
+            generation: 1,
+            sequence: 1,
+            event: RuntimeLifecycleEvent::Realized {
+                domain: "switcher".to_owned(),
+                manual_transition: Some(ManualTransitionStatus::Inactive),
+            },
+        }));
+    }
+
     #[test]
-    fn unresolved_wipe_downgrade_is_visible_and_retries_only_on_1_3() {
+    fn unresolved_manual_head_blocks_fifo_on_1_3_and_retries_only_on_1_4() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
-        let server = thread::spawn(move || {
-            let mut first =
-                accept_worker_snapshot_version_at(&listener, WIPE_PROTOCOL_VERSION, 4, 2, 2);
-            let WireMessage::Command(original) = first.receive() else {
-                panic!("expected original Wipe command");
-            };
-            drop(first);
-
-            let (mut downgraded, revision) =
-                accept_worker_resume_version(&listener, ProtocolVersion::new(1, 2), 4);
-            assert_eq!(revision, 4);
-            assert_eq!(
-                downgraded.stream.read(&mut [0_u8; 1]).unwrap(),
-                0,
-                "unresolved Wipe reached protocol 1.2"
-            );
-
-            let mut compatible = accept_worker_reconnect_snapshot_version(
-                &listener,
-                WIPE_PROTOCOL_VERSION,
-                4,
-                (1, 2),
-                (1, 2),
-            );
-            let WireMessage::Command(retried) = compatible.receive() else {
-                panic!("expected unresolved Wipe retry");
-            };
-            assert_eq!(retried, original);
-            compatible.send(&WireMessage::CommandResult(CommandResult::Accepted {
-                id: retried.id,
-                revision: 5,
-                scheduled_frame: None,
-            }));
-            compatible.send(&WireMessage::Event(EventMessage {
-                cursor: EventCursor {
-                    engine: test_engine(),
-                    revision: 5,
-                },
-                payload: EventPayload::DesiredSwitcher {
-                    program: wire_input(2),
-                    preview: wire_input(1),
-                    manual_transition: None,
-                },
-            }));
-            compatible.send(&WireMessage::RuntimeEvent(RuntimeEventMessage {
-                server: test_server(),
-                revision: 5,
-                generation: 1,
-                sequence: 1,
-                event: RuntimeLifecycleEvent::Realized {
-                    domain: "switcher".to_owned(),
-                    manual_transition: None,
-                },
-            }));
-        });
+        let server = thread::spawn(move || serve_unresolved_manual_downgrade(&listener));
 
         let (requests, states, worker) = spawn_test_worker(address);
         wait_until_ready(&states);
         try_enqueue(
             &requests,
-            WorkerRequest::Intent(StudioIntent::Wipe {
-                duration_frames: 45,
+            WorkerRequest::Intent(StudioIntent::StartManualTransition {
+                kind: ManualTransitionKind::Fade,
             }),
         )
         .unwrap();
         let mut saw_pending_incompatible = false;
+        let mut queued_cut = false;
         loop {
             let state = states.recv_timeout(Duration::from_secs(3)).unwrap();
-            saw_pending_incompatible |= state.connection_status
-                == StudioConnectionStatus::PendingIncompatible
-                && state.error.as_deref().is_some_and(|error| {
-                    error.contains("requires protocol 1.3") && error.contains("negotiated 1.2")
+            if state.connection_status == StudioConnectionStatus::PendingIncompatible {
+                saw_pending_incompatible |= state.error.as_deref().is_some_and(|error| {
+                    error.contains("requires protocol 1.4") && error.contains("negotiated 1.3")
                 });
+                if !queued_cut {
+                    try_enqueue(&requests, WorkerRequest::Intent(StudioIntent::Cut)).unwrap();
+                    queued_cut = true;
+                }
+            }
             if state.pending_commands == 0
+                && queued_cut
                 && state.view.as_ref().is_some_and(|view| {
                     view.cursor.revision.get() == 5
                         && view.switcher.realized.program == wire_input(2).to_domain()
                 })
             {
                 assert!(saw_pending_incompatible);
-                assert!(state.supports_wipe);
+                assert!(state.notice.is_none());
+                assert!(state.transition_protocol.wipe);
+                assert!(state.transition_protocol.manual);
                 break;
             }
         }

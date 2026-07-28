@@ -46,6 +46,20 @@ impl FakeRemoteServer {
         Self { address, worker }
     }
 
+    fn start_old_without_manual_t_bar() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || serve_old_daemon_without_manual_t_bar(&listener));
+        Self { address, worker }
+    }
+
+    fn start_manual_position() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || serve_manual_position(&listener));
+        Self { address, worker }
+    }
+
     fn address(&self) -> String {
         self.address.to_string()
     }
@@ -184,6 +198,116 @@ fn serve_old_daemon_without_wipe(listener: &TcpListener) {
     assert!(unexpected.is_empty());
 }
 
+fn serve_old_daemon_without_manual_t_bar(listener: &TcpListener) {
+    let engine = EngineIdentity {
+        engine_id: "project-42".into(),
+        state_epoch: 1,
+        log_id: "fake-remote-log".into(),
+    };
+    let (stream, _) = listener.accept().unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(stream);
+    assert_client_hello(read_message(&mut reader));
+    write_handshake_version(&mut writer, &engine, 0, ProtocolVersion::new(1, 3));
+
+    let mut unexpected = String::new();
+    assert_eq!(reader.read_line(&mut unexpected).unwrap(), 0);
+    assert!(
+        unexpected.is_empty(),
+        "protocol 1.4 command reached a 1.3 daemon"
+    );
+}
+
+fn serve_manual_position(listener: &TcpListener) {
+    let engine = EngineIdentity {
+        engine_id: "project-42".into(),
+        state_epoch: 1,
+        log_id: "fake-remote-log".into(),
+    };
+    let (stream, _) = listener.accept().unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(stream);
+    assert_client_hello(read_message(&mut reader));
+    let initial_manual =
+        fm_protocol::ManualTransitionStatus::Active(fm_protocol::ManualTransitionState {
+            kind: fm_protocol::ManualTransitionKind::Fade,
+            from: input(1),
+            to: input(2),
+            interval_start: fm_protocol::ManualTransitionPosition::START,
+            position: fm_protocol::ManualTransitionPosition::START,
+        });
+    write_handshake_version_with_manual(
+        &mut writer,
+        &engine,
+        0,
+        fm_protocol::MANUAL_TRANSITION_PROTOCOL_VERSION,
+        initial_manual,
+    );
+
+    let WireMessage::Command(command) = read_message(&mut reader) else {
+        panic!("expected remote manual-position command");
+    };
+    assert_eq!(
+        command.protocol,
+        fm_protocol::MANUAL_TRANSITION_PROTOCOL_VERSION
+    );
+    assert_eq!(
+        command.payload,
+        CommandPayload::SetManualTransitionPosition {
+            position: fm_protocol::ManualTransitionPosition::END,
+        }
+    );
+    assert_eq!(command.idempotency_key, "manual-endpoint");
+    assert_eq!(command.expected_revision, Some(0));
+    write_message(
+        &mut writer,
+        &WireMessage::CommandResult(CommandResult::Accepted {
+            id: command.id,
+            revision: 1,
+            scheduled_frame: Some(1),
+        }),
+    );
+    let desired_state = fm_protocol::ManualTransitionState {
+        kind: fm_protocol::ManualTransitionKind::Fade,
+        from: input(1),
+        to: input(2),
+        interval_start: fm_protocol::ManualTransitionPosition::START,
+        position: fm_protocol::ManualTransitionPosition::END,
+    };
+    write_message(
+        &mut writer,
+        &WireMessage::Event(EventMessage {
+            cursor: EventCursor {
+                engine: engine.clone(),
+                revision: 1,
+            },
+            payload: EventPayload::DesiredSwitcher {
+                program: input(1),
+                preview: input(2),
+                manual_transition: Some(fm_protocol::ManualTransitionStatus::Active(desired_state)),
+            },
+        }),
+    );
+    let realized =
+        fm_protocol::ManualTransitionStatus::Active(fm_protocol::ManualTransitionState {
+            interval_start: fm_protocol::ManualTransitionPosition::END,
+            ..desired_state
+        });
+    write_message(
+        &mut writer,
+        &WireMessage::RuntimeEvent(RuntimeEventMessage {
+            server: server_identity(&engine),
+            revision: 1,
+            generation: 1,
+            sequence: 1,
+            event: RuntimeLifecycleEvent::Realized {
+                domain: "switcher".into(),
+                manual_transition: Some(realized),
+            },
+        }),
+    );
+}
+
 fn assert_client_hello(message: WireMessage) {
     let WireMessage::ClientHello(hello) = message else {
         panic!("expected client hello");
@@ -195,10 +319,35 @@ fn assert_client_hello(message: WireMessage) {
 }
 
 fn write_handshake(writer: &mut TcpStream, engine: &EngineIdentity, revision: u64) {
+    write_handshake_version(writer, engine, revision, ProtocolVersion::new(1, 0));
+}
+
+fn write_handshake_version(
+    writer: &mut TcpStream,
+    engine: &EngineIdentity,
+    revision: u64,
+    negotiated: ProtocolVersion,
+) {
+    write_handshake_version_with_manual(
+        writer,
+        engine,
+        revision,
+        negotiated,
+        fm_protocol::ManualTransitionStatus::Inactive,
+    );
+}
+
+fn write_handshake_version_with_manual(
+    writer: &mut TcpStream,
+    engine: &EngineIdentity,
+    revision: u64,
+    negotiated: ProtocolVersion,
+    manual_transition: fm_protocol::ManualTransitionStatus,
+) {
     write_message(
         writer,
         &WireMessage::ServerHello(ServerHello {
-            negotiated: ProtocolVersion::new(1, 0),
+            negotiated,
             granted_role: Role::Operator,
             permissions: vec!["switcher.write".into()],
             capabilities_digest: "fake-capabilities".into(),
@@ -219,8 +368,8 @@ fn write_handshake(writer: &mut TcpStream, engine: &EngineIdentity, revision: u6
             desired_preview: preview,
             realized_program: input(1),
             realized_preview: preview,
-            desired_manual_transition: None,
-            realized_manual_transition: None,
+            desired_manual_transition: (negotiated.minor >= 4).then_some(manual_transition),
+            realized_manual_transition: (negotiated.minor >= 4).then_some(manual_transition),
         }),
     );
 }
@@ -408,6 +557,40 @@ fn new_cli_does_not_send_wipe_to_an_old_daemon() {
 }
 
 #[test]
+fn cli_does_not_send_manual_t_bar_commands_to_a_protocol_1_3_daemon() {
+    let server = FakeRemoteServer::start_old_without_manual_t_bar();
+    let output = invoke(&[
+        "remote-tbar-start",
+        &server.address(),
+        "fade",
+        "--key",
+        "unsupported-manual",
+    ]);
+    assert_failure_contains(
+        &output,
+        "command requires protocol 1.4, but the session negotiated 1.3",
+    );
+    server.finish();
+}
+
+#[test]
+fn remote_t_bar_position_preserves_the_exact_endpoint_and_replicated_status() {
+    let server = FakeRemoteServer::start_manual_position();
+    let output = invoke(&[
+        "remote-tbar-position",
+        &server.address(),
+        "10000",
+        "--key",
+        "manual-endpoint",
+        "--expect",
+        "0",
+    ]);
+    assert_success(&output);
+    assert!(stdout(&output).contains("TBar(desired=fade:1->2@10000, realized=fade:1->2@10000)"));
+    server.finish();
+}
+
+#[test]
 fn remote_commands_reject_durable_events_before_command_results() {
     assert_premature_event_rejected(PrematureEvent::Durable);
 }
@@ -481,6 +664,116 @@ fn local_wipe_preserves_duration_and_idempotency_contract() {
     assert_eq!(manifest(&context.project), wipe_manifest);
 
     fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
+fn local_manual_t_bar_holds_reverses_cancels_commits_and_survives_each_restart() {
+    let context = ContractContext::new();
+    assert_success(&invoke(&["new", context.project_path()]));
+
+    let start_wipe = invoke(&[
+        "tbar-start",
+        context.project_path(),
+        "wipe",
+        "--key",
+        "manual-wipe-start",
+        "--expect",
+        "0",
+    ]);
+    assert_success(&start_wipe);
+    assert!(stdout(&start_wipe).contains("TBar(desired=wipe:1->2@0, realized=wipe:1->2@0)"));
+    assert_eq!(status(&context.project), stdout(&start_wipe));
+
+    let endpoint = invoke(&[
+        "tbar-position",
+        context.project_path(),
+        "10000",
+        "--key",
+        "manual-end",
+        "--expect",
+        "1",
+    ]);
+    assert_success(&endpoint);
+    assert!(stdout(&endpoint).contains("TBar(desired=wipe:1->2@10000, realized=wipe:1->2@10000)"));
+    assert_eq!(status(&context.project), stdout(&endpoint));
+    let endpoint_manifest = manifest(&context.project);
+    assert!(endpoint_manifest.contains(
+        r#""desired": {"kind": "wipe", "from_id": 1, "to_id": 2, "interval_start_basis_points": 0, "position_basis_points": 10000}"#
+    ));
+    assert!(endpoint_manifest.contains(
+        r#""realized": {"kind": "wipe", "from_id": 1, "to_id": 2, "interval_start_basis_points": 10000, "position_basis_points": 10000}"#
+    ));
+
+    let reversed = invoke(&[
+        "tbar-position",
+        context.project_path(),
+        "2500",
+        "--key",
+        "manual-reverse",
+        "--expect",
+        "2",
+    ]);
+    assert_success(&reversed);
+    assert!(stdout(&reversed).contains("TBar(desired=wipe:1->2@2500, realized=wipe:1->2@2500)"));
+    assert_eq!(status(&context.project), stdout(&reversed));
+
+    let cancelled = invoke(&[
+        "tbar-cancel",
+        context.project_path(),
+        "--key",
+        "manual-cancel",
+        "--expect",
+        "3",
+    ]);
+    assert_success(&cancelled);
+    assert_status(&stdout(&cancelled), 4, 4, 1, 1, 2, 2);
+    assert!(stdout(&cancelled).contains("TBar(desired=inactive, realized=inactive)"));
+
+    for (command, revision, key) in [
+        ("tbar-start", "4", "manual-fade-start"),
+        ("tbar-position", "5", "manual-fade-end"),
+    ] {
+        let value = if command == "tbar-start" {
+            "fade"
+        } else {
+            "10000"
+        };
+        let output = invoke(&[
+            command,
+            context.project_path(),
+            value,
+            "--key",
+            key,
+            "--expect",
+            revision,
+        ]);
+        assert_success(&output);
+    }
+    let committed = invoke(&[
+        "tbar-commit",
+        context.project_path(),
+        "--key",
+        "manual-commit",
+        "--expect",
+        "6",
+    ]);
+    assert_success(&committed);
+    assert_status(&stdout(&committed), 7, 7, 2, 2, 1, 1);
+    assert!(stdout(&committed).contains("TBar(desired=inactive, realized=inactive)"));
+    assert_eq!(status(&context.project), stdout(&committed));
+
+    fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
+fn cli_rejects_fractional_and_out_of_range_t_bar_positions_before_project_io() {
+    let fractional = invoke(&["tbar-position", "missing.freemix", "62.5"]);
+    assert_failure_contains(&fractional, "invalid basis points value `62.5`");
+    let out_of_range = invoke(&["tbar-position", "missing.freemix", "10001"]);
+    assert_failure_contains(
+        &out_of_range,
+        "basis points must be in 0..=10000, got 10001",
+    );
 }
 
 struct ContractContext {
@@ -1021,6 +1314,53 @@ fn supported_legacy_manifest_is_migrated_before_cli_load() {
         "1",
     ]));
     assert_solid_ppm(&image, 2, 1, [73, 151, 199]);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn schema_v5_manual_state_migrates_then_mutates_and_restarts_exactly() {
+    let root = unique_test_root();
+    let project = root.join("manual-v5.freemix");
+    fs::create_dir_all(&project).unwrap();
+    fs::write(
+        project.join("project.json"),
+        include_str!("../../../crates/services/fm-persistence/tests/fixtures/schema-v5.json"),
+    )
+    .unwrap();
+
+    let migrated = status(&project);
+    assert!(migrated.contains("TBar(desired=fade:1->2@6250, realized=fade:1->2@6250)"));
+    let migrated_manifest = manifest(&project);
+    assert!(migrated_manifest.starts_with("{\n  \"schema_version\": 6,"));
+    assert!(migrated_manifest.contains(r#""mask": null"#));
+    assert!(migrated_manifest.contains(
+        r#""desired": {"kind": "fade", "from_id": 1, "to_id": 2, "interval_start_basis_points": 0, "position_basis_points": 6250}"#
+    ));
+    assert!(migrated_manifest.contains(
+        r#""realized": {"kind": "fade", "from_id": 1, "to_id": 2, "interval_start_basis_points": 6250, "position_basis_points": 6250}"#
+    ));
+
+    let reversed = invoke(&[
+        "tbar-position",
+        project.to_str().unwrap(),
+        "2500",
+        "--key",
+        "migrated-manual-reverse",
+        "--expect",
+        "0",
+    ]);
+    assert_success(&reversed);
+    assert_status(&stdout(&reversed), 1, 121, 1, 1, 2, 2);
+    assert!(stdout(&reversed).contains("TBar(desired=fade:1->2@2500, realized=fade:1->2@2500)"));
+    assert_eq!(status(&project), stdout(&reversed));
+    let saved = manifest(&project);
+    assert!(saved.contains(
+        r#""desired": {"kind": "fade", "from_id": 1, "to_id": 2, "interval_start_basis_points": 0, "position_basis_points": 2500}"#
+    ));
+    assert!(saved.contains(
+        r#""realized": {"kind": "fade", "from_id": 1, "to_id": 2, "interval_start_basis_points": 2500, "position_basis_points": 2500}"#
+    ));
 
     fs::remove_dir_all(root).unwrap();
 }
