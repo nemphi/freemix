@@ -60,6 +60,12 @@ pub enum Command {
         key: Option<String>,
         expected_revision: Option<u64>,
     },
+    Slide {
+        path: PathBuf,
+        frames: u32,
+        key: Option<String>,
+        expected_revision: Option<u64>,
+    },
     Wipe {
         path: PathBuf,
         frames: u32,
@@ -100,6 +106,12 @@ pub enum Command {
         expected_revision: Option<u64>,
     },
     RemoteAlphaFade {
+        address: SocketAddr,
+        frames: u32,
+        key: Option<String>,
+        expected_revision: Option<u64>,
+    },
+    RemoteSlide {
         address: SocketAddr,
         frames: u32,
         key: Option<String>,
@@ -222,7 +234,9 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
                 expected_revision,
             })
         }
-        "fade" | "alpha-fade" | "wipe" => parse_local_timed_transition(&command, arguments),
+        "fade" | "alpha-fade" | "slide" | "wipe" => {
+            parse_local_timed_transition(&command, arguments)
+        }
         "tbar-start" | "tbar-position" | "tbar-commit" | "tbar-cancel" => {
             parse_local_t_bar(&command, arguments)
         }
@@ -230,7 +244,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
         "remote-status" => parse_remote_status(arguments),
         "remote-preview" => parse_remote_preview(arguments),
         "remote-cut" => parse_remote_cut(arguments),
-        "remote-fade" | "remote-alpha-fade" | "remote-wipe" => {
+        "remote-fade" | "remote-alpha-fade" | "remote-slide" | "remote-wipe" => {
             parse_remote_timed_transition(&command, arguments)
         }
         "remote-tbar-start"
@@ -299,6 +313,12 @@ fn parse_local_timed_transition(
             expected_revision,
         },
         "alpha-fade" => Command::AlphaFade {
+            path,
+            frames,
+            key,
+            expected_revision,
+        },
+        "slide" => Command::Slide {
             path,
             frames,
             key,
@@ -436,6 +456,12 @@ fn parse_remote_timed_transition(
             expected_revision,
         },
         "remote-alpha-fade" => Command::RemoteAlphaFade {
+            address,
+            frames,
+            key,
+            expected_revision,
+        },
+        "remote-slide" => Command::RemoteSlide {
             address,
             frames,
             key,
@@ -645,6 +671,42 @@ mod tests {
                 address: "127.0.0.1:9123".parse().unwrap(),
                 frames: 12,
                 key: Some("remote-alpha-fade".into()),
+                expected_revision: None,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_local_and_remote_slide() {
+        assert_eq!(
+            parse(strings(&[
+                "slide",
+                "show.freemix",
+                "45",
+                "--key",
+                "slide-1",
+                "--expect",
+                "4",
+            ])),
+            Ok(Command::Slide {
+                path: "show.freemix".into(),
+                frames: 45,
+                key: Some("slide-1".into()),
+                expected_revision: Some(4),
+            })
+        );
+        assert_eq!(
+            parse(strings(&[
+                "remote-slide",
+                "127.0.0.1:9123",
+                "12",
+                "--key",
+                "remote-slide",
+            ])),
+            Ok(Command::RemoteSlide {
+                address: "127.0.0.1:9123".parse().unwrap(),
+                frames: 12,
+                key: Some("remote-slide".into()),
                 expected_revision: None,
             })
         );

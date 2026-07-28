@@ -698,13 +698,16 @@ Additive protocol 1.8 carries its exact duration, and client/server admission
 rejects it before mutation on older negotiated sessions. Daemon durable
 execution settles every requested frame before checkpointing; focused unit and
 process restart acceptances restore exact Program/Preview routing, counters,
-receipt history, and resume position. CLI, Web, Studio, and configured-output
-acceptance remain absent.
+receipt history, and resume position. CLI now exposes matching local and remote
+`slide ... <frames>` commands. Local execution settles and saves the bundle
+with replay-safe idempotency; remote execution preserves the exact duration and
+refuses to transmit after a protocol 1.7 downgrade. Web, Studio, and
+configured-output acceptance remain absent.
 
-Stinger, Slide operator controls, configured-output Slide evidence, Zoom, other
-transition families, cross-platform/fullscreen evidence, and complete `SW-004`
-acceptance remain pending; parity therefore stays planned. Item 5 and RC-007
-remain planned.
+Stinger, Slide Web and Studio controls, configured-output Slide evidence, Zoom,
+other transition families, cross-platform/fullscreen evidence, and complete
+`SW-004` acceptance remain pending; parity therefore stays planned. Item 5 and
+RC-007 remain planned.
 
 FTB groundwork now includes a switcher-owned bounded automatic control core
 alongside the compositor plan. The controller moves from its current exact

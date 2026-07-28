@@ -74,6 +74,20 @@ impl FakeRemoteServer {
         Self { address, worker }
     }
 
+    fn start_old_without_slide() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || serve_old_daemon_without_slide(&listener));
+        Self { address, worker }
+    }
+
+    fn start_slide() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || serve_slide(&listener));
+        Self { address, worker }
+    }
+
     fn start_fade_to_black() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -387,7 +401,7 @@ fn serve_old_daemon_without_alpha_fade(listener: &TcpListener) {
     );
 }
 
-fn serve_alpha_fade(listener: &TcpListener) {
+fn serve_old_daemon_without_slide(listener: &TcpListener) {
     let engine = EngineIdentity {
         engine_id: "project-42".into(),
         state_epoch: 1,
@@ -401,19 +415,65 @@ fn serve_alpha_fade(listener: &TcpListener) {
         &mut writer,
         &engine,
         0,
+        fm_protocol::MANUAL_ALPHA_FADE_PROTOCOL_VERSION,
+        live_fade_to_black(),
+    );
+
+    let mut unexpected = String::new();
+    assert_eq!(reader.read_line(&mut unexpected).unwrap(), 0);
+    assert!(
+        unexpected.is_empty(),
+        "protocol 1.8 command reached a 1.7 daemon"
+    );
+}
+
+fn serve_alpha_fade(listener: &TcpListener) {
+    serve_automatic_transition(
+        listener,
         fm_protocol::ALPHA_FADE_PROTOCOL_VERSION,
+        CommandPayload::AlphaFade { duration_frames: 3 },
+        "remote-alpha-fade",
+    );
+}
+
+fn serve_slide(listener: &TcpListener) {
+    serve_automatic_transition(
+        listener,
+        fm_protocol::SLIDE_PROTOCOL_VERSION,
+        CommandPayload::Slide { duration_frames: 3 },
+        "remote-slide",
+    );
+}
+
+fn serve_automatic_transition(
+    listener: &TcpListener,
+    negotiated: ProtocolVersion,
+    expected_payload: CommandPayload,
+    expected_key: &str,
+) {
+    let engine = EngineIdentity {
+        engine_id: "project-42".into(),
+        state_epoch: 1,
+        log_id: "fake-remote-log".into(),
+    };
+    let (stream, _) = listener.accept().unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(stream);
+    assert_client_hello(read_message(&mut reader));
+    write_handshake_version_with_fade_to_black(
+        &mut writer,
+        &engine,
+        0,
+        negotiated,
         live_fade_to_black(),
     );
 
     let WireMessage::Command(command) = read_message(&mut reader) else {
-        panic!("expected remote AlphaFade command");
+        panic!("expected remote automatic transition command");
     };
-    assert_eq!(command.protocol, fm_protocol::ALPHA_FADE_PROTOCOL_VERSION);
-    assert_eq!(
-        command.payload,
-        CommandPayload::AlphaFade { duration_frames: 3 }
-    );
-    assert_eq!(command.idempotency_key, "remote-alpha-fade");
+    assert_eq!(command.protocol, negotiated);
+    assert_eq!(command.payload, expected_payload);
+    assert_eq!(command.idempotency_key, expected_key);
     assert_eq!(command.expected_revision, Some(0));
     write_message(
         &mut writer,
@@ -1017,6 +1077,23 @@ fn cli_does_not_send_alpha_fade_to_a_protocol_1_5_daemon() {
 }
 
 #[test]
+fn cli_does_not_send_slide_to_a_protocol_1_7_daemon() {
+    let server = FakeRemoteServer::start_old_without_slide();
+    let output = invoke(&[
+        "remote-slide",
+        &server.address(),
+        "3",
+        "--key",
+        "unsupported-slide",
+    ]);
+    assert_failure_contains(
+        &output,
+        "command requires protocol 1.8, but the session negotiated 1.7",
+    );
+    server.finish();
+}
+
+#[test]
 fn cli_does_not_send_manual_alpha_fade_to_a_protocol_1_6_daemon() {
     let server = FakeRemoteServer::start_old_without_manual_alpha_fade();
     let output = invoke(&[
@@ -1061,6 +1138,22 @@ fn remote_alpha_fade_preserves_duration_and_protocol() {
         "3",
         "--key",
         "remote-alpha-fade",
+        "--expect",
+        "0",
+    ]);
+    assert_success(&output);
+    server.finish();
+}
+
+#[test]
+fn remote_slide_preserves_duration_and_protocol() {
+    let server = FakeRemoteServer::start_slide();
+    let output = invoke(&[
+        "remote-slide",
+        &server.address(),
+        "3",
+        "--key",
+        "remote-slide",
         "--expect",
         "0",
     ]);
@@ -1210,6 +1303,41 @@ fn local_alpha_fade_settles_and_preserves_idempotency_contract() {
     assert_success(&duplicate);
     assert_eq!(stdout(&duplicate), alpha_fade_status);
     assert_eq!(manifest(&context.project), alpha_fade_manifest);
+
+    fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
+fn local_slide_settles_and_preserves_idempotency_contract() {
+    let context = ContractContext::new();
+    assert_success(&invoke(&["new", context.project_path()]));
+
+    let slide = invoke(&[
+        "slide",
+        context.project_path(),
+        "3",
+        "--key",
+        "slide-three",
+        "--expect",
+        "0",
+    ]);
+    assert_success(&slide);
+    let slide_status = stdout(&slide);
+    assert_status(&slide_status, 1, 3, 2, 2, 1, 1);
+    let slide_manifest = manifest(&context.project);
+
+    let duplicate = invoke(&[
+        "slide",
+        context.project_path(),
+        "99",
+        "--key",
+        "slide-three",
+        "--expect",
+        "0",
+    ]);
+    assert_success(&duplicate);
+    assert_eq!(stdout(&duplicate), slide_status);
+    assert_eq!(manifest(&context.project), slide_manifest);
 
     fs::remove_dir_all(context.root).unwrap();
 }
