@@ -207,14 +207,16 @@ impl DriftEstimator {
         Ok(())
     }
 
-    /// Estimates a mapping from the complete observed span.
+    /// Estimates signed drift from the complete observed span without narrowing it.
+    ///
+    /// This is useful for callers that apply a bounded drift policy before
+    /// constructing a [`ClockMapping`].
     ///
     /// # Errors
     ///
     /// Returns [`MappingError::InsufficientSamples`] until two distinct sample
-    /// pairs are available, and an arithmetic error when the estimated mapping
-    /// cannot be represented.
-    pub fn mapping(self) -> Result<ClockMapping, MappingError> {
+    /// pairs are available.
+    pub fn estimated_drift_ppb(self) -> Result<i128, MappingError> {
         let (first_source, first_master) = self.first.ok_or(MappingError::InsufficientSamples)?;
         let (latest_source, latest_master) =
             self.latest.ok_or(MappingError::InsufficientSamples)?;
@@ -235,8 +237,20 @@ impl DriftEstimator {
             .checked_mul(PARTS_PER_BILLION)
             .ok_or(MappingError::ArithmeticOverflow)?
             / i128::from(source_delta);
-        let drift = scaled_rate - PARTS_PER_BILLION;
-        let drift_ppb = i64::try_from(drift).map_err(|_| MappingError::ArithmeticOverflow)?;
+        Ok(scaled_rate - PARTS_PER_BILLION)
+    }
+
+    /// Estimates a mapping from the complete observed span.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MappingError::InsufficientSamples`] until two distinct sample
+    /// pairs are available, and an arithmetic error when the estimated mapping
+    /// cannot be represented.
+    pub fn mapping(self) -> Result<ClockMapping, MappingError> {
+        let (first_source, first_master) = self.first.ok_or(MappingError::InsufficientSamples)?;
+        let drift_ppb = i64::try_from(self.estimated_drift_ppb()?)
+            .map_err(|_| MappingError::ArithmeticOverflow)?;
         ClockMapping::new(first_source, first_master, drift_ppb)
     }
 }
@@ -317,6 +331,21 @@ mod tests {
             mapping.map(sample(source, 2_001_000)).unwrap(),
             sample(master, 2_007_000)
         );
+    }
+
+    #[test]
+    fn estimator_exposes_drift_before_i64_narrowing() {
+        let source = domain(1);
+        let master = domain(2);
+        let mut estimator = DriftEstimator::new(source, master);
+        estimator
+            .observe(sample(source, 1), sample(master, 1))
+            .unwrap();
+        estimator
+            .observe(sample(source, 2), sample(master, u64::MAX))
+            .unwrap();
+        assert!(estimator.estimated_drift_ppb().unwrap() > i128::from(i64::MAX));
+        assert_eq!(estimator.mapping(), Err(MappingError::ArithmeticOverflow));
     }
 
     #[test]

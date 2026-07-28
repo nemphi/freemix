@@ -686,11 +686,23 @@ impl ClockMappedAudioSynchronizer {
         source: fm_clock::ClockSnapshot,
         master: fm_clock::ClockSnapshot,
     ) -> Result<ClockRecalibrationUpdate, ClockRecalibrationError> {
-        let (mapping, update) = self
+        let prepared = self
             .clock_recalibrator
-            .observe(self.mapping, source, master)?;
-        self.mapping = mapping;
-        if matches!(update, ClockRecalibrationUpdate::Recalibrated { .. }) {
+            .prepare_observation(self.mapping, source, master)?;
+        let candidate = if let Some(drift_ppb) = prepared.drift_ppb() {
+            match self.mapping_reanchored_at_render_frontier(drift_ppb) {
+                Ok(mapping) => Some(mapping),
+                Err(error) => {
+                    self.clock_recalibrator.reject_prepared_observation();
+                    return Err(error.into());
+                }
+            }
+        } else {
+            None
+        };
+        let update = self.clock_recalibrator.commit_observation(&prepared);
+        if let Some(mapping) = candidate {
+            self.mapping = mapping;
             self.render_generation = self.render_generation.wrapping_add(1);
         }
         Ok(update)
@@ -1460,11 +1472,18 @@ impl ClockMappedAudioSynchronizer {
         &self,
         output_sample: u64,
     ) -> Result<(i128, i128, i128), AudioSynchronizerError> {
+        self.source_phase_with_mapping(self.mapping, output_sample)
+    }
+
+    fn source_phase_with_mapping(
+        &self,
+        mapping: ClockMapping,
+        output_sample: u64,
+    ) -> Result<(i128, i128, i128), AudioSynchronizerError> {
         let source_rate = i128::from(self.source_rate.hertz());
         let master_timestamp =
             cadence_timestamp(self.master_origin, output_sample, self.output_rate)?;
-        let source_timestamp = self
-            .mapping
+        let source_timestamp = mapping
             .source_nanos_at_master(master_timestamp.as_nanos())
             .map_err(|_| AudioSynchronizerError::ArithmeticOverflow)?;
         let elapsed = i128::from(source_timestamp)
@@ -1503,6 +1522,45 @@ impl ClockMappedAudioSynchronizer {
             .checked_sub(source_boundary)
             .ok_or(AudioSynchronizerError::ArithmeticOverflow)?;
         Ok((source_sample, remainder, denominator))
+    }
+
+    fn mapping_reanchored_at_render_frontier(
+        &self,
+        drift_ppb: i64,
+    ) -> Result<ClockMapping, MappingError> {
+        let next_output_sample = self
+            .output_cursor
+            .map_or(self.master_origin.sample_index, |cursor| cursor.next_sample);
+        let master_nanos =
+            cadence_timestamp(self.master_origin, next_output_sample, self.output_rate)
+                .map_err(|_| MappingError::ArithmeticOverflow)?
+                .as_nanos();
+        let source_nanos = self.mapping.source_nanos_at_master(master_nanos)?;
+        let source_anchor = ClockSnapshot::new(
+            self.mapping.source_domain(),
+            fm_clock::ClockTime::from_nanos(
+                u64::try_from(source_nanos).map_err(|_| MappingError::ArithmeticOverflow)?,
+            ),
+        );
+        let master_anchor = ClockSnapshot::new(
+            self.mapping.master_domain(),
+            fm_clock::ClockTime::from_nanos(
+                u64::try_from(master_nanos).map_err(|_| MappingError::ArithmeticOverflow)?,
+            ),
+        );
+        let candidate = ClockMapping::new(source_anchor, master_anchor, drift_ppb)?;
+        let current_phase = self
+            .source_phase(next_output_sample)
+            .map_err(|_| MappingError::ArithmeticOverflow)?;
+        let candidate_phase = self
+            .source_phase_with_mapping(candidate, next_output_sample)
+            .map_err(|_| MappingError::ArithmeticOverflow)?;
+        if candidate_phase != current_phase
+            || candidate_phase.0 < i128::from(self.first_sample_index)
+        {
+            return Err(MappingError::ArithmeticOverflow);
+        }
+        Ok(candidate)
     }
 
     fn source_sample_requirement(

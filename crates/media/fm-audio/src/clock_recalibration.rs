@@ -214,7 +214,7 @@ impl ClockRecalibrator {
     pub(crate) fn reanchor(&mut self, mapping: ClockMapping) {
         self.observations.clear();
         self.current_drift_ppb = mapping.drift_ppb();
-        self.anchor_generation = self.anchor_generation.wrapping_add(1);
+        self.anchor_generation = next_anchor_generation(self.anchor_generation);
     }
 
     pub(crate) fn telemetry(&self) -> ClockRecalibrationTelemetry {
@@ -227,12 +227,12 @@ impl ClockRecalibrator {
         }
     }
 
-    pub(crate) fn observe(
+    pub(crate) fn prepare_observation(
         &mut self,
         mapping: ClockMapping,
         source: ClockSnapshot,
         master: ClockSnapshot,
-    ) -> Result<(ClockMapping, ClockRecalibrationUpdate), ClockRecalibrationError> {
+    ) -> Result<PreparedUpdate, ClockRecalibrationError> {
         let prepared = match self.prepare_update(mapping, source, master) {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -240,31 +240,36 @@ impl ClockRecalibrator {
                 return Err(error);
             }
         };
+        Ok(prepared)
+    }
 
+    pub(crate) fn commit_observation(
+        &mut self,
+        prepared: &PreparedUpdate,
+    ) -> ClockRecalibrationUpdate {
         if self.observations.len() == prepared.policy.window_observations {
             self.observations.pop_front();
         }
-        self.observations.push_back((source, master));
-        if let Some(candidate) = prepared.mapping {
-            self.current_drift_ppb = candidate.drift_ppb();
-            self.anchor_generation = self.anchor_generation.wrapping_add(1);
+        self.observations
+            .push_back((prepared.source, prepared.master));
+        if let Some(drift_ppb) = prepared.drift_ppb {
+            self.current_drift_ppb = drift_ppb;
+            self.anchor_generation = next_anchor_generation(self.anchor_generation);
             self.accepted_recalibrations = self.accepted_recalibrations.saturating_add(1);
-            Ok((
-                candidate,
-                ClockRecalibrationUpdate::Recalibrated {
-                    drift_ppb: candidate.drift_ppb(),
-                    clamped: prepared.clamped,
-                },
-            ))
+            ClockRecalibrationUpdate::Recalibrated {
+                drift_ppb,
+                clamped: prepared.clamped,
+            }
         } else {
-            Ok((
-                mapping,
-                ClockRecalibrationUpdate::Collecting {
-                    observations: self.observations.len(),
-                    required: prepared.policy.minimum_observations,
-                },
-            ))
+            ClockRecalibrationUpdate::Collecting {
+                observations: self.observations.len(),
+                required: prepared.policy.minimum_observations,
+            }
         }
+    }
+
+    pub(crate) fn reject_prepared_observation(&mut self) {
+        self.rejected_recalibrations = self.rejected_recalibrations.saturating_add(1);
     }
 
     fn prepare_update(
@@ -304,27 +309,53 @@ impl ClockRecalibrator {
         if projected_count < policy.minimum_observations {
             return Ok(PreparedUpdate {
                 policy,
-                mapping: None,
+                source,
+                master,
+                drift_ppb: None,
                 clamped: false,
             });
         }
 
-        let estimate = estimator.mapping()?;
-        let maximum_ppb = i64::from(policy.max_drift_ppm) * 1_000;
-        let drift_ppb = estimate.drift_ppb().clamp(-maximum_ppb, maximum_ppb);
-        let continuity_anchor = mapping.map(source)?;
-        let candidate = ClockMapping::new(source, continuity_anchor, drift_ppb)?;
-        debug_assert_eq!(candidate.map(source), Ok(continuity_anchor));
+        let estimated_drift_ppb = estimator.estimated_drift_ppb()?;
+        let maximum_ppb = i128::from(policy.max_drift_ppm) * 1_000;
+        let bounded_drift_ppb = estimated_drift_ppb.clamp(-maximum_ppb, maximum_ppb);
+        let drift_ppb =
+            i64::try_from(bounded_drift_ppb).expect("policy-bounded clock drift always fits i64");
         Ok(PreparedUpdate {
             policy,
-            mapping: Some(candidate),
-            clamped: drift_ppb != estimate.drift_ppb(),
+            source,
+            master,
+            drift_ppb: Some(drift_ppb),
+            clamped: bounded_drift_ppb != estimated_drift_ppb,
         })
     }
 }
 
-struct PreparedUpdate {
+pub(crate) struct PreparedUpdate {
     policy: ClockRecalibrationPolicy,
-    mapping: Option<ClockMapping>,
+    source: ClockSnapshot,
+    master: ClockSnapshot,
+    drift_ppb: Option<i64>,
     clamped: bool,
+}
+
+impl PreparedUpdate {
+    pub(crate) const fn drift_ppb(&self) -> Option<i64> {
+        self.drift_ppb
+    }
+}
+
+const fn next_anchor_generation(generation: u64) -> u64 {
+    generation.saturating_add(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_anchor_generation;
+
+    #[test]
+    fn anchor_generation_saturates() {
+        assert_eq!(next_anchor_generation(u64::MAX - 1), u64::MAX);
+        assert_eq!(next_anchor_generation(u64::MAX), u64::MAX);
+    }
 }
