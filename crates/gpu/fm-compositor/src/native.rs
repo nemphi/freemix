@@ -8,7 +8,9 @@ use fm_gpu::{
 };
 use fm_video::{CropRect, Rotation, Transform};
 
-use crate::{CompositionPlan, SourceId, TransitionKind, TransitionPlan, transition::wipe_boundary};
+use crate::{
+    CompositionPlan, RectMask, SourceId, TransitionKind, TransitionPlan, transition::wipe_boundary,
+};
 
 /// Maximum width or height accepted for a native layer transform.
 ///
@@ -16,7 +18,7 @@ use crate::{CompositionPlan, SourceId, TransitionKind, TransitionPlan, transitio
 /// arithmetic when combined with device-bounded source dimensions.
 pub const MAX_NATIVE_TRANSFORM_DIMENSION: u32 = 16_384;
 
-const COMPOSITION_UNIFORM_SIZE: usize = 64;
+const COMPOSITION_UNIFORM_SIZE: usize = 80;
 
 const COMPOSITION_FRAGMENT_SHADER: &str = r"
 struct LayerUniform {
@@ -33,9 +35,13 @@ struct LayerUniform {
     visible: u32,
     rotated_width: u32,
     rotated_height: u32,
-    padding_0: u32,
-    padding_1: u32,
-    padding_2: u32,
+    mask_left: u32,
+    mask_top: u32,
+    mask_right: u32,
+    mask_bottom: u32,
+    mask_enabled: u32,
+    mask_invert: u32,
+    padding: u32,
 };
 
 @group(0) @binding(0) var source_texture: texture_2d<f32>;
@@ -79,10 +85,21 @@ fn composition_fragment(@builtin(position) position: vec4<f32>) -> @location(0) 
         }
     }
 
-    let source_coordinates = vec2<u32>(
-        layer.crop_x + scaled.x * layer.crop_width / layer.scale_width,
-        layer.crop_y + scaled.y * layer.crop_height / layer.scale_height,
+    let cropped_coordinates = vec2<u32>(
+        scaled.x * layer.crop_width / layer.scale_width,
+        scaled.y * layer.crop_height / layer.scale_height,
     );
+    let inside_mask =
+        cropped_coordinates.x >= layer.mask_left &&
+        cropped_coordinates.y >= layer.mask_top &&
+        cropped_coordinates.x < layer.mask_right &&
+        cropped_coordinates.y < layer.mask_bottom;
+    if layer.mask_enabled != 0u && inside_mask == (layer.mask_invert != 0u) {
+        return vec4<f32>(0.0);
+    }
+
+    let source_coordinates =
+        vec2<u32>(layer.crop_x, layer.crop_y) + cropped_coordinates;
     let source = textureLoad(source_texture, vec2<i32>(source_coordinates), 0);
     return source * (f32(layer.opacity) / 255.0);
 }
@@ -385,7 +402,13 @@ fn validate_composition<'a>(
         let visible = transform_is_visible(plan.width(), plan.height(), layer.transform());
         prepared.push(PreparedLayer {
             texture,
-            uniform: encode_composition_uniform(layer.transform(), crop, layer.opacity(), visible),
+            uniform: encode_composition_uniform(
+                layer.transform(),
+                crop,
+                layer.mask(),
+                layer.opacity(),
+                visible,
+            ),
         });
     }
     Ok(prepared)
@@ -412,9 +435,6 @@ fn validate_supported_work(plan: &CompositionPlan) -> Result<(), NativeCompositi
         });
     }
     for (layer_index, layer) in plan.layers().iter().enumerate() {
-        if layer.mask().is_some() {
-            return Err(NativeCompositionError::UnsupportedMask { layer: layer_index });
-        }
         if layer.key().is_some() {
             return Err(NativeCompositionError::UnsupportedKey { layer: layer_index });
         }
@@ -495,6 +515,7 @@ fn transform_is_visible(output_width: u32, output_height: u32, transform: Transf
 fn encode_composition_uniform(
     transform: Transform,
     crop: CropRect,
+    mask: Option<RectMask>,
     opacity: u8,
     visible: bool,
 ) -> [u8; COMPOSITION_UNIFORM_SIZE] {
@@ -505,6 +526,23 @@ fn encode_composition_uniform(
         Rotation::Deg180 => 2,
         Rotation::Deg270 => 3,
     };
+    let (mask_left, mask_top, mask_right, mask_bottom, mask_enabled, mask_invert) =
+        if let Some(mask) = mask {
+            (
+                mask.x,
+                mask.y,
+                mask.x
+                    .checked_add(mask.width)
+                    .expect("compiled mask right edge cannot overflow"),
+                mask.y
+                    .checked_add(mask.height)
+                    .expect("compiled mask bottom edge cannot overflow"),
+                1,
+                u32::from(mask.invert),
+            )
+        } else {
+            (0, 0, 0, 0, 0, 0)
+        };
     let words = [
         transform.translation_x.cast_unsigned(),
         transform.translation_y.cast_unsigned(),
@@ -519,8 +557,12 @@ fn encode_composition_uniform(
         u32::from(visible),
         rotated_width,
         rotated_height,
-        0,
-        0,
+        mask_left,
+        mask_top,
+        mask_right,
+        mask_bottom,
+        mask_enabled,
+        mask_invert,
         0,
     ];
     let mut bytes = [0; COMPOSITION_UNIFORM_SIZE];
@@ -709,8 +751,8 @@ mod tests {
         Transform::new(x, y, width, height, rotation)
     }
 
-    fn uniform_words(uniform: [u8; COMPOSITION_UNIFORM_SIZE]) -> [u32; 16] {
-        let mut words = [0; 16];
+    fn uniform_words(uniform: [u8; COMPOSITION_UNIFORM_SIZE]) -> [u32; 20] {
+        let mut words = [0; 20];
         for (word, bytes) in words.iter_mut().zip(uniform.chunks_exact(4)) {
             *word = u32::from_le_bytes(bytes.try_into().unwrap());
         }
@@ -718,10 +760,12 @@ mod tests {
     }
 
     #[test]
-    fn composition_uniform_is_sixteen_little_endian_words() {
+    fn composition_uniform_is_twenty_little_endian_words_with_explicit_mask_bounds() {
         let transform = transform(-7, 9, 12, 5, Rotation::Deg90);
-        let uniform = encode_composition_uniform(transform, CropRect::new(2, 3, 4, 6), 128, true);
-        assert_eq!(uniform.len(), 64);
+        let mask = RectMask::new(5, 6, 7, 8).inverted(true);
+        let uniform =
+            encode_composition_uniform(transform, CropRect::new(2, 3, 4, 6), Some(mask), 128, true);
+        assert_eq!(uniform.len(), 80);
         assert_eq!(
             uniform_words(uniform),
             [
@@ -738,8 +782,12 @@ mod tests {
                 1,
                 5,
                 12,
-                0,
-                0,
+                5,
+                6,
+                12,
+                14,
+                1,
+                1,
                 0,
             ]
         );
@@ -792,6 +840,7 @@ mod tests {
             let words = uniform_words(encode_composition_uniform(
                 offscreen,
                 CropRect::new(0, 0, 1, 1),
+                None,
                 255,
                 false,
             ));
@@ -807,17 +856,14 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_native_plan_features_return_indexed_errors() {
+    fn rect_masks_are_supported_while_other_native_plan_features_return_indexed_errors() {
         let source = SourceId::new(1);
         let base = transform(0, 0, 1, 1, Rotation::Deg0);
 
         let mask = composition_plan(
             SourceLayer::new(source, 0, base).with_mask(RectMask::new(0, 0, 1, 1)),
         );
-        assert_eq!(
-            validate_supported_work(&mask),
-            Err(NativeCompositionError::UnsupportedMask { layer: 0 })
-        );
+        assert_eq!(validate_supported_work(&mask), Ok(()));
 
         let key = composition_plan(
             SourceLayer::new(source, 0, base).with_key(Key::Luma(LumaKey::new(1, 2, false))),

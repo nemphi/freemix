@@ -121,6 +121,49 @@ fn crop_transform_mask_chroma_luma_order_and_opacity_have_exact_pixels() {
 }
 
 #[test]
+fn rectangular_mask_edges_and_crop_space_are_exact_across_layers() {
+    let black = Rgba8::new(0, 0, 0, 255);
+    let red = Rgba8::new(255, 0, 0, 255);
+    let green = Rgba8::new(0, 255, 0, 255);
+    let blue = Rgba8::new(0, 0, 255, 255);
+    let source = frame(4, 1, &[Rgba8::new(255, 255, 255, 255), red, green, blue]);
+    let mut scene = Scene::new(12, 1, black).unwrap();
+    for (x, mask) in [
+        (0, RectMask::new(1, 0, 1, 1)),
+        (3, RectMask::new(1, 0, 1, 1).inverted(true)),
+        (6, RectMask::new(3, 0, 1, 1)),
+        (9, RectMask::new(0, 0, 3, 1)),
+    ] {
+        scene.push_layer(
+            SourceLayer::new(SourceId::new(1), x, transform(x, 0, 3, 1))
+                .with_crop(CropRect::new(1, 0, 3, 1))
+                .with_mask(mask)
+                .with_opacity(128),
+        );
+    }
+
+    let (plan, _) = compile_scene(&scene, OutputTarget::Program).unwrap();
+    let output = execute_cpu(&plan, &[CpuSourceFrame::new(SourceId::new(1), &source)]).unwrap();
+    assert_eq!(
+        pixels(&output),
+        [
+            black,
+            Rgba8::new(0, 128, 0, 255),
+            black,
+            Rgba8::new(128, 0, 0, 255),
+            black,
+            Rgba8::new(0, 0, 128, 255),
+            black,
+            black,
+            black,
+            Rgba8::new(128, 0, 0, 255),
+            Rgba8::new(0, 128, 0, 255),
+            Rgba8::new(0, 0, 128, 255),
+        ]
+    );
+}
+
+#[test]
 fn equal_z_scene_order_is_preserved_and_disabled_sources_are_not_resolved() {
     let mut scene = Scene::new(1, 1, Rgba8::new(0, 0, 0, 255)).unwrap();
     scene.push_layer(SourceLayer::new(SourceId::new(1), 5, transform(0, 0, 1, 1)));

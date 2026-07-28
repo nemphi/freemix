@@ -12,9 +12,9 @@ use std::{
 use fm_color::{ColorPipeline, NativeImportNormalizer, working_color_metadata};
 use fm_compositor::{
     CpuSourceFrame, CropRect, NativeCompositionRenderer, NativeSourceFrame,
-    NativeTransitionRenderer, OutputTarget, Rgba8, Rotation, Scene, SourceId, SourceLayer,
-    Transform, TransitionKind, TransitionPlan, compile_scene, execute_cpu, execute_transition,
-    image_from_cpu_frame,
+    NativeTransitionRenderer, OutputTarget, RectMask, Rgba8, Rotation, Scene, SourceId,
+    SourceLayer, Transform, TransitionKind, TransitionPlan, compile_scene, execute_cpu,
+    execute_transition, image_from_cpu_frame,
 };
 use fm_frame::{
     AlphaMode, ChromaLocation, ClockDomainId, ColorMetadata, ColorPrimaries, CpuVideoFrame,
@@ -474,6 +474,111 @@ fn native_metal_composition_matches_cpu_geometry_and_blending() {
                 (SourceId::new(5), &blue_cpu),
                 (SourceId::new(6), &green_cpu),
             ],
+        )
+        .await;
+    });
+}
+
+#[test]
+#[ignore = "requires a native macOS Metal adapter"]
+#[allow(clippy::too_many_lines)]
+fn native_metal_rect_masks_match_cpu_edges_transforms_and_layers() {
+    block_on(async {
+        let context = NativeContext::new([NativeBackend::Metal]).await.unwrap();
+        let normalizer = NativeImportNormalizer::new(&context).await.unwrap();
+        let renderer = NativeCompositionRenderer::new(&context).await.unwrap();
+        let black = Rgba8::new(0, 0, 0, 255);
+        let source_id = SourceId::new(20);
+        let source = sized_frame(
+            20,
+            4,
+            2,
+            &[
+                255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255, 128, 0, 0, 255,
+                0, 128, 0, 255, 0, 0, 128, 255, 128, 128, 128, 255,
+            ],
+        );
+        let cpu = canonical_cpu_image(&source);
+
+        for (mask, transform, crop, opacity) in [
+            (
+                RectMask::new(0, 0, 4, 2),
+                Transform::new(0, 0, 4, 2, Rotation::Deg0),
+                None,
+                255,
+            ),
+            (
+                RectMask::new(4, 0, 1, 2),
+                Transform::new(0, 0, 4, 2, Rotation::Deg0),
+                None,
+                255,
+            ),
+        ] {
+            let mut scene = Scene::new(5, 6, black).unwrap();
+            let mut layer = SourceLayer::new(source_id, 0, transform)
+                .with_mask(mask)
+                .with_opacity(opacity)
+                .with_alpha_mode(AlphaMode::Premultiplied);
+            if let Some(crop) = crop {
+                layer = layer.with_crop(crop);
+            }
+            scene.push_layer(layer);
+            assert_composition_case(
+                &context,
+                &normalizer,
+                &renderer,
+                &scene,
+                &[(source_id, &source)],
+                &[(source_id, &cpu)],
+            )
+            .await;
+        }
+
+        for rotation in [
+            Rotation::Deg0,
+            Rotation::Deg90,
+            Rotation::Deg180,
+            Rotation::Deg270,
+        ] {
+            let mut scene = Scene::new(7, 7, black).unwrap();
+            scene.push_layer(
+                SourceLayer::new(source_id, 0, Transform::new(-1, 1, 6, 4, rotation))
+                    .with_crop(CropRect::new(1, 0, 3, 2))
+                    .with_mask(RectMask::new(1, 0, 2, 2).inverted(true))
+                    .with_opacity(128)
+                    .with_alpha_mode(AlphaMode::Premultiplied),
+            );
+            assert_composition_case(
+                &context,
+                &normalizer,
+                &renderer,
+                &scene,
+                &[(source_id, &source)],
+                &[(source_id, &cpu)],
+            )
+            .await;
+        }
+
+        let mut layered = Scene::new(5, 3, black).unwrap();
+        layered.push_layer(
+            SourceLayer::new(source_id, 0, Transform::new(0, 0, 4, 2, Rotation::Deg0))
+                .with_mask(RectMask::new(0, 0, 2, 2))
+                .with_opacity(128)
+                .with_alpha_mode(AlphaMode::Premultiplied),
+        );
+        layered.push_layer(
+            SourceLayer::new(source_id, 1, Transform::new(1, 1, 4, 2, Rotation::Deg180))
+                .with_mask(RectMask::new(2, 0, 2, 2))
+                .with_opacity(192)
+                .with_alpha_mode(AlphaMode::Premultiplied),
+        );
+        assert_composition_case(
+            &context,
+            &normalizer,
+            &renderer,
+            &layered,
+            &[(source_id, &source)],
+            &[(source_id, &cpu)],
         )
         .await;
     });
