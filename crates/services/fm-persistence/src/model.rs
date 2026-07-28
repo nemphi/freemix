@@ -312,29 +312,7 @@ impl StoredProject {
             }
         }
 
-        for (state, program, preview) in [
-            (
-                self.manual_transitions.desired,
-                self.routing.desired_program_id,
-                self.routing.desired_preview_id,
-            ),
-            (
-                self.manual_transitions.realized,
-                self.routing.realized_program_id,
-                self.routing.realized_preview_id,
-            ),
-        ] {
-            if let Some(state) = state {
-                if state.interval_start_basis_points > ManualTransitionState::MAX_POSITION
-                    || state.position_basis_points > ManualTransitionState::MAX_POSITION
-                {
-                    return Err(ProjectValidationError::InvalidManualTransitionPosition);
-                }
-                if Some(state.from_id) != program || Some(state.to_id) != preview {
-                    return Err(ProjectValidationError::ManualTransitionRoutingMismatch);
-                }
-            }
-        }
+        self.validate_manual_transitions()?;
 
         let mut keys = BTreeSet::new();
         for receipt in &self.idempotency_receipts {
@@ -373,6 +351,47 @@ impl StoredProject {
                     project_revision: self.position.revision,
                 });
             }
+        }
+        Ok(())
+    }
+
+    fn validate_manual_transitions(&self) -> Result<(), ProjectValidationError> {
+        for (state, program, preview) in [
+            (
+                self.manual_transitions.desired,
+                self.routing.desired_program_id,
+                self.routing.desired_preview_id,
+            ),
+            (
+                self.manual_transitions.realized,
+                self.routing.realized_program_id,
+                self.routing.realized_preview_id,
+            ),
+        ] {
+            if let Some(state) = state {
+                if state.interval_start_basis_points > ManualTransitionState::MAX_POSITION
+                    || state.position_basis_points > ManualTransitionState::MAX_POSITION
+                {
+                    return Err(ProjectValidationError::InvalidManualTransitionPosition);
+                }
+                if Some(state.from_id) != program || Some(state.to_id) != preview {
+                    return Err(ProjectValidationError::ManualTransitionRoutingMismatch);
+                }
+            }
+        }
+        if self
+            .manual_transitions
+            .desired
+            .is_some_and(|state| state.interval_start_basis_points != 0)
+        {
+            return Err(ProjectValidationError::InvalidDesiredManualTransitionInterval);
+        }
+        if self
+            .manual_transitions
+            .realized
+            .is_some_and(|state| state.interval_start_basis_points != state.position_basis_points)
+        {
+            return Err(ProjectValidationError::InvalidRealizedManualTransitionInterval);
         }
         Ok(())
     }
@@ -554,6 +573,8 @@ pub enum ProjectValidationError {
     },
     InvalidManualTransitionPosition,
     ManualTransitionRoutingMismatch,
+    InvalidDesiredManualTransitionInterval,
+    InvalidRealizedManualTransitionInterval,
     EmptyIdempotencyKey,
     EmptyCommandId {
         key: String,
@@ -591,6 +612,12 @@ impl fmt::Display for ProjectValidationError {
             }
             Self::ManualTransitionRoutingMismatch => formatter.write_str(
                 "manual transition from/to routes do not match persisted program/preview routing",
+            ),
+            Self::InvalidDesiredManualTransitionInterval => formatter.write_str(
+                "desired manual transition interval must start at zero at an idle checkpoint",
+            ),
+            Self::InvalidRealizedManualTransitionInterval => formatter.write_str(
+                "realized manual transition interval start must equal its position at an idle checkpoint",
             ),
             Self::EmptyIdempotencyKey => formatter.write_str("idempotency key is blank"),
             Self::EmptyCommandId { key } => {

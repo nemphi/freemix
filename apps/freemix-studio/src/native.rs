@@ -1628,6 +1628,8 @@ mod tests {
             desired_preview: wire_input(desired_preview),
             realized_program: wire_input(1),
             realized_preview: wire_input(realized_preview),
+            desired_manual_transition: None,
+            realized_manual_transition: None,
         }));
         peer
     }
@@ -1704,6 +1706,8 @@ mod tests {
             desired_preview: wire_input(desired.1),
             realized_program: wire_input(realized.0),
             realized_preview: wire_input(realized.1),
+            desired_manual_transition: None,
+            realized_manual_transition: None,
         }));
         peer
     }
@@ -1782,6 +1786,7 @@ mod tests {
             payload: EventPayload::DesiredSwitcher {
                 program: wire_input(1),
                 preview: wire_input(3),
+                manual_transition: None,
             },
         }));
         peer.send(&WireMessage::RuntimeEvent(RuntimeEventMessage {
@@ -1791,6 +1796,7 @@ mod tests {
             sequence: 1,
             event: RuntimeLifecycleEvent::Realized {
                 domain: "switcher".to_owned(),
+                manual_transition: None,
             },
         }));
     }
@@ -1823,6 +1829,7 @@ mod tests {
             payload: EventPayload::DesiredSwitcher {
                 program: wire_input(2),
                 preview: wire_input(1),
+                manual_transition: None,
             },
         }));
         peer.send(&WireMessage::RuntimeEvent(RuntimeEventMessage {
@@ -1832,6 +1839,7 @@ mod tests {
             sequence: 1,
             event: RuntimeLifecycleEvent::Realized {
                 domain: "switcher".to_owned(),
+                manual_transition: None,
             },
         }));
     }
@@ -1876,6 +1884,7 @@ mod tests {
             payload: EventPayload::DesiredSwitcher {
                 program: wire_input(2),
                 preview: wire_input(1),
+                manual_transition: None,
             },
         }));
         second.send(&WireMessage::RuntimeEvent(RuntimeEventMessage {
@@ -1885,6 +1894,7 @@ mod tests {
             sequence: 1,
             event: RuntimeLifecycleEvent::Realized {
                 domain: "switcher".to_owned(),
+                manual_transition: None,
             },
         }));
     }
@@ -1907,6 +1917,7 @@ mod tests {
             payload: EventPayload::DesiredSwitcher {
                 program: wire_input(1),
                 preview: wire_input(3),
+                manual_transition: None,
             },
         }));
         let WireMessage::Command(retried) = downgraded.receive() else {
@@ -1948,6 +1959,7 @@ mod tests {
             payload: EventPayload::DesiredSwitcher {
                 program: wire_input(3),
                 preview: wire_input(1),
+                manual_transition: None,
             },
         }));
         compatible.send(&WireMessage::RuntimeEvent(RuntimeEventMessage {
@@ -1957,6 +1969,7 @@ mod tests {
             sequence: 1,
             event: RuntimeLifecycleEvent::Realized {
                 domain: "switcher".to_owned(),
+                manual_transition: None,
             },
         }));
 
@@ -1987,6 +2000,7 @@ mod tests {
             payload: EventPayload::DesiredSwitcher {
                 program: wire_input(3),
                 preview: wire_input(2),
+                manual_transition: None,
             },
         }));
         peer.send(&WireMessage::RuntimeEvent(RuntimeEventMessage {
@@ -1996,6 +2010,7 @@ mod tests {
             sequence: 2,
             event: RuntimeLifecycleEvent::Realized {
                 domain: "switcher".to_owned(),
+                manual_transition: None,
             },
         }));
     }
@@ -2017,6 +2032,7 @@ mod tests {
             payload: EventPayload::DesiredSwitcher {
                 program: wire_input(1),
                 preview: wire_input(3),
+                manual_transition: None,
             },
         }));
         let WireMessage::Command(retried) = second.receive() else {
@@ -2050,6 +2066,7 @@ mod tests {
             payload: EventPayload::DesiredSwitcher {
                 program: wire_input(3),
                 preview: wire_input(1),
+                manual_transition: None,
             },
         }));
         third.send(&WireMessage::RuntimeEvent(RuntimeEventMessage {
@@ -2059,6 +2076,7 @@ mod tests {
             sequence: 1,
             event: RuntimeLifecycleEvent::Realized {
                 domain: "switcher".to_owned(),
+                manual_transition: None,
             },
         }));
     }
@@ -2288,6 +2306,7 @@ mod tests {
                 payload: EventPayload::DesiredSwitcher {
                     program: wire_input(2),
                     preview: wire_input(1),
+                    manual_transition: None,
                 },
             }));
             compatible.send(&WireMessage::RuntimeEvent(RuntimeEventMessage {
@@ -2297,6 +2316,7 @@ mod tests {
                 sequence: 1,
                 event: RuntimeLifecycleEvent::Realized {
                     domain: "switcher".to_owned(),
+                    manual_transition: None,
                 },
             }));
         });
@@ -2515,6 +2535,7 @@ mod tests {
                 payload: EventPayload::DesiredSwitcher {
                     program: wire_input(1),
                     preview: wire_input(3),
+                    manual_transition: None,
                 },
             }));
             assert_eq!(first.stream.read(&mut [0_u8; 1]).unwrap(), 0);
@@ -2569,6 +2590,7 @@ mod tests {
                 payload: EventPayload::DesiredSwitcher {
                     program: wire_input(1),
                     preview: wire_input(99),
+                    manual_transition: None,
                 },
             }));
             assert_eq!(first.stream.read(&mut [0_u8; 1]).unwrap(), 0);
@@ -2772,6 +2794,7 @@ mod tests {
                 payload: EventPayload::DesiredSwitcher {
                     program: wire_input(1),
                     preview: wire_input(3),
+                    manual_transition: None,
                 },
             }));
             second.send(&WireMessage::RuntimeEvent(RuntimeEventMessage {
@@ -2781,6 +2804,7 @@ mod tests {
                 sequence: 1,
                 event: RuntimeLifecycleEvent::Realized {
                     domain: "switcher".to_owned(),
+                    manual_transition: None,
                 },
             }));
             assert_eq!(second.stream.read(&mut [0_u8; 1]).unwrap(), 0);
@@ -2843,6 +2867,7 @@ mod tests {
                 payload: EventPayload::DesiredSwitcher {
                     program: wire_input(1),
                     preview: wire_input(3),
+                    manual_transition: None,
                 },
             }))
             .unwrap();

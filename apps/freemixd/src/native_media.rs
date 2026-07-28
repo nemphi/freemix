@@ -5113,10 +5113,11 @@ mod tests {
     use std::{num::NonZeroU128, process::Command, thread, time::Duration};
 
     use fm_clock::ClockDomainId as EngineClockDomainId;
-    use fm_command::{
-        CommandEnvelope, EventSequence, IdempotencyKey, Revision, RuntimeGeneration, StateEpoch,
+    use fm_command::{CommandEnvelope, IdempotencyKey, Revision, RuntimeGeneration};
+    use fm_engine::{
+        Engine, EngineCommand, EngineManualTransitionKind, EngineManualTransitionPosition,
+        ShowState,
     };
-    use fm_engine::{Engine, EngineCommand, EngineRestoreState, ShowState};
     #[cfg(target_os = "macos")]
     use fm_frame::{
         AlphaMode, ChromaLocation, ColorMetadata, ColorPrimaries, MatrixCoefficients, SignalRange,
@@ -7317,39 +7318,41 @@ mod tests {
         );
 
         let t_bar_frame = |end: u16| {
-            let mut realized = SwitcherState::new(inputs.clone(), old, new).unwrap();
-            realized
-                .apply(SwitcherCommand::StartTBar {
-                    kind: SwitcherTransitionKind::Fade,
-                })
+            let mut engine = Engine::new(show(), frame_rate, clock_domain);
+            for (key, command) in [
+                (
+                    "manual-start",
+                    EngineCommand::StartManualTransition {
+                        kind: EngineManualTransitionKind::Fade,
+                    },
+                ),
+                (
+                    "manual-forward",
+                    EngineCommand::SetManualTransitionPosition {
+                        position: EngineManualTransitionPosition::new(8_000).unwrap(),
+                    },
+                ),
+            ] {
+                engine
+                    .execute(
+                        CommandEnvelope::new(key, IdempotencyKey::new(key), command),
+                        0,
+                    )
+                    .unwrap();
+                engine.tick().unwrap();
+            }
+            engine
+                .execute(
+                    CommandEnvelope::new(
+                        "manual-end",
+                        IdempotencyKey::new("manual-end"),
+                        EngineCommand::SetManualTransitionPosition {
+                            position: EngineManualTransitionPosition::new(end).unwrap(),
+                        },
+                    ),
+                    0,
+                )
                 .unwrap();
-            realized
-                .apply(SwitcherCommand::SetTBarPosition(
-                    TBarPosition::new(8_000).unwrap(),
-                ))
-                .unwrap();
-            assert_eq!(realized.advance_frame(), None);
-            realized
-                .apply(SwitcherCommand::SetTBarPosition(
-                    TBarPosition::new(end).unwrap(),
-                ))
-                .unwrap();
-            let mut engine = Engine::restore_persisted(
-                show(),
-                realized,
-                frame_rate,
-                clock_domain,
-                EngineRestoreState {
-                    state_epoch: StateEpoch::new(1),
-                    revision: Revision::new(0),
-                    event_sequence: EventSequence::new(0),
-                    runtime_generation: RuntimeGeneration::new(0),
-                    clock_time: ClockTime::ZERO,
-                    frame_cursor: FrameNumber::new(0),
-                    receipts: Vec::new(),
-                },
-            )
-            .unwrap();
             engine.tick().unwrap()
         };
         let held = native_audio_mix_plan(t_bar_frame(8_000).program).unwrap();

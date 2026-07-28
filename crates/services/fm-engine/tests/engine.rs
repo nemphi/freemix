@@ -10,7 +10,7 @@ use fm_engine::{
     EnginePrepareOutcome, EngineRestoreState, EngineSnapshot, ShowState, SnapshotError,
 };
 use fm_scheduler::FrameNumber;
-use fm_switcher::{SwitcherEvent, SwitcherState, TransitionKind};
+use fm_switcher::{SwitcherEvent, SwitcherState, TBarPosition, TBarState, TransitionKind};
 use fm_types::{FrameRate, InputId};
 
 fn input(value: u128) -> InputId {
@@ -697,6 +697,109 @@ fn persisted_restore_rejects_mismatched_idle_routing() {
     assert_eq!(
         restore_persisted(&snapshot, realized, restore_state(&snapshot)).unwrap_err(),
         SnapshotError::MismatchedSwitcherRouting
+    );
+}
+
+#[test]
+fn persisted_restore_accepts_settled_realized_manual_state_with_desired_interval_origin() {
+    let snapshot = engine().snapshot().unwrap();
+    let mut show = snapshot.show().clone();
+    show.restore_manual_transition(TBarState::restore(
+        TransitionKind::Fade,
+        input(1),
+        input(2),
+        TBarPosition::START,
+        TBarPosition::new(6_250).unwrap(),
+    ))
+    .unwrap();
+    let mut realized = snapshot.realized_switcher().clone();
+    realized
+        .restore_t_bar(TBarState::restore(
+            TransitionKind::Fade,
+            input(1),
+            input(2),
+            TBarPosition::new(6_250).unwrap(),
+            TBarPosition::new(6_250).unwrap(),
+        ))
+        .unwrap();
+
+    Engine::restore_persisted(
+        show,
+        realized,
+        snapshot.frame_rate(),
+        domain(),
+        restore_state(&snapshot),
+    )
+    .unwrap();
+}
+
+#[test]
+fn persisted_restore_rejects_unsettled_manual_interval_boundaries() {
+    let snapshot = engine().snapshot().unwrap();
+    let position = TBarPosition::new(6_250).unwrap();
+
+    let mut malformed_desired = snapshot.show().clone();
+    malformed_desired
+        .restore_manual_transition(TBarState::restore(
+            TransitionKind::Fade,
+            input(1),
+            input(2),
+            TBarPosition::new(2_500).unwrap(),
+            position,
+        ))
+        .unwrap();
+    let mut settled_realized = snapshot.realized_switcher().clone();
+    settled_realized
+        .restore_t_bar(TBarState::restore(
+            TransitionKind::Fade,
+            input(1),
+            input(2),
+            position,
+            position,
+        ))
+        .unwrap();
+    assert_eq!(
+        Engine::restore_persisted(
+            malformed_desired,
+            settled_realized,
+            snapshot.frame_rate(),
+            domain(),
+            restore_state(&snapshot),
+        )
+        .unwrap_err(),
+        SnapshotError::MismatchedManualTransition
+    );
+
+    let mut valid_desired = snapshot.show().clone();
+    valid_desired
+        .restore_manual_transition(TBarState::restore(
+            TransitionKind::Fade,
+            input(1),
+            input(2),
+            TBarPosition::START,
+            position,
+        ))
+        .unwrap();
+    let mut malformed_realized = snapshot.realized_switcher().clone();
+    malformed_realized
+        .restore_t_bar(TBarState::restore(
+            TransitionKind::Fade,
+            input(1),
+            input(2),
+            TBarPosition::new(2_500).unwrap(),
+            position,
+        ))
+        .unwrap();
+    assert_eq!(
+        Engine::restore_persisted(
+            valid_desired,
+            malformed_realized,
+            snapshot.frame_rate(),
+            domain(),
+            restore_state(&snapshot),
+        )
+        .unwrap_err(),
+        SnapshotError::MismatchedManualTransition
     );
 }
 

@@ -99,7 +99,7 @@ outside this item, so its parity rows remain planned.
 Current implementation boundary for item 5: `freemix-studio` opens a native
 `eframe`/wgpu shell by default with responsive Program/Preview monitor wells,
 stable-ID input tiles, realized/desired tally, and permission-gated Cut/Fade/Wipe
-controls. Studio now advertises protocol 1.3; Wipe additionally requires the
+controls. Studio still advertises protocol 1.3; Wipe additionally requires the
 negotiated protocol capability and shares Fade's bounded 1-to-3,600-frame
 duration control. Bounded worker channels preserve strict operator FIFO while
 recovering: an unresolved or deferred Wipe cannot cross a downgrade to protocol
@@ -120,10 +120,11 @@ capped, and supervised daemon shutdown or restart performs bounded
 process-group/job and descendant cleanup. Project input names and video frames
 are not present in the replicated client contract, so tiles use ordinal/ID
 labels and monitor wells state that real preview delivery remains pending.
-`freemix-web` now declares protocol 1.3 support in its client configuration,
+`freemix-web` likewise declares protocol 1.3 support in its client configuration,
 and its transport-free semantic presentation model exposes permission- and
 protocol-gated Wipe with Fade's bounded 1-to-3,600-frame duration. No browser
-renderer or network runtime exists; item 5 and RC-007 remain planned.
+renderer or network runtime exists. Neither client exposes T-bar controls; item
+5 and RC-007 remain planned.
 
 Current implementation boundary for item 6: `fm-frame` defines a bounded,
 portable local-preview contract for shared-image versus encoded fallback,
@@ -180,11 +181,14 @@ Scene inputs recursively route audio through explicit `audio_source` links to a
 physical leaf or explicit silence. Cut keeps one source at unity; Fade and Wipe
 crossfade two sources with sample-linear gains from each interval's explicit
 start/end mix endpoints. Identical terminals collapse to one unity-gain source.
-Automatic Fade and held or reversed Fade T-bar movement propagate exact
-endpoints, although T-bar control remains internal rather than exposed by
-`EngineCommand`, protocol, or UI. Missing local audio, stills, scene silence,
-and configured simulated silence produce silence; unsupported simulated sine
-audio is rejected. At decoded EOS, the daemon synthesizes continuing silence for
+Automatic Fade and held or reversed Fade and Wipe T-bar movement propagate exact
+endpoints. The manual-transition core is exposed through `EngineCommand` and
+protocol 1.4, and schema v5 preserves exact desired and realized manual state
+across replay-safe daemon restart. The CLI can load, save, and migrate that
+state, but has no manual-transition commands; Studio and Web remain on protocol
+1.3 without T-bar controls. Missing local audio, stills, scene silence, and
+configured simulated silence produce silence; unsupported simulated sine audio
+is rejected. At decoded EOS, the daemon synthesizes continuing silence for
 subsequent Master intervals. It exposes no media-completion/end trigger and has
 no stop, loop, or operator-selectable EOS policy.
 
@@ -208,9 +212,9 @@ estimator, device clock or OS audio device, channel conversion, persisted
 buses/output routing or strip controls, DSP, or externally delivered audio.
 Dedicated Wipe audio-policy tests cover exact interval endpoints, sample-linear
 rendering, unity Cut completion, and held, reversed, and committed manual T-bar
-movement. Broader transition policies and public T-bar exposure remain
-incomplete. Item 7 and the related parity rows therefore remain incomplete and
-planned.
+movement. Protocol-driven native-media end-to-end and hardware evidence for the
+manual path is absent, and operator controls remain incomplete. Item 7 and the
+related parity rows therefore remain incomplete and planned.
 
 Current implementation boundary for item 8: `fm-gpu` provides a portable,
 bounded latest-frame presentation policy plus opaque, context-bound native
@@ -324,7 +328,8 @@ lifecycle.
 3. Implement audio device clocks, drift correction, channel mapping, delay,
    native EQ/gate/compressor/limiter.
 4. Add scenes with background plus ten layers, keys, masks, and effect stack.
-5. Complete standard transitions, AlphaFade, T-bar, FTB.
+5. Complete standard transition families, AlphaFade, FTB, and T-bar operator
+   controls and acceptance evidence.
 6. Add eight overlay channels, stinger preload/cut point, per-output inclusion.
 7. Add two multiviews, labels, tally, audio meters, safe areas.
 8. Add scopes and professional color correction.
@@ -528,13 +533,22 @@ the negotiated protocol allow it; Fade and Wipe share one bounded duration.
 Recovery preserves strict intent FIFO across a tested protocol downgrade, so an
 unresolved Wipe is neither sent to 1.2 nor bypassed by later commands. Bounded
 terminal history, collision-triggered authoritative resync, and Studio's sticky
-terminal-uncertainty ledger cover ambiguous replay receipts. `freemix-web` now
+terminal-uncertainty ledger cover ambiguous replay receipts. `freemix-web`
 declares protocol 1.3 support in its client configuration, and its
 transport-free semantic presentation model exposes permission- and
 protocol-gated Wipe with Fade's bounded 1-to-3,600-frame duration. No browser
-renderer or network runtime exists. Public T-bar command exposure and
-AlphaFade, FTB, stinger, Slide/Zoom, and other transition families remain
-pending. Item 5 and RC-007 remain planned.
+renderer or network runtime exists.
+
+The T-bar control core supports Fade and Wipe through `fm-switcher`,
+`EngineCommand`, `fm-control`, and protocol 1.4 with exact held, reversed,
+committed, and cancelled progress. Schema v5 persists distinct desired and
+realized manual state and daemon process tests cover replay-safe restart through
+commit and cancel. The CLI is persistence-compatible but exposes no manual
+commands. Studio and Web remain protocol 1.3 clients without T-bar controls, and
+there is no protocol-driven native-media end-to-end or hardware evidence for the
+manual path. FTB, AlphaFade, stinger, Slide/Zoom, the remaining transition
+families, and `SW-004` acceptance remain pending; parity therefore stays
+planned. Item 5 and RC-007 remain planned.
 
 Exit: `P0` switcher, composition, audio, display, record, and control rows pass.
 

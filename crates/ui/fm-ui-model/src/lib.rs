@@ -918,11 +918,15 @@ impl ClientModel {
             .ok_or(ModelError::UnknownDurableRevision {
                 revision: realization.revision,
             })?;
-        let state = self.state.as_mut().ok_or(ModelError::StateUnavailable)?;
-        state.switcher.realized = desired;
-        state.switcher.realized_manual_transition = realization
+        let realized_manual_transition = realization
             .manual_transition
             .unwrap_or(desired_manual_transition);
+        let state = self.state.as_ref().ok_or(ModelError::StateUnavailable)?;
+        let inputs = state.inputs.iter().copied().collect();
+        validate_manual_transition(realized_manual_transition, desired, &inputs)?;
+        let state = self.state.as_mut().ok_or(ModelError::StateUnavailable)?;
+        state.switcher.realized = desired;
+        state.switcher.realized_manual_transition = realized_manual_transition;
         state.switcher.runtime_generation = Some(realization.generation);
         self.last_runtime_realization = Some(realization);
         Ok(RuntimeRealizationApplied::Applied)

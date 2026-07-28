@@ -1516,7 +1516,7 @@ impl StudioClient {
                 WireMessage::RuntimeEvent(event)
                     if matches!(
                         event.event,
-                        RuntimeLifecycleEvent::Realized { ref domain } if domain == "switcher"
+                        RuntimeLifecycleEvent::Realized { ref domain, .. } if domain == "switcher"
                     ) =>
                 {
                     realized_revisions.insert(event.revision);

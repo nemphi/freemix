@@ -158,6 +158,72 @@ fn round_trip_preserves_exact_desired_and_realized_manual_transition_state() {
 }
 
 #[test]
+fn manifests_reject_unsettled_manual_transition_intervals() {
+    let temp = TestDirectory::new("manual-transition-intervals");
+    let valid_root = temp.project_path("valid");
+    let valid_store = ProjectStore::new(&valid_root).unwrap();
+    let base = project("Manual intervals", 11);
+    let routing = base.runtime_routing();
+    let valid = StoredProject::from_project_with_manual_transitions(
+        base.project().clone(),
+        routing,
+        RuntimeManualTransitions {
+            desired: ManualTransitionState::new(
+                ManualTransitionKind::Fade,
+                routing.desired_program_id.unwrap(),
+                routing.desired_preview_id.unwrap(),
+                0,
+                6_250,
+            ),
+            realized: ManualTransitionState::new(
+                ManualTransitionKind::Fade,
+                routing.realized_program_id.unwrap(),
+                routing.realized_preview_id.unwrap(),
+                6_250,
+                6_250,
+            ),
+        },
+        base.position(),
+        base.idempotency_receipts().to_vec(),
+    )
+    .unwrap();
+    valid_store.save(&valid).unwrap();
+    let manifest = fs::read_to_string(valid_store.manifest_path()).unwrap();
+
+    let desired_root = temp.project_path("desired");
+    write_manifest(
+        &desired_root,
+        &manifest.replacen(
+            "\"interval_start_basis_points\": 0, \"position_basis_points\": 6250",
+            "\"interval_start_basis_points\": 2500, \"position_basis_points\": 6250",
+            1,
+        ),
+    );
+    assert!(matches!(
+        ProjectStore::new(desired_root).unwrap().load(),
+        Err(StoreError::Validation(
+            ProjectValidationError::InvalidDesiredManualTransitionInterval
+        ))
+    ));
+
+    let realized_root = temp.project_path("realized");
+    write_manifest(
+        &realized_root,
+        &manifest.replacen(
+            "\"interval_start_basis_points\": 6250, \"position_basis_points\": 6250",
+            "\"interval_start_basis_points\": 2500, \"position_basis_points\": 6250",
+            1,
+        ),
+    );
+    assert!(matches!(
+        ProjectStore::new(realized_root).unwrap().load(),
+        Err(StoreError::Validation(
+            ProjectValidationError::InvalidRealizedManualTransitionInterval
+        ))
+    ));
+}
+
+#[test]
 fn schema_v4_migrates_with_inactive_manual_transition_defaults() {
     let temp = TestDirectory::new("schema-v4");
     let root = temp.project_path("show");

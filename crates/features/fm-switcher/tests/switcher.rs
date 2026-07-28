@@ -4,7 +4,7 @@ use fm_switcher::{
     MissingMediaFallback, OVERLAY_CHANNEL_COUNT, OverlayChannelId, STINGER_SLOT_COUNT,
     StingerAudioPolicy, StingerDescriptor, StingerPlaybackDecision, StingerPreloadState,
     StingerSlotId, SwitcherCommand, SwitcherError, SwitcherEvent, SwitcherState, TBarPosition,
-    TransitionKind,
+    TBarState, TransitionKind,
 };
 use fm_types::{InputId, OutputId};
 
@@ -225,7 +225,7 @@ fn t_bar_can_reverse_then_commit_or_cancel() {
 
     switcher
         .apply(SwitcherCommand::StartTBar {
-            kind: TransitionKind::Slide,
+            kind: TransitionKind::Fade,
         })
         .unwrap();
     switcher
@@ -237,6 +237,37 @@ fn t_bar_can_reverse_then_commit_or_cancel() {
     );
     assert_eq!(switcher.program(), input(2));
     assert_eq!(switcher.program_frame().secondary, None);
+}
+
+#[test]
+fn manual_transition_rejects_every_unsupported_kind_without_mutation() {
+    let unsupported = [
+        TransitionKind::Slide,
+        TransitionKind::Zoom,
+        TransitionKind::AlphaFade,
+        TransitionKind::Stinger(StingerSlotId::new(1).unwrap()),
+    ];
+
+    for kind in unsupported {
+        let mut switcher = state();
+        assert_eq!(
+            switcher.start_t_bar(kind),
+            Err(SwitcherError::UnsupportedManualTransitionKind)
+        );
+        assert!(switcher.t_bar().is_none());
+
+        assert_eq!(
+            switcher.restore_t_bar(TBarState::restore(
+                kind,
+                input(1),
+                input(2),
+                TBarPosition::START,
+                TBarPosition::START,
+            )),
+            Err(SwitcherError::UnsupportedManualTransitionKind)
+        );
+        assert!(switcher.t_bar().is_none());
+    }
 }
 
 #[test]

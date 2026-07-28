@@ -89,9 +89,13 @@ impl SwitcherState {
     /// # Errors
     ///
     /// Returns an error when a transition is already active, an endpoint is
-    /// unavailable, or the saved endpoints do not match Program and Preview.
+    /// unavailable, the transition kind is not Fade or Wipe, or the saved
+    /// endpoints do not match Program and Preview.
     pub fn restore_t_bar(&mut self, t_bar: TBarState) -> Result<(), SwitcherError> {
         self.require_idle()?;
+        if !matches!(t_bar.kind(), TransitionKind::Fade | TransitionKind::Wipe) {
+            return Err(SwitcherError::UnsupportedManualTransitionKind);
+        }
         self.require_input(t_bar.from())?;
         self.require_input(t_bar.to())?;
         if t_bar.from() != self.program || t_bar.to() != self.preview {
@@ -287,12 +291,17 @@ impl SwitcherState {
     ///
     /// # Errors
     ///
-    /// Returns [`SwitcherError::TransitionInProgress`] when another transition is active.
+    /// Returns [`SwitcherError::TransitionInProgress`] when another transition
+    /// is active, or [`SwitcherError::UnsupportedManualTransitionKind`] when
+    /// `kind` is not Fade or Wipe.
     pub fn start_t_bar(
         &mut self,
         kind: TransitionKind,
     ) -> Result<Vec<SwitcherEvent>, SwitcherError> {
         self.require_idle()?;
+        if !matches!(kind, TransitionKind::Fade | TransitionKind::Wipe) {
+            return Err(SwitcherError::UnsupportedManualTransitionKind);
+        }
         self.t_bar = Some(TBarState::new(kind, self.program, self.preview));
         Ok(vec![SwitcherEvent::TBarStarted {
             kind,

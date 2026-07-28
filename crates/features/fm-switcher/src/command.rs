@@ -100,6 +100,7 @@ pub enum SwitcherEvent {
 pub enum SwitcherError {
     UnknownInput(InputId),
     TransitionInProgress,
+    UnsupportedManualTransitionKind,
     InvalidManualTransitionRoute,
     ZeroDuration,
 }
@@ -110,6 +111,9 @@ impl core::fmt::Display for SwitcherError {
             Self::UnknownInput(id) => write!(formatter, "input {id} is not part of this mix"),
             Self::TransitionInProgress => {
                 formatter.write_str("a transition is already in progress")
+            }
+            Self::UnsupportedManualTransitionKind => {
+                formatter.write_str("manual transitions support only Fade and Wipe")
             }
             Self::InvalidManualTransitionRoute => {
                 formatter.write_str("manual transition endpoints must match Program and Preview")

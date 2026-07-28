@@ -743,7 +743,7 @@ fn v1_project_is_rejected_as_unsupported() {
     assert!(
         String::from_utf8(output.stderr)
             .unwrap()
-            .contains("unsupported schema 1; expected 4")
+            .contains("unsupported schema 1; expected 5")
     );
 }
 

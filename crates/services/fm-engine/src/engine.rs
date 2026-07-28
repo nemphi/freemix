@@ -681,10 +681,14 @@ fn validate_idle_restore(
     match (show.desired_switcher().t_bar(), realized_switcher.t_bar()) {
         (None, None) => {}
         (Some(desired), Some(realized))
-            if desired.kind() == realized.kind()
+            if matches!(desired.kind(), TransitionKind::Fade | TransitionKind::Wipe)
+                && matches!(realized.kind(), TransitionKind::Fade | TransitionKind::Wipe)
+                && desired.kind() == realized.kind()
                 && desired.from() == realized.from()
                 && desired.to() == realized.to()
-                && desired.position() == realized.position() => {}
+                && desired.interval_start() == TBarPosition::START
+                && desired.position() == realized.position()
+                && realized.interval_start() == realized.position() => {}
         _ => return Err(SnapshotError::MismatchedManualTransition),
     }
 
@@ -853,9 +857,9 @@ fn switcher_rejection(error: SwitcherError) -> Rejection {
     let code = match error {
         SwitcherError::UnknownInput(_) => RejectionCode::NotFound,
         SwitcherError::TransitionInProgress => RejectionCode::Conflict,
-        SwitcherError::InvalidManualTransitionRoute | SwitcherError::ZeroDuration => {
-            RejectionCode::InvalidCommand
-        }
+        SwitcherError::UnsupportedManualTransitionKind
+        | SwitcherError::InvalidManualTransitionRoute
+        | SwitcherError::ZeroDuration => RejectionCode::InvalidCommand,
     };
     Rejection::new(code, error.to_string())
 }

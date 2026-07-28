@@ -465,6 +465,48 @@ fn runtime_realization_rejects_unknown_revision_and_identity() {
 }
 
 #[test]
+fn runtime_realization_rejects_invalid_manual_endpoints_transactionally() {
+    let project_id = project(10);
+    let mut model = ClientModel::new(project_id);
+    model.install_snapshot(snapshot(project_id, 7)).unwrap();
+    let identity = model.reconnect_cursor().unwrap().engine.clone();
+    let before = model.state().unwrap().clone();
+
+    let mut unknown = realization(project_id, identity.clone(), 7, 5, 1);
+    unknown.manual_transition = Some(ManualTransitionStatus::Active(ActiveManualTransition {
+        kind: ManualTransitionKind::Fade,
+        from: input(1),
+        to: input(99),
+        interval_start: ManualTransitionPosition::START,
+        position: ManualTransitionPosition::new(2_500).unwrap(),
+    }));
+    assert_eq!(
+        model.apply_runtime_realization(unknown),
+        Err(ModelError::UnknownInput(input(99)))
+    );
+    assert_eq!(model.state(), Some(&before));
+
+    let mut mismatched = realization(project_id, identity.clone(), 7, 5, 1);
+    mismatched.manual_transition = Some(ManualTransitionStatus::Active(ActiveManualTransition {
+        kind: ManualTransitionKind::Fade,
+        from: input(1),
+        to: input(3),
+        interval_start: ManualTransitionPosition::START,
+        position: ManualTransitionPosition::new(2_500).unwrap(),
+    }));
+    assert_eq!(
+        model.apply_runtime_realization(mismatched),
+        Err(ModelError::InvalidManualTransitionRouting)
+    );
+    assert_eq!(model.state(), Some(&before));
+
+    assert_eq!(
+        model.apply_runtime_realization(realization(project_id, identity, 7, 5, 1)),
+        Ok(RuntimeRealizationApplied::Applied)
+    );
+}
+
+#[test]
 fn runtime_revision_errors_are_separate_from_durable_gaps() {
     let project_id = project(10);
     let mut model = ClientModel::new(project_id);

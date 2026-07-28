@@ -624,7 +624,7 @@ const fn tally_fill(tally: TallyState) -> Color32 {
 mod tests {
     use core::num::NonZeroU128;
 
-    use fm_ui_model::BusSelection;
+    use fm_ui_model::{BusSelection, ManualTransitionStatus};
 
     use super::*;
 
@@ -636,6 +636,8 @@ mod tests {
         SwitcherState {
             desired: BusSelection::new(input(desired.0), input(desired.1)),
             realized: BusSelection::new(input(realized.0), input(realized.1)),
+            desired_manual_transition: ManualTransitionStatus::Inactive,
+            realized_manual_transition: ManualTransitionStatus::Inactive,
             runtime_generation: None,
         }
     }
