@@ -2,8 +2,8 @@ use core::num::NonZeroU128;
 
 use fm_client::{ConnectionState, ReconnectBackoff, Session};
 use fm_protocol::{
-    CommandPayload, MANUAL_TRANSITION_PROTOCOL_VERSION, ManualTransitionKind,
-    ManualTransitionPosition, ProtocolVersion, Role, ServerIdentity,
+    CommandPayload, FADE_TO_BLACK_PROTOCOL_VERSION, MANUAL_TRANSITION_PROTOCOL_VERSION,
+    ManualTransitionKind, ManualTransitionPosition, ProtocolVersion, Role, ServerIdentity,
 };
 use fm_types::InputId;
 use fm_ui_model::{ActiveManualTransition, BusSelection, ManualTransitionStatus, SwitcherState};
@@ -51,15 +51,16 @@ fn active(
 }
 
 fn ready_session() -> Session {
-    session(MANUAL_TRANSITION_PROTOCOL_VERSION, &["transition"])
+    session(FADE_TO_BLACK_PROTOCOL_VERSION, &["transition"])
 }
 
 #[test]
-fn web_handshake_advertises_only_protocol_1_4() {
+fn web_handshake_advertises_only_protocol_1_5() {
     assert_eq!(
         SUPPORTED_PROTOCOL_VERSIONS,
-        [MANUAL_TRANSITION_PROTOCOL_VERSION]
+        [FADE_TO_BLACK_PROTOCOL_VERSION]
     );
+    assert_eq!(FADE_TO_BLACK_PROTOCOL_VERSION, ProtocolVersion::new(1, 5));
     assert_eq!(
         MANUAL_TRANSITION_PROTOCOL_VERSION,
         ProtocolVersion::new(1, 4)
@@ -295,7 +296,7 @@ fn missing_projection_ready_and_permission_gates_disable_without_hiding() {
         Some(active(ManualTransitionKind::Fade, 1, 2, 0, 0)),
     );
     let operator_session = ready_session();
-    let no_permission = session(MANUAL_TRANSITION_PROTOCOL_VERSION, &["view_status"]);
+    let no_permission = session(FADE_TO_BLACK_PROTOCOL_VERSION, &["view_status"]);
 
     for model in [missing_desired, missing_realized] {
         assert_eq!(
