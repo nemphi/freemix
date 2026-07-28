@@ -22,7 +22,7 @@ use std::{
 };
 
 use fm_audio::{
-    AudioCadenceOrigin, AudioRenderPlan, AudioSilenceSpan, AudioSynchronizerLimits, ChannelMap,
+    AudioCadenceOrigin, AudioRenderPlan, AudioSilenceSpan, AudioSynchronizerLimits, ChannelMapping,
     ClockMappedAudioSynchronizer, InputState, MasterAudioInterval, MasterMixer, PlanarAudioSource,
     SourceGain,
 };
@@ -1386,6 +1386,7 @@ pub enum NativeMasterError {
         error: fm_codec_ffmpeg::Error,
     },
     Audio(fm_audio::AudioError),
+    ChannelMapping(fm_audio::ChannelMappingError),
     Synchronizer(fm_audio::AudioSynchronizerError),
     AudioBlock(fm_frame::AudioBlockError),
     Timing(TimingError),
@@ -1425,6 +1426,9 @@ impl fmt::Display for NativeMasterError {
                 )
             }
             Self::Audio(error) => write!(formatter, "native Master mix failed: {error}"),
+            Self::ChannelMapping(error) => {
+                write!(formatter, "native audio channel mapping failed: {error}")
+            }
             Self::Synchronizer(error) => {
                 write!(formatter, "native audio synchronization failed: {error}")
             }
@@ -1480,6 +1484,7 @@ impl Error for NativeMasterError {
         match self {
             Self::Ffmpeg { error, .. } => Some(error),
             Self::Audio(error) => Some(error),
+            Self::ChannelMapping(error) => Some(error),
             Self::Synchronizer(error) => Some(error),
             Self::AudioBlock(error) => Some(error),
             Self::Timing(error) => Some(error),
@@ -1492,6 +1497,12 @@ impl Error for NativeMasterError {
 impl From<fm_audio::AudioError> for NativeMasterError {
     fn from(value: fm_audio::AudioError) -> Self {
         Self::Audio(value)
+    }
+}
+
+impl From<fm_audio::ChannelMappingError> for NativeMasterError {
+    fn from(value: fm_audio::ChannelMappingError) -> Self {
+        Self::ChannelMapping(value)
     }
 }
 
@@ -1851,7 +1862,7 @@ impl NativeMasterRuntime {
                 mixer.add_input(
                     input,
                     format.clone(),
-                    ChannelMap::identity(format.channels.channels().len())?,
+                    ChannelMapping::identity(format.channels.clone())?,
                     InputState {
                         follow_video: true,
                         ..InputState::default()
@@ -1872,7 +1883,7 @@ impl NativeMasterRuntime {
                 mixer.add_input(
                     input,
                     format.clone(),
-                    ChannelMap::identity(format.channels.channels().len())?,
+                    ChannelMapping::identity(format.channels.clone())?,
                     InputState {
                         follow_video: true,
                         ..InputState::default()
@@ -1909,7 +1920,7 @@ impl NativeMasterRuntime {
                 mixer.add_input(
                     input,
                     format.clone(),
-                    ChannelMap::identity(format.channels.channels().len())?,
+                    ChannelMapping::identity(format.channels.clone())?,
                     InputState {
                         follow_video: true,
                         ..InputState::default()
@@ -2093,7 +2104,7 @@ impl NativeMasterRuntime {
             mixer.add_input(
                 input,
                 mixer_format,
-                ChannelMap::matching_labels(&source_layout, &format.channels)?,
+                ChannelMapping::matching(source_layout.clone(), format.channels.clone())?,
                 InputState {
                     follow_video: true,
                     ..InputState::default()
@@ -2168,7 +2179,7 @@ impl NativeMasterRuntime {
             expected_next_frame,
             limits,
         )?;
-        let map = ChannelMap::identity(format.channels.channels().len())?;
+        let map = ChannelMapping::identity(format.channels.clone())?;
         for input in project.silent_audio_inputs() {
             if runtime.sources.contains_key(&input) {
                 continue;
@@ -5383,7 +5394,7 @@ mod tests {
                 .add_input(
                     input,
                     format.clone(),
-                    ChannelMap::identity(1).unwrap(),
+                    ChannelMapping::identity(format.channels.clone()).unwrap(),
                     InputState {
                         follow_video: true,
                         ..InputState::default()
@@ -5432,7 +5443,7 @@ mod tests {
             .add_input(
                 input,
                 format.clone(),
-                ChannelMap::identity(1).unwrap(),
+                ChannelMapping::identity(format.channels.clone()).unwrap(),
                 InputState {
                     follow_video: true,
                     ..InputState::default()

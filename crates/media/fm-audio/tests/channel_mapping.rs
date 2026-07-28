@@ -4,7 +4,7 @@ use std::num::NonZeroU128;
 
 use fm_audio::{
     ChannelMapping, ChannelMappingError, ChannelMappingRoute, ChannelMappingSide,
-    MAX_CHANNEL_MAPPING_ROUTES, MAX_CHANNELS, MAX_SAMPLES_PER_BLOCK,
+    MAX_CHANNEL_MAPPING_CHANNELS, MAX_CHANNEL_MAPPING_ROUTES, MAX_SAMPLES_PER_BLOCK,
 };
 use fm_frame::{
     AudioBlock, Channel, ChannelLayout, ClockDomainId, MediaFlags, MediaTiming, NormalizedDuration,
@@ -14,6 +14,18 @@ use fm_types::{MediaTimestamp, SampleRate, TimeBase};
 
 fn layout(channels: Vec<Channel>) -> ChannelLayout {
     ChannelLayout::new(channels).unwrap()
+}
+
+fn all_channels() -> Vec<Channel> {
+    vec![
+        Channel::Mono,
+        Channel::Left,
+        Channel::Right,
+        Channel::Center,
+        Channel::LowFrequency,
+        Channel::LeftSurround,
+        Channel::RightSurround,
+    ]
 }
 
 fn timing() -> MediaTiming {
@@ -119,6 +131,112 @@ fn explicit_routes_duplicate_mono_and_downmix_stereo() {
 }
 
 #[test]
+fn empty_routes_are_silent_and_signed_coefficients_invert() {
+    let stereo = ChannelLayout::stereo();
+    let mono = layout(vec![Channel::Mono]);
+    let input = block(stereo.clone(), vec![vec![0.5, -0.5], vec![1.0, 0.25]]);
+
+    let silent = ChannelMapping::new(stereo.clone(), mono.clone(), Vec::new()).unwrap();
+    assert_eq!(silent.map(&input).unwrap().planes(), &[vec![0.0, 0.0]]);
+
+    let difference = ChannelMapping::new(
+        stereo,
+        mono,
+        vec![
+            ChannelMappingRoute {
+                source: Channel::Left,
+                destination: Channel::Mono,
+                coefficient: 1.0,
+            },
+            ChannelMappingRoute {
+                source: Channel::Right,
+                destination: Channel::Mono,
+                coefficient: -0.5,
+            },
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        difference.map(&input).unwrap().planes(),
+        &[vec![0.0, -0.625]]
+    );
+}
+
+#[test]
+fn largest_unique_layout_accepts_the_full_route_matrix() {
+    let channels = all_channels();
+    assert_eq!(channels.len(), MAX_CHANNEL_MAPPING_CHANNELS);
+    assert_eq!(
+        MAX_CHANNEL_MAPPING_ROUTES,
+        MAX_CHANNEL_MAPPING_CHANNELS * MAX_CHANNEL_MAPPING_CHANNELS
+    );
+    let source = layout(channels.clone());
+    let destination = layout(channels.iter().copied().rev().collect());
+    let routes = channels
+        .iter()
+        .flat_map(|source| {
+            channels.iter().map(move |destination| ChannelMappingRoute {
+                source: *source,
+                destination: *destination,
+                coefficient: 1.0,
+            })
+        })
+        .collect();
+    let mapping = ChannelMapping::new(source.clone(), destination, routes).unwrap();
+    let input = block(
+        source,
+        [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
+            .into_iter()
+            .map(|sample| vec![sample])
+            .collect(),
+    );
+
+    let output = mapping.map(&input).unwrap();
+
+    assert_eq!(mapping.routes().len(), MAX_CHANNEL_MAPPING_ROUTES);
+    assert!(
+        output
+            .planes()
+            .iter()
+            .all(|plane| plane.as_slice() == [28.0])
+    );
+}
+
+#[test]
+fn route_order_compiles_to_one_deterministic_plan() {
+    let source = layout(vec![Channel::Left, Channel::Right, Channel::Center]);
+    let destination = layout(vec![Channel::Mono]);
+    let routes = vec![
+        ChannelMappingRoute {
+            source: Channel::Center,
+            destination: Channel::Mono,
+            coefficient: 3.0,
+        },
+        ChannelMappingRoute {
+            source: Channel::Left,
+            destination: Channel::Mono,
+            coefficient: 1.0e20,
+        },
+        ChannelMappingRoute {
+            source: Channel::Right,
+            destination: Channel::Mono,
+            coefficient: -1.0e20,
+        },
+    ];
+    let forward = ChannelMapping::new(source.clone(), destination.clone(), routes.clone()).unwrap();
+    let reverse = ChannelMapping::new(
+        source.clone(),
+        destination,
+        routes.into_iter().rev().collect(),
+    )
+    .unwrap();
+    let input = block(source, vec![vec![1.0], vec![1.0], vec![1.0]]);
+
+    assert_eq!(forward, reverse);
+    assert_eq!(forward.map(&input).unwrap(), reverse.map(&input).unwrap());
+}
+
+#[test]
 fn invalid_layouts_routes_and_coefficients_are_rejected() {
     let mono = layout(vec![Channel::Mono]);
     let stereo = ChannelLayout::stereo();
@@ -200,13 +318,15 @@ fn invalid_layouts_routes_and_coefficients_are_rejected() {
         })
     );
 
-    let too_wide = layout(vec![Channel::Mono; MAX_CHANNELS + 1]);
+    let mut too_wide_channels = all_channels();
+    too_wide_channels.push(Channel::Mono);
+    let too_wide = layout(too_wide_channels);
     assert_eq!(
         ChannelMapping::matching(too_wide, stereo),
         Err(ChannelMappingError::ChannelCountOutOfRange {
             side: ChannelMappingSide::Source,
-            actual: MAX_CHANNELS + 1,
-            maximum: MAX_CHANNELS,
+            actual: MAX_CHANNEL_MAPPING_CHANNELS + 1,
+            maximum: MAX_CHANNEL_MAPPING_CHANNELS,
         })
     );
 }

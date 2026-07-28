@@ -3,15 +3,18 @@ use core::fmt;
 use fm_frame::AudioBlock;
 use fm_types::{Channel, ChannelLayout};
 
-use crate::{MAX_CHANNELS, MAX_SAMPLES_PER_BLOCK};
+use crate::MAX_SAMPLES_PER_BLOCK;
 
 const BYTES_PER_SAMPLE: usize = size_of::<f32>();
 
+/// Number of distinct semantic channel labels currently representable.
+pub const MAX_CHANNEL_MAPPING_CHANNELS: usize = 7;
 /// Maximum number of explicit source-to-destination routes in one mapping.
-pub const MAX_CHANNEL_MAPPING_ROUTES: usize = MAX_CHANNELS * MAX_CHANNELS;
+pub const MAX_CHANNEL_MAPPING_ROUTES: usize =
+    MAX_CHANNEL_MAPPING_CHANNELS * MAX_CHANNEL_MAPPING_CHANNELS;
 /// Maximum temporary PCM storage used by one mapping operation.
 pub const MAX_CHANNEL_MAPPING_BYTES: usize =
-    MAX_CHANNELS * MAX_SAMPLES_PER_BLOCK * BYTES_PER_SAMPLE;
+    MAX_CHANNEL_MAPPING_CHANNELS * MAX_SAMPLES_PER_BLOCK * BYTES_PER_SAMPLE;
 
 /// Identifies one side of a channel mapping.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -295,6 +298,16 @@ impl ChannelMapping {
         Self::new(source_layout, destination_layout, routes)
     }
 
+    /// Creates an identity map for a semantic channel layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the layout is unsupported or contains duplicate
+    /// labels.
+    pub fn identity(layout: ChannelLayout) -> Result<Self, ChannelMappingError> {
+        Self::matching(layout.clone(), layout)
+    }
+
     #[must_use]
     pub const fn source_layout(&self) -> &ChannelLayout {
         &self.source_layout
@@ -312,8 +325,8 @@ impl ChannelMapping {
 
     /// Maps a canonical timed block into a newly allocated canonical block.
     ///
-    /// Timing, sample rate, sample count, and source samples are preserved;
-    /// only the channel layout and planes are transformed.
+    /// Timing, sample rate, and sample count are preserved. The input block is
+    /// not modified; its samples are transformed into destination planes.
     ///
     /// # Errors
     ///
@@ -427,18 +440,30 @@ impl ChannelMapping {
         }
         Ok(output)
     }
+
+    pub(crate) fn compiled_routes(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (usize, usize, f32)> + '_ {
+        self.routes.iter().map(|route| {
+            (
+                route.source_index,
+                route.destination_index,
+                route.route.coefficient,
+            )
+        })
+    }
 }
 
-fn validate_layout(
+pub(crate) fn validate_layout(
     side: ChannelMappingSide,
     layout: &ChannelLayout,
 ) -> Result<(), ChannelMappingError> {
     let channels = layout.channels();
-    if !(1..=MAX_CHANNELS).contains(&channels.len()) {
+    if !(1..=MAX_CHANNEL_MAPPING_CHANNELS).contains(&channels.len()) {
         return Err(ChannelMappingError::ChannelCountOutOfRange {
             side,
             actual: channels.len(),
-            maximum: MAX_CHANNELS,
+            maximum: MAX_CHANNEL_MAPPING_CHANNELS,
         });
     }
     for (index, channel) in channels.iter().enumerate() {

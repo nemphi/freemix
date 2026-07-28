@@ -14,7 +14,7 @@ mod synchronizer;
 
 pub use channel_mapping::{
     ChannelMapping, ChannelMappingError, ChannelMappingRoute, ChannelMappingSide,
-    MAX_CHANNEL_MAPPING_BYTES, MAX_CHANNEL_MAPPING_ROUTES,
+    MAX_CHANNEL_MAPPING_BYTES, MAX_CHANNEL_MAPPING_CHANNELS, MAX_CHANNEL_MAPPING_ROUTES,
 };
 pub use synchronizer::{
     AudioCadenceOrigin, AudioRenderPlan, AudioSilenceSpan, AudioSynchronizerError,
@@ -38,6 +38,7 @@ pub const MAX_GAIN_DB: f32 = 24.0;
 #[derive(Clone, Debug, PartialEq)]
 pub enum AudioError {
     AudioBlock(fm_frame::AudioBlockError),
+    ChannelMapping(ChannelMappingError),
     UnsupportedSampleFormat(SampleFormat),
     ChannelCountOutOfRange(usize),
     SampleCountOutOfRange(usize),
@@ -62,7 +63,7 @@ pub enum AudioError {
         channel: usize,
         channels: usize,
     },
-    MappingChannelCountMismatch,
+    MappingLayoutMismatch,
     FormatMismatch,
     SampleCountMismatch {
         expected: usize,
@@ -88,6 +89,7 @@ impl fmt::Display for AudioError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::AudioBlock(error) => write!(formatter, "canonical audio block error: {error}"),
+            Self::ChannelMapping(error) => write!(formatter, "channel mapping error: {error}"),
             Self::UnsupportedSampleFormat(format) => {
                 write!(formatter, "unsupported audio sample format: {format:?}")
             }
@@ -130,8 +132,8 @@ impl fmt::Display for AudioError {
                 formatter,
                 "channel index {channel} is outside a {channels}-channel layout"
             ),
-            Self::MappingChannelCountMismatch => {
-                formatter.write_str("channel map does not match the configured formats")
+            Self::MappingLayoutMismatch => {
+                formatter.write_str("channel mapping does not match the configured layouts")
             }
             Self::FormatMismatch => formatter.write_str("audio format or layout mismatch"),
             Self::SampleCountMismatch { expected, actual } => write!(
@@ -172,6 +174,7 @@ impl std::error::Error for AudioError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::AudioBlock(error) => Some(error),
+            Self::ChannelMapping(error) => Some(error),
             _ => None,
         }
     }
@@ -180,6 +183,12 @@ impl std::error::Error for AudioError {
 impl From<fm_frame::AudioBlockError> for AudioError {
     fn from(value: fm_frame::AudioBlockError) -> Self {
         Self::AudioBlock(value)
+    }
+}
+
+impl From<ChannelMappingError> for AudioError {
+    fn from(value: ChannelMappingError) -> Self {
+        Self::ChannelMapping(value)
     }
 }
 
@@ -494,108 +503,6 @@ impl AudioGenerator for ImpulseGenerator {
     }
 }
 
-/// One source-to-destination channel route.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ChannelRoute {
-    pub source: usize,
-    pub destination: usize,
-    pub gain: Gain,
-}
-
-/// A validated channel routing matrix.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ChannelMap {
-    source_channels: usize,
-    destination_channels: usize,
-    routes: Vec<ChannelRoute>,
-}
-
-impl ChannelMap {
-    /// Creates a channel map. Multiple routes may feed the same destination.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for unsupported channel counts or an invalid route.
-    pub fn new(
-        source_channels: usize,
-        destination_channels: usize,
-        routes: Vec<ChannelRoute>,
-    ) -> Result<Self, AudioError> {
-        validate_channel_count(source_channels)?;
-        validate_channel_count(destination_channels)?;
-        for route in &routes {
-            if route.source >= source_channels {
-                return Err(AudioError::ChannelIndexOutOfRange {
-                    channel: route.source,
-                    channels: source_channels,
-                });
-            }
-            if route.destination >= destination_channels {
-                return Err(AudioError::ChannelIndexOutOfRange {
-                    channel: route.destination,
-                    channels: destination_channels,
-                });
-            }
-        }
-        Ok(Self {
-            source_channels,
-            destination_channels,
-            routes,
-        })
-    }
-
-    /// Creates an index-preserving map.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when `channels` is outside the supported range.
-    pub fn identity(channels: usize) -> Result<Self, AudioError> {
-        let routes = (0..channels)
-            .map(|channel| ChannelRoute {
-                source: channel,
-                destination: channel,
-                gain: Gain::UNITY,
-            })
-            .collect();
-        Self::new(channels, channels, routes)
-    }
-
-    /// Maps channels with matching semantic labels.
-    ///
-    /// A destination without a matching source remains silent.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when either layout exceeds the supported channel count.
-    pub fn matching_labels(
-        source: &ChannelLayout,
-        destination: &ChannelLayout,
-    ) -> Result<Self, AudioError> {
-        let source_channels = source.channels().len();
-        let destination_channels = destination.channels().len();
-        let mut routes = Vec::new();
-        for (destination_index, destination_channel) in destination.channels().iter().enumerate() {
-            if let Some(source_index) = source
-                .channels()
-                .iter()
-                .position(|source_channel| source_channel == destination_channel)
-            {
-                routes.push(ChannelRoute {
-                    source: source_index,
-                    destination: destination_index,
-                    gain: Gain::UNITY,
-                });
-            }
-        }
-        Self::new(source_channels, destination_channels, routes)
-    }
-
-    #[must_use]
-    pub fn routes(&self) -> &[ChannelRoute] {
-        &self.routes
-    }
-}
-
 /// User-visible state of one input strip.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct InputState {
@@ -723,7 +630,7 @@ impl GainRamp {
 #[derive(Clone, Debug)]
 struct InputStrip {
     format: AudioFormat,
-    map: ChannelMap,
+    mapping: ChannelMapping,
     state: InputState,
     ramp: GainRamp,
 }
@@ -910,9 +817,11 @@ impl MasterMixer {
     ///
     /// # Errors
     ///
-    /// Returns an error unless `format` is bounded planar `F32`.
+    /// Returns an error unless `format` is bounded planar `F32` with a
+    /// representable, unique semantic channel layout.
     pub fn new(format: AudioFormat) -> Result<Self, AudioError> {
         validate_format(&format)?;
+        channel_mapping::validate_layout(ChannelMappingSide::Destination, &format.channels)?;
         Ok(Self {
             format,
             inputs: BTreeMap::new(),
@@ -939,12 +848,12 @@ impl MasterMixer {
     /// # Errors
     ///
     /// Returns an error for a duplicate ID, format incompatibility, or channel
-    /// map dimension mismatch. The mixer is unchanged on error.
+    /// mapping layout mismatch. The mixer is unchanged on error.
     pub fn add_input(
         &mut self,
         id: InputId,
         format: AudioFormat,
-        map: ChannelMap,
+        mapping: ChannelMapping,
         state: InputState,
     ) -> Result<(), AudioError> {
         if self.inputs.contains_key(&id) {
@@ -954,17 +863,17 @@ impl MasterMixer {
         if format.sample_rate != self.format.sample_rate {
             return Err(AudioError::FormatMismatch);
         }
-        if map.source_channels != format.channels.channels().len()
-            || map.destination_channels != self.format.channels.channels().len()
+        if mapping.source_layout() != &format.channels
+            || mapping.destination_layout() != &self.format.channels
         {
-            return Err(AudioError::MappingChannelCountMismatch);
+            return Err(AudioError::MappingLayoutMismatch);
         }
         let ramp = GainRamp::immediate(state.gain);
         self.inputs.insert(
             id,
             InputStrip {
                 format,
-                map,
+                mapping,
                 state,
                 ramp,
             },
@@ -1035,7 +944,7 @@ impl MasterMixer {
         }
         for (id, strip) in &mut self.inputs {
             let source = other.inputs.get(id).ok_or(AudioError::FormatMismatch)?;
-            if strip.format != source.format || strip.map != source.map {
+            if strip.format != source.format || strip.mapping != source.mapping {
                 return Err(AudioError::FormatMismatch);
             }
             strip.state = source.state;
@@ -1126,7 +1035,9 @@ impl MasterMixer {
     /// Mixes borrowed planar sources into caller-owned preallocated planes.
     ///
     /// Only the first `samples` values of each source and output plane are used.
-    /// Validation completes before output or strip-ramp state changes.
+    /// Structural validation completes before output or strip-ramp state
+    /// changes. A numeric error while summing can leave the output prefix
+    /// partially rendered, but strip-ramp state remains unchanged.
     ///
     /// # Errors
     ///
@@ -1247,11 +1158,19 @@ impl MasterMixer {
                 for sample in 0..samples {
                     let strip_gain = ramp.next();
                     let source_gain = source_gain.at_sample(sample, samples);
-                    for route in &strip.map.routes {
-                        output[route.destination][sample] += block.planes()[route.source][sample]
-                            * strip_gain
-                            * source_gain
-                            * route.gain.linear();
+                    for (source, destination, coefficient) in strip.mapping.compiled_routes() {
+                        let mapped = output[destination][sample]
+                            + block.planes()[source][sample]
+                                * strip_gain
+                                * source_gain
+                                * coefficient;
+                        if !mapped.is_finite() {
+                            return Err(AudioError::NonFiniteSample {
+                                channel: destination,
+                                sample,
+                            });
+                        }
+                        output[destination][sample] = mapped;
                     }
                 }
             } else {
@@ -1640,7 +1559,7 @@ mod tests {
             .add_input(
                 id,
                 format.clone(),
-                ChannelMap::identity(2).unwrap(),
+                ChannelMapping::identity(format.channels.clone()).unwrap(),
                 InputState::default(),
             )
             .unwrap();
@@ -1691,7 +1610,7 @@ mod tests {
             .add_input(
                 source,
                 format.clone(),
-                ChannelMap::identity(1).unwrap(),
+                ChannelMapping::identity(mono_format().channels).unwrap(),
                 InputState::default(),
             )
             .unwrap();
@@ -1710,7 +1629,7 @@ mod tests {
             .add_input(
                 source,
                 format.clone(),
-                ChannelMap::identity(1).unwrap(),
+                ChannelMapping::identity(mono_format().channels).unwrap(),
                 InputState::default(),
             )
             .unwrap();
@@ -1758,7 +1677,7 @@ mod tests {
                 .add_input(
                     id,
                     format.clone(),
-                    ChannelMap::identity(1).unwrap(),
+                    ChannelMapping::identity(mono_format().channels).unwrap(),
                     InputState {
                         follow_video: true,
                         ..InputState::default()
@@ -1831,7 +1750,7 @@ mod tests {
                 .add_input(
                     id,
                     format.clone(),
-                    ChannelMap::identity(1).unwrap(),
+                    ChannelMapping::identity(mono_format().channels).unwrap(),
                     InputState {
                         muted: is_muted,
                         follow_video: true,
@@ -1879,7 +1798,7 @@ mod tests {
             .add_input(
                 id,
                 format,
-                ChannelMap::identity(1).unwrap(),
+                ChannelMapping::identity(mono_format().channels).unwrap(),
                 InputState::default(),
             )
             .unwrap();
@@ -1947,7 +1866,12 @@ mod tests {
             ),
         ] {
             legacy_mixer
-                .add_input(id, format.clone(), ChannelMap::identity(1).unwrap(), state)
+                .add_input(
+                    id,
+                    format.clone(),
+                    ChannelMapping::identity(mono_format().channels).unwrap(),
+                    state,
+                )
                 .unwrap();
         }
         legacy_mixer
@@ -2012,7 +1936,7 @@ mod tests {
             .add_input(
                 id,
                 format.clone(),
-                ChannelMap::identity(1).unwrap(),
+                ChannelMapping::identity(mono_format().channels).unwrap(),
                 InputState::default(),
             )
             .unwrap();
@@ -2121,7 +2045,7 @@ mod tests {
             .add_input(
                 id,
                 format,
-                ChannelMap::identity(1).unwrap(),
+                ChannelMapping::identity(mono_format().channels).unwrap(),
                 InputState {
                     gain: maximum_gain,
                     ..InputState::default()
@@ -2169,7 +2093,7 @@ mod tests {
             .add_input(
                 id,
                 high_rate_format,
-                ChannelMap::identity(1).unwrap(),
+                ChannelMapping::identity(mono_format().channels).unwrap(),
                 InputState::default(),
             )
             .unwrap();
@@ -2208,7 +2132,7 @@ mod tests {
             .add_input(
                 first_id,
                 format.clone(),
-                ChannelMap::identity(1).unwrap(),
+                ChannelMapping::identity(mono_format().channels).unwrap(),
                 InputState {
                     gain: Gain::from_db(-6.020_6).unwrap(),
                     muted: false,
@@ -2220,7 +2144,7 @@ mod tests {
             .add_input(
                 second_id,
                 format,
-                ChannelMap::identity(1).unwrap(),
+                ChannelMapping::identity(mono_format().channels).unwrap(),
                 InputState {
                     gain: Gain::UNITY,
                     muted: false,
@@ -2263,19 +2187,19 @@ mod tests {
         let input_format = stereo_format();
         let output_format = mono_format();
         let id = input_id(1);
-        let map = ChannelMap::new(
-            2,
-            1,
+        let map = ChannelMapping::new(
+            input_format.channels.clone(),
+            output_format.channels.clone(),
             vec![
-                ChannelRoute {
-                    source: 0,
-                    destination: 0,
-                    gain: Gain::UNITY,
+                ChannelMappingRoute {
+                    source: fm_types::Channel::Left,
+                    destination: fm_types::Channel::Mono,
+                    coefficient: Gain::UNITY.linear(),
                 },
-                ChannelRoute {
-                    source: 1,
-                    destination: 0,
-                    gain: Gain::from_db(-6.020_6).unwrap(),
+                ChannelMappingRoute {
+                    source: fm_types::Channel::Right,
+                    destination: fm_types::Channel::Mono,
+                    coefficient: Gain::from_db(-6.020_6).unwrap().linear(),
                 },
             ],
         )
@@ -2294,6 +2218,119 @@ mod tests {
     }
 
     #[test]
+    fn mixer_executes_the_canonical_signed_channel_mapping() {
+        let input_format = stereo_format();
+        let output_format = mono_format();
+        let id = input_id(1);
+        let mapping = ChannelMapping::new(
+            input_format.channels.clone(),
+            output_format.channels.clone(),
+            vec![
+                ChannelMappingRoute {
+                    source: fm_types::Channel::Left,
+                    destination: fm_types::Channel::Mono,
+                    coefficient: 1.0,
+                },
+                ChannelMappingRoute {
+                    source: fm_types::Channel::Right,
+                    destination: fm_types::Channel::Mono,
+                    coefficient: -0.5,
+                },
+            ],
+        )
+        .unwrap();
+        let planes = vec![vec![0.25, 0.5], vec![0.5, 0.5]];
+        let expected = mapping
+            .map(&canonical_block(timing(1), &input_format, planes.clone()))
+            .unwrap();
+        let block = AudioBlock::from_planar(input_format.clone(), planes).unwrap();
+        let mut mixer = MasterMixer::new(output_format).unwrap();
+        mixer.set_clipping_policy(ClippingPolicy::Allow);
+        mixer
+            .add_input(id, input_format, mapping, InputState::default())
+            .unwrap();
+
+        let output = mixer.mix(2, &[(id, &block)], None).unwrap();
+
+        assert_eq!(output.block.planes(), expected.planes());
+    }
+
+    #[test]
+    fn mixer_rejects_mapping_overflow_before_default_clipping() {
+        let format = mono_format();
+        let id = input_id(1);
+        let mapping = ChannelMapping::new(
+            format.channels.clone(),
+            format.channels.clone(),
+            vec![ChannelMappingRoute {
+                source: fm_types::Channel::Mono,
+                destination: fm_types::Channel::Mono,
+                coefficient: f32::MAX,
+            }],
+        )
+        .unwrap();
+        let canonical = canonical_block(timing(1), &format, vec![vec![2.0]]);
+        assert_eq!(
+            mapping.map(&canonical),
+            Err(ChannelMappingError::NonFiniteOutput {
+                channel: 0,
+                sample: 0,
+            })
+        );
+        let block = AudioBlock::from_planar(format.clone(), vec![vec![2.0]]).unwrap();
+        let mut mixer = MasterMixer::new(format.clone()).unwrap();
+        mixer
+            .add_input(id, format, mapping, InputState::default())
+            .unwrap();
+
+        assert_eq!(
+            mixer.mix(1, &[(id, &block)], None),
+            Err(AudioError::NonFiniteSample {
+                channel: 0,
+                sample: 0,
+            })
+        );
+        assert_eq!(mixer.current_linear_gain(id), Some(1.0));
+    }
+
+    #[test]
+    fn add_input_rejects_same_width_wrong_mapping_layout_atomically() {
+        let format = stereo_format();
+        let id = input_id(1);
+        let swapped =
+            ChannelLayout::new(vec![fm_types::Channel::Right, fm_types::Channel::Left]).unwrap();
+        let mapping = ChannelMapping::matching(swapped, format.channels.clone()).unwrap();
+        let mut mixer = MasterMixer::new(format.clone()).unwrap();
+
+        assert_eq!(
+            mixer.add_input(id, format, mapping, InputState::default()),
+            Err(AudioError::MappingLayoutMismatch)
+        );
+        assert_eq!(mixer.input_state(id), None);
+    }
+
+    #[test]
+    fn mixer_rejects_an_unrepresentable_destination_layout() {
+        let channels =
+            ChannelLayout::new(vec![fm_types::Channel::Left, fm_types::Channel::Left]).unwrap();
+        let format = AudioFormat {
+            sample_rate: SampleRate::new(48_000).unwrap(),
+            sample_format: SampleFormat::F32,
+            channels,
+        };
+
+        assert!(matches!(
+            MasterMixer::new(format),
+            Err(AudioError::ChannelMapping(
+                ChannelMappingError::DuplicateLayoutChannel {
+                    side: ChannelMappingSide::Destination,
+                    channel: fm_types::Channel::Left,
+                }
+            ))
+        ));
+    }
+
+    #[test]
     fn ramps_are_linear_and_continue_across_blocks() {
         let format = mono_format();
         let id = input_id(1);
@@ -2304,7 +2341,7 @@ mod tests {
             .add_input(
                 id,
                 format,
-                ChannelMap::identity(1).unwrap(),
+                ChannelMapping::identity(mono_format().channels).unwrap(),
                 InputState::default(),
             )
             .unwrap();
@@ -2335,7 +2372,7 @@ mod tests {
             .add_input(
                 id,
                 format,
-                ChannelMap::identity(1).unwrap(),
+                ChannelMapping::identity(mono_format().channels).unwrap(),
                 InputState::default(),
             )
             .unwrap();
@@ -2347,7 +2384,7 @@ mod tests {
             .add_input(
                 second,
                 mono_format(),
-                ChannelMap::identity(1).unwrap(),
+                ChannelMapping::identity(mono_format().channels).unwrap(),
                 InputState::default(),
             )
             .unwrap();
@@ -2388,7 +2425,7 @@ mod tests {
             .add_input(
                 id,
                 format.clone(),
-                ChannelMap::identity(1).unwrap(),
+                ChannelMapping::identity(mono_format().channels).unwrap(),
                 InputState::default(),
             )
             .unwrap();
@@ -2417,7 +2454,7 @@ mod tests {
             mixer.add_input(
                 id,
                 format,
-                ChannelMap::identity(1).unwrap(),
+                ChannelMapping::identity(mono_format().channels).unwrap(),
                 InputState::default()
             ),
             Err(AudioError::DuplicateInput(id))
