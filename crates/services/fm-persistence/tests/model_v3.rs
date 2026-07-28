@@ -6,9 +6,10 @@ use std::{
 };
 
 use fm_model::{
-    AudioBus, BusSend, CropRect, Input, InputKind, Layer, LayerGeometry, MainMix, Output, Project,
-    ProjectSettings, RectMask, RestartPolicy, Rgba8, Rotation, Scene, SimulatedAudio,
-    SimulatedInput, SimulatedVideo, SolidColor, SourceRef, StartupPolicy,
+    AudioBus, BusSend, CropRect, Input, InputAudioStripState, InputGainMilliDb, InputKind, Layer,
+    LayerGeometry, MainMix, Output, Project, ProjectSettings, RectMask, RestartPolicy, Rgba8,
+    Rotation, Scene, SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef,
+    StartupPolicy,
 };
 use fm_persistence::{ProjectPosition, ProjectStore, RuntimeRouting, StoreError, StoredProject};
 use fm_types::{
@@ -260,6 +261,98 @@ fn stored_rich_project() -> StoredProject {
 }
 
 #[test]
+fn input_audio_strips_round_trip_exactly_and_reject_malformed_gain() {
+    let temp = TestDirectory::new("input-audio-strips");
+    let store = temp.store("show");
+    let mut project = rich_project();
+    let input = project.inputs()[1].id;
+    let state = InputAudioStripState {
+        gain: InputGainMilliDb::new(-12_345).unwrap(),
+        muted: true,
+        follow_video: false,
+    };
+    assert!(project.set_input_audio_strip(input, state));
+    let stored = StoredProject::from_project(
+        project,
+        RuntimeRouting::default(),
+        ProjectPosition::default(),
+        Vec::new(),
+    )
+    .unwrap();
+
+    store.save(&stored).unwrap();
+    let loaded = store.load().unwrap();
+    assert_eq!(loaded.project().input_audio_strip(input), Some(state));
+    let encoded = fs::read_to_string(store.manifest_path()).unwrap();
+    assert!(
+        encoded.contains("\"gain_milli_db\": -12345, \"muted\": true, \"follow_video\": false")
+    );
+
+    let strip_line = encoded
+        .lines()
+        .find(|line| line.contains("\"gain_milli_db\": -12345"))
+        .unwrap();
+    for invalid in [
+        encoded.replacen("\"gain_milli_db\": -12345", "\"gain_milli_db\": 24001", 1),
+        encoded.replacen(
+            "\"gain_milli_db\": -12345",
+            "\"gain_milli_db\": \"-12345\"",
+            1,
+        ),
+        encoded.replacen(
+            &format!("\"input\": {input}, \"gain_milli_db\": -12345"),
+            "\"input\": 999, \"gain_milli_db\": -12345",
+            1,
+        ),
+        encoded.replacen(strip_line, &format!("{strip_line}\n{strip_line}"), 1),
+    ] {
+        fs::write(store.manifest_path(), invalid).unwrap();
+        assert!(matches!(
+            store.load(),
+            Err(StoreError::MalformedManifest { .. })
+        ));
+    }
+}
+
+#[test]
+fn schema_v6_defaults_audio_strips_for_every_input_kind_without_losing_masks() {
+    let temp = TestDirectory::new("v6-audio-defaults");
+    let store = temp.store("show");
+    let expected = stored_rich_project();
+    store.save(&expected).unwrap();
+    let current = fs::read_to_string(store.manifest_path()).unwrap();
+    let strips_start = current.find(",\n    \"input_audio_strips\": [").unwrap();
+    let scenes_start = current.find(",\n    \"scenes\": [").unwrap();
+    let legacy = format!("{}{}", &current[..strips_start], &current[scenes_start..]).replacen(
+        "\"schema_version\": 7",
+        "\"schema_version\": 6",
+        1,
+    );
+    fs::write(store.manifest_path(), legacy).unwrap();
+
+    store.migrate_v6().unwrap();
+    let migrated = store.load().unwrap();
+
+    assert_eq!(migrated.project().inputs().len(), 7);
+    assert_eq!(migrated.project().input_audio_strips().len(), 7);
+    assert!(
+        migrated
+            .project()
+            .input_audio_strips()
+            .iter()
+            .all(|strip| strip.state == InputAudioStripState::default())
+    );
+    assert_eq!(
+        migrated.project().scenes()[0].layers[0].mask,
+        expected.project().scenes()[0].layers[0].mask
+    );
+    assert_eq!(
+        migrated.project().scenes()[1].layers[1].mask,
+        expected.project().scenes()[1].layers[1].mask
+    );
+}
+
+#[test]
 fn complete_project_round_trip_preserves_formats_graph_capabilities_and_u128_ids() {
     let temp = TestDirectory::new("rich-round-trip");
     let store = temp.store("show");
@@ -463,7 +556,7 @@ fn golden_v2_manifest_migrates_with_cli_defaults_and_main_mix() {
     let report = store.migrate_v2().unwrap();
     let migrated = store.load().unwrap();
 
-    assert_eq!((report.from_schema(), report.to_schema()), (2, 6));
+    assert_eq!((report.from_schema(), report.to_schema()), (2, 7));
     assert_eq!(
         migrated.project().settings().frame_rate,
         FrameRate::new(60_000, 1_001).unwrap()
@@ -509,7 +602,7 @@ fn frozen_v3_manifest_migrates_with_composition_defaults_only() {
     second.migrate_v3().unwrap();
     let migrated = store.load().unwrap();
 
-    assert_eq!((report.from_schema(), report.to_schema()), (3, 6));
+    assert_eq!((report.from_schema(), report.to_schema()), (3, 7));
     assert_eq!(
         report.defaulted_fields(),
         [
@@ -520,6 +613,7 @@ fn frozen_v3_manifest_migrates_with_composition_defaults_only() {
             "scenes.layers.z_order=0",
             "runtime.manual_transitions=inactive",
             "scenes.layers.mask=null",
+            "input_audio_strips=per-input gain_milli_db=0/muted=false/follow_video=true",
         ]
     );
     let scene = &migrated.project().scenes()[0];

@@ -6,6 +6,7 @@ const V2_SCHEMA_VERSION: u32 = 2;
 const V3_SCHEMA_VERSION: u32 = 3;
 const V4_SCHEMA_VERSION: u32 = 4;
 const V5_SCHEMA_VERSION: u32 = 5;
+const V6_SCHEMA_VERSION: u32 = 6;
 const V3_DEFAULTS: [&str; 8] = [
     "settings.frame_rate=60000/1001",
     "settings.video=1920x1080/nv12/progressive/bt709",
@@ -25,6 +26,8 @@ const V4_DEFAULTS: [&str; 5] = [
 ];
 const V5_DEFAULTS: [&str; 1] = ["runtime.manual_transitions=inactive"];
 const V6_DEFAULTS: [&str; 1] = ["scenes.layers.mask=null"];
+const V7_DEFAULTS: [&str; 1] =
+    ["input_audio_strips=per-input gain_milli_db=0/muted=false/follow_video=true"];
 
 /// Summary of an explicitly completed manifest migration.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -70,6 +73,7 @@ impl ProjectStore {
                 .chain(V4_DEFAULTS)
                 .chain(V5_DEFAULTS)
                 .chain(V6_DEFAULTS)
+                .chain(V7_DEFAULTS)
                 .collect(),
         })
     }
@@ -91,6 +95,7 @@ impl ProjectStore {
                 .into_iter()
                 .chain(V5_DEFAULTS)
                 .chain(V6_DEFAULTS)
+                .chain(V7_DEFAULTS)
                 .collect(),
         })
     }
@@ -108,7 +113,11 @@ impl ProjectStore {
         Ok(MigrationReport {
             from_schema: V4_SCHEMA_VERSION,
             to_schema: CURRENT_SCHEMA_VERSION,
-            defaulted_fields: V5_DEFAULTS.into_iter().chain(V6_DEFAULTS).collect(),
+            defaulted_fields: V5_DEFAULTS
+                .into_iter()
+                .chain(V6_DEFAULTS)
+                .chain(V7_DEFAULTS)
+                .collect(),
         })
     }
 
@@ -128,7 +137,28 @@ impl ProjectStore {
         Ok(MigrationReport {
             from_schema: V5_SCHEMA_VERSION,
             to_schema: CURRENT_SCHEMA_VERSION,
-            defaulted_fields: V6_DEFAULTS.to_vec(),
+            defaulted_fields: V6_DEFAULTS.into_iter().chain(V7_DEFAULTS).collect(),
+        })
+    }
+
+    /// Explicitly migrates a schema-v6 manifest to schema v7.
+    ///
+    /// Exact masks and desired/realized manual-transition state are preserved.
+    /// Every input receives the previously hard-coded native daemon strip
+    /// behavior: unity gain, unmuted, and follow-video enabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed data, the wrong schema, validation,
+    /// size-limit, or filesystem failures.
+    pub fn migrate_v6(&self) -> Result<MigrationReport, StoreError> {
+        let source = self.read_legacy_manifest()?;
+        let project = json::decode_v6(&source).map_err(StoreError::from_decode)?;
+        self.save(&project)?;
+        Ok(MigrationReport {
+            from_schema: V6_SCHEMA_VERSION,
+            to_schema: CURRENT_SCHEMA_VERSION,
+            defaulted_fields: V7_DEFAULTS.to_vec(),
         })
     }
 

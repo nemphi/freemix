@@ -577,6 +577,12 @@ fn load_stored_project(path: &Path) -> AppResult<StoredProject> {
             store.migrate_v5()?;
             Ok(store.load()?)
         }
+        Err(StoreError::Validation(ProjectValidationError::UnsupportedSchema {
+            found: 6, ..
+        })) => {
+            store.migrate_v6()?;
+            Ok(store.load()?)
+        }
         Err(error) => Err(error.into()),
     }
 }

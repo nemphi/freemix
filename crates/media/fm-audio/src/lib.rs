@@ -886,6 +886,29 @@ impl MasterMixer {
         Ok(())
     }
 
+    /// Adds a strip that reuses another configured input's format and mapping.
+    ///
+    /// This supports independently controlled logical inputs that share one
+    /// physical PCM source. The mixer is unchanged on error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `source` is unknown or `id` is already configured.
+    pub fn add_input_alias(
+        &mut self,
+        id: InputId,
+        source: InputId,
+        state: InputState,
+    ) -> Result<(), AudioError> {
+        let source = self
+            .inputs
+            .get(&source)
+            .ok_or(AudioError::UnknownInput(source))?;
+        let format = source.format.clone();
+        let mapping = source.mapping.clone();
+        self.add_input(id, format, mapping, state)
+    }
+
     /// Removes an input.
     ///
     /// # Errors
@@ -2276,6 +2299,54 @@ mod tests {
                 .iter()
                 .all(|sample| *sample == 0.0)
         );
+    }
+
+    #[test]
+    fn logical_alias_reuses_source_mapping_with_independent_strip_controls() {
+        let format = mono_format();
+        let source = input_id(1);
+        let alias = input_id(2);
+        let block = AudioBlock::from_planar(format.clone(), vec![vec![1.0; 4]]).unwrap();
+        let mut mixer = MasterMixer::new(format.clone()).unwrap();
+        mixer
+            .add_input(
+                source,
+                format,
+                ChannelMapping::identity(mono_format().channels).unwrap(),
+                InputState::default(),
+            )
+            .unwrap();
+        mixer
+            .add_input_alias(
+                alias,
+                source,
+                InputState {
+                    gain: Gain::from_db(-6.020_6).unwrap(),
+                    muted: false,
+                    follow_video: true,
+                },
+            )
+            .unwrap();
+
+        let inactive = mixer.mix(4, &[(alias, &block)], None).unwrap();
+        assert!(
+            inactive
+                .block
+                .plane(0)
+                .unwrap()
+                .iter()
+                .all(|sample| *sample == 0.0)
+        );
+        let selected = mixer.mix(4, &[(alias, &block)], Some(alias)).unwrap();
+        assert!(
+            selected
+                .block
+                .plane(0)
+                .unwrap()
+                .iter()
+                .all(|sample| (*sample - 0.5).abs() < 0.000_01)
+        );
+        assert_eq!(mixer.input_state(source), Some(InputState::default()));
     }
 
     #[test]

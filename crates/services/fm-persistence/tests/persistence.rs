@@ -233,12 +233,13 @@ fn schema_v4_migrates_with_inactive_manual_transition_defaults() {
     let report = store.migrate_v4().unwrap();
     let migrated = store.load().unwrap();
 
-    assert_eq!((report.from_schema(), report.to_schema()), (4, 6));
+    assert_eq!((report.from_schema(), report.to_schema()), (4, 7));
     assert_eq!(
         report.defaulted_fields(),
         [
             "runtime.manual_transitions=inactive",
-            "scenes.layers.mask=null"
+            "scenes.layers.mask=null",
+            "input_audio_strips=per-input gain_milli_db=0/muted=false/follow_video=true"
         ]
     );
     assert_eq!(
@@ -257,8 +258,14 @@ fn schema_v5_migration_preserves_manual_state_and_defaults_no_mask() {
     let report = store.migrate_v5().unwrap();
     let migrated = store.load().unwrap();
 
-    assert_eq!((report.from_schema(), report.to_schema()), (5, 6));
-    assert_eq!(report.defaulted_fields(), ["scenes.layers.mask=null"]);
+    assert_eq!((report.from_schema(), report.to_schema()), (5, 7));
+    assert_eq!(
+        report.defaulted_fields(),
+        [
+            "scenes.layers.mask=null",
+            "input_audio_strips=per-input gain_milli_db=0/muted=false/follow_video=true"
+        ]
+    );
     assert_eq!(migrated.project().scenes()[0].layers[0].mask, None);
     let transitions = migrated.runtime_manual_transitions();
     assert_eq!(
@@ -282,8 +289,42 @@ fn schema_v5_migration_preserves_manual_state_and_defaults_no_mask() {
         )
     );
     let encoded = fs::read_to_string(store.manifest_path()).unwrap();
-    assert!(encoded.starts_with("{\n  \"schema_version\": 6,"));
+    assert!(encoded.starts_with("{\n  \"schema_version\": 7,"));
     assert!(encoded.contains("\"mask\": null"));
+}
+
+#[test]
+fn schema_v6_migration_preserves_masks_and_manual_state_and_defaults_audio_strips() {
+    let temp = TestDirectory::new("schema-v6");
+    let root = temp.project_path("show");
+    write_manifest(&root, include_str!("fixtures/schema-v6.json"));
+    let store = ProjectStore::new(root).unwrap();
+
+    let report = store.migrate_v6().unwrap();
+    let migrated = store.load().unwrap();
+
+    assert_eq!((report.from_schema(), report.to_schema()), (6, 7));
+    assert_eq!(
+        report.defaulted_fields(),
+        ["input_audio_strips=per-input gain_milli_db=0/muted=false/follow_video=true"]
+    );
+    assert_eq!(
+        migrated.project().scenes()[0].layers[0].mask,
+        Some(fm_model::RectMask::new(0, 0, 2, 2).inverted(true))
+    );
+    assert!(
+        migrated
+            .project()
+            .input_audio_strips()
+            .iter()
+            .all(|strip| strip.state == fm_model::InputAudioStripState::default())
+    );
+    let transitions = migrated.runtime_manual_transitions();
+    assert_eq!(transitions.desired.unwrap().position_basis_points, 6_250);
+    assert_eq!(
+        transitions.realized.unwrap().interval_start_basis_points,
+        6_250
+    );
 }
 
 #[test]
@@ -389,8 +430,8 @@ fn explicit_unsupported_schema_is_reported_before_missing_current_fields() {
 fn strict_parser_rejects_unknown_duplicate_and_wrong_typed_fields() {
     let temp = TestDirectory::new("strict");
     for (name, manifest) in [
-        ("unknown", "{\"schema_version\":6,\"unknown\":true}"),
-        ("duplicate", "{\"schema_version\":6,\"schema_version\":6}"),
+        ("unknown", "{\"schema_version\":7,\"unknown\":true}"),
+        ("duplicate", "{\"schema_version\":7,\"schema_version\":7}"),
         ("wrong-type", "{\"schema_version\":\"1\"}"),
         ("object-trailing-comma", "{\"schema_version\":2,}"),
         (

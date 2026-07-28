@@ -1,11 +1,12 @@
 use std::num::NonZeroU128;
 
 use fm_model::{
-    AudioBus, BusSend, CURRENT_SCHEMA_VERSION, CropRect, EntityRef, Input, InputKind, Layer,
-    LayerGeometry, MainMix, MigrationInput, OLDEST_SUPPORTED_SCHEMA_VERSION, Output, OutputFormat,
-    Project, ProjectSettings, RectMask, RestartPolicy, Rgba8, Rotation, SUPPORTED_SCHEMA_VERSIONS,
-    Scene, SchemaVersion, SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef,
-    StartupPolicy, ValidationErrorKind,
+    AudioBus, BusSend, CURRENT_SCHEMA_VERSION, CropRect, EntityRef, Input, InputAudioStripState,
+    InputGainMilliDb, InputKind, Layer, LayerGeometry, MainMix, MigrationInput,
+    OLDEST_SUPPORTED_SCHEMA_VERSION, Output, OutputFormat, Project, ProjectSettings, RectMask,
+    RestartPolicy, Rgba8, Rotation, SUPPORTED_SCHEMA_VERSIONS, Scene, SchemaVersion,
+    SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef, StartupPolicy,
+    ValidationErrorKind,
 };
 use fm_types::{
     AudioFormat, BusId, ChannelLayout, ColorMetadata, FrameRate, InputId, OutputId, PixelFormat,
@@ -245,11 +246,12 @@ fn duplicate_routes_are_rejected() {
 
 #[test]
 fn schema_support_window_is_current_through_oldest_supported() {
-    assert_eq!(CURRENT_SCHEMA_VERSION, SchemaVersion::new(6));
+    assert_eq!(CURRENT_SCHEMA_VERSION, SchemaVersion::new(7));
     assert_eq!(OLDEST_SUPPORTED_SCHEMA_VERSION, SchemaVersion::new(2));
     assert_eq!(
         SUPPORTED_SCHEMA_VERSIONS,
         [
+            SchemaVersion::new(7),
             SchemaVersion::new(6),
             SchemaVersion::new(5),
             SchemaVersion::new(4),
@@ -261,11 +263,34 @@ fn schema_support_window_is_current_through_oldest_supported() {
     assert!(!CURRENT_SCHEMA_VERSION.requires_migration());
     assert!(SchemaVersion::new(2).requires_migration());
     assert!(!SchemaVersion::new(1).is_supported());
-    assert!(!SchemaVersion::new(7).is_supported());
+    assert!(!SchemaVersion::new(8).is_supported());
 
     let input = MigrationInput::new(SchemaVersion::new(2), ("format-neutral", 7_u8));
     assert_eq!(input.schema_version(), SchemaVersion::new(2));
     assert_eq!(input.into_representation(), ("format-neutral", 7));
+}
+
+#[test]
+fn persisted_input_gain_is_exact_and_bounded() {
+    assert_eq!(
+        InputGainMilliDb::new(InputGainMilliDb::MIN).unwrap().get(),
+        -96_000
+    );
+    assert_eq!(InputGainMilliDb::UNITY.get(), 0);
+    assert_eq!(
+        InputGainMilliDb::new(InputGainMilliDb::MAX).unwrap().get(),
+        24_000
+    );
+    assert_eq!(InputGainMilliDb::new(InputGainMilliDb::MIN - 1), None);
+    assert_eq!(InputGainMilliDb::new(InputGainMilliDb::MAX + 1), None);
+    assert_eq!(
+        InputAudioStripState::default(),
+        InputAudioStripState {
+            gain: InputGainMilliDb::UNITY,
+            muted: false,
+            follow_video: true,
+        }
+    );
 }
 
 #[test]

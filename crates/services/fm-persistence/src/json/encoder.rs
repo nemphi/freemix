@@ -176,6 +176,20 @@ fn write_project_collections(output: &mut String, project: &fm_model::Project) {
         output.push_str("\n      }");
     }
     array_end(output, project.inputs().is_empty(), 4);
+    output.push_str(",\n    \"input_audio_strips\": [");
+    for (index, strip) in project.input_audio_strips().iter().enumerate() {
+        item_prefix(output, index, 6);
+        write!(
+            output,
+            "{{\"input\": {}, \"gain_milli_db\": {}, \"muted\": {}, \"follow_video\": {}}}",
+            strip.input,
+            strip.state.gain.get(),
+            strip.state.muted,
+            strip.state.follow_video,
+        )
+        .expect("writing to a string cannot fail");
+    }
+    array_end(output, project.input_audio_strips().is_empty(), 4);
     write_scenes(output, project);
     output.push_str(",\n    \"audio_buses\": [");
     for (index, bus) in project.audio_buses().iter().enumerate() {

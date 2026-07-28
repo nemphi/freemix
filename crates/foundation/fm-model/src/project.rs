@@ -2,10 +2,11 @@ use fm_types::{AudioFormat, BusId, FrameRate, InputId, OutputId, ProjectId, Scen
 
 use crate::{ValidationError, validation::validate_project};
 
-pub const CURRENT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(6);
+pub const CURRENT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(7);
 pub const OLDEST_SUPPORTED_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(2);
-pub const SUPPORTED_SCHEMA_VERSIONS: [SchemaVersion; 5] = [
+pub const SUPPORTED_SCHEMA_VERSIONS: [SchemaVersion; 6] = [
     CURRENT_SCHEMA_VERSION,
+    SchemaVersion::new(6),
     SchemaVersion::new(5),
     SchemaVersion::new(4),
     SchemaVersion::new(3),
@@ -80,6 +81,7 @@ pub struct Project {
     name: String,
     settings: ProjectSettings,
     inputs: Vec<Input>,
+    input_audio_strips: Vec<InputAudioStrip>,
     scenes: Vec<Scene>,
     audio_buses: Vec<AudioBus>,
     outputs: Vec<Output>,
@@ -96,6 +98,7 @@ impl Project {
             name: name.into(),
             settings,
             inputs: Vec::new(),
+            input_audio_strips: Vec::new(),
             scenes: Vec::new(),
             audio_buses: Vec::new(),
             outputs: Vec::new(),
@@ -130,6 +133,19 @@ impl Project {
     }
 
     #[must_use]
+    pub fn input_audio_strips(&self) -> &[InputAudioStrip] {
+        &self.input_audio_strips
+    }
+
+    #[must_use]
+    pub fn input_audio_strip(&self, input: InputId) -> Option<InputAudioStripState> {
+        self.input_audio_strips
+            .iter()
+            .find(|strip| strip.input == input)
+            .map(|strip| strip.state)
+    }
+
+    #[must_use]
     pub fn scenes(&self) -> &[Scene] {
         &self.scenes
     }
@@ -155,7 +171,26 @@ impl Project {
     }
 
     pub fn add_input(&mut self, input: Input) {
+        self.input_audio_strips.push(InputAudioStrip {
+            input: input.id,
+            state: InputAudioStripState::default(),
+        });
         self.inputs.push(input);
+    }
+
+    /// Replaces the persisted audio strip for an existing input.
+    ///
+    /// Returns `false` when `input` is not part of this project.
+    pub fn set_input_audio_strip(&mut self, input: InputId, state: InputAudioStripState) -> bool {
+        let Some(strip) = self
+            .input_audio_strips
+            .iter_mut()
+            .find(|strip| strip.input == input)
+        else {
+            return false;
+        };
+        strip.state = state;
+        true
     }
 
     pub fn add_scene(&mut self, scene: Scene) {
@@ -252,6 +287,58 @@ pub struct Input {
     pub name: String,
     pub kind: InputKind,
     pub required_capabilities: Vec<String>,
+}
+
+/// Exact persisted gain for an input strip, in one-thousandth of a decibel.
+///
+/// The integer representation is stable across JSON round trips and excludes
+/// non-finite floating-point values by construction.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct InputGainMilliDb(i32);
+
+impl InputGainMilliDb {
+    pub const MIN: i32 = -96_000;
+    pub const MAX: i32 = 24_000;
+    pub const UNITY: Self = Self(0);
+
+    #[must_use]
+    pub const fn new(value: i32) -> Option<Self> {
+        if value >= Self::MIN && value <= Self::MAX {
+            Some(Self(value))
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub const fn get(self) -> i32 {
+        self.0
+    }
+}
+
+/// Persisted user controls for one input's Master mixer strip.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InputAudioStripState {
+    pub gain: InputGainMilliDb,
+    pub muted: bool,
+    pub follow_video: bool,
+}
+
+impl Default for InputAudioStripState {
+    fn default() -> Self {
+        Self {
+            gain: InputGainMilliDb::UNITY,
+            muted: false,
+            follow_video: true,
+        }
+    }
+}
+
+/// Input identity paired with its persisted strip state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InputAudioStrip {
+    pub input: InputId,
+    pub state: InputAudioStripState,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

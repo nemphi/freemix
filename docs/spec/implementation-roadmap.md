@@ -82,9 +82,10 @@ rotation, translation, opacity, stable z-order, premultiplied source-over, and
 canonical RGBA16F inputs. It also executes hard-edged rectangular masks in
 half-open post-crop source space, with exact CPU-oracle coverage and ignored
 native Metal readback coverage that remains opt-in and is not claimed without
-an adapter. Schema v6 persists each scene background and each layer's explicit
+an adapter. Schema v7 persists each scene background and each layer's explicit
 input/scene source, geometry, crop, optional hard-edged rectangular mask,
-opacity, and z-order. Mask bounds are validated against the effective
+opacity, and z-order; rectangular masks were introduced in schema v6. Mask
+bounds are validated against the effective
 post-crop source dimensions before native planning; inversion does not change
 planner capacity or transient-resource accounting. The explicit v5-to-v6
 migration defaults existing layers to no mask while preserving exact desired
@@ -185,6 +186,21 @@ audio is trimmed and delayed audio produces bounded leading silence. Every
 decoded source, including an inactive one, advances on every Master interval so
 later switching does not replay stale audio.
 
+Schema v7 also persists one exact per-input audio strip as bounded integer
+milli-dB gain (`-96000..=24000`), mute, and follow-video. The explicit v6-to-v7
+migration adds unity gain, unmuted, follow-video-enabled records for every
+input kind while preserving v6 masks and exact v5 desired/realized manual
+transition state. Native daemon preflight transactionally maps those records
+to `fm-audio::Gain` and constructs both Master mixer copies with the target
+gain applied immediately rather than as a restart ramp. Checkpoint/restart
+keeps the strips because engine routing projection clones the canonical
+project. Persistence, generated-audio, AFV selected/inactive, mute, immediate
+startup gain, and failed-preflight no-partial-state tests cover this slice.
+There are still no live strip commands or operator controls, meters in the
+studio, pan/solo/PFL, delay, labels/groups, bus sends, microphone automix,
+device-audio path, or acceptance evidence. Phase 2 item 7 is partial, Phase 3
+item 3 is partial, and `AU-001`/`AU-007` remain planned.
+
 The worker and synchronizer retain bounded blocks, samples, and bytes. Refills
 reserve capacity before nonblocking dispatch, prioritize uncovered sources, and
 commit a completed batch only after every returned page validates. EOS silence
@@ -202,11 +218,11 @@ crossfade two sources with sample-linear gains from each interval's explicit
 start/end mix endpoints. Identical terminals collapse to one unity-gain source.
 Automatic Fade and held or reversed Fade and Wipe T-bar movement propagate exact
 endpoints. The manual-transition core is exposed through `EngineCommand` and
-protocol 1.4, and schema v6 preserves exact desired and realized manual state
+protocol 1.4, and schema v7 preserves exact desired and realized manual state
 across replay-safe daemon restart, including through the explicit v5-to-v6
 no-mask migration. The CLI exposes local and remote manual Start, exact integer
 position, Commit, and Cancel commands; its local path restores and saves the
-schema-v6 engine state and its remote path gates the commands at protocol 1.4.
+schema-v7 engine state and its remote path gates the commands at protocol 1.4.
 Studio negotiates protocol 1.4 and exposes permission-gated manual Fade/Wipe
 controls while Ready. Web remains on protocol 1.3 without T-bar controls.
 Missing local audio, stills, scene silence, and
@@ -490,7 +506,7 @@ camera alongside one uninterrupted camera, aggregate multi-camera startup
 cleanup and shutdown cancellation, frame conservation, and helper reaping. The
 hermetic daemon process exercises generated camera metadata plus selected GPU
 ingest, frame conservation, source timing, checkpointing, and cleanup. Separate
-protocol and capture-node tests cover metadata boundaries, and schema-v6
+protocol and capture-node tests cover metadata boundaries, and schema-v7
 persistence round-trips Display-P3/BT.709. Separate native Metal readback tests
 compare color conversions across supported primary/transfer combinations
 against CPU oracles; this does not claim that every combination traverses and
@@ -511,7 +527,7 @@ and screen/window/application-audio capture. Items 1 and 2, plus `IN-001`,
 `IN-005`, and `IN-011`, therefore remain incomplete and planned.
 
 Current implementation boundary for item 4: native `freemixd` now realizes
-schema-v6 scene inputs through an immutable `NativeProjectPlan` compiled before
+schema-v7 scene inputs through an immutable `NativeProjectPlan` compiled before
 opening media or GPU resources. The planner rejects missing references and
 video/audio cycles, bounds reachable scenes and total enabled layers at 64 each,
 and enforces a default 512 MiB peak transient RGBA16F budget. It maps full-width

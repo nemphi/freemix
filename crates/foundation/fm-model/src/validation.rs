@@ -42,6 +42,7 @@ pub(crate) fn validate_project(project: &Project) -> Vec<ValidationError> {
     validate_settings(project, &mut errors);
     validate_unique_entities(project, &mut errors);
     validate_inputs(project, &mut errors);
+    validate_input_audio_strips(project, &mut errors);
     validate_main_mix(project, &mut errors);
     validate_scenes(project, &mut errors);
     validate_buses(project, &mut errors);
@@ -50,6 +51,32 @@ pub(crate) fn validate_project(project: &Project) -> Vec<ValidationError> {
     mark_audio_input_cycles(project, &mut errors);
     mark_bus_cycles(project, &mut errors);
     errors
+}
+
+fn validate_input_audio_strips(project: &Project, errors: &mut Vec<ValidationError>) {
+    for input in project.inputs() {
+        let count = project
+            .input_audio_strips()
+            .iter()
+            .filter(|strip| strip.input == input.id)
+            .count();
+        if count != 1 {
+            errors.push(ValidationError {
+                entity: Some(EntityRef::Input(input.id)),
+                field: "audio_strip",
+                kind: ValidationErrorKind::DuplicateReference,
+            });
+        }
+    }
+    for strip in project.input_audio_strips() {
+        if !project.inputs().iter().any(|input| input.id == strip.input) {
+            errors.push(ValidationError {
+                entity: Some(EntityRef::Input(strip.input)),
+                field: "audio_strip.input",
+                kind: ValidationErrorKind::MissingReference(EntityRef::Input(strip.input)),
+            });
+        }
+    }
 }
 
 fn validate_settings(project: &Project, errors: &mut Vec<ValidationError>) {

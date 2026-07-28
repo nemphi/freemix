@@ -686,7 +686,7 @@ fn v2_project_migrates_and_serves() {
     daemon.wait_success();
 
     let migrated = ProjectStore::new(project_path).unwrap().load().unwrap();
-    assert_eq!(migrated.schema_version(), 6);
+    assert_eq!(migrated.schema_version(), 7);
     assert_eq!(migrated.project().name(), "Legacy V2");
 }
 
@@ -714,7 +714,7 @@ fn v3_project_migrates_and_serves() {
     daemon.wait_success();
 
     let migrated = ProjectStore::new(project_path).unwrap().load().unwrap();
-    assert_eq!(migrated.schema_version(), 6);
+    assert_eq!(migrated.schema_version(), 7);
     assert_eq!(migrated.project().name(), "Frozen V3 Scene");
     let scene = &migrated.project().scenes()[0];
     assert_eq!(scene.background, Rgba8::OPAQUE_BLACK);
@@ -743,7 +743,7 @@ fn v5_project_migrates_without_losing_manual_transition_state() {
     daemon.wait_success();
 
     let migrated = ProjectStore::new(project_path).unwrap().load().unwrap();
-    assert_eq!(migrated.schema_version(), 6);
+    assert_eq!(migrated.schema_version(), 7);
     assert_eq!(migrated.project().scenes()[0].layers[0].mask, None);
     let transitions = migrated.runtime_manual_transitions();
     let desired = transitions.desired.unwrap();
@@ -779,7 +779,7 @@ fn v1_project_is_rejected_as_unsupported() {
     assert!(
         String::from_utf8(output.stderr)
             .unwrap()
-            .contains("unsupported schema 1; expected 6")
+            .contains("unsupported schema 1; expected 7")
     );
 }
 

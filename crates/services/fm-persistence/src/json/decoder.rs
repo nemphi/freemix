@@ -4,9 +4,10 @@ use std::{
 };
 
 use fm_model::{
-    AudioBus, BusSend, CropRect, Input, InputKind, Layer, LayerGeometry, MainMix, Output, Project,
-    ProjectSettings, RectMask, RestartPolicy, Rgba8, Rotation, Scene, SimulatedAudio,
-    SimulatedInput, SimulatedVideo, SolidColor, SourceRef, StartupPolicy,
+    AudioBus, BusSend, CropRect, Input, InputAudioStrip, InputAudioStripState, InputGainMilliDb,
+    InputKind, Layer, LayerGeometry, MainMix, Output, Project, ProjectSettings, RectMask,
+    RestartPolicy, Rgba8, Rotation, Scene, SimulatedAudio, SimulatedInput, SimulatedVideo,
+    SolidColor, SourceRef, StartupPolicy,
 };
 use fm_types::{
     AudioFormat, BusId, Channel, ChannelLayout, ChromaLocation, ColorMetadata, ColorPrimaries,
@@ -29,6 +30,7 @@ const V2_SCHEMA_VERSION: u32 = 2;
 const V3_SCHEMA_VERSION: u32 = 3;
 const V4_SCHEMA_VERSION: u32 = 4;
 const V5_SCHEMA_VERSION: u32 = 5;
+const V6_SCHEMA_VERSION: u32 = 6;
 
 pub(crate) fn decode(source: &str) -> Result<StoredProject, DecodeError> {
     let mut root = Object::new(Reader::new(source).document()?, "manifest")?;
@@ -41,7 +43,7 @@ pub(crate) fn decode(source: &str) -> Result<StoredProject, DecodeError> {
             },
         ));
     }
-    let project = ProjectDto::parse(root.take("project")?, false, true)?.into_domain();
+    let project = ProjectDto::parse(root.take("project")?, false, true, true)?.into_domain();
     let (routing, manual_transitions, position, receipts) =
         parse_runtime(root.take("runtime")?, true)?;
     root.finish()?;
@@ -70,7 +72,7 @@ pub(crate) fn decode_v3(source: &str) -> Result<StoredProject, DecodeError> {
             },
         ));
     }
-    let project = ProjectDto::parse(root.take("project")?, true, false)?.into_domain();
+    let project = ProjectDto::parse(root.take("project")?, true, false, false)?.into_domain();
     let (routing, _, position, receipts) = parse_runtime(root.take("runtime")?, false)?;
     root.finish()?;
     StoredProject::from_project(project, routing, position, receipts)
@@ -88,7 +90,7 @@ pub(crate) fn decode_v4(source: &str) -> Result<StoredProject, DecodeError> {
             },
         ));
     }
-    let project = ProjectDto::parse(root.take("project")?, false, false)?.into_domain();
+    let project = ProjectDto::parse(root.take("project")?, false, false, false)?.into_domain();
     let (routing, _, position, receipts) = parse_runtime(root.take("runtime")?, false)?;
     root.finish()?;
     StoredProject::from_project(project, routing, position, receipts)
@@ -106,7 +108,32 @@ pub(crate) fn decode_v5(source: &str) -> Result<StoredProject, DecodeError> {
             },
         ));
     }
-    let project = ProjectDto::parse(root.take("project")?, false, false)?.into_domain();
+    let project = ProjectDto::parse(root.take("project")?, false, false, false)?.into_domain();
+    let (routing, manual_transitions, position, receipts) =
+        parse_runtime(root.take("runtime")?, true)?;
+    root.finish()?;
+    StoredProject::from_project_with_manual_transitions(
+        project,
+        routing,
+        manual_transitions,
+        position,
+        receipts,
+    )
+    .map_err(DecodeError::Validation)
+}
+
+pub(crate) fn decode_v6(source: &str) -> Result<StoredProject, DecodeError> {
+    let mut root = Object::new(Reader::new(source).document()?, "manifest")?;
+    let schema = root.u32("schema_version")?;
+    if schema != V6_SCHEMA_VERSION {
+        return Err(DecodeError::Validation(
+            ProjectValidationError::UnsupportedSchema {
+                found: schema,
+                supported: V6_SCHEMA_VERSION,
+            },
+        ));
+    }
+    let project = ProjectDto::parse(root.take("project")?, false, true, false)?.into_domain();
     let (routing, manual_transitions, position, receipts) =
         parse_runtime(root.take("runtime")?, true)?;
     root.finish()?;
@@ -125,6 +152,7 @@ struct ProjectDto {
     name: String,
     settings: ProjectSettings,
     inputs: Vec<Input>,
+    input_audio_strips: Option<Vec<InputAudioStrip>>,
     scenes: Vec<Scene>,
     audio_buses: Vec<AudioBus>,
     outputs: Vec<Output>,
@@ -133,7 +161,12 @@ struct ProjectDto {
 }
 
 impl ProjectDto {
-    fn parse(value: Value, schema_v3: bool, schema_v6: bool) -> Result<Self, DecodeError> {
+    fn parse(
+        value: Value,
+        schema_v3: bool,
+        schema_v6: bool,
+        schema_v7: bool,
+    ) -> Result<Self, DecodeError> {
         let mut object = Object::new(value, "project")?;
         let id = ProjectId::new(object.nonzero_u128("id")?);
         let name = object.string("name")?;
@@ -147,6 +180,15 @@ impl ProjectDto {
             name,
             settings,
             inputs,
+            input_audio_strips: if schema_v7 {
+                Some(parse_array(
+                    object.take("input_audio_strips")?,
+                    "input_audio_strips",
+                    parse_input_audio_strip,
+                )?)
+            } else {
+                None
+            },
             scenes: parse_array(object.take("scenes")?, "scenes", |value| {
                 parse_scene(
                     value,
@@ -162,6 +204,28 @@ impl ProjectDto {
             restart_policy: parse_restart_policy(object.take("restart_policy")?)?,
         };
         object.finish()?;
+        if let Some(strips) = &dto.input_audio_strips {
+            for input in &dto.inputs {
+                if strips
+                    .iter()
+                    .filter(|strip| strip.input == input.id)
+                    .count()
+                    != 1
+                {
+                    return Err(syntax(
+                        "input_audio_strips must contain exactly one strip for every input",
+                    ));
+                }
+            }
+            if strips
+                .iter()
+                .any(|strip| !dto.inputs.iter().any(|input| input.id == strip.input))
+            {
+                return Err(syntax(
+                    "input_audio_strips must not reference an unknown input",
+                ));
+            }
+        }
         Ok(dto)
     }
 
@@ -170,6 +234,14 @@ impl ProjectDto {
             .with_restart_policy(self.restart_policy);
         for input in self.inputs {
             project.add_input(input);
+        }
+        if let Some(strips) = self.input_audio_strips {
+            for strip in strips {
+                assert!(
+                    project.set_input_audio_strip(strip.input, strip.state),
+                    "validated input audio strip must reference an input"
+                );
+            }
         }
         for scene in self.scenes {
             project.add_scene(scene);
@@ -185,6 +257,29 @@ impl ProjectDto {
         }
         project
     }
+}
+
+fn parse_input_audio_strip(value: Value) -> Result<InputAudioStrip, DecodeError> {
+    let mut object = Object::new(value, "input audio strip")?;
+    let input = InputId::new(object.nonzero_u128("input")?);
+    let gain_value = object.i32("gain_milli_db")?;
+    let gain = InputGainMilliDb::new(gain_value).ok_or_else(|| {
+        syntax(format!(
+            "input gain_milli_db must be between {} and {}",
+            InputGainMilliDb::MIN,
+            InputGainMilliDb::MAX
+        ))
+    })?;
+    let strip = InputAudioStrip {
+        input,
+        state: InputAudioStripState {
+            gain,
+            muted: object.boolean("muted")?,
+            follow_video: object.boolean("follow_video")?,
+        },
+    };
+    object.finish()?;
+    Ok(strip)
 }
 
 fn parse_settings(value: Value) -> Result<ProjectSettings, DecodeError> {

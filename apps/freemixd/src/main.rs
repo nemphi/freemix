@@ -3293,6 +3293,7 @@ fn load_migrate_recover(store: &ProjectStore) -> AppResult<StoredProject> {
                 3 => store.migrate_v3()?,
                 4 => store.migrate_v4()?,
                 5 => store.migrate_v5()?,
+                6 => store.migrate_v6()?,
                 _ => {
                     return Err(StoreError::Validation(
                         ProjectValidationError::UnsupportedSchema {
@@ -4324,8 +4325,8 @@ mod tests {
     #[cfg(all(feature = "native-media", target_os = "macos"))]
     use fm_io_macos::{CameraIdKind, deterministic_camera_id};
     use fm_model::{
-        Input, InputKind, Project, ProjectSettings, SimulatedAudio, SimulatedInput, SimulatedVideo,
-        SolidColor,
+        Input, InputAudioStripState, InputGainMilliDb, InputKind, Project, ProjectSettings,
+        SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor,
     };
     #[cfg(feature = "native-media")]
     use fm_model::{Rgba8 as ModelRgba8, Scene};
@@ -6459,6 +6460,10 @@ mod tests {
         let checkpoint =
             stored_project_checkpoint(&durable, &control.idle_engine_snapshot().unwrap()).unwrap();
         assert_eq!(checkpoint.project(), durable.project());
+        assert_eq!(
+            checkpoint.project().input_audio_strip(test_input_id(1)),
+            durable.project().input_audio_strip(test_input_id(1))
+        );
         assert_eq!(checkpoint.runtime_routing(), durable.runtime_routing());
         assert_eq!(
             checkpoint.idempotency_receipts(),
@@ -6629,6 +6634,14 @@ mod tests {
             )),
             required_capabilities: Vec::new(),
         });
+        assert!(project.set_input_audio_strip(
+            test_input_id(1),
+            InputAudioStripState {
+                gain: InputGainMilliDb::new(-3_000).unwrap(),
+                muted: false,
+                follow_video: true,
+            },
+        ));
         project.set_main_mix(MainMix::new(test_input_id(1), test_input_id(2)));
         StoredProject::from_project(
             project,
