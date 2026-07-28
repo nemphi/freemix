@@ -1299,6 +1299,7 @@ dependencies = [
  "fm-client",
  "fm-protocol",
  "fm-types",
+ "fm-ui-model",
 ]
 
 [[package]]

@@ -128,12 +128,15 @@ capped, and supervised daemon shutdown or restart performs bounded
 process-group/job and descendant cleanup. Project input names and video frames
 are not present in the replicated client contract, so tiles use ordinal/ID
 labels and monitor wells state that real preview delivery remains pending.
-`freemix-web` likewise declares protocol 1.3 support in its client configuration,
-and its transport-free semantic presentation model exposes permission- and
-protocol-gated Wipe with Fade's bounded 1-to-3,600-frame duration. No browser
-renderer or network runtime exists. Web exposes no T-bar controls, and the
-remaining transition families, FTB, and native-media/hardware T-bar evidence
-keep item 5 and RC-007 planned.
+`freemix-web` likewise declares protocol 1.4 support in its client configuration.
+Its transport-free semantic presentation model preserves the existing
+permission- and protocol-gated Cut/Fade/Wipe controls and adds manual Fade/Wipe
+Start, exact basis-point Position, Commit, and Cancel controls. Manual controls
+are hidden below protocol 1.4 and otherwise derive availability from Ready
+state, transition permission, and separate authoritative desired and realized
+manual projections. Web still has no browser renderer or network runtime, and
+the remaining transition families, FTB, and protocol-driven
+native-media/hardware T-bar evidence keep item 5 and RC-007 planned.
 
 Current implementation boundary for item 6: `fm-frame` defines a bounded,
 portable local-preview contract for shared-image versus encoded fallback,
@@ -224,7 +227,8 @@ no-mask migration. The CLI exposes local and remote manual Start, exact integer
 position, Commit, and Cancel commands; its local path restores and saves the
 schema-v7 engine state and its remote path gates the commands at protocol 1.4.
 Studio negotiates protocol 1.4 and exposes permission-gated manual Fade/Wipe
-controls while Ready. Web remains on protocol 1.3 without T-bar controls.
+controls while Ready. Web now has only a protocol-1.4 transport-free semantic
+manual-control model; it still has no browser renderer or network runtime.
 Missing local audio, stills, scene silence, and
 configured simulated silence produce silence; unsupported simulated sine audio
 is rejected. At decoded EOS, the daemon synthesizes continuing silence for
@@ -585,10 +589,11 @@ Recovery preserves strict intent FIFO across a tested protocol downgrade, so an
 unresolved Wipe is neither sent to 1.2 nor bypassed by later commands. Bounded
 terminal history, collision-triggered authoritative resync, and Studio's sticky
 terminal-uncertainty ledger cover ambiguous replay receipts. `freemix-web`
-declares protocol 1.3 support in its client configuration, and its
-transport-free semantic presentation model exposes permission- and
-protocol-gated Wipe with Fade's bounded 1-to-3,600-frame duration. No browser
-renderer or network runtime exists.
+declares protocol 1.4 support in its client configuration. Its transport-free
+semantic presentation model preserves permission- and protocol-gated
+Cut/Fade/Wipe and adds manual Fade/Wipe Start, exact basis-point Position,
+Commit, and Cancel controls derived from separate authoritative desired and
+realized projections. No browser renderer or network runtime exists.
 
 The T-bar control core supports Fade and Wipe through `fm-switcher`,
 `EngineCommand`, `fm-control`, and protocol 1.4 with exact held, reversed,
@@ -603,8 +608,9 @@ exact position without treating widget state as engine truth. Its manual
 controls require Ready state, transition permission, and negotiated 1.4.
 Reconnect tests preserve strict worker FIFO: an unresolved manual head and
 later commands remain blocked through a 1.3 downgrade and resume unchanged only
-on 1.4. Web remains a protocol 1.3 client without T-bar controls, and there is
-no protocol-driven native-media end-to-end or hardware evidence for the manual
+on 1.4. Web now has only a protocol-1.4 transport-free semantic manual-control
+model; it still has no browser renderer or network runtime. There is no
+protocol-driven native-media end-to-end or hardware evidence for the manual
 path. FTB, AlphaFade, stinger, Slide/Zoom, the remaining transition families,
 and `SW-004` acceptance remain pending; parity therefore stays planned. Item 5
 and RC-007 remain planned.

@@ -9,6 +9,7 @@ rust-version.workspace = true
 fm-client = { path = "../../crates/services/fm-client" }
 fm-protocol = { path = "../../crates/foundation/fm-protocol" }
 fm-types = { path = "../../crates/foundation/fm-types" }
+fm-ui-model = { path = "../../crates/ui/fm-ui-model" }
 
 [lints]
 workspace = true

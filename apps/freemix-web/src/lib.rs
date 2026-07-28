@@ -4,15 +4,20 @@ use std::fmt;
 use std::net::Ipv6Addr;
 
 use fm_client::ClientConfig;
-use fm_protocol::{ClientType, ProtocolVersion, Role, WIPE_PROTOCOL_VERSION};
+use fm_protocol::{ClientType, MANUAL_TRANSITION_PROTOCOL_VERSION, ProtocolVersion, Role};
 use fm_types::ProjectId;
 
+mod manual_transition;
 mod transition;
 
+pub use manual_transition::{
+    ManualTransitionControl, ManualTransitionModel, ManualTransitionMotion,
+    ManualTransitionPresentation, ManualTransitionProjection,
+};
 pub use transition::{TransitionControl, TransitionControlState, TransitionControls};
 
 /// Protocol versions implemented by this control surface.
-pub const SUPPORTED_PROTOCOL_VERSIONS: [ProtocolVersion; 1] = [WIPE_PROTOCOL_VERSION];
+pub const SUPPORTED_PROTOCOL_VERSIONS: [ProtocolVersion; 1] = [MANUAL_TRANSITION_PROTOCOL_VERSION];
 
 /// A semantic panel that can appear in a role-scoped route.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -463,5 +468,9 @@ mod tests {
         assert_eq!(config.client.client_id, "web-console-1");
         assert_eq!(config.client.project_id, project_id());
         assert_eq!(config.client.build, "freemix-web 0.1.0");
+        assert_eq!(
+            config.client.supported_versions,
+            [MANUAL_TRANSITION_PROTOCOL_VERSION]
+        );
     }
 }
