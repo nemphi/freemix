@@ -788,7 +788,8 @@ fn format_t_bar(state: Option<TBarState>) -> String {
                 match state.kind() {
                     TransitionKind::Fade => "fade",
                     TransitionKind::Wipe => "wipe",
-                    _ => unreachable!("engine manual transitions are fade or wipe"),
+                    TransitionKind::AlphaFade => "alpha_fade",
+                    _ => unreachable!("engine manual transitions are fade, wipe, or AlphaFade"),
                 },
                 state.from(),
                 state.to(),
@@ -811,7 +812,7 @@ Usage:
   freemix-cli fade <show.freemix> <frames> [--key <key>] [--expect <revision>]
   freemix-cli alpha-fade <show.freemix> <frames> [--key <key>] [--expect <revision>]
   freemix-cli wipe <show.freemix> <frames> [--key <key>] [--expect <revision>]
-  freemix-cli tbar-start <show.freemix> <fade|wipe> [--key <key>] [--expect <revision>]
+  freemix-cli tbar-start <show.freemix> <fade|wipe|alpha-fade> [--key <key>] [--expect <revision>]
   freemix-cli tbar-position <show.freemix> <basis-points:0..=10000> [--key <key>] [--expect <revision>]
   freemix-cli tbar-commit <show.freemix> [--key <key>] [--expect <revision>]
   freemix-cli tbar-cancel <show.freemix> [--key <key>] [--expect <revision>]
@@ -822,7 +823,7 @@ Usage:
   freemix-cli remote-fade <127.0.0.1:port> <frames> [--key <key>] [--expect <revision>]
   freemix-cli remote-alpha-fade <127.0.0.1:port> <frames> [--key <key>] [--expect <revision>]
   freemix-cli remote-wipe <127.0.0.1:port> <frames> [--key <key>] [--expect <revision>]
-  freemix-cli remote-tbar-start <127.0.0.1:port> <fade|wipe> [--key <key>] [--expect <revision>]
+  freemix-cli remote-tbar-start <127.0.0.1:port> <fade|wipe|alpha-fade> [--key <key>] [--expect <revision>]
   freemix-cli remote-tbar-position <127.0.0.1:port> <basis-points:0..=10000> [--key <key>] [--expect <revision>]
   freemix-cli remote-tbar-commit <127.0.0.1:port> [--key <key>] [--expect <revision>]
   freemix-cli remote-tbar-cancel <127.0.0.1:port> [--key <key>] [--expect <revision>]
@@ -836,6 +837,7 @@ const fn engine_manual_kind(kind: ManualTransitionKind) -> EngineManualTransitio
     match kind {
         ManualTransitionKind::Fade => EngineManualTransitionKind::Fade,
         ManualTransitionKind::Wipe => EngineManualTransitionKind::Wipe,
+        ManualTransitionKind::AlphaFade => EngineManualTransitionKind::AlphaFade,
     }
 }
 
@@ -857,6 +859,7 @@ const fn protocol_manual_kind(kind: ManualTransitionKind) -> fm_protocol::Manual
     match kind {
         ManualTransitionKind::Fade => fm_protocol::ManualTransitionKind::Fade,
         ManualTransitionKind::Wipe => fm_protocol::ManualTransitionKind::Wipe,
+        ManualTransitionKind::AlphaFade => fm_protocol::ManualTransitionKind::AlphaFade,
     }
 }
 

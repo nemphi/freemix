@@ -4,6 +4,7 @@ use std::{net::SocketAddr, path::PathBuf};
 pub enum ManualTransitionKind {
     Fade,
     Wipe,
+    AlphaFade,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -515,6 +516,7 @@ fn manual_kind(value: &str) -> Result<ManualTransitionKind, ArgsError> {
     match value {
         "fade" => Ok(ManualTransitionKind::Fade),
         "wipe" => Ok(ManualTransitionKind::Wipe),
+        "alpha-fade" => Ok(ManualTransitionKind::AlphaFade),
         _ => Err(ArgsError::InvalidChoice {
             field: "transition kind",
             value: value.to_owned(),
@@ -689,6 +691,21 @@ mod tests {
                 action: TBarAction::SetPosition(10_000),
                 key: None,
                 expected_revision: Some(9),
+            })
+        );
+        assert_eq!(
+            parse(strings(&[
+                "remote-tbar-start",
+                "127.0.0.1:9123",
+                "alpha-fade",
+                "--key",
+                "manual-alpha-start",
+            ])),
+            Ok(Command::RemoteTBar {
+                address: "127.0.0.1:9123".parse().unwrap(),
+                action: TBarAction::Start(ManualTransitionKind::AlphaFade),
+                key: Some("manual-alpha-start".into()),
+                expected_revision: None,
             })
         );
         assert!(matches!(
