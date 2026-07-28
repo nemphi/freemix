@@ -78,26 +78,38 @@ layer's explicit input/scene source, geometry, crop, opacity, and z-order.
 audio `BusId`. The explicit v3-to-v4 migration supplies opaque-black,
 canvas-identity, no-crop, full-opacity, and zero-z-order defaults while
 preserving legacy sources and layer counts; outputs are preserved as declared
-and are not inferred. Native `freemixd` scene realization remains explicitly
-unsupported and pending: native media rejects scene inputs because it does not
-yet connect the persisted model to compositor execution.
+and are not inferred. Native `freemixd` now consumes this visual model through
+the bounded schema-v4 scene planner described under Phase 3 item 4 instead of
+rejecting scene inputs. Keys, masks, effects, per-output realization, live
+edits, and cross-platform certification remain outside this item, so its parity
+rows remain planned.
 
 Current implementation boundary for item 5: `freemix-studio` opens a native
 `eframe`/wgpu shell by default with responsive Program/Preview monitor wells,
-stable-ID input tiles, realized/desired tally, permission-gated Cut/Fade
-controls, bounded worker channels, optimistic Preview intent, and negotiated
-client-state replication. Blocking TCP and daemon supervision remain off the
-render thread. The worker now reconnects automatically after bounded backoff,
-negotiates durable resume or an authoritative snapshot, resumes unresolved
-command sequences, and requests a snapshot when runtime realization becomes
-uncertain. TCP establishment is finite, using one attempt of up to the
-configured timeout, but cancellation is checked only before and after that
-attempt. Supervisor readiness and connected protocol read, write, and flush
-waits are polled and cancellable; deferred intents are capped, and supervised
-daemon shutdown or restart performs bounded process-group/job and descendant
-cleanup. Project input names and video frames are not present in the replicated
-client contract, so tiles use ordinal/ID labels and monitor wells state that
-real preview delivery remains pending.
+stable-ID input tiles, realized/desired tally, and permission-gated Cut/Fade/Wipe
+controls. Studio now advertises protocol 1.3; Wipe additionally requires the
+negotiated protocol capability and shares Fade's bounded 1-to-3,600-frame
+duration control. Bounded worker channels preserve strict operator FIFO while
+recovering: an unresolved or deferred Wipe cannot cross a downgrade to protocol
+1.2, and later supported intents cannot overtake it. `fm-client` retains a
+bounded terminal command history (256 by default, configurable through 65,536),
+while replay-receipt collisions mark affected sent commands terminal-uncertain,
+force authoritative snapshot resynchronization, and remain visibly sticky in
+Studio's bounded eight-entry ledger until Studio is restarted.
+
+Blocking TCP and daemon supervision remain off the render thread. The worker
+reconnects after bounded backoff, negotiates durable resume or an authoritative
+snapshot, resumes unresolved command sequences, and requests a snapshot when
+runtime realization becomes uncertain. TCP establishment is finite, using one
+attempt of up to the configured timeout, but cancellation is checked only
+before and after that attempt. Supervisor readiness and connected protocol
+read, write, and flush waits are polled and cancellable; deferred intents are
+capped, and supervised daemon shutdown or restart performs bounded
+process-group/job and descendant cleanup. Project input names and video frames
+are not present in the replicated client contract, so tiles use ordinal/ID
+labels and monitor wells state that real preview delivery remains pending. The
+Web control remains protocol 1.2 and has no Wipe control. Item 5 and its parity
+rows remain incomplete and planned.
 
 Current implementation boundary for item 6: `fm-frame` defines a bounded,
 portable local-preview contract for shared-image versus encoded fallback,
@@ -117,44 +129,53 @@ Current implementation boundary for item 7: `fm-codec-ffmpeg` provides a
 transactional sequential local-audio cursor with global block sequence,
 sample-contiguous timing, sticky EOS, and explicit per-page operation
 block/sample/byte limits. Cursor progress no longer spends prior pages against
-those limits. `fm-audio` provides a deterministic reference Master
-with planar F32 identity mapping, gain/mute/follow-video, meters, timed canonical
-blocks, sample-count timing validation, and transactional gain ramps. Its
-`ClockMappedAudioSynchronizer` is a bounded, fixed-format linear synchronizer
-and resampler over `fm-clock::ClockMapping`; construction preallocates bounded
-PCM, block metadata, and output-phase storage. Explicit source and Master
-`AudioCadenceOrigin`s retain absolute sample indices so floor-rounded cadence
-phase is preserved when a stream starts or resets away from sample zero. Push,
-render, and reset update stream state transactionally: failed push/render
-preflight leaves cursors and caller output unchanged, while reset atomically
-drops buffered media and rearms both cadence origins without reallocating.
-Deterministic tests cover 44.1 kHz to 48 kHz linear resampling, split blocks,
-arbitrary absolute origins, reset, continuity failures, and resource bounds.
-The synchronizer is not connected to `freemixd`, an OS audio device, or a drift
-estimator.
+those limits, and bounded metadata-only positioning can skip complete blocks to
+a restored sample without decoding their PCM prefix.
 
-Opt-in native daemon mode still maintains bounded CPU audio rings on a decode
-worker, allocates Master intervals directly from absolute engine frame numbers,
-follows the authoritative `ProgramFrame`, and writes a bounded fake sink. Cut
-keeps one source at unity; Fade and Wipe currently both crossfade two sources
-with sample-linear gains derived from the explicit mix start and end endpoints
-of each audio interval. Automatic Fade and held or reversed Fade T-bar movement
-propagate those exact endpoints; this T-bar propagation is internal
-switcher/engine-tick behavior and is not exposed by `EngineCommand`, the
-protocol, or the UI. Identical source IDs collapse to one unity-gain source
-instead of being mixed twice. This existing local path still requires audio to
-exactly match the project sample rate/layout and its first timestamp to align
-with the selected video's first timestamp; it performs no resampling or implicit
-mapping. Missing audio, stills, and configured simulated silence produce
-silence, while unsupported simulated sine audio is rejected. This remains a
-diagnostic/reference path: it allocates while mixing, waits for all preflighted
-sources, and has no OS audio device, bus/output routing, persisted strip
-controls, drift correction, or externally delivered audio. Dedicated Wipe audio
-policy testing is absent, and broader transition audio policies remain
-incomplete. Later FFmpeg pages still rescan and trim from the beginning, so deep
-playback becomes progressively more expensive and can fail transactionally at
-fixed metadata-output or subprocess-timeout bounds. Item 7 and the related
-parity rows therefore remain incomplete.
+`fm-audio` provides a deterministic reference Master with planar F32 mapping,
+gain/mute/follow-video, meters, timed canonical blocks, sample-count timing
+validation, and transactional gain ramps. Its bounded
+`ClockMappedAudioSynchronizer` is now connected to native `freemixd` local-file
+audio. The daemon accepts source rates such as 44.1 kHz and linearly resamples
+them to the 48 kHz project Master while preserving absolute source and Master
+cadence origins. Master intervals derive directly from absolute engine frame
+numbers, including deep restored cursors and fractional video rates. Initial
+positioning compares audio and video on their relative media timeline: early
+audio is trimmed and delayed audio produces bounded leading silence. Every
+decoded source, including an inactive one, advances on every Master interval so
+later switching does not replay stale audio.
+
+The worker and synchronizer retain bounded blocks, samples, and bytes. Refills
+reserve capacity before nonblocking dispatch, prioritize uncovered sources, and
+commit a completed batch only after every returned page validates. EOS silence
+is staged and preflighted across all affected sources before any cursor changes;
+render preflights every source commit and sink admission before advancing the
+absolute frame cursor. Reusable source, discard, mix, plan, and EOS staging
+scratch is preallocated; only the canonical returned block and bounded fake-sink
+clone allocate per frame. Exact source channel layout is enforced across pages
+and must map by matching labels to Master; there is no channel conversion.
+
+Scene inputs recursively route audio through explicit `audio_source` links to a
+physical leaf or explicit silence. Cut keeps one source at unity; Fade and Wipe
+crossfade two sources with sample-linear gains from each interval's explicit
+start/end mix endpoints. Identical terminals collapse to one unity-gain source.
+Automatic Fade and held or reversed Fade T-bar movement propagate exact
+endpoints, although T-bar control remains internal rather than exposed by
+`EngineCommand`, protocol, or UI. Missing local audio, stills, scene silence,
+and configured simulated silence produce silence; unsupported simulated sine
+audio is rejected.
+
+`FREEMIXD_TELEMETRY` v4 reports current and observed-peak retained
+blocks/samples/bytes; reservation requests and current/peak reserved
+blocks/samples/bytes; source stalls; positioned blocks/samples; leading-silence
+samples; EOS-padding blocks/samples; and fake-sink current depth, peak depth, and
+drops. Native daemon, deep-restore FFmpeg, 44.1-to-48 kHz Metal recording, and
+restart/soak evidence exercise this path. It remains a fixed-clock linear
+diagnostic resampler feeding a fake sink: there is no drift estimator, device
+clock or OS audio device, channel conversion, persisted buses/output routing or
+strip controls, DSP, or externally delivered audio. Dedicated Wipe audio-policy
+testing and broader transition policies remain incomplete. Item 7 and the
+related parity rows therefore remain incomplete and planned.
 
 Current implementation boundary for item 8: `fm-gpu` provides a portable,
 bounded latest-frame presentation policy plus opaque, context-bound native
@@ -391,8 +412,9 @@ ingest failures, and successful live GPU ingests. Per-source tests assert exact
 conservation of every adapter-received frame across ingestion, explicit discard
 or replacement classes, and instantaneous outstanding slots; daemon aggregates
 are folded from the same snapshots. Telemetry v4 additionally exposes native
-audio reservation pressure, stalls, positioning, EOS padding, and retained-byte
-counters. Diagnostics remain local
+audio current/peak retention and reservation blocks, samples, and bytes;
+reservation requests, stalls, positioned blocks/samples, leading-silence and
+EOS-padding samples, and fake-sink depth/peak/drop counters. Diagnostics remain local
 `diagnostic-not-certification` records and omit hardware identifiers, names,
 stable keys, paths, health details, clocks, and media.
 
@@ -423,6 +445,34 @@ certification, Windows/Linux adapters, audio-device daemon/Master realization,
 and screen/window/application-audio capture. Items 1 and 2, plus `IN-001`,
 `IN-005`, and `IN-011`, therefore remain incomplete and planned.
 
+Current implementation boundary for item 4: native `freemixd` now realizes
+schema-v4 scene inputs through an immutable `NativeProjectPlan` compiled before
+opening media or GPU resources. The planner rejects missing references and
+video/audio cycles, bounds reachable scenes and total enabled layers at 64 each,
+and enforces a default 512 MiB peak transient RGBA16F budget. It maps full-width
+128-bit input/scene identities to generated compositor tokens without narrowing,
+orders nested and shareable scenes dependency-first, and preserves background,
+enabled state, translation/size, crop, opacity, signed z-order, and 0/90/180/270
+degree rotation. Per frame it derives the selected Program transition roots,
+renders only their dependency closure once, releases non-root scene textures
+after their final consumer, and composites both scene endpoints before applying
+Cut, Fade, or Wipe.
+
+Scene audio recursively follows each explicit `audio_source` to one physical
+leaf or explicit silence; two scene routes that resolve to the same terminal are
+mixed once at unity. One GPU completion-fenced project-frame slot prevents the
+next frame from reclaiming transient scene textures before prior submissions
+complete, and the planner charges the worst selected closure plus transition and
+previous-Program targets against its peak budget. CPU planner tests cover bounds,
+cycles, full-width-ID collisions, visual mapping, selected closure, recursive
+audio, and sharing. Native Metal tests cover nested shared scenes before Fade and
+Wipe plus 96 completion-fenced frames without production readback; a daemon test
+checkpoints and restarts from scene Program/Preview routes. These are macOS/Metal
+and hermetic diagnostics, not cross-platform certification. Keys, masks, effect
+stacks, a ten-layer product limit, per-output scene realization/routing, live
+scene edits/replanning, and Windows/DX12 or Linux/Vulkan evidence remain. Item 4
+and its parity rows therefore remain incomplete and planned.
+
 Current implementation boundary for item 5: horizontal Wipe now flows through
 local and remote CLI commands, `fm-control`, `EngineCommand`, the switcher,
 `fm-sim`, the native compositor, and daemon rendering/checkpointing. Protocol
@@ -430,10 +480,16 @@ local and remote CLI commands, `fm-control`, `EngineCommand`, the switcher,
 negotiated peer before durable acceptance or control/engine mutation. Exact
 rational progress selects `floor(width * numerator / denominator)` replacement
 columns and preserves identical start/end frames, with exact CPU and Metal
-coverage of endpoints and pixel boundaries. `freemix-studio` remains a protocol
-1.2 client with no Wipe UI; public T-bar command exposure and AlphaFade, FTB,
-stinger, Slide/Zoom, and other transition families remain pending. Item 5
-therefore remains incomplete.
+coverage of endpoints and pixel boundaries. `freemix-studio` now negotiates
+protocol 1.3 and exposes a Wipe button only when both transition permission and
+the negotiated protocol allow it; Fade and Wipe share one bounded duration.
+Recovery preserves strict intent FIFO across a tested protocol downgrade, so an
+unresolved Wipe is neither sent to 1.2 nor bypassed by later commands. Bounded
+terminal history, collision-triggered authoritative resync, and Studio's sticky
+terminal-uncertainty ledger cover ambiguous replay receipts. `freemix-web`
+remains protocol 1.2 and has no Wipe control. Public T-bar command exposure and
+AlphaFade, FTB, stinger, Slide/Zoom, and other transition families remain
+pending. Item 5 and its parity rows therefore remain incomplete and planned.
 
 Exit: `P0` switcher, composition, audio, display, record, and control rows pass.
 
