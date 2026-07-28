@@ -11,8 +11,8 @@ use std::collections::{HashMap, HashSet};
 
 use fm_command::{CommandId, Revision};
 use fm_protocol::{
-    CommandResult, EngineIdentity, EventCursor, EventMessage, EventPayload, FieldIssue,
-    ManualTransitionKind, ManualTransitionPosition,
+    CommandResult, EngineIdentity, EventCursor, EventMessage, EventPayload, FadeToBlackPosition,
+    FadeToBlackState, FieldIssue, ManualTransitionKind, ManualTransitionPosition,
     ManualTransitionStatus as ProtocolManualTransitionStatus, ResumeCursor, ServerHello,
     ServerIdentity, SnapshotMessage,
 };
@@ -100,6 +100,8 @@ pub struct SwitcherState {
     pub realized: BusSelection,
     pub desired_manual_transition: ManualTransitionStatus,
     pub realized_manual_transition: ManualTransitionStatus,
+    pub desired_fade_to_black: FadeToBlackState,
+    pub realized_fade_to_black: FadeToBlackState,
     pub runtime_generation: Option<u64>,
 }
 
@@ -174,6 +176,8 @@ impl ProjectSnapshot {
                 realized_manual_transition: manual_status_from_protocol(
                     message.realized_manual_transition,
                 ),
+                desired_fade_to_black: fade_to_black_from_protocol(message.desired_fade_to_black),
+                realized_fade_to_black: fade_to_black_from_protocol(message.realized_fade_to_black),
                 runtime_generation: None,
             },
         }
@@ -186,6 +190,7 @@ pub enum DurableChange {
     DesiredSwitcher {
         selection: BusSelection,
         manual_transition: ManualTransitionStatus,
+        fade_to_black: FadeToBlackState,
     },
 }
 
@@ -205,9 +210,11 @@ impl DurableProjectEvent {
                 program,
                 preview,
                 manual_transition,
+                fade_to_black,
             } => DurableChange::DesiredSwitcher {
                 selection: BusSelection::new(program.to_domain(), preview.to_domain()),
                 manual_transition: manual_status_from_protocol(manual_transition),
+                fade_to_black: fade_to_black_from_protocol(fade_to_black),
             },
         };
         Self {
@@ -253,6 +260,7 @@ pub struct RuntimeRealization {
     pub generation: u64,
     pub sequence: u64,
     pub manual_transition: Option<ManualTransitionStatus>,
+    pub fade_to_black: Option<FadeToBlackState>,
 }
 
 /// Authoritative project data at the last applied cursor.
@@ -541,7 +549,8 @@ pub struct ClientModel {
     expected_engine: Option<EngineIdentity>,
     state: Option<ProjectState>,
     applied_events: HashMap<Revision, DurableProjectEvent>,
-    desired_by_revision: HashMap<Revision, (BusSelection, ManualTransitionStatus)>,
+    desired_by_revision:
+        HashMap<Revision, (BusSelection, ManualTransitionStatus, FadeToBlackState)>,
     last_runtime_realization: Option<RuntimeRealization>,
     pending: Vec<PendingCommand>,
     last_rejection: Option<RejectedCommand>,
@@ -753,6 +762,7 @@ impl ClientModel {
             (
                 snapshot.switcher.desired,
                 snapshot.switcher.desired_manual_transition,
+                snapshot.switcher.desired_fade_to_black,
             ),
         );
         self.expected_engine = Some(snapshot.cursor.engine.clone());
@@ -839,6 +849,7 @@ impl ClientModel {
             (
                 state.switcher.desired,
                 state.switcher.desired_manual_transition,
+                state.switcher.desired_fade_to_black,
             ),
         );
         self.cursor = Some(event.cursor.clone());
@@ -911,7 +922,7 @@ impl ClientModel {
                 },
             }
         }
-        let (desired, desired_manual_transition) = self
+        let (desired, desired_manual_transition, desired_fade_to_black) = self
             .desired_by_revision
             .get(&realization.revision)
             .copied()
@@ -921,12 +932,14 @@ impl ClientModel {
         let realized_manual_transition = realization
             .manual_transition
             .unwrap_or(desired_manual_transition);
+        let realized_fade_to_black = realization.fade_to_black.unwrap_or(desired_fade_to_black);
         let state = self.state.as_ref().ok_or(ModelError::StateUnavailable)?;
         let inputs = state.inputs.iter().copied().collect();
         validate_manual_transition(realized_manual_transition, desired, &inputs)?;
         let state = self.state.as_mut().ok_or(ModelError::StateUnavailable)?;
         state.switcher.realized = desired;
         state.switcher.realized_manual_transition = realized_manual_transition;
+        state.switcher.realized_fade_to_black = realized_fade_to_black;
         state.switcher.runtime_generation = Some(realization.generation);
         self.last_runtime_realization = Some(realization);
         Ok(RuntimeRealizationApplied::Applied)
@@ -1144,6 +1157,7 @@ fn validate_change(change: &DurableChange, inputs: &[InputId]) -> Result<(), Mod
         DurableChange::DesiredSwitcher {
             selection,
             manual_transition,
+            ..
         } => (selection, manual_transition),
     };
     for input in [selection.program, selection.preview] {
@@ -1170,9 +1184,11 @@ fn apply_change(switcher: &mut SwitcherState, change: DurableChange) {
         DurableChange::DesiredSwitcher {
             selection,
             manual_transition,
+            fade_to_black,
         } => {
             switcher.desired = selection;
             switcher.desired_manual_transition = manual_transition;
+            switcher.desired_fade_to_black = fade_to_black;
         }
     }
 }
@@ -1184,6 +1200,13 @@ fn manual_status_from_protocol(
         ManualTransitionStatus::Inactive,
         ManualTransitionStatus::from_protocol,
     )
+}
+
+fn fade_to_black_from_protocol(state: Option<FadeToBlackState>) -> FadeToBlackState {
+    state.unwrap_or(FadeToBlackState {
+        target_active: false,
+        position: FadeToBlackPosition::LIVE,
+    })
 }
 
 fn validate_manual_transition(

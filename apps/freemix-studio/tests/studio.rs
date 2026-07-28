@@ -97,6 +97,8 @@ fn snapshot(revision: u64) -> SnapshotMessage {
         realized_preview: input(2),
         desired_manual_transition: None,
         realized_manual_transition: None,
+        desired_fade_to_black: None,
+        realized_fade_to_black: None,
     }
 }
 
@@ -110,6 +112,7 @@ fn event(revision: u64) -> EventMessage {
             program: input(2),
             preview: input(1),
             manual_transition: None,
+            fade_to_black: None,
         },
     }
 }
@@ -123,6 +126,7 @@ fn runtime_event(revision: u64) -> RuntimeEventMessage {
         event: RuntimeLifecycleEvent::Realized {
             domain: "switcher".to_owned(),
             manual_transition: None,
+            fade_to_black: None,
         },
     }
 }

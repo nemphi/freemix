@@ -6,11 +6,11 @@ use fm_client::{
 };
 use fm_protocol::{
     CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, ClientType, CommandPayload, CommandResult,
-    EngineIdentity, EventCursor, EventMessage, EventPayload, HandshakeOutcome, HandshakeResponse,
-    MANUAL_TRANSITION_PROTOCOL_VERSION, ManualTransitionKind, ManualTransitionPosition,
-    ManualTransitionState, ManualTransitionStatus, ProtocolVersion, ResumeCursor, Role,
-    RuntimeEventMessage, RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage, SnapshotReason,
-    WIPE_PROTOCOL_VERSION, WireInputId, WireMessage,
+    EngineIdentity, EventCursor, EventMessage, EventPayload, FadeToBlackPosition, FadeToBlackState,
+    HandshakeOutcome, HandshakeResponse, MANUAL_TRANSITION_PROTOCOL_VERSION, ManualTransitionKind,
+    ManualTransitionPosition, ManualTransitionState, ManualTransitionStatus, ProtocolVersion,
+    ResumeCursor, Role, RuntimeEventMessage, RuntimeLifecycleEvent, ServerIdentity,
+    SnapshotMessage, SnapshotReason, WIPE_PROTOCOL_VERSION, WireInputId, WireMessage,
 };
 use fm_types::ProjectId;
 use fm_ui_model::ManualTransitionStatus as ModelManualTransitionStatus;
@@ -98,6 +98,19 @@ fn snapshot(revision: u64) -> SnapshotMessage {
         realized_preview: input(2),
         desired_manual_transition: Some(ManualTransitionStatus::Inactive),
         realized_manual_transition: Some(ManualTransitionStatus::Inactive),
+        desired_fade_to_black: Some(live_fade_to_black()),
+        realized_fade_to_black: Some(live_fade_to_black()),
+    }
+}
+
+fn live_fade_to_black() -> FadeToBlackState {
+    fade_to_black(false, FadeToBlackPosition::LIVE.numerator())
+}
+
+fn fade_to_black(target_active: bool, numerator: u16) -> FadeToBlackState {
+    FadeToBlackState {
+        target_active,
+        position: FadeToBlackPosition::new(numerator),
     }
 }
 
@@ -192,6 +205,7 @@ fn connect_snapshot_resume_and_reconnect_are_deterministic() {
                 program: input(2),
                 preview: input(1),
                 manual_transition: Some(ManualTransitionStatus::Inactive),
+                fade_to_black: Some(live_fade_to_black()),
             },
         })
         .unwrap();
@@ -204,6 +218,111 @@ fn connect_snapshot_resume_and_reconnect_are_deterministic() {
     assert_eq!(client.transport_disconnected().attempt, 1);
     assert_eq!(client.transport_disconnected().attempt, 2);
     assert_eq!(client.transport_disconnected().delay_ms, 40);
+}
+
+#[test]
+fn protocol_1_5_requires_and_reduces_exact_fade_to_black_state() {
+    let mut client = Client::new(config(4)).unwrap();
+    client.start_connect().unwrap();
+    client.transport_connected().unwrap();
+    client.accept_handshake(handshake(4, None)).unwrap();
+
+    let mut incomplete = snapshot(4);
+    incomplete.desired_fade_to_black = None;
+    assert!(matches!(
+        client.apply_snapshot(incomplete),
+        Err(ClientError::InvalidSnapshot(
+            "protocol 1.5 snapshot omitted fade-to-black state"
+        ))
+    ));
+
+    let mut initial = snapshot(4);
+    initial.desired_fade_to_black = Some(fade_to_black(true, 40_000));
+    initial.realized_fade_to_black = Some(fade_to_black(true, 20_000));
+    client.apply_snapshot(initial).unwrap();
+    let switcher = client.model().state().unwrap().switcher();
+    assert_eq!(switcher.desired_fade_to_black, fade_to_black(true, 40_000));
+    assert_eq!(switcher.realized_fade_to_black, fade_to_black(true, 20_000));
+
+    let incomplete_event = EventMessage {
+        cursor: EventCursor {
+            engine: engine(),
+            revision: 5,
+        },
+        payload: EventPayload::DesiredSwitcher {
+            program: input(1),
+            preview: input(2),
+            manual_transition: Some(ManualTransitionStatus::Inactive),
+            fade_to_black: None,
+        },
+    };
+    assert!(matches!(
+        client.apply_event(incomplete_event),
+        Err(ClientError::InvalidSnapshot(
+            "protocol 1.5 event omitted fade-to-black state"
+        ))
+    ));
+    client
+        .apply_event(EventMessage {
+            cursor: EventCursor {
+                engine: engine(),
+                revision: 5,
+            },
+            payload: EventPayload::DesiredSwitcher {
+                program: input(1),
+                preview: input(2),
+                manual_transition: Some(ManualTransitionStatus::Inactive),
+                fade_to_black: Some(fade_to_black(false, 12_345)),
+            },
+        })
+        .unwrap();
+    assert_eq!(
+        client
+            .model()
+            .state()
+            .unwrap()
+            .switcher()
+            .desired_fade_to_black,
+        fade_to_black(false, 12_345)
+    );
+
+    let incomplete_runtime = runtime_event(
+        5,
+        7,
+        1,
+        RuntimeLifecycleEvent::Realized {
+            domain: "switcher".into(),
+            manual_transition: Some(ManualTransitionStatus::Inactive),
+            fade_to_black: None,
+        },
+    );
+    assert!(matches!(
+        client.apply_runtime_event(incomplete_runtime),
+        Err(ClientError::InvalidSnapshot(
+            "protocol 1.5 runtime event omitted fade-to-black state"
+        ))
+    ));
+    client
+        .apply_runtime_event(runtime_event(
+            5,
+            7,
+            1,
+            RuntimeLifecycleEvent::Realized {
+                domain: "switcher".into(),
+                manual_transition: Some(ManualTransitionStatus::Inactive),
+                fade_to_black: Some(fade_to_black(false, 12_345)),
+            },
+        ))
+        .unwrap();
+    assert_eq!(
+        client
+            .model()
+            .state()
+            .unwrap()
+            .switcher()
+            .realized_fade_to_black,
+        fade_to_black(false, 12_345)
+    );
 }
 
 #[test]
@@ -670,6 +789,7 @@ fn event_gap_requests_snapshot_resync() {
                 program: input(2),
                 preview: input(1),
                 manual_transition: Some(ManualTransitionStatus::Inactive),
+                fade_to_black: Some(live_fade_to_black()),
             },
         })
         .unwrap_err();
@@ -702,6 +822,7 @@ fn same_revision_runtime_realization_does_not_move_durable_cursor() {
                 RuntimeLifecycleEvent::Realized {
                     domain: "switcher".to_owned(),
                     manual_transition: Some(ManualTransitionStatus::Inactive),
+                    fade_to_black: Some(live_fade_to_black()),
                 },
             )))
             .unwrap(),
@@ -760,6 +881,7 @@ fn reconnecting_second_client_reduces_exact_desired_and_realized_manual_state() 
                 program: input(1),
                 preview: input(2),
                 manual_transition: Some(active_manual(0, 2_500)),
+                fade_to_black: Some(live_fade_to_black()),
             },
         })
         .unwrap();
@@ -771,6 +893,7 @@ fn reconnecting_second_client_reduces_exact_desired_and_realized_manual_state() 
             RuntimeLifecycleEvent::Realized {
                 domain: "switcher".into(),
                 manual_transition: Some(active_manual(2_500, 2_500)),
+                fade_to_black: Some(live_fade_to_black()),
             },
         ))
         .unwrap();
@@ -802,6 +925,7 @@ fn runtime_lifecycle_sequence_is_recorded_without_durable_reduction() {
             RuntimeLifecycleEvent::Realized {
                 domain: "audio".to_owned(),
                 manual_transition: Some(ManualTransitionStatus::Inactive),
+                fade_to_black: None,
             },
         ))
         .unwrap();
@@ -868,6 +992,7 @@ fn runtime_sequence_gap_does_not_request_durable_resync() {
                 program: input(2),
                 preview: input(1),
                 manual_transition: Some(ManualTransitionStatus::Inactive),
+                fade_to_black: Some(live_fade_to_black()),
             },
         })
         .unwrap();

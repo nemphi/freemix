@@ -1,10 +1,10 @@
 use crate::{
     CapabilityReportMessage, CapabilityReportSummary, ClientHello, CommandMessage, CommandPayload,
     CommandResult, DurableEventBatch, DurableGap, EngineIdentity, ErrorMessage, EventCursor,
-    EventMessage, EventPayload, HandshakeOutcome, HandshakeRequest, HandshakeResponse,
-    HeartbeatMessage, ManualTransitionKind, ManualTransitionStatus, ResumeCursor,
-    RuntimeEventMessage, RuntimeFailureDisposition, RuntimeLifecycleEvent, ServerHello,
-    ServerIdentity, SnapshotMessage, SnapshotReason, StructuredError, WireMessage,
+    EventMessage, EventPayload, FadeToBlackState, HandshakeOutcome, HandshakeRequest,
+    HandshakeResponse, HeartbeatMessage, ManualTransitionKind, ManualTransitionStatus,
+    ResumeCursor, RuntimeEventMessage, RuntimeFailureDisposition, RuntimeLifecycleEvent,
+    ServerHello, ServerIdentity, SnapshotMessage, SnapshotReason, StructuredError, WireMessage,
 };
 
 use super::value::{
@@ -180,6 +180,14 @@ fn encode_command(record: &mut Record, message: &CommandMessage) -> Result<(), C
             record.field("payload", "wipe")?;
             record.field("duration_frames", duration_frames)?;
         }
+        CommandPayload::FadeToBlack {
+            active,
+            duration_frames,
+        } => {
+            record.field("payload", "fade_to_black")?;
+            record.field("active", u8::from(active))?;
+            record.field("duration_frames", duration_frames)?;
+        }
         CommandPayload::StartManualTransition { kind } => {
             record.field("payload", "manual_start")?;
             record.field(
@@ -265,6 +273,16 @@ fn encode_snapshot(record: &mut Record, message: &SnapshotMessage) -> Result<(),
         record,
         message.realized_manual_transition,
         ManualStatusFields::Realized,
+    )?;
+    encode_fade_to_black_state(
+        record,
+        message.desired_fade_to_black,
+        FadeToBlackStateFields::Desired,
+    )?;
+    encode_fade_to_black_state(
+        record,
+        message.realized_fade_to_black,
+        FadeToBlackStateFields::Realized,
     )
 }
 
@@ -276,11 +294,13 @@ fn encode_event(record: &mut Record, message: &EventMessage) -> Result<(), Codec
             program,
             preview,
             manual_transition,
+            fade_to_black,
         } => {
             record.field("event", "desired_switcher")?;
             record.field("program", program)?;
             record.field("preview", preview)?;
             encode_manual_status(record, manual_transition, ManualStatusFields::Unqualified)?;
+            encode_fade_to_black_state(record, fade_to_black, FadeToBlackStateFields::Unqualified)?;
         }
     }
     Ok(())
@@ -433,10 +453,16 @@ fn encode_runtime_event(
         RuntimeLifecycleEvent::Realized {
             domain,
             manual_transition,
+            fade_to_black,
         } => {
             record.field("event", "realized")?;
             record.field_str("domain", domain)?;
             encode_manual_status(record, *manual_transition, ManualStatusFields::Unqualified)?;
+            encode_fade_to_black_state(
+                record,
+                *fade_to_black,
+                FadeToBlackStateFields::Unqualified,
+            )?;
         }
         RuntimeLifecycleEvent::Failed { error, disposition } => {
             record.field("event", "failed")?;
@@ -509,6 +535,36 @@ fn encode_manual_status(
             record.field(position, state.position.basis_points())
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum FadeToBlackStateFields {
+    Desired,
+    Realized,
+    Unqualified,
+}
+
+fn encode_fade_to_black_state(
+    record: &mut Record,
+    state: Option<FadeToBlackState>,
+    fields: FadeToBlackStateFields,
+) -> Result<(), CodecError> {
+    let Some(state) = state else {
+        return Ok(());
+    };
+    let (target_active, position) = match fields {
+        FadeToBlackStateFields::Desired => (
+            "?desired_ftb_target_active",
+            "?desired_ftb_position_numerator",
+        ),
+        FadeToBlackStateFields::Realized => (
+            "?realized_ftb_target_active",
+            "?realized_ftb_position_numerator",
+        ),
+        FadeToBlackStateFields::Unqualified => ("?ftb_target_active", "?ftb_position_numerator"),
+    };
+    record.field(target_active, u8::from(state.target_active))?;
+    record.field(position, state.position.numerator())
 }
 
 fn encode_heartbeat(record: &mut Record, message: &HeartbeatMessage) -> Result<(), CodecError> {

@@ -37,10 +37,11 @@ use fm_control::{
 use fm_engine::{Engine, EngineAcceptance, EngineRestoreState, EngineSnapshot, ShowState};
 use fm_model::MainMix;
 use fm_persistence::{
-    IdempotencyReceipt, ManualTransitionKind as PersistedManualTransitionKind,
+    FadeToBlackState as PersistedFadeToBlackState, IdempotencyReceipt,
+    ManualTransitionKind as PersistedManualTransitionKind,
     ManualTransitionState as PersistedManualTransitionState, ProjectPosition, ProjectStore,
-    ProjectValidationError, ReceiptOutcome, RuntimeManualTransitions, RuntimeRouting, StoreError,
-    StoredProject,
+    ProjectValidationError, ReceiptOutcome, RuntimeFadeToBlack, RuntimeManualTransitions,
+    RuntimeRouting, StoreError, StoredProject,
 };
 use fm_protocol::{
     CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, ClientHello, CommandMessage, CommandPayload,
@@ -3294,6 +3295,7 @@ fn load_migrate_recover(store: &ProjectStore) -> AppResult<StoredProject> {
                 4 => store.migrate_v4()?,
                 5 => store.migrate_v5()?,
                 6 => store.migrate_v6()?,
+                7 => store.migrate_v7()?,
                 _ => {
                     return Err(StoreError::Validation(
                         ProjectValidationError::UnsupportedSchema {
@@ -3348,6 +3350,9 @@ fn restore_engine(project: &StoredProject) -> AppResult<Engine> {
     if let Some(state) = manual.realized {
         realized.restore_t_bar(restored_t_bar(state)?)?;
     }
+    let fade_to_black = project.runtime_fade_to_black();
+    show.restore_fade_to_black(fade_to_black.desired.target_active);
+    let _ = realized.set_fade_to_black(fade_to_black.realized.target_active);
     let position = project.position();
     Ok(Engine::restore_persisted(
         show,
@@ -3858,6 +3863,9 @@ fn command_ticks(command: &CommandMessage) -> u32 {
         CommandPayload::Fade { duration_frames } | CommandPayload::Wipe { duration_frames } => {
             duration_frames
         }
+        CommandPayload::FadeToBlack {
+            duration_frames, ..
+        } => duration_frames,
         CommandPayload::SelectPreview { .. }
         | CommandPayload::Cut
         | CommandPayload::StartManualTransition { .. }
@@ -3920,7 +3928,7 @@ fn stored_project_with_receipts(
     let realized = snapshot.realized_switcher();
     let mut project = durable.project().clone();
     project.set_main_mix(MainMix::new(desired.program(), desired.preview()));
-    StoredProject::from_project_with_manual_transitions(
+    StoredProject::from_project_with_runtime_state(
         project,
         RuntimeRouting {
             desired_program_id: Some(desired.program()),
@@ -3931,6 +3939,10 @@ fn stored_project_with_receipts(
         RuntimeManualTransitions {
             desired: desired.t_bar().map(persisted_t_bar),
             realized: realized.t_bar().map(persisted_t_bar),
+        },
+        RuntimeFadeToBlack {
+            desired: persisted_fade_to_black(snapshot.desired_fade_to_black()),
+            realized: persisted_fade_to_black(snapshot.realized_fade_to_black()),
         },
         ProjectPosition {
             revision: snapshot.revision().get(),
@@ -3943,6 +3955,14 @@ fn stored_project_with_receipts(
         receipts,
     )
     .map_err(Into::into)
+}
+
+fn persisted_fade_to_black(state: fm_engine::EngineFadeToBlackState) -> PersistedFadeToBlackState {
+    PersistedFadeToBlackState::new(
+        state.active,
+        u16::try_from(state.position.numerator())
+            .expect("engine fade-to-black numerator uses the u16 contract"),
+    )
 }
 
 fn persisted_t_bar(state: TBarState) -> PersistedManualTransitionState {
@@ -6438,6 +6458,75 @@ mod tests {
         let mut expected_project = original_project;
         expected_project.set_main_mix(durable.project().main_mix().unwrap());
         assert_eq!(durable.project(), &expected_project);
+    }
+
+    #[test]
+    fn fade_to_black_commands_persist_exact_settled_restart_state() {
+        let mut durable = test_project();
+        let mut control = test_control(&durable);
+        let server = test_server(&control);
+
+        execute_durable_command(
+            &mut control,
+            &CountingSaver::default(),
+            &mut durable,
+            &operator(),
+            &server,
+            &test_command(
+                "fade-to-black",
+                "fade-to-black-key",
+                CommandPayload::FadeToBlack {
+                    active: true,
+                    duration_frames: 4,
+                },
+            ),
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(
+            durable.runtime_fade_to_black(),
+            RuntimeFadeToBlack {
+                desired: PersistedFadeToBlackState::BLACK,
+                realized: PersistedFadeToBlackState::BLACK,
+            }
+        );
+        let black = restore_engine(&durable).unwrap().snapshot().unwrap();
+        assert!(black.desired_fade_to_black().active);
+        assert_eq!(
+            black.desired_fade_to_black().position,
+            fm_switcher::FadeToBlackPosition::BLACK
+        );
+        assert_eq!(live_engine_snapshot(&mut control), black);
+
+        execute_durable_command(
+            &mut control,
+            &CountingSaver::default(),
+            &mut durable,
+            &operator(),
+            &server,
+            &test_command(
+                "fade-from-black",
+                "fade-from-black-key",
+                CommandPayload::FadeToBlack {
+                    active: false,
+                    duration_frames: 3,
+                },
+            ),
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(
+            durable.runtime_fade_to_black(),
+            RuntimeFadeToBlack::default()
+        );
+        let live = restore_engine(&durable).unwrap().snapshot().unwrap();
+        assert_eq!(
+            live.realized_fade_to_black().position,
+            fm_switcher::FadeToBlackPosition::LIVE
+        );
+        assert_eq!(live_engine_snapshot(&mut control), live);
     }
 
     #[test]

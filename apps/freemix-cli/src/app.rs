@@ -21,10 +21,11 @@ use fm_model::{
     SimulatedVideo, SolidColor,
 };
 use fm_persistence::{
-    IdempotencyReceipt, ManualTransitionKind as PersistedManualTransitionKind,
+    FadeToBlackState as PersistedFadeToBlackState, IdempotencyReceipt,
+    ManualTransitionKind as PersistedManualTransitionKind,
     ManualTransitionState as PersistedManualTransitionState, ProjectPosition, ProjectStore,
-    ProjectValidationError, ReceiptOutcome, RuntimeManualTransitions, RuntimeRouting, StoreError,
-    StoredProject,
+    ProjectValidationError, ReceiptOutcome, RuntimeFadeToBlack, RuntimeManualTransitions,
+    RuntimeRouting, StoreError, StoredProject,
 };
 use fm_sim::{Rgba8, SimulatedPipeline, SimulatedSource, SourcePattern};
 use fm_switcher::{SwitcherState, TBarPosition, TBarState, TransitionKind};
@@ -436,7 +437,7 @@ fn save_engine(path: &Path, project_engine: &ProjectEngine) -> AppResult<()> {
     let realized = snapshot.realized_switcher();
     let mut project = project_engine.project.clone();
     project.set_main_mix(MainMix::new(desired.program(), desired.preview()));
-    let stored = StoredProject::from_project_with_manual_transitions(
+    let stored = StoredProject::from_project_with_runtime_state(
         project,
         RuntimeRouting {
             desired_program_id: Some(desired.program()),
@@ -447,6 +448,10 @@ fn save_engine(path: &Path, project_engine: &ProjectEngine) -> AppResult<()> {
         RuntimeManualTransitions {
             desired: desired.t_bar().map(persisted_t_bar),
             realized: realized.t_bar().map(persisted_t_bar),
+        },
+        RuntimeFadeToBlack {
+            desired: persisted_fade_to_black(snapshot.desired_fade_to_black()),
+            realized: persisted_fade_to_black(snapshot.realized_fade_to_black()),
         },
         ProjectPosition {
             revision: snapshot.revision().get(),
@@ -492,6 +497,9 @@ fn load_engine(path: &Path) -> AppResult<ProjectEngine> {
     if let Some(state) = manual.realized {
         realized.restore_t_bar(restored_t_bar(state)?)?;
     }
+    let fade_to_black = stored.runtime_fade_to_black();
+    show.restore_fade_to_black(fade_to_black.desired.target_active);
+    let _ = realized.set_fade_to_black(fade_to_black.realized.target_active);
     let position = stored.position();
     let engine = Engine::restore_persisted(
         show,
@@ -513,6 +521,14 @@ fn load_engine(path: &Path) -> AppResult<ProjectEngine> {
         },
     )?;
     Ok(ProjectEngine { project, engine })
+}
+
+fn persisted_fade_to_black(state: fm_engine::EngineFadeToBlackState) -> PersistedFadeToBlackState {
+    PersistedFadeToBlackState::new(
+        state.active,
+        u16::try_from(state.position.numerator())
+            .expect("engine fade-to-black numerator uses the u16 contract"),
+    )
 }
 
 fn persisted_t_bar(state: TBarState) -> PersistedManualTransitionState {
@@ -581,6 +597,12 @@ fn load_stored_project(path: &Path) -> AppResult<StoredProject> {
             found: 6, ..
         })) => {
             store.migrate_v6()?;
+            Ok(store.load()?)
+        }
+        Err(StoreError::Validation(ProjectValidationError::UnsupportedSchema {
+            found: 7, ..
+        })) => {
+            store.migrate_v7()?;
             Ok(store.load()?)
         }
         Err(error) => Err(error.into()),

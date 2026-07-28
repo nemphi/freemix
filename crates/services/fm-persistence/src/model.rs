@@ -75,6 +75,48 @@ pub struct RuntimeManualTransitions {
     pub realized: Option<ManualTransitionState>,
 }
 
+/// Exact settled Fade-to-Black state at an idle checkpoint.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FadeToBlackState {
+    pub target_active: bool,
+    pub position_numerator: u16,
+}
+
+impl FadeToBlackState {
+    pub const LIVE: Self = Self {
+        target_active: false,
+        position_numerator: 0,
+    };
+    pub const BLACK: Self = Self {
+        target_active: true,
+        position_numerator: u16::MAX,
+    };
+
+    #[must_use]
+    pub const fn new(target_active: bool, position_numerator: u16) -> Self {
+        Self {
+            target_active,
+            position_numerator,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_settled(self) -> bool {
+        if self.target_active {
+            self.position_numerator == u16::MAX
+        } else {
+            self.position_numerator == 0
+        }
+    }
+}
+
+/// Desired and realized Fade-to-Black checkpoint state.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeFadeToBlack {
+    pub desired: FadeToBlackState,
+    pub realized: FadeToBlackState,
+}
+
 /// Legacy 64-bit routing view retained while existing applications migrate.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ProjectRouting {
@@ -190,6 +232,7 @@ pub struct StoredProject {
     project: Project,
     routing: RuntimeRouting,
     manual_transitions: RuntimeManualTransitions,
+    fade_to_black: RuntimeFadeToBlack,
     position: ProjectPosition,
     idempotency_receipts: Vec<IdempotencyReceipt>,
 }
@@ -227,6 +270,30 @@ impl StoredProject {
         routing: RuntimeRouting,
         manual_transitions: RuntimeManualTransitions,
         position: ProjectPosition,
+        idempotency_receipts: Vec<IdempotencyReceipt>,
+    ) -> Result<Self, ProjectValidationError> {
+        Self::from_project_with_runtime_state(
+            project,
+            routing,
+            manual_transitions,
+            RuntimeFadeToBlack::default(),
+            position,
+            idempotency_receipts,
+        )
+    }
+
+    /// Creates a manifest with all exact switcher runtime checkpoint state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectValidationError`] when the domain project or runtime
+    /// metadata is inconsistent or Fade-to-Black is not settled.
+    pub fn from_project_with_runtime_state(
+        project: Project,
+        routing: RuntimeRouting,
+        manual_transitions: RuntimeManualTransitions,
+        fade_to_black: RuntimeFadeToBlack,
+        position: ProjectPosition,
         mut idempotency_receipts: Vec<IdempotencyReceipt>,
     ) -> Result<Self, ProjectValidationError> {
         idempotency_receipts.sort_by(|left, right| left.key.cmp(&right.key));
@@ -234,6 +301,7 @@ impl StoredProject {
             project,
             routing,
             manual_transitions,
+            fade_to_black,
             position,
             idempotency_receipts,
         };
@@ -313,6 +381,7 @@ impl StoredProject {
         }
 
         self.validate_manual_transitions()?;
+        self.validate_fade_to_black()?;
 
         let mut keys = BTreeSet::new();
         for receipt in &self.idempotency_receipts {
@@ -396,6 +465,16 @@ impl StoredProject {
         Ok(())
     }
 
+    fn validate_fade_to_black(&self) -> Result<(), ProjectValidationError> {
+        if !self.fade_to_black.desired.is_settled() || !self.fade_to_black.realized.is_settled() {
+            return Err(ProjectValidationError::UnsettledFadeToBlack);
+        }
+        if self.fade_to_black.desired != self.fade_to_black.realized {
+            return Err(ProjectValidationError::FadeToBlackCheckpointMismatch);
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub const fn schema_version(&self) -> u32 {
         CURRENT_SCHEMA_VERSION
@@ -414,6 +493,11 @@ impl StoredProject {
     #[must_use]
     pub const fn runtime_manual_transitions(&self) -> RuntimeManualTransitions {
         self.manual_transitions
+    }
+
+    #[must_use]
+    pub const fn runtime_fade_to_black(&self) -> RuntimeFadeToBlack {
+        self.fade_to_black
     }
 
     /// Returns the legacy project ID view.
@@ -575,6 +659,8 @@ pub enum ProjectValidationError {
     ManualTransitionRoutingMismatch,
     InvalidDesiredManualTransitionInterval,
     InvalidRealizedManualTransitionInterval,
+    UnsettledFadeToBlack,
+    FadeToBlackCheckpointMismatch,
     EmptyIdempotencyKey,
     EmptyCommandId {
         key: String,
@@ -618,6 +704,12 @@ impl fmt::Display for ProjectValidationError {
             ),
             Self::InvalidRealizedManualTransitionInterval => formatter.write_str(
                 "realized manual transition interval start must equal its position at an idle checkpoint",
+            ),
+            Self::UnsettledFadeToBlack => formatter.write_str(
+                "fade-to-black position must match its target at an idle checkpoint",
+            ),
+            Self::FadeToBlackCheckpointMismatch => formatter.write_str(
+                "desired and realized fade-to-black state must match at an idle checkpoint",
             ),
             Self::EmptyIdempotencyKey => formatter.write_str("idempotency key is blank"),
             Self::EmptyCommandId { key } => {

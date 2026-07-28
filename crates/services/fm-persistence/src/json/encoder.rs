@@ -9,8 +9,8 @@ use fm_types::{
 };
 
 use crate::{
-    CURRENT_SCHEMA_VERSION, IdempotencyReceipt, ManualTransitionKind, ManualTransitionState,
-    ReceiptOutcome, StoredProject,
+    CURRENT_SCHEMA_VERSION, FadeToBlackState, IdempotencyReceipt, ManualTransitionKind,
+    ManualTransitionState, ReceiptOutcome, StoredProject,
 };
 
 pub(crate) fn encode(stored: &StoredProject) -> String {
@@ -121,6 +121,10 @@ fn write_runtime(output: &mut String, stored: &StoredProject) {
     write_manual_transition(output, manual.desired);
     output.push_str(",\n      \"realized\": ");
     write_manual_transition(output, manual.realized);
+    output.push_str("\n    },\n    \"fade_to_black\": {\n      \"desired\": ");
+    write_fade_to_black(output, stored.runtime_fade_to_black().desired);
+    output.push_str(",\n      \"realized\": ");
+    write_fade_to_black(output, stored.runtime_fade_to_black().realized);
     output.push_str("\n    },\n");
     let position = stored.position();
     write!(
@@ -139,6 +143,15 @@ fn write_runtime(output: &mut String, stored: &StoredProject) {
     }
     array_end(output, stored.idempotency_receipts().is_empty(), 4);
     output.push_str("\n  }");
+}
+
+fn write_fade_to_black(output: &mut String, state: FadeToBlackState) {
+    write!(
+        output,
+        "{{\"target_active\": {}, \"position_numerator\": {}}}",
+        state.target_active, state.position_numerator,
+    )
+    .expect("writing to a string cannot fail");
 }
 
 fn write_manual_transition(output: &mut String, transition: Option<ManualTransitionState>) {

@@ -73,6 +73,11 @@ impl ShowState {
             .map_err(ShowError::Switcher)
     }
 
+    /// Restores a settled desired Fade-to-Black endpoint from a checkpoint.
+    pub fn restore_fade_to_black(&mut self, active: bool) {
+        let _ = self.desired_switcher.set_fade_to_black(active);
+    }
+
     pub(crate) const fn desired_switcher_mut(&mut self) -> &mut SwitcherState {
         &mut self.desired_switcher
     }

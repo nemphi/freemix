@@ -165,6 +165,7 @@ fn serve_premature_event(listener: &TcpListener, kind: PrematureEvent) {
                 program: input(2),
                 preview: input(1),
                 manual_transition: None,
+                fade_to_black: None,
             },
         }),
         PrematureEvent::Runtime => WireMessage::RuntimeEvent(RuntimeEventMessage {
@@ -175,6 +176,7 @@ fn serve_premature_event(listener: &TcpListener, kind: PrematureEvent) {
             event: RuntimeLifecycleEvent::Realized {
                 domain: "switcher".into(),
                 manual_transition: None,
+                fade_to_black: None,
             },
         }),
     };
@@ -285,6 +287,7 @@ fn serve_manual_position(listener: &TcpListener) {
                 program: input(1),
                 preview: input(2),
                 manual_transition: Some(fm_protocol::ManualTransitionStatus::Active(desired_state)),
+                fade_to_black: None,
             },
         }),
     );
@@ -303,6 +306,7 @@ fn serve_manual_position(listener: &TcpListener) {
             event: RuntimeLifecycleEvent::Realized {
                 domain: "switcher".into(),
                 manual_transition: Some(realized),
+                fade_to_black: None,
             },
         }),
     );
@@ -370,6 +374,8 @@ fn write_handshake_version_with_manual(
             realized_preview: preview,
             desired_manual_transition: (negotiated.minor >= 4).then_some(manual_transition),
             realized_manual_transition: (negotiated.minor >= 4).then_some(manual_transition),
+            desired_fade_to_black: None,
+            realized_fade_to_black: None,
         }),
     );
 }
@@ -405,6 +411,7 @@ fn write_command_events(
                 program: input(1),
                 preview: input(1),
                 manual_transition: None,
+                fade_to_black: None,
             },
         }),
     );
@@ -441,6 +448,7 @@ fn write_command_events(
             event: RuntimeLifecycleEvent::Realized {
                 domain: "switcher".into(),
                 manual_transition: None,
+                fade_to_black: None,
             },
         }),
     );
@@ -1301,7 +1309,7 @@ fn supported_legacy_manifest_is_migrated_before_cli_load() {
     assert!(migrated_status.contains("project_id=42 show=\"Legacy CLI\""));
     assert_status(&migrated_status, 0, 0, 1, 1, 2, 2);
     let migrated = manifest(&project);
-    assert!(migrated.starts_with("{\n  \"schema_version\": 7,"));
+    assert!(migrated.starts_with("{\n  \"schema_version\": 8,"));
     assert!(migrated.contains(r#""type": "simulated""#));
 
     assert_success(&invoke(&[
@@ -1332,7 +1340,7 @@ fn schema_v5_manual_state_migrates_then_mutates_and_restarts_exactly() {
     let migrated = status(&project);
     assert!(migrated.contains("TBar(desired=fade:1->2@6250, realized=fade:1->2@6250)"));
     let migrated_manifest = manifest(&project);
-    assert!(migrated_manifest.starts_with("{\n  \"schema_version\": 7,"));
+    assert!(migrated_manifest.starts_with("{\n  \"schema_version\": 8,"));
     assert!(migrated_manifest.contains(r#""mask": null"#));
     assert!(migrated_manifest.contains(
         r#""desired": {"kind": "fade", "from_id": 1, "to_id": 2, "interval_start_basis_points": 0, "position_basis_points": 6250}"#
@@ -1384,7 +1392,7 @@ fn schema_v3_manifest_is_migrated_before_cli_load() {
     let migrated_status = status(&project);
     assert!(migrated_status.contains("show=\"Frozen V3 Scene\""));
     let migrated = manifest(&project);
-    assert!(migrated.starts_with("{\n  \"schema_version\": 7,"));
+    assert!(migrated.starts_with("{\n  \"schema_version\": 8,"));
     assert!(migrated.contains(r#""background": {"red": 0, "green": 0, "blue": 0, "alpha": 255}"#));
     assert!(migrated.contains(
         r#""geometry": {"translation_x": 0, "translation_y": 0, "width": 3840, "height": 2160, "rotation": "deg0"}"#
@@ -1404,7 +1412,7 @@ fn schema_v1_manifest_is_rejected_without_mutation() {
 
     let result = invoke(&["status", project.to_str().unwrap()]);
 
-    assert_failure_contains(&result, "unsupported schema 1; expected 7");
+    assert_failure_contains(&result, "unsupported schema 1; expected 8");
     assert_eq!(manifest(&project), original);
     fs::remove_dir_all(root).unwrap();
 }

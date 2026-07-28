@@ -388,6 +388,14 @@ fn replicated_switcher_conversion_preserves_both_authoritative_projections() {
         realized: BusSelection::new(input(1), input(2)),
         desired_manual_transition: active(ManualTransitionKind::Wipe, 1, 2, 8_000, 2_500),
         realized_manual_transition: active(ManualTransitionKind::Wipe, 1, 2, 2_500, 2_500),
+        desired_fade_to_black: fm_protocol::FadeToBlackState {
+            target_active: false,
+            position: fm_protocol::FadeToBlackPosition::LIVE,
+        },
+        realized_fade_to_black: fm_protocol::FadeToBlackState {
+            target_active: false,
+            position: fm_protocol::FadeToBlackPosition::LIVE,
+        },
         runtime_generation: Some(9),
     };
 

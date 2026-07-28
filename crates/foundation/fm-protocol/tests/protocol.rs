@@ -5,15 +5,15 @@ use fm_protocol::{
     BASE_PROTOCOL_VERSION, CURRENT_PROTOCOL_VERSION, CapabilityReportMessage,
     CapabilityReportSummary, ClientHello, ClientType, CodecError, CommandMessage, CommandPayload,
     CommandResult, DurableEvent, DurableEventBatch, DurableGap, EngineIdentity, ErrorMessage,
-    EventCursor, EventMessage, EventPayload, FieldIssue, HandshakeOutcome, HandshakeRequest,
-    HandshakeResponse, HeartbeatMessage, LineDecoder, MANUAL_TRANSITION_PROTOCOL_VERSION,
-    MAX_FIELD_VALUE_BYTES, MAX_FIELDS_PER_MESSAGE, MAX_LINE_BYTES, MAX_LIST_ITEMS,
-    MAX_MESSAGES_PER_PUSH, ManualTransitionKind, ManualTransitionPosition, ManualTransitionState,
-    ManualTransitionStatus, ProtocolVersion, ResumeCursor, Role, RuntimeDomainBoundary,
-    RuntimeEventMessage, RuntimeFailureDisposition, RuntimeLifecycleEvent, ServerHello,
-    ServerIdentity, SnapshotMessage, SnapshotReason, StructuredError, WIPE_PROTOCOL_VERSION,
-    WireInputId, WireMessage, choose_handshake_outcome, decode_line, encode_line,
-    negotiate_version,
+    EventCursor, EventMessage, EventPayload, FADE_TO_BLACK_PROTOCOL_VERSION, FadeToBlackPosition,
+    FadeToBlackState, FieldIssue, HandshakeOutcome, HandshakeRequest, HandshakeResponse,
+    HeartbeatMessage, LineDecoder, MANUAL_TRANSITION_PROTOCOL_VERSION, MAX_FIELD_VALUE_BYTES,
+    MAX_FIELDS_PER_MESSAGE, MAX_LINE_BYTES, MAX_LIST_ITEMS, MAX_MESSAGES_PER_PUSH,
+    ManualTransitionKind, ManualTransitionPosition, ManualTransitionState, ManualTransitionStatus,
+    ProtocolVersion, ResumeCursor, Role, RuntimeDomainBoundary, RuntimeEventMessage,
+    RuntimeFailureDisposition, RuntimeLifecycleEvent, ServerHello, ServerIdentity, SnapshotMessage,
+    SnapshotReason, StructuredError, WIPE_PROTOCOL_VERSION, WireInputId, WireMessage,
+    choose_handshake_outcome, decode_line, encode_line, negotiate_version,
 };
 
 fn input(value: u128) -> WireInputId {
@@ -182,6 +182,8 @@ fn every_message_variant_round_trips() {
             realized_preview: input(2),
             desired_manual_transition: None,
             realized_manual_transition: None,
+            desired_fade_to_black: None,
+            realized_fade_to_black: None,
         }),
         WireMessage::Event(EventMessage {
             cursor: cursor(),
@@ -189,6 +191,7 @@ fn every_message_variant_round_trips() {
                 program: input(2),
                 preview: input(1),
                 manual_transition: None,
+                fade_to_black: None,
             },
         }),
     ];
@@ -263,6 +266,8 @@ fn manual_transition_snapshot_and_events_have_stable_exact_wire_forms() {
                 realized_preview: input(2),
                 desired_manual_transition: Some(desired),
                 realized_manual_transition: Some(realized),
+                desired_fade_to_black: None,
+                realized_fade_to_black: None,
             }),
         ),
         (
@@ -273,6 +278,7 @@ fn manual_transition_snapshot_and_events_have_stable_exact_wire_forms() {
                     program: input(1),
                     preview: input(2),
                     manual_transition: Some(desired),
+                    fade_to_black: None,
                 },
             }),
         ),
@@ -286,6 +292,7 @@ fn manual_transition_snapshot_and_events_have_stable_exact_wire_forms() {
                 event: RuntimeLifecycleEvent::Realized {
                     domain: "switcher".into(),
                     manual_transition: Some(realized),
+                    fade_to_black: None,
                 },
             }),
         ),
@@ -297,6 +304,68 @@ fn manual_transition_snapshot_and_events_have_stable_exact_wire_forms() {
 }
 
 #[test]
+fn fade_to_black_command_and_state_have_exact_versioned_wire_forms() {
+    let command = WireMessage::Command(CommandMessage {
+        protocol: FADE_TO_BLACK_PROTOCOL_VERSION,
+        payload: CommandPayload::FadeToBlack {
+            active: true,
+            duration_frames: 25,
+        },
+        ..command()
+    });
+    let command_wire = "command\tprotocol=1.5\tid=01K%3Atest\tidempotency_key=operator-7%3A01K\texpected_revision=1842\tdeadline_ms=500\tpayload=fade_to_black\tactive=1\tduration_frames=25\n";
+    assert_eq!(encode_line(&command).unwrap(), command_wire);
+    assert_eq!(decode_line(command_wire).unwrap(), command);
+
+    let desired = FadeToBlackState {
+        target_active: true,
+        position: FadeToBlackPosition::BLACK,
+    };
+    let realized = FadeToBlackState {
+        target_active: true,
+        position: FadeToBlackPosition::new(32_767),
+    };
+    let snapshot = WireMessage::Snapshot(SnapshotMessage {
+        engine: identity(),
+        revision: 1_842,
+        show_name: "FTB".into(),
+        inputs: vec![input(1), input(2)],
+        desired_program: input(1),
+        desired_preview: input(2),
+        realized_program: input(1),
+        realized_preview: input(2),
+        desired_manual_transition: Some(ManualTransitionStatus::Inactive),
+        realized_manual_transition: Some(ManualTransitionStatus::Inactive),
+        desired_fade_to_black: Some(desired),
+        realized_fade_to_black: Some(realized),
+    });
+    let encoded = encode_line(&snapshot).unwrap();
+    assert!(encoded.contains("?desired_ftb_target_active=1"));
+    assert!(encoded.contains("?desired_ftb_position_numerator=65535"));
+    assert!(encoded.contains("?realized_ftb_position_numerator=32767"));
+    assert_eq!(decode_line(&encoded).unwrap(), snapshot);
+    assert_eq!(
+        decode_line(&encoded.replace("\t?desired_ftb_position_numerator=65535", "")),
+        Err(CodecError::MissingField("?desired_ftb_position_numerator"))
+    );
+    assert_eq!(
+        decode_line(&encoded.replace("\t?desired_ftb_target_active=1", "")),
+        Err(CodecError::MissingField("?desired_ftb_target_active"))
+    );
+
+    let projected = snapshot.compatible_with(MANUAL_TRANSITION_PROTOCOL_VERSION);
+    assert!(matches!(
+        projected,
+        WireMessage::Snapshot(SnapshotMessage {
+            desired_manual_transition: Some(ManualTransitionStatus::Inactive),
+            desired_fade_to_black: None,
+            realized_fade_to_black: None,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn protocol_1_3_projection_omits_manual_transition_extensions() {
     let message = WireMessage::Event(EventMessage {
         cursor: cursor(),
@@ -304,6 +373,7 @@ fn protocol_1_3_projection_omits_manual_transition_extensions() {
             program: input(1),
             preview: input(2),
             manual_transition: Some(ManualTransitionStatus::Inactive),
+            fade_to_black: None,
         },
     });
 
@@ -347,13 +417,25 @@ fn command_minimum_versions_gate_wipe_and_manual_transitions() {
         MANUAL_TRANSITION_PROTOCOL_VERSION,
         ProtocolVersion::new(1, 4)
     );
-    assert_eq!(CURRENT_PROTOCOL_VERSION, MANUAL_TRANSITION_PROTOCOL_VERSION);
     assert_eq!(
         manual.minimum_protocol_version(),
         MANUAL_TRANSITION_PROTOCOL_VERSION
     );
     assert!(!manual.is_supported_by(WIPE_PROTOCOL_VERSION));
     assert!(manual.is_supported_by(CURRENT_PROTOCOL_VERSION));
+
+    let fade_to_black = CommandPayload::FadeToBlack {
+        active: true,
+        duration_frames: 25,
+    };
+    assert_eq!(FADE_TO_BLACK_PROTOCOL_VERSION, ProtocolVersion::new(1, 5));
+    assert_eq!(CURRENT_PROTOCOL_VERSION, FADE_TO_BLACK_PROTOCOL_VERSION);
+    assert_eq!(
+        fade_to_black.minimum_protocol_version(),
+        FADE_TO_BLACK_PROTOCOL_VERSION
+    );
+    assert!(!fade_to_black.is_supported_by(MANUAL_TRANSITION_PROTOCOL_VERSION));
+    assert!(fade_to_black.is_supported_by(CURRENT_PROTOCOL_VERSION));
 }
 
 #[test]
@@ -662,6 +744,7 @@ fn runtime_lifecycle_variants_use_the_independent_runtime_sequence() {
         RuntimeLifecycleEvent::Realized {
             domain: "video".to_owned(),
             manual_transition: None,
+            fade_to_black: None,
         },
         RuntimeLifecycleEvent::Failed {
             error: structured_error(),

@@ -14,10 +14,10 @@ use std::fmt;
 use fm_command::{CommandId, Revision};
 use fm_protocol::{
     ClientType, CommandMessage, CommandPayload, CommandResult, DurableGap, EngineIdentity,
-    EventMessage, HandshakeOutcome, HandshakeRequest, HandshakeResponse, HeartbeatMessage,
-    MANUAL_TRANSITION_PROTOCOL_VERSION, ProtocolVersion, ResumeCursor, Role, RuntimeEventMessage,
-    RuntimeLifecycleEvent, ServerHello, ServerIdentity, SnapshotMessage, StructuredError,
-    WireMessage, negotiate_version,
+    EventMessage, FADE_TO_BLACK_PROTOCOL_VERSION, HandshakeOutcome, HandshakeRequest,
+    HandshakeResponse, HeartbeatMessage, MANUAL_TRANSITION_PROTOCOL_VERSION, ProtocolVersion,
+    ResumeCursor, Role, RuntimeEventMessage, RuntimeLifecycleEvent, ServerHello, ServerIdentity,
+    SnapshotMessage, StructuredError, WireMessage, negotiate_version,
 };
 use fm_types::ProjectId;
 use fm_ui_model::{
@@ -712,6 +712,14 @@ impl Client {
                 "protocol 1.4 snapshot omitted manual-transition state",
             ));
         }
+        if supports_fade_to_black_state(session.protocol)
+            && (snapshot.desired_fade_to_black.is_none()
+                || snapshot.realized_fade_to_black.is_none())
+        {
+            return Err(ClientError::InvalidSnapshot(
+                "protocol 1.5 snapshot omitted fade-to-black state",
+            ));
+        }
         self.model.install_snapshot(ProjectSnapshot::from_protocol(
             self.config.project_id,
             snapshot,
@@ -754,6 +762,19 @@ impl Client {
         {
             return Err(ClientError::InvalidSnapshot(
                 "protocol 1.4 event omitted manual-transition state",
+            ));
+        }
+        if supports_fade_to_black_state(protocol)
+            && matches!(
+                event.payload,
+                fm_protocol::EventPayload::DesiredSwitcher {
+                    fade_to_black: None,
+                    ..
+                }
+            )
+        {
+            return Err(ClientError::InvalidSnapshot(
+                "protocol 1.5 event omitted fade-to-black state",
             ));
         }
         let expected_revision = current
@@ -852,6 +873,7 @@ impl Client {
                 RuntimeLifecycleEvent::Realized {
                     domain,
                     manual_transition: None,
+                    ..
                 } if domain == "switcher"
             )
         {
@@ -859,10 +881,25 @@ impl Client {
                 "protocol 1.4 runtime event omitted manual-transition state",
             ));
         }
+        if supports_fade_to_black_state(session.protocol)
+            && matches!(
+                &event.event,
+                RuntimeLifecycleEvent::Realized {
+                    domain,
+                    fade_to_black: None,
+                    ..
+                } if domain == "switcher"
+            )
+        {
+            return Err(ClientError::InvalidSnapshot(
+                "protocol 1.5 runtime event omitted fade-to-black state",
+            ));
+        }
 
         if let RuntimeLifecycleEvent::Realized {
             domain,
             manual_transition,
+            fade_to_black,
         } = &event.event
             && domain == "switcher"
         {
@@ -874,6 +911,7 @@ impl Client {
                 sequence: event.sequence,
                 manual_transition: manual_transition
                     .map(ModelManualTransitionStatus::from_protocol),
+                fade_to_black: *fade_to_black,
             })?;
         }
         self.runtime_server = Some(event.server);
@@ -942,6 +980,7 @@ impl Client {
             CommandPayload::Cut
             | CommandPayload::Fade { .. }
             | CommandPayload::Wipe { .. }
+            | CommandPayload::FadeToBlack { .. }
             | CommandPayload::StartManualTransition { .. }
             | CommandPayload::SetManualTransitionPosition { .. }
             | CommandPayload::CommitManualTransition
@@ -1249,6 +1288,11 @@ impl Client {
 const fn supports_manual_state(version: ProtocolVersion) -> bool {
     version.major == MANUAL_TRANSITION_PROTOCOL_VERSION.major
         && version.minor >= MANUAL_TRANSITION_PROTOCOL_VERSION.minor
+}
+
+const fn supports_fade_to_black_state(version: ProtocolVersion) -> bool {
+    version.major == FADE_TO_BLACK_PROTOCOL_VERSION.major
+        && version.minor >= FADE_TO_BLACK_PROTOCOL_VERSION.minor
 }
 
 fn engine_identity(server: &ServerIdentity) -> EngineIdentity {

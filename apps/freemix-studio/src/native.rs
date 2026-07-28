@@ -1710,6 +1710,8 @@ mod tests {
             realized_preview: wire_input(realized_preview),
             desired_manual_transition: manual_projection(negotiated),
             realized_manual_transition: manual_projection(negotiated),
+            desired_fade_to_black: None,
+            realized_fade_to_black: None,
         }));
         peer
     }
@@ -1788,6 +1790,8 @@ mod tests {
             realized_preview: wire_input(realized.1),
             desired_manual_transition: manual_projection(negotiated),
             realized_manual_transition: manual_projection(negotiated),
+            desired_fade_to_black: None,
+            realized_fade_to_black: None,
         }));
         peer
     }
@@ -1867,6 +1871,7 @@ mod tests {
                 program: wire_input(1),
                 preview: wire_input(3),
                 manual_transition: None,
+                fade_to_black: None,
             },
         }));
         peer.send(&WireMessage::RuntimeEvent(RuntimeEventMessage {
@@ -1877,6 +1882,7 @@ mod tests {
             event: RuntimeLifecycleEvent::Realized {
                 domain: "switcher".to_owned(),
                 manual_transition: None,
+                fade_to_black: None,
             },
         }));
     }
@@ -1910,6 +1916,7 @@ mod tests {
                 program: wire_input(2),
                 preview: wire_input(1),
                 manual_transition: None,
+                fade_to_black: None,
             },
         }));
         peer.send(&WireMessage::RuntimeEvent(RuntimeEventMessage {
@@ -1920,6 +1927,7 @@ mod tests {
             event: RuntimeLifecycleEvent::Realized {
                 domain: "switcher".to_owned(),
                 manual_transition: None,
+                fade_to_black: None,
             },
         }));
     }
@@ -1999,6 +2007,7 @@ mod tests {
                     manual_transition: Some(
                         desired_manual_transition.unwrap_or(ManualTransitionStatus::Inactive),
                     ),
+                    fade_to_black: None,
                 },
             }));
             let realized_manual_transition =
@@ -2013,6 +2022,7 @@ mod tests {
                     manual_transition: Some(
                         realized_manual_transition.unwrap_or(ManualTransitionStatus::Inactive),
                     ),
+                    fade_to_black: None,
                 },
             }));
         }
@@ -2059,6 +2069,7 @@ mod tests {
                 program: wire_input(2),
                 preview: wire_input(1),
                 manual_transition: None,
+                fade_to_black: None,
             },
         }));
         second.send(&WireMessage::RuntimeEvent(RuntimeEventMessage {
@@ -2069,6 +2080,7 @@ mod tests {
             event: RuntimeLifecycleEvent::Realized {
                 domain: "switcher".to_owned(),
                 manual_transition: None,
+                fade_to_black: None,
             },
         }));
     }
@@ -2092,6 +2104,7 @@ mod tests {
                 program: wire_input(1),
                 preview: wire_input(3),
                 manual_transition: None,
+                fade_to_black: None,
             },
         }));
         let WireMessage::Command(retried) = downgraded.receive() else {
@@ -2134,6 +2147,7 @@ mod tests {
                 program: wire_input(3),
                 preview: wire_input(1),
                 manual_transition: None,
+                fade_to_black: None,
             },
         }));
         compatible.send(&WireMessage::RuntimeEvent(RuntimeEventMessage {
@@ -2144,6 +2158,7 @@ mod tests {
             event: RuntimeLifecycleEvent::Realized {
                 domain: "switcher".to_owned(),
                 manual_transition: None,
+                fade_to_black: None,
             },
         }));
 
@@ -2175,6 +2190,7 @@ mod tests {
                 program: wire_input(3),
                 preview: wire_input(2),
                 manual_transition: None,
+                fade_to_black: None,
             },
         }));
         peer.send(&WireMessage::RuntimeEvent(RuntimeEventMessage {
@@ -2185,6 +2201,7 @@ mod tests {
             event: RuntimeLifecycleEvent::Realized {
                 domain: "switcher".to_owned(),
                 manual_transition: None,
+                fade_to_black: None,
             },
         }));
     }
@@ -2207,6 +2224,7 @@ mod tests {
                 program: wire_input(1),
                 preview: wire_input(3),
                 manual_transition: None,
+                fade_to_black: None,
             },
         }));
         let WireMessage::Command(retried) = second.receive() else {
@@ -2241,6 +2259,7 @@ mod tests {
                 program: wire_input(3),
                 preview: wire_input(1),
                 manual_transition: None,
+                fade_to_black: None,
             },
         }));
         third.send(&WireMessage::RuntimeEvent(RuntimeEventMessage {
@@ -2251,6 +2270,7 @@ mod tests {
             event: RuntimeLifecycleEvent::Realized {
                 domain: "switcher".to_owned(),
                 manual_transition: None,
+                fade_to_black: None,
             },
         }));
     }
@@ -2528,6 +2548,8 @@ mod tests {
                 realized_preview: wire_input(2),
                 desired_manual_transition: Some(ManualTransitionStatus::Inactive),
                 realized_manual_transition: Some(ManualTransitionStatus::Inactive),
+                desired_fade_to_black: None,
+                realized_fade_to_black: None,
             }));
         });
         let config = StudioConfig {
@@ -2670,6 +2692,7 @@ mod tests {
                 program: wire_input(2),
                 preview: wire_input(1),
                 manual_transition: Some(ManualTransitionStatus::Inactive),
+                fade_to_black: None,
             },
         }));
         compatible.send(&WireMessage::RuntimeEvent(RuntimeEventMessage {
@@ -2680,6 +2703,7 @@ mod tests {
             event: RuntimeLifecycleEvent::Realized {
                 domain: "switcher".to_owned(),
                 manual_transition: Some(ManualTransitionStatus::Inactive),
+                fade_to_black: None,
             },
         }));
     }
@@ -2913,6 +2937,7 @@ mod tests {
                     program: wire_input(1),
                     preview: wire_input(3),
                     manual_transition: None,
+                    fade_to_black: None,
                 },
             }));
             assert_eq!(first.stream.read(&mut [0_u8; 1]).unwrap(), 0);
@@ -2968,6 +2993,7 @@ mod tests {
                     program: wire_input(1),
                     preview: wire_input(99),
                     manual_transition: None,
+                    fade_to_black: None,
                 },
             }));
             assert_eq!(first.stream.read(&mut [0_u8; 1]).unwrap(), 0);
@@ -3172,6 +3198,7 @@ mod tests {
                     program: wire_input(1),
                     preview: wire_input(3),
                     manual_transition: None,
+                    fade_to_black: None,
                 },
             }));
             second.send(&WireMessage::RuntimeEvent(RuntimeEventMessage {
@@ -3182,6 +3209,7 @@ mod tests {
                 event: RuntimeLifecycleEvent::Realized {
                     domain: "switcher".to_owned(),
                     manual_transition: None,
+                    fade_to_black: None,
                 },
             }));
             assert_eq!(second.stream.read(&mut [0_u8; 1]).unwrap(), 0);
@@ -3245,6 +3273,7 @@ mod tests {
                     program: wire_input(1),
                     preview: wire_input(3),
                     manual_transition: None,
+                    fade_to_black: None,
                 },
             }))
             .unwrap();

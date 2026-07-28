@@ -19,14 +19,15 @@ use fm_auth::{AuthorizationDenial, CommandClass, Policy, Principal};
 use fm_command::{CommandReceipt, DurableEvent, IdempotencyKey, RejectionCode};
 use fm_engine::{
     Engine, EngineAcceptance, EngineCommand, EngineCommandOutcome, EngineError, EngineEvent,
-    EngineManualTransitionKind, EngineManualTransitionPosition, EngineManualTransitionState,
-    EnginePrepareOutcome, EngineSnapshot, FrameResult, PreparedEngineExecution, SnapshotError,
+    EngineFadeToBlackState, EngineManualTransitionKind, EngineManualTransitionPosition,
+    EngineManualTransitionState, EnginePrepareOutcome, EngineSnapshot, FrameResult,
+    PreparedEngineExecution, SnapshotError,
 };
 use fm_protocol::{
     CommandMessage, CommandPayload, CommandResult, EngineIdentity, EventCursor, EventMessage,
-    EventPayload, FieldIssue, ManualTransitionKind, ManualTransitionPosition,
-    ManualTransitionState, ManualTransitionStatus, RuntimeEventMessage, RuntimeLifecycleEvent,
-    ServerIdentity, SnapshotMessage, WireInputId, WireMessage,
+    EventPayload, FadeToBlackPosition, FadeToBlackState, FieldIssue, ManualTransitionKind,
+    ManualTransitionPosition, ManualTransitionState, ManualTransitionStatus, RuntimeEventMessage,
+    RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage, WireInputId, WireMessage,
 };
 
 /// Target-free authorization called before an engine command is constructed or validated.
@@ -494,6 +495,7 @@ pub struct ControlService<A = Policy> {
     next_subscriber_id: u64,
     pending_runtime_actions: VecDeque<PendingRuntimeAction>,
     active_transition: Option<ActiveTransition>,
+    active_fade_to_black: Option<ActiveTransition>,
     runtime_sequence_generation: u64,
     runtime_sequence: u64,
 }
@@ -527,6 +529,7 @@ impl<A: AuthorizationHook> ControlService<A> {
             next_subscriber_id: 1,
             pending_runtime_actions: VecDeque::new(),
             active_transition: None,
+            active_fade_to_black: None,
             runtime_sequence_generation,
             runtime_sequence: 0,
         }
@@ -558,7 +561,10 @@ impl<A: AuthorizationHook> ControlService<A> {
     /// Returns [`SnapshotError::WorkInFlight`] while an engine action or
     /// transition is pending, including an unpublished control realization.
     pub fn idle_engine_snapshot(&self) -> Result<EngineSnapshot, SnapshotError> {
-        if !self.pending_runtime_actions.is_empty() || self.active_transition.is_some() {
+        if !self.pending_runtime_actions.is_empty()
+            || self.active_transition.is_some()
+            || self.active_fade_to_black.is_some()
+        {
             return Err(SnapshotError::WorkInFlight);
         }
         self.engine.snapshot()
@@ -674,6 +680,7 @@ impl<A: AuthorizationHook> ControlService<A> {
             CommandPayload::Cut
             | CommandPayload::Fade { .. }
             | CommandPayload::Wipe { .. }
+            | CommandPayload::FadeToBlack { .. }
             | CommandPayload::StartManualTransition { .. }
             | CommandPayload::SetManualTransitionPosition { .. }
             | CommandPayload::CommitManualTransition
@@ -711,6 +718,13 @@ impl<A: AuthorizationHook> ControlService<A> {
             CommandPayload::Cut => EngineCommand::Cut,
             CommandPayload::Fade { duration_frames } => EngineCommand::Fade { duration_frames },
             CommandPayload::Wipe { duration_frames } => EngineCommand::Wipe { duration_frames },
+            CommandPayload::FadeToBlack {
+                active,
+                duration_frames,
+            } => EngineCommand::FadeToBlack {
+                active,
+                duration_frames,
+            },
             CommandPayload::StartManualTransition { kind } => {
                 EngineCommand::StartManualTransition {
                     kind: match kind {
@@ -888,6 +902,22 @@ impl<A: AuthorizationHook> ControlService<A> {
                     revision: pending.revision,
                     generation,
                 });
+            } else if matches!(pending.command, EngineCommand::FadeToBlack { .. }) {
+                if let Some(superseded) = self.active_fade_to_black.replace(ActiveTransition {
+                    revision: pending.revision,
+                    generation,
+                }) && publish_runtime_realization
+                {
+                    runtime_events.push(
+                        self.runtime_superseded(
+                            server,
+                            superseded.revision,
+                            generation,
+                            pending.revision,
+                        )
+                        .map_err(TickWithRealizerError::Tick)?,
+                    );
+                }
             } else if publish_runtime_realization {
                 runtime_events.push(
                     self.runtime_realized(server, pending.revision, generation)
@@ -903,11 +933,23 @@ impl<A: AuthorizationHook> ControlService<A> {
                 == self.engine.show().desired_switcher().preview())
         .then(|| self.active_transition.take())
         .flatten();
-        if let (true, Some(transition)) = (publish_runtime_realization, completed_transition) {
-            runtime_events.push(
-                self.runtime_realized(server, transition.revision, transition.generation)
-                    .map_err(TickWithRealizerError::Tick)?,
-            );
+        let completed_fade_to_black =
+            (!self.engine.realized_switcher().fade_to_black_is_automatic()
+                && self.engine.realized_fade_to_black() == self.engine.desired_fade_to_black())
+            .then(|| self.active_fade_to_black.take())
+            .flatten();
+        let mut completions = [completed_transition, completed_fade_to_black]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        completions.sort_by_key(|operation| operation.generation);
+        if publish_runtime_realization {
+            for operation in completions {
+                runtime_events.push(
+                    self.runtime_realized(server, operation.revision, current_generation)
+                        .map_err(TickWithRealizerError::Tick)?,
+                );
+            }
         }
 
         self.snapshot = snapshot_record(&self.engine, &self.identity);
@@ -930,6 +972,40 @@ impl<A: AuthorizationHook> ControlService<A> {
         revision: u64,
         generation: u64,
     ) -> Result<RuntimeEventMessage, ControlError> {
+        let event = RuntimeLifecycleEvent::Realized {
+            domain: "switcher".to_owned(),
+            manual_transition: Some(protocol_manual_status(
+                self.engine.realized_manual_transition(),
+            )),
+            fade_to_black: Some(protocol_fade_to_black_state(
+                self.engine.realized_fade_to_black(),
+            )),
+        };
+        self.runtime_event(server, revision, generation, event)
+    }
+
+    fn runtime_superseded(
+        &mut self,
+        server: &ServerIdentity,
+        revision: u64,
+        generation: u64,
+        by_revision: u64,
+    ) -> Result<RuntimeEventMessage, ControlError> {
+        self.runtime_event(
+            server,
+            revision,
+            generation,
+            RuntimeLifecycleEvent::Superseded { by_revision },
+        )
+    }
+
+    fn runtime_event(
+        &mut self,
+        server: &ServerIdentity,
+        revision: u64,
+        generation: u64,
+        event: RuntimeLifecycleEvent,
+    ) -> Result<RuntimeEventMessage, ControlError> {
         if generation != self.runtime_sequence_generation {
             if generation < self.runtime_sequence_generation {
                 return Err(ControlError::RuntimeGenerationOutOfOrder);
@@ -946,12 +1022,7 @@ impl<A: AuthorizationHook> ControlService<A> {
             revision,
             generation,
             sequence: self.runtime_sequence,
-            event: RuntimeLifecycleEvent::Realized {
-                domain: "switcher".to_owned(),
-                manual_transition: Some(protocol_manual_status(
-                    self.engine.realized_manual_transition(),
-                )),
-            },
+            event,
         })
     }
 
@@ -1036,6 +1107,7 @@ fn engine_submission(
                 program: WireInputId::from_domain(engine.show().desired_switcher().program()),
                 preview: WireInputId::from_domain(engine.show().desired_switcher().preview()),
                 manual_transition: Some(protocol_manual_status(engine.desired_manual_transition())),
+                fade_to_black: Some(protocol_fade_to_black_state(engine.desired_fade_to_black())),
             },
         }]
     } else {
@@ -1086,6 +1158,10 @@ fn snapshot_record(engine: &Engine, identity: &EngineIdentity) -> SnapshotRecord
         realized_manual_transition: Some(protocol_manual_status(
             engine.realized_manual_transition(),
         )),
+        desired_fade_to_black: Some(protocol_fade_to_black_state(engine.desired_fade_to_black())),
+        realized_fade_to_black: Some(protocol_fade_to_black_state(
+            engine.realized_fade_to_black(),
+        )),
     };
     SnapshotRecord {
         cursor: EventCursor {
@@ -1113,6 +1189,16 @@ fn protocol_manual_status(state: Option<EngineManualTransitionState>) -> ManualT
         position: ManualTransitionPosition::new(state.position.basis_points())
             .expect("engine manual transition positions are bounded"),
     })
+}
+
+fn protocol_fade_to_black_state(state: EngineFadeToBlackState) -> FadeToBlackState {
+    FadeToBlackState {
+        target_active: state.active,
+        position: FadeToBlackPosition::new(
+            u16::try_from(state.position.numerator())
+                .expect("engine Fade-to-Black positions use a u16 denominator"),
+        ),
+    }
 }
 
 #[cfg(test)]

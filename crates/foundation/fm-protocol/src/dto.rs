@@ -4,8 +4,8 @@ use fm_command::{CommandEnvelope, Deadline, Revision, StateEpoch};
 use fm_types::InputId;
 
 use crate::{
-    BASE_PROTOCOL_VERSION, MANUAL_TRANSITION_PROTOCOL_VERSION, ProtocolVersion,
-    WIPE_PROTOCOL_VERSION,
+    BASE_PROTOCOL_VERSION, FADE_TO_BLACK_PROTOCOL_VERSION, MANUAL_TRANSITION_PROTOCOL_VERSION,
+    ProtocolVersion, WIPE_PROTOCOL_VERSION,
 };
 
 /// Stable identity of one project's durable state on one server.
@@ -251,12 +251,40 @@ pub enum ManualTransitionStatus {
     Active(ManualTransitionState),
 }
 
+/// Exact fixed-rational FTB position; `0` is live and `u16::MAX` is black.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct FadeToBlackPosition(u16);
+
+impl FadeToBlackPosition {
+    pub const LIVE: Self = Self(0);
+    pub const BLACK: Self = Self(u16::MAX);
+    pub const DENOMINATOR: u32 = u16::MAX as u32;
+
+    #[must_use]
+    pub const fn new(numerator: u16) -> Self {
+        Self(numerator)
+    }
+
+    #[must_use]
+    pub const fn numerator(self) -> u16 {
+        self.0
+    }
+}
+
+/// Desired or realized Fade-to-Black state at one frame boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FadeToBlackState {
+    pub target_active: bool,
+    pub position: FadeToBlackPosition,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CommandPayload {
     SelectPreview { input: WireInputId },
     Cut,
     Fade { duration_frames: u32 },
     Wipe { duration_frames: u32 },
+    FadeToBlack { active: bool, duration_frames: u32 },
     StartManualTransition { kind: ManualTransitionKind },
     SetManualTransitionPosition { position: ManualTransitionPosition },
     CommitManualTransition,
@@ -269,6 +297,7 @@ impl CommandPayload {
         match self {
             Self::SelectPreview { .. } | Self::Cut | Self::Fade { .. } => BASE_PROTOCOL_VERSION,
             Self::Wipe { .. } => WIPE_PROTOCOL_VERSION,
+            Self::FadeToBlack { .. } => FADE_TO_BLACK_PROTOCOL_VERSION,
             Self::StartManualTransition { .. }
             | Self::SetManualTransitionPosition { .. }
             | Self::CommitManualTransition
@@ -363,6 +392,10 @@ pub struct SnapshotMessage {
     pub desired_manual_transition: Option<ManualTransitionStatus>,
     /// `None` means the protocol extension was omitted for an older peer.
     pub realized_manual_transition: Option<ManualTransitionStatus>,
+    /// `None` means the protocol extension was omitted for an older peer.
+    pub desired_fade_to_black: Option<FadeToBlackState>,
+    /// `None` means the protocol extension was omitted for an older peer.
+    pub realized_fade_to_black: Option<FadeToBlackState>,
 }
 
 /// A durable state change. Runtime progress uses [`RuntimeEventMessage`].
@@ -373,6 +406,8 @@ pub enum EventPayload {
         preview: WireInputId,
         /// `None` means the protocol extension was omitted for an older peer.
         manual_transition: Option<ManualTransitionStatus>,
+        /// `None` means the protocol extension was omitted for an older peer.
+        fade_to_black: Option<FadeToBlackState>,
     },
 }
 
@@ -430,6 +465,8 @@ pub enum RuntimeLifecycleEvent {
         domain: String,
         /// `None` means the protocol extension was omitted for an older peer.
         manual_transition: Option<ManualTransitionStatus>,
+        /// `None` means the protocol extension was omitted for an older peer.
+        fade_to_black: Option<FadeToBlackState>,
     },
     Failed {
         error: StructuredError,
@@ -497,6 +534,25 @@ impl WireMessage {
     #[must_use]
     pub fn compatible_with(&self, version: ProtocolVersion) -> Self {
         let mut message = self.clone();
+        if version.major != FADE_TO_BLACK_PROTOCOL_VERSION.major
+            || version.minor < FADE_TO_BLACK_PROTOCOL_VERSION.minor
+        {
+            match &mut message {
+                Self::Snapshot(snapshot) => {
+                    snapshot.desired_fade_to_black = None;
+                    snapshot.realized_fade_to_black = None;
+                }
+                Self::Event(EventMessage {
+                    payload: EventPayload::DesiredSwitcher { fade_to_black, .. },
+                    ..
+                })
+                | Self::RuntimeEvent(RuntimeEventMessage {
+                    event: RuntimeLifecycleEvent::Realized { fade_to_black, .. },
+                    ..
+                }) => *fade_to_black = None,
+                _ => {}
+            }
+        }
         if version.major == MANUAL_TRANSITION_PROTOCOL_VERSION.major
             && version.minor >= MANUAL_TRANSITION_PROTOCOL_VERSION.minor
         {

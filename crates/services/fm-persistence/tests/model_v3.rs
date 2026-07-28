@@ -323,11 +323,13 @@ fn schema_v6_defaults_audio_strips_for_every_input_kind_without_losing_masks() {
     let current = fs::read_to_string(store.manifest_path()).unwrap();
     let strips_start = current.find(",\n    \"input_audio_strips\": [").unwrap();
     let scenes_start = current.find(",\n    \"scenes\": [").unwrap();
-    let legacy = format!("{}{}", &current[..strips_start], &current[scenes_start..]).replacen(
-        "\"schema_version\": 7",
-        "\"schema_version\": 6",
-        1,
-    );
+    let legacy = format!("{}{}", &current[..strips_start], &current[scenes_start..])
+        .replacen("\"schema_version\": 8", "\"schema_version\": 6", 1)
+        .replacen(
+            "    \"fade_to_black\": {\n      \"desired\": {\"target_active\": false, \"position_numerator\": 0},\n      \"realized\": {\"target_active\": false, \"position_numerator\": 0}\n    },\n",
+            "",
+            1,
+        );
     fs::write(store.manifest_path(), legacy).unwrap();
 
     store.migrate_v6().unwrap();
@@ -556,7 +558,7 @@ fn golden_v2_manifest_migrates_with_cli_defaults_and_main_mix() {
     let report = store.migrate_v2().unwrap();
     let migrated = store.load().unwrap();
 
-    assert_eq!((report.from_schema(), report.to_schema()), (2, 7));
+    assert_eq!((report.from_schema(), report.to_schema()), (2, 8));
     assert_eq!(
         migrated.project().settings().frame_rate,
         FrameRate::new(60_000, 1_001).unwrap()
@@ -602,7 +604,7 @@ fn frozen_v3_manifest_migrates_with_composition_defaults_only() {
     second.migrate_v3().unwrap();
     let migrated = store.load().unwrap();
 
-    assert_eq!((report.from_schema(), report.to_schema()), (3, 7));
+    assert_eq!((report.from_schema(), report.to_schema()), (3, 8));
     assert_eq!(
         report.defaulted_fields(),
         [
@@ -614,6 +616,7 @@ fn frozen_v3_manifest_migrates_with_composition_defaults_only() {
             "runtime.manual_transitions=inactive",
             "scenes.layers.mask=null",
             "input_audio_strips=per-input gain_milli_db=0/muted=false/follow_video=true",
+            "runtime.fade_to_black=live",
         ]
     );
     let scene = &migrated.project().scenes()[0];

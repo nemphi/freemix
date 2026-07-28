@@ -16,9 +16,9 @@ use fm_types::{
 };
 
 use crate::{
-    CURRENT_SCHEMA_VERSION, IdempotencyReceipt, ManualTransitionKind, ManualTransitionState,
-    ProjectPosition, ProjectRouting, ProjectValidationError, RuntimeManualTransitions,
-    RuntimeRouting, StoredProject,
+    CURRENT_SCHEMA_VERSION, FadeToBlackState, IdempotencyReceipt, ManualTransitionKind,
+    ManualTransitionState, ProjectPosition, ProjectRouting, ProjectValidationError,
+    RuntimeFadeToBlack, RuntimeManualTransitions, RuntimeRouting, StoredProject,
 };
 
 use super::{
@@ -31,6 +31,7 @@ const V3_SCHEMA_VERSION: u32 = 3;
 const V4_SCHEMA_VERSION: u32 = 4;
 const V5_SCHEMA_VERSION: u32 = 5;
 const V6_SCHEMA_VERSION: u32 = 6;
+const V7_SCHEMA_VERSION: u32 = 7;
 
 pub(crate) fn decode(source: &str) -> Result<StoredProject, DecodeError> {
     let mut root = Object::new(Reader::new(source).document()?, "manifest")?;
@@ -44,13 +45,14 @@ pub(crate) fn decode(source: &str) -> Result<StoredProject, DecodeError> {
         ));
     }
     let project = ProjectDto::parse(root.take("project")?, false, true, true)?.into_domain();
-    let (routing, manual_transitions, position, receipts) =
-        parse_runtime(root.take("runtime")?, true)?;
+    let (routing, manual_transitions, fade_to_black, position, receipts) =
+        parse_runtime(root.take("runtime")?, true, true)?;
     root.finish()?;
-    StoredProject::from_project_with_manual_transitions(
+    StoredProject::from_project_with_runtime_state(
         project,
         routing,
         manual_transitions,
+        fade_to_black,
         position,
         receipts,
     )
@@ -73,7 +75,7 @@ pub(crate) fn decode_v3(source: &str) -> Result<StoredProject, DecodeError> {
         ));
     }
     let project = ProjectDto::parse(root.take("project")?, true, false, false)?.into_domain();
-    let (routing, _, position, receipts) = parse_runtime(root.take("runtime")?, false)?;
+    let (routing, _, _, position, receipts) = parse_runtime(root.take("runtime")?, false, false)?;
     root.finish()?;
     StoredProject::from_project(project, routing, position, receipts)
         .map_err(DecodeError::Validation)
@@ -91,7 +93,7 @@ pub(crate) fn decode_v4(source: &str) -> Result<StoredProject, DecodeError> {
         ));
     }
     let project = ProjectDto::parse(root.take("project")?, false, false, false)?.into_domain();
-    let (routing, _, position, receipts) = parse_runtime(root.take("runtime")?, false)?;
+    let (routing, _, _, position, receipts) = parse_runtime(root.take("runtime")?, false, false)?;
     root.finish()?;
     StoredProject::from_project(project, routing, position, receipts)
         .map_err(DecodeError::Validation)
@@ -109,8 +111,8 @@ pub(crate) fn decode_v5(source: &str) -> Result<StoredProject, DecodeError> {
         ));
     }
     let project = ProjectDto::parse(root.take("project")?, false, false, false)?.into_domain();
-    let (routing, manual_transitions, position, receipts) =
-        parse_runtime(root.take("runtime")?, true)?;
+    let (routing, manual_transitions, _, position, receipts) =
+        parse_runtime(root.take("runtime")?, true, false)?;
     root.finish()?;
     StoredProject::from_project_with_manual_transitions(
         project,
@@ -134,8 +136,33 @@ pub(crate) fn decode_v6(source: &str) -> Result<StoredProject, DecodeError> {
         ));
     }
     let project = ProjectDto::parse(root.take("project")?, false, true, false)?.into_domain();
-    let (routing, manual_transitions, position, receipts) =
-        parse_runtime(root.take("runtime")?, true)?;
+    let (routing, manual_transitions, _, position, receipts) =
+        parse_runtime(root.take("runtime")?, true, false)?;
+    root.finish()?;
+    StoredProject::from_project_with_manual_transitions(
+        project,
+        routing,
+        manual_transitions,
+        position,
+        receipts,
+    )
+    .map_err(DecodeError::Validation)
+}
+
+pub(crate) fn decode_v7(source: &str) -> Result<StoredProject, DecodeError> {
+    let mut root = Object::new(Reader::new(source).document()?, "manifest")?;
+    let schema = root.u32("schema_version")?;
+    if schema != V7_SCHEMA_VERSION {
+        return Err(DecodeError::Validation(
+            ProjectValidationError::UnsupportedSchema {
+                found: schema,
+                supported: V7_SCHEMA_VERSION,
+            },
+        ));
+    }
+    let project = ProjectDto::parse(root.take("project")?, false, true, true)?.into_domain();
+    let (routing, manual_transitions, _, position, receipts) =
+        parse_runtime(root.take("runtime")?, true, false)?;
     root.finish()?;
     StoredProject::from_project_with_manual_transitions(
         project,
@@ -687,10 +714,12 @@ fn parse_restart_policy(value: Value) -> Result<RestartPolicy, DecodeError> {
 fn parse_runtime(
     value: Value,
     has_manual_transitions: bool,
+    has_fade_to_black: bool,
 ) -> Result<
     (
         RuntimeRouting,
         RuntimeManualTransitions,
+        RuntimeFadeToBlack,
         ProjectPosition,
         Vec<IdempotencyReceipt>,
     ),
@@ -703,6 +732,11 @@ fn parse_runtime(
     } else {
         RuntimeManualTransitions::default()
     };
+    let fade_to_black = if has_fade_to_black {
+        parse_fade_to_black(object.take("fade_to_black")?)?
+    } else {
+        RuntimeFadeToBlack::default()
+    };
     let position = parse_position(object.take("position")?)?;
     let receipts = parse_array(
         object.take("idempotency_receipts")?,
@@ -710,7 +744,33 @@ fn parse_runtime(
         parse_receipt,
     )?;
     object.finish()?;
-    Ok((routing, manual_transitions, position, receipts))
+    Ok((
+        routing,
+        manual_transitions,
+        fade_to_black,
+        position,
+        receipts,
+    ))
+}
+
+fn parse_fade_to_black(value: Value) -> Result<RuntimeFadeToBlack, DecodeError> {
+    let mut object = Object::new(value, "fade to black")?;
+    let state = RuntimeFadeToBlack {
+        desired: parse_fade_to_black_state(object.take("desired")?)?,
+        realized: parse_fade_to_black_state(object.take("realized")?)?,
+    };
+    object.finish()?;
+    Ok(state)
+}
+
+fn parse_fade_to_black_state(value: Value) -> Result<FadeToBlackState, DecodeError> {
+    let mut object = Object::new(value, "fade to black state")?;
+    let state = FadeToBlackState::new(
+        object.boolean("target_active")?,
+        object.u16("position_numerator")?,
+    );
+    object.finish()?;
+    Ok(state)
 }
 
 fn parse_manual_transitions(value: Value) -> Result<RuntimeManualTransitions, DecodeError> {

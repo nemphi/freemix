@@ -318,6 +318,181 @@ fn wipe_propagates_with_authorization_idempotency_resume_and_exact_endpoints() {
 }
 
 #[test]
+fn fade_to_black_is_authorized_reversible_and_runtime_ordered_with_program() {
+    let mut control = service(16, 8);
+    let operator = principal(Role::Operator);
+    let server = server_identity();
+
+    let denied = control
+        .submit(
+            &principal(Role::Viewer),
+            command(
+                "denied-ftb",
+                "denied-ftb-key",
+                CommandPayload::FadeToBlack {
+                    active: true,
+                    duration_frames: 4,
+                },
+            ),
+            0,
+        )
+        .unwrap();
+    assert!(matches!(
+        denied.output.result,
+        CommandResult::Rejected { ref code, .. } if code == "permission_denied"
+    ));
+
+    let accepted = control
+        .submit(
+            &operator,
+            command(
+                "ftb-on",
+                "ftb-on-key",
+                CommandPayload::FadeToBlack {
+                    active: true,
+                    duration_frames: 4,
+                },
+            ),
+            0,
+        )
+        .unwrap();
+    assert!(matches!(
+        accepted.output.events[0].payload,
+        EventPayload::DesiredSwitcher {
+            fade_to_black: Some(FadeToBlackState {
+                target_active: true,
+                position: FadeToBlackPosition::BLACK,
+            }),
+            ..
+        }
+    ));
+    assert_eq!(
+        control
+            .snapshot()
+            .snapshot
+            .realized_fade_to_black
+            .unwrap()
+            .position,
+        FadeToBlackPosition::LIVE
+    );
+
+    let first = control.tick(&server).unwrap();
+    assert!(first.runtime_events.is_empty());
+    assert_eq!(first.frame.fade_to_black.interval_end().numerator(), 16_383);
+
+    control
+        .submit(
+            &operator,
+            command("cut-during-ftb", "cut-during-ftb-key", CommandPayload::Cut),
+            0,
+        )
+        .unwrap();
+    let cut = control.tick(&server).unwrap();
+    assert_eq!(cut.runtime_events.len(), 1);
+    assert_eq!(cut.runtime_events[0].revision, 2);
+    assert_eq!(cut.runtime_events[0].generation, 2);
+    assert_eq!(cut.runtime_events[0].sequence, 1);
+    assert!(control.tick(&server).unwrap().runtime_events.is_empty());
+
+    let completed = control.tick(&server).unwrap();
+    assert_eq!(completed.runtime_events.len(), 1);
+    assert_eq!(completed.runtime_events[0].revision, 1);
+    assert_eq!(completed.runtime_events[0].generation, 2);
+    assert_eq!(completed.runtime_events[0].sequence, 2);
+    assert!(matches!(
+        completed.runtime_events[0].event,
+        RuntimeLifecycleEvent::Realized {
+            fade_to_black: Some(FadeToBlackState {
+                target_active: true,
+                position: FadeToBlackPosition::BLACK,
+            }),
+            ..
+        }
+    ));
+    assert!(control.idle_engine_snapshot().is_ok());
+}
+
+#[test]
+fn reversing_fade_to_black_supersedes_only_the_displaced_intent() {
+    let mut control = service(16, 8);
+    let operator = principal(Role::Operator);
+    let server = server_identity();
+    control
+        .submit(
+            &operator,
+            command(
+                "ftb-on",
+                "ftb-on-key",
+                CommandPayload::FadeToBlack {
+                    active: true,
+                    duration_frames: 1,
+                },
+            ),
+            0,
+        )
+        .unwrap();
+    assert_eq!(control.tick(&server).unwrap().runtime_events.len(), 1);
+    control
+        .submit(
+            &operator,
+            command(
+                "ftb-off",
+                "ftb-off-key",
+                CommandPayload::FadeToBlack {
+                    active: false,
+                    duration_frames: 3,
+                },
+            ),
+            0,
+        )
+        .unwrap();
+    assert!(control.tick(&server).unwrap().runtime_events.is_empty());
+    control
+        .submit(
+            &operator,
+            command(
+                "ftb-reverse",
+                "ftb-reverse-key",
+                CommandPayload::FadeToBlack {
+                    active: true,
+                    duration_frames: 3,
+                },
+            ),
+            0,
+        )
+        .unwrap();
+    let reversed = control.tick(&server).unwrap();
+    assert!(matches!(
+        reversed.runtime_events.as_slice(),
+        [RuntimeEventMessage {
+            revision: 2,
+            generation: 3,
+            sequence: 1,
+            event: RuntimeLifecycleEvent::Superseded { by_revision: 3 },
+            ..
+        }]
+    ));
+    assert!(control.tick(&server).unwrap().runtime_events.is_empty());
+    let reversed_completion = control.tick(&server).unwrap();
+    assert!(matches!(
+        reversed_completion.runtime_events.as_slice(),
+        [RuntimeEventMessage {
+            revision: 3,
+            generation: 3,
+            sequence: 2,
+            event: RuntimeLifecycleEvent::Realized {
+                fade_to_black: Some(FadeToBlackState {
+                    target_active: true,
+                    position: FadeToBlackPosition::BLACK,
+                }),
+                ..
+            },
+            ..
+        }]
+    ));
+}
+
+#[test]
 fn accepted_preparation_is_isolated_until_commit_and_projects_exactly() {
     let mut control = service(8, 8);
     let subscription = control.subscribe().unwrap();
@@ -684,6 +859,10 @@ fn command_result_is_represented_before_its_events() {
             program: WireInputId::from_domain(input(2)),
             preview: WireInputId::from_domain(input(1)),
             manual_transition: Some(fm_protocol::ManualTransitionStatus::Inactive),
+            fade_to_black: Some(fm_protocol::FadeToBlackState {
+                target_active: false,
+                position: fm_protocol::FadeToBlackPosition::LIVE,
+            }),
         }
     );
 }

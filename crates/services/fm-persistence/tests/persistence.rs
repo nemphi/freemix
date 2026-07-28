@@ -6,10 +6,10 @@ use std::{
 };
 
 use fm_persistence::{
-    CURRENT_SCHEMA_VERSION, IdempotencyReceipt, JournalError, MAX_MANIFEST_BYTES,
+    CURRENT_SCHEMA_VERSION, FadeToBlackState, IdempotencyReceipt, JournalError, MAX_MANIFEST_BYTES,
     ManualTransitionKind, ManualTransitionState, MutationBatch, ProjectPosition, ProjectRouting,
-    ProjectStore, ProjectValidationError, ReceiptOutcome, ReferenceField, RuntimeManualTransitions,
-    StoreError, StoredProject,
+    ProjectStore, ProjectValidationError, ReceiptOutcome, ReferenceField, RuntimeFadeToBlack,
+    RuntimeManualTransitions, StoreError, StoredProject,
 };
 
 static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -158,6 +158,61 @@ fn round_trip_preserves_exact_desired_and_realized_manual_transition_state() {
 }
 
 #[test]
+fn round_trip_preserves_settled_fade_to_black_state() {
+    let temp = TestDirectory::new("fade-to-black");
+    let store = ProjectStore::new(temp.project_path("show")).unwrap();
+    let base = project("Fade to black", 11);
+    let expected = StoredProject::from_project_with_runtime_state(
+        base.project().clone(),
+        base.runtime_routing(),
+        base.runtime_manual_transitions(),
+        RuntimeFadeToBlack {
+            desired: FadeToBlackState::BLACK,
+            realized: FadeToBlackState::BLACK,
+        },
+        base.position(),
+        base.idempotency_receipts().to_vec(),
+    )
+    .unwrap();
+
+    store.save(&expected).unwrap();
+
+    assert_eq!(store.load().unwrap(), expected);
+    let encoded = fs::read_to_string(store.manifest_path()).unwrap();
+    assert!(encoded.contains("\"target_active\": true, \"position_numerator\": 65535"));
+}
+
+#[test]
+fn manifests_reject_unsettled_or_divergent_fade_to_black_checkpoints() {
+    let base = project("Fade to black validation", 11);
+    let build = |fade_to_black| {
+        StoredProject::from_project_with_runtime_state(
+            base.project().clone(),
+            base.runtime_routing(),
+            base.runtime_manual_transitions(),
+            fade_to_black,
+            base.position(),
+            base.idempotency_receipts().to_vec(),
+        )
+    };
+
+    assert_eq!(
+        build(RuntimeFadeToBlack {
+            desired: FadeToBlackState::new(true, 40_000),
+            realized: FadeToBlackState::BLACK,
+        }),
+        Err(ProjectValidationError::UnsettledFadeToBlack)
+    );
+    assert_eq!(
+        build(RuntimeFadeToBlack {
+            desired: FadeToBlackState::BLACK,
+            realized: FadeToBlackState::LIVE,
+        }),
+        Err(ProjectValidationError::FadeToBlackCheckpointMismatch)
+    );
+}
+
+#[test]
 fn manifests_reject_unsettled_manual_transition_intervals() {
     let temp = TestDirectory::new("manual-transition-intervals");
     let valid_root = temp.project_path("valid");
@@ -233,13 +288,14 @@ fn schema_v4_migrates_with_inactive_manual_transition_defaults() {
     let report = store.migrate_v4().unwrap();
     let migrated = store.load().unwrap();
 
-    assert_eq!((report.from_schema(), report.to_schema()), (4, 7));
+    assert_eq!((report.from_schema(), report.to_schema()), (4, 8));
     assert_eq!(
         report.defaulted_fields(),
         [
             "runtime.manual_transitions=inactive",
             "scenes.layers.mask=null",
-            "input_audio_strips=per-input gain_milli_db=0/muted=false/follow_video=true"
+            "input_audio_strips=per-input gain_milli_db=0/muted=false/follow_video=true",
+            "runtime.fade_to_black=live"
         ]
     );
     assert_eq!(
@@ -258,12 +314,13 @@ fn schema_v5_migration_preserves_manual_state_and_defaults_no_mask() {
     let report = store.migrate_v5().unwrap();
     let migrated = store.load().unwrap();
 
-    assert_eq!((report.from_schema(), report.to_schema()), (5, 7));
+    assert_eq!((report.from_schema(), report.to_schema()), (5, 8));
     assert_eq!(
         report.defaulted_fields(),
         [
             "scenes.layers.mask=null",
-            "input_audio_strips=per-input gain_milli_db=0/muted=false/follow_video=true"
+            "input_audio_strips=per-input gain_milli_db=0/muted=false/follow_video=true",
+            "runtime.fade_to_black=live"
         ]
     );
     assert_eq!(migrated.project().scenes()[0].layers[0].mask, None);
@@ -289,7 +346,7 @@ fn schema_v5_migration_preserves_manual_state_and_defaults_no_mask() {
         )
     );
     let encoded = fs::read_to_string(store.manifest_path()).unwrap();
-    assert!(encoded.starts_with("{\n  \"schema_version\": 7,"));
+    assert!(encoded.starts_with("{\n  \"schema_version\": 8,"));
     assert!(encoded.contains("\"mask\": null"));
 }
 
@@ -303,10 +360,13 @@ fn schema_v6_migration_preserves_masks_and_manual_state_and_defaults_audio_strip
     let report = store.migrate_v6().unwrap();
     let migrated = store.load().unwrap();
 
-    assert_eq!((report.from_schema(), report.to_schema()), (6, 7));
+    assert_eq!((report.from_schema(), report.to_schema()), (6, 8));
     assert_eq!(
         report.defaulted_fields(),
-        ["input_audio_strips=per-input gain_milli_db=0/muted=false/follow_video=true"]
+        [
+            "input_audio_strips=per-input gain_milli_db=0/muted=false/follow_video=true",
+            "runtime.fade_to_black=live"
+        ]
     );
     assert_eq!(
         migrated.project().scenes()[0].layers[0].mask,
@@ -324,6 +384,40 @@ fn schema_v6_migration_preserves_masks_and_manual_state_and_defaults_audio_strip
     assert_eq!(
         transitions.realized.unwrap().interval_start_basis_points,
         6_250
+    );
+}
+
+#[test]
+fn schema_v7_migration_preserves_project_state_and_defaults_live_fade_to_black() {
+    let temp = TestDirectory::new("schema-v7");
+    let source_store = ProjectStore::new(temp.project_path("source")).unwrap();
+    let expected = project("Schema v7", 11);
+    source_store.save(&expected).unwrap();
+    let source = fs::read_to_string(source_store.manifest_path())
+        .unwrap()
+        .replacen("\"schema_version\": 8", "\"schema_version\": 7", 1)
+        .replacen(
+            "    \"fade_to_black\": {\n      \"desired\": {\"target_active\": false, \"position_numerator\": 0},\n      \"realized\": {\"target_active\": false, \"position_numerator\": 0}\n    },\n",
+            "",
+            1,
+        );
+
+    let root = temp.project_path("show");
+    write_manifest(&root, &source);
+    let store = ProjectStore::new(root).unwrap();
+    let report = store.migrate_v7().unwrap();
+    let migrated = store.load().unwrap();
+
+    assert_eq!((report.from_schema(), report.to_schema()), (7, 8));
+    assert_eq!(report.defaulted_fields(), ["runtime.fade_to_black=live"]);
+    assert_eq!(
+        migrated.runtime_fade_to_black(),
+        RuntimeFadeToBlack::default()
+    );
+    assert_eq!(migrated.project(), expected.project());
+    assert_eq!(
+        migrated.runtime_manual_transitions(),
+        expected.runtime_manual_transitions()
     );
 }
 
@@ -430,8 +524,8 @@ fn explicit_unsupported_schema_is_reported_before_missing_current_fields() {
 fn strict_parser_rejects_unknown_duplicate_and_wrong_typed_fields() {
     let temp = TestDirectory::new("strict");
     for (name, manifest) in [
-        ("unknown", "{\"schema_version\":7,\"unknown\":true}"),
-        ("duplicate", "{\"schema_version\":7,\"schema_version\":7}"),
+        ("unknown", "{\"schema_version\":8,\"unknown\":true}"),
+        ("duplicate", "{\"schema_version\":8,\"schema_version\":8}"),
         ("wrong-type", "{\"schema_version\":\"1\"}"),
         ("object-trailing-comma", "{\"schema_version\":2,}"),
         (

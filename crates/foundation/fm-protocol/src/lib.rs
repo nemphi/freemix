@@ -12,14 +12,15 @@ pub use codec::{
 pub use dto::{
     CapabilityReportMessage, CapabilityReportSummary, ClientHello, ClientType, CommandMessage,
     CommandPayload, CommandResult, DurableEvent, DurableEventBatch, DurableGap, EngineIdentity,
-    ErrorMessage, EventCursor, EventMessage, EventPayload, FieldIssue, HandshakeOutcome,
-    HandshakeRequest, HandshakeResponse, HeartbeatMessage, ManualTransitionKind,
-    ManualTransitionPosition, ManualTransitionState, ManualTransitionStatus, ResumeCursor, Role,
-    RuntimeDomainBoundary, RuntimeEventMessage, RuntimeFailureDisposition, RuntimeLifecycleEvent,
-    ServerHello, ServerIdentity, SnapshotMessage, SnapshotReason, StructuredError, WireInputId,
-    WireMessage, choose_handshake_outcome,
+    ErrorMessage, EventCursor, EventMessage, EventPayload, FadeToBlackPosition, FadeToBlackState,
+    FieldIssue, HandshakeOutcome, HandshakeRequest, HandshakeResponse, HeartbeatMessage,
+    ManualTransitionKind, ManualTransitionPosition, ManualTransitionState, ManualTransitionStatus,
+    ResumeCursor, Role, RuntimeDomainBoundary, RuntimeEventMessage, RuntimeFailureDisposition,
+    RuntimeLifecycleEvent, ServerHello, ServerIdentity, SnapshotMessage, SnapshotReason,
+    StructuredError, WireInputId, WireMessage, choose_handshake_outcome,
 };
 pub use version::{
-    BASE_PROTOCOL_VERSION, CURRENT_PROTOCOL_VERSION, MANUAL_TRANSITION_PROTOCOL_VERSION,
-    NegotiationError, ProtocolVersion, WIPE_PROTOCOL_VERSION, negotiate_version,
+    BASE_PROTOCOL_VERSION, CURRENT_PROTOCOL_VERSION, FADE_TO_BLACK_PROTOCOL_VERSION,
+    MANUAL_TRANSITION_PROTOCOL_VERSION, NegotiationError, ProtocolVersion, WIPE_PROTOCOL_VERSION,
+    negotiate_version,
 };

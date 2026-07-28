@@ -3,9 +3,9 @@ use std::{convert::Infallible, net::IpAddr, num::NonZeroU128};
 use fm_auth::{Principal, Role as AuthRole, SessionId, UserId};
 use fm_protocol::{
     CURRENT_PROTOCOL_VERSION, ClientHello, ClientType, CommandMessage, CommandPayload,
-    EngineIdentity, EventCursor, EventMessage, EventPayload, MANUAL_TRANSITION_PROTOCOL_VERSION,
-    ManualTransitionKind, ManualTransitionStatus, ProtocolVersion, Role, SnapshotMessage,
-    WIPE_PROTOCOL_VERSION, WireInputId,
+    EngineIdentity, EventCursor, EventMessage, EventPayload, FADE_TO_BLACK_PROTOCOL_VERSION,
+    MANUAL_TRANSITION_PROTOCOL_VERSION, ManualTransitionKind, ManualTransitionStatus,
+    ProtocolVersion, Role, SnapshotMessage, WIPE_PROTOCOL_VERSION, WireInputId,
 };
 use fm_server::{
     AuthenticationMode, ConfigError, ControlPlane, DisconnectReason, HandshakeError, HealthState,
@@ -70,6 +70,8 @@ fn control() -> FakeControl {
         realized_preview: input(2),
         desired_manual_transition: Some(ManualTransitionStatus::Inactive),
         realized_manual_transition: Some(ManualTransitionStatus::Inactive),
+        desired_fade_to_black: None,
+        realized_fade_to_black: None,
     };
     let events = [3, 4]
         .map(|revision| EventMessage {
@@ -81,6 +83,7 @@ fn control() -> FakeControl {
                 program: input(1),
                 preview: input(2),
                 manual_transition: Some(ManualTransitionStatus::Inactive),
+                fade_to_black: None,
             },
         })
         .to_vec();
@@ -347,6 +350,54 @@ fn protocol_1_3_peer_cannot_admit_manual_transition() {
         Err(SessionError::UnsupportedCommandVersion {
             negotiated: WIPE_PROTOCOL_VERSION,
             required: MANUAL_TRANSITION_PROTOCOL_VERSION,
+        })
+    );
+    assert_eq!(session.accounting().inbound_commands_admitted_total, 0);
+    assert_eq!(session.accounting().inbound_commands_inflight, 0);
+}
+
+#[test]
+fn protocol_1_4_peer_cannot_admit_fade_to_black() {
+    let server = ready_server(ServerConfig::new(
+        ServerMode::Production,
+        AuthenticationMode::Required,
+        IpAddr::from([127, 0, 0, 1]),
+        vec![CURRENT_PROTOCOL_VERSION],
+        "capabilities-v1",
+    ));
+    let mut old_hello = hello(Role::Operator, None);
+    old_hello.versions = vec![MANUAL_TRANSITION_PROTOCOL_VERSION];
+    let outcome = server
+        .handshake(&old_hello, &principal(AuthRole::Operator), 0)
+        .unwrap();
+    assert_eq!(
+        outcome.server_hello.negotiated,
+        MANUAL_TRANSITION_PROTOCOL_VERSION
+    );
+    assert!(matches!(
+        &outcome.sync,
+        SyncPayload::Snapshot(snapshot)
+            if matches!(
+                snapshot.as_ref(),
+                SnapshotMessage {
+                    desired_fade_to_black: None,
+                    realized_fade_to_black: None,
+                    ..
+                }
+            )
+    ));
+
+    let mut session = outcome.session;
+    let mut command = command(CommandPayload::FadeToBlack {
+        active: true,
+        duration_frames: 30,
+    });
+    command.protocol = MANUAL_TRANSITION_PROTOCOL_VERSION;
+    assert_eq!(
+        session.admit_command(&command, 10, 0),
+        Err(SessionError::UnsupportedCommandVersion {
+            negotiated: MANUAL_TRANSITION_PROTOCOL_VERSION,
+            required: FADE_TO_BLACK_PROTOCOL_VERSION,
         })
     );
     assert_eq!(session.accounting().inbound_commands_admitted_total, 0);

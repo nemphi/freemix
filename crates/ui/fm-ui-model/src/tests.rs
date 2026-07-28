@@ -34,6 +34,14 @@ fn snapshot(project_id: ProjectId, revision: u64) -> ProjectSnapshot {
             realized: BusSelection::new(input(1), input(2)),
             desired_manual_transition: ManualTransitionStatus::Inactive,
             realized_manual_transition: ManualTransitionStatus::Inactive,
+            desired_fade_to_black: FadeToBlackState {
+                target_active: false,
+                position: FadeToBlackPosition::LIVE,
+            },
+            realized_fade_to_black: FadeToBlackState {
+                target_active: false,
+                position: FadeToBlackPosition::LIVE,
+            },
             runtime_generation: Some(4),
         },
     }
@@ -69,6 +77,7 @@ fn realization(
         generation,
         sequence,
         manual_transition: None,
+        fade_to_black: None,
     }
 }
 
@@ -76,6 +85,17 @@ fn desired(selection: BusSelection) -> DurableChange {
     DurableChange::DesiredSwitcher {
         selection,
         manual_transition: ManualTransitionStatus::Inactive,
+        fade_to_black: FadeToBlackState {
+            target_active: false,
+            position: FadeToBlackPosition::LIVE,
+        },
+    }
+}
+
+fn fade_to_black(target_active: bool, numerator: u16) -> FadeToBlackState {
+    FadeToBlackState {
+        target_active,
+        position: FadeToBlackPosition::new(numerator),
     }
 }
 
@@ -105,6 +125,55 @@ fn installs_and_validates_snapshot() {
         }
     );
     assert_eq!(model.reconnect_cursor().unwrap().revision, Revision::new(7));
+}
+
+#[test]
+fn reduces_exact_desired_and_realized_fade_to_black_state() {
+    let project_id = project(10);
+    let mut initial = snapshot(project_id, 4);
+    initial.switcher.desired_fade_to_black = fade_to_black(true, 40_000);
+    initial.switcher.realized_fade_to_black = fade_to_black(true, 20_000);
+
+    let mut model = ClientModel::new(project_id);
+    model.install_snapshot(initial).unwrap();
+    let identity = model.reconnect_cursor().unwrap().engine.clone();
+    assert_eq!(
+        model.state().unwrap().switcher().desired_fade_to_black,
+        fade_to_black(true, 40_000)
+    );
+    assert_eq!(
+        model.state().unwrap().switcher().realized_fade_to_black,
+        fade_to_black(true, 20_000)
+    );
+
+    model
+        .apply_event(event(
+            project_id,
+            identity.clone(),
+            5,
+            DurableChange::DesiredSwitcher {
+                selection: BusSelection::new(input(1), input(2)),
+                manual_transition: ManualTransitionStatus::Inactive,
+                fade_to_black: fade_to_black(false, 12_345),
+            },
+        ))
+        .unwrap();
+    assert_eq!(
+        model.state().unwrap().switcher().desired_fade_to_black,
+        fade_to_black(false, 12_345)
+    );
+    assert_eq!(
+        model.state().unwrap().switcher().realized_fade_to_black,
+        fade_to_black(true, 20_000)
+    );
+
+    let mut realized = realization(project_id, identity, 5, 9, 1);
+    realized.fade_to_black = Some(fade_to_black(false, 12_345));
+    model.apply_runtime_realization(realized).unwrap();
+    assert_eq!(
+        model.state().unwrap().switcher().realized_fade_to_black,
+        fade_to_black(false, 12_345)
+    );
 }
 
 #[test]

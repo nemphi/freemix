@@ -4,11 +4,11 @@ use std::collections::BTreeMap;
 use crate::{
     CapabilityReportMessage, CapabilityReportSummary, ClientHello, CodecError, CommandMessage,
     CommandPayload, CommandResult, DurableEventBatch, DurableGap, EngineIdentity, ErrorMessage,
-    EventCursor, EventMessage, EventPayload, HandshakeOutcome, HandshakeRequest, HandshakeResponse,
-    HeartbeatMessage, ManualTransitionKind, ManualTransitionPosition, ManualTransitionState,
-    ManualTransitionStatus, ResumeCursor, RuntimeEventMessage, RuntimeFailureDisposition,
-    RuntimeLifecycleEvent, ServerHello, ServerIdentity, SnapshotMessage, SnapshotReason,
-    StructuredError, WireInputId, WireMessage,
+    EventCursor, EventMessage, EventPayload, FadeToBlackPosition, FadeToBlackState,
+    HandshakeOutcome, HandshakeRequest, HandshakeResponse, HeartbeatMessage, ManualTransitionKind,
+    ManualTransitionPosition, ManualTransitionState, ManualTransitionStatus, ResumeCursor,
+    RuntimeEventMessage, RuntimeFailureDisposition, RuntimeLifecycleEvent, ServerHello,
+    ServerIdentity, SnapshotMessage, SnapshotReason, StructuredError, WireInputId, WireMessage,
 };
 
 use super::value::{
@@ -312,6 +312,10 @@ fn decode_command(fields: &mut Fields) -> Result<CommandMessage, CodecError> {
         "wipe" => CommandPayload::Wipe {
             duration_frames: fields.parse_required("duration_frames")?,
         },
+        "fade_to_black" => CommandPayload::FadeToBlack {
+            active: fields.boolean("active")?,
+            duration_frames: fields.parse_required("duration_frames")?,
+        },
         "manual_start" => {
             let value = fields.required("transition")?;
             let kind = match value.as_str() {
@@ -399,6 +403,11 @@ fn decode_snapshot(fields: &mut Fields) -> Result<SnapshotMessage, CodecError> {
         realized_preview: fields.input("realized_preview")?,
         desired_manual_transition: decode_manual_status(fields, ManualStatusFields::Desired)?,
         realized_manual_transition: decode_manual_status(fields, ManualStatusFields::Realized)?,
+        desired_fade_to_black: decode_fade_to_black_state(fields, FadeToBlackStateFields::Desired)?,
+        realized_fade_to_black: decode_fade_to_black_state(
+            fields,
+            FadeToBlackStateFields::Realized,
+        )?,
     })
 }
 
@@ -409,6 +418,7 @@ fn decode_event(fields: &mut Fields) -> Result<EventMessage, CodecError> {
             program: fields.input("program")?,
             preview: fields.input("preview")?,
             manual_transition: decode_manual_status(fields, ManualStatusFields::Unqualified)?,
+            fade_to_black: decode_fade_to_black_state(fields, FadeToBlackStateFields::Unqualified)?,
         },
         _ => {
             return Err(CodecError::InvalidField {
@@ -612,6 +622,7 @@ fn decode_runtime_event(fields: &mut Fields) -> Result<RuntimeEventMessage, Code
         "realized" => RuntimeLifecycleEvent::Realized {
             domain: fields.required("domain")?,
             manual_transition: decode_manual_status(fields, ManualStatusFields::Unqualified)?,
+            fade_to_black: decode_fade_to_black_state(fields, FadeToBlackStateFields::Unqualified)?,
         },
         "failed" => {
             let disposition_value = fields.required("disposition")?;
@@ -729,6 +740,41 @@ fn decode_manual_status(
             position: exact_position,
         },
     )))
+}
+
+#[derive(Clone, Copy)]
+enum FadeToBlackStateFields {
+    Desired,
+    Realized,
+    Unqualified,
+}
+
+fn decode_fade_to_black_state(
+    fields: &mut Fields,
+    names: FadeToBlackStateFields,
+) -> Result<Option<FadeToBlackState>, CodecError> {
+    let (target_active, position) = match names {
+        FadeToBlackStateFields::Desired => (
+            "?desired_ftb_target_active",
+            "?desired_ftb_position_numerator",
+        ),
+        FadeToBlackStateFields::Realized => (
+            "?realized_ftb_target_active",
+            "?realized_ftb_position_numerator",
+        ),
+        FadeToBlackStateFields::Unqualified => ("?ftb_target_active", "?ftb_position_numerator"),
+    };
+    let target = fields.boolean_optional(target_active)?;
+    let numerator = fields.parse_optional(position)?;
+    match (target, numerator) {
+        (None, None) => Ok(None),
+        (Some(target_active), Some(numerator)) => Ok(Some(FadeToBlackState {
+            target_active,
+            position: FadeToBlackPosition::new(numerator),
+        })),
+        (Some(_), None) => Err(CodecError::MissingField(position)),
+        (None, Some(_)) => Err(CodecError::MissingField(target_active)),
+    }
 }
 
 fn decode_heartbeat(fields: &mut Fields) -> Result<HeartbeatMessage, CodecError> {

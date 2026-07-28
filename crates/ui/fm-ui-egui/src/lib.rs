@@ -870,6 +870,14 @@ mod tests {
             realized: BusSelection::new(input(realized.0), input(realized.1)),
             desired_manual_transition: ManualTransitionStatus::Inactive,
             realized_manual_transition: ManualTransitionStatus::Inactive,
+            desired_fade_to_black: fm_protocol::FadeToBlackState {
+                target_active: false,
+                position: fm_protocol::FadeToBlackPosition::LIVE,
+            },
+            realized_fade_to_black: fm_protocol::FadeToBlackState {
+                target_active: false,
+                position: fm_protocol::FadeToBlackPosition::LIVE,
+            },
             runtime_generation: None,
         }
     }

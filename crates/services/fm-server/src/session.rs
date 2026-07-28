@@ -170,6 +170,7 @@ impl Session {
             CommandPayload::Cut
             | CommandPayload::Fade { .. }
             | CommandPayload::Wipe { .. }
+            | CommandPayload::FadeToBlack { .. }
             | CommandPayload::StartManualTransition { .. }
             | CommandPayload::SetManualTransitionPosition { .. }
             | CommandPayload::CommitManualTransition

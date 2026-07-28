@@ -444,6 +444,7 @@ fn validate_durable_event(
                 program: WireInputId::from_domain(expected_program),
                 preview: WireInputId::from_domain(expected_preview),
                 manual_transition: None,
+                fade_to_black: None,
             })
     {
         return Err(format!(
@@ -468,6 +469,7 @@ fn validate_runtime_event(
             RuntimeLifecycleEvent::Realized {
                 ref domain,
                 manual_transition: None,
+                fade_to_black: None,
             } if domain == "switcher"
         )
     {
