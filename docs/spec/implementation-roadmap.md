@@ -79,8 +79,11 @@ RC-008 therefore remains planned.
 Current implementation boundary for item 4: `fm-compositor` executes bounded
 native `CompositionPlan` layers with crop, nearest scaling, quarter-turn
 rotation, translation, opacity, stable z-order, premultiplied source-over, and
-canonical RGBA16F inputs. Schema v4 now persists each scene background and each
-layer's explicit input/scene source, geometry, crop, opacity, and z-order.
+canonical RGBA16F inputs. It also executes hard-edged rectangular masks in
+half-open post-crop source space, with exact CPU-oracle coverage and ignored
+native Metal readback coverage that was not run because no adapter was
+available. Schema v4 now persists each scene background and each layer's
+explicit input/scene source, geometry, crop, opacity, and z-order.
 `InputKind::Scene` explicitly routes a `SceneId` plus an optional audio
 `InputId`, while every persisted output explicitly routes a video `SceneId` and
 audio `BusId`. The explicit v3-to-v4 migration supplies opaque-black,
@@ -88,9 +91,10 @@ canvas-identity, no-crop, full-opacity, and zero-z-order defaults while
 preserving legacy sources and layer counts; outputs are preserved as declared
 and are not inferred. Native `freemixd` now consumes this visual model through
 the bounded schema-v4 scene planner described under Phase 3 item 4 instead of
-rejecting scene inputs. Keys, masks, effects, per-output realization, live
-edits, and cross-platform certification remain outside this item, so its parity
-rows remain planned.
+rejecting scene inputs. Schema persistence and `freemixd` planner routing for
+masks, feathered or non-rectangular masks, keys, effects, per-output
+realization, live edits, and cross-platform or hardware certification remain
+outside this item, so its parity rows remain planned.
 
 Current implementation boundary for item 5: `freemix-studio` opens a native
 `eframe`/wgpu shell by default with responsive Program/Preview monitor wells,
@@ -499,10 +503,15 @@ cycles, full-width-ID collisions, visual mapping, selected closure, recursive
 audio, and sharing. Native Metal tests cover nested shared scenes before Fade and
 Wipe plus 96 completion-fenced frames without production readback; a daemon test
 checkpoints and restarts from scene Program/Preview routes. These are macOS/Metal
-and hermetic diagnostics, not cross-platform certification. Keys, masks, effect
-stacks, a ten-layer product limit, per-output scene realization/routing, live
-scene edits/replanning, and Windows/DX12 or Linux/Vulkan evidence remain. Item 4
-and its parity rows therefore remain incomplete and planned.
+and hermetic diagnostics, not cross-platform certification. Independently,
+`fm-compositor` executes hard-edged rectangular masks in half-open post-crop
+source space, with exact CPU-oracle coverage and ignored native Metal readback
+coverage that was not run because no adapter was available. Schema persistence
+and `freemixd` planner routing for masks, feathered or non-rectangular masks,
+keys, effect stacks, a ten-layer product limit, per-output scene
+realization/routing, live scene edits/replanning, and cross-platform or hardware
+certification remain. Item 4 and its parity rows therefore remain incomplete
+and planned.
 
 Current implementation boundary for item 5: horizontal Wipe now flows through
 local and remote CLI commands, `fm-control`, `EngineCommand`, the switcher,

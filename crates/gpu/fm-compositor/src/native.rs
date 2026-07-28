@@ -182,9 +182,6 @@ pub enum NativeCompositionError {
         height: u32,
         maximum: u32,
     },
-    UnsupportedMask {
-        layer: usize,
-    },
     UnsupportedKey {
         layer: usize,
     },
@@ -237,12 +234,6 @@ impl fmt::Display for NativeCompositionError {
                 formatter,
                 "layer {layer} native transform dimensions {width}x{height} exceed {maximum}"
             ),
-            Self::UnsupportedMask { layer } => {
-                write!(
-                    formatter,
-                    "layer {layer} masks are unsupported by native composition"
-                )
-            }
             Self::UnsupportedKey { layer } => {
                 write!(
                     formatter,
