@@ -128,15 +128,16 @@ capped, and supervised daemon shutdown or restart performs bounded
 process-group/job and descendant cleanup. Project input names and video frames
 are not present in the replicated client contract, so tiles use ordinal/ID
 labels and monitor wells state that real preview delivery remains pending.
-`freemix-web` likewise declares protocol 1.4 support in its client configuration.
+`freemix-web` likewise declares protocol 1.5 support in its client configuration.
 Its transport-free semantic presentation model preserves the existing
 permission- and protocol-gated Cut/Fade/Wipe controls and adds manual Fade/Wipe
 Start, exact basis-point Position, Commit, and Cancel controls. Manual controls
 are hidden below protocol 1.4 and otherwise derive availability from Ready
 state, transition permission, and separate authoritative desired and realized
-manual projections. Web still has no browser renderer or network runtime, and
-the remaining transition families, FTB, and protocol-driven
-native-media/hardware T-bar evidence keep item 5 and RC-007 planned.
+manual projections. It also models protocol-gated FTB actions and exact state.
+Web still has no browser renderer or network runtime, and the remaining
+transition families plus cross-platform output acceptance keep item 5 and
+RC-007 planned.
 
 Current implementation boundary for item 6: `fm-frame` defines a bounded,
 portable local-preview contract for shared-image versus encoded fallback,
@@ -259,9 +260,11 @@ estimator, device clock or OS audio device, channel conversion, persisted
 buses/output routing or strip controls, DSP, or externally delivered audio.
 Dedicated Wipe audio-policy tests cover exact interval endpoints, sample-linear
 rendering, unity Cut completion, and held, reversed, and committed manual T-bar
-movement. Protocol-driven native-media end-to-end and hardware evidence for the
-manual path is absent, and the Web operator path remains incomplete. Item 7 and
-the related parity rows therefore remain incomplete and planned.
+movement. A protocol-driven macOS/Metal recording acceptance now covers manual
+video progression, reversal, cancel, and commit, but does not distinguish
+T-bar audio sources or certify other platforms and outputs. The Web runtime
+operator path also remains incomplete. Item 7 and the related parity rows
+therefore remain incomplete and planned.
 
 Current implementation boundary for item 8: `fm-gpu` provides a portable,
 bounded latest-frame presentation policy plus opaque, context-bound native
@@ -621,10 +624,12 @@ on 1.4. Web now advertises only protocol 1.5. Its transport-free semantic model
 retains the manual controls and adds FTB live/black actions, a bounded duration,
 exact separate desired and realized state, reversal through the opposite target,
 and protocol/permission/readiness/completeness gates. It still has no browser
-renderer or network runtime. There is no protocol-driven native-media
-end-to-end or hardware evidence for the manual path. AlphaFade, stinger,
-Slide/Zoom, the remaining transition families, and `SW-004` acceptance remain
-pending; parity therefore stays planned. Item 5 and RC-007 remain planned.
+renderer or network runtime. A hardware-gated macOS recording acceptance covers
+protocol-driven native manual Fade progression, reversal, cancel, and commit on
+one configured output. AlphaFade, stinger, Slide/Zoom, the remaining transition
+families, cross-platform/fullscreen evidence, and complete `SW-004` acceptance
+remain pending; parity therefore stays planned. Item 5 and RC-007 remain
+planned.
 
 FTB groundwork now includes a switcher-owned bounded automatic control core
 alongside the compositor plan. The controller moves from its current exact
@@ -681,9 +686,14 @@ macOS daemon acceptance now sends protocol 1.5 live-to-black and black-to-live
 commands while Program recording is configured, decodes the H.264/AAC result,
 requires ordered live/black/live video plus a sustained Master-audio silence
 interval, and verifies the final live checkpoint. This proves the native FTB
-path reaches one configured output on the exercised Metal/FFmpeg host. It does
-not cover fullscreen presentation, Windows/Linux adapters, or a protocol-driven
-native T-bar path, so Phase 3 item 5 and `SW-004` remain planned.
+path reaches one configured output on the exercised Metal/FFmpeg host. A
+companion acceptance records a protocol-driven manual Fade at 75% forward,
+25% reversed, cancelled, then fully progressed and committed; decoded video
+must contain the corresponding ordered Program/Preview blend sequence, and the
+checkpoint must be inactive with committed routing. Together these exercise
+both halves of `SW-004` on one macOS recording output. Fullscreen presentation,
+Windows/Linux adapters, and complete profile acceptance remain absent, so Phase
+3 item 5 and `SW-004` remain planned.
 
 Exit: `P0` switcher, composition, audio, display, record, and control rows pass.
 

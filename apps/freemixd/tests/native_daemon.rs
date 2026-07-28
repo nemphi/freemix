@@ -29,8 +29,8 @@ use fm_persistence::{ProjectPosition, ProjectStore, RuntimeRouting, StoredProjec
 #[cfg(target_os = "macos")]
 use fm_protocol::{
     CURRENT_PROTOCOL_VERSION, ClientHello, ClientType, CommandMessage, CommandPayload,
-    CommandResult, Role, RuntimeLifecycleEvent, SnapshotMessage, WireInputId, WireMessage,
-    decode_line, encode_line,
+    CommandResult, ManualTransitionKind, ManualTransitionPosition, Role, RuntimeLifecycleEvent,
+    SnapshotMessage, WireInputId, WireMessage, decode_line, encode_line,
 };
 use fm_types::{
     AudioFormat, ChannelLayout, ColorMetadata, FrameRate, InputId, PixelFormat, ProjectId,
@@ -884,6 +884,108 @@ fn protocol_fade_to_black_reaches_configured_program_recording() {
     );
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires FFmpeg with libx264/AAC, ffprobe, and a native macOS Metal adapter"]
+fn protocol_manual_fade_reversal_reaches_configured_program_recording() {
+    let _hardware_lock = NATIVE_MEDIA_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let directory = tempfile::tempdir().unwrap();
+    if require_recording_tools().is_none() {
+        return;
+    }
+    let project_path = directory.path().join("record-manual-fade.freemix");
+    let output_path = directory.path().join("program-manual-fade.mp4");
+    if !prepare_native_project(&project_path) {
+        return;
+    }
+
+    let Some(mut daemon) = require_native_recorder(NativeDaemonProcess::start_recording(
+        &project_path,
+        &output_path,
+    )) else {
+        return;
+    };
+    let mut client = StudioClient::connect(daemon.address);
+    let initial = client.handshake();
+    assert_snapshot_routing(&initial, 0, input(1), input(2));
+    thread::sleep(Duration::from_millis(300));
+
+    let steps = [
+        (
+            "manual-start-reverse",
+            CommandPayload::StartManualTransition {
+                kind: ManualTransitionKind::Fade,
+            },
+            100,
+        ),
+        (
+            "manual-forward",
+            CommandPayload::SetManualTransitionPosition {
+                position: ManualTransitionPosition::new(7_500).unwrap(),
+            },
+            250,
+        ),
+        (
+            "manual-reverse",
+            CommandPayload::SetManualTransitionPosition {
+                position: ManualTransitionPosition::new(2_500).unwrap(),
+            },
+            250,
+        ),
+        ("manual-cancel", CommandPayload::CancelManualTransition, 250),
+        (
+            "manual-start-commit",
+            CommandPayload::StartManualTransition {
+                kind: ManualTransitionKind::Fade,
+            },
+            100,
+        ),
+        (
+            "manual-end",
+            CommandPayload::SetManualTransitionPosition {
+                position: ManualTransitionPosition::END,
+            },
+            250,
+        ),
+        ("manual-commit", CommandPayload::CommitManualTransition, 250),
+    ];
+    for (index, (id, payload, hold_ms)) in steps.into_iter().enumerate() {
+        let outcome = client.command(id, &format!("{id}-key"), payload);
+        assert_eq!(outcome.revision, u64::try_from(index + 1).unwrap());
+        thread::sleep(Duration::from_millis(hold_ms));
+    }
+    daemon.signal_terminate();
+
+    let output = daemon.wait_for(RECORDING_PROCESS_TIMEOUT);
+    drop(client);
+    assert!(
+        output.status.success(),
+        "manual Fade recording daemon failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let luma = recording_average_luma(&output_path).unwrap();
+    assert_ordered_manual_forward_reverse_commit(&luma);
+    decode_recording(&output_path).unwrap();
+
+    let persisted = ProjectStore::new(&project_path).unwrap().load().unwrap();
+    assert_eq!(persisted.position().revision, 7);
+    assert_eq!(
+        persisted.runtime_manual_transitions(),
+        fm_persistence::RuntimeManualTransitions::default()
+    );
+    assert_eq!(
+        persisted.runtime_routing(),
+        RuntimeRouting {
+            desired_program_id: Some(input(2)),
+            realized_program_id: Some(input(2)),
+            desired_preview_id: Some(input(1)),
+            realized_preview_id: Some(input(1)),
+        }
+    );
+}
+
 #[cfg(all(target_os = "macos", feature = "macos-program-surface"))]
 #[test]
 #[ignore = "opens a fullscreen macOS Program surface and requires a Metal adapter"]
@@ -1492,6 +1594,40 @@ fn assert_ordered_live_black_live(luma: &[u8]) -> (usize, usize) {
         "recording has no stable live interval after black: {luma:?}"
     );
     (first_black, last_black)
+}
+
+#[cfg(target_os = "macos")]
+fn assert_ordered_manual_forward_reverse_commit(luma: &[u8]) {
+    const REQUIRED_FRAMES: usize = 3;
+
+    let initial = luma_run(luma, 0, 205, u8::MAX, REQUIRED_FRAMES)
+        .unwrap_or_else(|| panic!("recording has no stable initial Program interval: {luma:?}"));
+    let forward = luma_run(luma, initial + REQUIRED_FRAMES, 120, 150, REQUIRED_FRAMES)
+        .unwrap_or_else(|| panic!("recording has no stable forward T-bar interval: {luma:?}"));
+    let reverse = luma_run(luma, forward + REQUIRED_FRAMES, 175, 200, REQUIRED_FRAMES)
+        .unwrap_or_else(|| panic!("recording has no stable reversed T-bar interval: {luma:?}"));
+    let cancelled = luma_run(
+        luma,
+        reverse + REQUIRED_FRAMES,
+        205,
+        u8::MAX,
+        REQUIRED_FRAMES,
+    )
+    .unwrap_or_else(|| panic!("recording has no stable cancelled T-bar interval: {luma:?}"));
+    luma_run(luma, cancelled + REQUIRED_FRAMES, 0, 100, REQUIRED_FRAMES)
+        .unwrap_or_else(|| panic!("recording has no stable committed Program interval: {luma:?}"));
+}
+
+#[cfg(target_os = "macos")]
+fn luma_run(luma: &[u8], start: usize, minimum: u8, maximum: u8, length: usize) -> Option<usize> {
+    luma.get(start..)?
+        .windows(length)
+        .position(|window| {
+            window
+                .iter()
+                .all(|value| (minimum..=maximum).contains(value))
+        })
+        .map(|offset| start + offset)
 }
 
 #[cfg(target_os = "macos")]
