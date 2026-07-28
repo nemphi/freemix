@@ -624,13 +624,20 @@ path. FTB, AlphaFade, stinger, Slide/Zoom, the remaining transition families,
 and `SW-004` acceptance remain pending; parity therefore stays planned. Item 5
 and RC-007 remain planned.
 
-Compositor-only FTB groundwork now admits a bounded exact-rational start, end,
-and progress plan, including hold and reverse trajectories. Its CPU oracle and
-native wgpu path apply the plan after canonical RGBA16F Program composition by
-mixing premultiplied linear RGBA toward opaque black, without color conversion,
-audio work, or production readback. No switcher, engine, protocol, persistence,
-operator control, output-routing integration, or acceptance evidence is exposed
-by this slice, so Phase 3 item 5 and `SW-004` remain planned.
+FTB groundwork now includes a switcher-owned bounded automatic control core
+alongside the compositor plan. The controller moves from its current exact
+fixed-rational position to live or black over 1–3,600 frames, supports
+no-jump reversal and idempotent repeated targets, and exposes each interval plus
+exact trajectory progress without cumulative floating-point drift. It advances
+orthogonally to automatic and manual Program/Preview transitions; the existing
+immediate boolean command remains compatible. The compositor separately admits
+a bounded exact-rational start, end, and progress plan, including hold and
+reverse trajectories. Its CPU oracle and native wgpu path apply the plan after
+canonical RGBA16F Program composition by mixing premultiplied linear RGBA toward
+opaque black, without color conversion, audio work, or production readback.
+There is still no engine/protocol/persistence, compositor-control wiring, FTB
+audio attenuation, configured-output routing, operator control, or acceptance
+evidence, so Phase 3 item 5 and `SW-004` remain planned.
 
 Exit: `P0` switcher, composition, audio, display, record, and control rows pass.
 

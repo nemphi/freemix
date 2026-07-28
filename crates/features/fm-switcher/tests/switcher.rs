@@ -1,10 +1,11 @@
 use std::num::NonZeroU128;
 
 use fm_switcher::{
-    MissingMediaFallback, OVERLAY_CHANNEL_COUNT, OverlayChannelId, STINGER_SLOT_COUNT,
-    StingerAudioPolicy, StingerDescriptor, StingerPlaybackDecision, StingerPreloadState,
-    StingerSlotId, SwitcherCommand, SwitcherError, SwitcherEvent, SwitcherState, TBarPosition,
-    TBarState, TransitionKind,
+    FADE_TO_BLACK_POSITION_DENOMINATOR, FadeToBlackError, FadeToBlackPosition, FadeToBlackTarget,
+    MAX_FADE_TO_BLACK_DURATION_FRAMES, MissingMediaFallback, OVERLAY_CHANNEL_COUNT,
+    OverlayChannelId, STINGER_SLOT_COUNT, StingerAudioPolicy, StingerDescriptor,
+    StingerPlaybackDecision, StingerPreloadState, StingerSlotId, SwitcherCommand, SwitcherError,
+    SwitcherEvent, SwitcherState, TBarPosition, TBarState, TransitionKind,
 };
 use fm_types::{InputId, OutputId};
 
@@ -283,6 +284,238 @@ fn fade_to_black_tracks_explicit_on_and_off_state() {
         .apply(SwitcherCommand::SetFadeToBlack(false))
         .unwrap();
     assert!(!switcher.fade_to_black());
+}
+
+#[test]
+fn automatic_fade_to_black_exposes_exact_frame_intervals_and_endpoints() {
+    let mut switcher = state();
+    assert_eq!(
+        switcher.request_fade_to_black(true, 3),
+        Ok(vec![SwitcherEvent::FadeToBlackStarted {
+            from: FadeToBlackPosition::LIVE,
+            target: FadeToBlackTarget::Black,
+            duration_frames: 3,
+        }])
+    );
+    assert!(switcher.fade_to_black());
+
+    for (frame, (start, end)) in [(0, 21_845), (21_845, 43_690), (43_690, 65_535)]
+        .into_iter()
+        .enumerate()
+    {
+        let plan = switcher.fade_to_black_frame();
+        assert_eq!(plan.interval_start().numerator(), start);
+        assert_eq!(plan.interval_end().numerator(), end);
+        assert_eq!(
+            (
+                plan.progress_start_numerator(),
+                plan.progress_end_numerator(),
+                plan.progress_denominator(),
+            ),
+            (
+                u32::try_from(frame).unwrap(),
+                u32::try_from(frame + 1).unwrap(),
+                3
+            )
+        );
+        assert_eq!(plan.target(), FadeToBlackTarget::Black);
+        let events = switcher.advance_frame_events();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SwitcherEvent::FadeToBlackPositionChanged { position }
+                if position.numerator() == end
+        )));
+    }
+
+    assert_eq!(
+        switcher.fade_to_black_position(),
+        FadeToBlackPosition::BLACK
+    );
+    assert_eq!(
+        switcher.fade_to_black_frame().interval_start(),
+        FadeToBlackPosition::BLACK
+    );
+}
+
+#[test]
+fn automatic_fade_to_black_reverses_without_a_jump() {
+    let mut switcher = state();
+    switcher.request_fade_to_black(true, 5).unwrap();
+    let _ = switcher.advance_frame_events();
+    let _ = switcher.advance_frame_events();
+    let reversal_position = switcher.fade_to_black_position();
+    assert_eq!(reversal_position.numerator(), 26_214);
+
+    assert_eq!(
+        switcher.request_fade_to_black(false, 3),
+        Ok(vec![SwitcherEvent::FadeToBlackStarted {
+            from: reversal_position,
+            target: FadeToBlackTarget::Live,
+            duration_frames: 3,
+        }])
+    );
+    assert_eq!(
+        switcher.fade_to_black_frame().interval_start(),
+        reversal_position
+    );
+    assert_eq!(
+        switcher.fade_to_black_frame().interval_end().numerator(),
+        17_476
+    );
+
+    for expected in [17_476, 8_738, 0] {
+        let _ = switcher.advance_frame_events();
+        assert_eq!(switcher.fade_to_black_position().numerator(), expected);
+    }
+    assert_eq!(switcher.fade_to_black_position(), FadeToBlackPosition::LIVE);
+    assert!(!switcher.fade_to_black());
+}
+
+#[test]
+fn repeated_fade_to_black_target_does_not_restart_progress() {
+    let mut switcher = state();
+    switcher.request_fade_to_black(true, 4).unwrap();
+    let _ = switcher.advance_frame_events();
+    assert_eq!(switcher.fade_to_black_position().numerator(), 16_383);
+
+    assert_eq!(switcher.request_fade_to_black(true, 2), Ok(Vec::new()));
+    let frame = switcher.fade_to_black_frame();
+    assert_eq!(
+        (
+            frame.progress_start_numerator(),
+            frame.progress_end_numerator(),
+            frame.progress_denominator(),
+        ),
+        (1, 2, 4)
+    );
+}
+
+#[test]
+fn reversing_before_progress_cancels_without_noop_frame_spam() {
+    let mut switcher = state();
+    switcher.request_fade_to_black(true, 20).unwrap();
+    assert_eq!(
+        switcher.request_fade_to_black(false, 20),
+        Ok(vec![SwitcherEvent::FadeToBlackCompleted { active: false }])
+    );
+    assert!(!switcher.fade_to_black());
+    assert_eq!(switcher.fade_to_black_position(), FadeToBlackPosition::LIVE);
+    assert!(switcher.advance_frame_events().is_empty());
+}
+
+#[test]
+fn automatic_fade_to_black_rejects_invalid_durations_transactionally() {
+    let mut switcher = state();
+    assert_eq!(
+        switcher.request_fade_to_black(true, 0),
+        Err(FadeToBlackError::ZeroDuration)
+    );
+    assert_eq!(
+        switcher.request_fade_to_black(true, MAX_FADE_TO_BLACK_DURATION_FRAMES + 1),
+        Err(FadeToBlackError::DurationLimit {
+            duration_frames: MAX_FADE_TO_BLACK_DURATION_FRAMES + 1,
+            maximum: MAX_FADE_TO_BLACK_DURATION_FRAMES,
+        })
+    );
+    assert_eq!(switcher.fade_to_black_position(), FadeToBlackPosition::LIVE);
+    assert!(!switcher.fade_to_black());
+}
+
+#[test]
+fn immediate_fade_to_black_cancels_automatic_motion_compatibly() {
+    let mut switcher = state();
+    switcher.request_fade_to_black(true, 10).unwrap();
+    let _ = switcher.advance_frame_events();
+
+    assert_eq!(
+        switcher.apply(SwitcherCommand::SetFadeToBlack(false)),
+        Ok(vec![SwitcherEvent::FadeToBlackChanged { active: false }])
+    );
+    assert_eq!(switcher.fade_to_black_position(), FadeToBlackPosition::LIVE);
+    assert!(switcher.advance_frame_events().is_empty());
+}
+
+#[test]
+fn fade_to_black_advances_orthogonally_to_automatic_and_manual_transitions() {
+    let mut automatic = state();
+    automatic
+        .apply(SwitcherCommand::Transition {
+            kind: TransitionKind::Wipe,
+            duration_frames: 2,
+        })
+        .unwrap();
+    automatic.request_fade_to_black(true, 3).unwrap();
+
+    let first = automatic.advance_frame_events();
+    assert!(matches!(
+        first.as_slice(),
+        [SwitcherEvent::FadeToBlackPositionChanged { .. }]
+    ));
+    let second = automatic.advance_frame_events();
+    assert!(matches!(
+        second.as_slice(),
+        [
+            SwitcherEvent::ProgramChanged { .. },
+            SwitcherEvent::TransitionCompleted {
+                kind: TransitionKind::Wipe,
+                ..
+            },
+            SwitcherEvent::FadeToBlackPositionChanged { .. },
+        ]
+    ));
+    let third = automatic.advance_frame_events();
+    assert!(matches!(
+        third.as_slice(),
+        [
+            SwitcherEvent::FadeToBlackPositionChanged { .. },
+            SwitcherEvent::FadeToBlackCompleted { active: true },
+        ]
+    ));
+
+    let mut manual = state();
+    manual
+        .apply(SwitcherCommand::StartTBar {
+            kind: TransitionKind::Fade,
+        })
+        .unwrap();
+    manual
+        .apply(SwitcherCommand::SetTBarPosition(
+            TBarPosition::new(4_000).unwrap(),
+        ))
+        .unwrap();
+    manual.request_fade_to_black(true, 2).unwrap();
+    assert!(matches!(
+        manual.advance_frame(),
+        Some(SwitcherEvent::FadeToBlackPositionChanged { .. })
+    ));
+    assert_eq!(
+        manual.program_frame().mix_start_numerator,
+        manual.program_frame().mix_end_numerator
+    );
+}
+
+#[test]
+fn longest_fade_to_black_has_no_cumulative_drift() {
+    let mut switcher = state();
+    switcher
+        .request_fade_to_black(true, MAX_FADE_TO_BLACK_DURATION_FRAMES)
+        .unwrap();
+    let mut previous = 0;
+    for frame in 0..MAX_FADE_TO_BLACK_DURATION_FRAMES {
+        let plan = switcher.fade_to_black_frame();
+        assert_eq!(plan.interval_start().numerator(), previous);
+        assert_eq!(
+            plan.interval_end().numerator(),
+            u32::from(u16::MAX) * (frame + 1) / MAX_FADE_TO_BLACK_DURATION_FRAMES
+        );
+        let _ = switcher.advance_frame_events();
+        previous = switcher.fade_to_black_position().numerator();
+    }
+    assert_eq!(previous, FADE_TO_BLACK_POSITION_DENOMINATOR);
+    assert_eq!(
+        switcher.fade_to_black_position(),
+        FadeToBlackPosition::BLACK
+    );
 }
 
 #[test]

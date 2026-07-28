@@ -1,8 +1,8 @@
 use fm_types::{InputId, OutputId};
 
 use crate::{
-    MissingMediaFallback, OverlayChannelId, StingerPreloadState, StingerSlotId, TBarPosition,
-    TransitionKind,
+    FadeToBlackPosition, FadeToBlackTarget, MissingMediaFallback, OverlayChannelId,
+    StingerPreloadState, StingerSlotId, TBarPosition, TransitionKind,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -68,6 +68,17 @@ pub enum SwitcherEvent {
     },
     TBarCancelled,
     FadeToBlackChanged {
+        active: bool,
+    },
+    FadeToBlackStarted {
+        from: FadeToBlackPosition,
+        target: FadeToBlackTarget,
+        duration_frames: u32,
+    },
+    FadeToBlackPositionChanged {
+        position: FadeToBlackPosition,
+    },
+    FadeToBlackCompleted {
         active: bool,
     },
     OverlayTaken {

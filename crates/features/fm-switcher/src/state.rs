@@ -1,10 +1,12 @@
 use fm_types::{InputId, OutputId};
 
 use crate::{
-    MissingMediaFallback, OVERLAY_CHANNEL_COUNT, OverlayChannelId, OverlayChannelState,
-    STINGER_SLOT_COUNT, StingerDescriptor, StingerPlaybackDecision, StingerPreloadState,
-    StingerSlotId, StingerSlotState, SwitcherCommand, SwitcherError, SwitcherEvent, TBarPosition,
-    TBarState, TransitionKind, TransitionState,
+    FadeToBlackAdvance, FadeToBlackController, FadeToBlackError, FadeToBlackFrame,
+    FadeToBlackPosition, FadeToBlackRequest, FadeToBlackTarget, MissingMediaFallback,
+    OVERLAY_CHANNEL_COUNT, OverlayChannelId, OverlayChannelState, STINGER_SLOT_COUNT,
+    StingerDescriptor, StingerPlaybackDecision, StingerPreloadState, StingerSlotId,
+    StingerSlotState, SwitcherCommand, SwitcherError, SwitcherEvent, TBarPosition, TBarState,
+    TransitionKind, TransitionState,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -28,7 +30,7 @@ pub struct SwitcherState {
     program: InputId,
     transition: Option<TransitionState>,
     t_bar: Option<TBarState>,
-    fade_to_black: bool,
+    fade_to_black: FadeToBlackController,
     overlays: [OverlayChannelState; OVERLAY_CHANNEL_COUNT],
     stingers: [StingerSlotState; STINGER_SLOT_COUNT],
 }
@@ -50,7 +52,7 @@ impl SwitcherState {
             program,
             transition: None,
             t_bar: None,
-            fade_to_black: false,
+            fade_to_black: FadeToBlackController::default(),
             overlays: std::array::from_fn(|_| OverlayChannelState::empty()),
             stingers: std::array::from_fn(|_| StingerSlotState::empty()),
         };
@@ -107,7 +109,17 @@ impl SwitcherState {
 
     #[must_use]
     pub const fn fade_to_black(&self) -> bool {
-        self.fade_to_black
+        self.fade_to_black.target().active()
+    }
+
+    #[must_use]
+    pub const fn fade_to_black_position(&self) -> FadeToBlackPosition {
+        self.fade_to_black.position()
+    }
+
+    #[must_use]
+    pub fn fade_to_black_frame(&self) -> FadeToBlackFrame {
+        self.fade_to_black.frame()
     }
 
     #[must_use]
@@ -218,44 +230,44 @@ impl SwitcherState {
     }
 
     pub fn advance_frame(&mut self) -> Option<SwitcherEvent> {
+        let fade_to_black = self.advance_fade_to_black();
         if let Some(t_bar) = &mut self.t_bar {
             t_bar.settle_frame();
         }
-        let mut transition = self.transition?;
-        if transition.advance() {
-            let kind = transition.kind();
-            self.transition = None;
-            Some(self.complete_take(kind))
-        } else {
+        if let Some(mut transition) = self.transition {
+            if transition.advance() {
+                let kind = transition.kind();
+                self.transition = None;
+                return Some(self.complete_take(kind));
+            }
             self.transition = Some(transition);
-            None
         }
+        legacy_fade_to_black_event(fade_to_black)
     }
 
-    /// Advances one frame and reports both the legacy program change and completion event.
+    /// Advances one frame and reports all Program/Preview and FTB control events.
     #[must_use]
     pub fn advance_frame_events(&mut self) -> Vec<SwitcherEvent> {
+        let fade_to_black = self.advance_fade_to_black();
         if let Some(t_bar) = &mut self.t_bar {
             t_bar.settle_frame();
         }
-        let Some(mut transition) = self.transition else {
-            return Vec::new();
-        };
-        if !transition.advance() {
-            self.transition = Some(transition);
-            return Vec::new();
+        let mut events = Vec::new();
+        if let Some(mut transition) = self.transition {
+            if transition.advance() {
+                let kind = transition.kind();
+                self.transition = None;
+                events.push(self.complete_take(kind));
+                events.push(SwitcherEvent::TransitionCompleted {
+                    kind,
+                    program: self.program,
+                });
+            } else {
+                self.transition = Some(transition);
+            }
         }
-
-        let kind = transition.kind();
-        self.transition = None;
-        let program_changed = self.complete_take(kind);
-        vec![
-            program_changed,
-            SwitcherEvent::TransitionCompleted {
-                kind,
-                program: self.program,
-            },
-        ]
+        append_fade_to_black_events(&mut events, fade_to_black);
+        events
     }
 
     /// Configures a stinger slot and clears any readiness result for its previous media.
@@ -361,8 +373,39 @@ impl SwitcherState {
 
     #[must_use]
     pub fn set_fade_to_black(&mut self, active: bool) -> Vec<SwitcherEvent> {
-        self.fade_to_black = active;
+        self.fade_to_black
+            .set_immediate(FadeToBlackTarget::from_active(active));
         vec![SwitcherEvent::FadeToBlackChanged { active }]
+    }
+
+    /// Starts or reverses an automatic FTB move independently of Program/Preview.
+    ///
+    /// Repeating the current target is idempotent and does not restart progress.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FadeToBlackError`] for a zero or oversized duration.
+    pub fn request_fade_to_black(
+        &mut self,
+        active: bool,
+        duration_frames: u32,
+    ) -> Result<Vec<SwitcherEvent>, FadeToBlackError> {
+        let target = FadeToBlackTarget::from_active(active);
+        Ok(match self.fade_to_black.request(target, duration_frames)? {
+            FadeToBlackRequest::Unchanged => Vec::new(),
+            FadeToBlackRequest::Started(started) => {
+                vec![SwitcherEvent::FadeToBlackStarted {
+                    from: started.from,
+                    target: started.target,
+                    duration_frames: started.duration_frames,
+                }]
+            }
+            FadeToBlackRequest::Completed(target) => {
+                vec![SwitcherEvent::FadeToBlackCompleted {
+                    active: target.active(),
+                }]
+            }
+        })
     }
 
     /// Configures and activates an overlay channel.
@@ -494,5 +537,32 @@ impl SwitcherState {
         } else {
             Err(SwitcherError::TransitionInProgress)
         }
+    }
+
+    fn advance_fade_to_black(&mut self) -> FadeToBlackAdvance {
+        self.fade_to_black.advance()
+    }
+}
+
+fn legacy_fade_to_black_event(advance: FadeToBlackAdvance) -> Option<SwitcherEvent> {
+    if let Some(target) = advance.completed {
+        Some(SwitcherEvent::FadeToBlackCompleted {
+            active: target.active(),
+        })
+    } else {
+        advance
+            .position_changed
+            .map(|position| SwitcherEvent::FadeToBlackPositionChanged { position })
+    }
+}
+
+fn append_fade_to_black_events(events: &mut Vec<SwitcherEvent>, advance: FadeToBlackAdvance) {
+    if let Some(position) = advance.position_changed {
+        events.push(SwitcherEvent::FadeToBlackPositionChanged { position });
+    }
+    if let Some(target) = advance.completed {
+        events.push(SwitcherEvent::FadeToBlackCompleted {
+            active: target.active(),
+        });
     }
 }
