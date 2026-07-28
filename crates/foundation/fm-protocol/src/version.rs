@@ -5,7 +5,8 @@ pub const WIPE_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 3);
 pub const MANUAL_TRANSITION_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 4);
 pub const FADE_TO_BLACK_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 5);
 pub const ALPHA_FADE_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 6);
-pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ALPHA_FADE_PROTOCOL_VERSION;
+pub const MANUAL_ALPHA_FADE_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 7);
+pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = MANUAL_ALPHA_FADE_PROTOCOL_VERSION;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ProtocolVersion {

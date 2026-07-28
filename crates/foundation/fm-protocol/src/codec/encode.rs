@@ -199,6 +199,7 @@ fn encode_command(record: &mut Record, message: &CommandMessage) -> Result<(), C
                 match kind {
                     crate::ManualTransitionKind::Fade => "fade",
                     crate::ManualTransitionKind::Wipe => "wipe",
+                    crate::ManualTransitionKind::AlphaFade => "alpha_fade",
                 },
             )?;
         }
@@ -531,6 +532,7 @@ fn encode_manual_status(
                 match state.kind {
                     ManualTransitionKind::Fade => "fade",
                     ManualTransitionKind::Wipe => "wipe",
+                    ManualTransitionKind::AlphaFade => "alpha_fade",
                 },
             )?;
             record.field(from, state.from)?;

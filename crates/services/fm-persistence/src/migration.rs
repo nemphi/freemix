@@ -8,6 +8,7 @@ const V4_SCHEMA_VERSION: u32 = 4;
 const V5_SCHEMA_VERSION: u32 = 5;
 const V6_SCHEMA_VERSION: u32 = 6;
 const V7_SCHEMA_VERSION: u32 = 7;
+const V8_SCHEMA_VERSION: u32 = 8;
 const V3_DEFAULTS: [&str; 8] = [
     "settings.frame_rate=60000/1001",
     "settings.video=1920x1080/nv12/progressive/bt709",
@@ -188,6 +189,27 @@ impl ProjectStore {
             from_schema: V7_SCHEMA_VERSION,
             to_schema: CURRENT_SCHEMA_VERSION,
             defaulted_fields: V8_DEFAULTS.to_vec(),
+        })
+    }
+
+    /// Explicitly migrates a schema-v8 manifest to the current schema.
+    ///
+    /// Project, routing, manual-transition, Fade-to-Black, and receipt state
+    /// are preserved exactly. Schema v9 extends the set of manual-transition
+    /// kinds without adding a defaulted field.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed data, the wrong schema, validation,
+    /// size-limit, or filesystem failures.
+    pub fn migrate_v8(&self) -> Result<MigrationReport, StoreError> {
+        let source = self.read_legacy_manifest()?;
+        let project = json::decode_v8(&source).map_err(StoreError::from_decode)?;
+        self.save(&project)?;
+        Ok(MigrationReport {
+            from_schema: V8_SCHEMA_VERSION,
+            to_schema: CURRENT_SCHEMA_VERSION,
+            defaulted_fields: Vec::new(),
         })
     }
 

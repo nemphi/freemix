@@ -663,12 +663,23 @@ event, and runtime realization ordering. A hardware-gated macOS/Metal process
 acceptance now sends protocol AlphaFade to a real configured Program recorder
 using static opaque-white and transparent-black generators, observes an ordered
 opaque/intermediate/transparent recording, decodes the result, and verifies the
-settled persisted routing. Manual T-bar AlphaFade remains absent.
+settled persisted routing.
 
-The remaining AlphaFade manual T-bar path, stinger, Slide/Zoom, other transition
-families, cross-platform/fullscreen evidence, and complete `SW-004` acceptance
-remain pending; parity therefore stays planned. Item 5 and RC-007 remain
-planned.
+The authoritative manual T-bar core now accepts AlphaFade alongside Fade and
+Wipe, preserving exact held and reversed basis-point intervals through engine
+snapshots and feeding the existing AlphaFade native video plus sample-linear
+Master-audio plans. Additive protocol 1.7 carries the new manual kind and
+rejects its Start command before mutation on older sessions; 1.4–1.6 peers
+retain their existing manual fields but see an active AlphaFade projected as
+inactive. Schema v9 persists the kind with lossless schema-v8 migration, and a
+daemon restart acceptance verifies replay-safe commit and cancel from the
+restored held state. CLI, Web, and Studio manual AlphaFade controls remain
+absent.
+
+The remaining AlphaFade manual operator controls, stinger, Slide/Zoom, other
+transition families, cross-platform/fullscreen evidence, and complete `SW-004`
+acceptance remain pending; parity therefore stays planned. Item 5 and RC-007
+remain planned.
 
 FTB groundwork now includes a switcher-owned bounded automatic control core
 alongside the compositor plan. The controller moves from its current exact

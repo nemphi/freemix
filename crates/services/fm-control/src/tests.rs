@@ -2,7 +2,7 @@ use std::{error::Error, fmt, num::NonZeroU128, sync::mpsc::TryRecvError};
 
 use fm_auth::{Policy, Principal, Role, SessionId, UserId};
 use fm_clock::ClockDomainId;
-use fm_engine::{Engine, ShowState};
+use fm_engine::{Engine, EngineManualTransitionKind, ShowState};
 use fm_protocol::{
     CommandMessage, CommandPayload, CommandResult, EngineIdentity, EventCursor,
     ManualTransitionKind, ManualTransitionPosition, ManualTransitionStatus, ProtocolVersion,
@@ -207,6 +207,50 @@ fn manual_transition_is_authorized_durable_reversible_and_replay_safe() {
     );
     assert_eq!(control.engine.realized_switcher().program(), input(1));
     assert_eq!(control.diagnostics().current_revision, 4);
+}
+
+#[test]
+fn manual_alpha_fade_projects_exact_authoritative_state() {
+    let mut control = service(8, 8);
+    for (id, payload) in [
+        (
+            "manual-alpha-start",
+            CommandPayload::StartManualTransition {
+                kind: ManualTransitionKind::AlphaFade,
+            },
+        ),
+        (
+            "manual-alpha-position",
+            CommandPayload::SetManualTransitionPosition {
+                position: ManualTransitionPosition::new(6_250).unwrap(),
+            },
+        ),
+    ] {
+        let submitted = control
+            .submit(&principal(Role::Operator), command(id, id, payload), 0)
+            .unwrap();
+        assert!(matches!(
+            submitted.output.result,
+            CommandResult::Accepted { .. }
+        ));
+        control.tick(&server_identity()).unwrap();
+    }
+
+    for status in [
+        control.snapshot().snapshot.desired_manual_transition,
+        control.snapshot().snapshot.realized_manual_transition,
+    ] {
+        assert!(matches!(
+            status,
+            Some(ManualTransitionStatus::Active(state))
+                if state.kind == ManualTransitionKind::AlphaFade
+                    && state.position.basis_points() == 6_250
+        ));
+    }
+    assert_eq!(
+        control.engine.realized_manual_transition().unwrap().kind,
+        EngineManualTransitionKind::AlphaFade
+    );
 }
 
 fn assert_manual_snapshot(control: &ControlService<Policy>, position: u16) {

@@ -246,11 +246,12 @@ fn duplicate_routes_are_rejected() {
 
 #[test]
 fn schema_support_window_is_current_through_oldest_supported() {
-    assert_eq!(CURRENT_SCHEMA_VERSION, SchemaVersion::new(8));
+    assert_eq!(CURRENT_SCHEMA_VERSION, SchemaVersion::new(9));
     assert_eq!(OLDEST_SUPPORTED_SCHEMA_VERSION, SchemaVersion::new(2));
     assert_eq!(
         SUPPORTED_SCHEMA_VERSIONS,
         [
+            SchemaVersion::new(9),
             SchemaVersion::new(8),
             SchemaVersion::new(7),
             SchemaVersion::new(6),
@@ -264,7 +265,7 @@ fn schema_support_window_is_current_through_oldest_supported() {
     assert!(!CURRENT_SCHEMA_VERSION.requires_migration());
     assert!(SchemaVersion::new(2).requires_migration());
     assert!(!SchemaVersion::new(1).is_supported());
-    assert!(!SchemaVersion::new(9).is_supported());
+    assert!(!SchemaVersion::new(10).is_supported());
 
     let input = MigrationInput::new(SchemaVersion::new(2), ("format-neutral", 7_u8));
     assert_eq!(input.schema_version(), SchemaVersion::new(2));

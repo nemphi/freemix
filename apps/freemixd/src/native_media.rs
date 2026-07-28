@@ -8137,6 +8137,64 @@ mod tests {
     }
 
     #[test]
+    fn manual_alpha_fade_engine_interval_reaches_native_video_and_audio_plans() {
+        let old = input(1);
+        let new = input(2);
+        let frame_rate = FrameRate::new(25, 1).unwrap();
+        let clock_domain = EngineClockDomainId::new(NonZeroU128::new(99).unwrap());
+        let show = ShowState::new("manual alpha", vec![old, new], old, new).unwrap();
+        let mut engine = Engine::new(show, frame_rate, clock_domain);
+        for (key, command) in [
+            (
+                "manual-alpha-start",
+                EngineCommand::StartManualTransition {
+                    kind: EngineManualTransitionKind::AlphaFade,
+                },
+            ),
+            (
+                "manual-alpha-forward",
+                EngineCommand::SetManualTransitionPosition {
+                    position: EngineManualTransitionPosition::new(8_000).unwrap(),
+                },
+            ),
+        ] {
+            engine
+                .execute(
+                    CommandEnvelope::new(key, IdempotencyKey::new(key), command),
+                    0,
+                )
+                .unwrap();
+            let _ = engine.tick().unwrap();
+        }
+        engine
+            .execute(
+                CommandEnvelope::new(
+                    "manual-alpha-reverse",
+                    IdempotencyKey::new("manual-alpha-reverse"),
+                    EngineCommand::SetManualTransitionPosition {
+                        position: EngineManualTransitionPosition::new(6_250).unwrap(),
+                    },
+                ),
+                0,
+            )
+            .unwrap();
+        let frame = engine.tick().unwrap().program;
+
+        assert_eq!(
+            native_audio_mix_plan(frame).unwrap(),
+            NativeAudioMixPlan {
+                primary: old,
+                primary_gain: SourceGain::new(2_000, 3_750, 10_000).unwrap(),
+                secondary: Some((new, SourceGain::new(8_000, 6_250, 10_000).unwrap())),
+            }
+        );
+        assert_eq!(
+            native_mix_plan(frame).unwrap().transition.kind(),
+            TransitionKind::AlphaFade
+        );
+    }
+
+    #[test]
     fn identical_fade_sources_render_once_at_unity_without_poisoning_runtime() {
         let source = input(1);
         let mut master = audio_test_master(&[(source, 0.25)], 2);

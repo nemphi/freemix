@@ -324,6 +324,7 @@ fn decode_command(fields: &mut Fields) -> Result<CommandMessage, CodecError> {
             let kind = match value.as_str() {
                 "fade" => crate::ManualTransitionKind::Fade,
                 "wipe" => crate::ManualTransitionKind::Wipe,
+                "alpha_fade" => crate::ManualTransitionKind::AlphaFade,
                 _ => {
                     return Err(CodecError::InvalidField {
                         field: "transition",
@@ -705,6 +706,7 @@ fn decode_manual_status(
     let kind = match kind_value.as_str() {
         "fade" => ManualTransitionKind::Fade,
         "wipe" => ManualTransitionKind::Wipe,
+        "alpha_fade" => ManualTransitionKind::AlphaFade,
         _ => {
             return Err(CodecError::InvalidField {
                 field: kind,

@@ -241,11 +241,50 @@ fn t_bar_can_reverse_then_commit_or_cancel() {
 }
 
 #[test]
+fn alpha_fade_t_bar_preserves_kind_through_hold_restore_and_commit() {
+    let mut switcher = state();
+    switcher
+        .apply(SwitcherCommand::StartTBar {
+            kind: TransitionKind::AlphaFade,
+        })
+        .unwrap();
+    switcher
+        .apply(SwitcherCommand::SetTBarPosition(
+            TBarPosition::new(6_250).unwrap(),
+        ))
+        .unwrap();
+
+    let moving = switcher.program_frame();
+    assert_eq!(moving.transition_kind, Some(TransitionKind::AlphaFade));
+    assert_eq!(
+        (moving.mix_start_numerator, moving.mix_end_numerator),
+        (0, 6_250)
+    );
+    assert_eq!(switcher.advance_frame(), None);
+
+    let mut restored = state();
+    restored.restore_t_bar(switcher.t_bar().unwrap()).unwrap();
+    let held = restored.program_frame();
+    assert_eq!(held.transition_kind, Some(TransitionKind::AlphaFade));
+    assert_eq!(
+        (held.mix_start_numerator, held.mix_end_numerator),
+        (6_250, 6_250)
+    );
+    let events = restored.apply(SwitcherCommand::CommitTBar).unwrap();
+    assert_eq!(
+        events.last(),
+        Some(&SwitcherEvent::TransitionCompleted {
+            kind: TransitionKind::AlphaFade,
+            program: input(2),
+        })
+    );
+}
+
+#[test]
 fn manual_transition_rejects_every_unsupported_kind_without_mutation() {
     let unsupported = [
         TransitionKind::Slide,
         TransitionKind::Zoom,
-        TransitionKind::AlphaFade,
         TransitionKind::Stinger(StingerSlotId::new(1).unwrap()),
     ];
 

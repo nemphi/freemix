@@ -324,7 +324,7 @@ fn schema_v6_defaults_audio_strips_for_every_input_kind_without_losing_masks() {
     let strips_start = current.find(",\n    \"input_audio_strips\": [").unwrap();
     let scenes_start = current.find(",\n    \"scenes\": [").unwrap();
     let legacy = format!("{}{}", &current[..strips_start], &current[scenes_start..])
-        .replacen("\"schema_version\": 8", "\"schema_version\": 6", 1)
+        .replacen("\"schema_version\": 9", "\"schema_version\": 6", 1)
         .replacen(
             "    \"fade_to_black\": {\n      \"desired\": {\"target_active\": false, \"position_numerator\": 0},\n      \"realized\": {\"target_active\": false, \"position_numerator\": 0}\n    },\n",
             "",
@@ -558,7 +558,7 @@ fn golden_v2_manifest_migrates_with_cli_defaults_and_main_mix() {
     let report = store.migrate_v2().unwrap();
     let migrated = store.load().unwrap();
 
-    assert_eq!((report.from_schema(), report.to_schema()), (2, 8));
+    assert_eq!((report.from_schema(), report.to_schema()), (2, 9));
     assert_eq!(
         migrated.project().settings().frame_rate,
         FrameRate::new(60_000, 1_001).unwrap()
@@ -604,7 +604,7 @@ fn frozen_v3_manifest_migrates_with_composition_defaults_only() {
     second.migrate_v3().unwrap();
     let migrated = store.load().unwrap();
 
-    assert_eq!((report.from_schema(), report.to_schema()), (3, 8));
+    assert_eq!((report.from_schema(), report.to_schema()), (3, 9));
     assert_eq!(
         report.defaulted_fields(),
         [

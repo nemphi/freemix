@@ -162,6 +162,7 @@ fn write_manual_transition(output: &mut String, transition: Option<ManualTransit
     let kind = match transition.kind {
         ManualTransitionKind::Fade => "fade",
         ManualTransitionKind::Wipe => "wipe",
+        ManualTransitionKind::AlphaFade => "alpha_fade",
     };
     write!(
         output,

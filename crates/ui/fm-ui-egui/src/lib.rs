@@ -620,6 +620,7 @@ fn manual_transition_label(status: ManualTransitionStatus) -> String {
             match state.kind {
                 ManualTransitionKind::Fade => "FADE",
                 ManualTransitionKind::Wipe => "WIPE",
+                ManualTransitionKind::AlphaFade => "ALPHA FADE",
             },
             state.from,
             state.to,

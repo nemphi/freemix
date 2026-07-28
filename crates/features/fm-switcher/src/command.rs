@@ -124,7 +124,7 @@ impl core::fmt::Display for SwitcherError {
                 formatter.write_str("a transition is already in progress")
             }
             Self::UnsupportedManualTransitionKind => {
-                formatter.write_str("manual transitions support only Fade and Wipe")
+                formatter.write_str("manual transitions support only Fade, Wipe, and AlphaFade")
             }
             Self::InvalidManualTransitionRoute => {
                 formatter.write_str("manual transition endpoints must match Program and Preview")

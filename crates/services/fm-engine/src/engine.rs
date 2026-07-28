@@ -22,6 +22,7 @@ const MAX_TRANSITION_DURATION_FRAMES: u32 = 3_600;
 pub enum EngineManualTransitionKind {
     Fade,
     Wipe,
+    AlphaFade,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -740,8 +741,8 @@ fn validate_idle_restore(
     match (show.desired_switcher().t_bar(), realized_switcher.t_bar()) {
         (None, None) => {}
         (Some(desired), Some(realized))
-            if matches!(desired.kind(), TransitionKind::Fade | TransitionKind::Wipe)
-                && matches!(realized.kind(), TransitionKind::Fade | TransitionKind::Wipe)
+            if manual_transition_kind_supported(desired.kind())
+                && manual_transition_kind_supported(realized.kind())
                 && desired.kind() == realized.kind()
                 && desired.from() == realized.from()
                 && desired.to() == realized.to()
@@ -940,7 +941,15 @@ const fn manual_transition_kind(kind: EngineManualTransitionKind) -> TransitionK
     match kind {
         EngineManualTransitionKind::Fade => TransitionKind::Fade,
         EngineManualTransitionKind::Wipe => TransitionKind::Wipe,
+        EngineManualTransitionKind::AlphaFade => TransitionKind::AlphaFade,
     }
+}
+
+const fn manual_transition_kind_supported(kind: TransitionKind) -> bool {
+    matches!(
+        kind,
+        TransitionKind::Fade | TransitionKind::Wipe | TransitionKind::AlphaFade
+    )
 }
 
 fn engine_manual_state(state: fm_switcher::TBarState) -> EngineManualTransitionState {
@@ -948,7 +957,8 @@ fn engine_manual_state(state: fm_switcher::TBarState) -> EngineManualTransitionS
         kind: match state.kind() {
             TransitionKind::Fade => EngineManualTransitionKind::Fade,
             TransitionKind::Wipe => EngineManualTransitionKind::Wipe,
-            _ => unreachable!("engine manual transitions are fade or wipe"),
+            TransitionKind::AlphaFade => EngineManualTransitionKind::AlphaFade,
+            _ => unreachable!("engine manual transitions are Fade, Wipe, or AlphaFade"),
         },
         from: state.from(),
         to: state.to(),

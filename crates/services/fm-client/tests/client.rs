@@ -8,10 +8,11 @@ use fm_protocol::{
     ALPHA_FADE_PROTOCOL_VERSION, CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, ClientType,
     CommandPayload, CommandResult, EngineIdentity, EventCursor, EventMessage, EventPayload,
     FADE_TO_BLACK_PROTOCOL_VERSION, FadeToBlackPosition, FadeToBlackState, HandshakeOutcome,
-    HandshakeResponse, MANUAL_TRANSITION_PROTOCOL_VERSION, ManualTransitionKind,
-    ManualTransitionPosition, ManualTransitionState, ManualTransitionStatus, ProtocolVersion,
-    ResumeCursor, Role, RuntimeEventMessage, RuntimeLifecycleEvent, ServerIdentity,
-    SnapshotMessage, SnapshotReason, WIPE_PROTOCOL_VERSION, WireInputId, WireMessage,
+    HandshakeResponse, MANUAL_ALPHA_FADE_PROTOCOL_VERSION, MANUAL_TRANSITION_PROTOCOL_VERSION,
+    ManualTransitionKind, ManualTransitionPosition, ManualTransitionState, ManualTransitionStatus,
+    ProtocolVersion, ResumeCursor, Role, RuntimeEventMessage, RuntimeLifecycleEvent,
+    ServerIdentity, SnapshotMessage, SnapshotReason, WIPE_PROTOCOL_VERSION, WireInputId,
+    WireMessage,
 };
 use fm_types::ProjectId;
 use fm_ui_model::ManualTransitionStatus as ModelManualTransitionStatus;
@@ -710,7 +711,7 @@ fn alpha_fade_command_is_queued_only_on_protocol_1_6() {
             None,
         )
         .unwrap();
-    assert_eq!(command.protocol, ALPHA_FADE_PROTOCOL_VERSION);
+    assert_eq!(command.protocol, CURRENT_PROTOCOL_VERSION);
     assert_eq!(
         command.payload,
         CommandPayload::AlphaFade {
@@ -735,6 +736,44 @@ fn alpha_fade_command_is_queued_only_on_protocol_1_6() {
         Err(ClientError::UnsupportedCommandVersion {
             negotiated: FADE_TO_BLACK_PROTOCOL_VERSION,
             required: ALPHA_FADE_PROTOCOL_VERSION,
+        })
+    );
+    assert_eq!(old.outbound_len(), 0);
+}
+
+#[test]
+fn manual_alpha_fade_start_is_queued_only_on_protocol_1_7() {
+    let mut current = ready_client(1);
+    let command = current
+        .queue_command(
+            CommandPayload::StartManualTransition {
+                kind: ManualTransitionKind::AlphaFade,
+            },
+            "manual-alpha-fade",
+            Some(4),
+            None,
+        )
+        .unwrap();
+    assert_eq!(command.protocol, MANUAL_ALPHA_FADE_PROTOCOL_VERSION);
+
+    let mut old = Client::new(config(2)).unwrap();
+    old.start_connect().unwrap();
+    old.transport_connected().unwrap();
+    old.accept_handshake(handshake_version(ALPHA_FADE_PROTOCOL_VERSION, 4, None))
+        .unwrap();
+    old.apply_snapshot(snapshot(4)).unwrap();
+    assert_eq!(
+        old.queue_command(
+            CommandPayload::StartManualTransition {
+                kind: ManualTransitionKind::AlphaFade,
+            },
+            "unsupported-manual-alpha-fade",
+            Some(4),
+            None,
+        ),
+        Err(ClientError::UnsupportedCommandVersion {
+            negotiated: ALPHA_FADE_PROTOCOL_VERSION,
+            required: MANUAL_ALPHA_FADE_PROTOCOL_VERSION,
         })
     );
     assert_eq!(old.outbound_len(), 0);

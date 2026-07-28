@@ -5,7 +5,8 @@ use fm_types::InputId;
 
 use crate::{
     ALPHA_FADE_PROTOCOL_VERSION, BASE_PROTOCOL_VERSION, FADE_TO_BLACK_PROTOCOL_VERSION,
-    MANUAL_TRANSITION_PROTOCOL_VERSION, ProtocolVersion, WIPE_PROTOCOL_VERSION,
+    MANUAL_ALPHA_FADE_PROTOCOL_VERSION, MANUAL_TRANSITION_PROTOCOL_VERSION, ProtocolVersion,
+    WIPE_PROTOCOL_VERSION,
 };
 
 /// Stable identity of one project's durable state on one server.
@@ -208,6 +209,7 @@ impl fmt::Display for WireInputId {
 pub enum ManualTransitionKind {
     Fade,
     Wipe,
+    AlphaFade,
 }
 
 /// Exact normalized manual-transition position expressed in basis points.
@@ -300,6 +302,9 @@ impl CommandPayload {
             Self::AlphaFade { .. } => ALPHA_FADE_PROTOCOL_VERSION,
             Self::Wipe { .. } => WIPE_PROTOCOL_VERSION,
             Self::FadeToBlack { .. } => FADE_TO_BLACK_PROTOCOL_VERSION,
+            Self::StartManualTransition {
+                kind: ManualTransitionKind::AlphaFade,
+            } => MANUAL_ALPHA_FADE_PROTOCOL_VERSION,
             Self::StartManualTransition { .. }
             | Self::SetManualTransitionPosition { .. }
             | Self::CommitManualTransition
@@ -558,6 +563,9 @@ impl WireMessage {
         if version.major == MANUAL_TRANSITION_PROTOCOL_VERSION.major
             && version.minor >= MANUAL_TRANSITION_PROTOCOL_VERSION.minor
         {
+            if version.minor < MANUAL_ALPHA_FADE_PROTOCOL_VERSION.minor {
+                project_manual_alpha_fade(&mut message);
+            }
             return message;
         }
         match &mut message {
@@ -582,5 +590,41 @@ impl WireMessage {
             _ => {}
         }
         message
+    }
+}
+
+fn project_manual_alpha_fade(message: &mut WireMessage) {
+    match message {
+        WireMessage::Snapshot(snapshot) => {
+            project_manual_alpha_fade_status(&mut snapshot.desired_manual_transition);
+            project_manual_alpha_fade_status(&mut snapshot.realized_manual_transition);
+        }
+        WireMessage::Event(EventMessage {
+            payload:
+                EventPayload::DesiredSwitcher {
+                    manual_transition, ..
+                },
+            ..
+        })
+        | WireMessage::RuntimeEvent(RuntimeEventMessage {
+            event:
+                RuntimeLifecycleEvent::Realized {
+                    manual_transition, ..
+                },
+            ..
+        }) => project_manual_alpha_fade_status(manual_transition),
+        _ => {}
+    }
+}
+
+fn project_manual_alpha_fade_status(status: &mut Option<ManualTransitionStatus>) {
+    if matches!(
+        status,
+        Some(ManualTransitionStatus::Active(ManualTransitionState {
+            kind: ManualTransitionKind::AlphaFade,
+            ..
+        }))
+    ) {
+        *status = Some(ManualTransitionStatus::Inactive);
     }
 }

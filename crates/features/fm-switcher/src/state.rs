@@ -91,11 +91,11 @@ impl SwitcherState {
     /// # Errors
     ///
     /// Returns an error when a transition is already active, an endpoint is
-    /// unavailable, the transition kind is not Fade or Wipe, or the saved
+    /// unavailable, the transition kind is not Fade, Wipe, or `AlphaFade`, or the saved
     /// endpoints do not match Program and Preview.
     pub fn restore_t_bar(&mut self, t_bar: TBarState) -> Result<(), SwitcherError> {
         self.require_idle()?;
-        if !matches!(t_bar.kind(), TransitionKind::Fade | TransitionKind::Wipe) {
+        if !manual_transition_supported(t_bar.kind()) {
             return Err(SwitcherError::UnsupportedManualTransitionKind);
         }
         self.require_input(t_bar.from())?;
@@ -310,13 +310,13 @@ impl SwitcherState {
     ///
     /// Returns [`SwitcherError::TransitionInProgress`] when another transition
     /// is active, or [`SwitcherError::UnsupportedManualTransitionKind`] when
-    /// `kind` is not Fade or Wipe.
+    /// `kind` is not Fade, Wipe, or `AlphaFade`.
     pub fn start_t_bar(
         &mut self,
         kind: TransitionKind,
     ) -> Result<Vec<SwitcherEvent>, SwitcherError> {
         self.require_idle()?;
-        if !matches!(kind, TransitionKind::Fade | TransitionKind::Wipe) {
+        if !manual_transition_supported(kind) {
             return Err(SwitcherError::UnsupportedManualTransitionKind);
         }
         self.t_bar = Some(TBarState::new(kind, self.program, self.preview));
@@ -547,6 +547,13 @@ impl SwitcherState {
     fn advance_fade_to_black(&mut self) -> FadeToBlackAdvance {
         self.fade_to_black.advance()
     }
+}
+
+const fn manual_transition_supported(kind: TransitionKind) -> bool {
+    matches!(
+        kind,
+        TransitionKind::Fade | TransitionKind::Wipe | TransitionKind::AlphaFade
+    )
 }
 
 fn legacy_fade_to_black_event(advance: FadeToBlackAdvance) -> Option<SwitcherEvent> {

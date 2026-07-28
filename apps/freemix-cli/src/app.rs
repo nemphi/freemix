@@ -601,7 +601,8 @@ fn persisted_t_bar(state: TBarState) -> PersistedManualTransitionState {
     let kind = match state.kind() {
         TransitionKind::Fade => PersistedManualTransitionKind::Fade,
         TransitionKind::Wipe => PersistedManualTransitionKind::Wipe,
-        _ => unreachable!("engine manual transitions are fade or wipe"),
+        TransitionKind::AlphaFade => PersistedManualTransitionKind::AlphaFade,
+        _ => unreachable!("engine manual transitions are Fade, Wipe, or AlphaFade"),
     };
     PersistedManualTransitionState::new(
         kind,
@@ -617,6 +618,7 @@ fn restored_t_bar(state: PersistedManualTransitionState) -> AppResult<TBarState>
     let kind = match state.kind {
         PersistedManualTransitionKind::Fade => TransitionKind::Fade,
         PersistedManualTransitionKind::Wipe => TransitionKind::Wipe,
+        PersistedManualTransitionKind::AlphaFade => TransitionKind::AlphaFade,
     };
     let interval_start = TBarPosition::new(state.interval_start_basis_points)
         .ok_or_else(|| AppFailure("invalid persisted manual-transition interval start".into()))?;
@@ -669,6 +671,12 @@ fn load_stored_project(path: &Path) -> AppResult<StoredProject> {
             found: 7, ..
         })) => {
             store.migrate_v7()?;
+            Ok(store.load()?)
+        }
+        Err(StoreError::Validation(ProjectValidationError::UnsupportedSchema {
+            found: 8, ..
+        })) => {
+            store.migrate_v8()?;
             Ok(store.load()?)
         }
         Err(error) => Err(error.into()),

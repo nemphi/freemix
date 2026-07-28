@@ -1045,6 +1045,7 @@ fn engine_command(payload: CommandPayload) -> EngineCommand {
             kind: match kind {
                 ManualTransitionKind::Fade => EngineManualTransitionKind::Fade,
                 ManualTransitionKind::Wipe => EngineManualTransitionKind::Wipe,
+                ManualTransitionKind::AlphaFade => EngineManualTransitionKind::AlphaFade,
             },
         },
         CommandPayload::SetManualTransitionPosition { position } => {
@@ -1193,6 +1194,7 @@ fn protocol_manual_status(state: Option<EngineManualTransitionState>) -> ManualT
     let kind = match state.kind {
         EngineManualTransitionKind::Fade => ManualTransitionKind::Fade,
         EngineManualTransitionKind::Wipe => ManualTransitionKind::Wipe,
+        EngineManualTransitionKind::AlphaFade => ManualTransitionKind::AlphaFade,
     };
     ManualTransitionStatus::Active(ManualTransitionState {
         kind,

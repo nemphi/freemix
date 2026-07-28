@@ -515,7 +515,7 @@ fn commands_survive_restart_resume_and_duplicate_replay() {
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn manual_transition_state_and_receipts_survive_restart_through_commit_and_cancel() {
+fn manual_alpha_fade_state_and_receipts_survive_restart_through_commit_and_cancel() {
     for (name, terminal, swaps_routes) in [
         (
             "manual-commit-restart",
@@ -543,7 +543,7 @@ fn manual_transition_state_and_receipts_survive_restart_through_commit_and_cance
             "manual-start",
             "manual-start-key",
             CommandPayload::StartManualTransition {
-                kind: ManualTransitionKind::Wipe,
+                kind: ManualTransitionKind::AlphaFade,
             },
         ));
         assert!(matches!(
@@ -574,7 +574,7 @@ fn manual_transition_state_and_receipts_survive_restart_through_commit_and_cance
         let realized = manual
             .realized
             .expect("realized manual state must be durable");
-        assert_eq!(desired.kind, PersistedManualTransitionKind::Wipe);
+        assert_eq!(desired.kind, PersistedManualTransitionKind::AlphaFade);
         assert_eq!(desired.interval_start_basis_points, 0);
         assert_eq!(desired.position_basis_points, 6_250);
         assert_eq!(realized.interval_start_basis_points, 6_250);
@@ -591,7 +591,7 @@ fn manual_transition_state_and_receipts_survive_restart_through_commit_and_cance
         assert!(matches!(
             snapshot.desired_manual_transition,
             Some(ManualTransitionStatus::Active(state))
-                if state.kind == ManualTransitionKind::Wipe
+                if state.kind == ManualTransitionKind::AlphaFade
                     && state.interval_start == ManualTransitionPosition::START
                     && state.position.basis_points() == 6_250
         ));
@@ -686,7 +686,7 @@ fn v2_project_migrates_and_serves() {
     daemon.wait_success();
 
     let migrated = ProjectStore::new(project_path).unwrap().load().unwrap();
-    assert_eq!(migrated.schema_version(), 8);
+    assert_eq!(migrated.schema_version(), 9);
     assert_eq!(migrated.project().name(), "Legacy V2");
 }
 
@@ -714,7 +714,7 @@ fn v3_project_migrates_and_serves() {
     daemon.wait_success();
 
     let migrated = ProjectStore::new(project_path).unwrap().load().unwrap();
-    assert_eq!(migrated.schema_version(), 8);
+    assert_eq!(migrated.schema_version(), 9);
     assert_eq!(migrated.project().name(), "Frozen V3 Scene");
     let scene = &migrated.project().scenes()[0];
     assert_eq!(scene.background, Rgba8::OPAQUE_BLACK);
@@ -743,7 +743,7 @@ fn v5_project_migrates_without_losing_manual_transition_state() {
     daemon.wait_success();
 
     let migrated = ProjectStore::new(project_path).unwrap().load().unwrap();
-    assert_eq!(migrated.schema_version(), 8);
+    assert_eq!(migrated.schema_version(), 9);
     assert_eq!(migrated.project().scenes()[0].layers[0].mask, None);
     let transitions = migrated.runtime_manual_transitions();
     let desired = transitions.desired.unwrap();
@@ -754,6 +754,31 @@ fn v5_project_migrates_without_losing_manual_transition_state() {
     assert_eq!(realized.kind, PersistedManualTransitionKind::Fade);
     assert_eq!(realized.interval_start_basis_points, 6_250);
     assert_eq!(realized.position_basis_points, 6_250);
+}
+
+#[test]
+fn v8_project_migrates_losslessly_before_daemon_start() {
+    let directory = TestDirectory::new("v8-migration");
+    let project_path = directory.project_path();
+    create_project(&project_path);
+    let manifest_path = project_path.join("project.json");
+    let source = fs::read_to_string(&manifest_path).unwrap().replacen(
+        "\"schema_version\": 9",
+        "\"schema_version\": 8",
+        1,
+    );
+    fs::write(&manifest_path, source).unwrap();
+
+    let daemon = Daemon::start(&project_path);
+    let mut client = daemon.connect();
+    assert_eq!(client.handshake(None).current_revision, 0);
+    assert!(matches!(client.receive(), WireMessage::Snapshot(_)));
+    drop(client);
+    daemon.wait_success();
+
+    let migrated = ProjectStore::new(project_path).unwrap().load().unwrap();
+    assert_eq!(migrated.schema_version(), 9);
+    assert_eq!(migrated.project().name(), "Process Test");
 }
 
 #[test]
@@ -779,7 +804,7 @@ fn v1_project_is_rejected_as_unsupported() {
     assert!(
         String::from_utf8(output.stderr)
             .unwrap()
-            .contains("unsupported schema 1; expected 8")
+            .contains("unsupported schema 1; expected 9")
     );
 }
 

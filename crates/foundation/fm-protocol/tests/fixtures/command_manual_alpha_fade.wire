@@ -1,0 +1,1 @@
+command	protocol=1.7	id=01K%3Atest	idempotency_key=operator-7%3A01K	expected_revision=1842	deadline_ms=500	payload=manual_start	transition=alpha_fade

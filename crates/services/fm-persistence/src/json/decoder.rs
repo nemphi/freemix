@@ -32,6 +32,7 @@ const V4_SCHEMA_VERSION: u32 = 4;
 const V5_SCHEMA_VERSION: u32 = 5;
 const V6_SCHEMA_VERSION: u32 = 6;
 const V7_SCHEMA_VERSION: u32 = 7;
+const V8_SCHEMA_VERSION: u32 = 8;
 
 pub(crate) fn decode(source: &str) -> Result<StoredProject, DecodeError> {
     let mut root = Object::new(Reader::new(source).document()?, "manifest")?;
@@ -168,6 +169,32 @@ pub(crate) fn decode_v7(source: &str) -> Result<StoredProject, DecodeError> {
         project,
         routing,
         manual_transitions,
+        position,
+        receipts,
+    )
+    .map_err(DecodeError::Validation)
+}
+
+pub(crate) fn decode_v8(source: &str) -> Result<StoredProject, DecodeError> {
+    let mut root = Object::new(Reader::new(source).document()?, "manifest")?;
+    let schema = root.u32("schema_version")?;
+    if schema != V8_SCHEMA_VERSION {
+        return Err(DecodeError::Validation(
+            ProjectValidationError::UnsupportedSchema {
+                found: schema,
+                supported: V8_SCHEMA_VERSION,
+            },
+        ));
+    }
+    let project = ProjectDto::parse(root.take("project")?, false, true, true)?.into_domain();
+    let (routing, manual_transitions, fade_to_black, position, receipts) =
+        parse_runtime(root.take("runtime")?, true, true)?;
+    root.finish()?;
+    StoredProject::from_project_with_runtime_state(
+        project,
+        routing,
+        manual_transitions,
+        fade_to_black,
         position,
         receipts,
     )
@@ -788,6 +815,7 @@ fn parse_manual_transition(value: Value) -> Result<ManualTransitionState, Decode
     let kind = match object.string("kind")?.as_str() {
         "fade" => ManualTransitionKind::Fade,
         "wipe" => ManualTransitionKind::Wipe,
+        "alpha_fade" => ManualTransitionKind::AlphaFade,
         value => return Err(unknown_enum("manual transition kind", value)),
     };
     let from_id = InputId::new(object.nonzero_u128("from_id")?);

@@ -683,6 +683,69 @@ fn manual_transition_holds_reverses_commits_and_restores_exactly() {
 }
 
 #[test]
+fn manual_alpha_fade_preserves_kind_and_exact_position_through_restore() {
+    let mut engine = engine();
+    engine
+        .execute(
+            envelope(
+                "alpha-manual-start",
+                EngineCommand::StartManualTransition {
+                    kind: EngineManualTransitionKind::AlphaFade,
+                },
+            ),
+            0,
+        )
+        .unwrap();
+    engine.tick().unwrap();
+    engine
+        .execute(
+            envelope(
+                "alpha-manual-position",
+                EngineCommand::SetManualTransitionPosition {
+                    position: EngineManualTransitionPosition::new(6_250).unwrap(),
+                },
+            ),
+            0,
+        )
+        .unwrap();
+    let moving = engine.tick().unwrap();
+    assert_eq!(
+        moving.program.transition_kind,
+        Some(TransitionKind::AlphaFade)
+    );
+    assert_eq!(
+        (
+            moving.program.mix_start_numerator,
+            moving.program.mix_end_numerator,
+        ),
+        (0, 6_250)
+    );
+
+    let mut restored = Engine::restore(engine.snapshot().unwrap()).unwrap();
+    let held = restored.tick().unwrap();
+    assert_eq!(
+        held.program.transition_kind,
+        Some(TransitionKind::AlphaFade)
+    );
+    assert_eq!(
+        (
+            held.program.mix_start_numerator,
+            held.program.mix_end_numerator,
+        ),
+        (6_250, 6_250)
+    );
+    restored
+        .execute(
+            envelope("alpha-manual-commit", EngineCommand::CommitManualTransition),
+            0,
+        )
+        .unwrap();
+    let committed = restored.tick().unwrap();
+    assert_eq!(committed.program.primary, input(2));
+    assert!(committed.program.secondary.is_none());
+}
+
+#[test]
 fn cancelling_manual_transition_preserves_program_and_preview() {
     let mut engine = engine();
     for (key, command) in [

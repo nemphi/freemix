@@ -8,13 +8,13 @@ use fm_protocol::{
     EngineIdentity, ErrorMessage, EventCursor, EventMessage, EventPayload,
     FADE_TO_BLACK_PROTOCOL_VERSION, FadeToBlackPosition, FadeToBlackState, FieldIssue,
     HandshakeOutcome, HandshakeRequest, HandshakeResponse, HeartbeatMessage, LineDecoder,
-    MANUAL_TRANSITION_PROTOCOL_VERSION, MAX_FIELD_VALUE_BYTES, MAX_FIELDS_PER_MESSAGE,
-    MAX_LINE_BYTES, MAX_LIST_ITEMS, MAX_MESSAGES_PER_PUSH, ManualTransitionKind,
-    ManualTransitionPosition, ManualTransitionState, ManualTransitionStatus, ProtocolVersion,
-    ResumeCursor, Role, RuntimeDomainBoundary, RuntimeEventMessage, RuntimeFailureDisposition,
-    RuntimeLifecycleEvent, ServerHello, ServerIdentity, SnapshotMessage, SnapshotReason,
-    StructuredError, WIPE_PROTOCOL_VERSION, WireInputId, WireMessage, choose_handshake_outcome,
-    decode_line, encode_line, negotiate_version,
+    MANUAL_ALPHA_FADE_PROTOCOL_VERSION, MANUAL_TRANSITION_PROTOCOL_VERSION, MAX_FIELD_VALUE_BYTES,
+    MAX_FIELDS_PER_MESSAGE, MAX_LINE_BYTES, MAX_LIST_ITEMS, MAX_MESSAGES_PER_PUSH,
+    ManualTransitionKind, ManualTransitionPosition, ManualTransitionState, ManualTransitionStatus,
+    ProtocolVersion, ResumeCursor, Role, RuntimeDomainBoundary, RuntimeEventMessage,
+    RuntimeFailureDisposition, RuntimeLifecycleEvent, ServerHello, ServerIdentity, SnapshotMessage,
+    SnapshotReason, StructuredError, WIPE_PROTOCOL_VERSION, WireInputId, WireMessage,
+    choose_handshake_outcome, decode_line, encode_line, negotiate_version,
 };
 
 fn input(value: u128) -> WireInputId {
@@ -257,6 +257,20 @@ fn manual_transition_commands_have_stable_exact_wire_forms() {
 }
 
 #[test]
+fn manual_alpha_fade_start_has_a_stable_versioned_wire_form() {
+    let fixture = include_str!("fixtures/command_manual_alpha_fade.wire");
+    let message = WireMessage::Command(CommandMessage {
+        protocol: MANUAL_ALPHA_FADE_PROTOCOL_VERSION,
+        payload: CommandPayload::StartManualTransition {
+            kind: ManualTransitionKind::AlphaFade,
+        },
+        ..command()
+    });
+    assert_eq!(encode_line(&message).unwrap(), fixture);
+    assert_eq!(decode_line(fixture).unwrap(), message);
+}
+
+#[test]
 fn manual_transition_snapshot_and_events_have_stable_exact_wire_forms() {
     let desired = ManualTransitionStatus::Active(ManualTransitionState {
         kind: ManualTransitionKind::Wipe,
@@ -414,6 +428,42 @@ fn protocol_1_3_projection_omits_manual_transition_extensions() {
 }
 
 #[test]
+fn protocol_1_6_projects_active_manual_alpha_fade_as_inactive() {
+    let active = ManualTransitionStatus::Active(ManualTransitionState {
+        kind: ManualTransitionKind::AlphaFade,
+        from: input(1),
+        to: input(2),
+        interval_start: ManualTransitionPosition::new(2_500).unwrap(),
+        position: ManualTransitionPosition::new(6_250).unwrap(),
+    });
+    let message = WireMessage::Event(EventMessage {
+        cursor: cursor(),
+        payload: EventPayload::DesiredSwitcher {
+            program: input(1),
+            preview: input(2),
+            manual_transition: Some(active),
+            fade_to_black: None,
+        },
+    });
+
+    let old = message.compatible_with(ALPHA_FADE_PROTOCOL_VERSION);
+    assert!(matches!(
+        old,
+        WireMessage::Event(EventMessage {
+            payload: EventPayload::DesiredSwitcher {
+                manual_transition: Some(ManualTransitionStatus::Inactive),
+                ..
+            },
+            ..
+        })
+    ));
+    assert_eq!(
+        message.compatible_with(MANUAL_ALPHA_FADE_PROTOCOL_VERSION),
+        message
+    );
+}
+
+#[test]
 fn command_minimum_versions_gate_additive_transitions() {
     for payload in [
         CommandPayload::SelectPreview { input: input(1) },
@@ -460,13 +510,27 @@ fn command_minimum_versions_gate_additive_transitions() {
         duration_frames: 25,
     };
     assert_eq!(ALPHA_FADE_PROTOCOL_VERSION, ProtocolVersion::new(1, 6));
-    assert_eq!(CURRENT_PROTOCOL_VERSION, ALPHA_FADE_PROTOCOL_VERSION);
     assert_eq!(
         alpha_fade.minimum_protocol_version(),
         ALPHA_FADE_PROTOCOL_VERSION
     );
     assert!(!alpha_fade.is_supported_by(FADE_TO_BLACK_PROTOCOL_VERSION));
     assert!(alpha_fade.is_supported_by(CURRENT_PROTOCOL_VERSION));
+
+    let manual_alpha_fade = CommandPayload::StartManualTransition {
+        kind: ManualTransitionKind::AlphaFade,
+    };
+    assert_eq!(
+        MANUAL_ALPHA_FADE_PROTOCOL_VERSION,
+        ProtocolVersion::new(1, 7)
+    );
+    assert_eq!(
+        manual_alpha_fade.minimum_protocol_version(),
+        MANUAL_ALPHA_FADE_PROTOCOL_VERSION
+    );
+    assert!(!manual_alpha_fade.is_supported_by(ALPHA_FADE_PROTOCOL_VERSION));
+    assert!(manual_alpha_fade.is_supported_by(CURRENT_PROTOCOL_VERSION));
+    assert_eq!(CURRENT_PROTOCOL_VERSION, MANUAL_ALPHA_FADE_PROTOCOL_VERSION);
 }
 
 #[test]

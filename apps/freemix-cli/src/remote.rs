@@ -293,6 +293,7 @@ fn format_manual_transition(status: ManualTransitionStatus) -> String {
             match state.kind {
                 fm_protocol::ManualTransitionKind::Fade => "fade",
                 fm_protocol::ManualTransitionKind::Wipe => "wipe",
+                fm_protocol::ManualTransitionKind::AlphaFade => "alpha_fade",
             },
             state.from,
             state.to,

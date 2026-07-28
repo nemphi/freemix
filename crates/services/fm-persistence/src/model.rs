@@ -29,6 +29,7 @@ pub struct RuntimeRouting {
 pub enum ManualTransitionKind {
     Fade,
     Wipe,
+    AlphaFade,
 }
 
 /// Exact state of one active manual transition at a frame boundary.
