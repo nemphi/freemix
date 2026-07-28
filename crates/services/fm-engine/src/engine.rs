@@ -8,7 +8,8 @@ use fm_command::{
 };
 use fm_scheduler::{FrameNumber, FrameScheduler, PlanGeneration};
 use fm_switcher::{
-    ProgramFrame, SwitcherCommand, SwitcherError, SwitcherEvent, SwitcherState, TransitionKind,
+    ProgramFrame, SwitcherCommand, SwitcherError, SwitcherEvent, SwitcherState, TBarPosition,
+    TransitionKind,
 };
 use fm_types::{FrameRate, InputId};
 
@@ -18,11 +19,55 @@ type RuntimeScheduler = FrameScheduler<(), (), EngineCommand, ()>;
 const MAX_TRANSITION_DURATION_FRAMES: u32 = 3_600;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EngineManualTransitionKind {
+    Fade,
+    Wipe,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct EngineManualTransitionPosition(TBarPosition);
+
+impl EngineManualTransitionPosition {
+    pub const MAX: u16 = TBarPosition::MAX;
+    pub const START: Self = Self(TBarPosition::START);
+    pub const END: Self = Self(TBarPosition::END);
+
+    #[must_use]
+    pub const fn new(basis_points: u16) -> Option<Self> {
+        match TBarPosition::new(basis_points) {
+            Some(position) => Some(Self(position)),
+            None => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn basis_points(self) -> u16 {
+        self.0.basis_points()
+    }
+
+    const fn domain(self) -> TBarPosition {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EngineCommand {
     SelectPreview(InputId),
     Cut,
-    Fade { duration_frames: u32 },
-    Wipe { duration_frames: u32 },
+    Fade {
+        duration_frames: u32,
+    },
+    Wipe {
+        duration_frames: u32,
+    },
+    StartManualTransition {
+        kind: EngineManualTransitionKind,
+    },
+    SetManualTransitionPosition {
+        position: EngineManualTransitionPosition,
+    },
+    CommitManualTransition,
+    CancelManualTransition,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -415,7 +460,12 @@ impl Engine {
             self.transition_in_flight = match command {
                 EngineCommand::Fade { .. } => Some(TransitionKind::Fade),
                 EngineCommand::Wipe { .. } => Some(TransitionKind::Wipe),
-                EngineCommand::SelectPreview(_) | EngineCommand::Cut => None,
+                EngineCommand::SelectPreview(_)
+                | EngineCommand::Cut
+                | EngineCommand::StartManualTransition { .. }
+                | EngineCommand::SetManualTransitionPosition { .. }
+                | EngineCommand::CommitManualTransition
+                | EngineCommand::CancelManualTransition => None,
             };
         } else if let Some(action) = scheduled {
             self.scheduler.cancel_action(action);
@@ -689,6 +739,14 @@ impl Mutation<ShowState, EngineEvent, EngineAcceptance> for EngineMutation {
                 }
                 SwitcherCommand::Cut
             }
+            EngineCommand::StartManualTransition { kind } => SwitcherCommand::StartTBar {
+                kind: manual_transition_kind(kind),
+            },
+            EngineCommand::SetManualTransitionPosition { position } => {
+                SwitcherCommand::SetTBarPosition(position.domain())
+            }
+            EngineCommand::CommitManualTransition => SwitcherCommand::CommitTBar,
+            EngineCommand::CancelManualTransition => SwitcherCommand::CancelTBar,
         };
         state
             .desired_switcher_mut()
@@ -713,7 +771,22 @@ fn apply_runtime(
             duration_frames,
         },
         EngineCommand::Wipe { duration_frames } => SwitcherCommand::Wipe { duration_frames },
+        EngineCommand::StartManualTransition { kind } => SwitcherCommand::StartTBar {
+            kind: manual_transition_kind(kind),
+        },
+        EngineCommand::SetManualTransitionPosition { position } => {
+            SwitcherCommand::SetTBarPosition(position.domain())
+        }
+        EngineCommand::CommitManualTransition => SwitcherCommand::CommitTBar,
+        EngineCommand::CancelManualTransition => SwitcherCommand::CancelTBar,
     })
+}
+
+const fn manual_transition_kind(kind: EngineManualTransitionKind) -> TransitionKind {
+    match kind {
+        EngineManualTransitionKind::Fade => TransitionKind::Fade,
+        EngineManualTransitionKind::Wipe => TransitionKind::Wipe,
+    }
 }
 
 fn switcher_rejection(error: SwitcherError) -> Rejection {

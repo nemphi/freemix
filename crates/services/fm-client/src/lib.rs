@@ -895,7 +895,13 @@ impl Client {
             CommandPayload::SelectPreview { input } => {
                 Some(OptimisticChange::DesiredPreview(input.to_domain()))
             }
-            CommandPayload::Cut | CommandPayload::Fade { .. } | CommandPayload::Wipe { .. } => None,
+            CommandPayload::Cut
+            | CommandPayload::Fade { .. }
+            | CommandPayload::Wipe { .. }
+            | CommandPayload::StartManualTransition { .. }
+            | CommandPayload::SetManualTransitionPosition { .. }
+            | CommandPayload::CommitManualTransition
+            | CommandPayload::CancelManualTransition => None,
         };
         self.model
             .track_command(CommandId::new(command.id.clone()), optimistic)?;
@@ -982,6 +988,17 @@ impl Client {
     pub fn pop_outbound(&mut self) -> Option<Outbound> {
         if matches!(self.outbound.front(), Some(Outbound::Command(_)))
             && self.state != ConnectionState::Ready
+        {
+            return None;
+        }
+        if self.unresolved_incompatible_command().is_some() {
+            return None;
+        }
+        if let Some(Outbound::Command(command)) = self.outbound.front()
+            && self
+                .session
+                .as_ref()
+                .is_some_and(|session| !command.payload.is_supported_by(session.protocol))
         {
             return None;
         }

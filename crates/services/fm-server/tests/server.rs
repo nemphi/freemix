@@ -3,8 +3,9 @@ use std::{convert::Infallible, net::IpAddr, num::NonZeroU128};
 use fm_auth::{Principal, Role as AuthRole, SessionId, UserId};
 use fm_protocol::{
     CURRENT_PROTOCOL_VERSION, ClientHello, ClientType, CommandMessage, CommandPayload,
-    EngineIdentity, EventCursor, EventMessage, EventPayload, ProtocolVersion, Role,
-    SnapshotMessage, WIPE_PROTOCOL_VERSION, WireInputId,
+    EngineIdentity, EventCursor, EventMessage, EventPayload, MANUAL_TRANSITION_PROTOCOL_VERSION,
+    ManualTransitionKind, ProtocolVersion, Role, SnapshotMessage, WIPE_PROTOCOL_VERSION,
+    WireInputId,
 };
 use fm_server::{
     AuthenticationMode, ConfigError, ControlPlane, DisconnectReason, HandshakeError, HealthState,
@@ -304,6 +305,37 @@ fn old_client_cannot_admit_wipe_to_a_new_server() {
     let mut cut = command(CommandPayload::Cut);
     cut.protocol = ProtocolVersion::new(1, 0);
     session.admit_command(&cut, 10, 0).unwrap();
+}
+
+#[test]
+fn protocol_1_3_peer_cannot_admit_manual_transition() {
+    let server = ready_server(ServerConfig::new(
+        ServerMode::Production,
+        AuthenticationMode::Required,
+        IpAddr::from([127, 0, 0, 1]),
+        vec![CURRENT_PROTOCOL_VERSION],
+        "capabilities-v1",
+    ));
+    let mut old_hello = hello(Role::Operator, None);
+    old_hello.versions = vec![WIPE_PROTOCOL_VERSION];
+    let outcome = server
+        .handshake(&old_hello, &principal(AuthRole::Operator), 0)
+        .unwrap();
+    assert_eq!(outcome.server_hello.negotiated, WIPE_PROTOCOL_VERSION);
+    let mut session = outcome.session;
+    let mut manual = command(CommandPayload::StartManualTransition {
+        kind: ManualTransitionKind::Fade,
+    });
+    manual.protocol = WIPE_PROTOCOL_VERSION;
+    assert_eq!(
+        session.admit_command(&manual, 10, 0),
+        Err(SessionError::UnsupportedCommandVersion {
+            negotiated: WIPE_PROTOCOL_VERSION,
+            required: MANUAL_TRANSITION_PROTOCOL_VERSION,
+        })
+    );
+    assert_eq!(session.accounting().inbound_commands_admitted_total, 0);
+    assert_eq!(session.accounting().inbound_commands_inflight, 0);
 }
 
 #[test]

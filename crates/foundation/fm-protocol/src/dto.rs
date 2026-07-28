@@ -3,7 +3,10 @@ use core::{fmt, num::NonZeroU128};
 use fm_command::{CommandEnvelope, Deadline, Revision, StateEpoch};
 use fm_types::InputId;
 
-use crate::{BASE_PROTOCOL_VERSION, ProtocolVersion, WIPE_PROTOCOL_VERSION};
+use crate::{
+    BASE_PROTOCOL_VERSION, MANUAL_TRANSITION_PROTOCOL_VERSION, ProtocolVersion,
+    WIPE_PROTOCOL_VERSION,
+};
 
 /// Stable identity of one project's durable state on one server.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -202,11 +205,45 @@ impl fmt::Display for WireInputId {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManualTransitionKind {
+    Fade,
+    Wipe,
+}
+
+/// Exact normalized manual-transition position expressed in basis points.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ManualTransitionPosition(u16);
+
+impl ManualTransitionPosition {
+    pub const MAX: u16 = 10_000;
+    pub const START: Self = Self(0);
+    pub const END: Self = Self(Self::MAX);
+
+    #[must_use]
+    pub const fn new(basis_points: u16) -> Option<Self> {
+        if basis_points <= Self::MAX {
+            Some(Self(basis_points))
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub const fn basis_points(self) -> u16 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CommandPayload {
     SelectPreview { input: WireInputId },
     Cut,
     Fade { duration_frames: u32 },
     Wipe { duration_frames: u32 },
+    StartManualTransition { kind: ManualTransitionKind },
+    SetManualTransitionPosition { position: ManualTransitionPosition },
+    CommitManualTransition,
+    CancelManualTransition,
 }
 
 impl CommandPayload {
@@ -215,6 +252,10 @@ impl CommandPayload {
         match self {
             Self::SelectPreview { .. } | Self::Cut | Self::Fade { .. } => BASE_PROTOCOL_VERSION,
             Self::Wipe { .. } => WIPE_PROTOCOL_VERSION,
+            Self::StartManualTransition { .. }
+            | Self::SetManualTransitionPosition { .. }
+            | Self::CommitManualTransition
+            | Self::CancelManualTransition => MANUAL_TRANSITION_PROTOCOL_VERSION,
         }
     }
 

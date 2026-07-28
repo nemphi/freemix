@@ -7,9 +7,9 @@ use fm_client::{
 use fm_protocol::{
     CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, ClientType, CommandPayload, CommandResult,
     EngineIdentity, EventCursor, EventMessage, EventPayload, HandshakeOutcome, HandshakeResponse,
-    ProtocolVersion, ResumeCursor, Role, RuntimeEventMessage, RuntimeLifecycleEvent,
-    ServerIdentity, SnapshotMessage, SnapshotReason, WIPE_PROTOCOL_VERSION, WireInputId,
-    WireMessage,
+    MANUAL_TRANSITION_PROTOCOL_VERSION, ManualTransitionKind, ProtocolVersion, ResumeCursor, Role,
+    RuntimeEventMessage, RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage, SnapshotReason,
+    WIPE_PROTOCOL_VERSION, WireInputId, WireMessage,
 };
 use fm_types::ProjectId;
 
@@ -592,6 +592,54 @@ fn new_client_does_not_send_wipe_after_negotiating_with_an_old_daemon() {
         .unwrap();
     assert_eq!(cut.id, "diagnostic-a:1");
     assert_eq!(cut.protocol, ProtocolVersion::new(1, 0));
+}
+
+#[test]
+fn unresolved_manual_intent_blocks_fifo_after_reconnect_downgrade() {
+    let mut client = ready_client(3);
+    let manual = client
+        .queue_command(
+            CommandPayload::StartManualTransition {
+                kind: ManualTransitionKind::Fade,
+            },
+            "manual-start",
+            Some(4),
+            None,
+        )
+        .unwrap();
+    assert!(matches!(
+        client.pop_outbound(),
+        Some(Outbound::Command(ref queued)) if queued == &manual
+    ));
+    client
+        .queue_command(CommandPayload::Cut, "later-cut", Some(4), None)
+        .unwrap();
+
+    let _ = client.transport_disconnected();
+    client.start_connect().unwrap();
+    let cursor = client.transport_connected().unwrap().resume_cursor.unwrap();
+    client
+        .accept_handshake(handshake_version(WIPE_PROTOCOL_VERSION, 4, Some(cursor)))
+        .unwrap();
+    assert_eq!(client.state(), &ConnectionState::Ready);
+    assert_eq!(
+        manual.payload.minimum_protocol_version(),
+        MANUAL_TRANSITION_PROTOCOL_VERSION
+    );
+    assert_eq!(
+        client.command(&manual.id).unwrap().command.protocol,
+        CURRENT_PROTOCOL_VERSION
+    );
+    assert_eq!(
+        client.outbound_len(),
+        1,
+        "the later cut must remain queued behind the sent manual intent"
+    );
+    assert_eq!(
+        client.pop_outbound(),
+        None,
+        "unsupported manual head must block the later cut"
+    );
 }
 
 #[test]

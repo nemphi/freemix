@@ -19,12 +19,13 @@ use fm_auth::{AuthorizationDenial, CommandClass, Policy, Principal};
 use fm_command::{CommandReceipt, DurableEvent, IdempotencyKey, RejectionCode};
 use fm_engine::{
     Engine, EngineAcceptance, EngineCommand, EngineCommandOutcome, EngineError, EngineEvent,
-    EnginePrepareOutcome, EngineSnapshot, FrameResult, PreparedEngineExecution, SnapshotError,
+    EngineManualTransitionKind, EngineManualTransitionPosition, EnginePrepareOutcome,
+    EngineSnapshot, FrameResult, PreparedEngineExecution, SnapshotError,
 };
 use fm_protocol::{
     CommandMessage, CommandPayload, CommandResult, EngineIdentity, EventCursor, EventMessage,
-    EventPayload, FieldIssue, RuntimeEventMessage, RuntimeLifecycleEvent, ServerIdentity,
-    SnapshotMessage, WireInputId, WireMessage,
+    EventPayload, FieldIssue, ManualTransitionKind, RuntimeEventMessage, RuntimeLifecycleEvent,
+    ServerIdentity, SnapshotMessage, WireInputId, WireMessage,
 };
 
 /// Target-free authorization called before an engine command is constructed or validated.
@@ -669,9 +670,13 @@ impl<A: AuthorizationHook> ControlService<A> {
 
         let command_class = match message.payload {
             CommandPayload::SelectPreview { .. } => CommandClass::SelectPreview,
-            CommandPayload::Cut | CommandPayload::Fade { .. } | CommandPayload::Wipe { .. } => {
-                CommandClass::Transition
-            }
+            CommandPayload::Cut
+            | CommandPayload::Fade { .. }
+            | CommandPayload::Wipe { .. }
+            | CommandPayload::StartManualTransition { .. }
+            | CommandPayload::SetManualTransitionPosition { .. }
+            | CommandPayload::CommitManualTransition
+            | CommandPayload::CancelManualTransition => CommandClass::Transition,
         };
         if let Err(denial) = self.authorizer.authorize(principal, command_class) {
             let result = CommandResult::Rejected {
@@ -705,6 +710,21 @@ impl<A: AuthorizationHook> ControlService<A> {
             CommandPayload::Cut => EngineCommand::Cut,
             CommandPayload::Fade { duration_frames } => EngineCommand::Fade { duration_frames },
             CommandPayload::Wipe { duration_frames } => EngineCommand::Wipe { duration_frames },
+            CommandPayload::StartManualTransition { kind } => {
+                EngineCommand::StartManualTransition {
+                    kind: match kind {
+                        ManualTransitionKind::Fade => EngineManualTransitionKind::Fade,
+                        ManualTransitionKind::Wipe => EngineManualTransitionKind::Wipe,
+                    },
+                }
+            }
+            CommandPayload::SetManualTransitionPosition { position } => {
+                EngineCommand::SetManualTransitionPosition {
+                    position: engine_manual_position(position),
+                }
+            }
+            CommandPayload::CommitManualTransition => EngineCommand::CommitManualTransition,
+            CommandPayload::CancelManualTransition => EngineCommand::CancelManualTransition,
         };
         match self
             .engine
@@ -953,6 +973,13 @@ impl<A: AuthorizationHook> ControlService<A> {
         }
         failures
     }
+}
+
+fn engine_manual_position(
+    position: fm_protocol::ManualTransitionPosition,
+) -> EngineManualTransitionPosition {
+    EngineManualTransitionPosition::new(position.basis_points())
+        .expect("protocol manual position is bounded")
 }
 
 fn command_result(receipt: &CommandReceipt<EngineAcceptance>) -> CommandResult {

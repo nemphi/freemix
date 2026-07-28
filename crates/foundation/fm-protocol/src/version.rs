@@ -2,7 +2,8 @@ use core::fmt;
 
 pub const BASE_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 0);
 pub const WIPE_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 3);
-pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = WIPE_PROTOCOL_VERSION;
+pub const MANUAL_TRANSITION_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 4);
+pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = MANUAL_TRANSITION_PROTOCOL_VERSION;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ProtocolVersion {

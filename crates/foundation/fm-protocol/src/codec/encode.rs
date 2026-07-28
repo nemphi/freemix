@@ -180,6 +180,26 @@ fn encode_command(record: &mut Record, message: &CommandMessage) -> Result<(), C
             record.field("payload", "wipe")?;
             record.field("duration_frames", duration_frames)?;
         }
+        CommandPayload::StartManualTransition { kind } => {
+            record.field("payload", "manual_start")?;
+            record.field(
+                "transition",
+                match kind {
+                    crate::ManualTransitionKind::Fade => "fade",
+                    crate::ManualTransitionKind::Wipe => "wipe",
+                },
+            )?;
+        }
+        CommandPayload::SetManualTransitionPosition { position } => {
+            record.field("payload", "manual_position")?;
+            record.field("position_basis_points", position.basis_points())?;
+        }
+        CommandPayload::CommitManualTransition => {
+            record.field("payload", "manual_commit")?;
+        }
+        CommandPayload::CancelManualTransition => {
+            record.field("payload", "manual_cancel")?;
+        }
     }
     Ok(())
 }

@@ -3844,7 +3844,12 @@ fn command_ticks(command: &CommandMessage) -> u32 {
         CommandPayload::Fade { duration_frames } | CommandPayload::Wipe { duration_frames } => {
             duration_frames
         }
-        CommandPayload::SelectPreview { .. } | CommandPayload::Cut => 1,
+        CommandPayload::SelectPreview { .. }
+        | CommandPayload::Cut
+        | CommandPayload::StartManualTransition { .. }
+        | CommandPayload::SetManualTransitionPosition { .. }
+        | CommandPayload::CommitManualTransition
+        | CommandPayload::CancelManualTransition => 1,
     }
 }
 

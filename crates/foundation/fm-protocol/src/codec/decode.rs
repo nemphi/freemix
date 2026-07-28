@@ -301,6 +301,36 @@ fn decode_command(fields: &mut Fields) -> Result<CommandMessage, CodecError> {
         "wipe" => CommandPayload::Wipe {
             duration_frames: fields.parse_required("duration_frames")?,
         },
+        "manual_start" => {
+            let value = fields.required("transition")?;
+            let kind = match value.as_str() {
+                "fade" => crate::ManualTransitionKind::Fade,
+                "wipe" => crate::ManualTransitionKind::Wipe,
+                _ => {
+                    return Err(CodecError::InvalidField {
+                        field: "transition",
+                        value,
+                    });
+                }
+            };
+            CommandPayload::StartManualTransition { kind }
+        }
+        "manual_position" => {
+            let value = fields.required("position_basis_points")?;
+            let basis_points = value.parse().map_err(|_| CodecError::InvalidField {
+                field: "position_basis_points",
+                value: value.clone(),
+            })?;
+            let position = crate::ManualTransitionPosition::new(basis_points).ok_or(
+                CodecError::InvalidField {
+                    field: "position_basis_points",
+                    value,
+                },
+            )?;
+            CommandPayload::SetManualTransitionPosition { position }
+        }
+        "manual_commit" => CommandPayload::CommitManualTransition,
+        "manual_cancel" => CommandPayload::CancelManualTransition,
         _ => {
             return Err(CodecError::InvalidField {
                 field: "payload",

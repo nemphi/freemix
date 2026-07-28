@@ -4,8 +4,9 @@ use fm_auth::{Policy, Principal, Role, SessionId, UserId};
 use fm_clock::ClockDomainId;
 use fm_engine::{Engine, ShowState};
 use fm_protocol::{
-    CommandMessage, CommandPayload, CommandResult, EngineIdentity, EventCursor, ProtocolVersion,
-    RuntimeLifecycleEvent, ServerIdentity, WireInputId, WireMessage,
+    CommandMessage, CommandPayload, CommandResult, EngineIdentity, EventCursor,
+    ManualTransitionKind, ManualTransitionPosition, ProtocolVersion, RuntimeLifecycleEvent,
+    ServerIdentity, WireInputId, WireMessage,
 };
 use fm_types::{FrameRate, InputId};
 
@@ -110,6 +111,93 @@ fn authorization_runs_before_detailed_command_validation() {
         panic!("zero fade should be rejected");
     };
     assert_eq!(code, "invalid_command");
+}
+
+#[test]
+fn manual_transition_is_authorized_durable_reversible_and_replay_safe() {
+    let mut control = service(16, 8);
+    let denied = control
+        .submit(
+            &principal(Role::Viewer),
+            command(
+                "denied-manual",
+                "denied-manual-key",
+                CommandPayload::StartManualTransition {
+                    kind: ManualTransitionKind::Fade,
+                },
+            ),
+            0,
+        )
+        .unwrap();
+    assert!(matches!(
+        denied.output.result,
+        CommandResult::Rejected { ref code, .. } if code == "permission_denied"
+    ));
+    assert_eq!(control.diagnostics().current_revision, 0);
+
+    let commands = [
+        (
+            "manual-start",
+            CommandPayload::StartManualTransition {
+                kind: ManualTransitionKind::Wipe,
+            },
+        ),
+        (
+            "manual-forward",
+            CommandPayload::SetManualTransitionPosition {
+                position: ManualTransitionPosition::new(8_000).unwrap(),
+            },
+        ),
+        (
+            "manual-reverse",
+            CommandPayload::SetManualTransitionPosition {
+                position: ManualTransitionPosition::new(2_500).unwrap(),
+            },
+        ),
+    ];
+    for (id, payload) in commands {
+        let message = command(id, id, payload);
+        let accepted = control
+            .submit(&principal(Role::Operator), message.clone(), 0)
+            .unwrap();
+        assert!(matches!(
+            accepted.output.result,
+            CommandResult::Accepted { .. }
+        ));
+        control.tick(&server_identity()).unwrap();
+        let replay = control
+            .submit(&principal(Role::Operator), message, 0)
+            .unwrap();
+        assert!(replay.replayed);
+        assert!(replay.output.events.is_empty());
+    }
+    assert_eq!(
+        control
+            .engine
+            .realized_switcher()
+            .t_bar()
+            .unwrap()
+            .position()
+            .basis_points(),
+        2_500
+    );
+    assert!(control.idle_engine_snapshot().is_ok());
+
+    control
+        .submit(
+            &principal(Role::Operator),
+            command(
+                "manual-cancel",
+                "manual-cancel",
+                CommandPayload::CancelManualTransition,
+            ),
+            0,
+        )
+        .unwrap();
+    control.tick(&server_identity()).unwrap();
+    assert!(control.engine.realized_switcher().t_bar().is_none());
+    assert_eq!(control.engine.realized_switcher().program(), input(1));
+    assert_eq!(control.diagnostics().current_revision, 4);
 }
 
 #[test]

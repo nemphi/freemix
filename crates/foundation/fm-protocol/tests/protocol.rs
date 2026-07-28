@@ -6,8 +6,9 @@ use fm_protocol::{
     CapabilityReportSummary, ClientHello, ClientType, CodecError, CommandMessage, CommandPayload,
     CommandResult, DurableEvent, DurableEventBatch, DurableGap, EngineIdentity, ErrorMessage,
     EventCursor, EventMessage, EventPayload, FieldIssue, HandshakeOutcome, HandshakeRequest,
-    HandshakeResponse, HeartbeatMessage, LineDecoder, MAX_FIELD_VALUE_BYTES,
-    MAX_FIELDS_PER_MESSAGE, MAX_LINE_BYTES, MAX_LIST_ITEMS, MAX_MESSAGES_PER_PUSH, ProtocolVersion,
+    HandshakeResponse, HeartbeatMessage, LineDecoder, MANUAL_TRANSITION_PROTOCOL_VERSION,
+    MAX_FIELD_VALUE_BYTES, MAX_FIELDS_PER_MESSAGE, MAX_LINE_BYTES, MAX_LIST_ITEMS,
+    MAX_MESSAGES_PER_PUSH, ManualTransitionKind, ManualTransitionPosition, ProtocolVersion,
     ResumeCursor, Role, RuntimeDomainBoundary, RuntimeEventMessage, RuntimeFailureDisposition,
     RuntimeLifecycleEvent, ServerHello, ServerIdentity, SnapshotMessage, SnapshotReason,
     StructuredError, WIPE_PROTOCOL_VERSION, WireInputId, WireMessage, choose_handshake_outcome,
@@ -101,7 +102,7 @@ fn additive_wipe_command_has_a_stable_wire_form_without_changing_existing_bytes(
 
     let fixture = include_str!("fixtures/command_wipe.wire");
     let message = WireMessage::Command(CommandMessage {
-        protocol: CURRENT_PROTOCOL_VERSION,
+        protocol: WIPE_PROTOCOL_VERSION,
         payload: CommandPayload::Wipe {
             duration_frames: 45,
         },
@@ -194,7 +195,42 @@ fn every_message_variant_round_trips() {
 }
 
 #[test]
-fn command_minimum_versions_gate_only_wipe() {
+fn manual_transition_commands_have_stable_exact_wire_forms() {
+    let cases = [
+        (
+            include_str!("fixtures/command_manual_start.wire"),
+            CommandPayload::StartManualTransition {
+                kind: ManualTransitionKind::Wipe,
+            },
+        ),
+        (
+            include_str!("fixtures/command_manual_position.wire"),
+            CommandPayload::SetManualTransitionPosition {
+                position: ManualTransitionPosition::new(6_250).unwrap(),
+            },
+        ),
+        (
+            include_str!("fixtures/command_manual_commit.wire"),
+            CommandPayload::CommitManualTransition,
+        ),
+        (
+            include_str!("fixtures/command_manual_cancel.wire"),
+            CommandPayload::CancelManualTransition,
+        ),
+    ];
+    for (fixture, payload) in cases {
+        let message = WireMessage::Command(CommandMessage {
+            protocol: MANUAL_TRANSITION_PROTOCOL_VERSION,
+            payload,
+            ..command()
+        });
+        assert_eq!(encode_line(&message).unwrap(), fixture);
+        assert_eq!(decode_line(fixture).unwrap(), message);
+    }
+}
+
+#[test]
+fn command_minimum_versions_gate_wipe_and_manual_transitions() {
     for payload in [
         CommandPayload::SelectPreview { input: input(1) },
         CommandPayload::Cut,
@@ -206,10 +242,37 @@ fn command_minimum_versions_gate_only_wipe() {
 
     let wipe = CommandPayload::Wipe { duration_frames: 1 };
     assert_eq!(WIPE_PROTOCOL_VERSION, ProtocolVersion::new(1, 3));
-    assert_eq!(CURRENT_PROTOCOL_VERSION, WIPE_PROTOCOL_VERSION);
     assert_eq!(wipe.minimum_protocol_version(), WIPE_PROTOCOL_VERSION);
     assert!(!wipe.is_supported_by(ProtocolVersion::new(1, 2)));
     assert!(wipe.is_supported_by(CURRENT_PROTOCOL_VERSION));
+
+    let manual = CommandPayload::SetManualTransitionPosition {
+        position: ManualTransitionPosition::new(5_000).unwrap(),
+    };
+    assert_eq!(
+        MANUAL_TRANSITION_PROTOCOL_VERSION,
+        ProtocolVersion::new(1, 4)
+    );
+    assert_eq!(CURRENT_PROTOCOL_VERSION, MANUAL_TRANSITION_PROTOCOL_VERSION);
+    assert_eq!(
+        manual.minimum_protocol_version(),
+        MANUAL_TRANSITION_PROTOCOL_VERSION
+    );
+    assert!(!manual.is_supported_by(WIPE_PROTOCOL_VERSION));
+    assert!(manual.is_supported_by(CURRENT_PROTOCOL_VERSION));
+}
+
+#[test]
+fn decoder_rejects_out_of_range_manual_position() {
+    let fixture = include_str!("fixtures/command_manual_position.wire");
+    let invalid = fixture.replace("position_basis_points=6250", "position_basis_points=10001");
+    assert!(matches!(
+        decode_line(&invalid),
+        Err(CodecError::InvalidField {
+            field: "position_basis_points",
+            ..
+        })
+    ));
 }
 
 #[test]

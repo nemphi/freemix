@@ -6,8 +6,8 @@ use fm_command::{
     StateEpoch,
 };
 use fm_engine::{
-    Engine, EngineCommand, EngineError, EnginePrepareOutcome, EngineRestoreState, EngineSnapshot,
-    ShowState, SnapshotError,
+    Engine, EngineCommand, EngineError, EngineManualTransitionKind, EngineManualTransitionPosition,
+    EnginePrepareOutcome, EngineRestoreState, EngineSnapshot, ShowState, SnapshotError,
 };
 use fm_scheduler::FrameNumber;
 use fm_switcher::{SwitcherEvent, SwitcherState, TransitionKind};
@@ -434,6 +434,131 @@ fn fade_renders_exactly_the_requested_number_of_frames() {
     let after = engine.tick().unwrap();
     assert_eq!(after.program.primary, input(2));
     assert_eq!(after.program.secondary, None);
+}
+
+#[test]
+fn manual_transition_holds_reverses_commits_and_restores_exactly() {
+    let mut engine = engine();
+    engine
+        .execute(
+            envelope(
+                "manual-start",
+                EngineCommand::StartManualTransition {
+                    kind: EngineManualTransitionKind::Fade,
+                },
+            ),
+            0,
+        )
+        .unwrap();
+    let start = engine.tick().unwrap();
+    assert_eq!(
+        (
+            start.program.mix_start_numerator,
+            start.program.mix_end_numerator,
+            start.program.mix_denominator,
+        ),
+        (0, 0, 10_000)
+    );
+
+    engine
+        .execute(
+            envelope(
+                "manual-forward",
+                EngineCommand::SetManualTransitionPosition {
+                    position: EngineManualTransitionPosition::new(8_000).unwrap(),
+                },
+            ),
+            0,
+        )
+        .unwrap();
+    let forward = engine.tick().unwrap();
+    assert_eq!(
+        (
+            forward.program.mix_start_numerator,
+            forward.program.mix_end_numerator,
+        ),
+        (0, 8_000)
+    );
+
+    engine
+        .execute(
+            envelope(
+                "manual-reverse",
+                EngineCommand::SetManualTransitionPosition {
+                    position: EngineManualTransitionPosition::new(2_500).unwrap(),
+                },
+            ),
+            0,
+        )
+        .unwrap();
+    let reverse = engine.tick().unwrap();
+    assert_eq!(
+        (
+            reverse.program.mix_start_numerator,
+            reverse.program.mix_end_numerator,
+        ),
+        (8_000, 2_500)
+    );
+
+    let held = engine.tick().unwrap();
+    assert_eq!(
+        (
+            held.program.mix_start_numerator,
+            held.program.mix_end_numerator,
+        ),
+        (2_500, 2_500)
+    );
+
+    let snapshot = engine.snapshot().unwrap();
+    let mut restored = Engine::restore(snapshot).unwrap();
+    assert_eq!(
+        restored
+            .realized_switcher()
+            .t_bar()
+            .unwrap()
+            .position()
+            .basis_points(),
+        2_500
+    );
+    restored
+        .execute(
+            envelope("manual-commit", EngineCommand::CommitManualTransition),
+            0,
+        )
+        .unwrap();
+    let committed = restored.tick().unwrap();
+    assert_eq!(committed.program.primary, input(2));
+    assert!(committed.program.secondary.is_none());
+    assert_eq!(restored.realized_switcher().program(), input(2));
+    assert!(restored.realized_switcher().t_bar().is_none());
+    assert_eq!(restored.snapshot().unwrap().receipts().len(), 4);
+}
+
+#[test]
+fn cancelling_manual_transition_preserves_program_and_preview() {
+    let mut engine = engine();
+    for (key, command) in [
+        (
+            "manual-start",
+            EngineCommand::StartManualTransition {
+                kind: EngineManualTransitionKind::Wipe,
+            },
+        ),
+        (
+            "manual-position",
+            EngineCommand::SetManualTransitionPosition {
+                position: EngineManualTransitionPosition::new(7_500).unwrap(),
+            },
+        ),
+        ("manual-cancel", EngineCommand::CancelManualTransition),
+    ] {
+        engine.execute(envelope(key, command), 0).unwrap();
+        engine.tick().unwrap();
+    }
+    assert_eq!(engine.realized_switcher().program(), input(1));
+    assert_eq!(engine.realized_switcher().preview(), input(2));
+    assert!(engine.realized_switcher().t_bar().is_none());
+    assert_eq!(engine.revision(), Revision::new(3));
 }
 
 #[test]

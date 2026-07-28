@@ -13,12 +13,12 @@ pub use dto::{
     CapabilityReportMessage, CapabilityReportSummary, ClientHello, ClientType, CommandMessage,
     CommandPayload, CommandResult, DurableEvent, DurableEventBatch, DurableGap, EngineIdentity,
     ErrorMessage, EventCursor, EventMessage, EventPayload, FieldIssue, HandshakeOutcome,
-    HandshakeRequest, HandshakeResponse, HeartbeatMessage, ResumeCursor, Role,
-    RuntimeDomainBoundary, RuntimeEventMessage, RuntimeFailureDisposition, RuntimeLifecycleEvent,
-    ServerHello, ServerIdentity, SnapshotMessage, SnapshotReason, StructuredError, WireInputId,
-    WireMessage, choose_handshake_outcome,
+    HandshakeRequest, HandshakeResponse, HeartbeatMessage, ManualTransitionKind,
+    ManualTransitionPosition, ResumeCursor, Role, RuntimeDomainBoundary, RuntimeEventMessage,
+    RuntimeFailureDisposition, RuntimeLifecycleEvent, ServerHello, ServerIdentity, SnapshotMessage,
+    SnapshotReason, StructuredError, WireInputId, WireMessage, choose_handshake_outcome,
 };
 pub use version::{
-    BASE_PROTOCOL_VERSION, CURRENT_PROTOCOL_VERSION, NegotiationError, ProtocolVersion,
-    WIPE_PROTOCOL_VERSION, negotiate_version,
+    BASE_PROTOCOL_VERSION, CURRENT_PROTOCOL_VERSION, MANUAL_TRANSITION_PROTOCOL_VERSION,
+    NegotiationError, ProtocolVersion, WIPE_PROTOCOL_VERSION, negotiate_version,
 };
