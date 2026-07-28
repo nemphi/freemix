@@ -9,12 +9,13 @@ use std::{
     thread,
 };
 
-use fm_color::{ColorPipeline, NativeImportNormalizer, working_color_metadata};
+use fm_color::{ColorPipeline, LinearFrame, NativeImportNormalizer, working_color_metadata};
 use fm_compositor::{
-    CpuSourceFrame, CropRect, NativeCompositionRenderer, NativeSourceFrame,
-    NativeTransitionRenderer, OutputTarget, RectMask, Rgba8, Rotation, Scene, SourceId,
-    SourceLayer, Transform, TransitionKind, TransitionPlan, compile_scene, execute_cpu,
-    execute_transition, image_from_cpu_frame,
+    CpuSourceFrame, CropRect, FadeToBlackPlan, FadeToBlackPosition, NativeCompositionRenderer,
+    NativeFadeToBlackRenderer, NativeSourceFrame, NativeTransitionRenderer, OutputTarget, RectMask,
+    Rgba8, Rotation, Scene, SourceId, SourceLayer, Transform, TransitionKind, TransitionPlan,
+    compile_scene, execute_cpu, execute_fade_to_black_cpu, execute_transition,
+    image_from_cpu_frame,
 };
 use fm_frame::{
     AlphaMode, ChromaLocation, ClockDomainId, ColorMetadata, ColorPrimaries, CpuVideoFrame,
@@ -138,6 +139,33 @@ fn assert_rgba16f_matches_cpu(output: &fm_gpu::NativeTextureReadback, expected: 
             // float/half arithmetic, so parity is intentionally tolerance-based.
             assert!(
                 (actual - expected).abs() <= 0.006,
+                "pixel {pixel_index}, component {component_index}: GPU {actual}, CPU {expected}"
+            );
+        }
+    }
+}
+
+fn assert_rgba16f_matches_linear(output: &fm_gpu::NativeTextureReadback, expected: &LinearFrame) {
+    assert_eq!(output.format, TextureFormat::Rgba16Float);
+    assert_eq!(
+        (output.width, output.height),
+        (expected.width(), expected.height())
+    );
+    assert_eq!(output.stride, expected.width() * 8);
+    for (pixel_index, (actual, expected)) in output
+        .bytes
+        .chunks_exact(8)
+        .zip(expected.pixels())
+        .enumerate()
+    {
+        for (component_index, (actual, expected)) in actual
+            .chunks_exact(2)
+            .zip([expected.r, expected.g, expected.b, expected.a])
+            .enumerate()
+        {
+            let actual = f16::from_bits(u16::from_le_bytes([actual[0], actual[1]])).to_f32();
+            assert!(
+                (actual - expected).abs() <= 0.002,
                 "pixel {pixel_index}, component {component_index}: GPU {actual}, CPU {expected}"
             );
         }
@@ -279,6 +307,46 @@ fn native_metal_cut_and_fade_match_cpu_linear_frames() {
                     );
                 }
             }
+        }
+    });
+}
+
+#[test]
+#[ignore = "requires a native macOS Metal adapter"]
+fn native_metal_fade_to_black_matches_the_cpu_oracle() {
+    block_on(async {
+        let program_cpu = frame(
+            21,
+            &[
+                255, 255, 255, 255, 96, 32, 8, 128, 0, 0, 0, 0, 12, 48, 200, 64,
+            ],
+        );
+        let cpu_pipeline = ColorPipeline::new(source_metadata().color(), working_color_metadata());
+        let program_linear = cpu_pipeline
+            .decode_cpu_payload(program_cpu.payload())
+            .unwrap()
+            .frame;
+
+        let context = NativeContext::new([NativeBackend::Metal]).await.unwrap();
+        let normalizer = NativeImportNormalizer::new(&context).await.unwrap();
+        let program = normalizer.normalize(&context, &program_cpu).await.unwrap();
+        let renderer = NativeFadeToBlackRenderer::new(&context).await.unwrap();
+
+        let position =
+            |numerator, denominator| FadeToBlackPosition::compile(numerator, denominator).unwrap();
+        for plan in [
+            FadeToBlackPlan::new(position(0, 1), position(1, 1), position(0, 1)),
+            FadeToBlackPlan::new(position(0, 1), position(1, 1), position(1, 2)),
+            FadeToBlackPlan::new(position(3, 4), position(1, 4), position(1, 2)),
+            FadeToBlackPlan::new(position(1, 1), position(1, 1), position(2, 3)),
+        ] {
+            let expected = execute_fade_to_black_cpu(plan, &program_linear).unwrap();
+            let output = renderer
+                .render(&context, plan, program.texture())
+                .await
+                .unwrap();
+            let actual = context.readback(&output).await.unwrap();
+            assert_rgba16f_matches_linear(&actual, &expected);
         }
     });
 }

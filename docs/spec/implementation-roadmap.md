@@ -585,6 +585,14 @@ path. FTB, AlphaFade, stinger, Slide/Zoom, the remaining transition families,
 and `SW-004` acceptance remain pending; parity therefore stays planned. Item 5
 and RC-007 remain planned.
 
+Compositor-only FTB groundwork now admits a bounded exact-rational start, end,
+and progress plan, including hold and reverse trajectories. Its CPU oracle and
+native wgpu path apply the plan after canonical RGBA16F Program composition by
+mixing premultiplied linear RGBA toward opaque black, without color conversion,
+audio work, or production readback. No switcher, engine, protocol, persistence,
+operator control, output-routing integration, or acceptance evidence is exposed
+by this slice, so Phase 3 item 5 and `SW-004` remain planned.
+
 Exit: `P0` switcher, composition, audio, display, record, and control rows pass.
 
 ## 6. Phase 4 — output, stream, and headless reliability (10–14 weeks)

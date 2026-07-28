@@ -9,7 +9,8 @@ use fm_gpu::{
 use fm_video::{CropRect, Rotation, Transform};
 
 use crate::{
-    CompositionPlan, RectMask, SourceId, TransitionKind, TransitionPlan, transition::wipe_boundary,
+    CompositionPlan, FadeToBlackPlan, RectMask, SourceId, TransitionKind, TransitionPlan,
+    transition::wipe_boundary,
 };
 
 /// Maximum width or height accepted for a native layer transform.
@@ -135,6 +136,54 @@ fn transition_fragment(@builtin(position) position: vec4<f32>) -> @location(0) v
         return source;
     }
     return mix(source, destination, f32(transition.numerator) / f32(transition.denominator));
+}
+";
+
+const FADE_TO_BLACK_UNIFORM_SIZE: usize = 32;
+
+const FADE_TO_BLACK_FRAGMENT_SHADER: &str = r"
+struct FadeToBlackUniform {
+    start_numerator: u32,
+    start_denominator: u32,
+    end_numerator: u32,
+    end_denominator: u32,
+    progress_numerator: u32,
+    progress_denominator: u32,
+    padding_0: u32,
+    padding_1: u32,
+};
+
+@group(0) @binding(0) var program_texture: texture_2d<f32>;
+@group(0) @binding(1) var unused_program_texture: texture_2d<f32>;
+@group(0) @binding(2) var<uniform> ftb: FadeToBlackUniform;
+
+fn ratio(numerator: u32, denominator: u32) -> f32 {
+    return f32(numerator) / f32(denominator);
+}
+
+@fragment
+fn fade_to_black_fragment(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
+    let coordinates = vec2<i32>(position.xy);
+    let source = textureLoad(program_texture, coordinates, 0);
+    let start = ratio(ftb.start_numerator, ftb.start_denominator);
+    let end = ratio(ftb.end_numerator, ftb.end_denominator);
+    var fade_position = start;
+    if ftb.progress_numerator == ftb.progress_denominator {
+        fade_position = end;
+    } else if ftb.progress_numerator != 0u {
+        fade_position = mix(
+            start,
+            end,
+            ratio(ftb.progress_numerator, ftb.progress_denominator),
+        );
+    }
+    if fade_position <= 0.0 {
+        return source;
+    }
+    if fade_position >= 1.0 {
+        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    }
+    return mix(source, vec4<f32>(0.0, 0.0, 0.0, 1.0), fade_position);
 }
 ";
 
@@ -570,6 +619,127 @@ const fn rotated_dimensions(transform: Transform) -> (u32, u32) {
     }
 }
 
+/// Errors produced by native Fade-to-Black application.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NativeFadeToBlackError {
+    SourceFormat { actual: TextureFormat },
+    Gpu(NativeGpuError),
+}
+
+impl fmt::Display for NativeFadeToBlackError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SourceFormat { actual } => write!(
+                formatter,
+                "Fade-to-Black source has native format {actual:?}; expected Rgba16Float"
+            ),
+            Self::Gpu(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for NativeFadeToBlackError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Gpu(error) => Some(error),
+            Self::SourceFormat { .. } => None,
+        }
+    }
+}
+
+impl From<NativeGpuError> for NativeFadeToBlackError {
+    fn from(value: NativeGpuError) -> Self {
+        Self::Gpu(value)
+    }
+}
+
+/// Native Fade-to-Black executor for an already composed Program texture.
+pub struct NativeFadeToBlackRenderer {
+    pipeline: NativeFullscreenPipeline,
+}
+
+impl NativeFadeToBlackRenderer {
+    /// Compiles the explicit 32-byte FTB uniform and replacement pipeline.
+    ///
+    /// # Errors
+    ///
+    /// Returns a mapped GPU shader or pipeline validation error.
+    pub async fn new(context: &NativeContext) -> Result<Self, NativeFadeToBlackError> {
+        let pipeline = context
+            .create_fullscreen_pipeline_with_options(
+                ShaderDescriptor::new(
+                    "fm-compositor native Fade-to-Black",
+                    ShaderStage::Fragment,
+                    ShaderLanguage::Wgsl,
+                    "fade_to_black_fragment",
+                    ShaderSource::Text(FADE_TO_BLACK_FRAGMENT_SHADER.to_owned()),
+                ),
+                NativeFullscreenPipelineOptions {
+                    target_format: TextureFormat::Rgba16Float,
+                    blend: NativeFullscreenBlend::Replace,
+                    uniform_size: FADE_TO_BLACK_UNIFORM_SIZE,
+                    source_extent_policy: NativeSourceExtentPolicy::MatchTarget,
+                },
+            )
+            .await?;
+        Ok(Self { pipeline })
+    }
+
+    /// Applies `plan` without color conversion, polling, or CPU readback.
+    ///
+    /// `program` must be the already composed canonical `Rgba16Float`,
+    /// linear-light, premultiplied-alpha Program texture. The returned texture
+    /// has the same dimensions and remains GPU-resident. This operation does
+    /// not inspect or alter audio.
+    ///
+    /// # Errors
+    ///
+    /// Returns a source-format error before output allocation, or a mapped GPU
+    /// resource, context, uniform, or validation error.
+    pub async fn render(
+        &self,
+        context: &NativeContext,
+        plan: FadeToBlackPlan,
+        program: &NativeTexture,
+    ) -> Result<NativeTexture, NativeFadeToBlackError> {
+        validate_fade_to_black_format(program.format())?;
+        let output = context
+            .create_rgba16_float_render_target(program.width(), program.height())
+            .await?;
+        let uniform = encode_fade_to_black_uniform(plan);
+        context
+            .submit_fullscreen(&self.pipeline, program, program, &output, &uniform)
+            .await?;
+        Ok(output)
+    }
+}
+
+fn validate_fade_to_black_format(format: TextureFormat) -> Result<(), NativeFadeToBlackError> {
+    if format == TextureFormat::Rgba16Float {
+        Ok(())
+    } else {
+        Err(NativeFadeToBlackError::SourceFormat { actual: format })
+    }
+}
+
+fn encode_fade_to_black_uniform(plan: FadeToBlackPlan) -> [u8; FADE_TO_BLACK_UNIFORM_SIZE] {
+    let words = [
+        u32::from(plan.start().numerator()),
+        u32::from(plan.start().denominator()),
+        u32::from(plan.end().numerator()),
+        u32::from(plan.end().denominator()),
+        u32::from(plan.progress().numerator()),
+        u32::from(plan.progress().denominator()),
+        0,
+        0,
+    ];
+    let mut bytes = [0; FADE_TO_BLACK_UNIFORM_SIZE];
+    for (chunk, word) in bytes.chunks_exact_mut(4).zip(words) {
+        chunk.copy_from_slice(&word.to_le_bytes());
+    }
+    bytes
+}
+
 /// Errors produced by the native Cut/Fade/Wipe renderer.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NativeTransitionError {
@@ -728,8 +898,8 @@ fn encode_uniform(plan: TransitionPlan, width: u32) -> [u8; 16] {
 mod tests {
     use super::*;
     use crate::{
-        Effect, Key, LumaKey, OutputTarget, RectMask, Rgba8, SafeAreaGuide, Scene, SourceLayer,
-        compile_scene,
+        Effect, FadeToBlackPosition, Key, LumaKey, OutputTarget, RectMask, Rgba8, SafeAreaGuide,
+        Scene, SourceLayer, compile_scene,
     };
 
     fn composition_plan(layer: SourceLayer) -> CompositionPlan {
@@ -937,6 +1107,42 @@ mod tests {
                     actual: TextureFormat::Rgba8Unorm,
                 }
             ))
+        );
+    }
+
+    #[test]
+    fn fade_to_black_plan_has_an_explicit_bounded_uniform_layout() {
+        let plan = FadeToBlackPlan::new(
+            FadeToBlackPosition::compile(3, 4).unwrap(),
+            FadeToBlackPosition::compile(1, 5).unwrap(),
+            FadeToBlackPosition::compile(2, 3).unwrap(),
+        );
+        let uniform = encode_fade_to_black_uniform(plan);
+        let mut words = [0_u32; 8];
+        for (word, bytes) in words.iter_mut().zip(uniform.chunks_exact(4)) {
+            *word = u32::from_le_bytes(bytes.try_into().unwrap());
+        }
+        assert_eq!(uniform.len(), FADE_TO_BLACK_UNIFORM_SIZE);
+        assert_eq!(words, [3, 4, 1, 5, 2, 3, 0, 0]);
+        assert_eq!(
+            validate_fade_to_black_format(TextureFormat::Rgba16Float),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn fade_to_black_rejects_noncanonical_native_inputs() {
+        assert_eq!(
+            validate_fade_to_black_format(TextureFormat::Rgba8Unorm),
+            Err(NativeFadeToBlackError::SourceFormat {
+                actual: TextureFormat::Rgba8Unorm,
+            })
+        );
+        assert_eq!(
+            validate_fade_to_black_format(TextureFormat::Rgba32Float),
+            Err(NativeFadeToBlackError::SourceFormat {
+                actual: TextureFormat::Rgba32Float,
+            })
         );
     }
 }
