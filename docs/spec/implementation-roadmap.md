@@ -680,12 +680,16 @@ exposes a manual AlphaFade start control only for compatible sessions, and
 preserves authoritative AlphaFade projections. Studio advertises protocol 1.7,
 gates its manual AlphaFade start button independently from the existing manual
 controls, and carries AlphaFade intents through the worker into authoritative
-desired and realized presentation.
+desired and realized presentation. A hardware-gated macOS/Metal process
+acceptance drives manual AlphaFade to 75%, reverses to 25%, cancels, then fully
+progresses and commits on a configured Program recorder. It requires the
+corresponding ordered decoded-luma sequence: initial white, forward gray,
+reversed bright, cancelled white, and committed black. It also verifies the
+inactive committed checkpoint.
 
-The remaining AlphaFade manual operator controls, stinger, Slide/Zoom, other
-transition families, cross-platform/fullscreen evidence, and complete `SW-004`
-acceptance remain pending; parity therefore stays planned. Item 5 and RC-007
-remain planned.
+Stinger, Slide/Zoom, other transition families, cross-platform/fullscreen
+evidence, and complete `SW-004` acceptance remain pending; parity therefore
+stays planned. Item 5 and RC-007 remain planned.
 
 FTB groundwork now includes a switcher-owned bounded automatic control core
 alongside the compositor plan. The controller moves from its current exact
