@@ -6,7 +6,7 @@ use fm_types::InputId;
 use crate::{
     ALPHA_FADE_PROTOCOL_VERSION, BASE_PROTOCOL_VERSION, FADE_TO_BLACK_PROTOCOL_VERSION,
     MANUAL_ALPHA_FADE_PROTOCOL_VERSION, MANUAL_TRANSITION_PROTOCOL_VERSION, ProtocolVersion,
-    SLIDE_PROTOCOL_VERSION, WIPE_PROTOCOL_VERSION,
+    SLIDE_PROTOCOL_VERSION, WIPE_PROTOCOL_VERSION, ZOOM_PROTOCOL_VERSION,
 };
 
 /// Stable identity of one project's durable state on one server.
@@ -287,6 +287,7 @@ pub enum CommandPayload {
     Fade { duration_frames: u32 },
     AlphaFade { duration_frames: u32 },
     Slide { duration_frames: u32 },
+    Zoom { duration_frames: u32 },
     Wipe { duration_frames: u32 },
     FadeToBlack { active: bool, duration_frames: u32 },
     StartManualTransition { kind: ManualTransitionKind },
@@ -302,6 +303,7 @@ impl CommandPayload {
             Self::SelectPreview { .. } | Self::Cut | Self::Fade { .. } => BASE_PROTOCOL_VERSION,
             Self::AlphaFade { .. } => ALPHA_FADE_PROTOCOL_VERSION,
             Self::Slide { .. } => SLIDE_PROTOCOL_VERSION,
+            Self::Zoom { .. } => ZOOM_PROTOCOL_VERSION,
             Self::Wipe { .. } => WIPE_PROTOCOL_VERSION,
             Self::FadeToBlack { .. } => FADE_TO_BLACK_PROTOCOL_VERSION,
             Self::StartManualTransition {

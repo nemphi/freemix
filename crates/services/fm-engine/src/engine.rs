@@ -79,6 +79,9 @@ pub enum EngineCommand {
     Slide {
         duration_frames: u32,
     },
+    Zoom {
+        duration_frames: u32,
+    },
     Wipe {
         duration_frames: u32,
     },
@@ -515,8 +518,9 @@ impl Engine {
                         TransitionKind::Fade => "fade",
                         TransitionKind::AlphaFade => "alpha fade",
                         TransitionKind::Slide => "slide",
+                        TransitionKind::Zoom => "zoom",
                         TransitionKind::Wipe => "wipe",
-                        _ => "timed",
+                        TransitionKind::Stinger(_) => "stinger",
                     };
                     return Err(Rejection::new(
                         RejectionCode::Conflict,
@@ -538,6 +542,7 @@ impl Engine {
                 EngineCommand::Fade { .. } => Some(TransitionKind::Fade),
                 EngineCommand::AlphaFade { .. } => Some(TransitionKind::AlphaFade),
                 EngineCommand::Slide { .. } => Some(TransitionKind::Slide),
+                EngineCommand::Zoom { .. } => Some(TransitionKind::Zoom),
                 EngineCommand::Wipe { .. } => Some(TransitionKind::Wipe),
                 EngineCommand::SelectPreview(_)
                 | EngineCommand::Cut
@@ -830,6 +835,10 @@ impl Mutation<ShowState, EngineEvent, EngineAcceptance> for EngineMutation {
                 validate_transition_duration("slide", duration_frames)?;
                 SwitcherCommand::Cut
             }
+            EngineCommand::Zoom { duration_frames } => {
+                validate_transition_duration("zoom", duration_frames)?;
+                SwitcherCommand::Cut
+            }
             EngineCommand::Wipe { duration_frames } => {
                 validate_transition_duration("wipe", duration_frames)?;
                 SwitcherCommand::Cut
@@ -891,6 +900,10 @@ fn apply_runtime(
         },
         EngineCommand::Slide { duration_frames } => SwitcherCommand::Transition {
             kind: TransitionKind::Slide,
+            duration_frames,
+        },
+        EngineCommand::Zoom { duration_frames } => SwitcherCommand::Transition {
+            kind: TransitionKind::Zoom,
             duration_frames,
         },
         EngineCommand::Wipe { duration_frames } => SwitcherCommand::Wipe { duration_frames },

@@ -12,7 +12,7 @@ use fm_protocol::{
     ManualTransitionKind, ManualTransitionPosition, ManualTransitionState, ManualTransitionStatus,
     ProtocolVersion, ResumeCursor, Role, RuntimeEventMessage, RuntimeLifecycleEvent,
     SLIDE_PROTOCOL_VERSION, ServerIdentity, SnapshotMessage, SnapshotReason, WIPE_PROTOCOL_VERSION,
-    WireInputId, WireMessage,
+    WireInputId, WireMessage, ZOOM_PROTOCOL_VERSION,
 };
 use fm_types::ProjectId;
 use fm_ui_model::ManualTransitionStatus as ModelManualTransitionStatus;
@@ -792,7 +792,7 @@ fn slide_is_queued_only_on_protocol_1_8() {
             None,
         )
         .unwrap();
-    assert_eq!(command.protocol, SLIDE_PROTOCOL_VERSION);
+    assert_eq!(command.protocol, CURRENT_PROTOCOL_VERSION);
 
     let mut old = Client::new(config(2)).unwrap();
     old.start_connect().unwrap();
@@ -814,6 +814,42 @@ fn slide_is_queued_only_on_protocol_1_8() {
         Err(ClientError::UnsupportedCommandVersion {
             negotiated: MANUAL_ALPHA_FADE_PROTOCOL_VERSION,
             required: SLIDE_PROTOCOL_VERSION,
+        })
+    );
+    assert_eq!(old.outbound_len(), 0);
+}
+
+#[test]
+fn zoom_is_queued_only_on_protocol_1_9() {
+    let mut current = ready_client(1);
+    let command = current
+        .queue_command(
+            CommandPayload::Zoom {
+                duration_frames: 45,
+            },
+            "zoom-45",
+            Some(4),
+            None,
+        )
+        .unwrap();
+    assert_eq!(command.protocol, ZOOM_PROTOCOL_VERSION);
+
+    let mut old = Client::new(config(2)).unwrap();
+    old.start_connect().unwrap();
+    old.transport_connected().unwrap();
+    old.accept_handshake(handshake_version(SLIDE_PROTOCOL_VERSION, 4, None))
+        .unwrap();
+    old.apply_snapshot(snapshot(4)).unwrap();
+    assert_eq!(
+        old.queue_command(
+            CommandPayload::Zoom { duration_frames: 3 },
+            "unsupported-zoom",
+            Some(4),
+            None,
+        ),
+        Err(ClientError::UnsupportedCommandVersion {
+            negotiated: SLIDE_PROTOCOL_VERSION,
+            required: ZOOM_PROTOCOL_VERSION,
         })
     );
     assert_eq!(old.outbound_len(), 0);

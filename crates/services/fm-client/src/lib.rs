@@ -981,6 +981,7 @@ impl Client {
             | CommandPayload::Fade { .. }
             | CommandPayload::AlphaFade { .. }
             | CommandPayload::Slide { .. }
+            | CommandPayload::Zoom { .. }
             | CommandPayload::Wipe { .. }
             | CommandPayload::FadeToBlack { .. }
             | CommandPayload::StartManualTransition { .. }

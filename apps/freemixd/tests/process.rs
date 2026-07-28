@@ -411,6 +411,42 @@ fn old_client_wipe_is_rejected_before_durable_acceptance() {
 }
 
 #[test]
+fn protocol_1_8_zoom_is_rejected_before_durable_acceptance() {
+    let directory = TestDirectory::new("old-client-zoom");
+    let project_path = directory.project_path();
+    create_project(&project_path);
+
+    let daemon = Daemon::start(&project_path);
+    let mut client = daemon.connect();
+    let old_version = ProtocolVersion::new(1, 8);
+    let hello = client.handshake_version(old_version, None);
+    assert_eq!(hello.negotiated, old_version);
+    assert!(matches!(client.receive(), WireMessage::Snapshot(_)));
+
+    client.send(&command_version(
+        old_version,
+        "unsupported-zoom",
+        "unsupported-zoom-key",
+        CommandPayload::Zoom { duration_frames: 3 },
+    ));
+    assert!(matches!(
+        client.next_result(),
+        CommandResult::Rejected {
+            code,
+            current_revision: 0,
+            retryable: false,
+            ..
+        } if code == "protocol_mismatch"
+    ));
+
+    drop(client);
+    daemon.wait_success();
+    let persisted = ProjectStore::new(&project_path).unwrap().load().unwrap();
+    assert_eq!(persisted.position().revision, 0);
+    assert!(persisted.idempotency_receipts().is_empty());
+}
+
+#[test]
 fn commands_survive_restart_resume_and_duplicate_replay() {
     let directory = TestDirectory::new("restart");
     let project_path = directory.project_path();
@@ -530,6 +566,62 @@ fn slide_command_settles_and_survives_daemon_restart() {
         "slide-command",
         "slide-key",
         CommandPayload::Slide { duration_frames: 3 },
+    ));
+    assert!(matches!(
+        client.next_result(),
+        CommandResult::Accepted { revision: 1, .. }
+    ));
+    drop(client);
+    daemon.wait_success();
+
+    let store = ProjectStore::new(&project_path).unwrap();
+    let persisted = store.load().unwrap();
+    assert_eq!(persisted.position().revision, 1);
+    assert_eq!(persisted.position().event_sequence, 1);
+    assert_eq!(persisted.position().runtime_generation, 1);
+    assert_eq!(persisted.position().frames_rendered, 3);
+    assert_eq!(
+        persisted.runtime_routing().realized_program_id,
+        Some(domain_input(2))
+    );
+    assert_eq!(
+        persisted.runtime_routing().realized_preview_id,
+        Some(domain_input(1))
+    );
+
+    let daemon = Daemon::start(&project_path);
+    let mut client = daemon.connect();
+    let resumed = client.handshake_version(
+        CURRENT_PROTOCOL_VERSION,
+        Some(EventCursor {
+            engine: initial.engine,
+            revision: 1,
+        }),
+    );
+    assert!(resumed.resume);
+    assert_eq!(resumed.current_revision, 1);
+    drop(client);
+    daemon.wait_success();
+    assert_eq!(store.load().unwrap(), persisted);
+}
+
+#[test]
+fn zoom_command_settles_and_survives_daemon_restart() {
+    let directory = TestDirectory::new("zoom-restart");
+    let project_path = directory.project_path();
+    create_project(&project_path);
+
+    let daemon = Daemon::start(&project_path);
+    let mut client = daemon.connect();
+    let initial = client.handshake_version(CURRENT_PROTOCOL_VERSION, None);
+    assert_eq!(initial.negotiated, CURRENT_PROTOCOL_VERSION);
+    assert!(matches!(client.receive(), WireMessage::Snapshot(_)));
+
+    client.send(&command_version(
+        CURRENT_PROTOCOL_VERSION,
+        "zoom-command",
+        "zoom-key",
+        CommandPayload::Zoom { duration_frames: 3 },
     ));
     assert!(matches!(
         client.next_result(),

@@ -184,6 +184,10 @@ fn encode_command(record: &mut Record, message: &CommandMessage) -> Result<(), C
             record.field("payload", "slide")?;
             record.field("duration_frames", duration_frames)?;
         }
+        CommandPayload::Zoom { duration_frames } => {
+            record.field("payload", "zoom")?;
+            record.field("duration_frames", duration_frames)?;
+        }
         CommandPayload::Wipe { duration_frames } => {
             record.field("payload", "wipe")?;
             record.field("duration_frames", duration_frames)?;

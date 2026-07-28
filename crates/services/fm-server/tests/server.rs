@@ -7,7 +7,7 @@ use fm_protocol::{
     FADE_TO_BLACK_PROTOCOL_VERSION, MANUAL_ALPHA_FADE_PROTOCOL_VERSION,
     MANUAL_TRANSITION_PROTOCOL_VERSION, ManualTransitionKind, ManualTransitionStatus,
     ProtocolVersion, Role, SLIDE_PROTOCOL_VERSION, SnapshotMessage, WIPE_PROTOCOL_VERSION,
-    WireInputId,
+    WireInputId, ZOOM_PROTOCOL_VERSION,
 };
 use fm_server::{
     AuthenticationMode, ConfigError, ControlPlane, DisconnectReason, HandshakeError, HealthState,
@@ -502,6 +502,38 @@ fn slide_requires_protocol_1_8() {
         Err(SessionError::UnsupportedCommandVersion {
             negotiated: MANUAL_ALPHA_FADE_PROTOCOL_VERSION,
             required: SLIDE_PROTOCOL_VERSION,
+        })
+    );
+    assert_eq!(session.accounting().inbound_commands_admitted_total, 0);
+    assert_eq!(session.accounting().inbound_commands_inflight, 0);
+}
+
+#[test]
+fn zoom_requires_protocol_1_9() {
+    let server = ready_server(ServerConfig::new(
+        ServerMode::Production,
+        AuthenticationMode::Required,
+        IpAddr::from([127, 0, 0, 1]),
+        vec![CURRENT_PROTOCOL_VERSION],
+        "capabilities-v1",
+    ));
+    let mut old_hello = hello(Role::Operator, None);
+    old_hello.versions = vec![SLIDE_PROTOCOL_VERSION];
+    let outcome = server
+        .handshake(&old_hello, &principal(AuthRole::Operator), 0)
+        .unwrap();
+    assert_eq!(outcome.server_hello.negotiated, SLIDE_PROTOCOL_VERSION);
+
+    let mut session = outcome.session;
+    let mut command = command(CommandPayload::Zoom {
+        duration_frames: 30,
+    });
+    command.protocol = SLIDE_PROTOCOL_VERSION;
+    assert_eq!(
+        session.admit_command(&command, 10, 0),
+        Err(SessionError::UnsupportedCommandVersion {
+            negotiated: SLIDE_PROTOCOL_VERSION,
+            required: ZOOM_PROTOCOL_VERSION,
         })
     );
     assert_eq!(session.accounting().inbound_commands_admitted_total, 0);

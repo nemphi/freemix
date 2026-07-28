@@ -7,7 +7,8 @@ pub const FADE_TO_BLACK_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new
 pub const ALPHA_FADE_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 6);
 pub const MANUAL_ALPHA_FADE_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 7);
 pub const SLIDE_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 8);
-pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = SLIDE_PROTOCOL_VERSION;
+pub const ZOOM_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 9);
+pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ZOOM_PROTOCOL_VERSION;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ProtocolVersion {
