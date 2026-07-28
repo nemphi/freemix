@@ -35,6 +35,8 @@ pub enum StudioIntent {
     Cut,
     /// Performs a Fade transition with a duration in frames.
     Fade { duration_frames: u32 },
+    /// Performs an `AlphaFade` transition with a duration in frames.
+    AlphaFade { duration_frames: u32 },
     /// Performs a Wipe transition with a duration in frames.
     Wipe { duration_frames: u32 },
     /// Fades realized Program video and audio to black or back to live.
@@ -148,7 +150,14 @@ impl StudioUiState {
     /// Publishes whether the negotiated protocol can carry Wipe commands.
     #[must_use]
     pub const fn with_wipe_support(mut self, supports_wipe: bool) -> Self {
-        self.transition_protocol.wipe = supports_wipe;
+        self.transition_protocol.automatic.wipe = supports_wipe;
+        self
+    }
+
+    /// Publishes whether the negotiated protocol can carry `AlphaFade` commands.
+    #[must_use]
+    pub const fn with_alpha_fade_support(mut self, supported: bool) -> Self {
+        self.transition_protocol.automatic.alpha_fade = supported;
         self
     }
 
@@ -170,25 +179,68 @@ impl StudioUiState {
 /// Additive transition features carried by the negotiated protocol.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TransitionProtocolSupport {
-    pub wipe: bool,
+    pub automatic: AutomaticTransitionProtocolSupport,
     pub manual: bool,
     pub fade_to_black: bool,
 }
 
 impl TransitionProtocolSupport {
     pub const NONE: Self = Self {
-        wipe: false,
+        automatic: AutomaticTransitionProtocolSupport::NONE,
         manual: false,
         fade_to_black: false,
+    };
+}
+
+/// Additive automatic-transition features carried by the negotiated protocol.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AutomaticTransitionProtocolSupport {
+    pub wipe: bool,
+    pub alpha_fade: bool,
+}
+
+impl AutomaticTransitionProtocolSupport {
+    pub const NONE: Self = Self {
+        wipe: false,
+        alpha_fade: false,
     };
 }
 
 /// Pure transition-control availability derived from one UI state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransitionAvailability {
-    pub cut: bool,
-    pub fade: bool,
+    basic: bool,
+    pub alpha_fade: bool,
     pub wipe: bool,
+}
+
+impl TransitionAvailability {
+    /// Returns whether protocol-independent Cut and Fade controls are available.
+    #[must_use]
+    pub const fn basic(self) -> bool {
+        self.basic
+    }
+}
+
+/// Session and protocol gates for automatic transition controls.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransitionGate {
+    pub connection_status: StudioConnectionStatus,
+    pub has_view: bool,
+    pub can_transition: bool,
+    pub protocol_support: AutomaticTransitionProtocolSupport,
+}
+
+impl TransitionGate {
+    #[must_use]
+    pub const fn from_state(state: &StudioUiState) -> Self {
+        Self {
+            connection_status: state.connection_status,
+            has_view: state.view.is_some(),
+            can_transition: state.can_transition,
+            protocol_support: state.transition_protocol.automatic,
+        }
+    }
 }
 
 /// Pure manual T-bar control availability derived from replicated state and session gates.
@@ -221,17 +273,12 @@ impl ManualTransitionGate {
 
 /// Computes transition availability without drawing or dispatching intents.
 #[must_use]
-pub const fn transition_availability(
-    connection_status: StudioConnectionStatus,
-    has_view: bool,
-    can_transition: bool,
-    supports_wipe: bool,
-) -> TransitionAvailability {
-    let base = connection_status.controls_enabled() && has_view && can_transition;
+pub const fn transition_availability(gate: TransitionGate) -> TransitionAvailability {
+    let base = gate.connection_status.controls_enabled() && gate.has_view && gate.can_transition;
     TransitionAvailability {
-        cut: base,
-        fade: base,
-        wipe: base && supports_wipe,
+        basic: base,
+        alpha_fade: base && gate.protocol_support.alpha_fade,
+        wipe: base && gate.protocol_support.wipe,
     }
 }
 
@@ -710,12 +757,7 @@ fn draw_transition_row(
     state: &StudioUiState,
     intents: &mut Vec<StudioIntent>,
 ) {
-    let availability = transition_availability(
-        state.connection_status,
-        state.view.is_some(),
-        state.can_transition,
-        state.transition_protocol.wipe,
-    );
+    let availability = transition_availability(TransitionGate::from_state(state));
     Frame::new()
         .fill(GRAPHITE_RAISED)
         .stroke(Stroke::new(1.0, Color32::from_rgb(67, 61, 44)))
@@ -725,7 +767,21 @@ fn draw_transition_row(
                 ui.label(RichText::new("TRANSITION").small().strong().color(AMBER));
                 if ui
                     .add_enabled(
-                        availability.cut,
+                        availability.alpha_fade,
+                        Button::new(RichText::new("ALPHA").strong())
+                            .fill(Color32::from_rgb(98, 66, 17))
+                            .min_size(Vec2::new(92.0, 32.0)),
+                    )
+                    .on_hover_text("AlphaFade Preview to Program")
+                    .clicked()
+                {
+                    intents.push(StudioIntent::AlphaFade {
+                        duration_frames: shell.transition_duration_frames,
+                    });
+                }
+                if ui
+                    .add_enabled(
+                        availability.basic(),
                         Button::new(RichText::new("CUT").strong())
                             .fill(Color32::from_rgb(98, 66, 17))
                             .min_size(Vec2::new(92.0, 32.0)),
@@ -736,7 +792,7 @@ fn draw_transition_row(
                 }
                 if ui
                     .add_enabled(
-                        availability.fade,
+                        availability.basic(),
                         Button::new(RichText::new("FADE").strong())
                             .fill(Color32::from_rgb(98, 66, 17))
                             .min_size(Vec2::new(92.0, 32.0)),
@@ -762,7 +818,7 @@ fn draw_transition_row(
                 }
                 ui.label(RichText::new("DURATION").small().color(MUTED));
                 ui.add_enabled(
-                    availability.fade,
+                    availability.basic(),
                     DragValue::new(&mut shell.transition_duration_frames)
                         .range(
                             StudioShell::MIN_TRANSITION_DURATION_FRAMES
@@ -1030,26 +1086,54 @@ mod tests {
     }
 
     #[test]
-    fn wipe_availability_requires_every_gate_while_cut_and_fade_do_not_require_support() {
+    fn additive_transition_availability_requires_protocol_and_base_gates() {
+        let base = TransitionGate {
+            connection_status: StudioConnectionStatus::Ready,
+            has_view: true,
+            can_transition: true,
+            protocol_support: AutomaticTransitionProtocolSupport::NONE,
+        };
         assert_eq!(
-            transition_availability(StudioConnectionStatus::Ready, true, true, false),
+            transition_availability(base),
             TransitionAvailability {
-                cut: true,
-                fade: true,
+                basic: true,
+                alpha_fade: false,
                 wipe: false,
             }
         );
-        assert!(transition_availability(StudioConnectionStatus::Ready, true, true, true).wipe);
-        for availability in [
-            transition_availability(StudioConnectionStatus::Connecting, true, true, true),
-            transition_availability(StudioConnectionStatus::Ready, false, true, true),
-            transition_availability(StudioConnectionStatus::Ready, true, false, true),
+        let all_protocols = AutomaticTransitionProtocolSupport {
+            wipe: true,
+            alpha_fade: true,
+        };
+        let supported = transition_availability(TransitionGate {
+            protocol_support: all_protocols,
+            ..base
+        });
+        assert!(supported.wipe);
+        assert!(supported.alpha_fade);
+        assert!(supported.basic());
+        for gate in [
+            TransitionGate {
+                connection_status: StudioConnectionStatus::Connecting,
+                protocol_support: all_protocols,
+                ..base
+            },
+            TransitionGate {
+                has_view: false,
+                protocol_support: all_protocols,
+                ..base
+            },
+            TransitionGate {
+                can_transition: false,
+                protocol_support: all_protocols,
+                ..base
+            },
         ] {
             assert_eq!(
-                availability,
+                transition_availability(gate),
                 TransitionAvailability {
-                    cut: false,
-                    fade: false,
+                    basic: false,
+                    alpha_fade: false,
                     wipe: false,
                 }
             );
@@ -1136,6 +1220,14 @@ mod tests {
         assert_ne!(StudioIntent::Cut, StudioIntent::Fade { duration_frames: 1 });
         assert_ne!(
             StudioIntent::Fade {
+                duration_frames: 30
+            },
+            StudioIntent::AlphaFade {
+                duration_frames: 30
+            }
+        );
+        assert_ne!(
+            StudioIntent::AlphaFade {
                 duration_frames: 30
             },
             StudioIntent::Wipe {

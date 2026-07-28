@@ -14,9 +14,9 @@ use fm_client::{
     ClientError, CommandStatus, CommandUncertainty, SessionEvent, SyncMode, TcpSessionError,
 };
 use fm_protocol::{
-    CommandPayload, CommandResult, DurableGap, FADE_TO_BLACK_PROTOCOL_VERSION,
-    MANUAL_TRANSITION_PROTOCOL_VERSION, ProtocolVersion, WIPE_PROTOCOL_VERSION, WireInputId,
-    WireMessage,
+    ALPHA_FADE_PROTOCOL_VERSION, CommandPayload, CommandResult, DurableGap,
+    FADE_TO_BLACK_PROTOCOL_VERSION, MANUAL_TRANSITION_PROTOCOL_VERSION, ProtocolVersion,
+    WIPE_PROTOCOL_VERSION, WireInputId, WireMessage,
 };
 use fm_ui_egui::{StudioConnectionStatus, StudioIntent, StudioShell, StudioUiState};
 
@@ -1170,6 +1170,9 @@ const fn intent_payload(intent: StudioIntent) -> CommandPayload {
         },
         StudioIntent::Cut => CommandPayload::Cut,
         StudioIntent::Fade { duration_frames } => CommandPayload::Fade { duration_frames },
+        StudioIntent::AlphaFade { duration_frames } => {
+            CommandPayload::AlphaFade { duration_frames }
+        }
         StudioIntent::Wipe { duration_frames } => CommandPayload::Wipe { duration_frames },
         StudioIntent::FadeToBlack {
             active,
@@ -1249,6 +1252,10 @@ fn runtime_state(runtime: &mut StudioRuntime, error: Option<String>) -> StudioUi
         session.protocol.major == WIPE_PROTOCOL_VERSION.major
             && session.protocol.minor >= WIPE_PROTOCOL_VERSION.minor
     });
+    let supports_alpha_fade = client.session().is_some_and(|session| {
+        session.protocol.major == ALPHA_FADE_PROTOCOL_VERSION.major
+            && session.protocol.minor >= ALPHA_FADE_PROTOCOL_VERSION.minor
+    });
     let supports_manual_transition = client.session().is_some_and(|session| {
         session.protocol.major == MANUAL_TRANSITION_PROTOCOL_VERSION.major
             && session.protocol.minor >= MANUAL_TRANSITION_PROTOCOL_VERSION.minor
@@ -1260,6 +1267,7 @@ fn runtime_state(runtime: &mut StudioRuntime, error: Option<String>) -> StudioUi
     let mut state = StudioUiState::new(connection_status)
         .with_switcher_permissions(can_select_preview, can_transition)
         .with_wipe_support(supports_wipe)
+        .with_alpha_fade_support(supports_alpha_fade)
         .with_manual_transition_support(supports_manual_transition)
         .with_fade_to_black_support(supports_fade_to_black);
     if connection_status == StudioConnectionStatus::Ready {
@@ -1314,6 +1322,7 @@ const fn intent_label(intent: StudioIntent) -> &'static str {
         StudioIntent::SelectPreview(_) => "Select Preview",
         StudioIntent::Cut => "Cut",
         StudioIntent::Fade { .. } => "Fade",
+        StudioIntent::AlphaFade { .. } => "AlphaFade",
         StudioIntent::Wipe { .. } => "Wipe",
         StudioIntent::FadeToBlack { active: true, .. } => "Fade to Black",
         StudioIntent::FadeToBlack { active: false, .. } => "Fade to Live",
@@ -1436,6 +1445,14 @@ mod tests {
                 duration_frames: u32::MAX,
             }),
             CommandPayload::Fade {
+                duration_frames: u32::MAX,
+            }
+        );
+        assert_eq!(
+            intent_payload(StudioIntent::AlphaFade {
+                duration_frames: u32::MAX,
+            }),
+            CommandPayload::AlphaFade {
                 duration_frames: u32::MAX,
             }
         );
@@ -1610,6 +1627,28 @@ mod tests {
         );
         assert_eq!(
             pop_supported_deferred_intent(&mut deferred, Some(FADE_TO_BLACK_PROTOCOL_VERSION),),
+            Some(StudioIntent::Cut)
+        );
+    }
+
+    #[test]
+    fn unsupported_head_alpha_fade_blocks_fifo_until_protocol_1_6() {
+        let alpha_fade = StudioIntent::AlphaFade {
+            duration_frames: 60,
+        };
+        let mut deferred = VecDeque::from([alpha_fade, StudioIntent::Cut]);
+
+        assert_eq!(
+            pop_supported_deferred_intent(&mut deferred, Some(FADE_TO_BLACK_PROTOCOL_VERSION)),
+            None
+        );
+        assert_eq!(deferred, VecDeque::from([alpha_fade, StudioIntent::Cut]));
+        assert_eq!(
+            pop_supported_deferred_intent(&mut deferred, Some(ALPHA_FADE_PROTOCOL_VERSION)),
+            Some(alpha_fade)
+        );
+        assert_eq!(
+            pop_supported_deferred_intent(&mut deferred, Some(ALPHA_FADE_PROTOCOL_VERSION)),
             Some(StudioIntent::Cut)
         );
     }
@@ -1944,18 +1983,17 @@ mod tests {
         }));
     }
 
-    fn serve_worker_wipe(listener: &TcpListener) {
-        let mut peer = accept_worker_snapshot_version_at(listener, WIPE_PROTOCOL_VERSION, 4, 2, 2);
+    fn serve_worker_automatic_transition(
+        listener: &TcpListener,
+        protocol: ProtocolVersion,
+        payload: CommandPayload,
+    ) {
+        let mut peer = accept_worker_snapshot_version_at(listener, protocol, 4, 2, 2);
         let WireMessage::Command(command) = peer.receive() else {
-            panic!("expected Wipe command");
+            panic!("expected automatic transition command");
         };
-        assert_eq!(command.protocol, WIPE_PROTOCOL_VERSION);
-        assert_eq!(
-            command.payload,
-            CommandPayload::Wipe {
-                duration_frames: 45
-            }
-        );
+        assert_eq!(command.protocol, protocol);
+        assert_eq!(command.payload, payload);
         assert_eq!(command.expected_revision, Some(4));
         assert_eq!(command.deadline_ms, None);
         assert!(!command.idempotency_key.is_empty());
@@ -1972,8 +2010,8 @@ mod tests {
             payload: EventPayload::DesiredSwitcher {
                 program: wire_input(2),
                 preview: wire_input(1),
-                manual_transition: None,
-                fade_to_black: None,
+                manual_transition: manual_projection(protocol),
+                fade_to_black: fade_to_black_projection(protocol),
             },
         }));
         peer.send(&WireMessage::RuntimeEvent(RuntimeEventMessage {
@@ -1983,8 +2021,8 @@ mod tests {
             sequence: 1,
             event: RuntimeLifecycleEvent::Realized {
                 domain: "switcher".to_owned(),
-                manual_transition: None,
-                fade_to_black: None,
+                manual_transition: manual_projection(protocol),
+                fade_to_black: fade_to_black_projection(protocol),
             },
         }));
     }
@@ -2442,7 +2480,15 @@ mod tests {
     fn worker_wipe_flow_preserves_exact_envelope_result_event_and_runtime_order() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
-        let server = thread::spawn(move || serve_worker_wipe(&listener));
+        let server = thread::spawn(move || {
+            serve_worker_automatic_transition(
+                &listener,
+                WIPE_PROTOCOL_VERSION,
+                CommandPayload::Wipe {
+                    duration_frames: 45,
+                },
+            );
+        });
         let (requests, states, worker) = spawn_test_worker(address);
         wait_until_ready(&states);
         try_enqueue(
@@ -2464,7 +2510,52 @@ mod tests {
                         && view.switcher.realized.preview == wire_input(1).to_domain()
                 })
             {
-                assert!(state.transition_protocol.wipe);
+                assert!(state.transition_protocol.automatic.wipe);
+                assert_eq!(state.error, None);
+                break;
+            }
+        }
+        assert!(pending_seen);
+        try_enqueue(&requests, WorkerRequest::Shutdown).unwrap();
+        worker.join().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn worker_alpha_fade_flow_preserves_protocol_duration_and_runtime_order() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            serve_worker_automatic_transition(
+                &listener,
+                ALPHA_FADE_PROTOCOL_VERSION,
+                CommandPayload::AlphaFade {
+                    duration_frames: 45,
+                },
+            );
+        });
+        let (requests, states, worker) = spawn_test_worker(address);
+        wait_until_ready(&states);
+        try_enqueue(
+            &requests,
+            WorkerRequest::Intent(StudioIntent::AlphaFade {
+                duration_frames: 45,
+            }),
+        )
+        .unwrap();
+
+        let mut pending_seen = false;
+        loop {
+            let state = states.recv_timeout(Duration::from_secs(3)).unwrap();
+            pending_seen |= state.pending_commands == 1;
+            if state.pending_commands == 0
+                && state.view.as_ref().is_some_and(|view| {
+                    view.cursor.revision.get() == 5
+                        && view.switcher.realized.program == wire_input(2).to_domain()
+                        && view.switcher.realized.preview == wire_input(1).to_domain()
+                })
+            {
+                assert!(state.transition_protocol.automatic.alpha_fade);
                 assert_eq!(state.error, None);
                 break;
             }
@@ -2664,7 +2755,7 @@ mod tests {
         let mut runtime = StudioRuntime::new(config).unwrap();
         runtime.connect(CONNECT_TIMEOUT).unwrap();
         let current = runtime_state(&mut runtime, None);
-        assert!(current.transition_protocol.wipe);
+        assert!(current.transition_protocol.automatic.wipe);
         assert!(current.transition_protocol.manual);
         assert!(current.transition_protocol.fade_to_black);
         assert!(current.can_transition);
@@ -2673,9 +2764,51 @@ mod tests {
             .reconnect(Duration::from_millis(250), CONNECT_TIMEOUT)
             .unwrap();
         let downgraded = runtime_state(&mut runtime, None);
-        assert!(downgraded.transition_protocol.wipe);
+        assert!(downgraded.transition_protocol.automatic.wipe);
         assert!(downgraded.transition_protocol.manual);
         assert!(!downgraded.transition_protocol.fade_to_black);
+        assert!(downgraded.can_transition, "Cut/Fade permission was lost");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn runtime_state_hides_alpha_fade_after_protocol_1_6_downgrade() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut first =
+                accept_worker_snapshot_version_at(&listener, ALPHA_FADE_PROTOCOL_VERSION, 4, 2, 2);
+            assert_eq!(first.stream.read(&mut [0_u8; 1]).unwrap(), 0);
+            accept_worker_reconnect_snapshot_version(
+                &listener,
+                FADE_TO_BLACK_PROTOCOL_VERSION,
+                4,
+                (1, 2),
+                (1, 2),
+            );
+        });
+        let config = StudioConfig {
+            connection: ConnectionConfig::Existing(ExistingConfig {
+                address,
+                expected_project_id: test_project_id(),
+            }),
+            client_id: "alpha-support-change".to_owned(),
+            desired_role: Role::Operator,
+            restart_policy: RestartPolicy::default(),
+        };
+        let mut runtime = StudioRuntime::new(config).unwrap();
+        runtime.connect(CONNECT_TIMEOUT).unwrap();
+        let current = runtime_state(&mut runtime, None);
+        assert!(current.transition_protocol.automatic.alpha_fade);
+        assert!(current.transition_protocol.fade_to_black);
+        assert!(current.can_transition);
+        runtime.session_mut().disconnect().unwrap();
+        runtime
+            .reconnect(Duration::from_millis(250), CONNECT_TIMEOUT)
+            .unwrap();
+        let downgraded = runtime_state(&mut runtime, None);
+        assert!(!downgraded.transition_protocol.automatic.alpha_fade);
+        assert!(downgraded.transition_protocol.fade_to_black);
         assert!(downgraded.can_transition, "Cut/Fade permission was lost");
         server.join().unwrap();
     }
@@ -2784,7 +2917,7 @@ mod tests {
                         && view.switcher.realized.preview == wire_input(2).to_domain()
                 })
             {
-                assert!(state.transition_protocol.wipe);
+                assert!(state.transition_protocol.automatic.wipe);
                 assert!(saw_pending_notice);
                 break;
             }
@@ -2916,7 +3049,7 @@ mod tests {
             {
                 assert!(saw_pending_incompatible);
                 assert!(state.notice.is_none());
-                assert!(state.transition_protocol.wipe);
+                assert!(state.transition_protocol.automatic.wipe);
                 assert!(state.transition_protocol.manual);
                 break;
             }

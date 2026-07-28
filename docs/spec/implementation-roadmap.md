@@ -653,7 +653,13 @@ protocol 1.5 downgrade. Web now advertises protocol 1.6 and exposes a semantic
 AlphaFade action with the shared bounded duration only when Ready, authorized,
 and negotiated at 1.6; downgrade and reconnect tests hide the action without
 disabling older Fade/Wipe controls. It remains a transport-free model with no
-browser network runtime. Studio controls, manual T-bar AlphaFade, and
+browser network runtime. Studio now also advertises protocol 1.6 and presents an
+AlphaFade action alongside Fade/Wipe using the same bounded duration. Its
+availability requires Ready state, replicated view, transition permission, and
+negotiated 1.6 support. The worker maps the typed intent to the exact command,
+preserves a blocked AlphaFade at the head of its reconnect FIFO through a 1.5
+downgrade, and a loopback worker test observes the duration, envelope, durable
+event, and runtime realization ordering. Manual T-bar AlphaFade and
 configured-output process acceptance remain absent.
 
 The remaining AlphaFade operator and output path, stinger, Slide/Zoom, other
