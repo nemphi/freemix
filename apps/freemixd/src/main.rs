@@ -6441,7 +6441,12 @@ mod tests {
     }
 
     #[test]
-    fn idle_snapshot_checkpoint_preserves_project_routing_and_receipts() {
+    fn idle_snapshot_checkpoint_survives_project_store_restart() {
+        let root = std::env::temp_dir().join(format!(
+            "freemixd-checkpoint-{}-{}.freemix",
+            std::process::id(),
+            now_millis().unwrap()
+        ));
         let mut durable = test_project();
         let mut control = test_control(&durable);
         let server = test_server(&control);
@@ -6459,21 +6464,26 @@ mod tests {
 
         let checkpoint =
             stored_project_checkpoint(&durable, &control.idle_engine_snapshot().unwrap()).unwrap();
-        assert_eq!(checkpoint.project(), durable.project());
+        ProjectStore::new(&root).unwrap().save(&checkpoint).unwrap();
+        let restarted = ProjectStore::new(&root).unwrap().load().unwrap();
+
+        assert_eq!(restarted.project(), durable.project());
         assert_eq!(
-            checkpoint.project().input_audio_strip(test_input_id(1)),
+            restarted.project().input_audio_strip(test_input_id(1)),
             durable.project().input_audio_strip(test_input_id(1))
         );
-        assert_eq!(checkpoint.runtime_routing(), durable.runtime_routing());
+        assert_eq!(restarted.runtime_routing(), durable.runtime_routing());
         assert_eq!(
-            checkpoint.idempotency_receipts(),
+            restarted.idempotency_receipts(),
             durable.idempotency_receipts()
         );
         assert_eq!(
-            checkpoint.position().frames_rendered,
+            restarted.position().frames_rendered,
             durable.position().frames_rendered + 1
         );
-        assert_eq!(checkpoint.position().revision, durable.position().revision);
+        assert_eq!(restarted.position().revision, durable.position().revision);
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

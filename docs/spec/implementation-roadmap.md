@@ -209,16 +209,20 @@ reserve capacity before nonblocking dispatch, prioritize uncovered sources, and
 commit a completed batch only after every returned page validates. EOS silence
 is staged and preflighted across all affected sources before any cursor changes;
 render preflights every source commit and sink admission before advancing the
-absolute frame cursor. Synchronizer/source PCM buffers and EOS staging scratch
-are preallocated. The canonical returned block and bounded fake-sink clone still
-allocate per frame; event-bearing `FrameResult`s and other control-path
-allocations can also remain. Exact source channel layout is enforced across
-pages and must map by matching labels to Master; there is no channel conversion.
+absolute frame cursor. Synchronizer/source PCM buffers, per-terminal render
+planes, and EOS staging scratch are preallocated. The canonical returned block
+and bounded fake-sink clone still allocate per frame; event-bearing
+`FrameResult`s and other control-path allocations can also remain. Exact source
+channel layout is enforced across pages and must map by matching labels to
+Master; there is no channel conversion.
 
 Scene inputs recursively route audio through explicit `audio_source` links to a
 physical leaf or explicit silence. Cut keeps one source at unity; Fade and Wipe
 crossfade two sources with sample-linear gains from each interval's explicit
-start/end mix endpoints. Identical terminals collapse to one unity-gain source.
+start/end mix endpoints. Physical terminals render once per interval, but
+distinct logical strips that share one terminal remain independent mixer
+submissions with their own gain/mute/follow-video state and transition
+coefficients. Truly identical logical Program IDs submit once at unity.
 Automatic Fade and held or reversed Fade and Wipe T-bar movement propagate exact
 endpoints. The manual-transition core is exposed through `EngineCommand` and
 protocol 1.4, and schema v7 preserves exact desired and realized manual state

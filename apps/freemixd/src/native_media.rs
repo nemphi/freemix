@@ -23,8 +23,8 @@ use std::{
 
 use fm_audio::{
     AudioCadenceOrigin, AudioRenderPlan, AudioSilenceSpan, AudioSynchronizerLimits, ChannelMapping,
-    ClockMappedAudioSynchronizer, InputState, MasterAudioInterval, MasterMixer, PlanarAudioSource,
-    SourceGain,
+    ClockMappedAudioSynchronizer, InputState, MAX_CHANNEL_MAPPING_CHANNELS, MasterAudioInterval,
+    MasterMixer, PlanarAudioSource, SourceGain,
 };
 use fm_clock::{ClockDomainId as MappingClockDomainId, ClockMapping, ClockSnapshot, ClockTime};
 #[cfg(test)]
@@ -62,7 +62,7 @@ const NATIVE_PROJECT_IN_FLIGHT_SLOTS: usize = 1;
 const SOURCE_REFILL_LOW_WATERMARK: usize = 4;
 const SOURCE_REFILL_MAX_PAGE: u32 = 4;
 const AUDIO_REFILL_LOW_WATERMARK: usize = 8;
-const NATIVE_AUDIO_SCRATCH_PLANE_SETS: usize = 5;
+const MAX_NATIVE_AUDIO_STRIPS: usize = NativeSourceLimits::DEFAULT_MAX_MEDIA_INPUTS;
 
 /// Resource bounds applied while compiling native scenes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1653,10 +1653,7 @@ pub struct NativeAudioTelemetry {
 }
 
 struct NativeAudioScratch {
-    primary: Vec<Vec<f32>>,
-    secondary: Vec<Vec<f32>>,
-    silence: Vec<Vec<f32>>,
-    discard: Vec<Vec<f32>>,
+    rendered: BTreeMap<InputId, Vec<Vec<f32>>>,
     mix: Vec<Vec<f32>>,
     plans: Vec<(InputId, AudioRenderPlan)>,
     uncovered: Vec<InputId>,
@@ -1683,22 +1680,35 @@ struct ValidatedCompletedAudioPage {
 }
 
 impl NativeAudioScratch {
-    fn new(channels: usize, samples: usize, sources: usize, padding_blocks: usize) -> Self {
-        let planes = || vec![vec![0.0; samples]; channels];
+    fn new(
+        channels: usize,
+        samples: usize,
+        sources: &BTreeMap<InputId, NativeAudioSource>,
+        padding_blocks: usize,
+    ) -> Self {
+        let rendered = sources
+            .iter()
+            .filter_map(|(&input, source)| {
+                source.synchronizer.as_ref().map(|synchronizer| {
+                    (
+                        input,
+                        vec![vec![0.0; samples]; synchronizer.channel_layout().channels().len()],
+                    )
+                })
+            })
+            .collect();
+        let source_count = sources.len();
         Self {
-            primary: planes(),
-            secondary: planes(),
-            silence: planes(),
-            discard: planes(),
-            mix: planes(),
-            plans: Vec::with_capacity(sources),
-            uncovered: Vec::with_capacity(sources),
-            padding_requests: Vec::with_capacity(sources),
+            rendered,
+            mix: vec![vec![0.0; samples]; channels],
+            plans: Vec::with_capacity(source_count),
+            uncovered: Vec::with_capacity(source_count),
+            padding_requests: Vec::with_capacity(source_count),
             padding_spans: Vec::with_capacity(padding_blocks),
-            padding_sources: Vec::with_capacity(sources),
-            completed: Vec::with_capacity(sources),
-            validated: Vec::with_capacity(sources),
-            inputs: Vec::with_capacity(sources),
+            padding_sources: Vec::with_capacity(source_count),
+            completed: Vec::with_capacity(source_count),
+            validated: Vec::with_capacity(source_count),
+            inputs: Vec::with_capacity(source_count),
         }
     }
 }
@@ -1875,10 +1885,19 @@ impl NativeMasterRuntime {
         let output_samples =
             usize::try_from(output_samples).map_err(|_| NativeMasterError::BoundsExceeded)?;
         validate_audio_limits(limits, format.channels.channels().len())?;
-        let scratch_samples = output_samples
-            .checked_mul(NATIVE_AUDIO_SCRATCH_PLANE_SETS)
+        let scratch_plane_sets = source_slots
+            .checked_add(1)
             .ok_or(NativeMasterError::BoundsExceeded)?;
-        let scratch_bytes = audio_sample_bytes(scratch_samples, format.channels.channels().len())?;
+        let scratch_samples = output_samples
+            .checked_mul(scratch_plane_sets)
+            .ok_or(NativeMasterError::BoundsExceeded)?;
+        let scratch_source_channels = source_slots
+            .checked_mul(MAX_CHANNEL_MAPPING_CHANNELS)
+            .ok_or(NativeMasterError::BoundsExceeded)?;
+        let scratch_channels = scratch_source_channels
+            .checked_add(format.channels.channels().len())
+            .ok_or(NativeMasterError::BoundsExceeded)?;
+        let scratch_bytes = audio_sample_bytes(output_samples, scratch_channels)?;
         let source_sample_capacity = limits
             .max_retained_samples
             .checked_sub(scratch_samples)
@@ -2177,7 +2196,7 @@ impl NativeMasterRuntime {
         let scratch = NativeAudioScratch::new(
             format.channels.channels().len(),
             output_samples,
-            sources.len(),
+            &sources,
             limits.max_retained_blocks,
         );
         Ok(Self {
@@ -2215,6 +2234,9 @@ impl NativeMasterRuntime {
         expected_next_frame: u64,
         limits: NativeAudioLimits,
     ) -> Result<Self, NativeMasterError> {
+        if project.audio_routes.len() > MAX_NATIVE_AUDIO_STRIPS {
+            return Err(NativeMasterError::BoundsExceeded);
+        }
         let mut runtime = Self::preflight_local_blocking(
             adapter,
             resolved,
@@ -2224,10 +2246,18 @@ impl NativeMasterRuntime {
             expected_next_frame,
             limits,
         )?;
-        runtime.apply_project_audio_strips(project)?;
-        let map = ChannelMapping::identity(format.channels.clone())?;
+        runtime.realize_project_audio(project)?;
+        Ok(runtime)
+    }
+
+    fn realize_project_audio(
+        &mut self,
+        project: &NativeProjectPlan,
+    ) -> Result<(), NativeMasterError> {
+        self.apply_project_audio_strips(project)?;
+        let map = ChannelMapping::identity(self.format.channels.clone())?;
         for input in project.audio_strips.keys().copied() {
-            if runtime.mixer.input_state(input).is_some() {
+            if self.mixer.input_state(input).is_some() {
                 continue;
             }
             let state = native_input_state(project, input)?;
@@ -2236,33 +2266,29 @@ impl NativeMasterRuntime {
                 .ok_or(NativeMasterError::MissingAudioRoute { input })?
             {
                 NativeAudioRoute::Leaf(source) => {
-                    runtime.mixer.add_input_alias(input, source, state)?;
-                    runtime
-                        .pending_mixer
-                        .add_input_alias(input, source, state)?;
+                    self.mixer.add_input_alias(input, source, state)?;
+                    self.pending_mixer.add_input_alias(input, source, state)?;
                 }
                 NativeAudioRoute::Silence => {
-                    runtime
-                        .mixer
-                        .add_input(input, format.clone(), map.clone(), state)?;
-                    runtime
-                        .pending_mixer
-                        .add_input(input, format.clone(), map.clone(), state)?;
-                    runtime.sources.insert(input, NativeAudioSource::silence());
+                    self.mixer
+                        .add_input(input, self.format.clone(), map.clone(), state)?;
+                    self.pending_mixer
+                        .add_input(input, self.format.clone(), map.clone(), state)?;
+                    self.sources.insert(input, NativeAudioSource::silence());
                 }
             }
         }
-        let source_count = runtime.sources.len();
-        if runtime.scratch.plans.capacity() < source_count {
-            runtime.scratch.plans.reserve(source_count);
-            runtime.scratch.uncovered.reserve(source_count);
-            runtime.scratch.padding_requests.reserve(source_count);
-            runtime.scratch.padding_sources.reserve(source_count);
-            runtime.scratch.completed.reserve(source_count);
-            runtime.scratch.validated.reserve(source_count);
-            runtime.scratch.inputs.reserve(source_count);
+        let source_count = self.sources.len();
+        if self.scratch.plans.capacity() < source_count {
+            self.scratch.plans.reserve(source_count);
+            self.scratch.uncovered.reserve(source_count);
+            self.scratch.padding_requests.reserve(source_count);
+            self.scratch.padding_sources.reserve(source_count);
+            self.scratch.completed.reserve(source_count);
+            self.scratch.validated.reserve(source_count);
+            self.scratch.inputs.reserve(source_count);
         }
-        Ok(runtime)
+        Ok(())
     }
 
     fn apply_project_audio_strips(
@@ -2790,35 +2816,19 @@ impl NativeMasterRuntime {
             return Err(NativeMasterError::SinkRejected);
         }
         let strip_plan = native_audio_mix_plan(frame.program)?;
-        let source_plan = if let Some(project) = project {
-            native_audio_mix_plan(route_program_audio(frame.program, project)?)?
-        } else {
-            strip_plan
-        };
         self.scratch.plans.clear();
-        for plane in &mut self.scratch.primary {
-            plane[..samples].fill(0.0);
-        }
-        for plane in &mut self.scratch.secondary {
-            plane[..samples].fill(0.0);
-        }
         for (&input, source) in &mut self.sources {
             if source.explicit_silence {
                 continue;
             }
-            let output = if input == source_plan.primary {
-                &mut self.scratch.primary
-            } else if source_plan
-                .secondary
-                .is_some_and(|(secondary, _)| input == secondary)
-            {
-                &mut self.scratch.secondary
-            } else {
-                for plane in &mut self.scratch.discard {
-                    plane[..samples].fill(0.0);
-                }
-                &mut self.scratch.discard
-            };
+            let output = self
+                .scratch
+                .rendered
+                .get_mut(&input)
+                .ok_or(NativeMasterError::DecodeContract { input })?;
+            for plane in &mut *output {
+                plane[..samples].fill(0.0);
+            }
             if end_sample <= source.audio_start_master_sample {
                 continue;
             }
@@ -2845,74 +2855,81 @@ impl NativeMasterRuntime {
             self.scratch.plans.push((input, render_plan));
         }
         self.pending_mixer.copy_runtime_state_from(&self.mixer)?;
-        let primary_source =
-            self.sources
-                .get(&source_plan.primary)
-                .ok_or(NativeMasterError::DecodeContract {
-                    input: source_plan.primary,
-                })?;
-        let primary_layout = primary_source.synchronizer.as_ref().map_or(
-            &self.format.channels,
-            ClockMappedAudioSynchronizer::channel_layout,
-        );
-        let primary_planes = if primary_source.explicit_silence {
-            &self.scratch.silence
+        let mut active_video_inputs = [strip_plan.primary; 2];
+        let active_video_input_count = if let Some((secondary, _)) = strip_plan.secondary {
+            active_video_inputs[1] = secondary;
+            2
         } else {
-            &self.scratch.primary
+            1
         };
-        let primary_submission = PlanarAudioSource {
-            input: strip_plan.primary,
-            sample_rate: self.format.sample_rate,
-            channel_layout: primary_layout,
-            planes: primary_planes,
-            samples,
-            source_gain: source_plan.primary_gain,
-        };
-        if let Some((secondary_source_id, secondary_gain)) = source_plan.secondary {
-            let secondary_strip_id = strip_plan.secondary.map(|(input, _)| input).ok_or(
-                NativeMasterError::DecodeContract {
-                    input: secondary_source_id,
-                },
-            )?;
-            let secondary_source = self.sources.get(&secondary_source_id).ok_or(
-                NativeMasterError::DecodeContract {
-                    input: secondary_source_id,
-                },
-            )?;
-            let secondary_layout = secondary_source.synchronizer.as_ref().map_or(
-                &self.format.channels,
-                ClockMappedAudioSynchronizer::channel_layout,
-            );
-            let secondary_planes = if secondary_source.explicit_silence {
-                &self.scratch.silence
-            } else {
-                &self.scratch.secondary
-            };
-            self.pending_mixer.mix_planar_timed_into(
+        let active_video_inputs = &active_video_inputs[..active_video_input_count];
+        if let Some(project) = project {
+            mix_project_audio_strips(
+                &mut self.pending_mixer,
                 timing,
                 samples,
-                &[
-                    primary_submission,
-                    PlanarAudioSource {
-                        input: secondary_strip_id,
-                        sample_rate: self.format.sample_rate,
-                        channel_layout: secondary_layout,
-                        planes: secondary_planes,
+                project,
+                strip_plan,
+                active_video_inputs,
+                &self.sources,
+                &self.scratch.rendered,
+                &mut self.scratch.mix,
+                self.format.sample_rate,
+            )?;
+        } else {
+            let primary = planar_audio_submission(
+                strip_plan.primary,
+                strip_plan.primary,
+                strip_plan.primary_gain,
+                samples,
+                self.format.sample_rate,
+                &self.sources,
+                &self.scratch.rendered,
+            )?;
+            let secondary = strip_plan
+                .secondary
+                .map(|(input, gain)| {
+                    planar_audio_submission(
+                        input,
+                        input,
+                        gain,
                         samples,
-                        source_gain: secondary_gain,
-                    },
-                ],
-                &[strip_plan.primary, secondary_strip_id],
-                &mut self.scratch.mix,
-            )?;
-        } else {
-            self.pending_mixer.mix_planar_timed_into(
-                timing,
-                samples,
-                &[primary_submission],
-                &[strip_plan.primary],
-                &mut self.scratch.mix,
-            )?;
+                        self.format.sample_rate,
+                        &self.sources,
+                        &self.scratch.rendered,
+                    )
+                })
+                .transpose()?
+                .flatten();
+            match (primary, secondary) {
+                (Some(primary), Some(secondary)) => {
+                    self.pending_mixer.mix_planar_timed_into(
+                        timing,
+                        samples,
+                        &[primary, secondary],
+                        active_video_inputs,
+                        &mut self.scratch.mix,
+                    )?;
+                }
+                (Some(submission), None) | (None, Some(submission)) => {
+                    self.pending_mixer.mix_planar_timed_into(
+                        timing,
+                        samples,
+                        &[submission],
+                        active_video_inputs,
+                        &mut self.scratch.mix,
+                    )?;
+                }
+                (None, None) => {
+                    self.pending_mixer.mix_planar_timed_into(
+                        timing,
+                        samples,
+                        &[],
+                        active_video_inputs,
+                        &mut self.scratch.mix,
+                    )?;
+                }
+            }
         }
         for &(input, render_plan) in &self.scratch.plans {
             self.sources
@@ -3456,46 +3473,117 @@ struct NativeAudioMixPlan {
     secondary: Option<(InputId, SourceGain)>,
 }
 
-fn route_program_audio(
-    mut program: ProgramFrame,
+#[allow(clippy::too_many_arguments)]
+fn mix_project_audio_strips(
+    mixer: &mut MasterMixer,
+    timing: MediaTiming,
+    samples: usize,
     project: &NativeProjectPlan,
-) -> Result<ProgramFrame, NativeMasterError> {
-    let primary_route =
-        project
-            .audio_route(program.primary)
-            .ok_or(NativeMasterError::MissingAudioRoute {
-                input: program.primary,
-            })?;
-    let primary = match primary_route {
-        NativeAudioRoute::Leaf(input) => input,
-        NativeAudioRoute::Silence => program.primary,
-    };
-    let Some(secondary_input) = program.secondary else {
-        program.primary = primary;
-        return Ok(program);
-    };
-    let secondary_route =
-        project
-            .audio_route(secondary_input)
-            .ok_or(NativeMasterError::MissingAudioRoute {
-                input: secondary_input,
-            })?;
-    if primary_route == secondary_route {
-        program.primary = primary;
-        program.secondary = None;
-        program.transition_kind = None;
-        program.mix_numerator = 0;
-        program.mix_denominator = 1;
-        program.mix_start_numerator = 0;
-        program.mix_end_numerator = 0;
-        return Ok(program);
+    program: NativeAudioMixPlan,
+    active_video_inputs: &[InputId],
+    sources: &BTreeMap<InputId, NativeAudioSource>,
+    rendered: &BTreeMap<InputId, Vec<Vec<f32>>>,
+    output: &mut [Vec<f32>],
+    sample_rate: fm_types::SampleRate,
+) -> Result<(), NativeMasterError> {
+    let mut first = None;
+    for (&logical, route) in &project.audio_routes {
+        let NativeAudioRoute::Leaf(physical) = *route else {
+            continue;
+        };
+        first = planar_audio_submission(
+            logical,
+            physical,
+            logical_source_gain(program, logical),
+            samples,
+            sample_rate,
+            sources,
+            rendered,
+        )?;
+        if first.is_some() {
+            break;
+        }
     }
-    program.primary = primary;
-    program.secondary = Some(match secondary_route {
-        NativeAudioRoute::Leaf(input) => input,
-        NativeAudioRoute::Silence => secondary_input,
-    });
-    Ok(program)
+    let Some(first) = first else {
+        mixer.mix_planar_timed_into(timing, samples, &[], active_video_inputs, output)?;
+        return Ok(());
+    };
+
+    let mut submissions = [first; MAX_NATIVE_AUDIO_STRIPS];
+    let mut submission_count = 0;
+    for (&logical, route) in &project.audio_routes {
+        let NativeAudioRoute::Leaf(physical) = *route else {
+            continue;
+        };
+        let Some(submission) = planar_audio_submission(
+            logical,
+            physical,
+            logical_source_gain(program, logical),
+            samples,
+            sample_rate,
+            sources,
+            rendered,
+        )?
+        else {
+            continue;
+        };
+        let slot = submissions
+            .get_mut(submission_count)
+            .ok_or(NativeMasterError::BoundsExceeded)?;
+        *slot = submission;
+        submission_count += 1;
+    }
+    mixer.mix_planar_timed_into(
+        timing,
+        samples,
+        &submissions[..submission_count],
+        active_video_inputs,
+        output,
+    )?;
+    Ok(())
+}
+
+fn planar_audio_submission<'a>(
+    logical: InputId,
+    physical: InputId,
+    source_gain: SourceGain,
+    samples: usize,
+    sample_rate: fm_types::SampleRate,
+    sources: &'a BTreeMap<InputId, NativeAudioSource>,
+    rendered: &'a BTreeMap<InputId, Vec<Vec<f32>>>,
+) -> Result<Option<PlanarAudioSource<'a>>, NativeMasterError> {
+    let source = sources
+        .get(&physical)
+        .ok_or(NativeMasterError::DecodeContract { input: physical })?;
+    if source.explicit_silence {
+        return Ok(None);
+    }
+    let synchronizer = source
+        .synchronizer
+        .as_ref()
+        .ok_or(NativeMasterError::DecodeContract { input: physical })?;
+    let planes = rendered
+        .get(&physical)
+        .ok_or(NativeMasterError::DecodeContract { input: physical })?;
+    Ok(Some(PlanarAudioSource {
+        input: logical,
+        sample_rate,
+        channel_layout: synchronizer.channel_layout(),
+        planes,
+        samples,
+        source_gain,
+    }))
+}
+
+fn logical_source_gain(program: NativeAudioMixPlan, input: InputId) -> SourceGain {
+    if input == program.primary {
+        program.primary_gain
+    } else {
+        program
+            .secondary
+            .filter(|(secondary, _)| *secondary == input)
+            .map_or(SourceGain::UNITY, |(_, gain)| gain)
+    }
 }
 
 fn native_input_state(
@@ -5227,6 +5315,7 @@ mod tests {
         Input, InputAudioStripState, InputGainMilliDb, Layer, LayerGeometry, ProjectSettings,
         Rgba8 as ModelRgba8, Scene as ModelScene, SimulatedAudio, SimulatedInput, SimulatedVideo,
     };
+    use fm_persistence::{ProjectPosition, ProjectStore, RuntimeRouting, StoredProject};
     use fm_scheduler::FrameNumber;
     use fm_switcher::{
         SwitcherCommand, SwitcherState, TBarPosition, TransitionKind as SwitcherTransitionKind,
@@ -5557,6 +5646,12 @@ mod tests {
             );
         }
         let pending_mixer = mixer.clone();
+        let scratch = NativeAudioScratch::new(
+            1,
+            fm_audio::MAX_SAMPLES_PER_BLOCK,
+            &audio_sources,
+            NativeAudioLimits::default().max_retained_blocks,
+        );
         NativeMasterRuntime {
             format,
             frame_rate: FrameRate::new(25, 1).unwrap(),
@@ -5572,12 +5667,7 @@ mod tests {
                 sink_blocks,
                 ..NativeAudioLimits::default()
             },
-            scratch: NativeAudioScratch::new(
-                1,
-                fm_audio::MAX_SAMPLES_PER_BLOCK,
-                sources.len(),
-                NativeAudioLimits::default().max_retained_blocks,
-            ),
+            scratch,
             audio_telemetry: NativeAudioTelemetry::default(),
             failed: false,
         }
@@ -5598,6 +5688,13 @@ mod tests {
             )
             .unwrap();
         let pending_mixer = mixer.clone();
+        let sources = BTreeMap::from([(input, NativeAudioSource::silence())]);
+        let scratch = NativeAudioScratch::new(
+            1,
+            fm_audio::MAX_SAMPLES_PER_BLOCK,
+            &sources,
+            NativeAudioLimits::default().max_retained_blocks,
+        );
         NativeMasterRuntime {
             format,
             frame_rate: FrameRate::new(25, 1).unwrap(),
@@ -5607,18 +5704,13 @@ mod tests {
             mixer,
             pending_mixer,
             sink: CollectingAudioSink::new(sink_blocks, OverflowPolicy::DropOldest).unwrap(),
-            sources: BTreeMap::from([(input, NativeAudioSource::silence())]),
+            sources,
             worker: NativeAudioDecodeWorker::spawn(BTreeMap::new()).unwrap(),
             limits: NativeAudioLimits {
                 sink_blocks,
                 ..NativeAudioLimits::default()
             },
-            scratch: NativeAudioScratch::new(
-                1,
-                fm_audio::MAX_SAMPLES_PER_BLOCK,
-                1,
-                NativeAudioLimits::default().max_retained_blocks,
-            ),
+            scratch,
             audio_telemetry: NativeAudioTelemetry::default(),
             failed: false,
         }
@@ -5910,7 +6002,7 @@ mod tests {
     }
 
     #[test]
-    fn native_project_plan_routes_recursive_audio_and_collapses_shared_terminal() {
+    fn native_project_plan_routes_recursive_audio_without_collapsing_logical_inputs() {
         let mut project = native_plan_project(4, 2);
         add_leaf(&mut project, input(1));
         add_scene_input(&mut project, input(2), scene(20), Some(input(1)));
@@ -5925,37 +6017,12 @@ mod tests {
             plan.audio_route(input(3)),
             Some(NativeAudioRoute::Leaf(input(1)))
         );
+        assert_eq!(
+            plan.audio_route(input(2)),
+            Some(NativeAudioRoute::Leaf(input(1)))
+        );
         assert_eq!(plan.audio_route(input(4)), Some(NativeAudioRoute::Silence));
-        let routed = route_program_audio(
-            ProgramFrame {
-                primary: input(3),
-                secondary: Some(input(2)),
-                transition_kind: Some(SwitcherTransitionKind::Fade),
-                mix_numerator: 1,
-                mix_denominator: 2,
-                mix_start_numerator: 0,
-                mix_end_numerator: 1,
-            },
-            &plan,
-        )
-        .unwrap();
-        assert_eq!(routed.primary, input(1));
-        assert_eq!(routed.secondary, None);
-
-        let silence = route_program_audio(
-            ProgramFrame {
-                primary: input(4),
-                secondary: None,
-                transition_kind: None,
-                mix_numerator: 0,
-                mix_denominator: 1,
-                mix_start_numerator: 0,
-                mix_end_numerator: 0,
-            },
-            &plan,
-        )
-        .unwrap();
-        assert_eq!(silence.primary, input(4));
+        assert_ne!(input(2), input(3));
     }
 
     #[test]
@@ -5983,6 +6050,179 @@ mod tests {
 
         assert_eq!(block.sample_count(), 1_600);
         assert!(block.planes()[0].iter().all(|sample| *sample == 0.0));
+    }
+
+    #[test]
+    fn inactive_physical_strip_without_follow_video_remains_audible() {
+        let active = input(1);
+        let inactive = input(2);
+        let mut project = native_plan_project(4, 2);
+        add_leaf(&mut project, active);
+        add_leaf(&mut project, inactive);
+        assert!(project.set_input_audio_strip(
+            inactive,
+            InputAudioStripState {
+                follow_video: false,
+                ..InputAudioStripState::default()
+            },
+        ));
+        let plan = NativeProjectPlan::compile(&project, NativeProjectLimits::default()).unwrap();
+        let mut master = audio_test_master(&[(active, 0.25), (inactive, 0.5)], 1);
+        master.realize_project_audio(&plan).unwrap();
+
+        assert!(master.service_next_frame().unwrap());
+        let output = master
+            .render_project_frame_audio(&frame_result(0, active, None), &plan)
+            .unwrap();
+
+        for sample in output.plane(0).unwrap() {
+            assert_sample_exact(*sample, 0.75);
+        }
+    }
+
+    #[test]
+    fn inactive_scene_alias_without_follow_video_remains_audible() {
+        let physical = input(1);
+        let active = input(2);
+        let alias = input(3);
+        let mut project = native_plan_project(4, 2);
+        add_leaf(&mut project, physical);
+        add_leaf(&mut project, active);
+        add_scene_input(&mut project, alias, scene(10), Some(physical));
+        add_scene(&mut project, scene(10), Vec::new());
+        assert!(project.set_input_audio_strip(
+            alias,
+            InputAudioStripState {
+                follow_video: false,
+                ..InputAudioStripState::default()
+            },
+        ));
+        let plan = NativeProjectPlan::compile(&project, NativeProjectLimits::default()).unwrap();
+        let mut master = audio_test_master(&[(physical, 0.5), (active, 0.25)], 1);
+        master.realize_project_audio(&plan).unwrap();
+
+        assert!(master.service_next_frame().unwrap());
+        let output = master
+            .render_project_frame_audio(&frame_result(0, active, None), &plan)
+            .unwrap();
+
+        for sample in output.plane(0).unwrap() {
+            assert_sample_exact(*sample, 0.75);
+        }
+    }
+
+    #[test]
+    fn project_store_restart_realizes_persisted_strips_in_master_output() {
+        let active = input(1);
+        let inactive = input(2);
+        let mut project = native_plan_project(4, 2);
+        add_leaf(&mut project, active);
+        add_leaf(&mut project, inactive);
+        assert!(project.set_input_audio_strip(
+            inactive,
+            InputAudioStripState {
+                gain: InputGainMilliDb::new(-6_021).unwrap(),
+                muted: false,
+                follow_video: false,
+            },
+        ));
+        let stored = StoredProject::from_project(
+            project,
+            RuntimeRouting::default(),
+            ProjectPosition::default(),
+            Vec::new(),
+        )
+        .unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "freemixd-native-audio-restart-{}-{}.freemix",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        ProjectStore::new(&root).unwrap().save(&stored).unwrap();
+        let restarted = ProjectStore::new(&root).unwrap().load().unwrap();
+        let plan = NativeProjectPlan::compile(restarted.project(), NativeProjectLimits::default())
+            .unwrap();
+        let inactive_gain = native_input_state(&plan, inactive).unwrap().gain.linear();
+        let mut master = audio_test_master(&[(active, 0.25), (inactive, 0.5)], 1);
+        master.realize_project_audio(&plan).unwrap();
+
+        assert!(master.service_next_frame().unwrap());
+        let output = master
+            .render_project_frame_audio(&frame_result(0, active, None), &plan)
+            .unwrap();
+        let expected = 0.25 + 0.5 * inactive_gain;
+        for sample in output.plane(0).unwrap() {
+            assert!((*sample - expected).abs() < 1.0e-6);
+        }
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shared_leaf_aliases_keep_independent_strip_state_and_transition_gains() {
+        let physical = input(1);
+        let primary = input(2);
+        let secondary = input(3);
+        let mut project = native_plan_project(4, 2);
+        add_leaf(&mut project, physical);
+        add_scene_input(&mut project, primary, scene(10), Some(physical));
+        add_scene_input(&mut project, secondary, scene(20), Some(physical));
+        add_scene(&mut project, scene(10), Vec::new());
+        add_scene(&mut project, scene(20), Vec::new());
+        assert!(project.set_input_audio_strip(
+            primary,
+            InputAudioStripState {
+                gain: InputGainMilliDb::new(-6_021).unwrap(),
+                muted: false,
+                follow_video: true,
+            },
+        ));
+        assert!(project.set_input_audio_strip(
+            secondary,
+            InputAudioStripState {
+                gain: InputGainMilliDb::UNITY,
+                muted: false,
+                follow_video: true,
+            },
+        ));
+        let plan = NativeProjectPlan::compile(&project, NativeProjectLimits::default()).unwrap();
+        let primary_gain = native_input_state(&plan, primary).unwrap().gain.linear();
+        let transition =
+            frame_result_with_interval(0, primary, Some(secondary), 2_500, 10_000, 2_500, 2_500);
+        let mut master = audio_test_master(&[(physical, 1.0)], 1);
+        master.realize_project_audio(&plan).unwrap();
+
+        assert!(master.service_next_frame().unwrap());
+        let output = master
+            .render_project_frame_audio(&transition, &plan)
+            .unwrap();
+        let expected = primary_gain * 0.75 + 0.25;
+        for sample in output.plane(0).unwrap() {
+            assert!((*sample - expected).abs() < 1.0e-6);
+        }
+
+        assert!(project.set_input_audio_strip(
+            secondary,
+            InputAudioStripState {
+                gain: InputGainMilliDb::UNITY,
+                muted: true,
+                follow_video: true,
+            },
+        ));
+        let muted_plan =
+            NativeProjectPlan::compile(&project, NativeProjectLimits::default()).unwrap();
+        let mut muted_master = audio_test_master(&[(physical, 1.0)], 1);
+        muted_master.realize_project_audio(&muted_plan).unwrap();
+        assert!(muted_master.service_next_frame().unwrap());
+        let muted = muted_master
+            .render_project_frame_audio(&transition, &muted_plan)
+            .unwrap();
+        for sample in muted.plane(0).unwrap() {
+            assert!((*sample - primary_gain * 0.75).abs() < 1.0e-6);
+        }
     }
 
     #[test]
@@ -6835,6 +7075,10 @@ mod tests {
         let source_id = input(1);
         let mut master = silent_test_master(source_id, 1);
         master.frame_rate = FrameRate::new(12_000, 1).unwrap();
+        master
+            .scratch
+            .rendered
+            .insert(source_id, vec![vec![0.0; fm_audio::MAX_SAMPLES_PER_BLOCK]]);
         master.sources.insert(
             source_id,
             audio_source(vec![audio_chunk(0, &[0.1, 0.2, 0.3])], true),
@@ -6851,6 +7095,10 @@ mod tests {
         let source_id = input(1);
         let mut master = silent_test_master(source_id, 1);
         master.frame_rate = FrameRate::new(24_000, 1).unwrap();
+        master
+            .scratch
+            .rendered
+            .insert(source_id, vec![vec![0.0; fm_audio::MAX_SAMPLES_PER_BLOCK]]);
         master.sources.insert(
             source_id,
             audio_source(vec![audio_chunk(0, &[1.0, 2.0, 3.0, 4.0])], true),
@@ -7363,12 +7611,12 @@ mod tests {
     }
 
     #[test]
-    fn runtime_reuses_source_discard_mix_and_plan_scratch() {
+    fn runtime_reuses_per_source_mix_and_plan_scratch() {
         let active = input(1);
         let inactive = input(2);
         let mut master = audio_test_master(&[(active, 0.1), (inactive, 0.2)], 2);
-        let primary = master.scratch.primary[0].as_ptr();
-        let discard = master.scratch.discard[0].as_ptr();
+        let active_planes = master.scratch.rendered[&active][0].as_ptr();
+        let inactive_planes = master.scratch.rendered[&inactive][0].as_ptr();
         let mix = master.scratch.mix[0].as_ptr();
         let plan_capacity = master.scratch.plans.capacity();
 
@@ -7379,8 +7627,11 @@ mod tests {
                 .unwrap();
         }
 
-        assert_eq!(master.scratch.primary[0].as_ptr(), primary);
-        assert_eq!(master.scratch.discard[0].as_ptr(), discard);
+        assert_eq!(master.scratch.rendered[&active][0].as_ptr(), active_planes);
+        assert_eq!(
+            master.scratch.rendered[&inactive][0].as_ptr(),
+            inactive_planes
+        );
         assert_eq!(master.scratch.mix[0].as_ptr(), mix);
         assert_eq!(master.scratch.plans.capacity(), plan_capacity);
     }
