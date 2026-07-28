@@ -39,6 +39,11 @@ pub const MAX_CHANNELS: usize = 32;
 pub const MAX_SAMPLES_PER_BLOCK: usize = 48_000;
 /// Maximum duration of a scheduled gain ramp, in samples.
 pub const MAX_RAMP_SAMPLES: usize = 48_000;
+/// Maximum bytes of sample-delay history retained by one [`MasterMixer`].
+///
+/// The limit is four times the maximum retained by one [`SampleDelay`], which
+/// prevents an unbounded number of independently delayed logical strips.
+pub const MAX_MASTER_MIXER_DELAY_BYTES: usize = MAX_SAMPLE_DELAY_BYTES * 4;
 /// Lowest non-silent gain accepted by [`Gain::from_db`].
 pub const MIN_GAIN_DB: f32 = -120.0;
 /// Highest gain accepted by [`Gain::from_db`].
@@ -91,6 +96,13 @@ pub enum AudioError {
         start_numerator: u32,
         end_numerator: u32,
         denominator: u32,
+    },
+    SampleDelay(SampleDelayError),
+    MixerDelayByteCountOverflow,
+    MixerDelayBudgetExceeded {
+        requested: usize,
+        retained: usize,
+        maximum: usize,
     },
     CadenceBlockTooLarge(u128),
 }
@@ -172,6 +184,18 @@ impl fmt::Display for AudioError {
                 formatter,
                 "source gain {start_numerator}/{denominator}..{end_numerator}/{denominator} is outside 0.0..=1.0"
             ),
+            Self::SampleDelay(error) => write!(formatter, "input sample delay error: {error}"),
+            Self::MixerDelayByteCountOverflow => {
+                formatter.write_str("Master mixer delay byte accounting overflow")
+            }
+            Self::MixerDelayBudgetExceeded {
+                requested,
+                retained,
+                maximum,
+            } => write!(
+                formatter,
+                "input sample delay needs {requested} bytes with {retained} already retained; Master mixer limit is {maximum} bytes"
+            ),
             Self::CadenceBlockTooLarge(samples) => write!(
                 formatter,
                 "video cadence requires up to {samples} audio samples in one block"
@@ -185,6 +209,7 @@ impl std::error::Error for AudioError {
         match self {
             Self::AudioBlock(error) => Some(error),
             Self::ChannelMapping(error) => Some(error),
+            Self::SampleDelay(error) => Some(error),
             _ => None,
         }
     }
@@ -199,6 +224,12 @@ impl From<fm_frame::AudioBlockError> for AudioError {
 impl From<ChannelMappingError> for AudioError {
     fn from(value: ChannelMappingError) -> Self {
         Self::ChannelMapping(value)
+    }
+}
+
+impl From<SampleDelayError> for AudioError {
+    fn from(value: SampleDelayError) -> Self {
+        Self::SampleDelay(value)
     }
 }
 
@@ -643,6 +674,7 @@ struct InputStrip {
     mapping: ChannelMapping,
     state: InputState,
     ramp: GainRamp,
+    delay: SampleDelay,
 }
 
 /// Master summing behavior when a sample exceeds the normalized range.
@@ -820,6 +852,7 @@ pub struct MasterMixer {
     format: AudioFormat,
     inputs: BTreeMap<InputId, InputStrip>,
     clipping_policy: ClippingPolicy,
+    retained_delay_bytes: usize,
 }
 
 impl MasterMixer {
@@ -836,6 +869,7 @@ impl MasterMixer {
             format,
             inputs: BTreeMap::new(),
             clipping_policy: ClippingPolicy::default(),
+            retained_delay_bytes: 0,
         })
     }
 
@@ -847,6 +881,11 @@ impl MasterMixer {
     #[must_use]
     pub const fn clipping_policy(&self) -> ClippingPolicy {
         self.clipping_policy
+    }
+
+    #[must_use]
+    pub const fn retained_delay_bytes(&self) -> usize {
+        self.retained_delay_bytes
     }
 
     pub fn set_clipping_policy(&mut self, policy: ClippingPolicy) {
@@ -878,6 +917,8 @@ impl MasterMixer {
         {
             return Err(AudioError::MappingLayoutMismatch);
         }
+        let channels = format.channels.channels().len();
+        let delay = SampleDelay::new(channels, 0)?;
         let ramp = GainRamp::immediate(state.gain);
         self.inputs.insert(
             id,
@@ -886,6 +927,7 @@ impl MasterMixer {
                 mapping,
                 state,
                 ramp,
+                delay,
             },
         );
         Ok(())
@@ -920,10 +962,20 @@ impl MasterMixer {
     ///
     /// Returns [`AudioError::UnknownInput`] when `id` is not configured.
     pub fn remove_input(&mut self, id: InputId) -> Result<(), AudioError> {
-        self.inputs
-            .remove(&id)
-            .map(|_| ())
-            .ok_or(AudioError::UnknownInput(id))
+        let strip = self.inputs.get(&id).ok_or(AudioError::UnknownInput(id))?;
+        let released = delay_bytes(
+            strip.format.channels.channels().len(),
+            strip.delay.delay_samples(),
+        )?;
+        let retained = self
+            .retained_delay_bytes
+            .checked_sub(released)
+            .ok_or(AudioError::MixerDelayByteCountOverflow)?;
+        let Some(_) = self.inputs.remove(&id) else {
+            return Err(AudioError::UnknownInput(id));
+        };
+        self.retained_delay_bytes = retained;
+        Ok(())
     }
 
     #[must_use]
@@ -934,6 +986,52 @@ impl MasterMixer {
     #[must_use]
     pub fn current_linear_gain(&self, id: InputId) -> Option<f32> {
         self.inputs.get(&id).map(|strip| strip.ramp.current)
+    }
+
+    #[must_use]
+    pub fn input_delay_samples(&self, id: InputId) -> Option<usize> {
+        self.inputs
+            .get(&id)
+            .map(|strip| strip.delay.delay_samples())
+    }
+
+    /// Reconfigures one strip's exact raw-planar delay.
+    ///
+    /// A changed delay starts with leading silence. Allocation, bounds, and the
+    /// per-mixer retained-byte budget are checked before the strip is mutated.
+    /// Setting the existing value preserves its history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown input, an out-of-range delay, allocation
+    /// failure, byte-accounting overflow, or mixer delay-budget exhaustion.
+    pub fn set_input_delay(&mut self, id: InputId, delay_samples: usize) -> Result<(), AudioError> {
+        let strip = self.inputs.get(&id).ok_or(AudioError::UnknownInput(id))?;
+        if strip.delay.delay_samples() == delay_samples {
+            return Ok(());
+        }
+        let channels = strip.format.channels.channels().len();
+        let current = delay_bytes(channels, strip.delay.delay_samples())?;
+        let requested = delay_bytes(channels, delay_samples)?;
+        let retained = self
+            .retained_delay_bytes
+            .checked_sub(current)
+            .and_then(|retained| retained.checked_add(requested))
+            .ok_or(AudioError::MixerDelayByteCountOverflow)?;
+        if retained > MAX_MASTER_MIXER_DELAY_BYTES {
+            return Err(AudioError::MixerDelayBudgetExceeded {
+                requested,
+                retained: self.retained_delay_bytes - current,
+                maximum: MAX_MASTER_MIXER_DELAY_BYTES,
+            });
+        }
+        let delay = SampleDelay::new(channels, delay_samples)?;
+        let Some(strip) = self.inputs.get_mut(&id) else {
+            return Err(AudioError::UnknownInput(id));
+        };
+        strip.delay = delay;
+        self.retained_delay_bytes = retained;
+        Ok(())
     }
 
     /// Replaces input state and schedules a linear gain ramp.
@@ -977,12 +1075,23 @@ impl MasterMixer {
         }
         for (id, strip) in &mut self.inputs {
             let source = other.inputs.get(id).ok_or(AudioError::FormatMismatch)?;
-            if strip.format != source.format || strip.mapping != source.mapping {
+            if strip.format != source.format
+                || strip.mapping != source.mapping
+                || strip.delay.channels() != source.delay.channels()
+                || strip.delay.delay_samples() != source.delay.delay_samples()
+            {
                 return Err(AudioError::FormatMismatch);
             }
+        }
+        for (id, strip) in &mut self.inputs {
+            let Some(source) = other.inputs.get(id) else {
+                return Err(AudioError::FormatMismatch);
+            };
             strip.state = source.state;
             strip.ramp = source.ramp;
+            strip.delay.copy_runtime_state_from(&source.delay);
         }
+        self.retained_delay_bytes = other.retained_delay_bytes;
         self.clipping_policy = other.clipping_policy;
         Ok(())
     }
@@ -1068,9 +1177,9 @@ impl MasterMixer {
     /// Mixes borrowed planar sources into caller-owned preallocated planes.
     ///
     /// Only the first `samples` values of each source and output plane are used.
-    /// Structural validation completes before output or strip-ramp state
-    /// changes. A numeric error while summing can leave the output prefix
-    /// partially rendered, but strip-ramp state remains unchanged.
+    /// Structural validation completes before output changes. A numeric error
+    /// while summing can leave the output prefix partially rendered, but strip
+    /// ramps and delay histories remain unchanged.
     ///
     /// # Errors
     ///
@@ -1192,18 +1301,16 @@ impl MasterMixer {
             let audible = !strip.state.muted
                 && (!strip.state.follow_video || active_video_inputs.contains(id));
             let mut ramp = strip.ramp;
-            if let Some((block, source_gain)) = block
-                && audible
-            {
+            if audible {
+                let source_gain = block.map_or(SourceGain::UNITY, |(_, source_gain)| source_gain);
                 for sample in 0..samples {
                     let strip_gain = ramp.next();
                     let source_gain = source_gain.at_sample(sample, samples);
                     for (source, destination, coefficient) in strip.mapping.compiled_routes() {
+                        let input = block.map(|(block, _)| block.planes()[source].as_slice());
+                        let delayed = strip.delay.preview_sample(source, sample, input);
                         let mapped = output[destination][sample]
-                            + block.planes()[source][sample]
-                                * strip_gain
-                                * source_gain
-                                * coefficient;
+                            + delayed * strip_gain * source_gain * coefficient;
                         if !mapped.is_finite() {
                             return Err(AudioError::NonFiniteSample {
                                 channel: destination,
@@ -1229,12 +1336,32 @@ impl MasterMixer {
         }
         validate_finite_sample_prefix(output, samples)?;
         let meters = measure_output.then(|| measure_plane_prefix(output, samples));
-        for strip in self.inputs.values_mut() {
+        self.commit_render(samples, blocks);
+        Ok(meters)
+    }
+
+    fn commit_render<B: MixerBlockView, S: MixerSubmission<B>>(
+        &mut self,
+        samples: usize,
+        blocks: &[S],
+    ) {
+        for (id, strip) in &mut self.inputs {
+            let block = blocks
+                .iter()
+                .find(|submission| submission.input() == *id)
+                .map(MixerSubmission::block);
+            let channels = strip.format.channels.channels().len();
+            for channel in 0..channels {
+                for sample in 0..samples {
+                    let input = block.map_or(0.0, |block| block.planes()[channel][sample]);
+                    strip.delay.commit_sample(channel, sample, input);
+                }
+            }
+            strip.delay.advance(samples);
             for _ in 0..samples {
                 strip.ramp.next();
             }
         }
-        Ok(meters)
     }
 }
 
@@ -1352,6 +1479,20 @@ fn validate_sample_count(samples: usize) -> Result<(), AudioError> {
         return Err(AudioError::SampleCountOutOfRange(samples));
     }
     Ok(())
+}
+
+fn delay_bytes(channels: usize, delay_samples: usize) -> Result<usize, AudioError> {
+    if delay_samples > MAX_SAMPLE_DELAY_SAMPLES {
+        return Err(SampleDelayError::DelayOutOfRange {
+            actual: delay_samples,
+            maximum: MAX_SAMPLE_DELAY_SAMPLES,
+        }
+        .into());
+    }
+    channels
+        .checked_mul(delay_samples)
+        .and_then(|samples| samples.checked_mul(size_of::<f32>()))
+        .ok_or(AudioError::MixerDelayByteCountOverflow)
 }
 
 fn validate_finite_sample_prefix(planes: &[Vec<f32>], samples: usize) -> Result<(), AudioError> {

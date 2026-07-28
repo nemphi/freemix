@@ -199,6 +199,39 @@ impl SampleDelay {
         self.cursor = 0;
     }
 
+    pub(crate) fn preview_sample(
+        &self,
+        channel: usize,
+        sample: usize,
+        input: Option<&[f32]>,
+    ) -> f32 {
+        if sample >= self.delay_samples {
+            input.map_or(0.0, |plane| plane[sample - self.delay_samples])
+        } else {
+            self.ring[channel * self.delay_samples + (self.cursor + sample) % self.delay_samples]
+        }
+    }
+
+    pub(crate) fn commit_sample(&mut self, channel: usize, sample: usize, input: f32) {
+        if self.delay_samples != 0 {
+            let index = channel * self.delay_samples + (self.cursor + sample) % self.delay_samples;
+            self.ring[index] = input;
+        }
+    }
+
+    pub(crate) fn advance(&mut self, samples: usize) {
+        if self.delay_samples != 0 {
+            self.cursor = (self.cursor + samples % self.delay_samples) % self.delay_samples;
+        }
+    }
+
+    pub(crate) fn copy_runtime_state_from(&mut self, other: &Self) {
+        debug_assert_eq!(self.channels, other.channels);
+        debug_assert_eq!(self.delay_samples, other.delay_samples);
+        self.ring.copy_from_slice(&other.ring);
+        self.cursor = other.cursor;
+    }
+
     fn validate_operation(
         &self,
         input: &[&[f32]],
@@ -279,4 +312,49 @@ fn validate_plane_count(
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SampleDelay;
+
+    fn preview_and_commit(delay: &mut SampleDelay, input: &[f32]) -> Vec<f32> {
+        let output = (0..input.len())
+            .map(|sample| delay.preview_sample(0, sample, Some(input)))
+            .collect();
+        for (sample, value) in input.iter().copied().enumerate() {
+            delay.commit_sample(0, sample, value);
+        }
+        delay.advance(input.len());
+        output
+    }
+
+    #[test]
+    fn transactional_preview_reads_current_block_after_the_leading_delay() {
+        let mut delay = SampleDelay::new(1, 2).unwrap();
+
+        assert_eq!(
+            preview_and_commit(&mut delay, &[1.0, 2.0, 3.0, 4.0, 5.0]),
+            [0.0, 0.0, 1.0, 2.0, 3.0]
+        );
+        assert_eq!(
+            preview_and_commit(&mut delay, &[6.0, 7.0, 8.0, 9.0, 10.0]),
+            [4.0, 5.0, 6.0, 7.0, 8.0]
+        );
+    }
+
+    #[test]
+    fn transactional_preview_partitioning_matches_one_multi_wrap_block() {
+        let input = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
+        let mut contiguous = SampleDelay::new(1, 2).unwrap();
+        let expected = preview_and_commit(&mut contiguous, &input);
+
+        let mut partitioned = SampleDelay::new(1, 2).unwrap();
+        let mut actual = Vec::new();
+        actual.extend(preview_and_commit(&mut partitioned, &input[..1]));
+        actual.extend(preview_and_commit(&mut partitioned, &input[1..4]));
+        actual.extend(preview_and_commit(&mut partitioned, &input[4..]));
+
+        assert_eq!(actual, expected);
+    }
 }

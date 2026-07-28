@@ -386,10 +386,15 @@ lifecycle.
 Current implementation boundary for item 3: `fm-audio` provides a bounded,
 deterministic planar-F32 sample-delay primitive with immutable channel count and
 exact nonnegative sample delay, transactional block validation, caller-owned
-output, allocation-free steady-state processing, and explicit reset. It is
-reusable DSP groundwork only: it is not connected to Master mixing, device
-audio, project persistence, daemon/protocol commands, or operator UI, and it
-does not complete item 3 or any `AU-*` parity row.
+output, allocation-free steady-state processing, and explicit reset. The
+reference `MasterMixer` now gives every logical strip independent raw-planar
+delay history before channel mapping and gains, advances that history with
+submitted PCM or silence on every successful Master interval, and bounds total
+retained history per mixer. Delay configuration is an in-memory mixer API with
+transactional allocation and leading-silence reset; it is not connected to
+device audio, project persistence, daemon/protocol commands, native DSP, or
+operator UI. This remains a partial item 3 slice and does not complete or change
+the status of any `AU-*` parity row.
 
 Current implementation boundary for item 1: `fm-io-macos` is the first native
 platform leaf. An isolated Swift helper uses `AVFoundation` to enumerate camera
