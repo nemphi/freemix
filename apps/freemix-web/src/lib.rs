@@ -4,7 +4,7 @@ use std::fmt;
 use std::net::Ipv6Addr;
 
 use fm_client::ClientConfig;
-use fm_protocol::{ClientType, FADE_TO_BLACK_PROTOCOL_VERSION, ProtocolVersion, Role};
+use fm_protocol::{ALPHA_FADE_PROTOCOL_VERSION, ClientType, ProtocolVersion, Role};
 use fm_types::ProjectId;
 
 mod fade_to_black;
@@ -21,7 +21,7 @@ pub use manual_transition::{
 pub use transition::{TransitionControl, TransitionControlState, TransitionControls};
 
 /// Protocol versions implemented by this control surface.
-pub const SUPPORTED_PROTOCOL_VERSIONS: [ProtocolVersion; 1] = [FADE_TO_BLACK_PROTOCOL_VERSION];
+pub const SUPPORTED_PROTOCOL_VERSIONS: [ProtocolVersion; 1] = [ALPHA_FADE_PROTOCOL_VERSION];
 
 /// A semantic panel that can appear in a role-scoped route.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -440,6 +440,10 @@ mod tests {
             "Transition Preview to Program"
         );
         assert_eq!(
+            TransitionControl::AlphaFade.accessibility_label(),
+            "Alpha fade Preview to Program"
+        );
+        assert_eq!(
             TransitionControl::Wipe.accessibility_label(),
             "Wipe Preview to Program"
         );
@@ -474,7 +478,7 @@ mod tests {
         assert_eq!(config.client.build, "freemix-web 0.1.0");
         assert_eq!(
             config.client.supported_versions,
-            [FADE_TO_BLACK_PROTOCOL_VERSION]
+            [ALPHA_FADE_PROTOCOL_VERSION]
         );
     }
 }

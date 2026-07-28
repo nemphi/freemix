@@ -2,8 +2,9 @@ use core::num::NonZeroU128;
 
 use fm_client::{ConnectionState, ReconnectBackoff, Session};
 use fm_protocol::{
-    CommandPayload, FADE_TO_BLACK_PROTOCOL_VERSION, MANUAL_TRANSITION_PROTOCOL_VERSION,
-    ManualTransitionKind, ManualTransitionPosition, ProtocolVersion, Role, ServerIdentity,
+    ALPHA_FADE_PROTOCOL_VERSION, CommandPayload, FADE_TO_BLACK_PROTOCOL_VERSION,
+    MANUAL_TRANSITION_PROTOCOL_VERSION, ManualTransitionKind, ManualTransitionPosition,
+    ProtocolVersion, Role, ServerIdentity,
 };
 use fm_types::InputId;
 use fm_ui_model::{ActiveManualTransition, BusSelection, ManualTransitionStatus, SwitcherState};
@@ -55,11 +56,9 @@ fn ready_session() -> Session {
 }
 
 #[test]
-fn web_handshake_advertises_only_protocol_1_5() {
-    assert_eq!(
-        SUPPORTED_PROTOCOL_VERSIONS,
-        [FADE_TO_BLACK_PROTOCOL_VERSION]
-    );
+fn web_handshake_advertises_only_protocol_1_6() {
+    assert_eq!(SUPPORTED_PROTOCOL_VERSIONS, [ALPHA_FADE_PROTOCOL_VERSION]);
+    assert_eq!(ALPHA_FADE_PROTOCOL_VERSION, ProtocolVersion::new(1, 6));
     assert_eq!(FADE_TO_BLACK_PROTOCOL_VERSION, ProtocolVersion::new(1, 5));
     assert_eq!(
         MANUAL_TRANSITION_PROTOCOL_VERSION,

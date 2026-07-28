@@ -1,11 +1,12 @@
 use fm_client::{ConnectionState, Session};
-use fm_protocol::{CommandPayload, WIPE_PROTOCOL_VERSION};
+use fm_protocol::{ALPHA_FADE_PROTOCOL_VERSION, CommandPayload, WIPE_PROTOCOL_VERSION};
 
 /// A transition control represented by the semantic presentation model.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransitionControl {
     Cut,
     Auto,
+    AlphaFade,
     Wipe,
     Duration,
 }
@@ -17,6 +18,7 @@ impl TransitionControl {
         match self {
             Self::Cut => "Cut Preview to Program",
             Self::Auto => "Transition Preview to Program",
+            Self::AlphaFade => "Alpha fade Preview to Program",
             Self::Wipe => "Wipe Preview to Program",
             Self::Duration => "Transition duration",
         }
@@ -64,7 +66,7 @@ impl TransitionControls {
         self.duration_frames
     }
 
-    /// Sets the Fade/Wipe duration, bounded to the range accepted by the control model.
+    /// Sets the automatic transition duration, bounded to the accepted range.
     pub fn set_duration_frames(&mut self, duration_frames: u32) {
         self.duration_frames =
             duration_frames.clamp(Self::MIN_DURATION_FRAMES, Self::MAX_DURATION_FRAMES);
@@ -79,6 +81,11 @@ impl TransitionControls {
         session: Option<&Session>,
     ) -> TransitionControlState {
         if matches!(control, TransitionControl::Wipe) && !session.is_some_and(session_supports_wipe)
+        {
+            return TransitionControlState::Hidden;
+        }
+        if matches!(control, TransitionControl::AlphaFade)
+            && !session.is_some_and(session_supports_alpha_fade)
         {
             return TransitionControlState::Hidden;
         }
@@ -112,6 +119,9 @@ impl TransitionControls {
             TransitionControl::Auto => Some(CommandPayload::Fade {
                 duration_frames: self.duration_frames,
             }),
+            TransitionControl::AlphaFade => Some(CommandPayload::AlphaFade {
+                duration_frames: self.duration_frames,
+            }),
             TransitionControl::Wipe => Some(CommandPayload::Wipe {
                 duration_frames: self.duration_frames,
             }),
@@ -138,6 +148,11 @@ fn session_can_transition(session: &Session) -> bool {
 fn session_supports_wipe(session: &Session) -> bool {
     session.protocol.major == WIPE_PROTOCOL_VERSION.major
         && session.protocol.minor >= WIPE_PROTOCOL_VERSION.minor
+}
+
+fn session_supports_alpha_fade(session: &Session) -> bool {
+    session.protocol.major == ALPHA_FADE_PROTOCOL_VERSION.major
+        && session.protocol.minor >= ALPHA_FADE_PROTOCOL_VERSION.minor
 }
 
 #[cfg(test)]
@@ -181,6 +196,64 @@ mod tests {
     }
 
     #[test]
+    fn protocol_1_6_exposes_alpha_fade_and_preserves_exact_duration() {
+        let mut controls = TransitionControls::default();
+        controls.set_duration_frames(45);
+        let session = session(ALPHA_FADE_PROTOCOL_VERSION, &["transition"]);
+
+        assert_eq!(
+            controls.control_state(
+                TransitionControl::AlphaFade,
+                &ConnectionState::Ready,
+                Some(&session)
+            ),
+            TransitionControlState::Enabled
+        );
+        assert_eq!(
+            controls.command_payload(
+                TransitionControl::AlphaFade,
+                &ConnectionState::Ready,
+                Some(&session)
+            ),
+            Some(CommandPayload::AlphaFade {
+                duration_frames: 45
+            })
+        );
+    }
+
+    #[test]
+    fn protocol_1_5_hides_alpha_fade_without_hiding_older_transitions() {
+        let controls = TransitionControls::default();
+        let session = session(fm_protocol::FADE_TO_BLACK_PROTOCOL_VERSION, &["transition"]);
+
+        assert_eq!(
+            controls.control_state(
+                TransitionControl::AlphaFade,
+                &ConnectionState::Ready,
+                Some(&session)
+            ),
+            TransitionControlState::Hidden
+        );
+        assert_eq!(
+            controls.command_payload(
+                TransitionControl::AlphaFade,
+                &ConnectionState::Ready,
+                Some(&session)
+            ),
+            None
+        );
+        assert!(
+            controls
+                .control_state(
+                    TransitionControl::Wipe,
+                    &ConnectionState::Ready,
+                    Some(&session)
+                )
+                .is_enabled()
+        );
+    }
+
+    #[test]
     fn protocol_1_2_neither_exposes_nor_builds_wipe() {
         let controls = TransitionControls::default();
         let session = session(ProtocolVersion::new(1, 2), &["transition"]);
@@ -212,13 +285,14 @@ mod tests {
     }
 
     #[test]
-    fn transition_permission_gates_cut_fade_and_wipe_independently_of_protocol() {
+    fn transition_permission_gates_all_supported_automatic_controls() {
         let controls = TransitionControls::default();
-        let session = session(WIPE_PROTOCOL_VERSION, &["view_status"]);
+        let session = session(ALPHA_FADE_PROTOCOL_VERSION, &["view_status"]);
 
         for control in [
             TransitionControl::Cut,
             TransitionControl::Auto,
+            TransitionControl::AlphaFade,
             TransitionControl::Wipe,
         ] {
             assert_eq!(
@@ -257,16 +331,16 @@ mod tests {
     }
 
     #[test]
-    fn fade_and_wipe_payloads_share_the_bounded_duration() {
+    fn fade_alpha_fade_and_wipe_payloads_share_the_bounded_duration() {
         let mut controls = TransitionControls::default();
-        let session = session(WIPE_PROTOCOL_VERSION, &["transition"]);
+        let wipe_session = session(WIPE_PROTOCOL_VERSION, &["transition"]);
 
         controls.set_duration_frames(45);
         assert_eq!(
             controls.command_payload(
                 TransitionControl::Auto,
                 &ConnectionState::Ready,
-                Some(&session)
+                Some(&wipe_session)
             ),
             Some(CommandPayload::Fade {
                 duration_frames: 45
@@ -274,9 +348,28 @@ mod tests {
         );
         assert_eq!(
             controls.command_payload(
+                TransitionControl::AlphaFade,
+                &ConnectionState::Ready,
+                Some(&wipe_session)
+            ),
+            None
+        );
+        let current = session(ALPHA_FADE_PROTOCOL_VERSION, &["transition"]);
+        assert_eq!(
+            controls.command_payload(
+                TransitionControl::AlphaFade,
+                &ConnectionState::Ready,
+                Some(&current)
+            ),
+            Some(CommandPayload::AlphaFade {
+                duration_frames: 45
+            })
+        );
+        assert_eq!(
+            controls.command_payload(
                 TransitionControl::Wipe,
                 &ConnectionState::Ready,
-                Some(&session)
+                Some(&wipe_session)
             ),
             Some(CommandPayload::Wipe {
                 duration_frames: 45
@@ -340,6 +433,43 @@ mod tests {
                 Some(&downgraded)
             ),
             None
+        );
+    }
+
+    #[test]
+    fn reconnect_hides_alpha_fade_until_protocol_1_6_is_ready() {
+        let controls = TransitionControls::default();
+        let current = session(ALPHA_FADE_PROTOCOL_VERSION, &["transition"]);
+        assert!(
+            controls
+                .control_state(
+                    TransitionControl::AlphaFade,
+                    &ConnectionState::Ready,
+                    Some(&current)
+                )
+                .is_enabled()
+        );
+
+        assert_eq!(
+            controls.control_state(
+                TransitionControl::AlphaFade,
+                &ConnectionState::Backoff(ReconnectBackoff {
+                    attempt: 1,
+                    delay_ms: 250,
+                }),
+                None
+            ),
+            TransitionControlState::Hidden
+        );
+
+        let downgraded = session(fm_protocol::FADE_TO_BLACK_PROTOCOL_VERSION, &["transition"]);
+        assert_eq!(
+            controls.control_state(
+                TransitionControl::AlphaFade,
+                &ConnectionState::Ready,
+                Some(&downgraded)
+            ),
+            TransitionControlState::Hidden
         );
     }
 }
