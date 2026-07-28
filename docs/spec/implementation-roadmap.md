@@ -687,9 +687,18 @@ corresponding ordered decoded-luma sequence: initial white, forward gray,
 reversed bright, cancelled white, and committed black. It also verifies the
 inactive committed checkpoint.
 
-Stinger, Slide/Zoom, other transition families, cross-platform/fullscreen
-evidence, and complete `SW-004` acceptance remain pending; parity therefore
-stays planned. Item 5 and RC-007 remain planned.
+Horizontal Slide rendering groundwork now moves Program left while Preview
+enters from the right at the exact integer offset
+`floor(width * numerator / denominator)`. CPU and simulated paths cover exact
+endpoints and odd-width pixels; a required Metal readback matches the CPU
+oracle. Native planning preserves the Slide kind, and Master audio uses the
+existing sample-linear two-source crossfade. Slide is not yet command-reachable:
+engine/control/protocol/operator paths and configured-output acceptance remain
+absent.
+
+Stinger, Slide authority, Zoom, other transition families,
+cross-platform/fullscreen evidence, and complete `SW-004` acceptance remain
+pending; parity therefore stays planned. Item 5 and RC-007 remain planned.
 
 FTB groundwork now includes a switcher-owned bounded automatic control core
 alongside the compositor plan. The controller moves from its current exact

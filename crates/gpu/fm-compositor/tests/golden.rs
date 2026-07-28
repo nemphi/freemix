@@ -227,7 +227,7 @@ fn safe_areas_never_enter_program_but_render_in_operator_output() {
 }
 
 #[test]
-fn cut_fade_and_wipe_have_byte_exact_endpoints() {
+fn cut_fade_wipe_and_slide_have_byte_exact_endpoints() {
     let left = frame(1, 1, &[Rgba8::new(1, 2, 3, 255)]);
     let right = frame(1, 1, &[Rgba8::new(200, 100, 50, 255)]);
     let cut = TransitionPlan::compile(TransitionKind::Cut, 0, 1).unwrap();
@@ -259,6 +259,14 @@ fn cut_fade_and_wipe_have_byte_exact_endpoints() {
     let wipe_end = TransitionPlan::compile(TransitionKind::Wipe, 10, 10).unwrap();
     assert_eq!(execute_transition(wipe_start, &left, &right).unwrap(), left);
     assert_eq!(execute_transition(wipe_end, &left, &right).unwrap(), right);
+
+    let slide_start = TransitionPlan::compile(TransitionKind::Slide, 0, 10).unwrap();
+    let slide_end = TransitionPlan::compile(TransitionKind::Slide, 10, 10).unwrap();
+    assert_eq!(
+        execute_transition(slide_start, &left, &right).unwrap(),
+        left
+    );
+    assert_eq!(execute_transition(slide_end, &left, &right).unwrap(), right);
 }
 
 #[test]
@@ -312,6 +320,56 @@ fn wipe_uses_a_floor_boundary_for_odd_widths() {
 }
 
 #[test]
+fn slide_uses_a_floor_offset_for_odd_widths() {
+    let from = frame(
+        5,
+        1,
+        &[
+            Rgba8::new(1, 0, 0, 255),
+            Rgba8::new(2, 0, 0, 255),
+            Rgba8::new(3, 0, 0, 255),
+            Rgba8::new(4, 0, 0, 255),
+            Rgba8::new(5, 0, 0, 255),
+        ],
+    );
+    let to = frame(
+        5,
+        1,
+        &[
+            Rgba8::new(101, 0, 0, 255),
+            Rgba8::new(102, 0, 0, 255),
+            Rgba8::new(103, 0, 0, 255),
+            Rgba8::new(104, 0, 0, 255),
+            Rgba8::new(105, 0, 0, 255),
+        ],
+    );
+
+    let half = TransitionPlan::compile(TransitionKind::Slide, 1, 2).unwrap();
+    assert_eq!(
+        pixels(&execute_transition(half, &from, &to).unwrap()),
+        [
+            Rgba8::new(3, 0, 0, 255),
+            Rgba8::new(4, 0, 0, 255),
+            Rgba8::new(5, 0, 0, 255),
+            Rgba8::new(101, 0, 0, 255),
+            Rgba8::new(102, 0, 0, 255),
+        ]
+    );
+
+    let two_thirds = TransitionPlan::compile(TransitionKind::Slide, 2, 3).unwrap();
+    assert_eq!(
+        pixels(&execute_transition(two_thirds, &from, &to).unwrap()),
+        [
+            Rgba8::new(4, 0, 0, 255),
+            Rgba8::new(5, 0, 0, 255),
+            Rgba8::new(101, 0, 0, 255),
+            Rgba8::new(102, 0, 0, 255),
+            Rgba8::new(103, 0, 0, 255),
+        ]
+    );
+}
+
+#[test]
 fn malformed_and_unsupported_work_is_rejected_explicitly() {
     assert_eq!(
         Scene::new(0, 1, Rgba8::new(0, 0, 0, 0)),
@@ -326,8 +384,8 @@ fn malformed_and_unsupported_work_is_rejected_explicitly() {
         Err(TransitionError::ZeroDenominator)
     );
     assert!(matches!(
-        TransitionPlan::compile(TransitionKind::Slide, 0, 1),
-        Err(TransitionError::UnsupportedKind(TransitionKind::Slide))
+        TransitionPlan::compile(TransitionKind::Zoom, 0, 1),
+        Err(TransitionError::UnsupportedKind(TransitionKind::Zoom))
     ));
 
     let mut invalid = Scene::new(1, 1, Rgba8::new(0, 0, 0, 255)).unwrap();

@@ -3651,13 +3651,12 @@ fn native_audio_mix_plan(program: ProgramFrame) -> Result<NativeAudioMixPlan, Na
         Some(
             SwitcherTransitionKind::Fade
             | SwitcherTransitionKind::Wipe
-            | SwitcherTransitionKind::AlphaFade,
+            | SwitcherTransitionKind::AlphaFade
+            | SwitcherTransitionKind::Slide,
         ) => sample_linear_audio_mix_plan(program, secondary),
-        Some(
-            kind @ (SwitcherTransitionKind::Slide
-            | SwitcherTransitionKind::Zoom
-            | SwitcherTransitionKind::Stinger(_)),
-        ) => Err(NativeMasterError::UnsupportedAudioTransition(kind)),
+        Some(kind @ (SwitcherTransitionKind::Zoom | SwitcherTransitionKind::Stinger(_))) => {
+            Err(NativeMasterError::UnsupportedAudioTransition(kind))
+        }
         None => Err(NativeMasterError::MissingAudioTransitionKind),
     }
 }
@@ -3716,6 +3715,7 @@ fn native_mix_plan(program: ProgramFrame) -> Result<NativeMixPlan, NativeSourceR
                 Some(SwitcherTransitionKind::Fade) => TransitionKind::Fade,
                 Some(SwitcherTransitionKind::AlphaFade) => TransitionKind::AlphaFade,
                 Some(SwitcherTransitionKind::Wipe) => TransitionKind::Wipe,
+                Some(SwitcherTransitionKind::Slide) => TransitionKind::Slide,
                 Some(kind) => return Err(NativeSourceRenderError::UnsupportedTransition(kind)),
                 None => return Err(NativeSourceRenderError::MissingTransitionKind),
             };
@@ -6774,7 +6774,7 @@ mod tests {
     }
 
     #[test]
-    fn program_frame_maps_exactly_to_cut_fade_or_wipe() {
+    fn program_frame_maps_exactly_to_cut_fade_wipe_or_slide() {
         let primary = input(1);
         let secondary = input((1_u128 << 64) + 1);
         let cut = native_mix_plan(ProgramFrame {
@@ -6853,18 +6853,34 @@ mod tests {
         assert_eq!(wipe.transition.numerator(), 1);
         assert_eq!(wipe.transition.denominator(), 2);
 
+        let slide = native_mix_plan(ProgramFrame {
+            primary,
+            secondary: Some(secondary),
+            transition_kind: Some(SwitcherTransitionKind::Slide),
+            mix_numerator: 2,
+            mix_denominator: 3,
+            mix_start_numerator: 1,
+            mix_end_numerator: 2,
+        })
+        .unwrap();
+        assert_eq!(slide.primary, primary);
+        assert_eq!(slide.secondary, secondary);
+        assert_eq!(slide.transition.kind(), TransitionKind::Slide);
+        assert_eq!(slide.transition.numerator(), 2);
+        assert_eq!(slide.transition.denominator(), 3);
+
         assert!(matches!(
             native_mix_plan(ProgramFrame {
                 primary,
                 secondary: Some(secondary),
-                transition_kind: Some(SwitcherTransitionKind::Slide),
+                transition_kind: Some(SwitcherTransitionKind::Zoom),
                 mix_numerator: 1,
                 mix_denominator: 2,
                 mix_start_numerator: 1,
                 mix_end_numerator: 2,
             }),
             Err(NativeSourceRenderError::UnsupportedTransition(
-                SwitcherTransitionKind::Slide
+                SwitcherTransitionKind::Zoom
             ))
         ));
     }
@@ -8000,7 +8016,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_two_source_audio_transitions_fail_explicitly() {
+    fn slide_audio_crossfades_while_unsupported_transitions_fail_explicitly() {
         let old = input(1);
         let new = input(2);
         let program = |transition_kind| ProgramFrame {
@@ -8013,8 +8029,16 @@ mod tests {
             mix_end_numerator: 1,
         };
 
+        assert_eq!(
+            native_audio_mix_plan(program(Some(SwitcherTransitionKind::Slide))).unwrap(),
+            NativeAudioMixPlan {
+                primary: old,
+                primary_gain: SourceGain::new(1, 0, 1).unwrap(),
+                secondary: Some((new, SourceGain::new(0, 1, 1).unwrap())),
+            }
+        );
+
         for kind in [
-            SwitcherTransitionKind::Slide,
             SwitcherTransitionKind::Zoom,
             SwitcherTransitionKind::Stinger(fm_switcher::StingerSlotId::new(1).unwrap()),
         ] {

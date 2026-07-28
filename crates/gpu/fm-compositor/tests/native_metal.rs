@@ -457,7 +457,7 @@ fn native_metal_fade_to_black_matches_direct_half_expectations() {
 
 #[test]
 #[ignore = "requires a native macOS Metal adapter"]
-fn native_metal_wipe_matches_cpu_at_odd_width_boundaries() {
+fn native_metal_wipe_and_slide_match_cpu_at_odd_width_boundaries() {
     block_on(async {
         let from_cpu = sized_frame(
             3,
@@ -487,29 +487,36 @@ fn native_metal_wipe_matches_cpu_at_odd_width_boundaries() {
         let from_half = context.readback(from.texture()).await.unwrap();
         let to_half = context.readback(to.texture()).await.unwrap();
 
-        for (numerator, denominator) in [(0, 2), (1, 3), (1, 2), (2, 2)] {
-            let plan =
-                TransitionPlan::compile(TransitionKind::Wipe, numerator, denominator).unwrap();
-            let expected = execute_transition(plan, &from_image, &to_image).unwrap();
-            let output = renderer
-                .render(&context, plan, from.texture(), to.texture())
-                .await
-                .unwrap();
-            let actual = context.readback(&output).await.unwrap();
-            assert_rgba16f_matches_cpu(&actual, &expected);
+        for kind in [TransitionKind::Wipe, TransitionKind::Slide] {
+            for (numerator, denominator) in [(0, 2), (1, 3), (1, 2), (2, 2)] {
+                let plan = TransitionPlan::compile(kind, numerator, denominator).unwrap();
+                let expected = execute_transition(plan, &from_image, &to_image).unwrap();
+                let output = renderer
+                    .render(&context, plan, from.texture(), to.texture())
+                    .await
+                    .unwrap();
+                let actual = context.readback(&output).await.unwrap();
+                assert_rgba16f_matches_cpu(&actual, &expected);
 
-            let boundary = 5 * numerator / denominator;
-            for (pixel, actual) in actual.bytes.chunks_exact(8).enumerate() {
-                let endpoint = if u32::try_from(pixel).unwrap() < boundary {
-                    &to_half
-                } else {
-                    &from_half
-                };
-                assert_eq!(
-                    actual,
-                    &endpoint.bytes[pixel * 8..pixel * 8 + 8],
-                    "Wipe {numerator}/{denominator}, pixel {pixel} endpoint"
-                );
+                let boundary = 5 * numerator / denominator;
+                for (pixel, actual) in actual.bytes.chunks_exact(8).enumerate() {
+                    let pixel = u32::try_from(pixel).unwrap();
+                    let (endpoint, source_pixel) = match kind {
+                        TransitionKind::Wipe if pixel < boundary => (&to_half, pixel),
+                        TransitionKind::Wipe => (&from_half, pixel),
+                        TransitionKind::Slide if pixel < 5 - boundary => {
+                            (&from_half, pixel + boundary)
+                        }
+                        TransitionKind::Slide => (&to_half, pixel - (5 - boundary)),
+                        _ => unreachable!("test covers Wipe and Slide"),
+                    };
+                    let source_pixel = usize::try_from(source_pixel).unwrap();
+                    assert_eq!(
+                        actual,
+                        &endpoint.bytes[source_pixel * 8..source_pixel * 8 + 8],
+                        "{kind:?} {numerator}/{denominator}, pixel {pixel} endpoint"
+                    );
+                }
             }
         }
     });

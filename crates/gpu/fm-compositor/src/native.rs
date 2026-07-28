@@ -135,6 +135,23 @@ fn transition_fragment(@builtin(position) position: vec4<f32>) -> @location(0) v
         }
         return source;
     }
+    if transition.operation == 3u {
+        let width = textureDimensions(from_texture).x;
+        let x = u32(position.x);
+        let remaining = width - transition.boundary;
+        if x < remaining {
+            return textureLoad(
+                from_texture,
+                vec2<i32>(i32(x + transition.boundary), coordinates.y),
+                0,
+            );
+        }
+        return textureLoad(
+            to_texture,
+            vec2<i32>(i32(x - remaining), coordinates.y),
+            0,
+        );
+    }
     return mix(source, destination, f32(transition.numerator) / f32(transition.denominator));
 }
 ";
@@ -751,7 +768,7 @@ fn encode_fade_to_black_uniform(plan: FadeToBlackPlan) -> [u8; FADE_TO_BLACK_UNI
     bytes
 }
 
-/// Errors produced by the native Cut/Fade/AlphaFade/Wipe renderer.
+/// Errors produced by the native Cut/Fade/AlphaFade/Wipe/Slide renderer.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NativeTransitionError {
     WidthMismatch { from: u32, to: u32 },
@@ -794,7 +811,7 @@ impl From<NativeGpuError> for NativeTransitionError {
     }
 }
 
-/// Native Cut/Fade/AlphaFade/Wipe renderer containing only its compiled GPU pipeline.
+/// Native Cut/Fade/AlphaFade/Wipe/Slide renderer containing only its compiled GPU pipeline.
 pub struct NativeTransitionRenderer {
     pipeline: NativeFullscreenPipeline,
 }
@@ -822,7 +839,7 @@ impl NativeTransitionRenderer {
         Ok(Self { pipeline })
     }
 
-    /// Submits a GPU-resident Cut, Fade, `AlphaFade`, or Wipe and returns its native texture.
+    /// Submits a GPU-resident Cut, Fade, `AlphaFade`, Wipe, or Slide and returns its native texture.
     /// This operation does not poll or read pixels back.
     ///
     /// # Errors
@@ -888,11 +905,12 @@ fn encode_uniform(plan: TransitionPlan, width: u32) -> [u8; 16] {
         TransitionKind::Cut => 0_u32,
         TransitionKind::Fade | TransitionKind::AlphaFade => 1_u32,
         TransitionKind::Wipe => 2_u32,
-        TransitionKind::Slide | TransitionKind::Zoom | TransitionKind::Stinger => {
-            unreachable!("TransitionPlan only compiles Cut, Fade, AlphaFade, and Wipe")
+        TransitionKind::Slide => 3_u32,
+        TransitionKind::Zoom | TransitionKind::Stinger => {
+            unreachable!("TransitionPlan only compiles Cut, Fade, AlphaFade, Wipe, and Slide")
         }
     };
-    let boundary = if plan.kind() == TransitionKind::Wipe {
+    let boundary = if matches!(plan.kind(), TransitionKind::Wipe | TransitionKind::Slide) {
         wipe_boundary(width, plan.numerator(), plan.denominator())
     } else {
         0
@@ -1099,6 +1117,11 @@ mod tests {
         let uniform = encode_uniform(wipe, 5);
         assert_eq!(u32::from_le_bytes(uniform[0..4].try_into().unwrap()), 2);
         assert_eq!(u32::from_le_bytes(uniform[12..16].try_into().unwrap()), 2);
+
+        let slide = TransitionPlan::compile(TransitionKind::Slide, 2, 3).unwrap();
+        let uniform = encode_uniform(slide, 5);
+        assert_eq!(u32::from_le_bytes(uniform[0..4].try_into().unwrap()), 3);
+        assert_eq!(u32::from_le_bytes(uniform[12..16].try_into().unwrap()), 3);
     }
 
     #[test]

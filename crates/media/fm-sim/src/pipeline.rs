@@ -111,6 +111,12 @@ impl SimulatedPipeline {
                 program.mix_numerator,
                 program.mix_denominator,
             )?),
+            Some(TransitionKind::Slide) => Ok(horizontal_slide(
+                &primary,
+                &secondary,
+                program.mix_numerator,
+                program.mix_denominator,
+            )?),
             Some(kind) => Err(RenderError::UnsupportedTransition(kind)),
             None => Err(RenderError::MissingTransitionKind),
         }
@@ -161,6 +167,50 @@ fn horizontal_wipe(
         .zip(to.pixels().chunks_exact(to.stride()))
     {
         output_row[..boundary_bytes].copy_from_slice(&to_row[..boundary_bytes]);
+    }
+    ImageFrame::new(from.width(), from.height(), from.stride(), pixels).map_err(BlendError::Frame)
+}
+
+fn horizontal_slide(
+    from: &ImageFrame,
+    to: &ImageFrame,
+    numerator: u32,
+    denominator: u32,
+) -> Result<ImageFrame, BlendError> {
+    if denominator == 0 {
+        return Err(BlendError::ZeroDenominator);
+    }
+    if numerator > denominator {
+        return Err(BlendError::NumeratorExceedsDenominator {
+            numerator,
+            denominator,
+        });
+    }
+    if numerator == 0 {
+        return Ok(from.clone());
+    }
+    if numerator == denominator {
+        return Ok(to.clone());
+    }
+
+    let offset = u64::from(from.width()) * u64::from(numerator) / u64::from(denominator);
+    let offset_bytes = usize::try_from(offset)
+        .map_err(|_| BlendError::Frame(FrameError::LayoutOverflow))?
+        .checked_mul(4)
+        .ok_or(BlendError::Frame(FrameError::LayoutOverflow))?;
+    let row_bytes = usize::try_from(from.width())
+        .map_err(|_| BlendError::Frame(FrameError::LayoutOverflow))?
+        .checked_mul(4)
+        .ok_or(BlendError::Frame(FrameError::LayoutOverflow))?;
+    let remaining_bytes = row_bytes - offset_bytes;
+    let mut pixels = from.pixels().to_vec();
+    for ((output_row, from_row), to_row) in pixels
+        .chunks_exact_mut(from.stride())
+        .zip(from.pixels().chunks_exact(from.stride()))
+        .zip(to.pixels().chunks_exact(to.stride()))
+    {
+        output_row[..remaining_bytes].copy_from_slice(&from_row[offset_bytes..row_bytes]);
+        output_row[remaining_bytes..row_bytes].copy_from_slice(&to_row[..offset_bytes]);
     }
     ImageFrame::new(from.width(), from.height(), from.stride(), pixels).map_err(BlendError::Frame)
 }

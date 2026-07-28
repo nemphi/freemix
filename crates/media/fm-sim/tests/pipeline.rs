@@ -159,6 +159,50 @@ fn wipe_renders_exact_endpoints_and_floor_pixel_boundary() {
 }
 
 #[test]
+fn slide_renders_exact_endpoints_and_shifts_program_left() {
+    let mut pipeline = SimulatedPipeline::new(5, 1).unwrap();
+    let blue = Rgba8::new(0, 0, 255, 255);
+    pipeline
+        .register(SimulatedSource::new(input(1), SourcePattern::Bars))
+        .unwrap();
+    pipeline
+        .register(SimulatedSource::new(input(2), SourcePattern::Solid(blue)))
+        .unwrap();
+    let frame = |numerator| ProgramFrame {
+        primary: input(1),
+        secondary: Some(input(2)),
+        transition_kind: Some(TransitionKind::Slide),
+        mix_numerator: numerator,
+        mix_denominator: 2,
+        mix_start_numerator: numerator,
+        mix_end_numerator: numerator,
+    };
+    let program = pipeline
+        .render(
+            0,
+            ProgramFrame {
+                primary: input(1),
+                secondary: None,
+                transition_kind: None,
+                mix_numerator: 0,
+                mix_denominator: 1,
+                mix_start_numerator: 0,
+                mix_end_numerator: 0,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(pipeline.render(0, frame(0)).unwrap(), program);
+    let half = pipeline.render(0, frame(1)).unwrap();
+    assert_eq!(half.pixel(0, 0), program.pixel(2, 0));
+    assert_eq!(half.pixel(1, 0), program.pixel(3, 0));
+    assert_eq!(half.pixel(2, 0), program.pixel(4, 0));
+    assert_eq!(half.pixel(3, 0), Some(blue));
+    assert_eq!(half.pixel(4, 0), Some(blue));
+    assert!((0..5).all(|x| pipeline.render(0, frame(2)).unwrap().pixel(x, 0) == Some(blue)));
+}
+
+#[test]
 fn pipeline_rejects_missing_and_unsupported_transition_kinds() {
     let mut pipeline = SimulatedPipeline::new(1, 1).unwrap();
     for value in [1, 2] {
@@ -184,8 +228,8 @@ fn pipeline_rejects_missing_and_unsupported_transition_kinds() {
         Err(RenderError::MissingTransitionKind)
     );
     assert_eq!(
-        pipeline.render(0, frame(Some(TransitionKind::Slide))),
-        Err(RenderError::UnsupportedTransition(TransitionKind::Slide))
+        pipeline.render(0, frame(Some(TransitionKind::Zoom))),
+        Err(RenderError::UnsupportedTransition(TransitionKind::Zoom))
     );
 }
 
