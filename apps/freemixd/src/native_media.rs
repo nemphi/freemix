@@ -37,8 +37,10 @@ use fm_color::{
     NativeImportError, NativeImportNormalizer, NativeSdrOutputTransform, NativeWorkingFrame,
 };
 use fm_compositor::{
-    CompositionPlan, NativeCompositionError, NativeCompositionRenderer, NativeSourceFrame,
-    NativeTransitionError, NativeTransitionRenderer, OutputTarget, PlanError,
+    CompositionPlan, FadeToBlackPlan, FadeToBlackPlanError,
+    FadeToBlackPosition as CompositorFadeToBlackPosition, NativeCompositionError,
+    NativeCompositionRenderer, NativeFadeToBlackError, NativeFadeToBlackRenderer,
+    NativeSourceFrame, NativeTransitionError, NativeTransitionRenderer, OutputTarget, PlanError,
     RectMask as CompositorRectMask, Rgba8 as CompositorRgba8, Rotation as CompositorRotation,
     Scene as CompositorScene, SourceId, SourceLayer, Transform, TransitionError, TransitionKind,
     TransitionPlan, compile_scene,
@@ -54,7 +56,7 @@ use fm_gpu::{
 };
 use fm_model::{InputAudioStripState, InputKind, Project, Rotation, SourceRef};
 use fm_sim::{CollectingAudioSink, OverflowPolicy, SinkConfigError, SinkTelemetry};
-use fm_switcher::{ProgramFrame, TransitionKind as SwitcherTransitionKind};
+use fm_switcher::{FadeToBlackFrame, ProgramFrame, TransitionKind as SwitcherTransitionKind};
 use fm_types::{AudioFormat, FrameRate, InputId, SampleFormat, SceneId, TimeBase};
 
 const RGBA16_FLOAT_BYTES_PER_PIXEL: u64 = 8;
@@ -539,7 +541,7 @@ fn maximum_native_execution_peak(
     scenes: &[NativeScenePlan],
 ) -> Result<usize, NativeProjectPlanError> {
     let routes = routes.values().copied().collect::<Vec<_>>();
-    let mut maximum = 2_usize;
+    let mut maximum = 3_usize;
     for primary in &routes {
         for secondary in &routes {
             let execution = scene_execution_for_routes(Some(*primary), Some(*secondary), scenes)
@@ -592,12 +594,14 @@ fn scene_execution_for_routes(
 fn native_execution_peak(
     execution: &NativeSceneExecution,
 ) -> Result<usize, NativeProjectPlanError> {
-    // One fenced slot retains the full closure plus its transition target. The
-    // daemon also owns the previous Program target until the new frame returns.
+    // One fenced slot retains the full closure, its transition target, and the
+    // post-Program FTB target. The daemon also owns the previous Program target
+    // until the new frame returns.
     execution
         .required
         .len()
         .checked_add(NATIVE_PROJECT_IN_FLIGHT_SLOTS)
+        .and_then(|targets| targets.checked_add(1))
         .and_then(|targets| targets.checked_add(1))
         .ok_or(NativeProjectPlanError::TransientTargetCountOverflow)
 }
@@ -752,6 +756,7 @@ pub enum NativeMediaError {
     Color(NativeImportError),
     SceneCompositor(NativeCompositionError),
     Compositor(NativeTransitionError),
+    FadeToBlack(NativeFadeToBlackError),
 }
 
 impl fmt::Display for NativeMediaError {
@@ -764,6 +769,9 @@ impl fmt::Display for NativeMediaError {
                 write!(formatter, "native scene composition failed: {error}")
             }
             Self::Compositor(error) => write!(formatter, "native composition failed: {error}"),
+            Self::FadeToBlack(error) => {
+                write!(formatter, "native Fade-to-Black setup failed: {error}")
+            }
         }
     }
 }
@@ -776,6 +784,7 @@ impl Error for NativeMediaError {
             Self::Color(error) => Some(error),
             Self::SceneCompositor(error) => Some(error),
             Self::Compositor(error) => Some(error),
+            Self::FadeToBlack(error) => Some(error),
         }
     }
 }
@@ -807,6 +816,12 @@ impl From<NativeTransitionError> for NativeMediaError {
 impl From<NativeCompositionError> for NativeMediaError {
     fn from(value: NativeCompositionError) -> Self {
         Self::SceneCompositor(value)
+    }
+}
+
+impl From<NativeFadeToBlackError> for NativeMediaError {
+    fn from(value: NativeFadeToBlackError) -> Self {
+        Self::FadeToBlack(value)
     }
 }
 
@@ -1128,6 +1143,8 @@ pub enum NativeSourceRenderError {
     Completion(NativeGpuError),
     SceneCompositor(NativeCompositionError),
     Compositor(NativeTransitionError),
+    InvalidFadeToBlack(FadeToBlackPlanError),
+    FadeToBlack(NativeFadeToBlackError),
 }
 
 impl fmt::Display for NativeSourceRenderError {
@@ -1164,6 +1181,12 @@ impl fmt::Display for NativeSourceRenderError {
                 write!(formatter, "native scene composition failed: {error}")
             }
             Self::Compositor(error) => write!(formatter, "native composition failed: {error}"),
+            Self::InvalidFadeToBlack(error) => {
+                write!(formatter, "native Fade-to-Black plan is invalid: {error}")
+            }
+            Self::FadeToBlack(error) => {
+                write!(formatter, "native Fade-to-Black rendering failed: {error}")
+            }
         }
     }
 }
@@ -1175,6 +1198,8 @@ impl Error for NativeSourceRenderError {
             Self::Completion(error) => Some(error),
             Self::SceneCompositor(error) => Some(error),
             Self::Compositor(error) => Some(error),
+            Self::InvalidFadeToBlack(error) => Some(error),
+            Self::FadeToBlack(error) => Some(error),
             Self::MissingSource { .. }
             | Self::DimensionMismatch { .. }
             | Self::MissingTransitionKind
@@ -2945,6 +2970,7 @@ impl NativeMasterRuntime {
                 .ok_or(NativeMasterError::DecodeContract { input })?
                 .commit_render(render_plan)?;
         }
+        apply_fade_to_black_audio(&mut self.scratch.mix, samples, frame.fade_to_black);
         // Canonical ownership is required by the returned/recorded frame. The
         // diagnostic collecting sink also retains its own bounded clone; these
         // are the only per-frame PCM allocations after reusable scratch render.
@@ -3656,6 +3682,25 @@ fn sample_linear_audio_mix_plan(
     })
 }
 
+#[allow(clippy::cast_possible_truncation)]
+fn apply_fade_to_black_audio(planes: &mut [Vec<f32>], samples: usize, frame: FadeToBlackFrame) {
+    let denominator = f64::from(frame.interval_start().denominator());
+    let start =
+        f64::from(frame.interval_start().denominator() - frame.interval_start().numerator())
+            / denominator;
+    let end = f64::from(frame.interval_end().denominator() - frame.interval_end().numerator())
+        / f64::from(frame.interval_end().denominator());
+    let steps = f64::from(u32::try_from(samples).expect("native audio sample count is bounded"));
+    for plane in planes {
+        for (sample, value) in plane[..samples].iter_mut().enumerate() {
+            let step =
+                f64::from(u32::try_from(sample + 1).expect("native audio sample count is bounded"));
+            let gain = start + (end - start) * (step / steps);
+            *value *= gain as f32;
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct NativeMixPlan {
     primary: InputId,
@@ -3689,6 +3734,26 @@ fn native_mix_plan(program: ProgramFrame) -> Result<NativeMixPlan, NativeSourceR
         secondary,
         transition,
     })
+}
+
+fn native_fade_to_black_plan(
+    frame: FadeToBlackFrame,
+) -> Result<FadeToBlackPlan, NativeSourceRenderError> {
+    let start = CompositorFadeToBlackPosition::compile(
+        frame.interval_start().numerator(),
+        frame.interval_start().denominator(),
+    )
+    .map_err(NativeSourceRenderError::InvalidFadeToBlack)?;
+    let end = CompositorFadeToBlackPosition::compile(
+        frame.interval_end().numerator(),
+        frame.interval_end().denominator(),
+    )
+    .map_err(NativeSourceRenderError::InvalidFadeToBlack)?;
+    Ok(FadeToBlackPlan::new(
+        start,
+        end,
+        CompositorFadeToBlackPosition::BLACK,
+    ))
 }
 
 #[cfg(test)]
@@ -4060,12 +4125,13 @@ fn project_texture<'a>(
     }
 }
 
-/// One native context shared by the import and Cut/Fade executors.
+/// One native context shared by import, scene, transition, and FTB executors.
 pub struct NativeMediaRuntime {
     context: NativeContext,
     normalizer: NativeImportNormalizer,
     composition_renderer: NativeCompositionRenderer,
     renderer: NativeTransitionRenderer,
+    fade_to_black_renderer: NativeFadeToBlackRenderer,
     project_rendering: AtomicBool,
     project_frames: Mutex<NativeProjectFrameState>,
 }
@@ -4160,11 +4226,13 @@ impl NativeMediaRuntime {
         let normalizer = NativeImportNormalizer::new(&context).await?;
         let composition_renderer = NativeCompositionRenderer::new(&context).await?;
         let renderer = NativeTransitionRenderer::new(&context).await?;
+        let fade_to_black_renderer = NativeFadeToBlackRenderer::new(&context).await?;
         Ok(Self {
             context,
             normalizer,
             composition_renderer,
             renderer,
+            fade_to_black_renderer,
             project_rendering: AtomicBool::new(false),
             project_frames: Mutex::new(NativeProjectFrameState::default()),
         })
@@ -5026,8 +5094,9 @@ impl NativeMediaRuntime {
     /// deadline, with the final retained frame held only after confirmed EOS.
     /// A frame without a secondary is rendered as
     /// `Cut(primary, primary)`; a frame with one is rendered using its supported
-    /// transition kind and exact numerator and denominator. This method performs
-    /// no decode, normalization, source upload, or CPU readback.
+    /// transition kind and exact numerator and denominator, then applies the
+    /// authoritative FTB interval endpoint. This method performs no decode,
+    /// normalization, source upload, or CPU readback.
     ///
     /// # Errors
     ///
@@ -5039,9 +5108,11 @@ impl NativeMediaRuntime {
         frame: &FrameResult,
     ) -> Result<NativeTexture, NativeSourceRenderError> {
         let plan = native_mix_plan(frame.program)?;
+        let fade_to_black = native_fade_to_black_plan(frame.fade_to_black)?;
         let primary = registry_frame(registry, plan.primary, frame.deadline)?;
         let secondary = registry_frame(registry, plan.secondary, frame.deadline)?;
-        self.renderer
+        let program = self
+            .renderer
             .render(
                 &self.context,
                 plan.transition,
@@ -5049,12 +5120,17 @@ impl NativeMediaRuntime {
                 secondary.texture(),
             )
             .await
-            .map_err(NativeSourceRenderError::Compositor)
+            .map_err(NativeSourceRenderError::Compositor)?;
+        self.fade_to_black_renderer
+            .render(&self.context, fade_to_black, &program)
+            .await
+            .map_err(NativeSourceRenderError::FadeToBlack)
     }
 
     /// Derives the active scene roots from the authoritative transition, renders
     /// only their dependency closure once in dependency-first order, releases
-    /// non-root outputs after their last consumer, then applies Cut, Fade, or Wipe.
+    /// non-root outputs after their last consumer, then applies Cut, Fade, or
+    /// Wipe followed by the authoritative FTB interval endpoint.
     ///
     /// # Errors
     ///
@@ -5066,6 +5142,7 @@ impl NativeMediaRuntime {
         frame: &FrameResult,
     ) -> Result<NativeTexture, NativeSourceRenderError> {
         let plan = native_mix_plan(frame.program)?;
+        let fade_to_black = native_fade_to_black_plan(frame.fade_to_black)?;
         let mut execution = project
             .scene_execution(plan.primary, plan.secondary)
             .ok_or(NativeSourceRenderError::ResourceBounds)?;
@@ -5135,11 +5212,16 @@ impl NativeMediaRuntime {
             plan.secondary,
             frame.deadline,
         )?;
-        let output = self
+        let program = self
             .renderer
             .render(&self.context, plan.transition, primary, secondary)
             .await
             .map_err(NativeSourceRenderError::Compositor)?;
+        let output = self
+            .fade_to_black_renderer
+            .render(&self.context, fade_to_black, &program)
+            .await
+            .map_err(NativeSourceRenderError::FadeToBlack)?;
         self.finish_project_frame()?;
         Ok(output)
     }
@@ -5157,7 +5239,7 @@ impl NativeMediaRuntime {
         block_on(self.render_frame_result(registry, frame))
     }
 
-    /// Synchronous daemon wrapper for scene realization followed by Program transition.
+    /// Synchronous daemon wrapper for scene, Program-transition, and FTB realization.
     ///
     /// # Errors
     ///
@@ -5723,8 +5805,8 @@ mod tests {
         add_leaf(&mut leaf_only, input(9));
         let leaf_plan =
             NativeProjectPlan::compile(&leaf_only, NativeProjectLimits::default()).unwrap();
-        assert_eq!(leaf_plan.peak_rgba16f_targets(), 2);
-        assert_eq!(leaf_plan.transient_rgba16f_bytes(), 2 * 4 * 2 * 8);
+        assert_eq!(leaf_plan.peak_rgba16f_targets(), 3);
+        assert_eq!(leaf_plan.transient_rgba16f_bytes(), 3 * 4 * 2 * 8);
 
         let mut project = native_plan_project(4, 2);
         add_scene_input(&mut project, input(1), scene(10), None);
@@ -5735,8 +5817,8 @@ mod tests {
 
         assert_eq!(plan.scene_order().collect::<Vec<_>>(), vec![scene(10)]);
         assert_eq!(plan.active_layer_count(), 0);
-        assert_eq!(plan.peak_rgba16f_targets(), 3);
-        assert_eq!(plan.transient_rgba16f_bytes(), 3 * 4 * 2 * 8);
+        assert_eq!(plan.peak_rgba16f_targets(), 4);
+        assert_eq!(plan.transient_rgba16f_bytes(), 4 * 4 * 2 * 8);
         assert_eq!(
             plan.video_route(input(1)),
             Some(NativeVideoRoute::Scene(scene(10)))
@@ -5776,19 +5858,19 @@ mod tests {
             vec![scene(10), scene(20), scene(30)]
         );
         assert_eq!(plan.active_layer_count(), 4);
-        assert_eq!(plan.peak_rgba16f_targets(), 5);
-        assert_eq!(plan.transient_rgba16f_bytes(), 5 * 4 * 2 * 8);
+        assert_eq!(plan.peak_rgba16f_targets(), 6);
+        assert_eq!(plan.transient_rgba16f_bytes(), 6 * 4 * 2 * 8);
         assert_eq!(
             NativeProjectPlan::compile(
                 &project,
                 NativeProjectLimits {
-                    max_transient_rgba16f_bytes: 319,
+                    max_transient_rgba16f_bytes: 383,
                     ..NativeProjectLimits::default()
                 }
             ),
             Err(NativeProjectPlanError::TransientBytesExceeded {
-                required: 320,
-                maximum: 319,
+                required: 384,
+                maximum: 383,
             })
         );
         let primary_only = plan.scene_execution(input(2), input(2)).unwrap();
@@ -6415,7 +6497,7 @@ mod tests {
                 },
             ),
             Err(NativeProjectPlanError::TransientBytesExceeded {
-                required: 192,
+                required: 256,
                 maximum: 191,
             })
         );
@@ -7704,6 +7786,87 @@ mod tests {
                 secondary: None,
             }
         );
+    }
+
+    #[test]
+    fn fade_to_black_video_plan_renders_the_exact_interval_endpoint() {
+        let old = input(1);
+        let new = input(2);
+        let mut switcher = SwitcherState::new(vec![old, new], old, new).unwrap();
+        switcher.request_fade_to_black(true, 4).unwrap();
+
+        let first = native_fade_to_black_plan(switcher.fade_to_black_frame()).unwrap();
+        assert_eq!(first.start().numerator(), 0);
+        assert_eq!(first.start().denominator(), 65_535);
+        assert_eq!(first.end().numerator(), 16_383);
+        assert_eq!(first.end().denominator(), 65_535);
+        assert_eq!(first.progress(), CompositorFadeToBlackPosition::BLACK);
+
+        let _ = switcher.advance_frame_events();
+        switcher.request_fade_to_black(false, 2).unwrap();
+        let reverse = native_fade_to_black_plan(switcher.fade_to_black_frame()).unwrap();
+        assert_eq!(reverse.start().numerator(), 16_383);
+        assert_eq!(reverse.end().numerator(), 8_192);
+        assert_eq!(reverse.progress(), CompositorFadeToBlackPosition::BLACK);
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn fade_to_black_audio_uses_master_sample_endpoint_convention() {
+        let old = input(1);
+        let new = input(2);
+        let mut switcher = SwitcherState::new(vec![old, new], old, new).unwrap();
+        switcher.request_fade_to_black(true, 2).unwrap();
+        let forward = switcher.fade_to_black_frame();
+        let mut planes = vec![vec![1.0; 4], vec![0.5; 4]];
+
+        apply_fade_to_black_audio(&mut planes, 4, forward);
+
+        let end_gain = f64::from(65_535 - 32_767) / 65_535.0;
+        let expected = std::array::from_fn::<_, 4, _>(|sample| {
+            let sample = u32::try_from(sample + 1).unwrap();
+            (1.0 + (end_gain - 1.0) * f64::from(sample) / 4.0) as f32
+        });
+        for (actual, expected) in planes[0].iter().zip(expected) {
+            assert!((actual - expected).abs() < 1.0e-6);
+        }
+        for (actual, expected) in planes[1].iter().zip(expected) {
+            assert!((actual - expected * 0.5).abs() < 1.0e-6);
+        }
+
+        let _ = switcher.advance_frame_events();
+        switcher.request_fade_to_black(false, 1).unwrap();
+        let mut reverse = vec![vec![1.0; 4]];
+        apply_fade_to_black_audio(&mut reverse, 4, switcher.fade_to_black_frame());
+        assert!(reverse[0].windows(2).all(|samples| samples[0] < samples[1]));
+        assert_sample_exact(reverse[0][3], 1.0);
+    }
+
+    #[test]
+    fn native_master_output_applies_fade_to_black_after_program_mix() {
+        let active = input(1);
+        let preview = input(2);
+        let mut project = native_plan_project(4, 2);
+        add_leaf(&mut project, active);
+        let plan = NativeProjectPlan::compile(&project, NativeProjectLimits::default()).unwrap();
+        let mut master = audio_test_master(&[(active, 1.0)], 2);
+        master.realize_project_audio(&plan).unwrap();
+        let mut switcher = SwitcherState::new(vec![active, preview], active, preview).unwrap();
+        switcher.request_fade_to_black(true, 1).unwrap();
+
+        assert!(master.service_next_frame().unwrap());
+        let mut first = frame_result(0, active, None);
+        first.fade_to_black = switcher.fade_to_black_frame();
+        let fading = master.render_project_frame_audio(&first, &plan).unwrap();
+        assert!(fading.plane(0).unwrap()[0] < 1.0);
+        assert_sample_exact(fading.plane(0).unwrap()[fading.sample_count() - 1], 0.0);
+
+        let _ = switcher.advance_frame_events();
+        assert!(master.service_next_frame().unwrap());
+        let mut second = frame_result(1, active, None);
+        second.fade_to_black = switcher.fade_to_black_frame();
+        let black = master.render_project_frame_audio(&second, &plan).unwrap();
+        assert!(black.plane(0).unwrap().iter().all(|sample| *sample == 0.0));
     }
 
     #[test]

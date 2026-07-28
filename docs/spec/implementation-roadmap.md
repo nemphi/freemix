@@ -655,11 +655,17 @@ Schema v8 persists only settled live or black checkpoints, rejects partial or
 desired/realized-divergent FTB state, and explicitly migrates v7 projects with a
 live default. Daemon and local CLI checkpoint/restore paths preserve the exact
 endpoint; daemon tests cover live-to-black and black-to-live commands across
-engine reconstruction. The production native realizer does not yet apply the
-engine frame plan to the compositor or Master audio path, and Studio/Web/CLI
-still expose no FTB operator control. Configured-output routing and end-to-end
-hardware acceptance evidence are also absent, so Phase 3 item 5 and `SW-004`
-remain planned.
+engine reconstruction. The production native realizer now applies each engine
+frame after Program scene/transition composition: video renders the exact FTB
+interval endpoint into a final canonical RGBA16F target, while Master audio
+ramps the inverse fixed-rational position across the same sample interval after
+the complete Program mix. Native project planning accounts for that additional
+in-flight target. Unit coverage exercises forward, reverse, held-black, and
+post-Master behavior, and focused Metal tests validate both the compositor
+oracle and the scene/transition/FTB ordering on a real adapter. Studio/Web/CLI
+still expose no FTB operator control. Configured-output routing and full
+end-to-end hardware acceptance evidence are also absent, so Phase 3 item 5 and
+`SW-004` remain planned.
 
 Exit: `P0` switcher, composition, audio, display, record, and control rows pass.
 

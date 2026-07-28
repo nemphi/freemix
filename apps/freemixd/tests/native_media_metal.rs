@@ -34,7 +34,7 @@ use fm_model::{
 };
 use fm_scheduler::FrameNumber;
 use fm_sim::{Rgba8 as SimRgba8, SimulatedVideoSource, SourcePattern};
-use fm_switcher::{ProgramFrame, TransitionKind as SwitcherTransitionKind};
+use fm_switcher::{ProgramFrame, SwitcherState, TransitionKind as SwitcherTransitionKind};
 use fm_types::{
     AudioFormat, ChannelLayout, ColorMetadata as ModelColorMetadata, FrameRate, InputId,
     PixelFormat, ProjectId, SampleFormat, SampleRate, ScanMode, SceneId, VideoDimensions,
@@ -770,7 +770,7 @@ fn native_metal_renders_scenes_before_exact_fade_and_wipe() {
     });
     let plan = NativeProjectPlan::compile(&project, NativeProjectLimits::default())
         .expect("compile scene routes");
-    assert_eq!(plan.peak_rgba16f_targets(), 5);
+    assert_eq!(plan.peak_rgba16f_targets(), 6);
     let red = native_leaf_rgba16f(&runtime, playback.registry(), red_leaf);
     let blue = native_leaf_rgba16f(&runtime, playback.registry(), blue_leaf);
     let half = |value| f16::from_f32(value * 0.5).to_f32();
@@ -814,6 +814,46 @@ fn native_metal_renders_scenes_before_exact_fade_and_wipe() {
                 assert_metal_rgba16f(&readback.bytes, 4, x, 0, expected, kind, deadline);
             }
         }
+    }
+
+    let mut switcher = SwitcherState::new(
+        vec![primary_input, secondary_input],
+        primary_input,
+        secondary_input,
+    )
+    .unwrap();
+    switcher.request_fade_to_black(true, 1).unwrap();
+    let frame = FrameResult {
+        fade_to_black: switcher.fade_to_black_frame(),
+        frame: FrameNumber::new(3),
+        deadline: ClockTime::ZERO,
+        program: ProgramFrame {
+            primary: primary_input,
+            secondary: Some(secondary_input),
+            transition_kind: Some(SwitcherTransitionKind::Fade),
+            mix_numerator: 1,
+            mix_denominator: 2,
+            mix_start_numerator: 0,
+            mix_end_numerator: 1,
+        },
+        events: Vec::new(),
+        revision: Revision::new(0),
+        runtime_generation: RuntimeGeneration::new(0),
+    };
+    let output = block_on(runtime.render_project_frame_result(playback.registry(), &plan, &frame))
+        .expect("apply Fade-to-Black after scene and Program composition");
+    let readback =
+        block_on(runtime.diagnostic_readback(&output)).expect("read black Program output");
+    for x in 0..4_u32 {
+        assert_metal_rgba16f(
+            &readback.bytes,
+            4,
+            x,
+            0,
+            [0.0, 0.0, 0.0, 1.0],
+            SwitcherTransitionKind::Fade,
+            0,
+        );
     }
 }
 
@@ -871,7 +911,7 @@ fn native_metal_project_frames_use_one_completed_in_flight_slot_without_readback
         layers: Vec::new(),
     });
     let plan = NativeProjectPlan::compile(&project, NativeProjectLimits::default()).unwrap();
-    assert_eq!(plan.peak_rgba16f_targets(), 3);
+    assert_eq!(plan.peak_rgba16f_targets(), 4);
 
     let mut latest_program = None;
     for frame_number in 0..FRAMES {

@@ -161,12 +161,12 @@ fn ratio(numerator: u32, denominator: u32) -> f32 {
     return f32(numerator) / f32(denominator);
 }
 
-fn affine_scalar(from: f32, to: f32, progress: f32) -> f32 {
-    return from + (to - from) * progress;
+fn affine_scalar(source_value: f32, target_value: f32, progress: f32) -> f32 {
+    return source_value + (target_value - source_value) * progress;
 }
 
-fn affine_rgba(from: vec4<f32>, to: vec4<f32>, progress: f32) -> vec4<f32> {
-    return from + (to - from) * progress;
+fn affine_rgba(source_value: vec4<f32>, target_value: vec4<f32>, progress: f32) -> vec4<f32> {
+    return source_value + (target_value - source_value) * progress;
 }
 
 @fragment
@@ -1145,7 +1145,7 @@ mod tests {
     fn fade_to_black_shader_uses_directional_affine_opaque_black() {
         assert_eq!(
             FADE_TO_BLACK_FRAGMENT_SHADER
-                .match_indices("return from + (to - from) * progress;")
+                .match_indices("return source_value + (target_value - source_value) * progress;")
                 .count(),
             2
         );
