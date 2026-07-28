@@ -1123,6 +1123,13 @@ impl MasterMixer {
                     actual: block.sample_count(),
                 });
             }
+            let expected_planes = strip.format.channels.channels().len();
+            if block.planes().len() != expected_planes {
+                return Err(AudioError::PlaneCountMismatch {
+                    expected: expected_planes,
+                    actual: block.planes().len(),
+                });
+            }
             validate_finite_sample_prefix(block.planes(), samples)?;
         }
 
@@ -1661,6 +1668,90 @@ mod tests {
         assert_close(output[0][2], 9.0);
         assert_eq!(mixer.current_linear_gain(source), Some(1.0));
         assert_eq!(pending.current_linear_gain(source), Some(0.5));
+    }
+
+    #[test]
+    fn planar_mix_rejects_source_plane_count_transactionally_for_all_mappings() {
+        let input_format = stereo_format();
+        let output_format = mono_format();
+        let source = input_id(1);
+        let valid_planes = vec![vec![1.0; 2], vec![1.0; 2]];
+        let route = ChannelMappingRoute {
+            source: Channel::Right,
+            destination: Channel::Mono,
+            coefficient: 1.0,
+        };
+
+        for (routes, expected_prefix) in [(vec![], [0.0, 0.0]), (vec![route], [0.75, 0.5])] {
+            for actual in [1, 3] {
+                let mapping = ChannelMapping::new(
+                    input_format.channels.clone(),
+                    output_format.channels.clone(),
+                    routes.clone(),
+                )
+                .unwrap();
+                let mut mixer = MasterMixer::new(output_format.clone()).unwrap();
+                mixer
+                    .add_input(source, input_format.clone(), mapping, InputState::default())
+                    .unwrap();
+                mixer
+                    .set_input_state(
+                        source,
+                        InputState {
+                            gain: Gain::SILENCE,
+                            ..InputState::default()
+                        },
+                        4,
+                    )
+                    .unwrap();
+                let malformed_planes = vec![vec![1.0; 2]; actual];
+                let mut output = vec![vec![9.0; 4]];
+
+                assert_eq!(
+                    mixer.mix_planar_timed_into(
+                        timing_for_samples(0, 2),
+                        2,
+                        &[PlanarAudioSource {
+                            input: source,
+                            sample_rate: input_format.sample_rate,
+                            channel_layout: &input_format.channels,
+                            planes: &malformed_planes,
+                            samples: 2,
+                            source_gain: SourceGain::UNITY,
+                        }],
+                        &[],
+                        &mut output,
+                    ),
+                    Err(AudioError::PlaneCountMismatch {
+                        expected: 2,
+                        actual,
+                    })
+                );
+                assert_eq!(output, vec![vec![9.0; 4]]);
+                assert_eq!(mixer.current_linear_gain(source), Some(1.0));
+
+                mixer
+                    .mix_planar_timed_into(
+                        timing_for_samples(1, 2),
+                        2,
+                        &[PlanarAudioSource {
+                            input: source,
+                            sample_rate: input_format.sample_rate,
+                            channel_layout: &input_format.channels,
+                            planes: &valid_planes,
+                            samples: 2,
+                            source_gain: SourceGain::UNITY,
+                        }],
+                        &[],
+                        &mut output,
+                    )
+                    .unwrap();
+
+                assert_eq!(&output[0][..2], &expected_prefix);
+                assert_eq!(&output[0][2..], &[9.0, 9.0]);
+                assert_eq!(mixer.current_linear_gain(source), Some(0.5));
+            }
+        }
     }
 
     #[test]
