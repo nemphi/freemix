@@ -524,6 +524,53 @@ fn native_metal_wipe_and_slide_match_cpu_at_odd_width_boundaries() {
 
 #[test]
 #[ignore = "requires a native macOS Metal adapter"]
+fn native_metal_zoom_matches_cpu_at_odd_centered_extents() {
+    block_on(async {
+        let from_cpu = sized_frame(
+            3,
+            5,
+            3,
+            &[
+                8, 8, 8, 255, 16, 16, 16, 255, 24, 24, 24, 255, 32, 32, 32, 255, 40, 40, 40, 255,
+                48, 48, 48, 255, 56, 56, 56, 255, 64, 64, 64, 255, 72, 72, 72, 255, 80, 80, 80,
+                255, 88, 88, 88, 255, 96, 96, 96, 255, 104, 104, 104, 255, 112, 112, 112, 255, 120,
+                120, 120, 255,
+            ],
+        );
+        let to_cpu = sized_frame(
+            4,
+            5,
+            3,
+            &[
+                255, 0, 0, 255, 224, 0, 0, 255, 192, 0, 0, 255, 160, 0, 0, 255, 128, 0, 0, 255, 0,
+                255, 0, 255, 0, 224, 0, 255, 0, 192, 0, 255, 0, 160, 0, 255, 0, 128, 0, 255, 0, 0,
+                255, 255, 0, 0, 224, 255, 0, 0, 192, 255, 0, 0, 160, 255, 0, 0, 128, 255,
+            ],
+        );
+        let from_image = canonical_cpu_image(&from_cpu);
+        let to_image = canonical_cpu_image(&to_cpu);
+
+        let context = NativeContext::new([NativeBackend::Metal]).await.unwrap();
+        let normalizer = NativeImportNormalizer::new(&context).await.unwrap();
+        let from = normalizer.normalize(&context, &from_cpu).await.unwrap();
+        let to = normalizer.normalize(&context, &to_cpu).await.unwrap();
+        let renderer = NativeTransitionRenderer::new(&context).await.unwrap();
+
+        for numerator in 0..=4 {
+            let plan = TransitionPlan::compile(TransitionKind::Zoom, numerator, 4).unwrap();
+            let expected = execute_transition(plan, &from_image, &to_image).unwrap();
+            let output = renderer
+                .render(&context, plan, from.texture(), to.texture())
+                .await
+                .unwrap();
+            let actual = context.readback(&output).await.unwrap();
+            assert_rgba16f_matches_cpu(&actual, &expected);
+        }
+    });
+}
+
+#[test]
+#[ignore = "requires a native macOS Metal adapter"]
 #[allow(clippy::too_many_lines)]
 fn native_metal_composition_matches_cpu_geometry_and_blending() {
     block_on(async {

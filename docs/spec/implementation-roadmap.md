@@ -717,9 +717,22 @@ protocol Slide through a real configured Program recorder, decodes stable
 white, a Slide-specific white-left/black-right intermediate frame, then stable
 black, and verifies the settled persisted routing.
 
-Stinger, Zoom, other transition families, cross-platform/fullscreen evidence,
-and complete `SW-004` acceptance remain pending; parity therefore stays
-planned. Item 5 and RC-007 remain planned.
+Centered Zoom rendering groundwork now overlays Preview on Program with
+independently floored extents
+`floor(width * numerator / denominator)` and
+`floor(height * numerator / denominator)`, a left/top bias for an odd centering
+remainder, and deterministic nearest-neighbor sampling from the full Preview
+frame. CPU and simulated paths cover byte-exact endpoints plus odd 5×3
+intermediates. The native wgpu path carries the same explicit geometry in its
+uniform, and a required Metal readback matches the CPU oracle at five progress
+points. Native daemon video planning now preserves Zoom, while Master audio
+uses the existing sample-linear two-source crossfade and continues to reject
+Stinger explicitly.
+
+Zoom authority, protocol, CLI/Web/Studio controls, configured-output evidence,
+Stinger, other transition families, cross-platform/fullscreen evidence, and
+complete `SW-004` acceptance remain pending; parity therefore stays planned.
+Item 5 and RC-007 remain planned.
 
 FTB groundwork now includes a switcher-owned bounded automatic control core
 alongside the compositor plan. The controller moves from its current exact

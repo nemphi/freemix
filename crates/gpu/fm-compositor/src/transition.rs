@@ -23,7 +23,7 @@ pub struct TransitionPlan {
 }
 
 impl TransitionPlan {
-    /// Compiles a Cut, Fade, `AlphaFade`, Wipe, or Slide at an exact rational progress value.
+    /// Compiles a Cut, Fade, `AlphaFade`, Wipe, Slide, or Zoom at an exact rational progress value.
     ///
     /// # Errors
     /// Returns an error for a zero denominator, progress beyond the endpoint,
@@ -47,14 +47,13 @@ impl TransitionPlan {
             | TransitionKind::Fade
             | TransitionKind::AlphaFade
             | TransitionKind::Wipe
-            | TransitionKind::Slide => Ok(Self {
+            | TransitionKind::Slide
+            | TransitionKind::Zoom => Ok(Self {
                 kind,
                 numerator,
                 denominator,
             }),
-            TransitionKind::Zoom | TransitionKind::Stinger => {
-                Err(TransitionError::UnsupportedKind(kind))
-            }
+            TransitionKind::Stinger => Err(TransitionError::UnsupportedKind(kind)),
         }
     }
 
@@ -112,7 +111,7 @@ impl From<BlendError> for TransitionError {
     }
 }
 
-/// Executes a Cut, exact integer Fade/AlphaFade, horizontal Wipe, or horizontal Slide.
+/// Executes a Cut, exact integer Fade/AlphaFade, horizontal Wipe/Slide, or centered Zoom.
 ///
 /// Cut is atomic and always returns `to`. Fade and `AlphaFade` return byte-identical endpoint
 /// clones at zero and full progress through `fm-video`'s reference crossfade. `AlphaFade`
@@ -120,9 +119,11 @@ impl From<BlendError> for TransitionError {
 /// Wipe replaces columns from left to right, with its boundary at
 /// `floor(width * numerator / denominator)`, and also returns byte-identical endpoints.
 /// Slide moves Program left and Preview in from the right by the same exact integer offset.
+/// Zoom draws Preview at the center over Program with independently floored width and height,
+/// using deterministic nearest-neighbor sampling.
 ///
 /// # Errors
-/// Returns an error if Fade, `AlphaFade`, Wipe, or Slide inputs have incompatible layouts.
+/// Returns an error if the transition inputs have incompatible layouts.
 pub fn execute_transition(
     plan: TransitionPlan,
     from: &ImageFrame,
@@ -135,9 +136,8 @@ pub fn execute_transition(
         }
         TransitionKind::Wipe => wipe(from, to, plan.numerator, plan.denominator),
         TransitionKind::Slide => slide(from, to, plan.numerator, plan.denominator),
-        TransitionKind::Zoom | TransitionKind::Stinger => {
-            Err(TransitionError::UnsupportedKind(plan.kind))
-        }
+        TransitionKind::Zoom => zoom(from, to, plan.numerator, plan.denominator),
+        TransitionKind::Stinger => Err(TransitionError::UnsupportedKind(plan.kind)),
     }
 }
 
@@ -210,6 +210,72 @@ fn slide(
     {
         output_row[..remaining_bytes].copy_from_slice(&from_row[offset_bytes..row_bytes]);
         output_row[remaining_bytes..row_bytes].copy_from_slice(&to_row[..offset_bytes]);
+    }
+    Ok(
+        ImageFrame::new(from.width(), from.height(), from.stride(), pixels)
+            .map_err(BlendError::Frame)?,
+    )
+}
+
+pub(crate) fn zoom_extent(size: u32, numerator: u32, denominator: u32) -> u32 {
+    let extent = u64::from(size) * u64::from(numerator) / u64::from(denominator);
+    u32::try_from(extent).expect("zoom extent cannot exceed its frame dimension")
+}
+
+fn zoom(
+    from: &ImageFrame,
+    to: &ImageFrame,
+    numerator: u32,
+    denominator: u32,
+) -> Result<ImageFrame, TransitionError> {
+    validate_horizontal_inputs(from, to)?;
+    if numerator == 0 {
+        return Ok(from.clone());
+    }
+    if numerator == denominator {
+        return Ok(to.clone());
+    }
+
+    let zoom_width = zoom_extent(from.width(), numerator, denominator);
+    let zoom_height = zoom_extent(from.height(), numerator, denominator);
+    if zoom_width == 0 || zoom_height == 0 {
+        return Ok(from.clone());
+    }
+    let left = (from.width() - zoom_width) / 2;
+    let top = (from.height() - zoom_height) / 2;
+    let mut pixels = from.pixels().to_vec();
+    for output_y in 0..zoom_height {
+        let source_y = u64::from(output_y) * u64::from(to.height()) / u64::from(zoom_height);
+        let source_y =
+            usize::try_from(source_y).map_err(|_| BlendError::Frame(FrameError::LayoutOverflow))?;
+        let output_y = usize::try_from(top + output_y)
+            .map_err(|_| BlendError::Frame(FrameError::LayoutOverflow))?;
+        let output_row_start = output_y
+            .checked_mul(from.stride())
+            .ok_or(BlendError::Frame(FrameError::LayoutOverflow))?;
+        let source_row_start = source_y
+            .checked_mul(to.stride())
+            .ok_or(BlendError::Frame(FrameError::LayoutOverflow))?;
+        for output_x in 0..zoom_width {
+            let source_x = u64::from(output_x) * u64::from(to.width()) / u64::from(zoom_width);
+            let source_x = usize::try_from(source_x)
+                .map_err(|_| BlendError::Frame(FrameError::LayoutOverflow))?;
+            let output_x = usize::try_from(left + output_x)
+                .map_err(|_| BlendError::Frame(FrameError::LayoutOverflow))?;
+            let output_x = output_x
+                .checked_mul(4)
+                .ok_or(BlendError::Frame(FrameError::LayoutOverflow))?;
+            let source_x = source_x
+                .checked_mul(4)
+                .ok_or(BlendError::Frame(FrameError::LayoutOverflow))?;
+            let output = output_row_start
+                .checked_add(output_x)
+                .ok_or(BlendError::Frame(FrameError::LayoutOverflow))?;
+            let source = source_row_start
+                .checked_add(source_x)
+                .ok_or(BlendError::Frame(FrameError::LayoutOverflow))?;
+            pixels[output..output + 4].copy_from_slice(&to.pixels()[source..source + 4]);
+        }
     }
     Ok(
         ImageFrame::new(from.width(), from.height(), from.stride(), pixels)

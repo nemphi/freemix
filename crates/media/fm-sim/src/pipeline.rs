@@ -117,6 +117,12 @@ impl SimulatedPipeline {
                 program.mix_numerator,
                 program.mix_denominator,
             )?),
+            Some(TransitionKind::Zoom) => Ok(centered_zoom(
+                &primary,
+                &secondary,
+                program.mix_numerator,
+                program.mix_denominator,
+            )?),
             Some(kind) => Err(RenderError::UnsupportedTransition(kind)),
             None => Err(RenderError::MissingTransitionKind),
         }
@@ -213,4 +219,73 @@ fn horizontal_slide(
         output_row[remaining_bytes..row_bytes].copy_from_slice(&to_row[..offset_bytes]);
     }
     ImageFrame::new(from.width(), from.height(), from.stride(), pixels).map_err(BlendError::Frame)
+}
+
+fn centered_zoom(
+    from: &ImageFrame,
+    to: &ImageFrame,
+    numerator: u32,
+    denominator: u32,
+) -> Result<ImageFrame, BlendError> {
+    if denominator == 0 {
+        return Err(BlendError::ZeroDenominator);
+    }
+    if numerator > denominator {
+        return Err(BlendError::NumeratorExceedsDenominator {
+            numerator,
+            denominator,
+        });
+    }
+    if numerator == 0 {
+        return Ok(from.clone());
+    }
+    if numerator == denominator {
+        return Ok(to.clone());
+    }
+
+    let width = scaled_extent(from.width(), numerator, denominator);
+    let height = scaled_extent(from.height(), numerator, denominator);
+    if width == 0 || height == 0 {
+        return Ok(from.clone());
+    }
+    let left = (from.width() - width) / 2;
+    let top = (from.height() - height) / 2;
+    let mut pixels = from.pixels().to_vec();
+    for output_y in 0..height {
+        let source_y =
+            usize::try_from(u64::from(output_y) * u64::from(to.height()) / u64::from(height))
+                .map_err(|_| BlendError::Frame(FrameError::LayoutOverflow))?;
+        let output_y = usize::try_from(top + output_y)
+            .map_err(|_| BlendError::Frame(FrameError::LayoutOverflow))?;
+        let output_row = output_y
+            .checked_mul(from.stride())
+            .ok_or(BlendError::Frame(FrameError::LayoutOverflow))?;
+        let source_row = source_y
+            .checked_mul(to.stride())
+            .ok_or(BlendError::Frame(FrameError::LayoutOverflow))?;
+        for output_x in 0..width {
+            let source_x =
+                usize::try_from(u64::from(output_x) * u64::from(to.width()) / u64::from(width))
+                    .map_err(|_| BlendError::Frame(FrameError::LayoutOverflow))?
+                    .checked_mul(4)
+                    .ok_or(BlendError::Frame(FrameError::LayoutOverflow))?;
+            let output_x = usize::try_from(left + output_x)
+                .map_err(|_| BlendError::Frame(FrameError::LayoutOverflow))?
+                .checked_mul(4)
+                .ok_or(BlendError::Frame(FrameError::LayoutOverflow))?;
+            let output = output_row
+                .checked_add(output_x)
+                .ok_or(BlendError::Frame(FrameError::LayoutOverflow))?;
+            let source = source_row
+                .checked_add(source_x)
+                .ok_or(BlendError::Frame(FrameError::LayoutOverflow))?;
+            pixels[output..output + 4].copy_from_slice(&to.pixels()[source..source + 4]);
+        }
+    }
+    ImageFrame::new(from.width(), from.height(), from.stride(), pixels).map_err(BlendError::Frame)
+}
+
+fn scaled_extent(size: u32, numerator: u32, denominator: u32) -> u32 {
+    let extent = u64::from(size) * u64::from(numerator) / u64::from(denominator);
+    u32::try_from(extent).expect("scaled extent cannot exceed its source dimension")
 }

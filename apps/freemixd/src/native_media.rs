@@ -3652,9 +3652,10 @@ fn native_audio_mix_plan(program: ProgramFrame) -> Result<NativeAudioMixPlan, Na
             SwitcherTransitionKind::Fade
             | SwitcherTransitionKind::Wipe
             | SwitcherTransitionKind::AlphaFade
-            | SwitcherTransitionKind::Slide,
+            | SwitcherTransitionKind::Slide
+            | SwitcherTransitionKind::Zoom,
         ) => sample_linear_audio_mix_plan(program, secondary),
-        Some(kind @ (SwitcherTransitionKind::Zoom | SwitcherTransitionKind::Stinger(_))) => {
+        Some(kind @ SwitcherTransitionKind::Stinger(_)) => {
             Err(NativeMasterError::UnsupportedAudioTransition(kind))
         }
         None => Err(NativeMasterError::MissingAudioTransitionKind),
@@ -3716,6 +3717,7 @@ fn native_mix_plan(program: ProgramFrame) -> Result<NativeMixPlan, NativeSourceR
                 Some(SwitcherTransitionKind::AlphaFade) => TransitionKind::AlphaFade,
                 Some(SwitcherTransitionKind::Wipe) => TransitionKind::Wipe,
                 Some(SwitcherTransitionKind::Slide) => TransitionKind::Slide,
+                Some(SwitcherTransitionKind::Zoom) => TransitionKind::Zoom,
                 Some(kind) => return Err(NativeSourceRenderError::UnsupportedTransition(kind)),
                 None => return Err(NativeSourceRenderError::MissingTransitionKind),
             };
@@ -6855,7 +6857,7 @@ mod tests {
     }
 
     #[test]
-    fn program_frame_preserves_slide_and_rejects_unsupported_transitions() {
+    fn program_frame_preserves_slide_kind_and_progress() {
         let primary = input(1);
         let secondary = input((1_u128 << 64) + 1);
         let slide = native_mix_plan(ProgramFrame {
@@ -6873,20 +6875,41 @@ mod tests {
         assert_eq!(slide.transition.kind(), TransitionKind::Slide);
         assert_eq!(slide.transition.numerator(), 2);
         assert_eq!(slide.transition.denominator(), 3);
+    }
 
+    #[test]
+    fn program_frame_preserves_zoom_and_rejects_stinger() {
+        let primary = input(1);
+        let secondary = input((1_u128 << 64) + 1);
+        let zoom = native_mix_plan(ProgramFrame {
+            primary,
+            secondary: Some(secondary),
+            transition_kind: Some(SwitcherTransitionKind::Zoom),
+            mix_numerator: 1,
+            mix_denominator: 2,
+            mix_start_numerator: 1,
+            mix_end_numerator: 2,
+        })
+        .unwrap();
+        assert_eq!(zoom.primary, primary);
+        assert_eq!(zoom.secondary, secondary);
+        assert_eq!(zoom.transition.kind(), TransitionKind::Zoom);
+        assert_eq!(zoom.transition.numerator(), 1);
+        assert_eq!(zoom.transition.denominator(), 2);
+
+        let stinger = SwitcherTransitionKind::Stinger(fm_switcher::StingerSlotId::new(1).unwrap());
         assert!(matches!(
             native_mix_plan(ProgramFrame {
                 primary,
                 secondary: Some(secondary),
-                transition_kind: Some(SwitcherTransitionKind::Zoom),
+                transition_kind: Some(stinger),
                 mix_numerator: 1,
                 mix_denominator: 2,
                 mix_start_numerator: 1,
                 mix_end_numerator: 2,
             }),
-            Err(NativeSourceRenderError::UnsupportedTransition(
-                SwitcherTransitionKind::Zoom
-            ))
+            Err(NativeSourceRenderError::UnsupportedTransition(actual))
+                if actual == stinger
         ));
     }
 
@@ -8021,7 +8044,7 @@ mod tests {
     }
 
     #[test]
-    fn slide_audio_crossfades_while_unsupported_transitions_fail_explicitly() {
+    fn slide_and_zoom_audio_crossfade_while_stinger_fails_explicitly() {
         let old = input(1);
         let new = input(2);
         let program = |transition_kind| ProgramFrame {
@@ -8043,17 +8066,22 @@ mod tests {
             }
         );
 
-        for kind in [
-            SwitcherTransitionKind::Zoom,
-            SwitcherTransitionKind::Stinger(fm_switcher::StingerSlotId::new(1).unwrap()),
-        ] {
-            let Err(NativeMasterError::UnsupportedAudioTransition(actual)) =
-                native_audio_mix_plan(program(Some(kind)))
-            else {
-                panic!("expected unsupported audio transition {kind:?}");
-            };
-            assert_eq!(actual, kind);
-        }
+        assert_eq!(
+            native_audio_mix_plan(program(Some(SwitcherTransitionKind::Zoom))).unwrap(),
+            NativeAudioMixPlan {
+                primary: old,
+                primary_gain: SourceGain::new(1, 0, 1).unwrap(),
+                secondary: Some((new, SourceGain::new(0, 1, 1).unwrap())),
+            }
+        );
+
+        let stinger = SwitcherTransitionKind::Stinger(fm_switcher::StingerSlotId::new(1).unwrap());
+        let Err(NativeMasterError::UnsupportedAudioTransition(actual)) =
+            native_audio_mix_plan(program(Some(stinger)))
+        else {
+            panic!("expected unsupported audio transition {stinger:?}");
+        };
+        assert_eq!(actual, stinger);
         assert!(matches!(
             native_audio_mix_plan(program(None)),
             Err(NativeMasterError::MissingAudioTransitionKind)

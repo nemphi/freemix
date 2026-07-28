@@ -2,7 +2,7 @@ use fm_sim::{
     PipelineConfigError, RegistryError, RenderError, Rgba8, SimulatedPipeline, SimulatedSource,
     SourcePattern,
 };
-use fm_switcher::{ProgramFrame, TransitionKind};
+use fm_switcher::{ProgramFrame, StingerSlotId, TransitionKind};
 use fm_types::InputId;
 use std::num::NonZeroU128;
 
@@ -203,6 +203,44 @@ fn slide_renders_exact_endpoints_and_shifts_program_left() {
 }
 
 #[test]
+fn zoom_renders_exact_endpoints_and_a_centered_preview() {
+    let mut pipeline = SimulatedPipeline::new(5, 3).unwrap();
+    let red = Rgba8::new(255, 0, 0, 255);
+    let blue = Rgba8::new(0, 0, 255, 255);
+    pipeline
+        .register(SimulatedSource::new(input(1), SourcePattern::Solid(red)))
+        .unwrap();
+    pipeline
+        .register(SimulatedSource::new(input(2), SourcePattern::Solid(blue)))
+        .unwrap();
+    let frame = |numerator| ProgramFrame {
+        primary: input(1),
+        secondary: Some(input(2)),
+        transition_kind: Some(TransitionKind::Zoom),
+        mix_numerator: numerator,
+        mix_denominator: 2,
+        mix_start_numerator: numerator,
+        mix_end_numerator: numerator,
+    };
+
+    let start = pipeline.render(0, frame(0)).unwrap();
+    assert!((0..3).all(|y| (0..5).all(|x| start.pixel(x, y) == Some(red))));
+    let half = pipeline.render(0, frame(1)).unwrap();
+    for y in 0..3 {
+        for x in 0..5 {
+            let expected = if y == 1 && (1..3).contains(&x) {
+                blue
+            } else {
+                red
+            };
+            assert_eq!(half.pixel(x, y), Some(expected));
+        }
+    }
+    let end = pipeline.render(0, frame(2)).unwrap();
+    assert!((0..3).all(|y| (0..5).all(|x| end.pixel(x, y) == Some(blue))));
+}
+
+#[test]
 fn pipeline_rejects_missing_and_unsupported_transition_kinds() {
     let mut pipeline = SimulatedPipeline::new(1, 1).unwrap();
     for value in [1, 2] {
@@ -228,8 +266,15 @@ fn pipeline_rejects_missing_and_unsupported_transition_kinds() {
         Err(RenderError::MissingTransitionKind)
     );
     assert_eq!(
-        pipeline.render(0, frame(Some(TransitionKind::Zoom))),
-        Err(RenderError::UnsupportedTransition(TransitionKind::Zoom))
+        pipeline.render(
+            0,
+            frame(Some(TransitionKind::Stinger(
+                StingerSlotId::new(1).unwrap()
+            )))
+        ),
+        Err(RenderError::UnsupportedTransition(TransitionKind::Stinger(
+            StingerSlotId::new(1).unwrap()
+        )))
     );
 }
 

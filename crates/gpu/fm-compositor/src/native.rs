@@ -10,7 +10,7 @@ use fm_video::{CropRect, Rotation, Transform};
 
 use crate::{
     CompositionPlan, FadeToBlackPlan, RectMask, SourceId, TransitionKind, TransitionPlan,
-    transition::wipe_boundary,
+    transition::{wipe_boundary, zoom_extent},
 };
 
 /// Maximum width or height accepted for a native layer transform.
@@ -20,6 +20,7 @@ use crate::{
 pub const MAX_NATIVE_TRANSFORM_DIMENSION: u32 = 16_384;
 
 const COMPOSITION_UNIFORM_SIZE: usize = 80;
+const TRANSITION_UNIFORM_SIZE: usize = 32;
 
 const COMPOSITION_FRAGMENT_SHADER: &str = r"
 struct LayerUniform {
@@ -112,6 +113,10 @@ struct TransitionUniform {
     numerator: u32,
     denominator: u32,
     boundary: u32,
+    scaled_width: u32,
+    scaled_height: u32,
+    padding_0: u32,
+    padding_1: u32,
 };
 
 @group(0) @binding(0) var from_texture: texture_2d<f32>;
@@ -151,6 +156,21 @@ fn transition_fragment(@builtin(position) position: vec4<f32>) -> @location(0) v
             vec2<i32>(i32(x - remaining), coordinates.y),
             0,
         );
+    }
+    if transition.operation == 4u {
+        if transition.scaled_width == 0u || transition.scaled_height == 0u {
+            return source;
+        }
+        let dimensions = textureDimensions(from_texture);
+        let extent = vec2<u32>(transition.scaled_width, transition.scaled_height);
+        let origin = (dimensions - extent) / vec2<u32>(2u);
+        let pixel = vec2<u32>(position.xy);
+        if any(pixel < origin) || any(pixel >= origin + extent) {
+            return source;
+        }
+        let relative = pixel - origin;
+        let destination_coordinates = relative * dimensions / extent;
+        return textureLoad(to_texture, vec2<i32>(destination_coordinates), 0);
     }
     return mix(source, destination, f32(transition.numerator) / f32(transition.denominator));
 }
@@ -768,7 +788,7 @@ fn encode_fade_to_black_uniform(plan: FadeToBlackPlan) -> [u8; FADE_TO_BLACK_UNI
     bytes
 }
 
-/// Errors produced by the native Cut/Fade/AlphaFade/Wipe/Slide renderer.
+/// Errors produced by the native Cut/Fade/AlphaFade/Wipe/Slide/Zoom renderer.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NativeTransitionError {
     WidthMismatch { from: u32, to: u32 },
@@ -811,7 +831,7 @@ impl From<NativeGpuError> for NativeTransitionError {
     }
 }
 
-/// Native Cut/Fade/AlphaFade/Wipe/Slide renderer containing only its compiled GPU pipeline.
+/// Native Cut/Fade/AlphaFade/Wipe/Slide/Zoom renderer containing only its compiled GPU pipeline.
 pub struct NativeTransitionRenderer {
     pipeline: NativeFullscreenPipeline,
 }
@@ -825,7 +845,7 @@ impl NativeTransitionRenderer {
     /// Returns a mapped GPU shader or pipeline validation error.
     pub async fn new(context: &NativeContext) -> Result<Self, NativeTransitionError> {
         let pipeline = context
-            .create_fullscreen_pipeline_for_format(
+            .create_fullscreen_pipeline_with_options(
                 ShaderDescriptor::new(
                     "fm-compositor native transition",
                     ShaderStage::Fragment,
@@ -833,13 +853,18 @@ impl NativeTransitionRenderer {
                     "transition_fragment",
                     ShaderSource::Text(TRANSITION_FRAGMENT_SHADER.to_owned()),
                 ),
-                TextureFormat::Rgba16Float,
+                NativeFullscreenPipelineOptions {
+                    target_format: TextureFormat::Rgba16Float,
+                    blend: NativeFullscreenBlend::Replace,
+                    uniform_size: TRANSITION_UNIFORM_SIZE,
+                    source_extent_policy: NativeSourceExtentPolicy::MatchTarget,
+                },
             )
             .await?;
         Ok(Self { pipeline })
     }
 
-    /// Submits a GPU-resident Cut, Fade, `AlphaFade`, Wipe, or Slide and returns its native texture.
+    /// Submits a GPU-resident Cut, Fade, `AlphaFade`, Wipe, Slide, or Zoom.
     /// This operation does not poll or read pixels back.
     ///
     /// # Errors
@@ -859,7 +884,7 @@ impl NativeTransitionRenderer {
         let output = context
             .create_rgba16_float_render_target(from.width(), from.height())
             .await?;
-        let uniform = encode_uniform(plan, from.width());
+        let uniform = encode_uniform(plan, from.width(), from.height());
         context
             .submit_fullscreen(&self.pipeline, from, to, &output, &uniform)
             .await?;
@@ -900,14 +925,15 @@ fn validate_dimensions(
     Ok(())
 }
 
-fn encode_uniform(plan: TransitionPlan, width: u32) -> [u8; 16] {
+fn encode_uniform(plan: TransitionPlan, width: u32, height: u32) -> [u8; TRANSITION_UNIFORM_SIZE] {
     let operation = match plan.kind() {
         TransitionKind::Cut => 0_u32,
         TransitionKind::Fade | TransitionKind::AlphaFade => 1_u32,
         TransitionKind::Wipe => 2_u32,
         TransitionKind::Slide => 3_u32,
-        TransitionKind::Zoom | TransitionKind::Stinger => {
-            unreachable!("TransitionPlan only compiles Cut, Fade, AlphaFade, Wipe, and Slide")
+        TransitionKind::Zoom => 4_u32,
+        TransitionKind::Stinger => {
+            unreachable!("TransitionPlan does not compile Stinger")
         }
     };
     let boundary = if matches!(plan.kind(), TransitionKind::Wipe | TransitionKind::Slide) {
@@ -915,8 +941,25 @@ fn encode_uniform(plan: TransitionPlan, width: u32) -> [u8; 16] {
     } else {
         0
     };
-    let words = [operation, plan.numerator(), plan.denominator(), boundary];
-    let mut bytes = [0; 16];
+    let (scaled_width, scaled_height) = if plan.kind() == TransitionKind::Zoom {
+        (
+            zoom_extent(width, plan.numerator(), plan.denominator()),
+            zoom_extent(height, plan.numerator(), plan.denominator()),
+        )
+    } else {
+        (0, 0)
+    };
+    let words = [
+        operation,
+        plan.numerator(),
+        plan.denominator(),
+        boundary,
+        scaled_width,
+        scaled_height,
+        0,
+        0,
+    ];
+    let mut bytes = [0; TRANSITION_UNIFORM_SIZE];
     for (chunk, word) in bytes.chunks_exact_mut(4).zip(words) {
         chunk.copy_from_slice(&word.to_le_bytes());
     }
@@ -1091,17 +1134,17 @@ mod tests {
     }
 
     #[test]
-    fn uniform_is_four_native_u32_words() {
+    fn transition_uniform_encodes_operation_progress_and_geometry() {
         let fade = TransitionPlan::compile(TransitionKind::Fade, 3, 7).unwrap();
-        let uniform = encode_uniform(fade, 11);
-        assert_eq!(uniform.len(), 16);
+        let uniform = encode_uniform(fade, 11, 7);
+        assert_eq!(uniform.len(), 32);
         assert_eq!(u32::from_le_bytes(uniform[0..4].try_into().unwrap()), 1);
         assert_eq!(u32::from_le_bytes(uniform[4..8].try_into().unwrap()), 3);
         assert_eq!(u32::from_le_bytes(uniform[8..12].try_into().unwrap()), 7);
         assert_eq!(u32::from_le_bytes(uniform[12..16].try_into().unwrap()), 0);
 
         let alpha_fade = TransitionPlan::compile(TransitionKind::AlphaFade, 2, 5).unwrap();
-        let uniform = encode_uniform(alpha_fade, 11);
+        let uniform = encode_uniform(alpha_fade, 11, 7);
         assert_eq!(u32::from_le_bytes(uniform[0..4].try_into().unwrap()), 1);
         assert_eq!(u32::from_le_bytes(uniform[4..8].try_into().unwrap()), 2);
         assert_eq!(u32::from_le_bytes(uniform[8..12].try_into().unwrap()), 5);
@@ -1109,19 +1152,27 @@ mod tests {
 
         let cut = TransitionPlan::compile(TransitionKind::Cut, 0, 1).unwrap();
         assert_eq!(
-            u32::from_le_bytes(encode_uniform(cut, 11)[0..4].try_into().unwrap()),
+            u32::from_le_bytes(encode_uniform(cut, 11, 7)[0..4].try_into().unwrap()),
             0
         );
 
         let wipe = TransitionPlan::compile(TransitionKind::Wipe, 1, 2).unwrap();
-        let uniform = encode_uniform(wipe, 5);
+        let uniform = encode_uniform(wipe, 5, 3);
         assert_eq!(u32::from_le_bytes(uniform[0..4].try_into().unwrap()), 2);
         assert_eq!(u32::from_le_bytes(uniform[12..16].try_into().unwrap()), 2);
 
         let slide = TransitionPlan::compile(TransitionKind::Slide, 2, 3).unwrap();
-        let uniform = encode_uniform(slide, 5);
+        let uniform = encode_uniform(slide, 5, 3);
         assert_eq!(u32::from_le_bytes(uniform[0..4].try_into().unwrap()), 3);
         assert_eq!(u32::from_le_bytes(uniform[12..16].try_into().unwrap()), 3);
+
+        let zoom = TransitionPlan::compile(TransitionKind::Zoom, 1, 2).unwrap();
+        let uniform = encode_uniform(zoom, 5, 3);
+        assert_eq!(u32::from_le_bytes(uniform[0..4].try_into().unwrap()), 4);
+        assert_eq!(u32::from_le_bytes(uniform[16..20].try_into().unwrap()), 2);
+        assert_eq!(u32::from_le_bytes(uniform[20..24].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(uniform[24..28].try_into().unwrap()), 0);
+        assert_eq!(u32::from_le_bytes(uniform[28..32].try_into().unwrap()), 0);
     }
 
     #[test]
