@@ -659,13 +659,16 @@ availability requires Ready state, replicated view, transition permission, and
 negotiated 1.6 support. The worker maps the typed intent to the exact command,
 preserves a blocked AlphaFade at the head of its reconnect FIFO through a 1.5
 downgrade, and a loopback worker test observes the duration, envelope, durable
-event, and runtime realization ordering. Manual T-bar AlphaFade and
-configured-output process acceptance remain absent.
+event, and runtime realization ordering. A hardware-gated macOS/Metal process
+acceptance now sends protocol AlphaFade to a real configured Program recorder
+using static opaque-white and transparent-black generators, observes an ordered
+opaque/intermediate/transparent recording, decodes the result, and verifies the
+settled persisted routing. Manual T-bar AlphaFade remains absent.
 
-The remaining AlphaFade operator and output path, stinger, Slide/Zoom, other
-transition families, cross-platform/fullscreen evidence, and complete `SW-004`
-acceptance remain pending; parity therefore stays planned. Item 5 and RC-007
-remain planned.
+The remaining AlphaFade manual T-bar path, stinger, Slide/Zoom, other transition
+families, cross-platform/fullscreen evidence, and complete `SW-004` acceptance
+remain pending; parity therefore stays planned. Item 5 and RC-007 remain
+planned.
 
 FTB groundwork now includes a switcher-owned bounded automatic control core
 alongside the compositor plan. The controller moves from its current exact

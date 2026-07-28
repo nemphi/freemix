@@ -887,6 +887,67 @@ fn protocol_fade_to_black_reaches_configured_program_recording() {
 #[cfg(target_os = "macos")]
 #[test]
 #[ignore = "requires FFmpeg with libx264/AAC, ffprobe, and a native macOS Metal adapter"]
+fn protocol_alpha_fade_reaches_configured_program_recording() {
+    let _hardware_lock = NATIVE_MEDIA_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let directory = tempfile::tempdir().unwrap();
+    if require_recording_tools().is_none() {
+        return;
+    }
+    let project_path = directory.path().join("record-alpha-fade.freemix");
+    let output_path = directory.path().join("program-alpha-fade.mp4");
+    save_alpha_fade_generator_project(&project_path);
+
+    let Some(mut daemon) = require_native_recorder(NativeDaemonProcess::start_recording(
+        &project_path,
+        &output_path,
+    )) else {
+        return;
+    };
+    let mut client = StudioClient::connect(daemon.address);
+    let initial = client.handshake();
+    assert_snapshot_routing(&initial, 0, input(1), input(2));
+    thread::sleep(Duration::from_millis(300));
+
+    let alpha_fade = client.command(
+        "record-alpha-fade",
+        "record-alpha-fade-key",
+        CommandPayload::AlphaFade {
+            duration_frames: 12,
+        },
+    );
+    assert_eq!(alpha_fade.revision, 1);
+    thread::sleep(Duration::from_millis(300));
+    daemon.signal_terminate();
+
+    let output = daemon.wait_for(RECORDING_PROCESS_TIMEOUT);
+    drop(client);
+    assert!(
+        output.status.success(),
+        "AlphaFade recording daemon failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let luma = recording_average_luma(&output_path).unwrap();
+    assert_ordered_opaque_alpha_fade_transparent(&luma);
+    decode_recording(&output_path).unwrap();
+
+    let persisted = ProjectStore::new(&project_path).unwrap().load().unwrap();
+    assert_eq!(persisted.position().revision, 1);
+    assert_eq!(
+        persisted.runtime_routing(),
+        RuntimeRouting {
+            desired_program_id: Some(input(2)),
+            realized_program_id: Some(input(2)),
+            desired_preview_id: Some(input(1)),
+            realized_preview_id: Some(input(1)),
+        }
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires FFmpeg with libx264/AAC, ffprobe, and a native macOS Metal adapter"]
 fn protocol_manual_fade_reversal_reaches_configured_program_recording() {
     let _hardware_lock = NATIVE_MEDIA_TEST_LOCK
         .lock()
@@ -1597,6 +1658,18 @@ fn assert_ordered_live_black_live(luma: &[u8]) -> (usize, usize) {
 }
 
 #[cfg(target_os = "macos")]
+fn assert_ordered_opaque_alpha_fade_transparent(luma: &[u8]) {
+    const REQUIRED_FRAMES: usize = 3;
+
+    let opaque = luma_run(luma, 0, 205, u8::MAX, REQUIRED_FRAMES)
+        .unwrap_or_else(|| panic!("recording has no stable opaque-white interval: {luma:?}"));
+    let intermediate = luma_run(luma, opaque + REQUIRED_FRAMES, 64, 190, 1)
+        .unwrap_or_else(|| panic!("recording has no AlphaFade intermediate frame: {luma:?}"));
+    luma_run(luma, intermediate + 1, 0, 32, REQUIRED_FRAMES)
+        .unwrap_or_else(|| panic!("recording has no stable transparent-black interval: {luma:?}"));
+}
+
+#[cfg(target_os = "macos")]
 fn assert_ordered_manual_forward_reverse_commit(luma: &[u8]) {
     const REQUIRED_FRAMES: usize = 3;
 
@@ -2187,6 +2260,22 @@ fn save_generator_project(path: &Path) {
     save_generator_project_with_position(path, FrameRate::new(25, 1).unwrap(), 0);
 }
 
+#[cfg(target_os = "macos")]
+fn save_alpha_fade_generator_project(path: &Path) {
+    save_generator_project_with_sources(
+        path,
+        FrameRate::new(25, 1).unwrap(),
+        0,
+        [
+            (
+                input(1),
+                SimulatedVideo::Solid(SolidColor::new(255, 255, 255, 255)),
+            ),
+            (input(2), SimulatedVideo::Solid(SolidColor::new(0, 0, 0, 0))),
+        ],
+    );
+}
+
 fn save_restored_generator_project(path: &Path, frames_rendered: u64) {
     save_generator_project_with_position(
         path,
@@ -2196,6 +2285,26 @@ fn save_restored_generator_project(path: &Path, frames_rendered: u64) {
 }
 
 fn save_generator_project_with_position(path: &Path, rate: FrameRate, frames_rendered: u64) {
+    save_generator_project_with_sources(
+        path,
+        rate,
+        frames_rendered,
+        [
+            (input(1), SimulatedVideo::Bars),
+            (
+                input(2),
+                SimulatedVideo::Solid(SolidColor::new(24, 80, 160, 255)),
+            ),
+        ],
+    );
+}
+
+fn save_generator_project_with_sources(
+    path: &Path,
+    rate: FrameRate,
+    frames_rendered: u64,
+    sources: [(InputId, SimulatedVideo); 2],
+) {
     let mut project = Project::new(
         ProjectId::new(NonZeroU128::new(7_002).unwrap()),
         "Native generator daemon test",
@@ -2215,13 +2324,7 @@ fn save_generator_project_with_position(path: &Path, rate: FrameRate, frames_ren
             },
         },
     );
-    for (id, video) in [
-        (input(1), SimulatedVideo::Bars),
-        (
-            input(2),
-            SimulatedVideo::Solid(SolidColor::new(24, 80, 160, 255)),
-        ),
-    ] {
+    for (id, video) in sources {
         project.add_input(Input {
             id,
             name: format!("Generator {id}"),
