@@ -4,7 +4,7 @@ use fm_client::{ConnectionState, ReconnectBackoff, Session};
 use fm_protocol::{
     ALPHA_FADE_PROTOCOL_VERSION, CommandPayload, FADE_TO_BLACK_PROTOCOL_VERSION,
     MANUAL_ALPHA_FADE_PROTOCOL_VERSION, MANUAL_TRANSITION_PROTOCOL_VERSION, ManualTransitionKind,
-    ManualTransitionPosition, ProtocolVersion, Role, ServerIdentity,
+    ManualTransitionPosition, ProtocolVersion, Role, SLIDE_PROTOCOL_VERSION, ServerIdentity,
 };
 use fm_types::InputId;
 use fm_ui_model::{ActiveManualTransition, BusSelection, ManualTransitionStatus, SwitcherState};
@@ -56,11 +56,9 @@ fn ready_session() -> Session {
 }
 
 #[test]
-fn web_handshake_advertises_only_protocol_1_7() {
-    assert_eq!(
-        SUPPORTED_PROTOCOL_VERSIONS,
-        [MANUAL_ALPHA_FADE_PROTOCOL_VERSION]
-    );
+fn web_handshake_advertises_only_protocol_1_8() {
+    assert_eq!(SUPPORTED_PROTOCOL_VERSIONS, [SLIDE_PROTOCOL_VERSION]);
+    assert_eq!(SLIDE_PROTOCOL_VERSION, ProtocolVersion::new(1, 8));
     assert_eq!(
         MANUAL_ALPHA_FADE_PROTOCOL_VERSION,
         ProtocolVersion::new(1, 7)

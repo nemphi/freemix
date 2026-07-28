@@ -701,13 +701,17 @@ process restart acceptances restore exact Program/Preview routing, counters,
 receipt history, and resume position. CLI now exposes matching local and remote
 `slide ... <frames>` commands. Local execution settles and saves the bundle
 with replay-safe idempotency; remote execution preserves the exact duration and
-refuses to transmit after a protocol 1.7 downgrade. Web, Studio, and
+refuses to transmit after a protocol 1.7 downgrade. Web now advertises protocol
+1.8 and exposes an accessible semantic Slide action with the shared bounded
+duration only when Ready, authorized, and negotiated at 1.8. Downgrade and
+reconnect tests hide Slide without disabling older transition controls. It
+remains a transport-free model with no browser network runtime. Studio and
 configured-output acceptance remain absent.
 
-Stinger, Slide Web and Studio controls, configured-output Slide evidence, Zoom,
-other transition families, cross-platform/fullscreen evidence, and complete
-`SW-004` acceptance remain pending; parity therefore stays planned. Item 5 and
-RC-007 remain planned.
+Stinger, Slide Studio controls, configured-output Slide evidence, Zoom, other
+transition families, cross-platform/fullscreen evidence, and complete `SW-004`
+acceptance remain pending; parity therefore stays planned. Item 5 and RC-007
+remain planned.
 
 FTB groundwork now includes a switcher-owned bounded automatic control core
 alongside the compositor plan. The controller moves from its current exact
