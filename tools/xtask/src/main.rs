@@ -590,7 +590,17 @@ fn validate_tests<'a>(
             resolve_test_path(root, &test.id, path)?;
         }
         for command in &test.commands {
-            resolve_test_command(&packages, &test.id, command)?;
+            let target = resolve_test_command(&packages, &test.id, command)?;
+            if test.state == TEST_VERIFIED
+                && !test.paths.iter().any(|path| root.join(path) == target)
+            {
+                let relative = target.strip_prefix(root).unwrap_or(&target);
+                return Err(format!(
+                    "{} is verified but command `{command}` resolves to {}, which is not declared in its paths",
+                    test.id,
+                    relative.display()
+                ));
+            }
         }
     }
     Ok(tests)
@@ -641,7 +651,7 @@ fn resolve_test_command(
     packages: &BTreeMap<String, PathBuf>,
     test_id: &str,
     command: &str,
-) -> Result<(), String> {
+) -> Result<PathBuf, String> {
     let parts: Vec<_> = command.split_ascii_whitespace().collect();
     let ["cargo", "test", "-p", package, "--test", target] = parts.as_slice() else {
         return Err(format!(
@@ -662,12 +672,15 @@ fn resolve_test_command(
     }
     let file_target = directory.join("tests").join(format!("{target}.rs"));
     let directory_target = directory.join("tests").join(target).join("main.rs");
-    if !file_target.is_file() && !directory_target.is_file() {
-        return Err(format!(
-            "{test_id} command target {package} --test {target} does not resolve locally"
-        ));
+    if file_target.is_file() {
+        return Ok(file_target);
     }
-    Ok(())
+    if directory_target.is_file() {
+        return Ok(directory_target);
+    }
+    Err(format!(
+        "{test_id} command target {package} --test {target} does not resolve locally"
+    ))
 }
 
 fn unique_registry<'a>(values: &'a [String], kind: &str) -> Result<BTreeSet<&'a str>, String> {
@@ -775,6 +788,13 @@ fn validate_feature(
         if !tests.contains_key(test.as_str()) {
             return Err(format!("{} has unknown test {test}", feature.id));
         }
+    }
+    let owned_test = format!("accept-{}", feature.id.to_ascii_lowercase());
+    if !unique_tests.contains(owned_test.as_str()) {
+        return Err(format!(
+            "{} must reference its acceptance test {owned_test}",
+            feature.id
+        ));
     }
     if !matches!(
         feature.status.as_str(),
@@ -1408,6 +1428,14 @@ mod tests {
     }
 
     #[test]
+    fn rejects_acceptance_evidence_owned_by_another_feature() {
+        assert_invalid(
+            |ledger| ledger.features[0].tests = vec!["accept-in-002".to_owned()],
+            "IN-001 must reference its acceptance test accept-in-001",
+        );
+    }
+
+    #[test]
     fn rejects_phase_inversion() {
         assert_invalid(
             |ledger| {
@@ -1597,6 +1625,22 @@ mod tests {
                 test.commands.clear();
             },
             "accept-rc-008 is verified but must provide both local test paths and runnable commands",
+        );
+    }
+
+    #[test]
+    fn rejects_verified_command_without_its_declared_test_path() {
+        assert_invalid(
+            |ledger| {
+                let test = ledger
+                    .tests
+                    .iter_mut()
+                    .find(|test| test.id == "accept-rc-008")
+                    .unwrap();
+                test.state = "verified".to_owned();
+                test.paths.remove(0);
+            },
+            "accept-rc-008 is verified but command `cargo test -p freemixd --test process` resolves to apps/freemixd/tests/process.rs, which is not declared in its paths",
         );
     }
 

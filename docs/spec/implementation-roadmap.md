@@ -692,7 +692,8 @@ unwaived applicable row. Named proprietary integrations may be legally blocked
 but cannot be marked parity-complete through a generic substitute.
 
 Acceptance-test evidence progresses from `planned` to `present` to `verified`.
-`present` records local test material and runnable commands without claiming the
-feature contract is complete. A feature may be `verified` only when every
-referenced acceptance test is also `verified` and has both resolvable local test
-paths and runnable test commands.
+`present` records local test material and resolvable command targets without
+claiming the feature contract is complete. Every feature must reference its
+owned `accept-<feature-id>` record. A feature may be `verified` only when every
+referenced acceptance test is also `verified`, has both local test paths and
+resolvable test commands, and declares the test file resolved by each command.
