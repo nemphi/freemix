@@ -712,11 +712,14 @@ requires Ready state, a replicated view, transition permission, and negotiated
 1.8 support. The worker maps the typed intent to the exact command, preserves a
 blocked Slide at the head of its reconnect FIFO through a 1.7 downgrade, and a
 loopback worker test observes the duration, envelope, durable event, and runtime
-realization ordering. Configured-output acceptance remains absent.
+realization ordering. A hardware-gated macOS/Metal process acceptance now sends
+protocol Slide through a real configured Program recorder, decodes stable
+white, a Slide-specific white-left/black-right intermediate frame, then stable
+black, and verifies the settled persisted routing.
 
-Stinger, configured-output Slide evidence, Zoom, other transition families,
-cross-platform/fullscreen evidence, and complete `SW-004` acceptance remain
-pending; parity therefore stays planned. Item 5 and RC-007 remain planned.
+Stinger, Zoom, other transition families, cross-platform/fullscreen evidence,
+and complete `SW-004` acceptance remain pending; parity therefore stays
+planned. Item 5 and RC-007 remain planned.
 
 FTB groundwork now includes a switcher-owned bounded automatic control core
 alongside the compositor plan. The controller moves from its current exact

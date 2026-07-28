@@ -948,6 +948,67 @@ fn protocol_alpha_fade_reaches_configured_program_recording() {
 #[cfg(target_os = "macos")]
 #[test]
 #[ignore = "requires FFmpeg with libx264/AAC, ffprobe, and a native macOS Metal adapter"]
+fn protocol_slide_reaches_configured_program_recording() {
+    let _hardware_lock = NATIVE_MEDIA_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let directory = tempfile::tempdir().unwrap();
+    if require_recording_tools().is_none() {
+        return;
+    }
+    let project_path = directory.path().join("record-slide.freemix");
+    let output_path = directory.path().join("program-slide.mp4");
+    save_slide_generator_project(&project_path);
+
+    let Some(mut daemon) = require_native_recorder(NativeDaemonProcess::start_recording(
+        &project_path,
+        &output_path,
+    )) else {
+        return;
+    };
+    let mut client = StudioClient::connect(daemon.address);
+    let initial = client.handshake();
+    assert_snapshot_routing(&initial, 0, input(1), input(2));
+    thread::sleep(Duration::from_millis(300));
+
+    let slide = client.command(
+        "record-slide",
+        "record-slide-key",
+        CommandPayload::Slide {
+            duration_frames: 12,
+        },
+    );
+    assert_eq!(slide.revision, 1);
+    thread::sleep(Duration::from_millis(300));
+    daemon.signal_terminate();
+
+    let output = daemon.wait_for(RECORDING_PROCESS_TIMEOUT);
+    drop(client);
+    assert!(
+        output.status.success(),
+        "Slide recording daemon failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let half_luma = recording_half_luma(&output_path).unwrap();
+    assert_ordered_white_slide_black(&half_luma);
+    decode_recording(&output_path).unwrap();
+
+    let persisted = ProjectStore::new(&project_path).unwrap().load().unwrap();
+    assert_eq!(persisted.position().revision, 1);
+    assert_eq!(
+        persisted.runtime_routing(),
+        RuntimeRouting {
+            desired_program_id: Some(input(2)),
+            realized_program_id: Some(input(2)),
+            desired_preview_id: Some(input(1)),
+            realized_preview_id: Some(input(1)),
+        }
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires FFmpeg with libx264/AAC, ffprobe, and a native macOS Metal adapter"]
 fn protocol_manual_fade_reversal_reaches_configured_program_recording() {
     let _hardware_lock = NATIVE_MEDIA_TEST_LOCK
         .lock()
@@ -1598,6 +1659,74 @@ fn recording_average_luma(path: &Path) -> Result<Vec<u8>, String> {
             String::from_utf8_lossy(&output.stderr)
         ))
     }
+}
+
+#[cfg(target_os = "macos")]
+fn recording_half_luma(path: &Path) -> Result<Vec<[u8; 2]>, String> {
+    let child = Command::new("ffmpeg")
+        .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-i"])
+        .arg(path)
+        .args([
+            "-map",
+            "0:v:0",
+            "-vf",
+            "scale=2:1:flags=area",
+            "-pix_fmt",
+            "gray",
+            "-f",
+            "rawvideo",
+            "-",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("cannot spawn FFmpeg half-luma decoder: {error}"))?;
+    let output = wait_bounded(child, PROCESS_TIMEOUT);
+    if !output.status.success() {
+        return Err(format!(
+            "recording half-luma decode failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let chunks = output.stdout.chunks_exact(2);
+    if !chunks.remainder().is_empty() {
+        return Err("recording half-luma output ended mid-frame".to_owned());
+    }
+    Ok(chunks.map(|frame| [frame[0], frame[1]]).collect())
+}
+
+#[cfg(target_os = "macos")]
+fn assert_ordered_white_slide_black(frames: &[[u8; 2]]) {
+    const REQUIRED_FRAMES: usize = 3;
+
+    let white = half_luma_run(frames, 0, REQUIRED_FRAMES, |[left, right]| {
+        left >= 205 && right >= 205
+    })
+    .unwrap_or_else(|| panic!("recording has no stable white Program interval: {frames:?}"));
+    let split = half_luma_run(frames, white + REQUIRED_FRAMES, 1, |[left, right]| {
+        left >= 180 && right <= 64
+    })
+    .unwrap_or_else(|| {
+        panic!("recording has no Slide frame with white left and black right: {frames:?}")
+    });
+    half_luma_run(frames, split + 1, REQUIRED_FRAMES, |[left, right]| {
+        left <= 32 && right <= 32
+    })
+    .unwrap_or_else(|| panic!("recording has no stable black Program interval: {frames:?}"));
+}
+
+#[cfg(target_os = "macos")]
+fn half_luma_run(
+    frames: &[[u8; 2]],
+    start: usize,
+    required: usize,
+    predicate: impl Fn([u8; 2]) -> bool,
+) -> Option<usize> {
+    frames[start..]
+        .windows(required)
+        .position(|window| window.iter().copied().all(&predicate))
+        .map(|offset| start + offset)
 }
 
 #[cfg(target_os = "macos")]
@@ -2349,6 +2478,25 @@ fn save_alpha_fade_generator_project(path: &Path) {
                 SimulatedVideo::Solid(SolidColor::new(255, 255, 255, 255)),
             ),
             (input(2), SimulatedVideo::Solid(SolidColor::new(0, 0, 0, 0))),
+        ],
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn save_slide_generator_project(path: &Path) {
+    save_generator_project_with_sources(
+        path,
+        FrameRate::new(25, 1).unwrap(),
+        0,
+        [
+            (
+                input(1),
+                SimulatedVideo::Solid(SolidColor::new(255, 255, 255, 255)),
+            ),
+            (
+                input(2),
+                SimulatedVideo::Solid(SolidColor::new(0, 0, 0, 255)),
+            ),
         ],
     );
 }
