@@ -9,8 +9,13 @@ use std::fmt;
 
 use fm_types::{AudioFormat, ChannelLayout, FrameRate, InputId, SampleFormat, SampleRate};
 
+mod channel_mapping;
 mod synchronizer;
 
+pub use channel_mapping::{
+    ChannelMapping, ChannelMappingError, ChannelMappingRoute, ChannelMappingSide,
+    MAX_CHANNEL_MAPPING_BYTES, MAX_CHANNEL_MAPPING_ROUTES,
+};
 pub use synchronizer::{
     AudioCadenceOrigin, AudioRenderPlan, AudioSilenceSpan, AudioSynchronizerError,
     AudioSynchronizerLimits, AudioSynchronizerTelemetry, BufferLimit, ClockMappedAudioSynchronizer,
