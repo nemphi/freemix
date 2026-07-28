@@ -10,7 +10,10 @@ use fm_engine::{
     EnginePrepareOutcome, EngineRestoreState, EngineSnapshot, ShowState, SnapshotError,
 };
 use fm_scheduler::FrameNumber;
-use fm_switcher::{SwitcherEvent, SwitcherState, TBarPosition, TBarState, TransitionKind};
+use fm_switcher::{
+    FadeToBlackPosition, FadeToBlackTarget, SwitcherEvent, SwitcherState, TBarPosition, TBarState,
+    TransitionKind,
+};
 use fm_types::{FrameRate, InputId};
 
 fn input(value: u128) -> InputId {
@@ -434,6 +437,121 @@ fn fade_renders_exactly_the_requested_number_of_frames() {
     let after = engine.tick().unwrap();
     assert_eq!(after.program.primary, input(2));
     assert_eq!(after.program.secondary, None);
+}
+
+#[test]
+fn fade_to_black_is_authoritative_reversible_and_program_orthogonal() {
+    let mut engine = engine();
+    engine
+        .execute(
+            envelope(
+                "ftb-on",
+                EngineCommand::FadeToBlack {
+                    active: true,
+                    duration_frames: 3,
+                },
+            ),
+            0,
+        )
+        .unwrap();
+    assert!(engine.desired_fade_to_black().active);
+    assert_eq!(
+        engine.desired_fade_to_black().position,
+        FadeToBlackPosition::BLACK
+    );
+    assert_eq!(
+        engine.realized_fade_to_black().position,
+        FadeToBlackPosition::LIVE
+    );
+
+    let first = engine.tick().unwrap();
+    assert_eq!(first.fade_to_black.target(), FadeToBlackTarget::Black);
+    assert_eq!(
+        first.fade_to_black.interval_start(),
+        FadeToBlackPosition::LIVE
+    );
+    assert_eq!(first.fade_to_black.interval_end().numerator(), 21_845);
+    assert_eq!(engine.realized_fade_to_black().position.numerator(), 21_845);
+    assert_eq!(engine.snapshot(), Err(SnapshotError::WorkInFlight));
+
+    engine
+        .execute(
+            envelope("program-fade", EngineCommand::Fade { duration_frames: 2 }),
+            0,
+        )
+        .unwrap();
+    let second = engine.tick().unwrap();
+    assert_eq!(second.program.transition_kind, Some(TransitionKind::Fade));
+    assert_eq!(second.fade_to_black.interval_start().numerator(), 21_845);
+    assert_eq!(second.fade_to_black.interval_end().numerator(), 43_690);
+
+    engine
+        .execute(
+            envelope(
+                "ftb-off",
+                EngineCommand::FadeToBlack {
+                    active: false,
+                    duration_frames: 2,
+                },
+            ),
+            0,
+        )
+        .unwrap();
+    assert!(!engine.desired_fade_to_black().active);
+    let reversal = engine.tick().unwrap();
+    assert_eq!(reversal.fade_to_black.target(), FadeToBlackTarget::Live);
+    assert_eq!(reversal.fade_to_black.interval_start().numerator(), 43_690);
+    assert_eq!(reversal.fade_to_black.interval_end().numerator(), 21_845);
+    assert!(reversal.events.iter().any(|event| matches!(
+        event,
+        SwitcherEvent::ProgramChanged { program, .. } if *program == input(2)
+    )));
+
+    let completed = engine.tick().unwrap();
+    assert_eq!(
+        completed.fade_to_black.interval_end(),
+        FadeToBlackPosition::LIVE
+    );
+    assert_eq!(
+        engine.realized_fade_to_black(),
+        engine.desired_fade_to_black()
+    );
+    let snapshot = engine.snapshot().unwrap();
+    assert_eq!(
+        Engine::restore(snapshot).unwrap().realized_fade_to_black(),
+        engine.realized_fade_to_black()
+    );
+}
+
+#[test]
+fn fade_to_black_duration_is_validated_before_desired_mutation() {
+    for (key, duration_frames, expected) in [
+        ("zero-ftb", 0, "Fade-to-Black duration must be nonzero"),
+        (
+            "oversized-ftb",
+            3_601,
+            "Fade-to-Black duration must not exceed 3600 frames",
+        ),
+    ] {
+        let mut engine = engine();
+        let outcome = engine
+            .execute(
+                envelope(
+                    key,
+                    EngineCommand::FadeToBlack {
+                        active: true,
+                        duration_frames,
+                    },
+                ),
+                0,
+            )
+            .unwrap();
+        let rejection = outcome.receipt.rejected().unwrap();
+        assert_eq!(rejection.rejection.code, RejectionCode::InvalidCommand);
+        assert_eq!(rejection.rejection.message, expected);
+        assert!(!engine.desired_fade_to_black().active);
+        assert!(!engine.realized_fade_to_black().active);
+    }
 }
 
 #[test]

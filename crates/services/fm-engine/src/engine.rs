@@ -8,8 +8,8 @@ use fm_command::{
 };
 use fm_scheduler::{FrameNumber, FrameScheduler, PlanGeneration};
 use fm_switcher::{
-    ProgramFrame, SwitcherCommand, SwitcherError, SwitcherEvent, SwitcherState, TBarPosition,
-    TransitionKind,
+    FadeToBlackFrame, FadeToBlackPosition, ProgramFrame, SwitcherCommand, SwitcherError,
+    SwitcherEvent, SwitcherState, TBarPosition, TransitionKind,
 };
 use fm_types::{FrameRate, InputId};
 
@@ -60,6 +60,12 @@ pub struct EngineManualTransitionState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EngineFadeToBlackState {
+    pub active: bool,
+    pub position: FadeToBlackPosition,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EngineCommand {
     SelectPreview(InputId),
     Cut,
@@ -67,6 +73,10 @@ pub enum EngineCommand {
         duration_frames: u32,
     },
     Wipe {
+        duration_frames: u32,
+    },
+    FadeToBlack {
+        active: bool,
         duration_frames: u32,
     },
     StartManualTransition {
@@ -187,6 +197,7 @@ pub struct FrameResult {
     pub frame: FrameNumber,
     pub deadline: ClockTime,
     pub program: ProgramFrame,
+    pub fade_to_black: FadeToBlackFrame,
     pub events: Vec<SwitcherEvent>,
     pub revision: Revision,
     pub runtime_generation: RuntimeGeneration,
@@ -224,6 +235,16 @@ impl EngineSnapshot {
             .desired_switcher()
             .t_bar()
             .map(engine_manual_state)
+    }
+
+    #[must_use]
+    pub const fn desired_fade_to_black(&self) -> EngineFadeToBlackState {
+        engine_fade_to_black_state(self.show.desired_switcher())
+    }
+
+    #[must_use]
+    pub const fn realized_fade_to_black(&self) -> EngineFadeToBlackState {
+        engine_fade_to_black_state(&self.realized_switcher)
     }
 
     #[must_use]
@@ -328,6 +349,16 @@ impl Engine {
     #[must_use]
     pub fn realized_manual_transition(&self) -> Option<EngineManualTransitionState> {
         self.realized_switcher.t_bar().map(engine_manual_state)
+    }
+
+    #[must_use]
+    pub const fn desired_fade_to_black(&self) -> EngineFadeToBlackState {
+        engine_fade_to_black_state(self.show().desired_switcher())
+    }
+
+    #[must_use]
+    pub const fn realized_fade_to_black(&self) -> EngineFadeToBlackState {
+        engine_fade_to_black_state(&self.realized_switcher)
     }
 
     #[must_use]
@@ -470,7 +501,9 @@ impl Engine {
         let outcome = self
             .commands
             .apply(envelope, now_millis, move |_, command| {
-                if let Some(kind) = runtime_busy {
+                if let Some(kind) = runtime_busy
+                    && !matches!(command, EngineCommand::FadeToBlack { .. })
+                {
                     let name = match kind {
                         TransitionKind::Fade => "fade",
                         TransitionKind::Wipe => "wipe",
@@ -492,16 +525,19 @@ impl Engine {
         }
         if outcome.receipt.accepted().is_some() && !outcome.replayed {
             self.pending_actions += 1;
-            self.transition_in_flight = match command {
+            if let Some(kind) = match command {
                 EngineCommand::Fade { .. } => Some(TransitionKind::Fade),
                 EngineCommand::Wipe { .. } => Some(TransitionKind::Wipe),
                 EngineCommand::SelectPreview(_)
                 | EngineCommand::Cut
+                | EngineCommand::FadeToBlack { .. }
                 | EngineCommand::StartManualTransition { .. }
                 | EngineCommand::SetManualTransitionPosition { .. }
                 | EngineCommand::CommitManualTransition
                 | EngineCommand::CancelManualTransition => None,
-            };
+            } {
+                self.transition_in_flight = Some(kind);
+            }
         } else if let Some(action) = scheduled {
             self.scheduler.cancel_action(action);
         }
@@ -544,15 +580,19 @@ impl Engine {
         }
 
         let program = self.realized_switcher.program_frame();
+        let fade_to_black = self.realized_switcher.fade_to_black_frame();
         if let Some(event) = self.realized_switcher.advance_frame() {
+            if matches!(event, SwitcherEvent::ProgramChanged { .. }) {
+                self.transition_in_flight = None;
+            }
             events.push(event);
-            self.transition_in_flight = None;
         }
 
         Ok(FrameResult {
             frame: tick.deadline.frame,
             deadline: ClockTime::from_nanos(tick.deadline.at_ns),
             program,
+            fade_to_black,
             events,
             revision: self.commands.revision(),
             runtime_generation: self.runtime_generation,
@@ -569,6 +609,12 @@ impl Engine {
         if self.pending_actions != 0
             || self.transition_in_flight.is_some()
             || self.realized_switcher.transition().is_some()
+            || self
+                .commands
+                .state()
+                .desired_switcher()
+                .fade_to_black_is_automatic()
+            || self.realized_switcher.fade_to_black_is_automatic()
         {
             return Err(SnapshotError::WorkInFlight);
         }
@@ -670,11 +716,19 @@ fn validate_idle_restore(
     if show.desired_switcher().transition().is_some() || realized_switcher.transition().is_some() {
         return Err(SnapshotError::WorkInFlight);
     }
+    if show.desired_switcher().fade_to_black_is_automatic()
+        || realized_switcher.fade_to_black_is_automatic()
+    {
+        return Err(SnapshotError::WorkInFlight);
+    }
     if show.inputs() != realized_switcher.inputs() {
         return Err(SnapshotError::IncompatibleSwitcher);
     }
     if show.desired_switcher().program() != realized_switcher.program()
         || show.desired_switcher().preview() != realized_switcher.preview()
+        || show.desired_switcher().fade_to_black() != realized_switcher.fade_to_black()
+        || show.desired_switcher().fade_to_black_position()
+            != realized_switcher.fade_to_black_position()
     {
         return Err(SnapshotError::MismatchedSwitcherRouting);
     }
@@ -787,6 +841,17 @@ impl Mutation<ShowState, EngineEvent, EngineAcceptance> for EngineMutation {
                 }
                 SwitcherCommand::Cut
             }
+            EngineCommand::FadeToBlack {
+                active,
+                duration_frames,
+            } => {
+                validate_fade_to_black_duration(duration_frames)?;
+                let _ = state.desired_switcher_mut().set_fade_to_black(active);
+                events.push(EngineEvent::DesiredSwitcherChanged(self.command));
+                return Ok(EngineAcceptance {
+                    target_frame: self.target_frame,
+                });
+            }
             EngineCommand::StartManualTransition { kind } => SwitcherCommand::StartTBar {
                 kind: manual_transition_kind(kind),
             },
@@ -811,6 +876,15 @@ fn apply_runtime(
     switcher: &mut SwitcherState,
     command: EngineCommand,
 ) -> Result<Vec<SwitcherEvent>, SwitcherError> {
+    if let EngineCommand::FadeToBlack {
+        active,
+        duration_frames,
+    } = command
+    {
+        return Ok(switcher
+            .request_fade_to_black(active, duration_frames)
+            .expect("accepted engine FTB durations are validated"));
+    }
     switcher.apply(match command {
         EngineCommand::SelectPreview(input) => SwitcherCommand::SelectPreview(input),
         EngineCommand::Cut => SwitcherCommand::Cut,
@@ -819,6 +893,9 @@ fn apply_runtime(
             duration_frames,
         },
         EngineCommand::Wipe { duration_frames } => SwitcherCommand::Wipe { duration_frames },
+        EngineCommand::FadeToBlack { .. } => {
+            unreachable!("Fade-to-Black commands return before switcher command mapping")
+        }
         EngineCommand::StartManualTransition { kind } => SwitcherCommand::StartTBar {
             kind: manual_transition_kind(kind),
         },
@@ -828,6 +905,32 @@ fn apply_runtime(
         EngineCommand::CommitManualTransition => SwitcherCommand::CommitTBar,
         EngineCommand::CancelManualTransition => SwitcherCommand::CancelTBar,
     })
+}
+
+const fn engine_fade_to_black_state(switcher: &SwitcherState) -> EngineFadeToBlackState {
+    EngineFadeToBlackState {
+        active: switcher.fade_to_black(),
+        position: switcher.fade_to_black_position(),
+    }
+}
+
+fn validate_fade_to_black_duration(duration_frames: u32) -> Result<(), Rejection> {
+    if duration_frames == 0 {
+        Err(Rejection::new(
+            RejectionCode::InvalidCommand,
+            "Fade-to-Black duration must be nonzero",
+        ))
+    } else if duration_frames > fm_switcher::MAX_FADE_TO_BLACK_DURATION_FRAMES {
+        Err(Rejection::new(
+            RejectionCode::InvalidCommand,
+            format!(
+                "Fade-to-Black duration must not exceed {} frames",
+                fm_switcher::MAX_FADE_TO_BLACK_DURATION_FRAMES
+            ),
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 const fn manual_transition_kind(kind: EngineManualTransitionKind) -> TransitionKind {

@@ -565,6 +565,7 @@ async fn assert_deadline_frame(
     expected_frame: &LinearFrame,
 ) {
     let frame = FrameResult {
+        fade_to_black: fm_switcher::FadeToBlackFrame::LIVE,
         frame: FrameNumber::new(10),
         deadline,
         program: ProgramFrame {
@@ -777,6 +778,7 @@ fn native_metal_renders_scenes_before_exact_fade_and_wipe() {
     for kind in [SwitcherTransitionKind::Fade, SwitcherTransitionKind::Wipe] {
         for (sequence, deadline) in [0, 33_333_333, 2_000_000_000].into_iter().enumerate() {
             let frame = FrameResult {
+                fade_to_black: fm_switcher::FadeToBlackFrame::LIVE,
                 frame: FrameNumber::new(u64::try_from(sequence).unwrap()),
                 deadline: ClockTime::from_nanos(deadline),
                 program: ProgramFrame {
@@ -874,6 +876,7 @@ fn native_metal_project_frames_use_one_completed_in_flight_slot_without_readback
     let mut latest_program = None;
     for frame_number in 0..FRAMES {
         let frame = FrameResult {
+            fade_to_black: fm_switcher::FadeToBlackFrame::LIVE,
             frame: FrameNumber::new(frame_number),
             deadline: ClockTime::from_nanos(frame_number * 33_333_333),
             program: ProgramFrame {
@@ -920,6 +923,7 @@ fn native_leaf_rgba16f(
     input: InputId,
 ) -> [f32; 4] {
     let frame = FrameResult {
+        fade_to_black: fm_switcher::FadeToBlackFrame::LIVE,
         frame: FrameNumber::new(0),
         deadline: ClockTime::from_nanos(0),
         program: ProgramFrame {

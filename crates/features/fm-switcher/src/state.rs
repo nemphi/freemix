@@ -118,6 +118,11 @@ impl SwitcherState {
     }
 
     #[must_use]
+    pub const fn fade_to_black_is_automatic(&self) -> bool {
+        self.fade_to_black.is_automatic()
+    }
+
+    #[must_use]
     pub fn fade_to_black_frame(&self) -> FadeToBlackFrame {
         self.fade_to_black.frame()
     }

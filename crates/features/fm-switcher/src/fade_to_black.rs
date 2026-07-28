@@ -63,6 +63,15 @@ pub struct FadeToBlackFrame {
 }
 
 impl FadeToBlackFrame {
+    pub const LIVE: Self = Self {
+        interval_start: FadeToBlackPosition::LIVE,
+        interval_end: FadeToBlackPosition::LIVE,
+        target: FadeToBlackTarget::Live,
+        progress_start_numerator: 0,
+        progress_end_numerator: 0,
+        progress_denominator: 1,
+    };
+
     #[must_use]
     pub const fn interval_start(self) -> FadeToBlackPosition {
         self.interval_start

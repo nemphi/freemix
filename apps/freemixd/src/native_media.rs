@@ -5603,6 +5603,7 @@ mod tests {
         mix_end_numerator: u32,
     ) -> FrameResult {
         FrameResult {
+            fade_to_black: fm_switcher::FadeToBlackFrame::LIVE,
             frame: FrameNumber::new(frame),
             deadline: ClockTime::ZERO,
             program: ProgramFrame {
