@@ -3648,13 +3648,14 @@ fn native_audio_mix_plan(program: ProgramFrame) -> Result<NativeAudioMixPlan, Na
         });
     }
     match program.transition_kind {
-        Some(SwitcherTransitionKind::Fade | SwitcherTransitionKind::Wipe) => {
-            sample_linear_audio_mix_plan(program, secondary)
-        }
+        Some(
+            SwitcherTransitionKind::Fade
+            | SwitcherTransitionKind::Wipe
+            | SwitcherTransitionKind::AlphaFade,
+        ) => sample_linear_audio_mix_plan(program, secondary),
         Some(
             kind @ (SwitcherTransitionKind::Slide
             | SwitcherTransitionKind::Zoom
-            | SwitcherTransitionKind::AlphaFade
             | SwitcherTransitionKind::Stinger(_)),
         ) => Err(NativeMasterError::UnsupportedAudioTransition(kind)),
         None => Err(NativeMasterError::MissingAudioTransitionKind),
@@ -3713,6 +3714,7 @@ fn native_mix_plan(program: ProgramFrame) -> Result<NativeMixPlan, NativeSourceR
         Some(secondary) if secondary != program.primary => {
             let kind = match program.transition_kind {
                 Some(SwitcherTransitionKind::Fade) => TransitionKind::Fade,
+                Some(SwitcherTransitionKind::AlphaFade) => TransitionKind::AlphaFade,
                 Some(SwitcherTransitionKind::Wipe) => TransitionKind::Wipe,
                 Some(kind) => return Err(NativeSourceRenderError::UnsupportedTransition(kind)),
                 None => return Err(NativeSourceRenderError::MissingTransitionKind),
@@ -6868,6 +6870,27 @@ mod tests {
     }
 
     #[test]
+    fn program_frame_preserves_alpha_fade_kind_and_progress() {
+        let primary = input(1);
+        let secondary = input((1_u128 << 64) + 1);
+        let plan = native_mix_plan(ProgramFrame {
+            primary,
+            secondary: Some(secondary),
+            transition_kind: Some(SwitcherTransitionKind::AlphaFade),
+            mix_numerator: 3,
+            mix_denominator: 5,
+            mix_start_numerator: 3,
+            mix_end_numerator: 4,
+        })
+        .unwrap();
+        assert_eq!(plan.primary, primary);
+        assert_eq!(plan.secondary, secondary);
+        assert_eq!(plan.transition.kind(), TransitionKind::AlphaFade);
+        assert_eq!(plan.transition.numerator(), 3);
+        assert_eq!(plan.transition.denominator(), 5);
+    }
+
+    #[test]
     fn prefix_selection_rebases_vfr_pts_and_holds_boundaries_and_end() {
         let source = input(1);
         let offsets = rebased_offsets(source, &[-20_000_000, 20_000_000, 100_000_000]).unwrap();
@@ -7991,7 +8014,6 @@ mod tests {
         };
 
         for kind in [
-            SwitcherTransitionKind::AlphaFade,
             SwitcherTransitionKind::Slide,
             SwitcherTransitionKind::Zoom,
             SwitcherTransitionKind::Stinger(fm_switcher::StingerSlotId::new(1).unwrap()),
@@ -8200,7 +8222,11 @@ mod tests {
     fn linear_transition_master_audio_is_continuous_and_reaches_cut_endpoint() {
         let old = input(1);
         let new = input(2);
-        for kind in [SwitcherTransitionKind::Fade, SwitcherTransitionKind::Wipe] {
+        for kind in [
+            SwitcherTransitionKind::Fade,
+            SwitcherTransitionKind::Wipe,
+            SwitcherTransitionKind::AlphaFade,
+        ] {
             let mut master = audio_test_master(&[(old, 1.0), (new, -1.0)], 3);
             let frame = |frame, primary, secondary, start, end, denominator| {
                 frame_result_with_transition_interval(

@@ -99,7 +99,7 @@ impl SimulatedPipeline {
         };
         let secondary = self.render_input(secondary, frame_number)?;
         match program.transition_kind {
-            Some(TransitionKind::Fade) => Ok(crossfade(
+            Some(TransitionKind::Fade | TransitionKind::AlphaFade) => Ok(crossfade(
                 &primary,
                 &secondary,
                 program.mix_numerator,

@@ -751,7 +751,7 @@ fn encode_fade_to_black_uniform(plan: FadeToBlackPlan) -> [u8; FADE_TO_BLACK_UNI
     bytes
 }
 
-/// Errors produced by the native Cut/Fade/Wipe renderer.
+/// Errors produced by the native Cut/Fade/AlphaFade/Wipe renderer.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NativeTransitionError {
     WidthMismatch { from: u32, to: u32 },
@@ -794,7 +794,7 @@ impl From<NativeGpuError> for NativeTransitionError {
     }
 }
 
-/// Native Cut/Fade/Wipe renderer containing only its compiled GPU pipeline.
+/// Native Cut/Fade/AlphaFade/Wipe renderer containing only its compiled GPU pipeline.
 pub struct NativeTransitionRenderer {
     pipeline: NativeFullscreenPipeline,
 }
@@ -822,7 +822,7 @@ impl NativeTransitionRenderer {
         Ok(Self { pipeline })
     }
 
-    /// Submits a GPU-resident Cut, Fade, or Wipe and returns its native texture.
+    /// Submits a GPU-resident Cut, Fade, `AlphaFade`, or Wipe and returns its native texture.
     /// This operation does not poll or read pixels back.
     ///
     /// # Errors
@@ -886,10 +886,10 @@ fn validate_dimensions(
 fn encode_uniform(plan: TransitionPlan, width: u32) -> [u8; 16] {
     let operation = match plan.kind() {
         TransitionKind::Cut => 0_u32,
-        TransitionKind::Fade => 1_u32,
+        TransitionKind::Fade | TransitionKind::AlphaFade => 1_u32,
         TransitionKind::Wipe => 2_u32,
         TransitionKind::Slide | TransitionKind::Zoom | TransitionKind::Stinger => {
-            unreachable!("TransitionPlan only compiles Cut, Fade, and Wipe")
+            unreachable!("TransitionPlan only compiles Cut, Fade, AlphaFade, and Wipe")
         }
     };
     let boundary = if plan.kind() == TransitionKind::Wipe {
@@ -1080,6 +1080,13 @@ mod tests {
         assert_eq!(u32::from_le_bytes(uniform[0..4].try_into().unwrap()), 1);
         assert_eq!(u32::from_le_bytes(uniform[4..8].try_into().unwrap()), 3);
         assert_eq!(u32::from_le_bytes(uniform[8..12].try_into().unwrap()), 7);
+        assert_eq!(u32::from_le_bytes(uniform[12..16].try_into().unwrap()), 0);
+
+        let alpha_fade = TransitionPlan::compile(TransitionKind::AlphaFade, 2, 5).unwrap();
+        let uniform = encode_uniform(alpha_fade, 11);
+        assert_eq!(u32::from_le_bytes(uniform[0..4].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(uniform[4..8].try_into().unwrap()), 2);
+        assert_eq!(u32::from_le_bytes(uniform[8..12].try_into().unwrap()), 5);
         assert_eq!(u32::from_le_bytes(uniform[12..16].try_into().unwrap()), 0);
 
         let cut = TransitionPlan::compile(TransitionKind::Cut, 0, 1).unwrap();

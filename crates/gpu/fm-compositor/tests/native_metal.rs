@@ -299,7 +299,7 @@ fn expected_component(
 
 #[test]
 #[ignore = "requires a native macOS Metal adapter"]
-fn native_metal_cut_and_fade_match_cpu_linear_frames() {
+fn native_metal_cut_fade_and_alpha_fade_match_cpu_linear_frames() {
     block_on(async {
         let from_cpu = frame(
             1,
@@ -336,6 +336,7 @@ fn native_metal_cut_and_fade_match_cpu_linear_frames() {
             (TransitionKind::Fade, 0, 4),
             (TransitionKind::Fade, 1, 4),
             (TransitionKind::Fade, 4, 4),
+            (TransitionKind::AlphaFade, 1, 4),
         ];
         for (kind, numerator, denominator) in cases {
             let plan = TransitionPlan::compile(kind, numerator, denominator).unwrap();

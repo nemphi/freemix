@@ -245,6 +245,16 @@ fn cut_fade_and_wipe_have_byte_exact_endpoints() {
         Some(Rgba8::new(101, 51, 27, 255))
     );
 
+    let alpha_middle = TransitionPlan::compile(TransitionKind::AlphaFade, 1, 2).unwrap();
+    let transparent_left = frame(1, 1, &[Rgba8::new(48, 24, 12, 64)]);
+    let transparent_right = frame(1, 1, &[Rgba8::new(120, 60, 30, 192)]);
+    assert_eq!(
+        execute_transition(alpha_middle, &transparent_left, &transparent_right)
+            .unwrap()
+            .pixel(0, 0),
+        Some(Rgba8::new(84, 42, 21, 128))
+    );
+
     let wipe_start = TransitionPlan::compile(TransitionKind::Wipe, 0, 10).unwrap();
     let wipe_end = TransitionPlan::compile(TransitionKind::Wipe, 10, 10).unwrap();
     assert_eq!(execute_transition(wipe_start, &left, &right).unwrap(), left);

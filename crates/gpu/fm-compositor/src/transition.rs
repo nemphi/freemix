@@ -6,6 +6,8 @@ use fm_video::{BlendError, FrameError, ImageFrame, crossfade};
 pub enum TransitionKind {
     Cut,
     Fade,
+    /// Independently crossfades every premultiplied RGBA channel.
+    AlphaFade,
     Wipe,
     Slide,
     Zoom,
@@ -21,7 +23,7 @@ pub struct TransitionPlan {
 }
 
 impl TransitionPlan {
-    /// Compiles a Cut, Fade, or Wipe at an exact rational progress value.
+    /// Compiles a Cut, Fade, `AlphaFade`, or Wipe at an exact rational progress value.
     ///
     /// # Errors
     /// Returns an error for a zero denominator, progress beyond the endpoint,
@@ -41,7 +43,10 @@ impl TransitionPlan {
             });
         }
         match kind {
-            TransitionKind::Cut | TransitionKind::Fade | TransitionKind::Wipe => Ok(Self {
+            TransitionKind::Cut
+            | TransitionKind::Fade
+            | TransitionKind::AlphaFade
+            | TransitionKind::Wipe => Ok(Self {
                 kind,
                 numerator,
                 denominator,
@@ -106,15 +111,16 @@ impl From<BlendError> for TransitionError {
     }
 }
 
-/// Executes a Cut, exact integer Fade, or horizontal Wipe between equal-format frames.
+/// Executes a Cut, exact integer Fade/AlphaFade, or horizontal Wipe.
 ///
-/// Cut is atomic and always returns `to`. Fade returns byte-identical endpoint
-/// clones at zero and full progress through `fm-video`'s reference crossfade.
+/// Cut is atomic and always returns `to`. Fade and `AlphaFade` return byte-identical endpoint
+/// clones at zero and full progress through `fm-video`'s reference crossfade. `AlphaFade`
+/// intentionally interpolates alpha together with the color channels for transparent content.
 /// Wipe replaces columns from left to right, with its boundary at
 /// `floor(width * numerator / denominator)`, and also returns byte-identical endpoints.
 ///
 /// # Errors
-/// Returns an error if Fade or Wipe inputs have incompatible layouts.
+/// Returns an error if Fade, `AlphaFade`, or Wipe inputs have incompatible layouts.
 pub fn execute_transition(
     plan: TransitionPlan,
     from: &ImageFrame,
@@ -122,7 +128,9 @@ pub fn execute_transition(
 ) -> Result<ImageFrame, TransitionError> {
     match plan.kind {
         TransitionKind::Cut => Ok(to.clone()),
-        TransitionKind::Fade => Ok(crossfade(from, to, plan.numerator, plan.denominator)?),
+        TransitionKind::Fade | TransitionKind::AlphaFade => {
+            Ok(crossfade(from, to, plan.numerator, plan.denominator)?)
+        }
         TransitionKind::Wipe => wipe(from, to, plan.numerator, plan.denominator),
         TransitionKind::Slide | TransitionKind::Zoom | TransitionKind::Stinger => {
             Err(TransitionError::UnsupportedKind(plan.kind))

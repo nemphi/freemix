@@ -190,6 +190,41 @@ fn pipeline_rejects_missing_and_unsupported_transition_kinds() {
 }
 
 #[test]
+fn alpha_fade_interpolates_transparent_rgba_channels() {
+    let mut pipeline = SimulatedPipeline::new(1, 1).unwrap();
+    pipeline
+        .register(SimulatedSource::new(
+            input(1),
+            SourcePattern::Solid(Rgba8::new(48, 24, 12, 64)),
+        ))
+        .unwrap();
+    pipeline
+        .register(SimulatedSource::new(
+            input(2),
+            SourcePattern::Solid(Rgba8::new(120, 60, 30, 192)),
+        ))
+        .unwrap();
+    assert_eq!(
+        pipeline
+            .render(
+                0,
+                ProgramFrame {
+                    primary: input(1),
+                    secondary: Some(input(2)),
+                    transition_kind: Some(TransitionKind::AlphaFade),
+                    mix_numerator: 1,
+                    mix_denominator: 2,
+                    mix_start_numerator: 1,
+                    mix_end_numerator: 1,
+                },
+            )
+            .unwrap()
+            .pixel(0, 0),
+        Some(Rgba8::new(84, 42, 21, 128))
+    );
+}
+
+#[test]
 fn moving_bars_change_deterministically_with_frame_number() {
     let mut pipeline = SimulatedPipeline::new(14, 4).unwrap();
     pipeline

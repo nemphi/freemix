@@ -626,7 +626,22 @@ exact separate desired and realized state, reversal through the opposite target,
 and protocol/permission/readiness/completeness gates. It still has no browser
 renderer or network runtime. A hardware-gated macOS recording acceptance covers
 protocol-driven native manual Fade progression, reversal, cancel, and commit on
-one configured output. AlphaFade, stinger, Slide/Zoom, the remaining transition
+one configured output.
+
+AlphaFade groundwork preserves the switcher's existing distinct transition kind
+through the simulated pipeline, compositor CPU plan, native wgpu plan, daemon
+video planner, and sample-linear Master-audio transition plan. The selected
+contract independently interpolates every premultiplied RGBA channel, including
+alpha. Exact CPU tests cover transparent intermediate pixels, daemon unit tests
+cover video mapping and continuous Master-audio endpoints, and an opt-in Metal
+test compares AlphaFade output with the CPU linear-frame oracle on a real
+adapter. The current standard Fade uses the same channel-wise reference math, so
+these primitives do not yet prove a visible product distinction between Fade and
+AlphaFade. There is also no AlphaFade `EngineCommand`, protocol command,
+persistence contract, operator surface, or configured-output process
+acceptance.
+
+The remaining AlphaFade product path, stinger, Slide/Zoom, other transition
 families, cross-platform/fullscreen evidence, and complete `SW-004` acceptance
 remain pending; parity therefore stays planned. Item 5 and RC-007 remain
 planned.
