@@ -197,9 +197,9 @@ keeps the strips because engine routing projection clones the canonical
 project. Persistence, generated-audio, AFV selected/inactive, mute, immediate
 startup gain, and failed-preflight no-partial-state tests cover this slice.
 There are still no live strip commands or operator controls, meters in the
-studio, pan/solo/PFL, delay, labels/groups, bus sends, microphone automix,
-device-audio path, or acceptance evidence. Phase 2 item 7 is partial, Phase 3
-item 3 is partial, and `AU-001`/`AU-007` remain planned.
+studio, pan/solo/PFL, realized strip delay, labels/groups, bus sends,
+microphone automix, device-audio path, or acceptance evidence. Phase 2 item 7
+is partial, Phase 3 item 3 is partial, and `AU-001`/`AU-007` remain planned.
 
 The worker and synchronizer retain bounded blocks, samples, and bytes. Refills
 reserve capacity before nonblocking dispatch, prioritize uncovered sources, and
@@ -374,6 +374,14 @@ lifecycle.
 8. Add scopes and professional color correction.
 9. Add shortcuts and initial MIDI/OSC/controller support.
 10. Certify Profile A without network contribution.
+
+Current implementation boundary for item 3: `fm-audio` provides a bounded,
+deterministic planar-F32 sample-delay primitive with immutable channel count and
+exact nonnegative sample delay, transactional block validation, caller-owned
+output, allocation-free steady-state processing, and explicit reset. It is
+reusable DSP groundwork only: it is not connected to Master mixing, device
+audio, project persistence, daemon/protocol commands, or operator UI, and it
+does not complete item 3 or any `AU-*` parity row.
 
 Current implementation boundary for item 1: `fm-io-macos` is the first native
 platform leaf. An isolated Swift helper uses `AVFoundation` to enumerate camera

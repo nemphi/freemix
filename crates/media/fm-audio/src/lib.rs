@@ -11,6 +11,7 @@ use fm_types::{AudioFormat, ChannelLayout, FrameRate, InputId, SampleFormat, Sam
 
 mod channel_mapping;
 mod clock_recalibration;
+mod sample_delay;
 mod synchronizer;
 
 pub use channel_mapping::{
@@ -20,6 +21,10 @@ pub use channel_mapping::{
 pub use clock_recalibration::{
     ClockRecalibrationError, ClockRecalibrationPolicy, ClockRecalibrationTelemetry,
     ClockRecalibrationUpdate, MAX_CLOCK_DRIFT_PPM, MAX_CLOCK_RECALIBRATION_OBSERVATIONS,
+};
+pub use sample_delay::{
+    MAX_SAMPLE_DELAY_BYTES, MAX_SAMPLE_DELAY_SAMPLES, SampleDelay, SampleDelayError,
+    SampleDelaySide,
 };
 pub use synchronizer::{
     AudioCadenceOrigin, AudioRenderPlan, AudioSilenceSpan, AudioSynchronizerError,
