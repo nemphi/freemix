@@ -18,7 +18,8 @@ use fm_engine::{
 };
 use fm_model::{
     Input, InputKind, MainMix, Project, ProjectSettings, SimulatedAudio, SimulatedInput,
-    SimulatedVideo, SolidColor,
+    SimulatedVideo, SolidColor, StingerAudioPolicy as ModelStingerAudioPolicy, StingerConfig,
+    StingerMissingMediaFallback, StingerSlotNumber,
 };
 use fm_persistence::{
     FadeToBlackState as PersistedFadeToBlackState, IdempotencyReceipt,
@@ -28,7 +29,10 @@ use fm_persistence::{
     RuntimeRouting, StoreError, StoredProject,
 };
 use fm_sim::{Rgba8, SimulatedPipeline, SimulatedSource, SourcePattern};
-use fm_switcher::{SwitcherState, TBarPosition, TBarState, TransitionKind};
+use fm_switcher::{
+    MissingMediaFallback, StingerAudioPolicy, StingerDescriptor, StingerSlotId, SwitcherState,
+    TBarPosition, TBarState, TransitionKind,
+};
 use fm_types::{
     AudioFormat, ChannelLayout, ColorMetadata, FrameRate, InputId, PixelFormat, ProjectId,
     SampleFormat, SampleRate, ScanMode, VideoDimensions, VideoFormat,
@@ -36,7 +40,10 @@ use fm_types::{
 use fm_video::write_ppm;
 
 use crate::{
-    args::{Command, ManualTransitionKind, TBarAction},
+    args::{
+        Command, ManualTransitionKind, StingerAudioPolicy as CliStingerAudioPolicy,
+        StingerFallback as CliStingerFallback, TBarAction,
+    },
     remote,
 };
 
@@ -142,6 +149,49 @@ pub fn run(command: Command) -> AppResult<()> {
             key,
             expected_revision,
         )?,
+        Command::Stinger {
+            path,
+            slot,
+            frames,
+            key,
+            expected_revision,
+        } => mutate(
+            &path,
+            EngineCommand::Stinger {
+                slot: StingerSlotId::new(slot).expect("CLI parser validates Stinger slots"),
+                duration_frames: frames,
+            },
+            frames,
+            key,
+            expected_revision,
+        )?,
+        Command::StingerConfigure {
+            path,
+            slot,
+            media_input,
+            preload,
+            cut_point_frames,
+            audio_policy,
+            fallback,
+        } => {
+            configure_stinger(
+                &path,
+                StingerConfig::new(
+                    StingerSlotNumber::new(slot).expect("CLI parser validates Stinger slots"),
+                    input_id(media_input)?,
+                    preload,
+                    cut_point_frames,
+                    model_stinger_audio_policy(audio_policy),
+                    model_stinger_fallback(fallback),
+                ),
+            )?;
+        }
+        Command::StingerRemove { path, slot } => {
+            remove_stinger(
+                &path,
+                StingerSlotNumber::new(slot).expect("CLI parser validates Stinger slots"),
+            )?;
+        }
         Command::Wipe {
             path,
             frames,
@@ -258,6 +308,22 @@ pub fn run(command: Command) -> AppResult<()> {
         } => remote::execute(
             address,
             fm_protocol::CommandPayload::Zoom {
+                duration_frames: frames,
+            },
+            key,
+            expected_revision,
+        )?,
+        Command::RemoteStinger {
+            address,
+            slot,
+            frames,
+            key,
+            expected_revision,
+        } => remote::execute(
+            address,
+            fm_protocol::CommandPayload::Stinger {
+                slot: fm_protocol::WireStingerSlotId::new(slot)
+                    .expect("CLI parser validates Stinger slots"),
                 duration_frames: frames,
             },
             key,
@@ -591,6 +657,34 @@ fn save_engine(path: &Path, project_engine: &ProjectEngine) -> AppResult<()> {
     Ok(())
 }
 
+fn configure_stinger(path: &Path, config: StingerConfig) -> AppResult<()> {
+    update_stingers(path, |project| project.set_stinger(config))
+}
+
+fn remove_stinger(path: &Path, slot: StingerSlotNumber) -> AppResult<()> {
+    update_stingers(path, |project| {
+        let _ = project.remove_stinger(slot);
+    })
+}
+
+fn update_stingers(path: &Path, update: impl FnOnce(&mut Project)) -> AppResult<()> {
+    let store = ProjectStore::new(path)?;
+    let stored = store.load()?;
+    let mut project = stored.project().clone();
+    update(&mut project);
+    let configured = StoredProject::from_project_with_runtime_state(
+        project,
+        stored.runtime_routing(),
+        stored.runtime_manual_transitions(),
+        stored.runtime_fade_to_black(),
+        stored.position(),
+        stored.idempotency_receipts().to_vec(),
+    )?;
+    store.save(&configured)?;
+    print_status(&load_engine(path)?);
+    Ok(())
+}
+
 fn load_engine(path: &Path) -> AppResult<ProjectEngine> {
     let stored = load_stored_project(path)?;
     let project = stored.project().clone();
@@ -610,6 +704,9 @@ fn load_engine(path: &Path) -> AppResult<ProjectEngine> {
         main_mix.desired_preview,
     )?;
     let mut realized = SwitcherState::new(inputs, realized_program, realized_preview)?;
+    for config in project.stingers() {
+        restore_stinger(&mut show, &mut realized, *config)?;
+    }
     let manual = stored.runtime_manual_transitions();
     if let Some(state) = manual.desired {
         show.restore_manual_transition(restored_t_bar(state)?)?;
@@ -641,6 +738,37 @@ fn load_engine(path: &Path) -> AppResult<ProjectEngine> {
         },
     )?;
     Ok(ProjectEngine { project, engine })
+}
+
+fn restore_stinger(
+    show: &mut ShowState,
+    realized: &mut SwitcherState,
+    config: StingerConfig,
+) -> AppResult<()> {
+    let slot = StingerSlotId::new(config.slot.number())
+        .expect("validated model Stinger slots are in the switcher range");
+    let descriptor = StingerDescriptor::new(
+        config.media_input,
+        config.preload,
+        config.cut_point_frames,
+        match config.audio_policy {
+            ModelStingerAudioPolicy::Muted => StingerAudioPolicy::Muted,
+            ModelStingerAudioPolicy::StingerOnly => StingerAudioPolicy::StingerOnly,
+            ModelStingerAudioPolicy::MixWithProgram => StingerAudioPolicy::MixWithProgram,
+        },
+        match config.missing_media_fallback {
+            StingerMissingMediaFallback::Cut => MissingMediaFallback::Cut,
+            StingerMissingMediaFallback::Fade => MissingMediaFallback::Fade,
+            StingerMissingMediaFallback::KeepProgram => MissingMediaFallback::KeepProgram,
+        },
+    );
+    show.configure_stinger(slot, descriptor)?;
+    realized.configure_stinger(slot, descriptor)?;
+    if config.preload {
+        let _ = show.preload_stinger(slot, true)?;
+        let _ = realized.preload_stinger(slot, true)?;
+    }
+    Ok(())
 }
 
 fn persisted_fade_to_black(state: fm_engine::EngineFadeToBlackState) -> PersistedFadeToBlackState {
@@ -733,6 +861,12 @@ fn load_stored_project(path: &Path) -> AppResult<StoredProject> {
             store.migrate_v8()?;
             Ok(store.load()?)
         }
+        Err(StoreError::Validation(ProjectValidationError::UnsupportedSchema {
+            found: 9, ..
+        })) => {
+            store.migrate_v9()?;
+            Ok(store.load()?)
+        }
         Err(error) => Err(error.into()),
     }
 }
@@ -808,7 +942,7 @@ fn print_status(project: &ProjectEngine) {
     let desired = engine.show().desired_switcher();
     let realized = engine.realized_switcher();
     println!(
-        "project_id={} show={:?} revision={} frame={} Program(desired={}, realized={}) Preview(desired={}, realized={}) TBar(desired={}, realized={}) FTB(desired={}, realized={})",
+        "project_id={} show={:?} revision={} frame={} Program(desired={}, realized={}) Preview(desired={}, realized={}) TBar(desired={}, realized={}) FTB(desired={}, realized={}) Stingers={}",
         project.project.id(),
         engine.show().name(),
         engine.revision(),
@@ -821,7 +955,39 @@ fn print_status(project: &ProjectEngine) {
         format_t_bar(realized.t_bar()),
         format_fade_to_black(engine.desired_fade_to_black()),
         format_fade_to_black(engine.realized_fade_to_black()),
+        format_stingers(project.project.stingers()),
     );
+}
+
+fn format_stingers(stingers: &[StingerConfig]) -> String {
+    let configured = stingers
+        .iter()
+        .map(|config| {
+            format!(
+                "{}:{}:{}:{}:{}:{}",
+                config.slot.number(),
+                config.media_input,
+                if config.preload {
+                    "preload"
+                } else {
+                    "deferred"
+                },
+                config.cut_point_frames,
+                match config.audio_policy {
+                    ModelStingerAudioPolicy::Muted => "muted",
+                    ModelStingerAudioPolicy::StingerOnly => "stinger-only",
+                    ModelStingerAudioPolicy::MixWithProgram => "mix-with-program",
+                },
+                match config.missing_media_fallback {
+                    StingerMissingMediaFallback::Cut => "cut",
+                    StingerMissingMediaFallback::Fade => "fade",
+                    StingerMissingMediaFallback::KeepProgram => "keep-program",
+                },
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{configured}]")
 }
 
 fn format_fade_to_black(state: EngineFadeToBlackState) -> String {
@@ -867,6 +1033,9 @@ Usage:
   freemix-cli alpha-fade <show.freemix> <frames> [--key <key>] [--expect <revision>]
   freemix-cli slide <show.freemix> <frames> [--key <key>] [--expect <revision>]
   freemix-cli zoom <show.freemix> <frames> [--key <key>] [--expect <revision>]
+  freemix-cli stinger <show.freemix> <slot:1..=8> <frames> [--key <key>] [--expect <revision>]
+  freemix-cli stinger-configure <show.freemix> <slot:1..=8> <media-input> <true|false> <cut-point-frames> <muted|stinger-only|mix-with-program> <cut|fade|keep-program>
+  freemix-cli stinger-remove <show.freemix> <slot:1..=8>
   freemix-cli wipe <show.freemix> <frames> [--key <key>] [--expect <revision>]
   freemix-cli tbar-start <show.freemix> <fade|wipe|alpha-fade> [--key <key>] [--expect <revision>]
   freemix-cli tbar-position <show.freemix> <basis-points:0..=10000> [--key <key>] [--expect <revision>]
@@ -880,6 +1049,7 @@ Usage:
   freemix-cli remote-alpha-fade <127.0.0.1:port> <frames> [--key <key>] [--expect <revision>]
   freemix-cli remote-slide <127.0.0.1:port> <frames> [--key <key>] [--expect <revision>]
   freemix-cli remote-zoom <127.0.0.1:port> <frames> [--key <key>] [--expect <revision>]
+  freemix-cli remote-stinger <127.0.0.1:port> <slot:1..=8> <frames> [--key <key>] [--expect <revision>]
   freemix-cli remote-wipe <127.0.0.1:port> <frames> [--key <key>] [--expect <revision>]
   freemix-cli remote-tbar-start <127.0.0.1:port> <fade|wipe|alpha-fade> [--key <key>] [--expect <revision>]
   freemix-cli remote-tbar-position <127.0.0.1:port> <basis-points:0..=10000> [--key <key>] [--expect <revision>]
@@ -910,6 +1080,22 @@ fn engine_t_bar_command(action: TBarAction) -> EngineCommand {
         },
         TBarAction::Commit => EngineCommand::CommitManualTransition,
         TBarAction::Cancel => EngineCommand::CancelManualTransition,
+    }
+}
+
+const fn model_stinger_audio_policy(policy: CliStingerAudioPolicy) -> ModelStingerAudioPolicy {
+    match policy {
+        CliStingerAudioPolicy::Muted => ModelStingerAudioPolicy::Muted,
+        CliStingerAudioPolicy::StingerOnly => ModelStingerAudioPolicy::StingerOnly,
+        CliStingerAudioPolicy::MixWithProgram => ModelStingerAudioPolicy::MixWithProgram,
+    }
+}
+
+const fn model_stinger_fallback(fallback: CliStingerFallback) -> StingerMissingMediaFallback {
+    match fallback {
+        CliStingerFallback::Cut => StingerMissingMediaFallback::Cut,
+        CliStingerFallback::Fade => StingerMissingMediaFallback::Fade,
+        CliStingerFallback::KeepProgram => StingerMissingMediaFallback::KeepProgram,
     }
 }
 
@@ -1027,6 +1213,51 @@ mod tests {
             error
                 .to_string()
                 .contains("unknown rejection code `future_code`")
+        );
+    }
+
+    #[test]
+    fn restore_stinger_only_marks_requested_preload_ready() {
+        let program = InputId::new(NonZeroU128::new(1).unwrap());
+        let preview = InputId::new(NonZeroU128::new(2).unwrap());
+        let inputs = vec![program, preview];
+        let mut show = ShowState::new("restore", inputs.clone(), program, preview).unwrap();
+        let mut realized = SwitcherState::new(inputs, program, preview).unwrap();
+        let slot = fm_model::StingerSlotNumber::new(1).unwrap();
+        let config = |preload| {
+            StingerConfig::new(
+                slot,
+                preview,
+                preload,
+                1,
+                ModelStingerAudioPolicy::Muted,
+                StingerMissingMediaFallback::KeepProgram,
+            )
+        };
+
+        restore_stinger(&mut show, &mut realized, config(false)).unwrap();
+        let switcher_slot = StingerSlotId::new(1).unwrap();
+        assert_eq!(
+            show.desired_switcher()
+                .stinger(switcher_slot)
+                .preload_state(),
+            fm_switcher::StingerPreloadState::NotRequested
+        );
+        assert_eq!(
+            realized.stinger(switcher_slot).preload_state(),
+            fm_switcher::StingerPreloadState::NotRequested
+        );
+
+        restore_stinger(&mut show, &mut realized, config(true)).unwrap();
+        assert_eq!(
+            show.desired_switcher()
+                .stinger(switcher_slot)
+                .preload_state(),
+            fm_switcher::StingerPreloadState::Ready
+        );
+        assert_eq!(
+            realized.stinger(switcher_slot).preload_state(),
+            fm_switcher::StingerPreloadState::Ready
         );
     }
 }

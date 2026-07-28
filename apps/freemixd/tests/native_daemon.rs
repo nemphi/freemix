@@ -24,13 +24,14 @@ use fm_io_macos::{CameraIdKind, deterministic_camera_id};
 use fm_model::{
     Input, InputKind, Layer, LayerGeometry, MainMix, Project, ProjectSettings, RectMask, Rgba8,
     Rotation, Scene, SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef,
+    StingerAudioPolicy, StingerConfig, StingerMissingMediaFallback, StingerSlotNumber,
 };
 use fm_persistence::{ProjectPosition, ProjectStore, RuntimeRouting, StoredProject};
 #[cfg(target_os = "macos")]
 use fm_protocol::{
     CURRENT_PROTOCOL_VERSION, ClientHello, ClientType, CommandMessage, CommandPayload,
     CommandResult, ManualTransitionKind, ManualTransitionPosition, Role, RuntimeLifecycleEvent,
-    SnapshotMessage, WireInputId, WireMessage, decode_line, encode_line,
+    SnapshotMessage, WireInputId, WireMessage, WireStingerSlotId, decode_line, encode_line,
 };
 use fm_types::{
     AudioFormat, ChannelLayout, ColorMetadata, FrameRate, InputId, PixelFormat, ProjectId,
@@ -364,6 +365,74 @@ fn native_media_daemon_refills_beyond_startup_prefix_and_checkpoints_once() {
         persisted.runtime_routing().realized_preview_id,
         Some(input(1))
     );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn native_daemon_rejects_live_stinger_mutation_without_durable_change() {
+    let _hardware_lock = NATIVE_MEDIA_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let directory = tempfile::tempdir().unwrap();
+    let project_path = directory.path().join("native-stinger-rejection.freemix");
+    save_generator_project(&project_path);
+    let manifest_path = project_path.join("project.json");
+    let before_bytes = fs::read(&manifest_path).unwrap();
+    let before = ProjectStore::new(&project_path).unwrap().load().unwrap();
+
+    let Some(daemon) = require_native(NativeDaemonProcess::start(&project_path, true)) else {
+        return;
+    };
+    let mut client = StudioClient::connect(daemon.address);
+    let initial = client.handshake();
+    assert_eq!(initial.revision, 0);
+    client.send(&WireMessage::Command(CommandMessage {
+        protocol: CURRENT_PROTOCOL_VERSION,
+        id: "native-configure-stinger".into(),
+        idempotency_key: "native-configure-stinger-key".into(),
+        expected_revision: Some(0),
+        deadline_ms: None,
+        payload: CommandPayload::ConfigureStinger {
+            slot: WireStingerSlotId::new(8).unwrap(),
+            media_input: WireInputId::from_domain(input(2)),
+            preload: false,
+            cut_point_frames: 7,
+            audio_policy: fm_protocol::StingerAudioPolicy::Muted,
+            missing_media_fallback: fm_protocol::StingerMissingMediaFallback::KeepProgram,
+        },
+    }));
+    let rejected = client.receive_until("native Stinger rejection", |message| {
+        if let WireMessage::CommandResult(result @ CommandResult::Rejected { id, .. }) = message
+            && id == "native-configure-stinger"
+        {
+            Some(result.clone())
+        } else {
+            None
+        }
+    });
+    assert!(matches!(
+        rejected,
+        CommandResult::Rejected {
+            code,
+            message,
+            current_revision: 0,
+            retryable: false,
+            ..
+        } if code == "unavailable" && message.contains("restart")
+    ));
+    assert_eq!(fs::read(&manifest_path).unwrap(), before_bytes);
+
+    drop(client);
+    let output = daemon.wait();
+    assert!(
+        output.status.success(),
+        "native daemon failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let after = ProjectStore::new(&project_path).unwrap().load().unwrap();
+    assert_eq!(after.position().revision, 0);
+    assert!(after.idempotency_receipts().is_empty());
+    assert_eq!(after.project(), before.project());
 }
 
 #[cfg(target_os = "macos")]
@@ -1063,6 +1132,325 @@ fn protocol_zoom_reaches_configured_program_recording() {
             realized_program_id: Some(input(2)),
             desired_preview_id: Some(input(1)),
             realized_preview_id: Some(input(1)),
+        }
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires FFmpeg with FFV1/libx264/AAC, ffprobe, and a native macOS Metal adapter"]
+fn protocol_stinger_retriggers_alpha_clip_and_survives_daemon_restart() {
+    let _hardware_lock = NATIVE_MEDIA_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let directory = tempfile::tempdir().unwrap();
+    if require_recording_tools().is_none() {
+        return;
+    }
+    let project_path = directory.path().join("record-stinger.freemix");
+    let output_path = directory.path().join("program-stinger.mp4");
+    if require_native(prepare_stinger_project(&project_path)).is_none() {
+        return;
+    }
+
+    let Some(mut daemon) = require_native_recorder(NativeDaemonProcess::start_recording(
+        &project_path,
+        &output_path,
+    )) else {
+        return;
+    };
+    let mut client = StudioClient::connect(daemon.address);
+    let initial = client.handshake();
+    assert_snapshot_routing(&initial, 0, input(1), input(2));
+    thread::sleep(Duration::from_millis(300));
+
+    let payload = || CommandPayload::Stinger {
+        slot: WireStingerSlotId::new(1).unwrap(),
+        duration_frames: 12,
+    };
+    let first = client.command("record-stinger-1", "record-stinger-key-1", payload());
+    assert_eq!(first.revision, 1);
+    let second = client.command("record-stinger-2", "record-stinger-key-2", payload());
+    assert_eq!(second.revision, 2);
+    assert!(second.scheduled_frame >= first.scheduled_frame + 12);
+    assert!(second.scheduled_frame <= first.scheduled_frame + 13);
+    thread::sleep(Duration::from_millis(650));
+    daemon.signal_terminate();
+
+    let output = daemon.wait_for(RECORDING_PROCESS_TIMEOUT);
+    drop(client);
+    assert!(
+        output.status.success(),
+        "Stinger recording daemon failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let luma = recording_average_luma(&output_path).unwrap();
+    assert_ordered_stinger_retrigger(&luma);
+    decode_recording(&output_path).unwrap();
+
+    let persisted = ProjectStore::new(&project_path).unwrap().load().unwrap();
+    assert_eq!(persisted.position().revision, 2);
+    assert_eq!(
+        persisted.runtime_routing(),
+        RuntimeRouting {
+            desired_program_id: Some(input(1)),
+            realized_program_id: Some(input(1)),
+            desired_preview_id: Some(input(2)),
+            realized_preview_id: Some(input(2)),
+        }
+    );
+
+    let restart_output = directory.path().join("program-stinger-restart.mp4");
+    let Some(mut restarted) = require_native_recorder(NativeDaemonProcess::start_recording(
+        &project_path,
+        &restart_output,
+    )) else {
+        return;
+    };
+    let mut restarted_client = StudioClient::connect(restarted.address);
+    let snapshot = restarted_client.handshake();
+    assert_snapshot_routing(&snapshot, 2, input(1), input(2));
+    thread::sleep(Duration::from_millis(300));
+    let third = restarted_client.command("record-stinger-3", "record-stinger-key-3", payload());
+    assert_eq!(third.revision, 3);
+    thread::sleep(Duration::from_millis(650));
+    restarted.signal_terminate();
+    let restart = restarted.wait_for(RECORDING_PROCESS_TIMEOUT);
+    drop(restarted_client);
+    assert!(
+        restart.status.success(),
+        "restarted Stinger daemon failed: {}",
+        String::from_utf8_lossy(&restart.stderr)
+    );
+    let restart_luma = recording_average_luma(&restart_output).unwrap();
+    assert_ordered_single_stinger(&restart_luma);
+    decode_recording(&restart_output).unwrap();
+    let restarted_persisted = ProjectStore::new(&project_path).unwrap().load().unwrap();
+    assert_eq!(restarted_persisted.position().revision, 3);
+    assert_eq!(
+        restarted_persisted.runtime_routing(),
+        RuntimeRouting {
+            desired_program_id: Some(input(2)),
+            realized_program_id: Some(input(2)),
+            desired_preview_id: Some(input(1)),
+            realized_preview_id: Some(input(1)),
+        }
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires FFmpeg with FFV1/libx264/AAC, ffprobe, and a native macOS Metal adapter"]
+fn protocol_stinger_audio_policies_replay_clip_local_audio() {
+    let _hardware_lock = NATIVE_MEDIA_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let directory = tempfile::tempdir().unwrap();
+    if require_recording_tools().is_none() {
+        return;
+    }
+    let project_path = directory.path().join("record-stinger-audio.freemix");
+    let output_path = directory.path().join("program-stinger-audio.mp4");
+    if require_native(prepare_audible_stinger_project(&project_path)).is_none() {
+        return;
+    }
+    let recording_origin = ProjectStore::new(&project_path)
+        .unwrap()
+        .load()
+        .unwrap()
+        .position()
+        .frames_rendered;
+
+    let Some(mut daemon) = require_native_recorder(NativeDaemonProcess::start_recording(
+        &project_path,
+        &output_path,
+    )) else {
+        return;
+    };
+    let mut client = StudioClient::connect(daemon.address);
+    let initial = client.handshake();
+    assert_snapshot_routing(&initial, 0, input(1), input(2));
+    thread::sleep(Duration::from_millis(300));
+
+    let stinger = |slot| CommandPayload::Stinger {
+        slot: WireStingerSlotId::new(slot).unwrap(),
+        duration_frames: 12,
+    };
+    let mut scheduled_frames = Vec::new();
+    for (index, (label, slot, hold_ms)) in [
+        ("muted", 1, 650),
+        ("only", 2, 650),
+        ("mixed", 3, 650),
+        ("replay-a", 2, 650),
+        ("replay-b", 2, 650),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let result = client.command(
+            &format!("stinger-audio-{label}"),
+            &format!("stinger-audio-{label}-key"),
+            stinger(slot),
+        );
+        assert_eq!(result.revision, u64::try_from(index + 1).unwrap());
+        scheduled_frames.push(result.scheduled_frame);
+        thread::sleep(Duration::from_millis(hold_ms));
+    }
+    daemon.signal_terminate();
+
+    let output = daemon.wait_for(RECORDING_PROCESS_TIMEOUT);
+    drop(client);
+    assert!(
+        output.status.success(),
+        "Stinger audio recording daemon failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let signatures = recording_audio_signatures(&output_path).unwrap();
+    assert_scheduled_stinger_audio_policies(&signatures, recording_origin, &scheduled_frames);
+    decode_recording(&output_path).unwrap();
+
+    let persisted = ProjectStore::new(&project_path).unwrap().load().unwrap();
+    let recorded_video = ffprobe_stream(&output_path, "v:0").unwrap();
+    let recorded_frames = probe_count(&recorded_video, "nb_read_frames");
+    let checkpoint_cursor = persisted.position().frames_rendered;
+    assert_eq!(
+        checkpoint_cursor,
+        recording_origin
+            .checked_add(recorded_frames)
+            .expect("recording cursor must not overflow"),
+        "persisted cursor must advance by exactly the independently encoded video-frame count"
+    );
+    assert_eq!(persisted.position().revision, 5);
+    assert_eq!(
+        persisted.runtime_routing(),
+        RuntimeRouting {
+            desired_program_id: Some(input(2)),
+            realized_program_id: Some(input(2)),
+            desired_preview_id: Some(input(1)),
+            realized_preview_id: Some(input(1)),
+        }
+    );
+
+    verify_restarted_stinger_audio(
+        &project_path,
+        &directory.path().join("program-stinger-audio-restart.mp4"),
+        checkpoint_cursor,
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn verify_restarted_stinger_audio(project_path: &Path, output_path: &Path, recording_origin: u64) {
+    let mut restarted = require_native_recorder(NativeDaemonProcess::start_recording(
+        project_path,
+        output_path,
+    ))
+    .expect("native recorder restart must succeed after the initial recording");
+    let mut restarted_client = StudioClient::connect(restarted.address);
+    let snapshot = restarted_client.handshake();
+    assert_snapshot_routing(&snapshot, 5, input(2), input(1));
+    thread::sleep(Duration::from_millis(300));
+    let replay = restarted_client.command(
+        "stinger-audio-restored",
+        "stinger-audio-restored-key",
+        CommandPayload::Stinger {
+            slot: WireStingerSlotId::new(2).unwrap(),
+            duration_frames: 12,
+        },
+    );
+    assert_eq!(replay.revision, 6);
+    thread::sleep(Duration::from_millis(500));
+    restarted.signal_terminate();
+    let restart = restarted.wait_for(RECORDING_PROCESS_TIMEOUT);
+    drop(restarted_client);
+    assert!(
+        restart.status.success(),
+        "restarted Stinger audio daemon failed: {}",
+        String::from_utf8_lossy(&restart.stderr)
+    );
+    let restart_signatures = recording_audio_signatures(output_path).unwrap();
+    assert_scheduled_clip_only_replay(
+        &restart_signatures,
+        recording_origin,
+        replay.scheduled_frame,
+    );
+    decode_recording(output_path).unwrap();
+    let restarted_persisted = ProjectStore::new(project_path).unwrap().load().unwrap();
+    assert_eq!(restarted_persisted.position().revision, 6);
+    assert_eq!(
+        restarted_persisted.runtime_routing(),
+        RuntimeRouting {
+            desired_program_id: Some(input(1)),
+            realized_program_id: Some(input(1)),
+            desired_preview_id: Some(input(2)),
+            realized_preview_id: Some(input(2)),
+        }
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires FFmpeg with libx264/AAC, ffprobe, and a native macOS Metal adapter"]
+fn protocol_stinger_not_requested_media_applies_all_configured_fallbacks() {
+    let _hardware_lock = NATIVE_MEDIA_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let directory = tempfile::tempdir().unwrap();
+    if require_recording_tools().is_none() {
+        return;
+    }
+    let project_path = directory.path().join("record-stinger-fallbacks.freemix");
+    let output_path = directory.path().join("program-stinger-fallbacks.mp4");
+    prepare_deferred_stinger_fallback_project(&project_path);
+
+    let Some(mut daemon) = require_native_recorder(NativeDaemonProcess::start_recording(
+        &project_path,
+        &output_path,
+    )) else {
+        return;
+    };
+    let mut client = StudioClient::connect(daemon.address);
+    let initial = client.handshake();
+    assert_snapshot_routing(&initial, 0, input(1), input(2));
+    thread::sleep(Duration::from_millis(240));
+
+    let stinger = |slot| CommandPayload::Stinger {
+        slot: WireStingerSlotId::new(slot).unwrap(),
+        duration_frames: 4,
+    };
+    let keep_white = client.command("fallback-keep-white", "fallback-keep-white-key", stinger(1));
+    assert_eq!(keep_white.revision, 1);
+    thread::sleep(Duration::from_millis(200));
+    let fade_black = client.command("fallback-fade-black", "fallback-fade-black-key", stinger(2));
+    assert_eq!(fade_black.revision, 2);
+    thread::sleep(Duration::from_millis(200));
+    let keep_black = client.command("fallback-keep-black", "fallback-keep-black-key", stinger(1));
+    assert_eq!(keep_black.revision, 3);
+    thread::sleep(Duration::from_millis(200));
+    let cut_white = client.command("fallback-cut-white", "fallback-cut-white-key", stinger(3));
+    assert_eq!(cut_white.revision, 4);
+    thread::sleep(Duration::from_millis(240));
+    daemon.signal_terminate();
+
+    let output = daemon.wait_for(RECORDING_PROCESS_TIMEOUT);
+    drop(client);
+    assert!(
+        output.status.success(),
+        "Stinger fallback recording daemon failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let luma = recording_average_luma(&output_path).unwrap();
+    assert_ordered_stinger_fallbacks(&luma);
+    decode_recording(&output_path).unwrap();
+
+    let persisted = ProjectStore::new(&project_path).unwrap().load().unwrap();
+    assert_eq!(persisted.position().revision, 4);
+    assert_eq!(
+        persisted.runtime_routing(),
+        RuntimeRouting {
+            desired_program_id: Some(input(1)),
+            realized_program_id: Some(input(1)),
+            desired_preview_id: Some(input(2)),
+            realized_preview_id: Some(input(2)),
         }
     );
 }
@@ -1823,6 +2211,65 @@ fn assert_ordered_white_centered_zoom_black(frames: &[[u8; 9]]) {
 }
 
 #[cfg(target_os = "macos")]
+fn assert_ordered_stinger_retrigger(luma: &[u8]) {
+    const REQUIRED_FRAMES: usize = 3;
+
+    let white = luma_run(luma, 0, 245, u8::MAX, REQUIRED_FRAMES)
+        .unwrap_or_else(|| panic!("recording has no initial white interval: {luma:?}"));
+    let black = luma_run(luma, white + REQUIRED_FRAMES, 0, 32, 1)
+        .unwrap_or_else(|| panic!("first Stinger did not settle on black: {luma:?}"));
+    assert!(
+        luma[white + REQUIRED_FRAMES..black]
+            .iter()
+            .any(|value| (40..=190).contains(value)),
+        "first Stinger contains no decoded alpha-media frame: {luma:?}"
+    );
+
+    let final_white = luma_run(luma, black + 1, 245, u8::MAX, REQUIRED_FRAMES)
+        .unwrap_or_else(|| panic!("retriggered Stinger did not settle on white: {luma:?}"));
+    assert!(
+        luma[black + 1..final_white]
+            .iter()
+            .any(|value| (40..=245).contains(value)),
+        "retriggered Stinger contains no decoded alpha-media frame: {luma:?}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn assert_ordered_single_stinger(luma: &[u8]) {
+    const REQUIRED_FRAMES: usize = 3;
+
+    let white = luma_run(luma, 0, 245, u8::MAX, REQUIRED_FRAMES)
+        .unwrap_or_else(|| panic!("recording has no initial white interval: {luma:?}"));
+    let black = luma_run(luma, white + REQUIRED_FRAMES, 0, 32, REQUIRED_FRAMES)
+        .unwrap_or_else(|| panic!("Stinger did not settle on black: {luma:?}"));
+    assert!(
+        luma[white + REQUIRED_FRAMES..black]
+            .iter()
+            .any(|value| (40..=245).contains(value)),
+        "Stinger contains no decoded alpha-media frame: {luma:?}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn assert_ordered_stinger_fallbacks(luma: &[u8]) {
+    const REQUIRED_FRAMES: usize = 4;
+
+    let white = luma_run(luma, 0, 245, u8::MAX, REQUIRED_FRAMES)
+        .unwrap_or_else(|| panic!("recording has no initial white interval: {luma:?}"));
+    let black = luma_run(luma, white + REQUIRED_FRAMES, 0, 32, REQUIRED_FRAMES)
+        .unwrap_or_else(|| panic!("Fade fallback did not settle on black: {luma:?}"));
+    assert!(
+        luma[white + REQUIRED_FRAMES..black]
+            .iter()
+            .any(|value| (48..=208).contains(value)),
+        "Fade fallback contains no intermediate frame: {luma:?}"
+    );
+    luma_run(luma, black + REQUIRED_FRAMES, 245, u8::MAX, REQUIRED_FRAMES)
+        .unwrap_or_else(|| panic!("Cut fallback did not settle on white: {luma:?}"));
+}
+
+#[cfg(target_os = "macos")]
 fn grid_luma_run(
     frames: &[[u8; 9]],
     start: usize,
@@ -2091,6 +2538,593 @@ fn recording_audio_silence_intervals(path: &Path) -> Result<Vec<(f64, f64)>, Str
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug)]
+struct AudioSignature {
+    base_program: f64,
+    base_preview: f64,
+    clip_lead: f64,
+    clip_tail: f64,
+}
+
+#[cfg(target_os = "macos")]
+fn recording_audio_signatures(path: &Path) -> Result<Vec<AudioSignature>, String> {
+    const MASTER_SAMPLE_RATE: usize = 48_000;
+    const MASTER_SAMPLE_RATE_HZ: f64 = 48_000.0;
+    const PROJECT_FRAME_RATE: usize = 25;
+    const SAMPLES_PER_FRAME: usize = MASTER_SAMPLE_RATE / PROJECT_FRAME_RATE;
+    // Classify the stable body of each lossy AAC frame; exact sample-boundary
+    // behavior is covered separately by the lossless PCM Stinger oracle.
+    const EDGE_SAMPLES: usize = 320;
+
+    let pcm = path.with_extension("audio.f32le");
+    let child = Command::new("ffmpeg")
+        .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i"])
+        .arg(path)
+        .args([
+            "-map",
+            "0:a:0",
+            "-ac",
+            "1",
+            "-ar",
+            "48000",
+            "-c:a",
+            "pcm_f32le",
+            "-f",
+            "f32le",
+        ])
+        .arg(&pcm)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("LC_ALL", "C")
+        .spawn()
+        .map_err(|error| format!("cannot spawn recording PCM decoder: {error}"))?;
+    let output = wait_bounded(child, PROCESS_TIMEOUT);
+    if !output.status.success() {
+        return Err(format!(
+            "recording PCM decode failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let bytes = fs::read(&pcm).map_err(|error| format!("cannot read decoded PCM: {error}"))?;
+    let mut chunks = bytes.chunks_exact(std::mem::size_of::<f32>());
+    let samples = chunks
+        .by_ref()
+        .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("f32 chunk is exact")))
+        .collect::<Vec<_>>();
+    if !chunks.remainder().is_empty() {
+        return Err("decoded PCM has a partial f32 sample".to_owned());
+    }
+    Ok(samples
+        .chunks_exact(SAMPLES_PER_FRAME)
+        .map(|frame| {
+            let frame = &frame[EDGE_SAMPLES..SAMPLES_PER_FRAME - EDGE_SAMPLES];
+            AudioSignature {
+                base_program: tone_amplitude(frame, 440.0, MASTER_SAMPLE_RATE_HZ),
+                base_preview: tone_amplitude(frame, 660.0, MASTER_SAMPLE_RATE_HZ),
+                clip_lead: tone_amplitude(frame, 997.0, MASTER_SAMPLE_RATE_HZ),
+                clip_tail: tone_amplitude(frame, 1499.0, MASTER_SAMPLE_RATE_HZ),
+            }
+        })
+        .collect())
+}
+
+#[cfg(target_os = "macos")]
+fn tone_amplitude(samples: &[f32], frequency_hz: f64, sample_rate: f64) -> f64 {
+    let angular_step = 2.0 * std::f64::consts::PI * frequency_hz / sample_rate;
+    let (sin, cos, _) =
+        samples
+            .iter()
+            .fold((0.0_f64, 0.0_f64, 0.0_f64), |(sin, cos, phase), sample| {
+                (
+                    sin + f64::from(*sample) * phase.sin(),
+                    cos + f64::from(*sample) * phase.cos(),
+                    phase + angular_step,
+                )
+            });
+    let sample_count =
+        f64::from(u32::try_from(samples.len()).expect("recording frame sample count is bounded"));
+    2.0 * sin.hypot(cos) / sample_count
+}
+
+#[cfg(target_os = "macos")]
+fn assert_scheduled_stinger_audio_policies(
+    signatures: &[AudioSignature],
+    recording_origin: u64,
+    scheduled_frames: &[u64],
+) {
+    let [muted, only, mixed, first_replay, second_replay] =
+        validated_stinger_audio_schedule(scheduled_frames);
+    let first_verified = recording_origin + RECORDING_STARTUP_SETTLING_FRAMES;
+    assert!(
+        muted >= first_verified,
+        "first Stinger frame {muted} precedes recording settling boundary {first_verified}"
+    );
+    assert_muted_stinger_audio(signatures, recording_origin, first_verified, muted, only);
+    assert_stinger_only_audio(signatures, recording_origin, only, mixed);
+    assert_mixed_stinger_audio(signatures, recording_origin, mixed, first_replay);
+    assert_first_stinger_replay_audio(signatures, recording_origin, first_replay, second_replay);
+    assert_second_stinger_replay_audio(signatures, recording_origin, second_replay);
+}
+
+#[cfg(target_os = "macos")]
+fn assert_muted_stinger_audio(
+    signatures: &[AudioSignature],
+    recording_origin: u64,
+    first_verified: u64,
+    muted: u64,
+    only: u64,
+) {
+    let ranges: &[(u64, u64, AudioSignaturePredicate, &str)] = &[
+        (
+            first_verified,
+            muted + STINGER_RECORDING_CUT_FRAME,
+            pure_program,
+            "initial and Muted Program",
+        ),
+        (
+            muted + STINGER_RECORDING_CUT_FRAME,
+            muted + STINGER_RECORDING_CUT_FRAME + 1,
+            boundary_program_preview,
+            "Muted Program-to-Preview AAC boundary",
+        ),
+        (
+            muted + STINGER_RECORDING_CUT_FRAME + 1,
+            only,
+            pure_preview,
+            "Muted Preview and settled Preview",
+        ),
+    ];
+    assert_audio_signature_ranges(signatures, recording_origin, ranges);
+}
+
+#[cfg(target_os = "macos")]
+fn assert_stinger_only_audio(
+    signatures: &[AudioSignature],
+    recording_origin: u64,
+    only: u64,
+    mixed: u64,
+) {
+    let ranges: &[(u64, u64, AudioSignaturePredicate, &str)] = &[
+        (
+            only,
+            only + 1,
+            boundary_preview_clip_lead,
+            "StingerOnly onset AAC boundary",
+        ),
+        (
+            only + 1,
+            only + STINGER_RECORDING_CUT_FRAME,
+            pure_clip_lead,
+            "StingerOnly lead",
+        ),
+        (
+            only + STINGER_RECORDING_CUT_FRAME,
+            only + STINGER_RECORDING_CUT_FRAME + 1,
+            boundary_clip_lead_tail,
+            "StingerOnly clip-cut AAC boundary",
+        ),
+        (
+            only + STINGER_RECORDING_CUT_FRAME + 1,
+            only + STINGER_RECORDING_DURATION_FRAMES,
+            pure_clip_tail,
+            "StingerOnly tail",
+        ),
+        (
+            only + STINGER_RECORDING_DURATION_FRAMES,
+            only + STINGER_RECORDING_DURATION_FRAMES + 1,
+            boundary_clip_tail_program,
+            "StingerOnly exit AAC boundary",
+        ),
+        (
+            only + STINGER_RECORDING_DURATION_FRAMES + 1,
+            mixed,
+            pure_program,
+            "post-StingerOnly Program",
+        ),
+    ];
+    assert_audio_signature_ranges(signatures, recording_origin, ranges);
+}
+
+#[cfg(target_os = "macos")]
+fn assert_mixed_stinger_audio(
+    signatures: &[AudioSignature],
+    recording_origin: u64,
+    mixed: u64,
+    first_replay: u64,
+) {
+    let ranges: &[(u64, u64, AudioSignaturePredicate, &str)] = &[
+        (
+            mixed,
+            mixed + 1,
+            boundary_program_mixed_lead,
+            "MixWithProgram onset AAC boundary",
+        ),
+        (
+            mixed + 1,
+            mixed + STINGER_RECORDING_CUT_FRAME,
+            mixed_program_lead,
+            "MixWithProgram Program lead",
+        ),
+        (
+            mixed + STINGER_RECORDING_CUT_FRAME,
+            mixed + STINGER_RECORDING_CUT_FRAME + 1,
+            boundary_mixed_cut,
+            "MixWithProgram clip/base cut AAC boundary",
+        ),
+        (
+            mixed + STINGER_RECORDING_CUT_FRAME + 1,
+            mixed + STINGER_RECORDING_DURATION_FRAMES,
+            mixed_preview_tail,
+            "MixWithProgram Preview tail",
+        ),
+        (
+            mixed + STINGER_RECORDING_DURATION_FRAMES,
+            mixed + STINGER_RECORDING_DURATION_FRAMES + 1,
+            boundary_mixed_tail_preview,
+            "MixWithProgram exit AAC boundary",
+        ),
+        (
+            mixed + STINGER_RECORDING_DURATION_FRAMES + 1,
+            first_replay,
+            pure_preview,
+            "post-MixWithProgram Preview",
+        ),
+    ];
+    assert_audio_signature_ranges(signatures, recording_origin, ranges);
+}
+
+#[cfg(target_os = "macos")]
+fn assert_first_stinger_replay_audio(
+    signatures: &[AudioSignature],
+    recording_origin: u64,
+    first_replay: u64,
+    second_replay: u64,
+) {
+    let ranges: &[(u64, u64, AudioSignaturePredicate, &str)] = &[
+        (
+            first_replay,
+            first_replay + 1,
+            boundary_preview_clip_lead,
+            "first replay onset AAC boundary",
+        ),
+        (
+            first_replay + 1,
+            first_replay + STINGER_RECORDING_CUT_FRAME,
+            pure_clip_lead,
+            "first replay lead",
+        ),
+        (
+            first_replay + STINGER_RECORDING_CUT_FRAME,
+            first_replay + STINGER_RECORDING_CUT_FRAME + 1,
+            boundary_clip_lead_tail,
+            "first replay clip-cut AAC boundary",
+        ),
+        (
+            first_replay + STINGER_RECORDING_CUT_FRAME + 1,
+            first_replay + STINGER_RECORDING_DURATION_FRAMES,
+            pure_clip_tail,
+            "first replay tail",
+        ),
+        (
+            first_replay + STINGER_RECORDING_DURATION_FRAMES,
+            first_replay + STINGER_RECORDING_DURATION_FRAMES + 1,
+            boundary_clip_tail_program,
+            "first replay exit AAC boundary",
+        ),
+        (
+            first_replay + STINGER_RECORDING_DURATION_FRAMES + 1,
+            second_replay,
+            pure_program,
+            "between replays Program",
+        ),
+    ];
+    assert_audio_signature_ranges(signatures, recording_origin, ranges);
+}
+
+#[cfg(target_os = "macos")]
+fn assert_second_stinger_replay_audio(
+    signatures: &[AudioSignature],
+    recording_origin: u64,
+    second_replay: u64,
+) {
+    let ranges: &[(u64, u64, AudioSignaturePredicate, &str)] = &[
+        (
+            second_replay,
+            second_replay + 1,
+            boundary_program_clip_lead,
+            "second replay onset AAC boundary",
+        ),
+        (
+            second_replay + 1,
+            second_replay + STINGER_RECORDING_CUT_FRAME,
+            pure_clip_lead,
+            "second replay lead",
+        ),
+        (
+            second_replay + STINGER_RECORDING_CUT_FRAME,
+            second_replay + STINGER_RECORDING_CUT_FRAME + 1,
+            boundary_clip_lead_tail,
+            "second replay clip-cut AAC boundary",
+        ),
+        (
+            second_replay + STINGER_RECORDING_CUT_FRAME + 1,
+            second_replay + STINGER_RECORDING_DURATION_FRAMES,
+            pure_clip_tail,
+            "second replay tail",
+        ),
+        (
+            second_replay + STINGER_RECORDING_DURATION_FRAMES,
+            second_replay + STINGER_RECORDING_DURATION_FRAMES + 1,
+            boundary_clip_tail_preview,
+            "second replay exit AAC boundary",
+        ),
+        (
+            second_replay + STINGER_RECORDING_DURATION_FRAMES + 1,
+            second_replay + STINGER_RECORDING_DURATION_FRAMES + RECORDING_POST_ROLL_FRAMES,
+            pure_preview,
+            "final settled Preview",
+        ),
+    ];
+    assert_audio_signature_ranges(signatures, recording_origin, ranges);
+}
+
+#[cfg(target_os = "macos")]
+fn validated_stinger_audio_schedule(scheduled_frames: &[u64]) -> [u64; 5] {
+    assert_eq!(scheduled_frames.len(), 5);
+    for pair in scheduled_frames.windows(2) {
+        assert!(
+            pair[1] > pair[0] + STINGER_RECORDING_DURATION_FRAMES + 1,
+            "Stinger commands overlap or leave no pure base-audio frame: {scheduled_frames:?}"
+        );
+    }
+    <[u64; 5]>::try_from(scheduled_frames).unwrap()
+}
+
+#[cfg(target_os = "macos")]
+fn assert_scheduled_clip_only_replay(
+    signatures: &[AudioSignature],
+    recording_origin: u64,
+    scheduled_frame: u64,
+) {
+    let first_verified = recording_origin + RECORDING_STARTUP_SETTLING_FRAMES;
+    assert!(
+        scheduled_frame >= first_verified,
+        "restored Stinger frame {scheduled_frame} precedes recording settling boundary \
+         {first_verified}"
+    );
+    let ranges: &[(u64, u64, AudioSignaturePredicate, &str)] = &[
+        (
+            first_verified,
+            scheduled_frame,
+            pure_preview,
+            "restored Program",
+        ),
+        (
+            scheduled_frame,
+            scheduled_frame + 1,
+            boundary_preview_clip_lead,
+            "restored replay onset AAC boundary",
+        ),
+        (
+            scheduled_frame + 1,
+            scheduled_frame + STINGER_RECORDING_CUT_FRAME,
+            pure_clip_lead,
+            "restored replay lead",
+        ),
+        (
+            scheduled_frame + STINGER_RECORDING_CUT_FRAME,
+            scheduled_frame + STINGER_RECORDING_CUT_FRAME + 1,
+            boundary_clip_lead_tail,
+            "restored replay clip-cut AAC boundary",
+        ),
+        (
+            scheduled_frame + STINGER_RECORDING_CUT_FRAME + 1,
+            scheduled_frame + STINGER_RECORDING_DURATION_FRAMES,
+            pure_clip_tail,
+            "restored replay tail",
+        ),
+        (
+            scheduled_frame + STINGER_RECORDING_DURATION_FRAMES,
+            scheduled_frame + STINGER_RECORDING_DURATION_FRAMES + 1,
+            boundary_clip_tail_program,
+            "restored replay exit AAC boundary",
+        ),
+        (
+            scheduled_frame + STINGER_RECORDING_DURATION_FRAMES + 1,
+            scheduled_frame + STINGER_RECORDING_DURATION_FRAMES + RECORDING_POST_ROLL_FRAMES,
+            pure_program,
+            "restored settled Program",
+        ),
+    ];
+    assert_audio_signature_ranges(signatures, recording_origin, ranges);
+}
+
+#[cfg(target_os = "macos")]
+// FFmpeg applies the AAC stream's skip-samples/edit-list metadata while
+// decoding, so recording frame zero remains authoritative.
+const RECORDING_STARTUP_SETTLING_FRAMES: u64 = 0;
+
+#[cfg(target_os = "macos")]
+const RECORDING_POST_ROLL_FRAMES: u64 = 3;
+
+#[cfg(target_os = "macos")]
+const STINGER_RECORDING_DURATION_FRAMES: u64 = 12;
+
+#[cfg(target_os = "macos")]
+const STINGER_RECORDING_CUT_FRAME: u64 = 6;
+
+#[cfg(target_os = "macos")]
+type AudioSignaturePredicate = fn(AudioSignature) -> bool;
+
+#[cfg(target_os = "macos")]
+fn assert_audio_signature_ranges(
+    signatures: &[AudioSignature],
+    recording_origin: u64,
+    ranges: &[(u64, u64, AudioSignaturePredicate, &str)],
+) {
+    for &(start, end, predicate, label) in ranges {
+        assert_audio_signature_range(signatures, recording_origin, start, end, predicate, label);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn assert_audio_signature_range(
+    signatures: &[AudioSignature],
+    recording_origin: u64,
+    start: u64,
+    end: u64,
+    predicate: fn(AudioSignature) -> bool,
+    label: &str,
+) {
+    assert!(start < end, "empty {label} frame range {start}..{end}");
+    let recording_start =
+        usize::try_from(start.checked_sub(recording_origin).unwrap_or_else(|| {
+            panic!("{label} starts before recording origin {recording_origin}")
+        }))
+        .unwrap();
+    let recording_end = usize::try_from(
+        end.checked_sub(recording_origin)
+            .unwrap_or_else(|| panic!("{label} ends before recording origin {recording_origin}")),
+    )
+    .unwrap();
+    let actual = signatures
+        .get(recording_start..recording_end)
+        .unwrap_or_else(|| {
+            panic!(
+                "recording has no complete {label} range {start}..{end} \
+             (origin {recording_origin}, decoded frames {})",
+                signatures.len()
+            )
+        });
+    for (offset, signature) in actual.iter().copied().enumerate() {
+        assert!(
+            predicate(signature),
+            "{label} mismatch at authoritative frame {} (recording frame {}): {signature:?}; \
+             nearby signatures: {:?}",
+            start + u64::try_from(offset).unwrap(),
+            recording_start + offset,
+            &signatures[recording_start.saturating_add(offset).saturating_sub(2)
+                ..signatures
+                    .len()
+                    .min(recording_start.saturating_add(offset).saturating_add(3))],
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn pure_program(signature: AudioSignature) -> bool {
+    signature.base_program > 0.035
+        && signature.base_preview < 0.02
+        && signature.clip_lead < 0.02
+        && signature.clip_tail < 0.02
+}
+
+#[cfg(target_os = "macos")]
+fn pure_preview(signature: AudioSignature) -> bool {
+    signature.base_program < 0.02
+        && signature.base_preview > 0.035
+        && signature.clip_lead < 0.02
+        && signature.clip_tail < 0.02
+}
+
+#[cfg(target_os = "macos")]
+fn pure_clip_lead(signature: AudioSignature) -> bool {
+    signature.base_program < 0.02
+        && signature.base_preview < 0.02
+        && signature.clip_lead > 0.05
+        && signature.clip_tail < 0.02
+}
+
+#[cfg(target_os = "macos")]
+fn pure_clip_tail(signature: AudioSignature) -> bool {
+    signature.base_program < 0.02
+        && signature.base_preview < 0.02
+        && signature.clip_lead < 0.02
+        && signature.clip_tail > 0.05
+}
+
+#[cfg(target_os = "macos")]
+fn mixed_program_lead(signature: AudioSignature) -> bool {
+    signature.base_program > 0.035
+        && signature.base_preview < 0.02
+        && signature.clip_lead > 0.05
+        && signature.clip_tail < 0.02
+}
+
+#[cfg(target_os = "macos")]
+fn mixed_preview_tail(signature: AudioSignature) -> bool {
+    signature.base_program < 0.02
+        && signature.base_preview > 0.035
+        && signature.clip_lead < 0.02
+        && signature.clip_tail > 0.05
+}
+
+#[cfg(target_os = "macos")]
+fn boundary_program_preview(signature: AudioSignature) -> bool {
+    codec_boundary(signature, [true, true, false, false])
+}
+
+#[cfg(target_os = "macos")]
+fn boundary_preview_clip_lead(signature: AudioSignature) -> bool {
+    codec_boundary(signature, [false, true, true, false])
+}
+
+#[cfg(target_os = "macos")]
+fn boundary_clip_lead_tail(signature: AudioSignature) -> bool {
+    codec_boundary(signature, [false, false, true, true])
+}
+
+#[cfg(target_os = "macos")]
+fn boundary_clip_tail_program(signature: AudioSignature) -> bool {
+    codec_boundary(signature, [true, false, false, true])
+}
+
+#[cfg(target_os = "macos")]
+fn boundary_program_mixed_lead(signature: AudioSignature) -> bool {
+    codec_boundary(signature, [true, false, true, false])
+}
+
+#[cfg(target_os = "macos")]
+fn boundary_mixed_cut(signature: AudioSignature) -> bool {
+    codec_boundary(signature, [true, true, true, true])
+}
+
+#[cfg(target_os = "macos")]
+fn boundary_mixed_tail_preview(signature: AudioSignature) -> bool {
+    codec_boundary(signature, [false, true, false, true])
+}
+
+#[cfg(target_os = "macos")]
+fn boundary_program_clip_lead(signature: AudioSignature) -> bool {
+    codec_boundary(signature, [true, false, true, false])
+}
+
+#[cfg(target_os = "macos")]
+fn boundary_clip_tail_preview(signature: AudioSignature) -> bool {
+    codec_boundary(signature, [false, true, false, true])
+}
+
+#[cfg(target_os = "macos")]
+fn codec_boundary(signature: AudioSignature, expected: [bool; 4]) -> bool {
+    [
+        signature.base_program,
+        signature.base_preview,
+        signature.clip_lead,
+        signature.clip_tail,
+    ]
+    .into_iter()
+    .zip(expected)
+    .all(|(amplitude, present)| {
+        if present {
+            amplitude > 0.02
+        } else {
+            amplitude < 0.02
+        }
+    })
+}
+
+#[cfg(target_os = "macos")]
 fn diagnostic_seconds(line: &str, label: &str) -> Option<f64> {
     line.split_once(label)?
         .1
@@ -2098,6 +3132,311 @@ fn diagnostic_seconds(line: &str, label: &str) -> Option<f64> {
         .next()?
         .parse()
         .ok()
+}
+
+#[cfg(target_os = "macos")]
+fn prepare_stinger_project(project_path: &Path) -> Result<(), String> {
+    save_white_black_generator_project(project_path);
+    let assets = project_path.join("assets");
+    fs::create_dir_all(&assets)
+        .map_err(|error| format!("cannot create Stinger asset directory: {error}"))?;
+    generate_alpha_stinger(&assets.join("stinger.mkv"))?;
+
+    let store = ProjectStore::new(project_path).map_err(|error| error.to_string())?;
+    let stored = store.load().map_err(|error| error.to_string())?;
+    let mut project = stored.project().clone();
+    project.add_input(Input {
+        id: input(3),
+        name: "Stinger media".into(),
+        kind: InputKind::Media {
+            asset_uri: "asset://stinger.mkv".into(),
+        },
+        required_capabilities: Vec::new(),
+    });
+    project.add_stinger(StingerConfig::new(
+        StingerSlotNumber::new(1).unwrap(),
+        input(3),
+        true,
+        6,
+        StingerAudioPolicy::Muted,
+        StingerMissingMediaFallback::Cut,
+    ));
+    let configured = StoredProject::from_project(
+        project,
+        stored.runtime_routing(),
+        stored.position(),
+        stored.idempotency_receipts().to_vec(),
+    )
+    .map_err(|error| error.to_string())?;
+    store.save(&configured).map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn prepare_audible_stinger_project(project_path: &Path) -> Result<(), String> {
+    let assets = project_path.join("assets");
+    fs::create_dir_all(&assets)
+        .map_err(|error| format!("cannot create audible Stinger asset directory: {error}"))?;
+    generate_tone_video(&assets.join("program.mov"), "white", 440)?;
+    generate_tone_video(&assets.join("preview.mov"), "black", 660)?;
+    generate_audible_alpha_stinger(&assets.join("stinger.mov"))?;
+    save_media_project(project_path, "asset://program.mov", "asset://preview.mov");
+
+    let store = ProjectStore::new(project_path).map_err(|error| error.to_string())?;
+    let stored = store.load().map_err(|error| error.to_string())?;
+    let mut project = stored.project().clone();
+    project.add_input(Input {
+        id: input(3),
+        name: "Audible Stinger media".into(),
+        kind: InputKind::Media {
+            asset_uri: "asset://stinger.mov".into(),
+        },
+        required_capabilities: Vec::new(),
+    });
+    for (slot, audio_policy) in [
+        (1, StingerAudioPolicy::Muted),
+        (2, StingerAudioPolicy::StingerOnly),
+        (3, StingerAudioPolicy::MixWithProgram),
+    ] {
+        project.add_stinger(StingerConfig::new(
+            StingerSlotNumber::new(slot).unwrap(),
+            input(3),
+            true,
+            6,
+            audio_policy,
+            StingerMissingMediaFallback::Cut,
+        ));
+    }
+    let configured = StoredProject::from_project(
+        project,
+        stored.runtime_routing(),
+        stored.position(),
+        stored.idempotency_receipts().to_vec(),
+    )
+    .map_err(|error| error.to_string())?;
+    store.save(&configured).map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn generate_tone_video(path: &Path, color: &str, frequency_hz: u32) -> Result<(), String> {
+    let video = format!("color=c={color}:size=64x48:rate=25:duration=8");
+    let audio = format!("sine=frequency={frequency_hz}:sample_rate=48000:duration=8");
+    let child = Command::new("ffmpeg")
+        .args([
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            &video,
+            "-f",
+            "lavfi",
+            "-i",
+            &audio,
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-frames:v",
+            "200",
+            "-vf",
+            "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-x264-params",
+            "colorprim=bt709:transfer=bt709:colormatrix=bt709:fullrange=off",
+            "-color_primaries",
+            "bt709",
+            "-color_trc",
+            "bt709",
+            "-colorspace",
+            "bt709",
+            "-color_range",
+            "tv",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "pcm_s16le",
+            "-ac",
+            "2",
+            "-f",
+            "mov",
+        ])
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("LC_ALL", "C")
+        .spawn()
+        .map_err(|error| format!("cannot spawn audible base generator: {error}"))?;
+    let output = wait_bounded(child, Duration::from_secs(15));
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "audible base generation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn generate_audible_alpha_stinger(path: &Path) -> Result<(), String> {
+    let video = path.with_file_name("stinger-video.mkv");
+    generate_alpha_stinger(&video)?;
+    let tone = "aevalsrc=if(lt(t\\,0.24)\\,0.12*sin(2*PI*997*t)\\,0.12*sin(2*PI*1499*t))|if(lt(t\\,0.24)\\,0.12*sin(2*PI*997*t)\\,0.12*sin(2*PI*1499*t)):s=48000:d=0.48";
+    let child = Command::new("ffmpeg")
+        .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i"])
+        .arg(&video)
+        .args([
+            "-f",
+            "lavfi",
+            "-i",
+            tone,
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-vf",
+            "format=yuva444p10le,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv",
+            "-c:v",
+            "prores_ks",
+            "-profile:v",
+            "4",
+            "-pix_fmt",
+            "yuva444p10le",
+            "-vendor",
+            "apl0",
+            "-color_primaries",
+            "bt709",
+            "-color_trc",
+            "bt709",
+            "-colorspace",
+            "bt709",
+            "-color_range",
+            "tv",
+            "-c:a",
+            "pcm_s16le",
+            "-shortest",
+            "-f",
+            "mov",
+        ])
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("LC_ALL", "C")
+        .spawn()
+        .map_err(|error| format!("cannot spawn audible Stinger generator: {error}"))?;
+    let output = wait_bounded(child, Duration::from_secs(15));
+    let _ = fs::remove_file(video.with_extension("rgba"));
+    let _ = fs::remove_file(&video);
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "audible Stinger generation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn prepare_deferred_stinger_fallback_project(project_path: &Path) {
+    save_white_black_generator_project(project_path);
+    let store = ProjectStore::new(project_path).unwrap();
+    let stored = store.load().unwrap();
+    let mut project = stored.project().clone();
+    for (slot, fallback) in [
+        (1, StingerMissingMediaFallback::KeepProgram),
+        (2, StingerMissingMediaFallback::Fade),
+        (3, StingerMissingMediaFallback::Cut),
+    ] {
+        project.add_stinger(StingerConfig::new(
+            StingerSlotNumber::new(slot).unwrap(),
+            input(2),
+            false,
+            1,
+            StingerAudioPolicy::Muted,
+            fallback,
+        ));
+    }
+    let configured = StoredProject::from_project(
+        project,
+        stored.runtime_routing(),
+        stored.position(),
+        stored.idempotency_receipts().to_vec(),
+    )
+    .unwrap();
+    store.save(&configured).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+fn generate_alpha_stinger(path: &Path) -> Result<(), String> {
+    let raw = path.with_extension("rgba");
+    let pixels = 64 * 48;
+    let mut frames = Vec::with_capacity(12 * pixels * 4);
+    for frame in 0..12 {
+        let alpha = u8::try_from(frame * 23).unwrap_or(u8::MAX);
+        let color = if frame == 11 {
+            [255, 255, 255, 255]
+        } else {
+            [0, 255, 0, alpha]
+        };
+        for _ in 0..pixels {
+            frames.extend_from_slice(&color);
+        }
+    }
+    fs::write(&raw, frames)
+        .map_err(|error| format!("cannot write Stinger RGBA fixture: {error}"))?;
+    let child = Command::new("ffmpeg")
+        .args([
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "rawvideo",
+            "-pixel_format",
+            "rgba",
+            "-video_size",
+            "64x48",
+            "-framerate",
+            "25",
+            "-i",
+        ])
+        .arg(&raw)
+        .args([
+            "-frames:v",
+            "12",
+            "-vf",
+            "setsar=1/1,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=full",
+            "-c:v",
+            "ffv1",
+            "-pix_fmt",
+            "bgra",
+        ])
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("LC_ALL", "C")
+        .spawn()
+        .map_err(|error| format!("cannot spawn alpha Stinger generator: {error}"))?;
+    let output = wait_bounded(child, Duration::from_secs(15));
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "alpha Stinger generation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -2241,6 +3580,16 @@ impl StudioClient {
     }
 
     fn command(&mut self, id: &str, key: &str, payload: CommandPayload) -> CommandOutcome {
+        self.try_command(id, key, payload)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    fn try_command(
+        &mut self,
+        id: &str,
+        key: &str,
+        payload: CommandPayload,
+    ) -> Result<CommandOutcome, String> {
         let message = WireMessage::Command(CommandMessage {
             protocol: CURRENT_PROTOCOL_VERSION,
             id: id.into(),
@@ -2256,7 +3605,8 @@ impl StudioClient {
         let mut durable_revisions = HashSet::new();
         let mut realized_revisions = HashSet::new();
         for _ in 0..4_096 {
-            let message = self.receive_before(deadline, "accepted result and runtime realization");
+            let message =
+                self.try_receive_before(deadline, "accepted result and runtime realization")?;
             match message {
                 WireMessage::CommandResult(CommandResult::Accepted {
                     id: result_id,
@@ -2271,7 +3621,7 @@ impl StudioClient {
                     message,
                     ..
                 }) if result_id == id => {
-                    panic!("command {id} was rejected ({code}): {message}");
+                    return Err(format!("command {id} was rejected ({code}): {message}"));
                 }
                 WireMessage::Event(event) => {
                     durable_revisions.insert(event.cursor.revision);
@@ -2290,14 +3640,16 @@ impl StudioClient {
                 && durable_revisions.contains(&revision)
                 && realized_revisions.contains(&revision)
             {
-                return CommandOutcome {
+                return Ok(CommandOutcome {
                     revision,
                     scheduled_frame,
                     elapsed: started.elapsed(),
-                };
+                });
             }
         }
-        panic!("too many interleaved messages while waiting for command {id}");
+        Err(format!(
+            "too many interleaved messages while waiting for command {id}"
+        ))
     }
 
     fn send(&mut self, message: &WireMessage) {
@@ -2323,26 +3675,40 @@ impl StudioClient {
     }
 
     fn receive_before(&mut self, deadline: Instant, expected: &str) -> WireMessage {
+        self.try_receive_before(deadline, expected)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    fn try_receive_before(
+        &mut self,
+        deadline: Instant,
+        expected: &str,
+    ) -> Result<WireMessage, String> {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        assert!(!remaining.is_zero(), "timed out waiting for {expected}");
+        if remaining.is_zero() {
+            return Err(format!("timed out waiting for {expected}"));
+        }
         self.reader
             .get_mut()
             .set_read_timeout(Some(remaining))
-            .unwrap();
+            .map_err(|error| format!("cannot set timeout while waiting for {expected}: {error}"))?;
         let mut line = String::new();
         let read = self
             .reader
             .read_line(&mut line)
-            .unwrap_or_else(|error| panic!("timed out waiting for {expected}: {error}"));
-        assert_ne!(read, 0, "daemon closed while waiting for {expected}");
-        let message = decode_line(&line).unwrap();
+            .map_err(|error| format!("timed out waiting for {expected}: {error}"))?;
+        if read == 0 {
+            return Err(format!("daemon closed while waiting for {expected}"));
+        }
+        let message =
+            decode_line(&line).map_err(|error| format!("invalid daemon message: {error}"))?;
         if let WireMessage::Error(error) = &message {
-            panic!(
+            return Err(format!(
                 "daemon returned protocol error while waiting for {expected}: {}: {}",
                 error.error.code, error.error.message
-            );
+            ));
         }
-        message
+        Ok(message)
     }
 }
 

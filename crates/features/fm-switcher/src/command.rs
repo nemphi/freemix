@@ -114,6 +114,12 @@ pub enum SwitcherError {
     UnsupportedManualTransitionKind,
     InvalidManualTransitionRoute,
     ZeroDuration,
+    UnconfiguredStinger(StingerSlotId),
+    StingerCutPointOutOfRange {
+        slot: StingerSlotId,
+        cut_point_frames: u32,
+        duration_frames: u32,
+    },
 }
 
 impl core::fmt::Display for SwitcherError {
@@ -130,6 +136,22 @@ impl core::fmt::Display for SwitcherError {
                 formatter.write_str("manual transition endpoints must match Program and Preview")
             }
             Self::ZeroDuration => formatter.write_str("transition duration must be nonzero"),
+            Self::UnconfiguredStinger(slot) => {
+                write!(
+                    formatter,
+                    "stinger slot {} is not configured",
+                    slot.number()
+                )
+            }
+            Self::StingerCutPointOutOfRange {
+                slot,
+                cut_point_frames,
+                duration_frames,
+            } => write!(
+                formatter,
+                "stinger slot {} cut point {cut_point_frames} exceeds duration {duration_frames}",
+                slot.number()
+            ),
         }
     }
 }

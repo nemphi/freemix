@@ -21,6 +21,20 @@ pub enum FadeToBlackTarget {
     Black,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StingerAudioPolicy {
+    Muted,
+    StingerOnly,
+    MixWithProgram,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StingerFallback {
+    Cut,
+    Fade,
+    KeepProgram,
+}
+
 impl FadeToBlackTarget {
     #[must_use]
     pub const fn active(self) -> bool {
@@ -71,6 +85,26 @@ pub enum Command {
         frames: u32,
         key: Option<String>,
         expected_revision: Option<u64>,
+    },
+    Stinger {
+        path: PathBuf,
+        slot: u8,
+        frames: u32,
+        key: Option<String>,
+        expected_revision: Option<u64>,
+    },
+    StingerConfigure {
+        path: PathBuf,
+        slot: u8,
+        media_input: u128,
+        preload: bool,
+        cut_point_frames: u32,
+        audio_policy: StingerAudioPolicy,
+        fallback: StingerFallback,
+    },
+    StingerRemove {
+        path: PathBuf,
+        slot: u8,
     },
     Wipe {
         path: PathBuf,
@@ -125,6 +159,13 @@ pub enum Command {
     },
     RemoteZoom {
         address: SocketAddr,
+        frames: u32,
+        key: Option<String>,
+        expected_revision: Option<u64>,
+    },
+    RemoteStinger {
+        address: SocketAddr,
+        slot: u8,
         frames: u32,
         key: Option<String>,
         expected_revision: Option<u64>,
@@ -249,6 +290,9 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
         "fade" | "alpha-fade" | "slide" | "zoom" | "wipe" => {
             parse_local_timed_transition(&command, arguments)
         }
+        "stinger" => parse_local_stinger(arguments),
+        "stinger-configure" => parse_stinger_configuration(arguments),
+        "stinger-remove" => parse_stinger_removal(arguments),
         "tbar-start" | "tbar-position" | "tbar-commit" | "tbar-cancel" => {
             parse_local_t_bar(&command, arguments)
         }
@@ -259,6 +303,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
         "remote-fade" | "remote-alpha-fade" | "remote-slide" | "remote-zoom" | "remote-wipe" => {
             parse_remote_timed_transition(&command, arguments)
         }
+        "remote-stinger" => parse_remote_stinger(arguments),
         "remote-tbar-start"
         | "remote-tbar-position"
         | "remote-tbar-commit"
@@ -350,6 +395,83 @@ fn parse_local_timed_transition(
         },
         _ => unreachable!("caller only dispatches timed local transitions"),
     })
+}
+
+fn parse_local_stinger(mut arguments: impl Iterator<Item = String>) -> Result<Command, ArgsError> {
+    let path = required_path(&mut arguments, "project path")?;
+    let slot = stinger_slot(&required(&mut arguments, "Stinger slot")?)?;
+    let frames = number(&required(&mut arguments, "frames")?, "frames")?;
+    let (key, expected_revision) = command_options(arguments)?;
+    Ok(Command::Stinger {
+        path,
+        slot,
+        frames,
+        key,
+        expected_revision,
+    })
+}
+
+fn parse_stinger_configuration(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Command, ArgsError> {
+    let path = required_path(&mut arguments, "project path")?;
+    let slot = stinger_slot(&required(&mut arguments, "Stinger slot")?)?;
+    let media_input = number(&required(&mut arguments, "media input")?, "media input")?;
+    let preload = match required(&mut arguments, "preload")?.as_str() {
+        "true" => true,
+        "false" => false,
+        value => {
+            return Err(ArgsError::InvalidChoice {
+                field: "preload",
+                value: value.to_owned(),
+            });
+        }
+    };
+    let cut_point_frames = number(
+        &required(&mut arguments, "cut point frames")?,
+        "cut point frames",
+    )?;
+    let audio_policy = match required(&mut arguments, "Stinger audio policy")?.as_str() {
+        "muted" => StingerAudioPolicy::Muted,
+        "stinger-only" => StingerAudioPolicy::StingerOnly,
+        "mix-with-program" => StingerAudioPolicy::MixWithProgram,
+        value => {
+            return Err(ArgsError::InvalidChoice {
+                field: "Stinger audio policy",
+                value: value.to_owned(),
+            });
+        }
+    };
+    let fallback = match required(&mut arguments, "Stinger fallback")?.as_str() {
+        "cut" => StingerFallback::Cut,
+        "fade" => StingerFallback::Fade,
+        "keep-program" => StingerFallback::KeepProgram,
+        value => {
+            return Err(ArgsError::InvalidChoice {
+                field: "Stinger fallback",
+                value: value.to_owned(),
+            });
+        }
+    };
+    reject_extra(&mut arguments)?;
+    Ok(Command::StingerConfigure {
+        path,
+        slot,
+        media_input,
+        preload,
+        cut_point_frames,
+        audio_policy,
+        fallback,
+    })
+}
+
+fn parse_stinger_removal(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Command, ArgsError> {
+    let path = required_path(&mut arguments, "project path")?;
+    let slot = stinger_slot(&required(&mut arguments, "Stinger slot")?)?;
+    reject_extra(&mut arguments)?;
+    Ok(Command::StingerRemove { path, slot })
 }
 
 fn parse_local_t_bar(
@@ -501,6 +623,20 @@ fn parse_remote_timed_transition(
     })
 }
 
+fn parse_remote_stinger(mut arguments: impl Iterator<Item = String>) -> Result<Command, ArgsError> {
+    let address = socket_address(&required(&mut arguments, "address")?)?;
+    let slot = stinger_slot(&required(&mut arguments, "Stinger slot")?)?;
+    let frames = number(&required(&mut arguments, "frames")?, "frames")?;
+    let (key, expected_revision) = command_options(arguments)?;
+    Ok(Command::RemoteStinger {
+        address,
+        slot,
+        frames,
+        key,
+        expected_revision,
+    })
+}
+
 fn command_options(
     mut arguments: impl Iterator<Item = String>,
 ) -> Result<(Option<String>, Option<u64>), ArgsError> {
@@ -597,6 +733,19 @@ fn basis_points(value: &str) -> Result<u16, ArgsError> {
             value: position,
         })
     }
+}
+
+fn stinger_slot(value: &str) -> Result<u8, ArgsError> {
+    let slot = number::<u16>(value, "Stinger slot")?;
+    if !(1..=8).contains(&slot) {
+        return Err(ArgsError::OutOfRange {
+            field: "Stinger slot",
+            minimum: 1,
+            maximum: 8,
+            value: slot,
+        });
+    }
+    Ok(u8::try_from(slot).expect("validated Stinger slot fits u8"))
 }
 
 #[cfg(test)]
@@ -770,6 +919,128 @@ mod tests {
                 expected_revision: None,
             })
         );
+    }
+
+    #[test]
+    fn parses_local_and_remote_stinger_and_rejects_invalid_slots() {
+        assert_eq!(
+            parse(strings(&[
+                "stinger",
+                "show.freemix",
+                "8",
+                "45",
+                "--key",
+                "stinger-8",
+                "--expect",
+                "4",
+            ])),
+            Ok(Command::Stinger {
+                path: "show.freemix".into(),
+                slot: 8,
+                frames: 45,
+                key: Some("stinger-8".into()),
+                expected_revision: Some(4),
+            })
+        );
+        assert_eq!(
+            parse(strings(&[
+                "remote-stinger",
+                "127.0.0.1:9123",
+                "1",
+                "12",
+                "--key",
+                "remote-stinger",
+            ])),
+            Ok(Command::RemoteStinger {
+                address: "127.0.0.1:9123".parse().unwrap(),
+                slot: 1,
+                frames: 12,
+                key: Some("remote-stinger".into()),
+                expected_revision: None,
+            })
+        );
+        assert_eq!(
+            parse(strings(&["stinger", "show.freemix", "0", "12"])),
+            Err(ArgsError::OutOfRange {
+                field: "Stinger slot",
+                minimum: 1,
+                maximum: 8,
+                value: 0,
+            })
+        );
+        assert_eq!(
+            parse(strings(&["remote-stinger", "127.0.0.1:9123", "9", "12"])),
+            Err(ArgsError::OutOfRange {
+                field: "Stinger slot",
+                minimum: 1,
+                maximum: 8,
+                value: 9,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_complete_stinger_configuration_and_removal() {
+        assert_eq!(
+            parse(strings(&[
+                "stinger-configure",
+                "show.freemix",
+                "8",
+                "340282366920938463463374607431768211455",
+                "false",
+                "45",
+                "mix-with-program",
+                "keep-program",
+            ])),
+            Ok(Command::StingerConfigure {
+                path: "show.freemix".into(),
+                slot: 8,
+                media_input: u128::MAX,
+                preload: false,
+                cut_point_frames: 45,
+                audio_policy: StingerAudioPolicy::MixWithProgram,
+                fallback: StingerFallback::KeepProgram,
+            })
+        );
+        assert_eq!(
+            parse(strings(&["stinger-remove", "show.freemix", "1"])),
+            Ok(Command::StingerRemove {
+                path: "show.freemix".into(),
+                slot: 1,
+            })
+        );
+        assert!(matches!(
+            parse(strings(&[
+                "stinger-configure",
+                "show.freemix",
+                "1",
+                "2",
+                "yes",
+                "12",
+                "muted",
+                "cut",
+            ])),
+            Err(ArgsError::InvalidChoice {
+                field: "preload",
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse(strings(&[
+                "stinger-configure",
+                "show.freemix",
+                "1",
+                "2",
+                "true",
+                "12",
+                "program-only",
+                "cut",
+            ])),
+            Err(ArgsError::InvalidChoice {
+                field: "Stinger audio policy",
+                ..
+            })
+        ));
     }
 
     #[test]

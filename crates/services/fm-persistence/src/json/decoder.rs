@@ -7,7 +7,8 @@ use fm_model::{
     AudioBus, BusSend, CropRect, Input, InputAudioStrip, InputAudioStripState, InputGainMilliDb,
     InputKind, Layer, LayerGeometry, MainMix, Output, Project, ProjectSettings, RectMask,
     RestartPolicy, Rgba8, Rotation, Scene, SimulatedAudio, SimulatedInput, SimulatedVideo,
-    SolidColor, SourceRef, StartupPolicy,
+    SolidColor, SourceRef, StartupPolicy, StingerAudioPolicy, StingerConfig,
+    StingerMissingMediaFallback, StingerSlotNumber,
 };
 use fm_types::{
     AudioFormat, BusId, Channel, ChannelLayout, ChromaLocation, ColorMetadata, ColorPrimaries,
@@ -33,6 +34,7 @@ const V5_SCHEMA_VERSION: u32 = 5;
 const V6_SCHEMA_VERSION: u32 = 6;
 const V7_SCHEMA_VERSION: u32 = 7;
 const V8_SCHEMA_VERSION: u32 = 8;
+const V9_SCHEMA_VERSION: u32 = 9;
 
 pub(crate) fn decode(source: &str) -> Result<StoredProject, DecodeError> {
     let mut root = Object::new(Reader::new(source).document()?, "manifest")?;
@@ -45,7 +47,7 @@ pub(crate) fn decode(source: &str) -> Result<StoredProject, DecodeError> {
             },
         ));
     }
-    let project = ProjectDto::parse(root.take("project")?, false, true, true)?.into_domain();
+    let project = ProjectDto::parse(root.take("project")?, ProjectSchema::V10)?.into_domain();
     let (routing, manual_transitions, fade_to_black, position, receipts) =
         parse_runtime(root.take("runtime")?, true, true)?;
     root.finish()?;
@@ -75,7 +77,7 @@ pub(crate) fn decode_v3(source: &str) -> Result<StoredProject, DecodeError> {
             },
         ));
     }
-    let project = ProjectDto::parse(root.take("project")?, true, false, false)?.into_domain();
+    let project = ProjectDto::parse(root.take("project")?, ProjectSchema::V3)?.into_domain();
     let (routing, _, _, position, receipts) = parse_runtime(root.take("runtime")?, false, false)?;
     root.finish()?;
     StoredProject::from_project(project, routing, position, receipts)
@@ -93,7 +95,7 @@ pub(crate) fn decode_v4(source: &str) -> Result<StoredProject, DecodeError> {
             },
         ));
     }
-    let project = ProjectDto::parse(root.take("project")?, false, false, false)?.into_domain();
+    let project = ProjectDto::parse(root.take("project")?, ProjectSchema::V4ToV5)?.into_domain();
     let (routing, _, _, position, receipts) = parse_runtime(root.take("runtime")?, false, false)?;
     root.finish()?;
     StoredProject::from_project(project, routing, position, receipts)
@@ -111,7 +113,7 @@ pub(crate) fn decode_v5(source: &str) -> Result<StoredProject, DecodeError> {
             },
         ));
     }
-    let project = ProjectDto::parse(root.take("project")?, false, false, false)?.into_domain();
+    let project = ProjectDto::parse(root.take("project")?, ProjectSchema::V4ToV5)?.into_domain();
     let (routing, manual_transitions, _, position, receipts) =
         parse_runtime(root.take("runtime")?, true, false)?;
     root.finish()?;
@@ -136,7 +138,7 @@ pub(crate) fn decode_v6(source: &str) -> Result<StoredProject, DecodeError> {
             },
         ));
     }
-    let project = ProjectDto::parse(root.take("project")?, false, true, false)?.into_domain();
+    let project = ProjectDto::parse(root.take("project")?, ProjectSchema::V6)?.into_domain();
     let (routing, manual_transitions, _, position, receipts) =
         parse_runtime(root.take("runtime")?, true, false)?;
     root.finish()?;
@@ -161,7 +163,7 @@ pub(crate) fn decode_v7(source: &str) -> Result<StoredProject, DecodeError> {
             },
         ));
     }
-    let project = ProjectDto::parse(root.take("project")?, false, true, true)?.into_domain();
+    let project = ProjectDto::parse(root.take("project")?, ProjectSchema::V7ToV9)?.into_domain();
     let (routing, manual_transitions, _, position, receipts) =
         parse_runtime(root.take("runtime")?, true, false)?;
     root.finish()?;
@@ -186,7 +188,33 @@ pub(crate) fn decode_v8(source: &str) -> Result<StoredProject, DecodeError> {
             },
         ));
     }
-    let project = ProjectDto::parse(root.take("project")?, false, true, true)?.into_domain();
+    let project = ProjectDto::parse(root.take("project")?, ProjectSchema::V7ToV9)?.into_domain();
+    let (routing, manual_transitions, fade_to_black, position, receipts) =
+        parse_runtime(root.take("runtime")?, true, true)?;
+    root.finish()?;
+    StoredProject::from_project_with_runtime_state(
+        project,
+        routing,
+        manual_transitions,
+        fade_to_black,
+        position,
+        receipts,
+    )
+    .map_err(DecodeError::Validation)
+}
+
+pub(crate) fn decode_v9(source: &str) -> Result<StoredProject, DecodeError> {
+    let mut root = Object::new(Reader::new(source).document()?, "manifest")?;
+    let schema = root.u32("schema_version")?;
+    if schema != V9_SCHEMA_VERSION {
+        return Err(DecodeError::Validation(
+            ProjectValidationError::UnsupportedSchema {
+                found: schema,
+                supported: V9_SCHEMA_VERSION,
+            },
+        ));
+    }
+    let project = ProjectDto::parse(root.take("project")?, ProjectSchema::V7ToV9)?.into_domain();
     let (routing, manual_transitions, fade_to_black, position, receipts) =
         parse_runtime(root.take("runtime")?, true, true)?;
     root.finish()?;
@@ -211,22 +239,45 @@ struct ProjectDto {
     audio_buses: Vec<AudioBus>,
     outputs: Vec<Output>,
     main_mix: Option<MainMix>,
+    stingers: Vec<StingerConfig>,
     restart_policy: RestartPolicy,
 }
 
+#[derive(Clone, Copy)]
+enum ProjectSchema {
+    V3,
+    V4ToV5,
+    V6,
+    V7ToV9,
+    V10,
+}
+
+impl ProjectSchema {
+    const fn legacy_v3_inputs(self) -> bool {
+        matches!(self, Self::V3)
+    }
+
+    const fn has_masks(self) -> bool {
+        matches!(self, Self::V6 | Self::V7ToV9 | Self::V10)
+    }
+
+    const fn has_audio_strips(self) -> bool {
+        matches!(self, Self::V7ToV9 | Self::V10)
+    }
+
+    const fn has_stingers(self) -> bool {
+        matches!(self, Self::V10)
+    }
+}
+
 impl ProjectDto {
-    fn parse(
-        value: Value,
-        schema_v3: bool,
-        schema_v6: bool,
-        schema_v7: bool,
-    ) -> Result<Self, DecodeError> {
+    fn parse(value: Value, schema: ProjectSchema) -> Result<Self, DecodeError> {
         let mut object = Object::new(value, "project")?;
         let id = ProjectId::new(object.nonzero_u128("id")?);
         let name = object.string("name")?;
         let settings = parse_settings(object.take("settings")?)?;
         let inputs = parse_array(object.take("inputs")?, "inputs", |value| {
-            parse_input(value, schema_v3)
+            parse_input(value, schema.legacy_v3_inputs())
         })?;
         let dimensions = settings.video.dimensions;
         let dto = Self {
@@ -234,7 +285,7 @@ impl ProjectDto {
             name,
             settings,
             inputs,
-            input_audio_strips: if schema_v7 {
+            input_audio_strips: if schema.has_audio_strips() {
                 Some(parse_array(
                     object.take("input_audio_strips")?,
                     "input_audio_strips",
@@ -246,8 +297,8 @@ impl ProjectDto {
             scenes: parse_array(object.take("scenes")?, "scenes", |value| {
                 parse_scene(
                     value,
-                    schema_v3,
-                    schema_v6,
+                    schema.legacy_v3_inputs(),
+                    schema.has_masks(),
                     dimensions.width(),
                     dimensions.height(),
                 )
@@ -255,6 +306,11 @@ impl ProjectDto {
             audio_buses: parse_array(object.take("audio_buses")?, "audio_buses", parse_bus)?,
             outputs: parse_array(object.take("outputs")?, "outputs", parse_output)?,
             main_mix: parse_optional(object.take("main_mix")?, parse_main_mix)?,
+            stingers: if schema.has_stingers() {
+                parse_array(object.take("stingers")?, "stingers", parse_stinger)?
+            } else {
+                Vec::new()
+            },
             restart_policy: parse_restart_policy(object.take("restart_policy")?)?,
         };
         object.finish()?;
@@ -309,8 +365,38 @@ impl ProjectDto {
         if let Some(main_mix) = self.main_mix {
             project.set_main_mix(main_mix);
         }
+        for stinger in self.stingers {
+            project.add_stinger(stinger);
+        }
         project
     }
+}
+
+fn parse_stinger(value: Value) -> Result<StingerConfig, DecodeError> {
+    let mut object = Object::new(value, "stinger")?;
+    let slot_number = object.u8("slot")?;
+    let slot = StingerSlotNumber::new(slot_number)
+        .ok_or_else(|| syntax("stinger slot must be between 1 and 8"))?;
+    let stinger = StingerConfig::new(
+        slot,
+        InputId::new(object.nonzero_u128("media_input")?),
+        object.boolean("preload")?,
+        object.u32("cut_point_frames")?,
+        match object.string("audio_policy")?.as_str() {
+            "muted" => StingerAudioPolicy::Muted,
+            "stinger_only" => StingerAudioPolicy::StingerOnly,
+            "mix_with_program" => StingerAudioPolicy::MixWithProgram,
+            value => return Err(unknown_enum("stinger audio policy", value)),
+        },
+        match object.string("missing_media_fallback")?.as_str() {
+            "cut" => StingerMissingMediaFallback::Cut,
+            "fade" => StingerMissingMediaFallback::Fade,
+            "keep_program" => StingerMissingMediaFallback::KeepProgram,
+            value => return Err(unknown_enum("stinger missing-media fallback", value)),
+        },
+    );
+    object.finish()?;
+    Ok(stinger)
 }
 
 fn parse_input_audio_strip(value: Value) -> Result<InputAudioStrip, DecodeError> {

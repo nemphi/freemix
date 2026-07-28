@@ -14,7 +14,8 @@ use fm_protocol::{
     CommandResult, EngineIdentity, EventCursor, EventMessage, EventPayload, FadeToBlackPosition,
     FadeToBlackState, FieldIssue, ManualTransitionKind, ManualTransitionPosition,
     ManualTransitionStatus as ProtocolManualTransitionStatus, ResumeCursor, ServerHello,
-    ServerIdentity, SnapshotMessage,
+    ServerIdentity, SnapshotMessage, StingerAudioPolicy, StingerMissingMediaFallback,
+    StingerReadiness,
 };
 use fm_types::{InputId, ProjectId};
 
@@ -106,6 +107,17 @@ pub struct SwitcherState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StingerStatus {
+    pub slot: u8,
+    pub media_input: InputId,
+    pub preload: bool,
+    pub cut_point_frames: u32,
+    pub audio_policy: StingerAudioPolicy,
+    pub missing_media_fallback: StingerMissingMediaFallback,
+    pub readiness: StingerReadiness,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ActiveManualTransition {
     pub kind: ManualTransitionKind,
     pub from: InputId,
@@ -142,6 +154,7 @@ pub struct ProjectSnapshot {
     pub cursor: ProjectCursor,
     pub show_name: String,
     pub inputs: Vec<InputId>,
+    pub stingers: Vec<StingerStatus>,
     pub switcher: SwitcherState,
 }
 
@@ -149,6 +162,7 @@ impl ProjectSnapshot {
     /// Adds the project identity omitted by the current protocol snapshot DTO.
     #[must_use]
     pub fn from_protocol(project_id: ProjectId, message: SnapshotMessage) -> Self {
+        let stingers = protocol_stingers(message.stingers.unwrap_or_default());
         Self {
             cursor: ProjectCursor {
                 project_id,
@@ -161,6 +175,7 @@ impl ProjectSnapshot {
                 .into_iter()
                 .map(fm_protocol::WireInputId::to_domain)
                 .collect(),
+            stingers,
             switcher: SwitcherState {
                 desired: BusSelection::new(
                     message.desired_program.to_domain(),
@@ -185,12 +200,18 @@ impl ProjectSnapshot {
 }
 
 /// A UI-owned durable desired-state change.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DurableChange {
     DesiredSwitcher {
         selection: BusSelection,
         manual_transition: ManualTransitionStatus,
         fade_to_black: FadeToBlackState,
+    },
+    StingerSlotsChanged {
+        selection: BusSelection,
+        manual_transition: ManualTransitionStatus,
+        fade_to_black: FadeToBlackState,
+        stingers: Vec<StingerStatus>,
     },
 }
 
@@ -215,6 +236,18 @@ impl DurableProjectEvent {
                 selection: BusSelection::new(program.to_domain(), preview.to_domain()),
                 manual_transition: manual_status_from_protocol(manual_transition),
                 fade_to_black: fade_to_black_from_protocol(fade_to_black),
+            },
+            EventPayload::StingerSlotsChanged {
+                program,
+                preview,
+                manual_transition,
+                fade_to_black,
+                stingers,
+            } => DurableChange::StingerSlotsChanged {
+                selection: BusSelection::new(program.to_domain(), preview.to_domain()),
+                manual_transition: manual_status_from_protocol(manual_transition),
+                fade_to_black: fade_to_black_from_protocol(fade_to_black),
+                stingers: protocol_stingers(stingers),
             },
         };
         Self {
@@ -268,6 +301,7 @@ pub struct RuntimeRealization {
 pub struct ProjectState {
     show_name: String,
     inputs: Vec<InputId>,
+    stingers: Vec<StingerStatus>,
     switcher: SwitcherState,
 }
 
@@ -283,6 +317,11 @@ impl ProjectState {
     }
 
     #[must_use]
+    pub fn stingers(&self) -> &[StingerStatus] {
+        &self.stingers
+    }
+
+    #[must_use]
     pub const fn switcher(&self) -> SwitcherState {
         self.switcher
     }
@@ -294,6 +333,7 @@ pub struct ClientView {
     pub cursor: ProjectCursor,
     pub show_name: String,
     pub inputs: Vec<InputId>,
+    pub stingers: Vec<StingerStatus>,
     pub switcher: SwitcherState,
 }
 
@@ -467,6 +507,8 @@ pub enum ModelError {
     },
     RevisionExhausted,
     DuplicateInput(InputId),
+    DuplicateStingerSlot(u8),
+    InvalidStingerSlot(u8),
     UnknownInput(InputId),
     InvalidManualTransitionRouting,
     DuplicateCommand(CommandId),
@@ -529,6 +571,10 @@ impl fmt::Display for ModelError {
             ),
             Self::RevisionExhausted => formatter.write_str("revision counter is exhausted"),
             Self::DuplicateInput(input) => write!(formatter, "snapshot repeats input {input}"),
+            Self::DuplicateStingerSlot(slot) => {
+                write!(formatter, "snapshot repeats Stinger slot {slot}")
+            }
+            Self::InvalidStingerSlot(slot) => write!(formatter, "invalid Stinger slot {slot}"),
             Self::UnknownInput(input) => write!(formatter, "unknown input {input}"),
             Self::InvalidManualTransitionRouting => formatter
                 .write_str("manual transition endpoints do not match Program and Preview routing"),
@@ -602,6 +648,7 @@ impl ClientModel {
             cursor,
             show_name: state.show_name.clone(),
             inputs: state.inputs.clone(),
+            stingers: state.stingers.clone(),
             switcher,
         })
     }
@@ -771,6 +818,7 @@ impl ClientModel {
         self.state = Some(ProjectState {
             show_name: snapshot.show_name,
             inputs: snapshot.inputs,
+            stingers: snapshot.stingers,
             switcher: snapshot.switcher,
         });
         self.applied_events.clear();
@@ -841,7 +889,7 @@ impl ClientModel {
         let state = self.state.as_ref().ok_or(ModelError::StateUnavailable)?;
         validate_change(&event.change, &state.inputs)?;
         let state = self.state.as_mut().ok_or(ModelError::StateUnavailable)?;
-        apply_change(&mut state.switcher, event.change);
+        apply_change(state, event.change.clone());
 
         let revision = event.cursor.revision;
         self.desired_by_revision.insert(
@@ -1139,6 +1187,7 @@ fn validate_snapshot_inputs(snapshot: &ProjectSnapshot) -> Result<(), ModelError
             return Err(ModelError::UnknownInput(input));
         }
     }
+    validate_stingers(&snapshot.stingers, &inputs)?;
     validate_manual_transition(
         snapshot.switcher.desired_manual_transition,
         snapshot.switcher.desired,
@@ -1152,13 +1201,38 @@ fn validate_snapshot_inputs(snapshot: &ProjectSnapshot) -> Result<(), ModelError
     Ok(())
 }
 
+fn validate_stingers(
+    stingers: &[StingerStatus],
+    inputs: &HashSet<InputId>,
+) -> Result<(), ModelError> {
+    let mut slots = HashSet::with_capacity(stingers.len());
+    for stinger in stingers {
+        if !(1..=8).contains(&stinger.slot) {
+            return Err(ModelError::InvalidStingerSlot(stinger.slot));
+        }
+        if !slots.insert(stinger.slot) {
+            return Err(ModelError::DuplicateStingerSlot(stinger.slot));
+        }
+        if !inputs.contains(&stinger.media_input) {
+            return Err(ModelError::UnknownInput(stinger.media_input));
+        }
+    }
+    Ok(())
+}
+
 fn validate_change(change: &DurableChange, inputs: &[InputId]) -> Result<(), ModelError> {
-    let (selection, manual_transition) = match *change {
+    let (selection, manual_transition, stingers) = match change {
         DurableChange::DesiredSwitcher {
             selection,
             manual_transition,
             ..
-        } => (selection, manual_transition),
+        } => (*selection, *manual_transition, None),
+        DurableChange::StingerSlotsChanged {
+            selection,
+            manual_transition,
+            stingers,
+            ..
+        } => (*selection, *manual_transition, Some(stingers.as_slice())),
     };
     for input in [selection.program, selection.preview] {
         if !inputs.contains(&input) {
@@ -1167,6 +1241,9 @@ fn validate_change(change: &DurableChange, inputs: &[InputId]) -> Result<(), Mod
     }
     let input_set = inputs.iter().copied().collect();
     validate_manual_transition(manual_transition, selection, &input_set)?;
+    if let Some(stingers) = stingers {
+        validate_stingers(stingers, &input_set)?;
+    }
     Ok(())
 }
 
@@ -1179,18 +1256,44 @@ fn validate_optimistic(change: OptimisticChange, inputs: &[InputId]) -> Result<(
     Ok(())
 }
 
-fn apply_change(switcher: &mut SwitcherState, change: DurableChange) {
+fn apply_change(state: &mut ProjectState, change: DurableChange) {
     match change {
         DurableChange::DesiredSwitcher {
             selection,
             manual_transition,
             fade_to_black,
         } => {
-            switcher.desired = selection;
-            switcher.desired_manual_transition = manual_transition;
-            switcher.desired_fade_to_black = fade_to_black;
+            state.switcher.desired = selection;
+            state.switcher.desired_manual_transition = manual_transition;
+            state.switcher.desired_fade_to_black = fade_to_black;
+        }
+        DurableChange::StingerSlotsChanged {
+            selection,
+            manual_transition,
+            fade_to_black,
+            stingers,
+        } => {
+            state.switcher.desired = selection;
+            state.switcher.desired_manual_transition = manual_transition;
+            state.switcher.desired_fade_to_black = fade_to_black;
+            state.stingers = stingers;
         }
     }
+}
+
+fn protocol_stingers(stingers: Vec<fm_protocol::StingerStatus>) -> Vec<StingerStatus> {
+    stingers
+        .into_iter()
+        .map(|status| StingerStatus {
+            slot: status.slot.number(),
+            media_input: status.media_input.to_domain(),
+            preload: status.preload,
+            cut_point_frames: status.cut_point_frames,
+            audio_policy: status.audio_policy,
+            missing_media_fallback: status.missing_media_fallback,
+            readiness: status.readiness,
+        })
+        .collect()
 }
 
 fn manual_status_from_protocol(

@@ -376,7 +376,9 @@ impl Adapter {
             .pixel_format
             .as_deref()
             .ok_or(Error::MalformedProbe)?;
-        if !supported_non_alpha_pixel_format(pixel_format) {
+        if !supported_non_alpha_pixel_format(pixel_format)
+            && !supported_alpha_pixel_format(pixel_format)
+        {
             return Err(Error::Unsupported(if source_has_alpha(pixel_format) {
                 Unsupported::AlphaVideo
             } else {
@@ -1047,6 +1049,16 @@ impl Adapter {
 }
 
 impl LocalVideoDecoder {
+    /// Restarts this cursor at video ordinal zero.
+    ///
+    /// The selected source, stream, clock domain, and source fingerprint stay
+    /// fixed. The next decode performs the normal source-change checks before
+    /// committing cursor state.
+    pub fn restart(&mut self) {
+        self.ordinal = 0;
+        self.end_of_stream = false;
+    }
+
     /// Decodes the next non-overlapping window, shortening only at proven EOS.
     ///
     /// Cursor state advances only after the complete window has been decoded
@@ -1101,6 +1113,17 @@ impl LocalVideoDecoder {
 }
 
 impl LocalAudioDecoder {
+    /// Restarts this cursor at audio block and sample zero.
+    ///
+    /// The bounded metadata index is retained so repeated clip-local playback
+    /// does not repeat already validated discovery work. Source identity is
+    /// checked before the next decode commits cursor state.
+    pub fn restart(&mut self) {
+        self.ordinal = 0;
+        self.absolute_sample_position = 0;
+        self.end_of_stream = false;
+    }
+
     /// Returns bounded metadata-index work and retention telemetry.
     #[must_use]
     pub fn metadata_index_telemetry(&self) -> crate::AudioMetadataIndexTelemetry {
@@ -2090,6 +2113,31 @@ fn supported_non_alpha_pixel_format(value: &str) -> bool {
     )
 }
 
+fn supported_alpha_pixel_format(value: &str) -> bool {
+    matches!(
+        value,
+        "yuva420p"
+            | "yuva422p"
+            | "yuva444p"
+            | "yuva420p10le"
+            | "yuva422p10le"
+            | "yuva444p10le"
+            | "yuva420p12le"
+            | "yuva422p12le"
+            | "yuva444p12le"
+            | "gbrap"
+            | "gbrap10le"
+            | "gbrap12le"
+            | "gbrap16le"
+            | "rgba"
+            | "bgra"
+            | "argb"
+            | "abgr"
+            | "ya8"
+            | "ya16le"
+    )
+}
+
 fn source_has_alpha(value: &str) -> bool {
     value.starts_with("yuva")
         || value.starts_with("gbrap")
@@ -2186,6 +2234,31 @@ mod tests {
             pixel_format: None,
             interlaced: None,
             sample_count: samples,
+        }
+    }
+
+    #[test]
+    fn alpha_video_admission_is_explicit_and_bounded() {
+        for pixel_format in [
+            "yuva420p",
+            "yuva444p10le",
+            "gbrap",
+            "gbrap16le",
+            "rgba",
+            "bgra",
+            "argb",
+            "abgr",
+            "ya8",
+            "ya16le",
+        ] {
+            assert!(supported_alpha_pixel_format(pixel_format), "{pixel_format}");
+            assert!(source_has_alpha(pixel_format), "{pixel_format}");
+        }
+        for pixel_format in ["yuva444p16be", "gbrap14le", "pal8", "xyz12le"] {
+            assert!(
+                !supported_alpha_pixel_format(pixel_format),
+                "{pixel_format}"
+            );
         }
     }
 

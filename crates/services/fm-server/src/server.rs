@@ -121,11 +121,18 @@ impl<C: ControlPlane> Server<C> {
         }
 
         let scoped_principal = scoped_principal(principal, requested_role);
-        let initial = self
+        let mut initial = self
             .control
             .initial_sync(hello.cached_cursor.as_ref())
             .map_err(HandshakeError::Control)?;
         validate_initial_sync(&initial, hello.cached_cursor.as_ref())?;
+        if !sync_is_compatible(&initial.payload, negotiated) {
+            initial = self
+                .control
+                .initial_sync(None)
+                .map_err(HandshakeError::Control)?;
+            validate_initial_sync(&initial, None)?;
+        }
 
         let permissions = self
             .policy
@@ -161,7 +168,19 @@ impl<C: ControlPlane> Server<C> {
     }
 }
 
+fn sync_is_compatible(payload: &SyncPayload, negotiated: fm_protocol::ProtocolVersion) -> bool {
+    match payload {
+        SyncPayload::Snapshot(snapshot) => {
+            WireMessage::Snapshot(snapshot.as_ref().clone()).is_compatible_with(negotiated)
+        }
+        SyncPayload::Resume(events) => events
+            .iter()
+            .all(|event| WireMessage::Event(event.clone()).is_compatible_with(negotiated)),
+    }
+}
+
 fn compatible_sync(payload: SyncPayload, negotiated: fm_protocol::ProtocolVersion) -> SyncPayload {
+    debug_assert!(sync_is_compatible(&payload, negotiated));
     match payload {
         SyncPayload::Snapshot(snapshot) => {
             let WireMessage::Snapshot(snapshot) =

@@ -6,8 +6,11 @@ use fm_engine::{Engine, EngineManualTransitionKind, ShowState};
 use fm_protocol::{
     CommandMessage, CommandPayload, CommandResult, EngineIdentity, EventCursor,
     ManualTransitionKind, ManualTransitionPosition, ManualTransitionStatus, ProtocolVersion,
-    RuntimeLifecycleEvent, ServerIdentity, WireInputId, WireMessage,
+    RuntimeLifecycleEvent, ServerIdentity, StingerAudioPolicy as ProtocolStingerAudioPolicy,
+    StingerMissingMediaFallback as ProtocolStingerFallback, StingerReadiness, StingerStatus,
+    WireInputId, WireMessage, WireStingerSlotId,
 };
+use fm_switcher::{MissingMediaFallback, StingerAudioPolicy, StingerDescriptor, StingerSlotId};
 use fm_types::{FrameRate, InputId};
 
 use super::*;
@@ -48,6 +51,121 @@ fn service(retained_events: usize, subscriber_queue: usize) -> ControlService {
             subscriber_queue,
         },
     )
+}
+
+fn stinger_service() -> ControlService {
+    let mut show = ShowState::new(
+        "stinger show",
+        vec![input(1), input(2), input(3)],
+        input(1),
+        input(2),
+    )
+    .unwrap();
+    let slot = StingerSlotId::new(1).unwrap();
+    show.configure_stinger(
+        slot,
+        StingerDescriptor::new(
+            input(3),
+            true,
+            1,
+            StingerAudioPolicy::Muted,
+            MissingMediaFallback::KeepProgram,
+        ),
+    )
+    .unwrap();
+    show.preload_stinger(slot, true).unwrap();
+    ControlService::new(
+        Engine::new(
+            show,
+            FrameRate::new(60, 1).unwrap(),
+            ClockDomainId::new(NonZeroU128::new(1).unwrap()),
+        ),
+        Policy::production(),
+        "engine-a",
+        "log-a",
+        ControlLimits {
+            retained_events: 8,
+            max_subscribers: 4,
+            subscriber_queue: 8,
+        },
+    )
+}
+
+#[test]
+fn snapshot_projects_exact_stinger_configuration_and_realized_readiness() {
+    let control = stinger_service();
+    assert_eq!(
+        control.snapshot().snapshot.stingers,
+        Some(vec![StingerStatus {
+            slot: WireStingerSlotId::new(1).unwrap(),
+            media_input: WireInputId::from_domain(input(3)),
+            preload: true,
+            cut_point_frames: 1,
+            audio_policy: ProtocolStingerAudioPolicy::Muted,
+            missing_media_fallback: ProtocolStingerFallback::KeepProgram,
+            readiness: StingerReadiness::Ready,
+        }])
+    );
+}
+
+#[test]
+fn stinger_slot_mutation_is_transition_authorized_and_projects_durable_state() {
+    let mut control = service(8, 8);
+    let configure = CommandPayload::ConfigureStinger {
+        slot: WireStingerSlotId::new(8).unwrap(),
+        media_input: WireInputId::from_domain(input(3)),
+        preload: true,
+        cut_point_frames: 4,
+        audio_policy: ProtocolStingerAudioPolicy::MixWithProgram,
+        missing_media_fallback: ProtocolStingerFallback::Fade,
+    };
+    let denied = control
+        .submit(
+            &principal(Role::Graphics),
+            command("configure-denied", "configure-denied-key", configure),
+            0,
+        )
+        .unwrap();
+    assert!(matches!(
+        denied.output.result,
+        CommandResult::Rejected { ref code, .. } if code == "permission_denied"
+    ));
+
+    let accepted = control
+        .submit(
+            &principal(Role::Operator),
+            command("configure", "configure-key", configure),
+            0,
+        )
+        .unwrap();
+    assert!(matches!(
+        accepted.output.events.as_slice(),
+        [EventMessage {
+            payload: EventPayload::StingerSlotsChanged { stingers, .. },
+            ..
+        }] if stingers.len() == 1 && stingers[0].slot.number() == 8
+    ));
+    control.tick(&server_identity()).unwrap();
+    assert_eq!(
+        control.snapshot().snapshot.stingers.as_ref().unwrap()[0].readiness,
+        StingerReadiness::Ready
+    );
+
+    control
+        .submit(
+            &principal(Role::Operator),
+            command(
+                "remove",
+                "remove-key",
+                CommandPayload::RemoveStinger {
+                    slot: WireStingerSlotId::new(8).unwrap(),
+                },
+            ),
+            0,
+        )
+        .unwrap();
+    control.tick(&server_identity()).unwrap();
+    assert_eq!(control.snapshot().snapshot.stingers, Some(Vec::new()));
 }
 
 fn command(id: &str, key: &str, payload: CommandPayload) -> CommandMessage {
@@ -503,6 +621,59 @@ fn zoom_propagates_with_exact_runtime_kind_and_endpoints() {
     assert_eq!(endpoint.frame.program.primary, input(2));
     assert_eq!(endpoint.frame.program.secondary, None);
     assert_eq!(endpoint.frame.program.transition_kind, None);
+}
+
+#[test]
+fn stinger_slot_propagates_with_exact_runtime_kind_and_endpoints() {
+    let mut control = stinger_service();
+    let accepted = control
+        .submit(
+            &principal(Role::Operator),
+            command(
+                "stinger",
+                "stinger-key",
+                CommandPayload::Stinger {
+                    slot: WireStingerSlotId::new(1).unwrap(),
+                    duration_frames: 3,
+                },
+            ),
+            0,
+        )
+        .unwrap();
+    assert!(matches!(
+        accepted.output.result,
+        CommandResult::Accepted {
+            revision: 1,
+            scheduled_frame: Some(0),
+            ..
+        }
+    ));
+
+    for (start, end) in [(0, 1), (1, 2), (2, 3)] {
+        let tick = control.tick(&server_identity()).unwrap();
+        assert_eq!(
+            tick.frame.program.transition_kind,
+            Some(fm_switcher::TransitionKind::Stinger(
+                StingerSlotId::new(1).unwrap()
+            ))
+        );
+        assert_eq!(
+            (
+                tick.frame.program.mix_start_numerator,
+                tick.frame.program.mix_end_numerator,
+            ),
+            (start, end)
+        );
+    }
+    assert_eq!(
+        control
+            .tick(&server_identity())
+            .unwrap()
+            .frame
+            .program
+            .primary,
+        input(2)
+    );
 }
 
 #[test]
@@ -1313,7 +1484,16 @@ fn tick_realizes_the_command_on_its_exact_scheduled_frame() {
         panic!("cut should be accepted");
     };
 
+    let projected = control.project_next_frame().unwrap();
+    assert_eq!(projected.frame.get(), scheduled_frame.unwrap());
+    assert_eq!(projected.program.primary, input(2));
+    assert_eq!(
+        control.next_frame_deadline().unwrap(),
+        fm_clock::ClockTime::ZERO
+    );
+
     let tick = control.tick(&server_identity()).unwrap();
+    assert_eq!(tick.frame, projected);
     assert_eq!(scheduled_frame, Some(tick.frame.frame.get()));
     assert_eq!(tick.frame.frame.get(), 0);
     assert_eq!(tick.frame.program.primary, input(2));

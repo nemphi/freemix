@@ -6,6 +6,7 @@ use fm_model::{
     OLDEST_SUPPORTED_SCHEMA_VERSION, Output, OutputFormat, Project, ProjectSettings, RectMask,
     RestartPolicy, Rgba8, Rotation, SUPPORTED_SCHEMA_VERSIONS, Scene, SchemaVersion,
     SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef, StartupPolicy,
+    StingerAudioPolicy, StingerConfig, StingerMissingMediaFallback, StingerSlotNumber,
     ValidationErrorKind,
 };
 use fm_types::{
@@ -246,11 +247,12 @@ fn duplicate_routes_are_rejected() {
 
 #[test]
 fn schema_support_window_is_current_through_oldest_supported() {
-    assert_eq!(CURRENT_SCHEMA_VERSION, SchemaVersion::new(9));
+    assert_eq!(CURRENT_SCHEMA_VERSION, SchemaVersion::new(10));
     assert_eq!(OLDEST_SUPPORTED_SCHEMA_VERSION, SchemaVersion::new(2));
     assert_eq!(
         SUPPORTED_SCHEMA_VERSIONS,
         [
+            SchemaVersion::new(10),
             SchemaVersion::new(9),
             SchemaVersion::new(8),
             SchemaVersion::new(7),
@@ -265,11 +267,70 @@ fn schema_support_window_is_current_through_oldest_supported() {
     assert!(!CURRENT_SCHEMA_VERSION.requires_migration());
     assert!(SchemaVersion::new(2).requires_migration());
     assert!(!SchemaVersion::new(1).is_supported());
-    assert!(!SchemaVersion::new(10).is_supported());
+    assert!(!SchemaVersion::new(11).is_supported());
 
     let input = MigrationInput::new(SchemaVersion::new(2), ("format-neutral", 7_u8));
     assert_eq!(input.schema_version(), SchemaVersion::new(2));
     assert_eq!(input.into_representation(), ("format-neutral", 7));
+}
+
+#[test]
+fn stinger_slots_are_unique_and_reference_project_inputs() {
+    let mut project = valid_project();
+    let slot = StingerSlotNumber::new(1).unwrap();
+    let config = |media_input| {
+        StingerConfig::new(
+            slot,
+            media_input,
+            true,
+            12,
+            StingerAudioPolicy::MixWithProgram,
+            StingerMissingMediaFallback::Fade,
+        )
+    };
+    project.add_stinger(config(input_id(1)));
+    assert!(project.validate().is_ok());
+
+    project.add_stinger(config(input_id(99)));
+    let errors = project.validate().unwrap_err();
+    assert!(errors.iter().any(|error| {
+        error.field == "stingers.slot" && error.kind == ValidationErrorKind::DuplicateId
+    }));
+    assert!(errors.iter().any(|error| {
+        error.field == "stingers.media_input"
+            && error.kind == ValidationErrorKind::MissingReference(EntityRef::Input(input_id(99)))
+    }));
+    assert_eq!(StingerSlotNumber::new(0), None);
+    assert_eq!(StingerSlotNumber::new(9), None);
+}
+
+#[test]
+fn stinger_slots_can_be_reconfigured_and_removed_without_duplicates() {
+    let mut project = simulated_project();
+    let first = StingerConfig::new(
+        StingerSlotNumber::new(1).unwrap(),
+        input_id(1),
+        true,
+        12,
+        StingerAudioPolicy::Muted,
+        StingerMissingMediaFallback::Cut,
+    );
+    let replacement = StingerConfig::new(
+        first.slot,
+        input_id(2),
+        false,
+        24,
+        StingerAudioPolicy::MixWithProgram,
+        StingerMissingMediaFallback::KeepProgram,
+    );
+
+    project.set_stinger(first);
+    project.set_stinger(replacement);
+    assert_eq!(project.stingers(), &[replacement]);
+    assert_eq!(project.remove_stinger(first.slot), Some(replacement));
+    assert!(project.stingers().is_empty());
+    assert_eq!(project.remove_stinger(first.slot), None);
+    assert_eq!(project.validate(), Ok(()));
 }
 
 #[test]

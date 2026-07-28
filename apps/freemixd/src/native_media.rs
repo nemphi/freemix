@@ -23,10 +23,12 @@ use std::{
 
 use fm_audio::{
     AudioCadenceOrigin, AudioRenderPlan, AudioSilenceSpan, AudioSynchronizerLimits, ChannelMapping,
-    ClockMappedAudioSynchronizer, InputState, MAX_CHANNEL_MAPPING_CHANNELS, MasterAudioInterval,
-    MasterMixer, PlanarAudioSource, SourceGain,
+    ClippingPolicy, ClockMappedAudioSynchronizer, InputState, MAX_CHANNEL_MAPPING_CHANNELS,
+    MasterAudioInterval, MasterMixer, PlanarAudioSource, SourceGain,
 };
-use fm_clock::{ClockDomainId as MappingClockDomainId, ClockMapping, ClockSnapshot, ClockTime};
+use fm_clock::{
+    ClockDomainId as MappingClockDomainId, ClockMapping, ClockSnapshot, ClockTime, FrameCadence,
+};
 #[cfg(test)]
 use fm_codec_ffmpeg::SequenceRequest;
 use fm_codec_ffmpeg::{
@@ -40,9 +42,10 @@ use fm_compositor::{
     CompositionPlan, FadeToBlackPlan, FadeToBlackPlanError,
     FadeToBlackPosition as CompositorFadeToBlackPosition, NativeCompositionError,
     NativeCompositionRenderer, NativeFadeToBlackError, NativeFadeToBlackRenderer,
-    NativeSourceFrame, NativeTransitionError, NativeTransitionRenderer, OutputTarget, PlanError,
-    RectMask as CompositorRectMask, Rgba8 as CompositorRgba8, Rotation as CompositorRotation,
-    Scene as CompositorScene, SourceId, SourceLayer, Transform, TransitionError, TransitionKind,
+    NativeSourceFrame, NativeStingerError, NativeStingerRenderer, NativeTransitionError,
+    NativeTransitionRenderer, OutputTarget, PlanError, RectMask as CompositorRectMask,
+    Rgba8 as CompositorRgba8, Rotation as CompositorRotation, Scene as CompositorScene, SourceId,
+    SourceLayer, StingerFramePlan, StingerPlanError, Transform, TransitionError, TransitionKind,
     TransitionPlan, compile_scene,
 };
 use fm_engine::FrameResult;
@@ -54,7 +57,10 @@ use fm_gpu::{
     DiagnosticReadback, NativeAdapterInfo, NativeBackend, NativeContext, NativeGpuError,
     NativeTexture, NativeTextureReadback,
 };
-use fm_model::{InputAudioStripState, InputKind, Project, Rotation, SourceRef};
+use fm_model::{
+    InputAudioStripState, InputKind, Project, Rotation, SourceRef,
+    StingerAudioPolicy as ModelStingerAudioPolicy,
+};
 use fm_sim::{CollectingAudioSink, OverflowPolicy, SinkConfigError, SinkTelemetry};
 use fm_switcher::{FadeToBlackFrame, ProgramFrame, TransitionKind as SwitcherTransitionKind};
 use fm_types::{AudioFormat, FrameRate, InputId, SampleFormat, SceneId, TimeBase};
@@ -134,11 +140,26 @@ struct NativeSceneExecution {
     remaining_consumers: BTreeMap<SceneId, usize>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeStingerConfig {
+    media_input: InputId,
+    preload: bool,
+    cut_point_frames: u32,
+    audio_policy: ModelStingerAudioPolicy,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeStingerFrameRequest {
+    pub input: InputId,
+    pub deadline: ClockTime,
+}
+
 /// Typed failures produced before any native device or decoder is opened.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NativeProjectPlanError {
     MissingInput(InputId),
     MissingScene(SceneId),
+    InvalidStingerSlot(u8),
     SceneCycle {
         scene: SceneId,
     },
@@ -181,6 +202,9 @@ impl fmt::Display for NativeProjectPlanError {
                 write!(formatter, "native scene references missing input {input}")
             }
             Self::MissingScene(scene) => write!(formatter, "native scene {scene} is missing"),
+            Self::InvalidStingerSlot(slot) => {
+                write!(formatter, "native project has invalid Stinger slot {slot}")
+            }
             Self::SceneCycle { scene } => {
                 write!(formatter, "native scene dependency cycle reaches {scene}")
             }
@@ -239,6 +263,8 @@ pub struct NativeProjectPlan {
     video_routes: BTreeMap<InputId, NativeVideoRoute>,
     audio_routes: BTreeMap<InputId, NativeAudioRoute>,
     audio_strips: BTreeMap<InputId, InputAudioStripState>,
+    stingers: BTreeMap<fm_switcher::StingerSlotId, NativeStingerConfig>,
+    frame_rate: FrameRate,
     scenes: Vec<NativeScenePlan>,
     peak_rgba16f_targets: usize,
     transient_rgba16f_bytes: u64,
@@ -439,7 +465,13 @@ impl NativeProjectPlan {
             });
         }
 
-        let peak_rgba16f_targets = maximum_native_execution_peak(&video_routes, &scenes)?;
+        let stinger_routes = project
+            .stingers()
+            .iter()
+            .filter_map(|config| video_routes.get(&config.media_input).copied())
+            .collect::<Vec<_>>();
+        let peak_rgba16f_targets =
+            maximum_native_execution_peak(&video_routes, &stinger_routes, &scenes)?;
         let frame_bytes = u64::from(dimensions.width())
             .checked_mul(u64::from(dimensions.height()))
             .and_then(|pixels| pixels.checked_mul(RGBA16_FLOAT_BYTES_PER_PIXEL))
@@ -470,6 +502,27 @@ impl NativeProjectPlan {
             let route = resolve_audio_route(input.id, &inputs, &mut audio_routes, &mut visiting)?;
             audio_routes.insert(input.id, route);
         }
+        let stingers = project
+            .stingers()
+            .iter()
+            .map(|config| {
+                fm_switcher::StingerSlotId::new(config.slot.number())
+                    .map(|slot| {
+                        (
+                            slot,
+                            NativeStingerConfig {
+                                media_input: config.media_input,
+                                preload: config.preload,
+                                cut_point_frames: config.cut_point_frames,
+                                audio_policy: config.audio_policy,
+                            },
+                        )
+                    })
+                    .ok_or(NativeProjectPlanError::InvalidStingerSlot(
+                        config.slot.number(),
+                    ))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
         Ok(Self {
             video_routes,
             audio_routes,
@@ -478,6 +531,8 @@ impl NativeProjectPlan {
                 .iter()
                 .map(|strip| (strip.input, strip.state))
                 .collect(),
+            stingers,
+            frame_rate: project.settings().frame_rate,
             scenes,
             peak_rgba16f_targets,
             transient_rgba16f_bytes,
@@ -497,6 +552,30 @@ impl NativeProjectPlan {
     #[must_use]
     pub fn audio_strip(&self, input: InputId) -> Option<InputAudioStripState> {
         self.audio_strips.get(&input).copied()
+    }
+
+    fn stinger(&self, slot: fm_switcher::StingerSlotId) -> Option<NativeStingerConfig> {
+        self.stingers.get(&slot).copied()
+    }
+
+    /// Resolves the clip-local media deadline required by an authoritative
+    /// projected Stinger frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed project-plan or clip-deadline failure.
+    pub fn stinger_frame_request(
+        &self,
+        frame: &FrameResult,
+    ) -> Result<Option<NativeStingerFrameRequest>, NativeSourceRenderError> {
+        let NativeProjectMixPlan::Stinger(plan) = native_project_mix_plan(self, frame.program)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(NativeStingerFrameRequest {
+            input: plan.media,
+            deadline: stinger_frame_deadline(self.frame_rate, plan.frame.frame_index())?,
+        }))
     }
 
     #[must_use]
@@ -523,14 +602,11 @@ impl NativeProjectPlan {
         self.transient_rgba16f_bytes
     }
 
-    fn scene_execution(
-        &self,
-        primary: InputId,
-        secondary: InputId,
-    ) -> Option<NativeSceneExecution> {
+    fn scene_execution(&self, inputs: &[InputId]) -> Option<NativeSceneExecution> {
         scene_execution_for_routes(
-            self.video_routes.get(&primary).copied(),
-            self.video_routes.get(&secondary).copied(),
+            inputs
+                .iter()
+                .map(|input| self.video_routes.get(input).copied()),
             &self.scenes,
         )
     }
@@ -538,26 +614,34 @@ impl NativeProjectPlan {
 
 fn maximum_native_execution_peak(
     routes: &BTreeMap<InputId, NativeVideoRoute>,
+    stinger_routes: &[NativeVideoRoute],
     scenes: &[NativeScenePlan],
 ) -> Result<usize, NativeProjectPlanError> {
     let routes = routes.values().copied().collect::<Vec<_>>();
     let mut maximum = 3_usize;
     for primary in &routes {
         for secondary in &routes {
-            let execution = scene_execution_for_routes(Some(*primary), Some(*secondary), scenes)
+            let execution = scene_execution_for_routes([Some(*primary), Some(*secondary)], scenes)
                 .ok_or(NativeProjectPlanError::TransientTargetCountOverflow)?;
             maximum = maximum.max(native_execution_peak(&execution)?);
+            for stinger in stinger_routes {
+                let execution = scene_execution_for_routes(
+                    [Some(*primary), Some(*secondary), Some(*stinger)],
+                    scenes,
+                )
+                .ok_or(NativeProjectPlanError::TransientTargetCountOverflow)?;
+                maximum = maximum.max(native_execution_peak(&execution)?);
+            }
         }
     }
     Ok(maximum)
 }
 
 fn scene_execution_for_routes(
-    primary: Option<NativeVideoRoute>,
-    secondary: Option<NativeVideoRoute>,
+    routes: impl IntoIterator<Item = Option<NativeVideoRoute>>,
     scenes: &[NativeScenePlan],
 ) -> Option<NativeSceneExecution> {
-    let roots = [primary, secondary]
+    let roots = routes
         .into_iter()
         .flatten()
         .filter_map(|route| match route {
@@ -756,6 +840,7 @@ pub enum NativeMediaError {
     Color(NativeImportError),
     SceneCompositor(NativeCompositionError),
     Compositor(NativeTransitionError),
+    Stinger(NativeStingerError),
     FadeToBlack(NativeFadeToBlackError),
 }
 
@@ -769,6 +854,7 @@ impl fmt::Display for NativeMediaError {
                 write!(formatter, "native scene composition failed: {error}")
             }
             Self::Compositor(error) => write!(formatter, "native composition failed: {error}"),
+            Self::Stinger(error) => write!(formatter, "native Stinger setup failed: {error}"),
             Self::FadeToBlack(error) => {
                 write!(formatter, "native Fade-to-Black setup failed: {error}")
             }
@@ -784,6 +870,7 @@ impl Error for NativeMediaError {
             Self::Color(error) => Some(error),
             Self::SceneCompositor(error) => Some(error),
             Self::Compositor(error) => Some(error),
+            Self::Stinger(error) => Some(error),
             Self::FadeToBlack(error) => Some(error),
         }
     }
@@ -810,6 +897,12 @@ impl From<NativeImportError> for NativeMediaError {
 impl From<NativeTransitionError> for NativeMediaError {
     fn from(value: NativeTransitionError) -> Self {
         Self::Compositor(value)
+    }
+}
+
+impl From<NativeStingerError> for NativeMediaError {
+    fn from(value: NativeStingerError) -> Self {
+        Self::Stinger(value)
     }
 }
 
@@ -1061,6 +1154,17 @@ pub enum NativeSourcePlaybackError {
     SourceNotLive {
         input: InputId,
     },
+    MissingSource {
+        input: InputId,
+    },
+    StingerSourceNotFullyPreloaded {
+        input: InputId,
+        retained_frames: usize,
+        maximum_frames: u32,
+    },
+    StingerSourceIsLive {
+        input: InputId,
+    },
     Failed,
 }
 
@@ -1095,6 +1199,20 @@ impl fmt::Display for NativeSourcePlaybackError {
             Self::SourceNotLive { input } => {
                 write!(formatter, "source {input} is not a live video source")
             }
+            Self::MissingSource { input } => {
+                write!(formatter, "source {input} is not registered")
+            }
+            Self::StingerSourceNotFullyPreloaded {
+                input,
+                retained_frames,
+                maximum_frames,
+            } => write!(
+                formatter,
+                "Stinger source {input} did not reach end of stream within {retained_frames} retained frames; maximum is {maximum_frames}"
+            ),
+            Self::StingerSourceIsLive { input } => {
+                write!(formatter, "Stinger source {input} is a live video source")
+            }
             Self::Failed => formatter.write_str("native source playback previously failed"),
         }
     }
@@ -1111,6 +1229,9 @@ impl Error for NativeSourcePlaybackError {
             | Self::WorkerPanicked
             | Self::WorkerQueueFull
             | Self::SourceNotLive { .. }
+            | Self::MissingSource { .. }
+            | Self::StingerSourceNotFullyPreloaded { .. }
+            | Self::StingerSourceIsLive { .. }
             | Self::Failed => None,
         }
     }
@@ -1136,13 +1257,19 @@ pub enum NativeSourceRenderError {
         actual_height: u32,
     },
     MissingTransitionKind,
+    MissingStingerConfiguration(fm_switcher::StingerSlotId),
+    StingerSourceNotPreloaded {
+        input: InputId,
+    },
     UnsupportedTransition(SwitcherTransitionKind),
     InvalidMix(TransitionError),
+    InvalidStinger(StingerPlanError),
     ResourceBounds,
     ConcurrentProjectRender,
     Completion(NativeGpuError),
     SceneCompositor(NativeCompositionError),
     Compositor(NativeTransitionError),
+    Stinger(NativeStingerError),
     InvalidFadeToBlack(FadeToBlackPlanError),
     FadeToBlack(NativeFadeToBlackError),
 }
@@ -1164,10 +1291,26 @@ impl fmt::Display for NativeSourceRenderError {
             Self::MissingTransitionKind => {
                 formatter.write_str("program-frame transition kind is missing")
             }
+            Self::MissingStingerConfiguration(slot) => {
+                write!(
+                    formatter,
+                    "native project has no configuration for Stinger slot {}",
+                    slot.number()
+                )
+            }
+            Self::StingerSourceNotPreloaded { input } => {
+                write!(
+                    formatter,
+                    "native Stinger source {input} is not pinned for clip-local playback"
+                )
+            }
             Self::UnsupportedTransition(kind) => {
                 write!(formatter, "native transition {kind:?} is not supported")
             }
             Self::InvalidMix(error) => write!(formatter, "program-frame mix is invalid: {error}"),
+            Self::InvalidStinger(error) => {
+                write!(formatter, "program-frame Stinger is invalid: {error}")
+            }
             Self::ResourceBounds => {
                 formatter.write_str("native scene execution exceeded planned resource bounds")
             }
@@ -1181,6 +1324,7 @@ impl fmt::Display for NativeSourceRenderError {
                 write!(formatter, "native scene composition failed: {error}")
             }
             Self::Compositor(error) => write!(formatter, "native composition failed: {error}"),
+            Self::Stinger(error) => write!(formatter, "native Stinger rendering failed: {error}"),
             Self::InvalidFadeToBlack(error) => {
                 write!(formatter, "native Fade-to-Black plan is invalid: {error}")
             }
@@ -1195,14 +1339,18 @@ impl Error for NativeSourceRenderError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::InvalidMix(error) => Some(error),
+            Self::InvalidStinger(error) => Some(error),
             Self::Completion(error) => Some(error),
             Self::SceneCompositor(error) => Some(error),
             Self::Compositor(error) => Some(error),
+            Self::Stinger(error) => Some(error),
             Self::InvalidFadeToBlack(error) => Some(error),
             Self::FadeToBlack(error) => Some(error),
             Self::MissingSource { .. }
             | Self::DimensionMismatch { .. }
             | Self::MissingTransitionKind
+            | Self::MissingStingerConfiguration(_)
+            | Self::StingerSourceNotPreloaded { .. }
             | Self::ResourceBounds
             | Self::ConcurrentProjectRender
             | Self::UnsupportedTransition(_) => None,
@@ -1226,7 +1374,9 @@ struct NativeVideoPrefix {
     clock_domain: ClockDomainId,
     kind: NativeVideoSourceKind,
     end_of_stream: bool,
-    in_flight: Option<NonZeroU32>,
+    in_flight: Option<NativeDecodeRequest>,
+    available_for_stinger: bool,
+    pinned_for_stinger: bool,
 }
 
 /// Bounded GPU-resident video prefixes keyed by full-width input identity.
@@ -1300,25 +1450,37 @@ impl NativeVideoPrefix {
         if self.kind == NativeVideoSourceKind::Live {
             !self.frames.is_empty()
         } else {
-            source_covers_deadline(
-                self.offsets_ns.last().copied(),
-                self.end_of_stream,
-                deadline,
-            )
+            self.in_flight
+                .is_none_or(|request| request.operation != NativeDecodeOperation::Restart)
+                && self
+                    .offsets_ns
+                    .first()
+                    .is_some_and(|first| *first <= deadline.as_nanos())
+                && source_covers_deadline(
+                    self.offsets_ns.last().copied(),
+                    self.end_of_stream,
+                    deadline,
+                )
         }
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeDecodeOperation {
+    Continue,
+    Restart,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct NativeDecodeRequest {
     input: InputId,
     count: NonZeroU32,
+    operation: NativeDecodeOperation,
 }
 
 #[derive(Debug)]
 struct NativeDecodeResult {
-    input: InputId,
-    count: NonZeroU32,
+    request: NativeDecodeRequest,
     window: Result<DecodedVideoWindow, fm_codec_ffmpeg::Error>,
 }
 
@@ -1343,13 +1505,14 @@ impl NativeDecodeWorker {
                     let window = decoders
                         .get_mut(&request.input)
                         .ok_or(fm_codec_ffmpeg::Error::InvalidConfig)
-                        .and_then(|decoder| decoder.decode_up_to(request.count));
+                        .and_then(|decoder| {
+                            if request.operation == NativeDecodeOperation::Restart {
+                                decoder.restart();
+                            }
+                            decoder.decode_up_to(request.count)
+                        });
                     if result_sender
-                        .send(NativeDecodeResult {
-                            input: request.input,
-                            count: request.count,
-                            window,
-                        })
+                        .send(NativeDecodeResult { request, window })
                         .is_err()
                     {
                         break;
@@ -1405,6 +1568,67 @@ impl NativeSourcePlayback {
         drop(worker);
         registry
     }
+
+    /// Pins one fully decoded source for clip-local Stinger playback.
+    ///
+    /// Pinned frames are not evicted by the global input timeline, so repeated
+    /// Stinger triggers can restart from local frame zero without decode or
+    /// upload work. A decoded source must have reached EOS during bounded
+    /// preflight; live sources cannot provide deterministic retriggering.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error for failed playback, a missing source, a live
+    /// source, or a local video longer than the configured GPU prefix bound.
+    pub fn pin_stinger_source(&mut self, input: InputId) -> Result<(), NativeSourcePlaybackError> {
+        if self.failed {
+            return Err(NativeSourcePlaybackError::Failed);
+        }
+        let maximum_frames = self.registry.limits.max_video_frames_per_source.get();
+        let prefix = self
+            .registry
+            .sources
+            .get_mut(&input)
+            .ok_or(NativeSourcePlaybackError::MissingSource { input })?;
+        if prefix.kind == NativeVideoSourceKind::Live {
+            return Err(NativeSourcePlaybackError::StingerSourceIsLive { input });
+        }
+        if prefix.kind == NativeVideoSourceKind::Decoded && !prefix.end_of_stream {
+            return Err(NativeSourcePlaybackError::StingerSourceNotFullyPreloaded {
+                input,
+                retained_frames: prefix.frames.len(),
+                maximum_frames,
+            });
+        }
+        prefix.available_for_stinger = true;
+        prefix.pinned_for_stinger = true;
+        Ok(())
+    }
+
+    /// Enables one decoded or retained source for an independently serviced
+    /// clip-local Stinger ring without pinning its frames.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed failed-playback, missing-source, or live-source error.
+    pub fn enable_stinger_source(
+        &mut self,
+        input: InputId,
+    ) -> Result<(), NativeSourcePlaybackError> {
+        if self.failed {
+            return Err(NativeSourcePlaybackError::Failed);
+        }
+        let prefix = self
+            .registry
+            .sources
+            .get_mut(&input)
+            .ok_or(NativeSourcePlaybackError::MissingSource { input })?;
+        if prefix.kind == NativeVideoSourceKind::Live {
+            return Err(NativeSourcePlaybackError::StingerSourceIsLive { input });
+        }
+        prefix.available_for_stinger = true;
+        Ok(())
+    }
 }
 
 /// Resource bounds for the independent CPU audio runtime.
@@ -1437,6 +1661,73 @@ impl Default for NativeAudioLimits {
     }
 }
 
+fn partition_native_audio_limits(
+    limits: NativeAudioLimits,
+    has_stinger_audio: bool,
+) -> Result<(NativeAudioLimits, NativeAudioLimits), NativeMasterError> {
+    if !has_stinger_audio {
+        return Ok((limits, limits));
+    }
+    let ordinary = NativeAudioLimits {
+        max_retained_blocks: limits.max_retained_blocks / 2,
+        max_retained_samples: limits.max_retained_samples / 2,
+        max_retained_bytes: limits.max_retained_bytes / 2,
+        ..limits
+    };
+    let stinger = NativeAudioLimits {
+        max_retained_blocks: limits
+            .max_retained_blocks
+            .checked_sub(ordinary.max_retained_blocks)
+            .ok_or(NativeMasterError::InvalidLimits)?,
+        max_retained_samples: limits
+            .max_retained_samples
+            .checked_sub(ordinary.max_retained_samples)
+            .ok_or(NativeMasterError::InvalidLimits)?,
+        max_retained_bytes: limits
+            .max_retained_bytes
+            .checked_sub(ordinary.max_retained_bytes)
+            .ok_or(NativeMasterError::InvalidLimits)?,
+        ..limits
+    };
+    Ok((ordinary, stinger))
+}
+
+fn partition_stinger_audio_limits(
+    limits: NativeAudioLimits,
+    source_count: usize,
+) -> Result<NativeAudioLimits, NativeMasterError> {
+    if source_count == 0 {
+        return Err(NativeMasterError::InvalidLimits);
+    }
+    Ok(NativeAudioLimits {
+        max_retained_blocks: limits.max_retained_blocks / source_count,
+        max_retained_samples: limits.max_retained_samples / source_count,
+        max_retained_bytes: limits.max_retained_bytes / source_count,
+        sink_blocks: 1,
+        ..limits
+    })
+}
+
+fn native_source_has_audio(
+    adapter: Option<&Adapter>,
+    source: &NativeResolvedSource,
+) -> Result<bool, NativeMasterError> {
+    let NativeResolvedSource::LocalVideo { input, path } = source else {
+        return Ok(false);
+    };
+    let adapter = adapter.ok_or(NativeMasterError::InvalidFormat)?;
+    let probe = adapter
+        .probe_local(path)
+        .map_err(|error| NativeMasterError::Ffmpeg {
+            input: *input,
+            error,
+        })?;
+    Ok(probe
+        .streams
+        .iter()
+        .any(|stream| matches!(stream.kind, StreamKind::Audio)))
+}
+
 /// Fatal setup, decode-contract, or render failures in native CPU audio.
 #[derive(Debug)]
 pub enum NativeMasterError {
@@ -1467,6 +1758,8 @@ pub enum NativeMasterError {
         input: InputId,
     },
     MissingAudioTransitionKind,
+    MissingStingerConfiguration(fm_switcher::StingerSlotId),
+    InvalidStinger(StingerPlanError),
     UnsupportedAudioTransition(SwitcherTransitionKind),
     UnexpectedFrame {
         expected: u64,
@@ -1527,6 +1820,16 @@ impl fmt::Display for NativeMasterError {
             Self::MissingAudioTransitionKind => {
                 formatter.write_str("native audio transition kind is missing")
             }
+            Self::MissingStingerConfiguration(slot) => {
+                write!(
+                    formatter,
+                    "native project has no audio configuration for Stinger slot {}",
+                    slot.number()
+                )
+            }
+            Self::InvalidStinger(error) => {
+                write!(formatter, "native Stinger audio plan is invalid: {error}")
+            }
             Self::UnsupportedAudioTransition(kind) => {
                 write!(
                     formatter,
@@ -1559,6 +1862,7 @@ impl Error for NativeMasterError {
             Self::AudioBlock(error) => Some(error),
             Self::Timing(error) => Some(error),
             Self::SinkConfig(error) => Some(error),
+            Self::InvalidStinger(error) => Some(error),
             _ => None,
         }
     }
@@ -1604,11 +1908,17 @@ impl From<SinkConfigError> for NativeMasterError {
 struct NativeAudioSource {
     explicit_silence: bool,
     synchronizer: Option<ClockMappedAudioSynchronizer>,
+    timeline_origin: AudioCadenceOrigin,
     next_sample: u64,
     next_sequence: u64,
     audio_start_master_sample: u64,
     end_of_stream: bool,
     in_flight: Option<NativeAudioReservation>,
+    decode_generation: u64,
+    restart_decode: bool,
+    restart_sample: u64,
+    restart_sequence: u64,
+    restart_target_ordinal: usize,
 }
 
 impl NativeAudioSource {
@@ -1616,29 +1926,44 @@ impl NativeAudioSource {
         Self {
             explicit_silence: true,
             synchronizer: None,
+            timeline_origin: AudioCadenceOrigin::new(NormalizedTimestamp::from_nanos(0), 0),
             next_sample: 0,
             next_sequence: 0,
             audio_start_master_sample: 0,
             end_of_stream: true,
             in_flight: None,
+            decode_generation: 0,
+            restart_decode: false,
+            restart_sample: 0,
+            restart_sequence: 0,
+            restart_target_ordinal: 0,
         }
     }
 
     fn decoded(
         synchronizer: ClockMappedAudioSynchronizer,
-        next_sample: u64,
-        next_sequence: u64,
+        timeline_origin: AudioCadenceOrigin,
+        page: ValidatedAudioPage,
         audio_start_master_sample: u64,
         end_of_stream: bool,
+        restart_target_ordinal: usize,
+        restart_sequence: u64,
     ) -> Self {
+        let restart_sample = synchronizer.source_origin().sample_index();
         Self {
             explicit_silence: false,
             synchronizer: Some(synchronizer),
-            next_sample,
-            next_sequence,
+            timeline_origin,
+            next_sample: page.next_sample,
+            next_sequence: page.next_sequence,
             audio_start_master_sample,
             end_of_stream,
             in_flight: None,
+            decode_generation: 0,
+            restart_decode: false,
+            restart_sample,
+            restart_sequence,
+            restart_target_ordinal,
         }
     }
 }
@@ -1654,6 +1979,7 @@ struct NativeAudioCharge {
 struct NativeAudioReservation {
     count: NonZeroU32,
     charge: NativeAudioCharge,
+    generation: u64,
 }
 
 /// Mutation-point pressure and alignment telemetry for native audio.
@@ -1675,6 +2001,51 @@ pub struct NativeAudioTelemetry {
     pub peak_retained_blocks: usize,
     pub peak_retained_samples: usize,
     pub peak_retained_bytes: usize,
+}
+
+impl NativeAudioTelemetry {
+    fn merge(&mut self, other: Self) {
+        self.reservation_requests = self
+            .reservation_requests
+            .saturating_add(other.reservation_requests);
+        self.reserved_blocks = self.reserved_blocks.saturating_add(other.reserved_blocks);
+        self.reserved_samples = self.reserved_samples.saturating_add(other.reserved_samples);
+        self.reserved_bytes = self.reserved_bytes.saturating_add(other.reserved_bytes);
+        self.peak_reserved_blocks = self
+            .peak_reserved_blocks
+            .saturating_add(other.peak_reserved_blocks);
+        self.peak_reserved_samples = self
+            .peak_reserved_samples
+            .saturating_add(other.peak_reserved_samples);
+        self.peak_reserved_bytes = self
+            .peak_reserved_bytes
+            .saturating_add(other.peak_reserved_bytes);
+        self.source_stalls = self.source_stalls.saturating_add(other.source_stalls);
+        self.positioned_blocks = self
+            .positioned_blocks
+            .saturating_add(other.positioned_blocks);
+        self.positioned_samples = self
+            .positioned_samples
+            .saturating_add(other.positioned_samples);
+        self.leading_silence_samples = self
+            .leading_silence_samples
+            .saturating_add(other.leading_silence_samples);
+        self.eos_padding_blocks = self
+            .eos_padding_blocks
+            .saturating_add(other.eos_padding_blocks);
+        self.eos_padding_samples = self
+            .eos_padding_samples
+            .saturating_add(other.eos_padding_samples);
+        self.peak_retained_blocks = self
+            .peak_retained_blocks
+            .saturating_add(other.peak_retained_blocks);
+        self.peak_retained_samples = self
+            .peak_retained_samples
+            .saturating_add(other.peak_retained_samples);
+        self.peak_retained_bytes = self
+            .peak_retained_bytes
+            .saturating_add(other.peak_retained_bytes);
+    }
 }
 
 struct NativeAudioScratch {
@@ -1762,12 +2133,18 @@ struct NativeAudioDecodeRequest {
     count: NonZeroU32,
     max_samples: usize,
     max_bytes: usize,
+    generation: u64,
+    restart: bool,
+    restart_target_ordinal: usize,
+    max_position_blocks: usize,
 }
 
 #[derive(Debug)]
 struct NativeAudioDecodeResult {
     input: InputId,
     reservation: NativeAudioReservation,
+    positioned_blocks: u64,
+    positioned_samples: u64,
     window: Result<DecodedAudioWindow, fm_codec_ffmpeg::Error>,
 }
 
@@ -1790,10 +2167,23 @@ impl NativeAudioDecodeWorker {
             .name("freemix-native-audio-decode".to_owned())
             .spawn(move || {
                 while let Ok(request) = request_receiver.recv() {
+                    let mut positioned_blocks = 0;
+                    let mut positioned_samples = 0;
                     let window = decoders
                         .get_mut(&request.input)
                         .ok_or(fm_codec_ffmpeg::Error::InvalidConfig)
                         .and_then(|decoder| {
+                            if request.restart {
+                                decoder.restart();
+                                let position = decoder.skip_complete_blocks_to_sample_bounded(
+                                    request.restart_target_ordinal,
+                                    request.max_position_blocks,
+                                )?;
+                                positioned_blocks =
+                                    u64::try_from(position.skipped_blocks).unwrap_or(u64::MAX);
+                                positioned_samples =
+                                    u64::try_from(position.skipped_samples).unwrap_or(u64::MAX);
+                            }
                             decoder.decode_up_to_bounded(
                                 request.count,
                                 request.max_samples,
@@ -1811,7 +2201,10 @@ impl NativeAudioDecodeWorker {
                                     samples: request.max_samples,
                                     bytes: request.max_bytes,
                                 },
+                                generation: request.generation,
                             },
+                            positioned_blocks,
+                            positioned_samples,
                             window,
                         })
                         .is_err()
@@ -1853,6 +2246,27 @@ struct ValidatedAudioPage {
     charge: NativeAudioCharge,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeStingerAudioTrigger {
+    slot: fm_switcher::StingerSlotId,
+    media: InputId,
+    cadence_origin_frame: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeStingerAudioRequest {
+    trigger: NativeStingerAudioTrigger,
+    frame_index: u32,
+    policy: ModelStingerAudioPolicy,
+}
+
+struct NativeStingerAudioPlayback {
+    masters: BTreeMap<InputId, Box<NativeMasterRuntime>>,
+    silent_inputs: BTreeSet<InputId>,
+    active_trigger: Option<NativeStingerAudioTrigger>,
+    ready: Option<NativeStingerAudioRequest>,
+}
+
 /// Independent bounded CPU audio playback and Master mixing runtime.
 ///
 /// It is intentionally separate from [`NativeSourceRegistry`]. Decoder work is
@@ -1863,6 +2277,7 @@ pub struct NativeMasterRuntime {
     frame_rate: FrameRate,
     clock_domain: ClockDomainId,
     expected_next_frame: u64,
+    cadence_origin_frame: u64,
     ready_frame: Option<(u64, u64, u64)>,
     mixer: MasterMixer,
     pending_mixer: MasterMixer,
@@ -1872,6 +2287,8 @@ pub struct NativeMasterRuntime {
     limits: NativeAudioLimits,
     scratch: NativeAudioScratch,
     audio_telemetry: NativeAudioTelemetry,
+    stinger_audio: Option<NativeStingerAudioPlayback>,
+    collect_output: bool,
     failed: bool,
 }
 
@@ -1892,6 +2309,29 @@ impl NativeMasterRuntime {
         clock_domain: ClockDomainId,
         expected_next_frame: u64,
         limits: NativeAudioLimits,
+    ) -> Result<Self, NativeMasterError> {
+        Self::preflight_local_blocking_with_decoder_retention(
+            adapter,
+            resolved,
+            format,
+            frame_rate,
+            clock_domain,
+            expected_next_frame,
+            limits,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+    fn preflight_local_blocking_with_decoder_retention(
+        adapter: Option<&Adapter>,
+        resolved: &[NativeResolvedSource],
+        format: AudioFormat,
+        frame_rate: FrameRate,
+        clock_domain: ClockDomainId,
+        expected_next_frame: u64,
+        limits: NativeAudioLimits,
+        retain_eos_decoders: bool,
     ) -> Result<Self, NativeMasterError> {
         if format.sample_format != SampleFormat::F32 {
             return Err(NativeMasterError::InvalidFormat);
@@ -2032,12 +2472,16 @@ impl NativeMasterRuntime {
             if first_audio.timing().clock_domain() != clock_domain {
                 return Err(NativeMasterError::InvalidTimeline { input });
             }
-            let media_audio_origin_sample =
-                original_timestamp_samples(first_audio.timing(), first_audio.sample_rate().hertz())
-                    .and_then(|sample| u64::try_from(sample).ok())
-                    .ok_or(NativeMasterError::InvalidTimeline { input })?;
             let media_audio_origin_timestamp = first_audio.timing().presentation_timestamp();
             let source_rate = first_audio.sample_rate();
+            let media_audio_phase =
+                original_timestamp_samples(first_audio.timing(), source_rate.hertz())
+                    .and_then(|sample| {
+                        u64::try_from(sample.rem_euclid(i128::from(source_rate.hertz()))).ok()
+                    })
+                    .ok_or(NativeMasterError::InvalidTimeline { input })?;
+            let media_audio_origin =
+                AudioCadenceOrigin::new(media_audio_origin_timestamp, media_audio_phase);
             let source_layout = first_audio.channel_layout().clone();
             let audio_offset = media_audio_origin_timestamp
                 .as_nanos()
@@ -2056,12 +2500,12 @@ impl NativeMasterRuntime {
                 .ok_or(NativeMasterError::InvalidTimeline { input })?
                 .max(media_audio_origin_timestamp.as_nanos());
             let target_source_sample = cadence_sample_at_timestamp(
-                AudioCadenceOrigin::new(media_audio_origin_timestamp, media_audio_origin_sample),
+                media_audio_origin,
                 target_source_timestamp,
                 source_rate.hertz(),
             )?;
             let target_ordinal = target_source_sample
-                .checked_sub(media_audio_origin_sample)
+                .checked_sub(media_audio_phase)
                 .and_then(|sample| usize::try_from(sample).ok())
                 .ok_or(NativeMasterError::InvalidTimeline { input })?;
             let first_samples = first_audio.sample_count();
@@ -2129,27 +2573,20 @@ impl NativeMasterRuntime {
             let sync_source_origin = if let Some(block) = window.blocks.first() {
                 AudioCadenceOrigin::new(
                     block.timing().presentation_timestamp(),
-                    original_timestamp_samples(block.timing(), source_rate.hertz())
-                        .and_then(|sample| u64::try_from(sample).ok())
-                        .ok_or(NativeMasterError::InvalidTimeline { input })?,
-                )
-            } else {
-                let sample = media_audio_origin_sample
-                    .checked_add(
-                        u64::try_from(target_ordinal)
-                            .map_err(|_| NativeMasterError::InvalidTimeline { input })?,
-                    )
-                    .ok_or(NativeMasterError::InvalidTimeline { input })?;
-                AudioCadenceOrigin::new(
-                    cadence_timestamp_at_sample(
-                        AudioCadenceOrigin::new(
-                            media_audio_origin_timestamp,
-                            media_audio_origin_sample,
-                        ),
-                        sample,
+                    cadence_sample_at_timestamp(
+                        media_audio_origin,
+                        block.timing().presentation_timestamp().as_nanos(),
                         source_rate.hertz(),
                     )?,
-                    sample,
+                )
+            } else {
+                AudioCadenceOrigin::new(
+                    cadence_timestamp_at_sample(
+                        media_audio_origin,
+                        target_source_sample,
+                        source_rate.hertz(),
+                    )?,
+                    target_source_sample,
                 )
             };
             let mut synchronizer = ClockMappedAudioSynchronizer::new(
@@ -2176,6 +2613,7 @@ impl NativeMasterRuntime {
                 validate_initial_audio_page(
                     input,
                     &window.blocks,
+                    media_audio_origin,
                     synchronizer.source_origin().sample_index(),
                     clock_domain,
                 )?
@@ -2203,13 +2641,20 @@ impl NativeMasterRuntime {
                 input,
                 NativeAudioSource::decoded(
                     synchronizer,
-                    page.next_sample,
-                    page.next_sequence,
+                    media_audio_origin,
+                    page,
                     audio_start_master_sample,
                     window.end_of_stream || positioned_end_of_stream,
+                    target_ordinal,
+                    window
+                        .blocks
+                        .first()
+                        .map_or(positioned_next_sequence, |block| {
+                            block.timing().sequence().get()
+                        }),
                 ),
             );
-            if !window.end_of_stream {
+            if retain_eos_decoders || !window.end_of_stream {
                 decoders.insert(input, decoder);
             }
         }
@@ -2229,6 +2674,7 @@ impl NativeMasterRuntime {
             frame_rate,
             clock_domain,
             expected_next_frame,
+            cadence_origin_frame: 0,
             ready_frame: None,
             mixer,
             pending_mixer,
@@ -2238,6 +2684,8 @@ impl NativeMasterRuntime {
             limits,
             scratch,
             audio_telemetry,
+            stinger_audio: None,
+            collect_output: true,
             failed: false,
         })
     }
@@ -2262,6 +2710,29 @@ impl NativeMasterRuntime {
         if project.audio_routes.len() > MAX_NATIVE_AUDIO_STRIPS {
             return Err(NativeMasterError::BoundsExceeded);
         }
+        let requested_stinger_inputs = project
+            .stingers
+            .values()
+            .filter(|config| {
+                config.preload && config.audio_policy != ModelStingerAudioPolicy::Muted
+            })
+            .map(|config| config.media_input)
+            .collect::<BTreeSet<_>>();
+        let mut stinger_inputs = BTreeSet::new();
+        let mut silent_stinger_inputs = BTreeSet::new();
+        for &input in &requested_stinger_inputs {
+            let source = resolved
+                .iter()
+                .find(|source| source.input() == input)
+                .ok_or(NativeMasterError::MissingAudioRoute { input })?;
+            if native_source_has_audio(adapter, source)? {
+                stinger_inputs.insert(input);
+            } else {
+                silent_stinger_inputs.insert(input);
+            }
+        }
+        let (ordinary_limits, stinger_limits) =
+            partition_native_audio_limits(limits, !stinger_inputs.is_empty())?;
         let mut runtime = Self::preflight_local_blocking(
             adapter,
             resolved,
@@ -2269,9 +2740,48 @@ impl NativeMasterRuntime {
             frame_rate,
             clock_domain,
             expected_next_frame,
-            limits,
+            ordinary_limits,
         )?;
         runtime.realize_project_audio(project)?;
+        if !requested_stinger_inputs.is_empty() {
+            let per_source_limits = (!stinger_inputs.is_empty())
+                .then(|| partition_stinger_audio_limits(stinger_limits, stinger_inputs.len()))
+                .transpose()?;
+            let mut masters = BTreeMap::new();
+            for input in stinger_inputs {
+                let stinger_source = resolved
+                    .iter()
+                    .find(|source| source.input() == input)
+                    .cloned()
+                    .ok_or(NativeMasterError::MissingAudioRoute { input })?;
+                let mut stinger_master = Self::preflight_local_blocking_with_decoder_retention(
+                    adapter,
+                    &[stinger_source],
+                    format.clone(),
+                    frame_rate,
+                    clock_domain,
+                    0,
+                    per_source_limits.ok_or(NativeMasterError::InvalidLimits)?,
+                    true,
+                )?;
+                if stinger_master.mixer.input_state(input).is_none() {
+                    continue;
+                }
+                let state = native_input_state(project, input)?;
+                stinger_master.mixer.set_input_state(input, state, 0)?;
+                stinger_master
+                    .pending_mixer
+                    .set_input_state(input, state, 0)?;
+                stinger_master.collect_output = false;
+                masters.insert(input, Box::new(stinger_master));
+            }
+            runtime.stinger_audio = Some(NativeStingerAudioPlayback {
+                masters,
+                silent_inputs: silent_stinger_inputs,
+                active_trigger: None,
+                ready: None,
+            });
+        }
         Ok(runtime)
     }
 
@@ -2343,17 +2853,26 @@ impl NativeMasterRuntime {
 
     #[must_use]
     pub fn retained_blocks(&self) -> usize {
-        self.retained_charge().blocks
+        self.stinger_masters()
+            .fold(self.retained_charge().blocks, |total, master| {
+                total.saturating_add(master.retained_charge().blocks)
+            })
     }
 
     #[must_use]
     pub fn retained_samples(&self) -> usize {
-        self.retained_charge().samples
+        self.stinger_masters()
+            .fold(self.retained_charge().samples, |total, master| {
+                total.saturating_add(master.retained_charge().samples)
+            })
     }
 
     #[must_use]
     pub fn retained_bytes(&self) -> usize {
-        self.retained_charge().bytes
+        self.stinger_masters()
+            .fold(self.retained_charge().bytes, |total, master| {
+                total.saturating_add(master.retained_charge().bytes)
+            })
     }
 
     #[must_use]
@@ -2367,13 +2886,23 @@ impl NativeMasterRuntime {
     }
 
     #[must_use]
-    pub const fn audio_telemetry(&self) -> NativeAudioTelemetry {
-        self.audio_telemetry
+    pub fn audio_telemetry(&self) -> NativeAudioTelemetry {
+        let mut telemetry = self.audio_telemetry;
+        for master in self.stinger_masters() {
+            telemetry.merge(master.audio_telemetry);
+        }
+        telemetry
     }
 
     #[must_use]
     pub fn collected_audio(&self) -> impl ExactSizeIterator<Item = &AudioBlock> {
         self.sink.iter()
+    }
+
+    fn stinger_masters(&self) -> impl Iterator<Item = &NativeMasterRuntime> {
+        self.stinger_audio
+            .iter()
+            .flat_map(|playback| playback.masters.values().map(Box::as_ref))
     }
 
     /// Drains completed pages, plans every source for the next absolute frame
@@ -2397,12 +2926,52 @@ impl NativeMasterRuntime {
         result
     }
 
+    /// Services ordinary globally-timed audio plus the projected clip-local
+    /// Stinger lane without allowing either cursor set to mutate the other.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sticky ordinary or clip-local decode, timeline, readiness, or
+    /// resource-bound failure.
+    pub fn service_project_next_frame(
+        &mut self,
+        frame: &FrameResult,
+        project: &NativeProjectPlan,
+    ) -> Result<bool, NativeMasterError> {
+        let ordinary_covered = self.service_next_frame()?;
+        let stinger_covered = match self.stinger_audio.as_mut() {
+            Some(playback) => playback.service(frame, project)?,
+            None => stinger_audio_request(project, frame)?
+                .is_none_or(|request| request.policy == ModelStingerAudioPolicy::Muted),
+        };
+        Ok(ordinary_covered && stinger_covered)
+    }
+
+    fn restart_clip_at(&mut self, cadence_origin_frame: u64) -> Result<(), NativeMasterError> {
+        self.expected_next_frame = 0;
+        self.cadence_origin_frame = cadence_origin_frame;
+        self.ready_frame = None;
+        self.mixer.reset_runtime_state();
+        self.pending_mixer.reset_runtime_state();
+        for source in self.sources.values_mut() {
+            let Some(synchronizer) = source.synchronizer.as_mut() else {
+                continue;
+            };
+            source.decode_generation = source
+                .decode_generation
+                .checked_add(1)
+                .ok_or(NativeMasterError::BoundsExceeded)?;
+            source.restart_decode = true;
+            source.next_sample = source.restart_sample;
+            source.next_sequence = source.restart_sequence;
+            source.end_of_stream = false;
+            synchronizer.reset(synchronizer.source_origin(), synchronizer.master_origin());
+        }
+        Ok(())
+    }
+
     fn service_next_frame_inner(&mut self) -> Result<bool, NativeMasterError> {
-        let (start_sample, end_sample) = absolute_frame_sample_span(
-            self.expected_next_frame,
-            self.format.sample_rate.hertz(),
-            self.frame_rate,
-        )?;
+        let (start_sample, end_sample) = self.next_frame_sample_span()?;
         self.commit_completed_pages()?;
         self.scratch.uncovered.clear();
         self.scratch.padding_requests.clear();
@@ -2448,6 +3017,30 @@ impl NativeMasterRuntime {
         let covered = self.scratch.uncovered.is_empty();
         self.ready_frame = covered.then_some((self.expected_next_frame, start_sample, end_sample));
         Ok(covered)
+    }
+
+    fn next_frame_sample_span(&self) -> Result<(u64, u64), NativeMasterError> {
+        let cadence_frame = self
+            .cadence_origin_frame
+            .checked_add(self.expected_next_frame)
+            .ok_or(NativeMasterError::BoundsExceeded)?;
+        let (origin, _) = absolute_frame_sample_span(
+            self.cadence_origin_frame,
+            self.format.sample_rate.hertz(),
+            self.frame_rate,
+        )?;
+        let (start, end) = absolute_frame_sample_span(
+            cadence_frame,
+            self.format.sample_rate.hertz(),
+            self.frame_rate,
+        )?;
+        Ok((
+            start
+                .checked_sub(origin)
+                .ok_or(NativeMasterError::BoundsExceeded)?,
+            end.checked_sub(origin)
+                .ok_or(NativeMasterError::BoundsExceeded)?,
+        ))
     }
 
     fn commit_staged_eos_padding(&mut self) -> Result<(), NativeMasterError> {
@@ -2519,6 +3112,25 @@ impl NativeMasterRuntime {
         let mut retained = self.retained_charge();
         while let Some(completed) = self.scratch.completed.pop() {
             let input = completed.input;
+            let source = self
+                .sources
+                .get_mut(&input)
+                .ok_or(NativeMasterError::DecodeContract { input })?;
+            if completed.reservation.generation != source.decode_generation {
+                if source.in_flight == Some(completed.reservation) {
+                    source.in_flight = None;
+                }
+                self.release_reservation(completed.reservation.charge)?;
+                continue;
+            }
+            self.audio_telemetry.positioned_blocks = self
+                .audio_telemetry
+                .positioned_blocks
+                .saturating_add(completed.positioned_blocks);
+            self.audio_telemetry.positioned_samples = self
+                .audio_telemetry
+                .positioned_samples
+                .saturating_add(completed.positioned_samples);
             let window = completed
                 .window
                 .map_err(|error| NativeMasterError::Ffmpeg { input, error })?;
@@ -2569,69 +3181,10 @@ impl NativeMasterRuntime {
         self.prepare_refill_order();
         for index in 0..self.scratch.inputs.len() {
             let input = self.scratch.inputs[index];
-            let source = self
-                .sources
-                .get(&input)
-                .ok_or(NativeMasterError::DecodeContract { input })?;
-            if source.explicit_silence {
+            let Some((request, reservation)) =
+                self.plan_refill(input, requested_end, retained, reserved)?
+            else {
                 continue;
-            }
-            let synchronizer = source
-                .synchronizer
-                .as_ref()
-                .ok_or(NativeMasterError::InvalidFormat)?;
-            let occupancy = synchronizer.telemetry();
-            let needs_coverage = self.scratch.uncovered.contains(&input);
-            if source.end_of_stream
-                || source.in_flight.is_some()
-                || (!needs_coverage && requested_end <= source.audio_start_master_sample)
-                || (!needs_coverage && occupancy.buffered_blocks() > AUDIO_REFILL_LOW_WATERMARK)
-            {
-                continue;
-            }
-            let available_blocks = usize::try_from(self.limits.max_blocks_per_source.get())
-                .unwrap_or(usize::MAX)
-                .saturating_sub(occupancy.buffered_blocks());
-            let count = available_blocks
-                .min(usize::try_from(self.limits.max_blocks_per_page.get()).unwrap_or(usize::MAX));
-            let Some(count) = u32::try_from(count).ok().and_then(NonZeroU32::new) else {
-                if needs_coverage {
-                    return Err(NativeMasterError::BoundsExceeded);
-                }
-                continue;
-            };
-            let reservation = NativeAudioCharge {
-                blocks: count.get() as usize,
-                samples: proportional_page_samples(count, self.limits)?,
-                bytes: audio_sample_bytes(
-                    proportional_page_samples(count, self.limits)?,
-                    synchronizer.channel_layout().channels().len(),
-                )?,
-            };
-            let allocated = retained
-                .checked_add(reserved)
-                .and_then(|charge| charge.checked_add(reservation));
-            let source_limits = synchronizer.limits();
-            if allocated.is_none_or(|charge| validate_retained_bounds(charge, self.limits).is_err())
-                || occupancy
-                    .buffered_samples()
-                    .checked_add(reservation.samples)
-                    .is_none_or(|samples| samples > source_limits.max_samples())
-                || occupancy
-                    .buffered_bytes()
-                    .checked_add(reservation.bytes)
-                    .is_none_or(|bytes| bytes > source_limits.max_bytes())
-            {
-                if needs_coverage {
-                    return Err(NativeMasterError::BoundsExceeded);
-                }
-                continue;
-            }
-            let request = NativeAudioDecodeRequest {
-                input,
-                count,
-                max_samples: reservation.samples,
-                max_bytes: reservation.bytes,
             };
             let Some(sender) = self.worker.requests.as_ref() else {
                 return Err(self.worker.disconnected_error());
@@ -2646,16 +3199,102 @@ impl NativeMasterRuntime {
             self.sources
                 .get_mut(&input)
                 .ok_or(NativeMasterError::DecodeContract { input })?
-                .in_flight = Some(NativeAudioReservation {
-                count,
-                charge: reservation,
-            });
+                .in_flight = Some(reservation);
+            self.sources
+                .get_mut(&input)
+                .ok_or(NativeMasterError::DecodeContract { input })?
+                .restart_decode = false;
             reserved = reserved
-                .checked_add(reservation)
+                .checked_add(reservation.charge)
                 .ok_or(NativeMasterError::BoundsExceeded)?;
-            self.record_reservation(reservation);
+            self.record_reservation(reservation.charge);
         }
         Ok(())
+    }
+
+    fn plan_refill(
+        &self,
+        input: InputId,
+        requested_end: u64,
+        retained: NativeAudioCharge,
+        reserved: NativeAudioCharge,
+    ) -> Result<Option<(NativeAudioDecodeRequest, NativeAudioReservation)>, NativeMasterError> {
+        let source = self
+            .sources
+            .get(&input)
+            .ok_or(NativeMasterError::DecodeContract { input })?;
+        if source.explicit_silence {
+            return Ok(None);
+        }
+        let synchronizer = source
+            .synchronizer
+            .as_ref()
+            .ok_or(NativeMasterError::InvalidFormat)?;
+        let occupancy = synchronizer.telemetry();
+        let needs_coverage = self.scratch.uncovered.contains(&input);
+        if source.end_of_stream
+            || source.in_flight.is_some()
+            || (!needs_coverage && requested_end <= source.audio_start_master_sample)
+            || (!needs_coverage && occupancy.buffered_blocks() > AUDIO_REFILL_LOW_WATERMARK)
+        {
+            return Ok(None);
+        }
+        let available_blocks = usize::try_from(self.limits.max_blocks_per_source.get())
+            .unwrap_or(usize::MAX)
+            .saturating_sub(occupancy.buffered_blocks());
+        let count = available_blocks
+            .min(usize::try_from(self.limits.max_blocks_per_page.get()).unwrap_or(usize::MAX));
+        let Some(count) = u32::try_from(count).ok().and_then(NonZeroU32::new) else {
+            return if needs_coverage {
+                Err(NativeMasterError::BoundsExceeded)
+            } else {
+                Ok(None)
+            };
+        };
+        let samples = proportional_page_samples(count, self.limits)?;
+        let charge = NativeAudioCharge {
+            blocks: count.get() as usize,
+            samples,
+            bytes: audio_sample_bytes(samples, synchronizer.channel_layout().channels().len())?,
+        };
+        let source_limits = synchronizer.limits();
+        let exceeds_bounds = retained
+            .checked_add(reserved)
+            .and_then(|allocated| allocated.checked_add(charge))
+            .is_none_or(|allocated| validate_retained_bounds(allocated, self.limits).is_err())
+            || occupancy
+                .buffered_samples()
+                .checked_add(charge.samples)
+                .is_none_or(|samples| samples > source_limits.max_samples())
+            || occupancy
+                .buffered_bytes()
+                .checked_add(charge.bytes)
+                .is_none_or(|bytes| bytes > source_limits.max_bytes());
+        if exceeds_bounds {
+            return if needs_coverage {
+                Err(NativeMasterError::BoundsExceeded)
+            } else {
+                Ok(None)
+            };
+        }
+        let reservation = NativeAudioReservation {
+            count,
+            charge,
+            generation: source.decode_generation,
+        };
+        Ok(Some((
+            NativeAudioDecodeRequest {
+                input,
+                count,
+                max_samples: charge.samples,
+                max_bytes: charge.bytes,
+                generation: source.decode_generation,
+                restart: source.restart_decode,
+                restart_target_ordinal: source.restart_target_ordinal,
+                max_position_blocks: self.limits.max_position_blocks,
+            },
+            reservation,
+        )))
     }
 
     fn prepare_refill_order(&mut self) {
@@ -2840,7 +3479,10 @@ impl NativeMasterRuntime {
         if self.sink.policy() == OverflowPolicy::Reject && self.sink.len() == self.sink.capacity() {
             return Err(NativeMasterError::SinkRejected);
         }
-        let strip_plan = native_audio_mix_plan(frame.program)?;
+        let strip_plan = match project {
+            Some(project) => native_project_audio_mix_plan(project, frame.program)?,
+            None => native_audio_mix_plan(frame.program)?,
+        };
         self.scratch.plans.clear();
         for (&input, source) in &mut self.sources {
             if source.explicit_silence {
@@ -2956,6 +3598,32 @@ impl NativeMasterRuntime {
                 }
             }
         }
+        if let Some(project) = project {
+            let request = stinger_audio_request(project, frame)?;
+            let rendered = match self.stinger_audio.as_mut() {
+                Some(playback) => playback.render(frame, project)?,
+                None if request
+                    .is_none_or(|request| request.policy == ModelStingerAudioPolicy::Muted) =>
+                {
+                    None
+                }
+                None => return Err(NativeMasterError::InvalidFormat),
+            };
+            if let Some((request, clip)) = rendered {
+                mix_clip_local_stinger_audio(
+                    &mut self.scratch.mix,
+                    samples,
+                    request.policy,
+                    clip.as_ref(),
+                    &self.format,
+                )?;
+            }
+        }
+        apply_master_clipping(
+            &mut self.scratch.mix,
+            samples,
+            self.pending_mixer.clipping_policy(),
+        );
         for &(input, render_plan) in &self.scratch.plans {
             self.sources
                 .get(&input)
@@ -2984,9 +3652,11 @@ impl NativeMasterRuntime {
                 .map(|plane| plane[..samples].to_vec())
                 .collect(),
         )?;
-        self.sink
-            .collect(block.clone())
-            .map_err(|_| NativeMasterError::SinkRejected)?;
+        if self.collect_output {
+            self.sink
+                .collect(block.clone())
+                .map_err(|_| NativeMasterError::SinkRejected)?;
+        }
         let leading = self
             .sources
             .values()
@@ -3007,6 +3677,151 @@ impl NativeMasterRuntime {
             .ok_or(NativeMasterError::BoundsExceeded)?;
         self.ready_frame = None;
         Ok(block)
+    }
+}
+
+impl NativeStingerAudioPlayback {
+    fn service(
+        &mut self,
+        frame: &FrameResult,
+        project: &NativeProjectPlan,
+    ) -> Result<bool, NativeMasterError> {
+        let Some(request) = stinger_audio_request(project, frame)? else {
+            self.ready = None;
+            return Ok(true);
+        };
+        if request.policy == ModelStingerAudioPolicy::Muted {
+            self.active_trigger = Some(request.trigger);
+            self.ready = Some(request);
+            return Ok(true);
+        }
+        let silent = self.silent_inputs.contains(&request.trigger.media);
+        match self.active_trigger {
+            None if !silent => {
+                self.master_mut(request.trigger.media)?.cadence_origin_frame =
+                    request.trigger.cadence_origin_frame;
+            }
+            Some(active) if active != request.trigger && !silent => {
+                self.master_mut(request.trigger.media)?
+                    .restart_clip_at(request.trigger.cadence_origin_frame)?;
+            }
+            None | Some(_) => {}
+        }
+        self.active_trigger = Some(request.trigger);
+        if silent {
+            self.ready = Some(request);
+            return Ok(true);
+        }
+        let master = self.master_mut(request.trigger.media)?;
+        if master.expected_next_frame != u64::from(request.frame_index) {
+            return Err(NativeMasterError::UnexpectedFrame {
+                expected: master.expected_next_frame,
+                actual: u64::from(request.frame_index),
+            });
+        }
+        let covered = master.service_next_frame()?;
+        self.ready = covered.then_some(request);
+        Ok(covered)
+    }
+
+    fn render(
+        &mut self,
+        frame: &FrameResult,
+        project: &NativeProjectPlan,
+    ) -> Result<Option<(NativeStingerAudioRequest, Option<AudioBlock>)>, NativeMasterError> {
+        let Some(request) = stinger_audio_request(project, frame)? else {
+            self.ready = None;
+            return Ok(None);
+        };
+        if self.ready != Some(request) {
+            return Err(NativeMasterError::FrameNotReady(frame.frame.get()));
+        }
+        self.ready = None;
+        if request.policy == ModelStingerAudioPolicy::Muted {
+            return Ok(None);
+        }
+        if self.silent_inputs.contains(&request.trigger.media) {
+            return Ok(Some((request, None)));
+        }
+        let mut local = frame.clone();
+        local.frame = fm_scheduler::FrameNumber::new(u64::from(request.frame_index));
+        local.program = ProgramFrame {
+            primary: request.trigger.media,
+            secondary: None,
+            transition_kind: None,
+            mix_numerator: 0,
+            mix_denominator: 1,
+            mix_start_numerator: 0,
+            mix_end_numerator: 0,
+        };
+        local.fade_to_black = FadeToBlackFrame::LIVE;
+        local.events.clear();
+        let block = self
+            .master_mut(request.trigger.media)?
+            .render_frame_audio(&local)?;
+        Ok(Some((request, Some(block))))
+    }
+
+    fn master_mut(
+        &mut self,
+        input: InputId,
+    ) -> Result<&mut NativeMasterRuntime, NativeMasterError> {
+        self.masters
+            .get_mut(&input)
+            .map(Box::as_mut)
+            .ok_or(NativeMasterError::MissingAudioRoute { input })
+    }
+}
+
+fn mix_clip_local_stinger_audio(
+    output: &mut [Vec<f32>],
+    samples: usize,
+    policy: ModelStingerAudioPolicy,
+    clip: Option<&AudioBlock>,
+    format: &AudioFormat,
+) -> Result<(), NativeMasterError> {
+    if output.len() != format.channels.channels().len() {
+        return Err(NativeMasterError::InvalidFormat);
+    }
+    if let Some(clip) = clip
+        && (clip.sample_rate() != format.sample_rate
+            || clip.channel_layout() != &format.channels
+            || clip.sample_count() != samples)
+    {
+        return Err(NativeMasterError::InvalidFormat);
+    }
+    for (channel, output_plane) in output.iter_mut().enumerate() {
+        let clip_plane = clip
+            .map(|clip| clip.plane(channel).ok_or(NativeMasterError::InvalidFormat))
+            .transpose()?;
+        match policy {
+            ModelStingerAudioPolicy::Muted => {}
+            ModelStingerAudioPolicy::StingerOnly => {
+                if let Some(clip_plane) = clip_plane {
+                    output_plane[..samples].copy_from_slice(clip_plane);
+                } else {
+                    output_plane[..samples].fill(0.0);
+                }
+            }
+            ModelStingerAudioPolicy::MixWithProgram => {
+                if let Some(clip_plane) = clip_plane {
+                    for (output, clip) in output_plane[..samples].iter_mut().zip(clip_plane) {
+                        *output += *clip;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn apply_master_clipping(output: &mut [Vec<f32>], samples: usize, policy: ClippingPolicy) {
+    if policy == ClippingPolicy::Clamp {
+        for plane in output {
+            for sample in &mut plane[..samples] {
+                *sample = sample.clamp(-1.0, 1.0);
+            }
+        }
     }
 }
 
@@ -3060,6 +3875,7 @@ fn validate_audio_page(
         blocks,
         synchronizer.source_rate(),
         synchronizer.channel_layout(),
+        source.timeline_origin,
         source.next_sample,
         source.next_sequence,
         clock_domain,
@@ -3071,6 +3887,7 @@ fn validate_audio_page(
 fn validate_initial_audio_page(
     input: InputId,
     blocks: &[AudioBlock],
+    timeline_origin: AudioCadenceOrigin,
     source_origin_sample: u64,
     clock_domain: ClockDomainId,
 ) -> Result<ValidatedAudioPage, NativeMasterError> {
@@ -3082,6 +3899,7 @@ fn validate_initial_audio_page(
         blocks,
         first.sample_rate(),
         first.channel_layout(),
+        timeline_origin,
         source_origin_sample,
         first.timing().sequence().get(),
         clock_domain,
@@ -3094,6 +3912,7 @@ fn validate_audio_blocks(
     blocks: &[AudioBlock],
     sample_rate: fm_types::SampleRate,
     channel_layout: &fm_types::ChannelLayout,
+    timeline_origin: AudioCadenceOrigin,
     mut next_sample: u64,
     mut next_sequence: u64,
     clock_domain: ClockDomainId,
@@ -3109,7 +3928,12 @@ fn validate_audio_blocks(
         }
         let raw_start = original_timestamp_samples(block.timing(), sample_rate.hertz())
             .ok_or(NativeMasterError::InvalidTimeline { input })?;
-        if raw_start != i128::from(next_sample) {
+        let relative_start = cadence_sample_at_timestamp(
+            timeline_origin,
+            block.timing().presentation_timestamp().as_nanos(),
+            sample_rate.hertz(),
+        )?;
+        if relative_start != next_sample {
             return Err(NativeMasterError::InvalidTimeline { input });
         }
         let sample_count = block.sample_count();
@@ -3662,6 +4486,68 @@ fn native_audio_mix_plan(program: ProgramFrame) -> Result<NativeAudioMixPlan, Na
     }
 }
 
+fn native_project_audio_mix_plan(
+    project: &NativeProjectPlan,
+    program: ProgramFrame,
+) -> Result<NativeAudioMixPlan, NativeMasterError> {
+    let Some(SwitcherTransitionKind::Stinger(slot)) = program.transition_kind else {
+        return native_audio_mix_plan(program);
+    };
+    let preview = program
+        .secondary
+        .filter(|preview| *preview != program.primary)
+        .ok_or(NativeMasterError::MissingAudioTransitionKind)?;
+    let config = project
+        .stinger(slot)
+        .ok_or(NativeMasterError::MissingStingerConfiguration(slot))?;
+    let frame = StingerFramePlan::compile(
+        program.mix_numerator,
+        program.mix_denominator,
+        config.cut_point_frames,
+    )
+    .map_err(NativeMasterError::InvalidStinger)?;
+    let base = match frame.base() {
+        fm_compositor::StingerBase::Program => program.primary,
+        fm_compositor::StingerBase::Preview => preview,
+    };
+    Ok(NativeAudioMixPlan {
+        primary: base,
+        primary_gain: SourceGain::UNITY,
+        secondary: None,
+    })
+}
+
+fn stinger_audio_request(
+    project: &NativeProjectPlan,
+    frame: &FrameResult,
+) -> Result<Option<NativeStingerAudioRequest>, NativeMasterError> {
+    let Some(SwitcherTransitionKind::Stinger(slot)) = frame.program.transition_kind else {
+        return Ok(None);
+    };
+    let config = project
+        .stinger(slot)
+        .ok_or(NativeMasterError::MissingStingerConfiguration(slot))?;
+    StingerFramePlan::compile(
+        frame.program.mix_numerator,
+        frame.program.mix_denominator,
+        config.cut_point_frames,
+    )
+    .map_err(NativeMasterError::InvalidStinger)?;
+    Ok(Some(NativeStingerAudioRequest {
+        trigger: NativeStingerAudioTrigger {
+            slot,
+            media: config.media_input,
+            cadence_origin_frame: frame
+                .frame
+                .get()
+                .checked_sub(u64::from(frame.program.mix_numerator))
+                .ok_or(NativeMasterError::BoundsExceeded)?,
+        },
+        frame_index: frame.program.mix_numerator,
+        policy: config.audio_policy,
+    }))
+}
+
 fn sample_linear_audio_mix_plan(
     program: ProgramFrame,
     secondary: InputId,
@@ -3709,6 +4595,20 @@ struct NativeMixPlan {
     transition: TransitionPlan,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeStingerMixPlan {
+    program: InputId,
+    preview: InputId,
+    media: InputId,
+    frame: StingerFramePlan,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeProjectMixPlan {
+    Transition(NativeMixPlan),
+    Stinger(NativeStingerMixPlan),
+}
+
 fn native_mix_plan(program: ProgramFrame) -> Result<NativeMixPlan, NativeSourceRenderError> {
     let (secondary, transition) = match program.secondary {
         Some(secondary) if secondary != program.primary => {
@@ -3738,6 +4638,34 @@ fn native_mix_plan(program: ProgramFrame) -> Result<NativeMixPlan, NativeSourceR
         secondary,
         transition,
     })
+}
+
+fn native_project_mix_plan(
+    project: &NativeProjectPlan,
+    program: ProgramFrame,
+) -> Result<NativeProjectMixPlan, NativeSourceRenderError> {
+    let Some(SwitcherTransitionKind::Stinger(slot)) = program.transition_kind else {
+        return native_mix_plan(program).map(NativeProjectMixPlan::Transition);
+    };
+    let preview = program
+        .secondary
+        .filter(|preview| *preview != program.primary)
+        .ok_or(NativeSourceRenderError::MissingTransitionKind)?;
+    let config = project
+        .stinger(slot)
+        .ok_or(NativeSourceRenderError::MissingStingerConfiguration(slot))?;
+    let frame = StingerFramePlan::compile(
+        program.mix_numerator,
+        program.mix_denominator,
+        config.cut_point_frames,
+    )
+    .map_err(NativeSourceRenderError::InvalidStinger)?;
+    Ok(NativeProjectMixPlan::Stinger(NativeStingerMixPlan {
+        program: program.primary,
+        preview,
+        media: config.media_input,
+        frame,
+    }))
 }
 
 fn native_fade_to_black_plan(
@@ -4035,6 +4963,18 @@ fn floor_anchor_eviction_count(offsets_ns: &[u64], deadline: ClockTime) -> usize
     frame_index_at_deadline(offsets_ns, deadline.as_nanos()).unwrap_or_default()
 }
 
+fn source_eviction_count(
+    offsets_ns: &[u64],
+    pinned_for_stinger: bool,
+    deadline: ClockTime,
+) -> usize {
+    if pinned_for_stinger {
+        0
+    } else {
+        floor_anchor_eviction_count(offsets_ns, deadline)
+    }
+}
+
 fn source_covers_deadline(
     latest_offset_ns: Option<u64>,
     end_of_stream: bool,
@@ -4101,6 +5041,50 @@ fn registry_frame(
     Ok(frame)
 }
 
+fn stinger_frame_deadline(
+    frame_rate: FrameRate,
+    frame_index: u32,
+) -> Result<ClockTime, NativeSourceRenderError> {
+    let interval_end = FrameCadence::new(frame_rate, ClockTime::ZERO)
+        .time_of_frame(u64::from(frame_index) + 1)
+        .map_err(|_| NativeSourceRenderError::ResourceBounds)?;
+    interval_end
+        .as_nanos()
+        .checked_sub(1)
+        .map(ClockTime::from_nanos)
+        .ok_or(NativeSourceRenderError::ResourceBounds)
+}
+
+fn registry_stinger_frame(
+    registry: &NativeSourceRegistry,
+    input: InputId,
+    frame_rate: FrameRate,
+    frame_index: u32,
+) -> Result<&NativeWorkingFrame, NativeSourceRenderError> {
+    let prefix = registered_source(&registry.sources, input)?;
+    if prefix.kind != NativeVideoSourceKind::Retained && !prefix.available_for_stinger {
+        return Err(NativeSourceRenderError::StingerSourceNotPreloaded { input });
+    }
+    let deadline = stinger_frame_deadline(frame_rate, frame_index)?;
+    let frame = prefix
+        .frame_at_deadline(deadline)
+        .ok_or(NativeSourceRenderError::MissingSource { input })?;
+    if let Some((expected_width, expected_height)) = registry.dimensions {
+        let actual_width = frame.texture().width();
+        let actual_height = frame.texture().height();
+        if (actual_width, actual_height) != (expected_width, expected_height) {
+            return Err(NativeSourceRenderError::DimensionMismatch {
+                input,
+                expected_width,
+                expected_height,
+                actual_width,
+                actual_height,
+            });
+        }
+    }
+    Ok(frame)
+}
+
 fn registered_source<T>(
     sources: &BTreeMap<InputId, T>,
     input: InputId,
@@ -4135,6 +5119,7 @@ pub struct NativeMediaRuntime {
     normalizer: NativeImportNormalizer,
     composition_renderer: NativeCompositionRenderer,
     renderer: NativeTransitionRenderer,
+    stinger_renderer: NativeStingerRenderer,
     fade_to_black_renderer: NativeFadeToBlackRenderer,
     project_rendering: AtomicBool,
     project_frames: Mutex<NativeProjectFrameState>,
@@ -4230,12 +5215,14 @@ impl NativeMediaRuntime {
         let normalizer = NativeImportNormalizer::new(&context).await?;
         let composition_renderer = NativeCompositionRenderer::new(&context).await?;
         let renderer = NativeTransitionRenderer::new(&context).await?;
+        let stinger_renderer = NativeStingerRenderer::new(&context).await?;
         let fade_to_black_renderer = NativeFadeToBlackRenderer::new(&context).await?;
         Ok(Self {
             context,
             normalizer,
             composition_renderer,
             renderer,
+            stinger_renderer,
             fade_to_black_renderer,
             project_rendering: AtomicBool::new(false),
             project_frames: Mutex::new(NativeProjectFrameState::default()),
@@ -4613,6 +5600,8 @@ impl NativeMediaRuntime {
                     kind,
                     end_of_stream,
                     in_flight: None,
+                    available_for_stinger: false,
+                    pinned_for_stinger: false,
                 },
             );
         }
@@ -4720,7 +5709,41 @@ impl NativeMediaRuntime {
         if playback.failed {
             return Err(NativeSourcePlaybackError::Failed);
         }
-        let result = self.service_source_playback_inner(playback, deadline).await;
+        let result = self
+            .service_source_playback_inner(playback, deadline, None)
+            .await;
+        if result.is_err() {
+            playback.failed = true;
+        }
+        result
+    }
+
+    /// Services one source against an independent clip-local deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed failed-playback, missing-source, decode, normalization,
+    /// worker, timeline, or resource-bound failure.
+    pub async fn service_source_playback_for_input(
+        &self,
+        playback: &mut NativeSourcePlayback,
+        input: InputId,
+        deadline: ClockTime,
+    ) -> Result<bool, NativeSourcePlaybackError> {
+        if playback.failed {
+            return Err(NativeSourcePlaybackError::Failed);
+        }
+        if !playback
+            .registry
+            .sources
+            .get(&input)
+            .is_some_and(|prefix| prefix.available_for_stinger)
+        {
+            return Err(NativeSourcePlaybackError::MissingSource { input });
+        }
+        let result = self
+            .service_source_playback_inner(playback, deadline, Some(input))
+            .await;
         if result.is_err() {
             playback.failed = true;
         }
@@ -4831,6 +5854,7 @@ impl NativeMediaRuntime {
         &self,
         playback: &mut NativeSourcePlayback,
         deadline: ClockTime,
+        only_input: Option<InputId>,
     ) -> Result<bool, NativeSourcePlaybackError> {
         let mut completed = Vec::with_capacity(playback.registry.sources.len());
         loop {
@@ -4844,7 +5868,8 @@ impl NativeMediaRuntime {
         }
 
         for completed in completed {
-            let input = completed.input;
+            let request = completed.request;
+            let input = request.input;
             let window = completed
                 .window
                 .map_err(|error| NativeSourcePlaybackError::Decode { input, error })?;
@@ -4853,12 +5878,10 @@ impl NativeMediaRuntime {
                 .sources
                 .get(&input)
                 .ok_or(NativeSourcePlaybackError::DecodeContract { input })?;
-            if prefix.kind != NativeVideoSourceKind::Decoded
-                || prefix.in_flight != Some(completed.count)
-            {
+            if prefix.kind != NativeVideoSourceKind::Decoded || prefix.in_flight != Some(request) {
                 return Err(NativeSourcePlaybackError::DecodeContract { input });
             }
-            let requested = usize::try_from(completed.count.get()).unwrap_or(usize::MAX);
+            let requested = usize::try_from(request.count.get()).unwrap_or(usize::MAX);
             if window.frames.len() > requested
                 || (window.frames.is_empty() && !window.end_of_stream)
                 || (!window.end_of_stream && window.frames.len() != requested)
@@ -4867,6 +5890,9 @@ impl NativeMediaRuntime {
             }
 
             if window.frames.is_empty() {
+                if request.operation == NativeDecodeOperation::Restart {
+                    return Err(NativeSourcePlaybackError::DecodeContract { input });
+                }
                 let prefix = playback
                     .registry
                     .sources
@@ -4877,15 +5903,29 @@ impl NativeMediaRuntime {
                 continue;
             }
 
-            let expected_sequence = prefix
-                .last_sequence
-                .checked_add(1)
-                .ok_or(NativeSourceError::InvalidTimeline { input })?;
+            let restarting = request.operation == NativeDecodeOperation::Restart;
+            let source_pts_origin = if restarting {
+                window.frames[0]
+                    .timing()
+                    .presentation_timestamp()
+                    .as_nanos()
+            } else {
+                prefix.source_pts_origin
+            };
+            let previous_pts = (!restarting).then_some(prefix.last_source_pts);
+            let expected_sequence = if restarting {
+                0
+            } else {
+                prefix
+                    .last_sequence
+                    .checked_add(1)
+                    .ok_or(NativeSourceError::InvalidTimeline { input })?
+            };
             let (offsets_ns, last_source_pts, last_sequence) = validate_page_timing(
                 input,
                 &window.frames,
-                prefix.source_pts_origin,
-                Some(prefix.last_source_pts),
+                source_pts_origin,
+                previous_pts,
                 expected_sequence,
                 prefix.clock_domain,
             )?;
@@ -4906,13 +5946,14 @@ impl NativeMediaRuntime {
                     .into());
                 }
             }
-            if prefix.frames.len().saturating_add(window.frames.len())
+            let retained_frames = if restarting { 0 } else { prefix.frames.len() };
+            if retained_frames.saturating_add(window.frames.len())
                 > usize::try_from(playback.registry.limits.max_video_frames_per_source.get())
                     .unwrap_or(usize::MAX)
             {
                 return Err(NativeSourceError::TooManyFrames {
                     input,
-                    actual: prefix.frames.len().saturating_add(window.frames.len()),
+                    actual: retained_frames.saturating_add(window.frames.len()),
                     maximum: playback.registry.limits.max_video_frames_per_source.get(),
                 }
                 .into());
@@ -4924,14 +5965,27 @@ impl NativeMediaRuntime {
                     required: u64::MAX,
                     maximum: playback.registry.limits.max_retained_rgba16f_bytes,
                 })?;
-            let required_bytes = playback
-                .registry
-                .retained_rgba16f_bytes
-                .checked_add(batch_bytes)
+            let replaced_bytes = frame_bytes
+                .checked_mul(u64::try_from(prefix.frames.len()).unwrap_or(u64::MAX))
                 .ok_or(NativeSourceError::RetainedBytesExceeded {
                     required: u64::MAX,
                     maximum: playback.registry.limits.max_retained_rgba16f_bytes,
                 })?;
+            let retained_bytes = if restarting {
+                playback
+                    .registry
+                    .retained_rgba16f_bytes
+                    .checked_sub(replaced_bytes)
+                    .ok_or(NativeSourcePlaybackError::DecodeContract { input })?
+            } else {
+                playback.registry.retained_rgba16f_bytes
+            };
+            let required_bytes = retained_bytes.checked_add(batch_bytes).ok_or(
+                NativeSourceError::RetainedBytesExceeded {
+                    required: u64::MAX,
+                    maximum: playback.registry.limits.max_retained_rgba16f_bytes,
+                },
+            )?;
             if required_bytes > playback.registry.limits.max_retained_rgba16f_bytes {
                 return Err(NativeSourceError::RetainedBytesExceeded {
                     required: required_bytes,
@@ -4955,6 +6009,11 @@ impl NativeMediaRuntime {
                 .sources
                 .get_mut(&input)
                 .ok_or(NativeSourcePlaybackError::DecodeContract { input })?;
+            if restarting {
+                prefix.frames.clear();
+                prefix.offsets_ns.clear();
+                prefix.source_pts_origin = source_pts_origin;
+            }
             prefix.frames.append(&mut normalized);
             prefix.offsets_ns.extend(offsets_ns);
             prefix.last_source_pts = last_source_pts;
@@ -4970,7 +6029,11 @@ impl NativeMediaRuntime {
             };
             let frame_bytes = rgba16f_frame_bytes(accounting_input, width, height)?;
             for (input, prefix) in &mut playback.registry.sources {
-                let remove = floor_anchor_eviction_count(&prefix.offsets_ns, deadline);
+                if only_input.is_some_and(|selected| selected != *input) {
+                    continue;
+                }
+                let remove =
+                    source_eviction_count(&prefix.offsets_ns, prefix.pinned_for_stinger, deadline);
                 prefix.frames.drain(..remove);
                 prefix.offsets_ns.drain(..remove);
                 let removed_bytes = frame_bytes
@@ -4990,10 +6053,17 @@ impl NativeMediaRuntime {
                 .registry
                 .sources
                 .values()
-                .filter_map(|prefix| prefix.in_flight)
-                .try_fold(0_u64, |reserved, count| {
+                .filter_map(|prefix| prefix.in_flight.map(|request| (prefix, request)))
+                .try_fold(0_u64, |reserved, (prefix, request)| {
+                    let reserved_frames = if request.operation == NativeDecodeOperation::Restart {
+                        usize::try_from(request.count.get())
+                            .unwrap_or(usize::MAX)
+                            .saturating_sub(prefix.frames.len())
+                    } else {
+                        usize::try_from(request.count.get()).unwrap_or(usize::MAX)
+                    };
                     frame_bytes
-                        .checked_mul(u64::from(count.get()))
+                        .checked_mul(u64::try_from(reserved_frames).unwrap_or(u64::MAX))
                         .and_then(|page| reserved.checked_add(page))
                 })
                 .ok_or(NativeSourceError::RetainedBytesExceeded {
@@ -5007,6 +6077,9 @@ impl NativeMediaRuntime {
                 .copied()
                 .collect::<Vec<_>>();
             for input in inputs {
+                if only_input.is_some_and(|selected| selected != input) {
+                    continue;
+                }
                 let prefix = playback
                     .registry
                     .sources
@@ -5015,6 +6088,11 @@ impl NativeMediaRuntime {
                 if prefix.kind != NativeVideoSourceKind::Decoded {
                     continue;
                 }
+                let restart = prefix.available_for_stinger
+                    && prefix
+                        .offsets_ns
+                        .first()
+                        .is_some_and(|first| *first > deadline.as_nanos());
                 let allocated = playback
                     .registry
                     .retained_rgba16f_bytes
@@ -5023,22 +6101,51 @@ impl NativeMediaRuntime {
                         required: u64::MAX,
                         maximum: playback.registry.limits.max_retained_rgba16f_bytes,
                     })?;
+                let source_bytes = frame_bytes
+                    .checked_mul(u64::try_from(prefix.frames.len()).unwrap_or(u64::MAX))
+                    .ok_or(NativeSourceError::RetainedBytesExceeded {
+                        required: u64::MAX,
+                        maximum: playback.registry.limits.max_retained_rgba16f_bytes,
+                    })?;
+                let allocated = if restart {
+                    allocated
+                        .checked_sub(source_bytes)
+                        .ok_or(NativeSourcePlaybackError::DecodeContract { input })?
+                } else {
+                    allocated
+                };
                 let budget_frames = playback
                     .registry
                     .limits
                     .max_retained_rgba16f_bytes
                     .saturating_sub(allocated)
                     / frame_bytes;
-                let Some(count) = refill_page_size(
-                    prefix.frames.len(),
-                    prefix.in_flight.is_some(),
-                    prefix.end_of_stream,
-                    playback.registry.limits.max_video_frames_per_source.get(),
-                    budget_frames,
-                ) else {
-                    continue;
+                let count = if restart && prefix.in_flight.is_none() {
+                    let count =
+                        u64::from(playback.registry.limits.max_video_frames_per_source.get())
+                            .min(budget_frames);
+                    u32::try_from(count).ok().and_then(NonZeroU32::new)
+                } else {
+                    refill_page_size(
+                        prefix.frames.len(),
+                        prefix.in_flight.is_some(),
+                        prefix.end_of_stream,
+                        playback.registry.limits.max_video_frames_per_source.get(),
+                        budget_frames,
+                    )
                 };
-                let request = NativeDecodeRequest { input, count };
+                let Some(count) = count else { continue };
+                let operation = if restart {
+                    NativeDecodeOperation::Restart
+                } else {
+                    NativeDecodeOperation::Continue
+                };
+                let request = NativeDecodeRequest {
+                    input,
+                    count,
+                    operation,
+                };
+                let retained_frames = prefix.frames.len();
                 let Some(sender) = playback.worker.requests.as_ref() else {
                     return Err(playback.worker.disconnected_error());
                 };
@@ -5056,13 +6163,20 @@ impl NativeMediaRuntime {
                     .sources
                     .get_mut(&input)
                     .ok_or(NativeSourcePlaybackError::DecodeContract { input })?
-                    .in_flight = Some(count);
-                let page_bytes = frame_bytes.checked_mul(u64::from(count.get())).ok_or(
-                    NativeSourceError::RetainedBytesExceeded {
+                    .in_flight = Some(request);
+                let reserved_frames = if restart {
+                    usize::try_from(count.get())
+                        .unwrap_or(usize::MAX)
+                        .saturating_sub(retained_frames)
+                } else {
+                    usize::try_from(count.get()).unwrap_or(usize::MAX)
+                };
+                let page_bytes = frame_bytes
+                    .checked_mul(u64::try_from(reserved_frames).unwrap_or(u64::MAX))
+                    .ok_or(NativeSourceError::RetainedBytesExceeded {
                         required: u64::MAX,
                         maximum: playback.registry.limits.max_retained_rgba16f_bytes,
-                    },
-                )?;
+                    })?;
                 reserved_bytes = reserved_bytes.checked_add(page_bytes).ok_or(
                     NativeSourceError::RetainedBytesExceeded {
                         required: u64::MAX,
@@ -5072,11 +6186,19 @@ impl NativeMediaRuntime {
             }
         }
 
-        Ok(playback
-            .registry
-            .sources
-            .values()
-            .all(|prefix| prefix.covers_deadline(deadline)))
+        match only_input {
+            Some(input) => playback
+                .registry
+                .sources
+                .get(&input)
+                .ok_or(NativeSourcePlaybackError::MissingSource { input })
+                .map(|prefix| prefix.covers_deadline(deadline)),
+            None => Ok(playback
+                .registry
+                .sources
+                .values()
+                .all(|prefix| prefix.covers_deadline(deadline))),
+        }
     }
 
     /// Synchronous wrapper for [`Self::service_source_playback`].
@@ -5091,6 +6213,21 @@ impl NativeMediaRuntime {
         deadline: ClockTime,
     ) -> Result<bool, NativeSourcePlaybackError> {
         block_on(self.service_source_playback(playback, deadline))
+    }
+
+    /// Synchronous wrapper for [`Self::service_source_playback_for_input`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as
+    /// [`Self::service_source_playback_for_input`].
+    pub fn service_source_playback_for_input_blocking(
+        &self,
+        playback: &mut NativeSourcePlayback,
+        input: InputId,
+        deadline: ClockTime,
+    ) -> Result<bool, NativeSourcePlaybackError> {
+        block_on(self.service_source_playback_for_input(playback, input, deadline))
     }
 
     /// Renders the engine's authoritative frame from retained GPU source
@@ -5131,27 +6268,14 @@ impl NativeMediaRuntime {
             .map_err(NativeSourceRenderError::FadeToBlack)
     }
 
-    /// Derives the active scene roots from the authoritative transition, renders
-    /// only their dependency closure once in dependency-first order, releases
-    /// non-root outputs after their last consumer, then applies Cut, Fade, or
-    /// Wipe followed by the authoritative FTB interval endpoint.
-    ///
-    /// # Errors
-    ///
-    /// Returns a typed missing source, scene-composition, or transition failure.
-    pub async fn render_project_frame_result(
+    async fn render_project_scenes(
         &self,
         registry: &NativeSourceRegistry,
         project: &NativeProjectPlan,
         frame: &FrameResult,
-    ) -> Result<NativeTexture, NativeSourceRenderError> {
-        let plan = native_mix_plan(frame.program)?;
-        let fade_to_black = native_fade_to_black_plan(frame.fade_to_black)?;
-        let mut execution = project
-            .scene_execution(plan.primary, plan.secondary)
-            .ok_or(NativeSourceRenderError::ResourceBounds)?;
-        let _frame_slot = self.begin_project_frame()?;
-        let mut scene_outputs: BTreeMap<SceneId, (SourceId, NativeTexture)> = BTreeMap::new();
+        execution: &mut NativeSceneExecution,
+    ) -> Result<BTreeMap<SceneId, (SourceId, NativeTexture)>, NativeSourceRenderError> {
+        let mut outputs: BTreeMap<SceneId, (SourceId, NativeTexture)> = BTreeMap::new();
         for scene in &project.scenes {
             if !execution.required.contains(&scene.id) {
                 continue;
@@ -5165,7 +6289,7 @@ impl NativeMediaRuntime {
                             registry_frame(registry, *input, frame.deadline)?.texture()
                         }
                         NativeSceneSource::Scene(dependency) => {
-                            &scene_outputs
+                            &outputs
                                 .get(dependency)
                                 .ok_or(NativeSourceRenderError::MissingSource {
                                     input: frame.program.primary,
@@ -5182,7 +6306,7 @@ impl NativeMediaRuntime {
                 .await
                 .map_err(NativeSourceRenderError::SceneCompositor)?;
             drop(sources);
-            scene_outputs.insert(scene.id, (scene.output, output));
+            outputs.insert(scene.id, (scene.output, output));
             for dependency in scene.scene_dependencies() {
                 let consumers = execution
                     .remaining_consumers
@@ -5192,35 +6316,116 @@ impl NativeMediaRuntime {
                     .checked_sub(1)
                     .ok_or(NativeSourceRenderError::ResourceBounds)?;
                 if *consumers == 0 && !execution.roots.contains(&dependency) {
-                    scene_outputs.remove(&dependency);
+                    outputs.remove(&dependency);
                 }
             }
         }
+        debug_assert!(outputs.keys().all(|scene| execution.roots.contains(scene)));
+        Ok(outputs)
+    }
 
-        debug_assert!(
-            scene_outputs
-                .keys()
-                .all(|scene| execution.roots.contains(scene))
-        );
-        let primary = project_texture(
-            registry,
-            project,
-            &scene_outputs,
-            plan.primary,
-            frame.deadline,
-        )?;
-        let secondary = project_texture(
-            registry,
-            project,
-            &scene_outputs,
-            plan.secondary,
-            frame.deadline,
-        )?;
-        let program = self
-            .renderer
-            .render(&self.context, plan.transition, primary, secondary)
+    /// Derives the active scene roots from the authoritative transition, renders
+    /// only their dependency closure once in dependency-first order, releases
+    /// non-root outputs after their last consumer, then applies Cut, Fade, or
+    /// Wipe followed by the authoritative FTB interval endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed missing source, scene-composition, or transition failure.
+    pub async fn render_project_frame_result(
+        &self,
+        registry: &NativeSourceRegistry,
+        project: &NativeProjectPlan,
+        frame: &FrameResult,
+    ) -> Result<NativeTexture, NativeSourceRenderError> {
+        self.render_project_frame_result_with_stingers(registry, registry, project, frame)
             .await
-            .map_err(NativeSourceRenderError::Compositor)?;
+    }
+
+    /// Renders one authoritative frame using an independent clip-local Stinger
+    /// registry while normal Program and Preview sources remain on the show
+    /// timeline.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed project route, source, scene, Stinger compositor, or
+    /// transition failure.
+    pub async fn render_project_frame_result_with_stingers(
+        &self,
+        registry: &NativeSourceRegistry,
+        stingers: &NativeSourceRegistry,
+        project: &NativeProjectPlan,
+        frame: &FrameResult,
+    ) -> Result<NativeTexture, NativeSourceRenderError> {
+        let plan = native_project_mix_plan(project, frame.program)?;
+        let fade_to_black = native_fade_to_black_plan(frame.fade_to_black)?;
+        let inputs = match plan {
+            NativeProjectMixPlan::Transition(plan) => [plan.primary, plan.secondary, plan.primary],
+            NativeProjectMixPlan::Stinger(plan) => [plan.program, plan.preview, plan.media],
+        };
+        let mut execution = project
+            .scene_execution(&inputs)
+            .ok_or(NativeSourceRenderError::ResourceBounds)?;
+        let _frame_slot = self.begin_project_frame()?;
+        let scene_outputs = self
+            .render_project_scenes(registry, project, frame, &mut execution)
+            .await?;
+        let program = match plan {
+            NativeProjectMixPlan::Transition(plan) => {
+                let primary = project_texture(
+                    registry,
+                    project,
+                    &scene_outputs,
+                    plan.primary,
+                    frame.deadline,
+                )?;
+                let secondary = project_texture(
+                    registry,
+                    project,
+                    &scene_outputs,
+                    plan.secondary,
+                    frame.deadline,
+                )?;
+                self.renderer
+                    .render(&self.context, plan.transition, primary, secondary)
+                    .await
+                    .map_err(NativeSourceRenderError::Compositor)?
+            }
+            NativeProjectMixPlan::Stinger(plan) => {
+                let program = project_texture(
+                    registry,
+                    project,
+                    &scene_outputs,
+                    plan.program,
+                    frame.deadline,
+                )?;
+                let preview = project_texture(
+                    registry,
+                    project,
+                    &scene_outputs,
+                    plan.preview,
+                    frame.deadline,
+                )?;
+                let media = match project.video_route(plan.media) {
+                    Some(NativeVideoRoute::Leaf(input)) => registry_stinger_frame(
+                        stingers,
+                        input,
+                        project.frame_rate,
+                        plan.frame.frame_index(),
+                    )?
+                    .texture(),
+                    Some(NativeVideoRoute::Scene(_)) | None => {
+                        return Err(NativeSourceRenderError::StingerSourceNotPreloaded {
+                            input: plan.media,
+                        });
+                    }
+                };
+                self.stinger_renderer
+                    .render(&self.context, plan.frame, program, preview, media)
+                    .await
+                    .map_err(NativeSourceRenderError::Stinger)?
+            }
+        };
         let output = self
             .fade_to_black_renderer
             .render(&self.context, fade_to_black, &program)
@@ -5255,6 +6460,23 @@ impl NativeMediaRuntime {
         frame: &FrameResult,
     ) -> Result<NativeTexture, NativeSourceRenderError> {
         block_on(self.render_project_frame_result(registry, project, frame))
+    }
+
+    /// Synchronous wrapper for
+    /// [`Self::render_project_frame_result_with_stingers`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as
+    /// [`Self::render_project_frame_result_with_stingers`].
+    pub fn render_project_frame_result_with_stingers_blocking(
+        &self,
+        registry: &NativeSourceRegistry,
+        stingers: &NativeSourceRegistry,
+        project: &NativeProjectPlan,
+        frame: &FrameResult,
+    ) -> Result<NativeTexture, NativeSourceRenderError> {
+        block_on(self.render_project_frame_result_with_stingers(registry, stingers, project, frame))
     }
 
     /// Renders a GPU-resident Cut, Fade, or Wipe between canonical RGBA16-float
@@ -5389,8 +6611,8 @@ mod tests {
     };
     #[cfg(target_os = "macos")]
     use fm_frame::{
-        AlphaMode, ChromaLocation, ColorMetadata, ColorPrimaries, MatrixCoefficients, SignalRange,
-        TransferFunction, VideoFrameMetadata,
+        AlphaMode, ChromaLocation, ColorMetadata, ColorPrimaries, CpuVideoPlane,
+        MatrixCoefficients, SignalRange, TransferFunction, VideoFrameMetadata,
     };
     use fm_frame::{
         Channel, ChannelLayout, CpuVideoPayload, MediaTimestamp, NormalizedDuration,
@@ -5400,6 +6622,7 @@ mod tests {
     use fm_model::{
         Input, InputAudioStripState, InputGainMilliDb, Layer, LayerGeometry, ProjectSettings,
         Rgba8 as ModelRgba8, Scene as ModelScene, SimulatedAudio, SimulatedInput, SimulatedVideo,
+        StingerConfig, StingerSlotNumber,
     };
     use fm_persistence::{ProjectPosition, ProjectStore, RuntimeRouting, StoredProject};
     use fm_scheduler::FrameNumber;
@@ -5407,6 +6630,8 @@ mod tests {
         SwitcherCommand, SwitcherState, TBarPosition, TransitionKind as SwitcherTransitionKind,
     };
     use fm_types::{ColorMetadata as ModelColorMetadata, ProjectId, ScanMode, VideoFormat};
+    #[cfg(target_os = "macos")]
+    use half::f16;
 
     use super::*;
 
@@ -5512,6 +6737,126 @@ mod tests {
             CpuVideoPayload::allocate(PixelFormat::Rgba8, VideoDimensions::new(1, 1).unwrap())
                 .unwrap();
         CpuVideoFrame::new(timing, payload)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn colored_retained_frame(clock_domain: ClockDomainId, rgba: [u8; 4]) -> CpuVideoFrame {
+        solid_retained_frame(clock_domain, rgba, 1, 1)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn solid_retained_frame(
+        clock_domain: ClockDomainId,
+        rgba: [u8; 4],
+        width: u32,
+        height: u32,
+    ) -> CpuVideoFrame {
+        let timing = MediaTiming::new(
+            OriginalTimestamp::new(
+                MediaTimestamp::new(0),
+                TimeBase::new(1, 1_000_000_000).unwrap(),
+            ),
+            NormalizedTimestamp::from_nanos(0),
+            NormalizedDuration::from_nanos(1).unwrap(),
+            clock_domain,
+            SequenceNumber::new(0),
+        )
+        .unwrap();
+        let width = usize::try_from(width).unwrap();
+        let height = usize::try_from(height).unwrap();
+        let mut bytes = Vec::with_capacity(width * height * 4);
+        for _ in 0..width * height {
+            bytes.extend_from_slice(&rgba);
+        }
+        let payload = CpuVideoPayload::new(
+            PixelFormat::Rgba8,
+            VideoDimensions::new(
+                u32::try_from(width).unwrap(),
+                u32::try_from(height).unwrap(),
+            )
+            .unwrap(),
+            vec![CpuVideoPlane::new(width * 4, bytes).unwrap()],
+        )
+        .unwrap();
+        CpuVideoFrame::new(timing, payload)
+            .with_metadata(VideoFrameMetadata::new(
+                ColorMetadata {
+                    primaries: ColorPrimaries::Bt709,
+                    transfer: TransferFunction::Srgb,
+                    matrix: MatrixCoefficients::Identity,
+                    range: SignalRange::Full,
+                    chroma_location: ChromaLocation::Center,
+                },
+                Some(AlphaMode::Straight),
+            ))
+            .unwrap()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn rgba16f_components(bytes: &[u8]) -> [f32; 4] {
+        std::array::from_fn(|component| {
+            let offset = component * 2;
+            f16::from_bits(u16::from_le_bytes([bytes[offset], bytes[offset + 1]])).to_f32()
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn create_local_stinger_fixture(directory: &std::path::Path) -> std::path::PathBuf {
+        let raw = directory.join("stinger.rgba");
+        let output = directory.join("stinger.mkv");
+        let mut frames = Vec::with_capacity(12 * 2 * 2 * 4);
+        for frame in 0..12 {
+            let color = if frame == 11 {
+                [255, 255, 0, 255]
+            } else {
+                [0, 255, 0, u8::try_from(frame * 23).unwrap()]
+            };
+            for _ in 0..4 {
+                frames.extend_from_slice(&color);
+            }
+        }
+        std::fs::write(&raw, frames).unwrap();
+        let status = Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "rawvideo",
+                "-pixel_format",
+                "rgba",
+                "-video_size",
+                "2x2",
+                "-framerate",
+                "30",
+                "-i",
+            ])
+            .arg(&raw)
+            .args([
+                "-frames:v",
+                "12",
+                "-vf",
+                "setsar=1/1,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=full",
+                "-c:v",
+                "ffv1",
+                "-pix_fmt",
+                "bgra",
+                "-color_primaries",
+                "bt709",
+                "-color_trc",
+                "iec61966-2-1",
+                "-colorspace",
+                "rgb",
+                "-color_range",
+                "pc",
+            ])
+            .arg(&output)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        output
     }
 
     fn mono_audio_format() -> AudioFormat {
@@ -5622,10 +6967,16 @@ mod tests {
         });
         NativeAudioSource::decoded(
             synchronizer,
-            next_sample,
-            u64::try_from(chunks.len()).unwrap(),
+            AudioCadenceOrigin::new(NormalizedTimestamp::from_nanos(0), 0),
+            ValidatedAudioPage {
+                next_sample,
+                next_sequence: u64::try_from(chunks.len()).unwrap(),
+                charge: NativeAudioCharge::default(),
+            },
             0,
             end_of_stream,
+            0,
+            0,
         )
     }
 
@@ -5744,6 +7095,7 @@ mod tests {
             frame_rate: FrameRate::new(25, 1).unwrap(),
             clock_domain: ClockDomainId::new(NonZeroU128::new(9).unwrap()),
             expected_next_frame: 0,
+            cadence_origin_frame: 0,
             ready_frame: None,
             mixer,
             pending_mixer,
@@ -5756,6 +7108,8 @@ mod tests {
             },
             scratch,
             audio_telemetry: NativeAudioTelemetry::default(),
+            stinger_audio: None,
+            collect_output: true,
             failed: false,
         }
     }
@@ -5787,6 +7141,7 @@ mod tests {
             frame_rate: FrameRate::new(25, 1).unwrap(),
             clock_domain: ClockDomainId::new(NonZeroU128::new(9).unwrap()),
             expected_next_frame: 0,
+            cadence_origin_frame: 0,
             ready_frame: None,
             mixer,
             pending_mixer,
@@ -5799,6 +7154,8 @@ mod tests {
             },
             scratch,
             audio_telemetry: NativeAudioTelemetry::default(),
+            stinger_audio: None,
+            collect_output: true,
             failed: false,
         }
     }
@@ -5877,12 +7234,45 @@ mod tests {
                 maximum: 383,
             })
         );
-        let primary_only = plan.scene_execution(input(2), input(2)).unwrap();
+        let primary_only = plan.scene_execution(&[input(2), input(2)]).unwrap();
         assert_eq!(
             primary_only.required,
             BTreeSet::from([scene(10), scene(20)])
         );
         assert!(!primary_only.required.contains(&scene(30)));
+    }
+
+    #[test]
+    fn native_project_plan_accounts_for_three_independent_stinger_scene_roots() {
+        let mut project = native_plan_project(4, 2);
+        for (input_id, scene_id) in [
+            (input(1), scene(10)),
+            (input(2), scene(20)),
+            (input(3), scene(30)),
+        ] {
+            add_scene_input(&mut project, input_id, scene_id, None);
+            add_scene(&mut project, scene_id, Vec::new());
+        }
+        project.add_stinger(StingerConfig::new(
+            StingerSlotNumber::new(1).unwrap(),
+            input(3),
+            true,
+            1,
+            fm_model::StingerAudioPolicy::Muted,
+            fm_model::StingerMissingMediaFallback::Cut,
+        ));
+
+        let plan = NativeProjectPlan::compile(&project, NativeProjectLimits::default()).unwrap();
+
+        assert_eq!(plan.peak_rgba16f_targets(), 6);
+        assert_eq!(plan.transient_rgba16f_bytes(), 6 * 4 * 2 * 8);
+        let execution = plan
+            .scene_execution(&[input(1), input(2), input(3)])
+            .unwrap();
+        assert_eq!(
+            execution.required,
+            BTreeSet::from([scene(10), scene(20), scene(30)])
+        );
     }
 
     #[test]
@@ -6914,6 +8304,101 @@ mod tests {
     }
 
     #[test]
+    fn configured_project_stinger_selects_program_then_preview_at_exact_cut() {
+        let program = input(1);
+        let preview = input(2);
+        let media = input(3);
+        let slot = fm_switcher::StingerSlotId::new(1).unwrap();
+        let mut project = native_plan_project(4, 2);
+        for source in [program, preview, media] {
+            add_leaf(&mut project, source);
+        }
+        project.add_stinger(StingerConfig::new(
+            StingerSlotNumber::new(1).unwrap(),
+            media,
+            true,
+            2,
+            fm_model::StingerAudioPolicy::Muted,
+            fm_model::StingerMissingMediaFallback::Cut,
+        ));
+        let project = NativeProjectPlan::compile(&project, NativeProjectLimits::default()).unwrap();
+        let frame = |frame_index| ProgramFrame {
+            primary: program,
+            secondary: Some(preview),
+            transition_kind: Some(SwitcherTransitionKind::Stinger(slot)),
+            mix_numerator: frame_index,
+            mix_denominator: 4,
+            mix_start_numerator: frame_index,
+            mix_end_numerator: frame_index + 1,
+        };
+
+        let NativeProjectMixPlan::Stinger(before) =
+            native_project_mix_plan(&project, frame(1)).unwrap()
+        else {
+            panic!("expected a configured Stinger plan");
+        };
+        assert_eq!(before.program, program);
+        assert_eq!(before.preview, preview);
+        assert_eq!(before.media, media);
+        assert_eq!(before.frame.base(), fm_compositor::StingerBase::Program);
+
+        let NativeProjectMixPlan::Stinger(at_cut) =
+            native_project_mix_plan(&project, frame(2)).unwrap()
+        else {
+            panic!("expected a configured Stinger plan");
+        };
+        assert_eq!(at_cut.frame.base(), fm_compositor::StingerBase::Preview);
+    }
+
+    #[test]
+    fn project_stinger_requires_configuration_and_valid_frame_position() {
+        let program = input(1);
+        let preview = input(2);
+        let slot = fm_switcher::StingerSlotId::new(8).unwrap();
+        let mut project = native_plan_project(4, 2);
+        add_leaf(&mut project, program);
+        add_leaf(&mut project, preview);
+        let project = NativeProjectPlan::compile(&project, NativeProjectLimits::default()).unwrap();
+        let frame = ProgramFrame {
+            primary: program,
+            secondary: Some(preview),
+            transition_kind: Some(SwitcherTransitionKind::Stinger(slot)),
+            mix_numerator: 0,
+            mix_denominator: 4,
+            mix_start_numerator: 0,
+            mix_end_numerator: 1,
+        };
+
+        assert!(matches!(
+            native_project_mix_plan(&project, frame),
+            Err(NativeSourceRenderError::MissingStingerConfiguration(actual))
+                if actual == slot
+        ));
+
+        let mut invalid = native_plan_project(4, 2);
+        add_leaf(&mut invalid, program);
+        add_leaf(&mut invalid, preview);
+        invalid.add_stinger(StingerConfig::new(
+            StingerSlotNumber::new(8).unwrap(),
+            preview,
+            true,
+            5,
+            fm_model::StingerAudioPolicy::Muted,
+            fm_model::StingerMissingMediaFallback::Cut,
+        ));
+        let invalid = NativeProjectPlan::compile(&invalid, NativeProjectLimits::default()).unwrap();
+        assert!(matches!(
+            native_project_mix_plan(&invalid, frame),
+            Err(NativeSourceRenderError::InvalidStinger(
+                StingerPlanError::CutPointOutOfRange {
+                    cut_point_frame: 5,
+                    frame_count: 4,
+                }
+            ))
+        ));
+    }
+
+    #[test]
     fn program_frame_preserves_alpha_fade_kind_and_progress() {
         let primary = input(1);
         let secondary = input((1_u128 << 64) + 1);
@@ -6957,6 +8442,90 @@ mod tests {
         assert_eq!(
             rebased_offsets(source, &[i64::MIN, i64::MAX]),
             Ok(vec![0, u64::MAX])
+        );
+    }
+
+    fn source_playback_for_pin_test(
+        kind: NativeVideoSourceKind,
+        end_of_stream: bool,
+    ) -> NativeSourcePlayback {
+        let input = input(1);
+        NativeSourcePlayback {
+            registry: NativeSourceRegistry {
+                sources: BTreeMap::from([(
+                    input,
+                    NativeVideoPrefix {
+                        frames: Vec::new(),
+                        offsets_ns: Vec::new(),
+                        source_pts_origin: 0,
+                        last_source_pts: 0,
+                        last_sequence: 0,
+                        clock_domain: ClockDomainId::new(NonZeroU128::new(1).unwrap()),
+                        kind,
+                        end_of_stream,
+                        in_flight: None,
+                        available_for_stinger: false,
+                        pinned_for_stinger: false,
+                    },
+                )]),
+                dimensions: None,
+                retained_rgba16f_bytes: 0,
+                limits: NativeSourceLimits::default(),
+            },
+            worker: NativeDecodeWorker::spawn(BTreeMap::new()).unwrap(),
+            failed: false,
+        }
+    }
+
+    #[test]
+    fn stinger_pin_requires_bounded_eos_and_rejects_live_sources() {
+        let source = input(1);
+        let mut complete = source_playback_for_pin_test(NativeVideoSourceKind::Decoded, true);
+        complete.pin_stinger_source(source).unwrap();
+        assert!(complete.registry.sources[&source].pinned_for_stinger);
+
+        let mut incomplete = source_playback_for_pin_test(NativeVideoSourceKind::Decoded, false);
+        assert!(matches!(
+            incomplete.pin_stinger_source(source),
+            Err(NativeSourcePlaybackError::StingerSourceNotFullyPreloaded {
+                input,
+                retained_frames: 0,
+                maximum_frames: 8,
+            }) if input == source
+        ));
+        assert!(!incomplete.registry.sources[&source].pinned_for_stinger);
+
+        let mut live = source_playback_for_pin_test(NativeVideoSourceKind::Live, false);
+        assert!(matches!(
+            live.pin_stinger_source(source),
+            Err(NativeSourcePlaybackError::StingerSourceIsLive { input }) if input == source
+        ));
+    }
+
+    #[test]
+    fn clip_local_stinger_cadence_restarts_and_pinned_frames_never_evict() {
+        let rate = FrameRate::new(25, 1).unwrap();
+        let offsets = [0, 40_000_000, 80_000_000];
+        for (frame, expected_deadline, expected_source_frame) in [
+            (0, 39_999_999, 0),
+            (1, 79_999_999, 1),
+            (2, 119_999_999, 2),
+            (3, 159_999_999, 2),
+        ] {
+            let deadline = stinger_frame_deadline(rate, frame).unwrap();
+            assert_eq!(deadline.as_nanos(), expected_deadline);
+            assert_eq!(
+                frame_index_at_deadline(&offsets, deadline.as_nanos()),
+                Some(expected_source_frame)
+            );
+        }
+        assert_eq!(
+            source_eviction_count(&offsets, true, ClockTime::from_nanos(u64::MAX)),
+            0
+        );
+        assert_eq!(
+            source_eviction_count(&offsets, false, ClockTime::from_nanos(u64::MAX)),
+            2
         );
     }
 
@@ -7435,16 +9004,19 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires FFmpeg with AAC and ffprobe"]
+    #[ignore = "requires FFmpeg and ffprobe"]
     #[allow(clippy::too_many_lines)]
-    fn aac_media_timeline_offsets_trim_early_audio_and_pad_delayed_audio() {
+    fn media_timeline_offsets_trim_early_audio_and_pad_delayed_audio() {
         let directory = tempfile::tempdir().unwrap();
-        for (name, audio_pts, delayed) in [
-            ("early.mp4", "PTS+1.95/TB", false),
-            ("delayed.mp4", "PTS+2.05/TB", true),
+        for (name, video_pts, audio_pts, delayed, negative_origin) in [
+            ("early.mov", "PTS+2/TB", "PTS+1.95/TB", false, false),
+            ("delayed.mov", "PTS+2/TB", "PTS+2.05/TB", true, false),
+            ("negative.mkv", "PTS", "PTS-0.05/TB", false, true),
         ] {
             let path = directory.path().join(name);
-            let filter = format!("[0:v]setpts=PTS+2/TB[v];[1:a]asetpts={audio_pts}[a]");
+            let filter = format!(
+                "[0:v]setpts={video_pts}[v];[1:a]asetpts={audio_pts},asetnsamples=n=441:p=1[a]"
+            );
             let status = Command::new("ffmpeg")
                 .args([
                     "-nostdin",
@@ -7452,6 +9024,7 @@ mod tests {
                     "-loglevel",
                     "error",
                     "-y",
+                    "-copyts",
                     "-f",
                     "lavfi",
                     "-i",
@@ -7469,7 +9042,9 @@ mod tests {
                     "-c:v",
                     "mpeg4",
                     "-c:a",
-                    "aac",
+                    "pcm_s16le",
+                    "-avoid_negative_ts",
+                    "disabled",
                 ])
                 .arg(&path)
                 .status()
@@ -7495,6 +9070,15 @@ mod tests {
                 NativeAudioLimits::default(),
             )
             .unwrap();
+            if negative_origin {
+                assert!(
+                    master.sources[&source_id]
+                        .timeline_origin
+                        .timestamp()
+                        .as_nanos()
+                        < 0
+                );
+            }
             assert!(master.service_next_frame().unwrap());
             let first = master
                 .render_frame_audio(&frame_result(0, source_id, None))
@@ -7542,6 +9126,25 @@ mod tests {
                         .any(|sample| sample.abs() > 0.01)
                 );
                 assert_eq!(master.audio_telemetry().leading_silence_samples, 0);
+            }
+
+            let positioned_before_restart = master.audio_telemetry().positioned_samples;
+            master.restart_clip_at(0).unwrap();
+            let mut replay_ready = false;
+            for _ in 0..1_000 {
+                if master.service_next_frame().unwrap() {
+                    replay_ready = true;
+                    break;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert!(replay_ready);
+            let replay = master
+                .render_frame_audio(&frame_result(0, source_id, None))
+                .unwrap();
+            assert_eq!(replay.plane(0), first.plane(0));
+            if !delayed {
+                assert!(master.audio_telemetry().positioned_samples > positioned_before_restart);
             }
         }
     }
@@ -8089,6 +9692,469 @@ mod tests {
     }
 
     #[test]
+    fn configured_stinger_audio_policies_switch_base_at_the_video_cut() {
+        let program = input(1);
+        let preview = input(2);
+        let media = input(3);
+        let slot = fm_switcher::StingerSlotId::new(1).unwrap();
+        let frame = |frame_index| ProgramFrame {
+            primary: program,
+            secondary: Some(preview),
+            transition_kind: Some(SwitcherTransitionKind::Stinger(slot)),
+            mix_numerator: frame_index,
+            mix_denominator: 4,
+            mix_start_numerator: frame_index,
+            mix_end_numerator: frame_index + 1,
+        };
+        let compile = |audio_policy| {
+            let mut project = native_plan_project(4, 2);
+            for source in [program, preview, media] {
+                add_leaf(&mut project, source);
+            }
+            project.add_stinger(StingerConfig::new(
+                StingerSlotNumber::new(1).unwrap(),
+                media,
+                true,
+                2,
+                audio_policy,
+                fm_model::StingerMissingMediaFallback::Cut,
+            ));
+            NativeProjectPlan::compile(&project, NativeProjectLimits::default()).unwrap()
+        };
+
+        let muted = compile(fm_model::StingerAudioPolicy::Muted);
+        assert_eq!(
+            native_project_audio_mix_plan(&muted, frame(1)).unwrap(),
+            NativeAudioMixPlan {
+                primary: program,
+                primary_gain: SourceGain::UNITY,
+                secondary: None,
+            }
+        );
+        assert_eq!(
+            native_project_audio_mix_plan(&muted, frame(2)).unwrap(),
+            NativeAudioMixPlan {
+                primary: preview,
+                primary_gain: SourceGain::UNITY,
+                secondary: None,
+            }
+        );
+
+        let only = compile(fm_model::StingerAudioPolicy::StingerOnly);
+        assert_eq!(
+            native_project_audio_mix_plan(&only, frame(1)).unwrap(),
+            NativeAudioMixPlan {
+                primary: program,
+                primary_gain: SourceGain::UNITY,
+                secondary: None,
+            }
+        );
+        assert_eq!(
+            native_project_audio_mix_plan(&only, frame(2)).unwrap(),
+            NativeAudioMixPlan {
+                primary: preview,
+                primary_gain: SourceGain::UNITY,
+                secondary: None,
+            }
+        );
+
+        let mixed = compile(fm_model::StingerAudioPolicy::MixWithProgram);
+        assert_eq!(
+            native_project_audio_mix_plan(&mixed, frame(1)).unwrap(),
+            NativeAudioMixPlan {
+                primary: program,
+                primary_gain: SourceGain::UNITY,
+                secondary: None,
+            }
+        );
+        assert_eq!(
+            native_project_audio_mix_plan(&mixed, frame(2)).unwrap(),
+            NativeAudioMixPlan {
+                primary: preview,
+                primary_gain: SourceGain::UNITY,
+                secondary: None,
+            }
+        );
+    }
+
+    #[test]
+    fn native_master_realizes_each_configured_stinger_audio_policy() {
+        let program = input(1);
+        let preview = input(2);
+        let media = input(3);
+        let slot = fm_switcher::StingerSlotId::new(1).unwrap();
+        let render = |audio_policy, frame_index| {
+            let mut project = native_plan_project(4, 2);
+            for source in [program, preview, media] {
+                add_leaf(&mut project, source);
+            }
+            project.add_stinger(StingerConfig::new(
+                StingerSlotNumber::new(1).unwrap(),
+                media,
+                true,
+                2,
+                audio_policy,
+                fm_model::StingerMissingMediaFallback::Cut,
+            ));
+            let project =
+                NativeProjectPlan::compile(&project, NativeProjectLimits::default()).unwrap();
+            let mut master = audio_test_master(&[(program, 0.1), (preview, 0.2), (media, 0.4)], 1);
+            master.realize_project_audio(&project).unwrap();
+            if audio_policy != fm_model::StingerAudioPolicy::Muted {
+                master.stinger_audio = Some(NativeStingerAudioPlayback {
+                    masters: BTreeMap::from([(
+                        media,
+                        Box::new(audio_test_master(&[(media, 0.4)], 1)),
+                    )]),
+                    silent_inputs: BTreeSet::new(),
+                    active_trigger: None,
+                    ready: None,
+                });
+            }
+            let mut rendered = 0.0;
+            for current in 0..=frame_index {
+                let frame = frame_result_with_transition_interval(
+                    u64::from(current),
+                    program,
+                    Some(preview),
+                    Some(SwitcherTransitionKind::Stinger(slot)),
+                    current,
+                    4,
+                    current,
+                    current + 1,
+                );
+                assert!(master.service_project_next_frame(&frame, &project).unwrap());
+                rendered = master
+                    .render_project_frame_audio(&frame, &project)
+                    .unwrap()
+                    .plane(0)
+                    .unwrap()[0];
+            }
+            rendered
+        };
+        let assert_close = |actual: f32, expected: f32| {
+            assert!((actual - expected).abs() < 1.0e-6, "{actual} != {expected}");
+        };
+
+        assert_close(render(fm_model::StingerAudioPolicy::Muted, 1), 0.1);
+        assert_close(render(fm_model::StingerAudioPolicy::Muted, 2), 0.2);
+        assert_close(render(fm_model::StingerAudioPolicy::StingerOnly, 1), 0.4);
+        assert_close(render(fm_model::StingerAudioPolicy::StingerOnly, 2), 0.4);
+        assert_close(render(fm_model::StingerAudioPolicy::MixWithProgram, 1), 0.5);
+        assert_close(render(fm_model::StingerAudioPolicy::MixWithProgram, 2), 0.6);
+    }
+
+    #[test]
+    fn clip_local_mix_applies_the_master_clipping_policy_after_summing() {
+        let format = mono_audio_format();
+        let clock = ClockDomainId::new(NonZeroU128::new(9).unwrap());
+        let clip = audio_block(0, 0, &[0.8], &format, clock);
+        let mut clamped = vec![vec![0.8]];
+        mix_clip_local_stinger_audio(
+            &mut clamped,
+            1,
+            ModelStingerAudioPolicy::MixWithProgram,
+            Some(&clip),
+            &format,
+        )
+        .unwrap();
+        apply_master_clipping(&mut clamped, 1, ClippingPolicy::Clamp);
+        assert_eq!(clamped, vec![vec![1.0]]);
+
+        let mut allowed = vec![vec![0.8]];
+        mix_clip_local_stinger_audio(
+            &mut allowed,
+            1,
+            ModelStingerAudioPolicy::MixWithProgram,
+            Some(&clip),
+            &format,
+        )
+        .unwrap();
+        apply_master_clipping(&mut allowed, 1, ClippingPolicy::Allow);
+        assert!((allowed[0][0] - 1.6).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn clip_local_stinger_audio_reanchors_fractional_cadence_to_trigger_frame() {
+        let program = input(1);
+        let preview = input(2);
+        let media = input(3);
+        let slot = fm_switcher::StingerSlotId::new(1).unwrap();
+        let rate = FrameRate::new(60_000, 1_001).unwrap();
+        let mut project = native_plan_project(4, 2);
+        for source in [program, preview, media] {
+            add_leaf(&mut project, source);
+        }
+        project.add_stinger(StingerConfig::new(
+            StingerSlotNumber::new(1).unwrap(),
+            media,
+            true,
+            1,
+            fm_model::StingerAudioPolicy::StingerOnly,
+            fm_model::StingerMissingMediaFallback::Cut,
+        ));
+        let project = NativeProjectPlan::compile(&project, NativeProjectLimits::default()).unwrap();
+        let mut master = audio_test_master(&[(program, 0.1), (preview, 0.2), (media, 0.4)], 2);
+        master.frame_rate = rate;
+        master.realize_project_audio(&project).unwrap();
+        let mut clip = audio_test_master(&[(media, 0.4)], 2);
+        clip.frame_rate = rate;
+        master.stinger_audio = Some(NativeStingerAudioPlayback {
+            masters: BTreeMap::from([(media, Box::new(clip))]),
+            silent_inputs: BTreeSet::new(),
+            active_trigger: None,
+            ready: None,
+        });
+
+        let idle = frame_result(0, program, None);
+        assert!(master.service_project_next_frame(&idle, &project).unwrap());
+        assert_eq!(
+            master
+                .render_project_frame_audio(&idle, &project)
+                .unwrap()
+                .sample_count(),
+            800
+        );
+
+        let stinger = frame_result_with_transition_interval(
+            1,
+            program,
+            Some(preview),
+            Some(SwitcherTransitionKind::Stinger(slot)),
+            0,
+            2,
+            0,
+            1,
+        );
+        assert!(
+            master
+                .service_project_next_frame(&stinger, &project)
+                .unwrap()
+        );
+        let rendered = master
+            .render_project_frame_audio(&stinger, &project)
+            .unwrap();
+        assert_eq!(rendered.sample_count(), 801);
+        assert!(
+            rendered
+                .plane(0)
+                .unwrap()
+                .iter()
+                .all(|sample| (*sample - 0.4).abs() < 1.0e-6)
+        );
+    }
+
+    #[test]
+    fn stinger_audio_services_only_selected_media_and_reports_aggregate_retention() {
+        let program = input(1);
+        let preview = input(2);
+        let selected = input(3);
+        let unrelated = input(4);
+        let slot = fm_switcher::StingerSlotId::new(1).unwrap();
+        let mut project = native_plan_project(4, 2);
+        for source in [program, preview, selected, unrelated] {
+            add_leaf(&mut project, source);
+        }
+        project.add_stinger(StingerConfig::new(
+            StingerSlotNumber::new(1).unwrap(),
+            selected,
+            true,
+            1,
+            fm_model::StingerAudioPolicy::StingerOnly,
+            fm_model::StingerMissingMediaFallback::Cut,
+        ));
+        project.add_stinger(StingerConfig::new(
+            StingerSlotNumber::new(2).unwrap(),
+            unrelated,
+            true,
+            1,
+            fm_model::StingerAudioPolicy::StingerOnly,
+            fm_model::StingerMissingMediaFallback::Cut,
+        ));
+        let project = NativeProjectPlan::compile(&project, NativeProjectLimits::default()).unwrap();
+        let mut master = audio_test_master(
+            &[
+                (program, 0.1),
+                (preview, 0.2),
+                (selected, 0.3),
+                (unrelated, 0.4),
+            ],
+            1,
+        );
+        master.realize_project_audio(&project).unwrap();
+        let mut selected_master = audio_test_master(&[(selected, 0.3)], 1);
+        selected_master.collect_output = false;
+        let mut unrelated_master = audio_test_master(&[(unrelated, 0.4)], 1);
+        unrelated_master.collect_output = false;
+        master.stinger_audio = Some(NativeStingerAudioPlayback {
+            masters: BTreeMap::from([
+                (selected, Box::new(selected_master)),
+                (unrelated, Box::new(unrelated_master)),
+            ]),
+            silent_inputs: BTreeSet::new(),
+            active_trigger: None,
+            ready: None,
+        });
+        assert!(master.retained_blocks() > master.retained_charge().blocks);
+
+        let frame = frame_result_with_transition_interval(
+            0,
+            program,
+            Some(preview),
+            Some(SwitcherTransitionKind::Stinger(slot)),
+            0,
+            2,
+            0,
+            1,
+        );
+        assert!(master.service_project_next_frame(&frame, &project).unwrap());
+        master.render_project_frame_audio(&frame, &project).unwrap();
+
+        let playback = master.stinger_audio.as_ref().unwrap();
+        assert_eq!(playback.masters[&selected].expected_next_frame(), 1);
+        assert_eq!(playback.masters[&unrelated].expected_next_frame(), 0);
+        assert_eq!(playback.masters[&selected].sink_len(), 0);
+        assert_eq!(playback.masters[&unrelated].sink_len(), 0);
+        assert_eq!(master.sink_len(), 1);
+    }
+
+    #[test]
+    fn video_only_stinger_audio_uses_silence_without_splitting_retention() {
+        let program = input(1);
+        let preview = input(2);
+        let media = input(3);
+        let slot = fm_switcher::StingerSlotId::new(1).unwrap();
+        let mut project = native_plan_project(4, 2);
+        for source in [program, preview, media] {
+            add_leaf(&mut project, source);
+        }
+        project.add_stinger(StingerConfig::new(
+            StingerSlotNumber::new(1).unwrap(),
+            media,
+            true,
+            1,
+            fm_model::StingerAudioPolicy::StingerOnly,
+            fm_model::StingerMissingMediaFallback::Cut,
+        ));
+        let project = NativeProjectPlan::compile(&project, NativeProjectLimits::default()).unwrap();
+        let clock = ClockDomainId::new(NonZeroU128::new(9).unwrap());
+        let resolved = [program, preview, media].map(|input| NativeResolvedSource::RetainedFrame {
+            input,
+            frame: retained_frame(clock, 0, 0),
+        });
+        let limits = NativeAudioLimits::default();
+        let mut master = NativeMasterRuntime::preflight_project_local_blocking(
+            None,
+            &resolved,
+            &project,
+            &mono_audio_format(),
+            FrameRate::new(25, 1).unwrap(),
+            clock,
+            0,
+            limits,
+        )
+        .unwrap();
+        assert_eq!(master.limits, limits);
+        let playback = master.stinger_audio.as_ref().unwrap();
+        assert!(playback.masters.is_empty());
+        assert_eq!(playback.silent_inputs, BTreeSet::from([media]));
+
+        let frame = frame_result_with_transition_interval(
+            0,
+            program,
+            Some(preview),
+            Some(SwitcherTransitionKind::Stinger(slot)),
+            0,
+            2,
+            0,
+            1,
+        );
+        assert!(master.service_project_next_frame(&frame, &project).unwrap());
+        let rendered = master.render_project_frame_audio(&frame, &project).unwrap();
+        assert!(
+            rendered
+                .plane(0)
+                .unwrap()
+                .iter()
+                .all(|sample| *sample == 0.0)
+        );
+    }
+
+    #[test]
+    fn fade_to_black_revision_change_does_not_restart_stinger_audio() {
+        let program = input(1);
+        let preview = input(2);
+        let media = input(3);
+        let slot = fm_switcher::StingerSlotId::new(1).unwrap();
+        let mut project = native_plan_project(4, 2);
+        for source in [program, preview, media] {
+            add_leaf(&mut project, source);
+        }
+        project.add_stinger(StingerConfig::new(
+            StingerSlotNumber::new(1).unwrap(),
+            media,
+            true,
+            1,
+            fm_model::StingerAudioPolicy::StingerOnly,
+            fm_model::StingerMissingMediaFallback::Cut,
+        ));
+        let project = NativeProjectPlan::compile(&project, NativeProjectLimits::default()).unwrap();
+        let mut master = audio_test_master(&[(program, 0.1), (preview, 0.2), (media, 0.4)], 1);
+        master.realize_project_audio(&project).unwrap();
+        master.stinger_audio = Some(NativeStingerAudioPlayback {
+            masters: BTreeMap::from([(media, Box::new(audio_test_master(&[(media, 0.4)], 1)))]),
+            silent_inputs: BTreeSet::new(),
+            active_trigger: None,
+            ready: None,
+        });
+        let first = frame_result_with_transition_interval(
+            0,
+            program,
+            Some(preview),
+            Some(SwitcherTransitionKind::Stinger(slot)),
+            0,
+            2,
+            0,
+            1,
+        );
+        assert!(master.service_project_next_frame(&first, &project).unwrap());
+        master.render_project_frame_audio(&first, &project).unwrap();
+
+        let mut switcher = SwitcherState::new(vec![program, preview], program, preview).unwrap();
+        switcher.request_fade_to_black(true, 1).unwrap();
+        let mut second = frame_result_with_transition_interval(
+            1,
+            program,
+            Some(preview),
+            Some(SwitcherTransitionKind::Stinger(slot)),
+            1,
+            2,
+            1,
+            2,
+        );
+        second.revision = Revision::new(1);
+        second.runtime_generation = RuntimeGeneration::new(1);
+        second.fade_to_black = switcher.fade_to_black_frame();
+
+        assert!(
+            master
+                .service_project_next_frame(&second, &project)
+                .unwrap()
+        );
+        let rendered = master
+            .render_project_frame_audio(&second, &project)
+            .unwrap();
+        let samples = rendered.plane(0).unwrap();
+        assert!(samples[0] < 0.4);
+        assert!(samples[0] > 0.0);
+        assert!(samples[samples.len() - 1].abs() < 1.0e-7);
+        assert_eq!(
+            master.stinger_audio.as_ref().unwrap().masters[&media].expected_next_frame(),
+            2
+        );
+    }
+
+    #[test]
     fn engine_ticks_propagate_automatic_and_manual_intervals_to_audio_plans() {
         let old = input(1);
         let new = input(2);
@@ -8606,5 +10672,213 @@ mod tests {
                 .all(|pixel| pixel == [0, 0, 0, 255])
         );
         assert_eq!(second, first);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires a native macOS Metal adapter"]
+    fn native_metal_project_stinger_changes_base_at_the_configured_cut() {
+        let runtime = NativeMediaRuntime::new_blocking([NativeBackend::Metal]).unwrap();
+        let clock_domain = ClockDomainId::new(NonZeroU128::new(77).unwrap());
+        let program = input(1);
+        let preview = input(2);
+        let media = input(3);
+        let playback = runtime
+            .preflight_resolved_source_playback_mixed_blocking(
+                None,
+                [
+                    NativeResolvedSource::RetainedFrame {
+                        input: program,
+                        frame: colored_retained_frame(clock_domain, [255, 0, 0, 255]),
+                    },
+                    NativeResolvedSource::RetainedFrame {
+                        input: preview,
+                        frame: colored_retained_frame(clock_domain, [0, 0, 255, 255]),
+                    },
+                    NativeResolvedSource::RetainedFrame {
+                        input: media,
+                        frame: colored_retained_frame(clock_domain, [0, 255, 0, 128]),
+                    },
+                ],
+                clock_domain,
+                StreamSelector::Best,
+                NativeSourceLimits::default(),
+            )
+            .unwrap();
+        let mut project = native_plan_project(1, 1);
+        for source in [program, preview, media] {
+            add_leaf(&mut project, source);
+        }
+        project.add_stinger(StingerConfig::new(
+            StingerSlotNumber::new(1).unwrap(),
+            media,
+            true,
+            1,
+            fm_model::StingerAudioPolicy::Muted,
+            fm_model::StingerMissingMediaFallback::Cut,
+        ));
+        let project = NativeProjectPlan::compile(&project, NativeProjectLimits::default()).unwrap();
+        let slot = fm_switcher::StingerSlotId::new(1).unwrap();
+        let render = |frame_index| {
+            let frame = frame_result_with_transition_interval(
+                0,
+                program,
+                Some(preview),
+                Some(SwitcherTransitionKind::Stinger(slot)),
+                frame_index,
+                2,
+                frame_index,
+                frame_index + 1,
+            );
+            let output = runtime
+                .render_project_frame_result_blocking(playback.registry(), &project, &frame)
+                .unwrap();
+            block_on(runtime.diagnostic_readback(&output)).unwrap()
+        };
+        let before = rgba16f_components(&render(0).bytes);
+        let at_cut = rgba16f_components(&render(1).bytes);
+        assert!(
+            before[0] > before[2],
+            "Program red must be the initial base"
+        );
+        assert!(at_cut[2] > at_cut[0], "Preview blue must be the cut base");
+        assert!(before[1] > 0.0 && at_cut[1] > 0.0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires FFmpeg, ffprobe, and a native macOS Metal adapter"]
+    #[allow(clippy::too_many_lines)]
+    fn native_metal_local_stinger_pages_restarts_and_preserves_normal_playback() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = create_local_stinger_fixture(directory.path());
+        let adapter = Adapter::new(fm_codec_ffmpeg::Config {
+            allowed_root: Some(directory.path().to_owned()),
+            ..fm_codec_ffmpeg::Config::default()
+        })
+        .unwrap();
+        let runtime = NativeMediaRuntime::new_blocking([NativeBackend::Metal]).unwrap();
+        let clock_domain = ClockDomainId::new(NonZeroU128::new(78).unwrap());
+        let program = input(1);
+        let preview = input(2);
+        let media = input(3);
+        let playback = runtime
+            .preflight_resolved_source_playback_mixed_blocking(
+                Some(&adapter),
+                [
+                    NativeResolvedSource::RetainedFrame {
+                        input: program,
+                        frame: solid_retained_frame(clock_domain, [255, 0, 0, 255], 2, 2),
+                    },
+                    NativeResolvedSource::RetainedFrame {
+                        input: preview,
+                        frame: solid_retained_frame(clock_domain, [0, 0, 255, 255], 2, 2),
+                    },
+                    NativeResolvedSource::LocalVideo {
+                        input: media,
+                        path: path.clone(),
+                    },
+                ],
+                clock_domain,
+                StreamSelector::Best,
+                NativeSourceLimits::default(),
+            )
+            .unwrap();
+        let mut stingers = runtime
+            .preflight_resolved_source_playback_mixed_blocking(
+                Some(&adapter),
+                [NativeResolvedSource::LocalVideo { input: media, path }],
+                clock_domain,
+                StreamSelector::Best,
+                NativeSourceLimits::default(),
+            )
+            .unwrap();
+        stingers.enable_stinger_source(media).unwrap();
+        assert_eq!(playback.registry.sources[&media].frames.len(), 8);
+        assert_eq!(stingers.registry.sources[&media].frames.len(), 8);
+        assert!(!stingers.registry.sources[&media].end_of_stream);
+        let normal_offsets = playback.registry.sources[&media].offsets_ns.clone();
+
+        let mut project = native_plan_project(2, 2);
+        for source in [program, preview, media] {
+            add_leaf(&mut project, source);
+        }
+        project.add_stinger(StingerConfig::new(
+            StingerSlotNumber::new(1).unwrap(),
+            media,
+            true,
+            6,
+            fm_model::StingerAudioPolicy::Muted,
+            fm_model::StingerMissingMediaFallback::Cut,
+        ));
+        let project = NativeProjectPlan::compile(&project, NativeProjectLimits::default()).unwrap();
+        let slot = fm_switcher::StingerSlotId::new(1).unwrap();
+        let render = |frame_index, stingers: &NativeSourcePlayback| {
+            let frame = frame_result_with_transition_interval(
+                0,
+                program,
+                Some(preview),
+                Some(SwitcherTransitionKind::Stinger(slot)),
+                frame_index,
+                12,
+                frame_index,
+                frame_index + 1,
+            );
+            runtime
+                .render_project_frame_result_with_stingers_blocking(
+                    playback.registry(),
+                    stingers.registry(),
+                    &project,
+                    &frame,
+                )
+                .map(|output| block_on(runtime.diagnostic_readback(&output)).unwrap())
+                .unwrap()
+        };
+        let mut rendered = Vec::new();
+        for frame_index in 0..12 {
+            let deadline =
+                stinger_frame_deadline(FrameRate::new(30, 1).unwrap(), frame_index).unwrap();
+            for _ in 0..10_000 {
+                if runtime
+                    .service_source_playback_for_input_blocking(&mut stingers, media, deadline)
+                    .unwrap()
+                {
+                    break;
+                }
+                thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(
+                stingers.registry.sources[&media].covers_deadline(deadline),
+                "Stinger ring did not cover clip frame {frame_index}: offsets={:?}, eos={}, in_flight={:?}",
+                stingers.registry.sources[&media].offsets_ns,
+                stingers.registry.sources[&media].end_of_stream,
+                stingers.registry.sources[&media].in_flight,
+            );
+            rendered.push(render(frame_index, &stingers));
+        }
+        assert!(stingers.registry.sources[&media].frames.len() <= 8);
+        assert_eq!(playback.registry.sources[&media].offsets_ns, normal_offsets);
+
+        let restart_deadline = stinger_frame_deadline(FrameRate::new(30, 1).unwrap(), 0).unwrap();
+        for _ in 0..10_000 {
+            if runtime
+                .service_source_playback_for_input_blocking(&mut stingers, media, restart_deadline)
+                .unwrap()
+            {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let restarted = render(0, &stingers);
+        let first = &rendered[0];
+        let middle = &rendered[5];
+        let last = &rendered[11];
+        let first_components = rgba16f_components(&first.bytes);
+        let middle_components = rgba16f_components(&middle.bytes);
+        let last_components = rgba16f_components(&last.bytes);
+        assert!(first_components[0] > first_components[2]);
+        assert!(middle_components[1] > 0.0 && middle_components[2] > 0.0);
+        assert!(last_components[0] > last_components[2] && last_components[1] > last_components[2]);
+        assert_eq!(restarted.bytes, first.bytes);
     }
 }

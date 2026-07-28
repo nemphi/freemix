@@ -34,8 +34,13 @@ use fm_command::{
 use fm_control::{
     CommandSubmission, ControlLimits, ControlService, PrepareSubmitOutcome, ResumeDecision,
 };
+#[cfg(feature = "native-media")]
+use fm_engine::FrameResult;
 use fm_engine::{Engine, EngineAcceptance, EngineRestoreState, EngineSnapshot, ShowState};
-use fm_model::MainMix;
+use fm_model::{
+    MainMix, StingerAudioPolicy as ModelStingerAudioPolicy, StingerConfig,
+    StingerMissingMediaFallback, StingerSlotNumber,
+};
 use fm_persistence::{
     FadeToBlackState as PersistedFadeToBlackState, IdempotencyReceipt,
     ManualTransitionKind as PersistedManualTransitionKind,
@@ -54,7 +59,10 @@ use fm_server::{
     AuthenticationMode, ControlPlane, HandshakeError, Heartbeat, InitialSync, Server, ServerConfig,
     ServerMode, Session, SessionError, SyncPayload,
 };
-use fm_switcher::{SwitcherState, TBarPosition, TBarState, TransitionKind};
+use fm_switcher::{
+    MissingMediaFallback, StingerAudioPolicy, StingerDescriptor, StingerSlotId, SwitcherState,
+    TBarPosition, TBarState, TransitionKind,
+};
 use fm_types::{InputId, ProjectId};
 use freemixd::ReadinessRecord;
 
@@ -237,6 +245,8 @@ struct NativeDaemon {
     master: NativeMasterRuntime,
     project_plan: NativeProjectPlan,
     playback: freemixd::native_media::NativeSourcePlayback,
+    stingers: freemixd::native_media::NativeSourcePlayback,
+    projected_frame: Option<FrameResult>,
     runtime: NativeMediaRuntime,
     recorder: Option<NativeProgramRecorder>,
     telemetry: NativeRuntimeTelemetry,
@@ -1623,6 +1633,10 @@ impl Error for NativeRealizationError {
 
 #[cfg(feature = "native-media")]
 impl NativeDaemon {
+    fn invalidate_projection(&mut self) {
+        self.projected_frame = None;
+    }
+
     fn start(
         store: &ProjectStore,
         stored: &StoredProject,
@@ -1642,6 +1656,7 @@ impl NativeDaemon {
         validate_native_audio_modes(stored)?;
         let mut resolution = resolve_native_sources(store, stored, camera_helper)?;
         let sources = resolution.sources;
+        validate_native_stinger_sources(stored, &sources)?;
         let requires_ffmpeg = sources
             .iter()
             .any(|source| matches!(source, NativeResolvedSource::LocalVideo { .. }));
@@ -1680,28 +1695,10 @@ impl NativeDaemon {
             Some(context) => NativeMediaRuntime::from_context_blocking(context)?,
             None => NativeMediaRuntime::new_blocking([platform_native_backend()])?,
         };
-        let playback = runtime.preflight_resolved_source_playback_mixed_blocking(
-            adapter.as_ref(),
-            sources,
-            native_clock_domain(),
-            StreamSelector::Best,
-            NativeSourceLimits::default(),
-        )?;
+        let (playback, stingers) =
+            preflight_native_video(&runtime, adapter.as_ref(), sources, stored)?;
         #[cfg(target_os = "macos")]
         resolution.cameras.mark_preflight_frames_ingested();
-        let expected = stored.project().settings().video.dimensions;
-        if playback
-            .registry()
-            .dimensions()
-            .is_some_and(|dimensions| dimensions != (expected.width(), expected.height()))
-        {
-            return Err(AppFailure(format!(
-                "native media source dimensions must match project output {}x{}",
-                expected.width(),
-                expected.height()
-            ))
-            .into());
-        }
         let pacer = FramePacer::restore(
             stored.project().settings().frame_rate,
             0,
@@ -1718,6 +1715,8 @@ impl NativeDaemon {
             master,
             project_plan,
             playback,
+            stingers,
+            projected_frame: None,
             runtime,
             recorder: None,
             telemetry,
@@ -1846,13 +1845,33 @@ impl NativeDaemon {
     fn service_playback(&mut self, control: &ControlService<Policy>) -> AppResult<bool> {
         #[cfg(target_os = "macos")]
         self.cameras.poll_into(&self.runtime, &mut self.playback)?;
-        let audio_covered = self.master.service_next_frame()?;
         let deadline = control.next_frame_deadline()?;
         let video_covered = self
             .runtime
             .service_source_playback_blocking(&mut self.playback, deadline)
             .map_err(Box::<dyn Error>::from)?;
-        Ok(audio_covered && video_covered)
+        if self.projected_frame.is_none() {
+            self.projected_frame = Some(control.project_next_frame()?);
+        }
+        let projected = self
+            .projected_frame
+            .as_ref()
+            .expect("next frame projection was initialized");
+        let audio_covered = self
+            .master
+            .service_project_next_frame(projected, &self.project_plan)?;
+        let stinger_covered = match self.project_plan.stinger_frame_request(projected)? {
+            Some(request) => self
+                .runtime
+                .service_source_playback_for_input_blocking(
+                    &mut self.stingers,
+                    request.input,
+                    request.deadline,
+                )
+                .map_err(Box::<dyn Error>::from)?,
+            None => true,
+        };
+        Ok(audio_covered && video_covered && stinger_covered)
     }
 
     fn realize_one(
@@ -1862,13 +1881,21 @@ impl NativeDaemon {
     ) -> AppResult<Vec<RuntimeEventMessage>> {
         let runtime = &self.runtime;
         let registry = self.playback.registry();
+        let stinger_registry = self.stingers.registry();
         let master = &mut self.master;
         let project_plan = &self.project_plan;
+        let projected_frame = self.projected_frame.as_ref();
         let latest_output = &mut self.latest_output;
         let mut audio = None;
         let outcome = control.tick_with_realizer(server, |frame| {
+            debug_assert_eq!(projected_frame, Some(frame));
             let output = runtime
-                .render_project_frame_result_blocking(registry, project_plan, frame)
+                .render_project_frame_result_with_stingers_blocking(
+                    registry,
+                    stinger_registry,
+                    project_plan,
+                    frame,
+                )
                 .map_err(NativeRealizationError::Video)?;
             let block = master
                 .render_project_frame_audio(frame, project_plan)
@@ -1877,6 +1904,7 @@ impl NativeDaemon {
             audio = Some(block);
             Ok::<(), NativeRealizationError>(())
         })?;
+        self.projected_frame = None;
         self.pacer.advance()?;
         #[cfg(all(feature = "macos-program-surface", target_os = "macos"))]
         if let (Some(program), Some(output)) = (&mut self.program, self.latest_output.as_ref()) {
@@ -1988,6 +2016,149 @@ impl NativeDaemon {
 }
 
 #[cfg(feature = "native-media")]
+fn validate_native_stinger_sources(
+    stored: &StoredProject,
+    sources: &[NativeResolvedSource],
+) -> AppResult<()> {
+    for config in stored
+        .project()
+        .stingers()
+        .iter()
+        .filter(|config| config.preload)
+    {
+        let source = sources
+            .iter()
+            .find(|source| source.input() == config.media_input)
+            .ok_or_else(|| {
+                AppFailure(format!(
+                    "native Stinger slot {} media input {} is unavailable",
+                    config.slot.number(),
+                    config.media_input
+                ))
+            })?;
+        match source {
+            NativeResolvedSource::RetainedFrame { .. }
+            | NativeResolvedSource::LocalVideo { .. } => {}
+            NativeResolvedSource::LiveFrame { .. } => {
+                return Err(AppFailure(format!(
+                    "native Stinger slot {} media input {} is live and cannot be preloaded",
+                    config.slot.number(),
+                    config.media_input
+                ))
+                .into());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "native-media")]
+fn partition_native_source_limits(
+    width: u32,
+    height: u32,
+    stinger_sources: usize,
+) -> AppResult<(NativeSourceLimits, NativeSourceLimits)> {
+    let defaults = NativeSourceLimits::default();
+    let stinger_ring_bytes = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(8))
+        .and_then(|bytes| bytes.checked_mul(u64::from(defaults.max_video_frames_per_source.get())))
+        .and_then(|bytes| bytes.checked_mul(u64::try_from(stinger_sources).unwrap_or(u64::MAX)))
+        .ok_or_else(|| AppFailure("native Stinger ring byte partition overflow".into()))?;
+    if stinger_ring_bytes > defaults.max_retained_rgba16f_bytes {
+        return Err(AppFailure(format!(
+            "native Stinger rings require {stinger_ring_bytes} retained bytes, exceeding aggregate limit {}",
+            defaults.max_retained_rgba16f_bytes
+        ))
+        .into());
+    }
+    Ok((
+        NativeSourceLimits {
+            max_retained_rgba16f_bytes: defaults
+                .max_retained_rgba16f_bytes
+                .saturating_sub(stinger_ring_bytes),
+            ..defaults
+        },
+        NativeSourceLimits {
+            max_retained_rgba16f_bytes: stinger_ring_bytes,
+            ..defaults
+        },
+    ))
+}
+
+#[cfg(feature = "native-media")]
+fn preflight_native_video(
+    runtime: &NativeMediaRuntime,
+    adapter: Option<&Adapter>,
+    sources: Vec<NativeResolvedSource>,
+    stored: &StoredProject,
+) -> AppResult<(
+    freemixd::native_media::NativeSourcePlayback,
+    freemixd::native_media::NativeSourcePlayback,
+)> {
+    let stinger_inputs = stored
+        .project()
+        .stingers()
+        .iter()
+        .filter(|config| config.preload)
+        .map(|config| config.media_input)
+        .fold(Vec::new(), |mut inputs, input| {
+            if !inputs.contains(&input) {
+                inputs.push(input);
+            }
+            inputs
+        });
+    let stinger_sources = sources
+        .iter()
+        .filter(|source| stinger_inputs.contains(&source.input()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let expected = stored.project().settings().video.dimensions;
+    let (playback_limits, stinger_limits) =
+        partition_native_source_limits(expected.width(), expected.height(), stinger_sources.len())?;
+    let mut stingers = runtime.preflight_resolved_source_playback_mixed_blocking(
+        adapter,
+        stinger_sources,
+        native_clock_domain(),
+        StreamSelector::Best,
+        stinger_limits,
+    )?;
+    for input in stinger_inputs {
+        stingers.enable_stinger_source(input)?;
+    }
+    let playback = runtime.preflight_resolved_source_playback_mixed_blocking(
+        adapter,
+        sources,
+        native_clock_domain(),
+        StreamSelector::Best,
+        playback_limits,
+    )?;
+    validate_native_video_dimensions("media source", playback.registry(), expected)?;
+    validate_native_video_dimensions("Stinger", stingers.registry(), expected)?;
+    Ok((playback, stingers))
+}
+
+#[cfg(feature = "native-media")]
+fn validate_native_video_dimensions(
+    label: &str,
+    registry: &freemixd::native_media::NativeSourceRegistry,
+    expected: fm_frame::VideoDimensions,
+) -> AppResult<()> {
+    if registry
+        .dimensions()
+        .is_some_and(|dimensions| dimensions != (expected.width(), expected.height()))
+    {
+        return Err(AppFailure(format!(
+            "native {label} dimensions must match project output {}x{}",
+            expected.width(),
+            expected.height()
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "native-media")]
 impl Drop for NativeDaemon {
     fn drop(&mut self) {
         let _ = self.finalize_recorder();
@@ -2023,6 +2194,9 @@ struct NativeDaemon;
 
 #[cfg(not(feature = "native-media"))]
 impl NativeDaemon {
+    #[allow(clippy::unused_self)]
+    fn invalidate_projection(&mut self) {}
+
     fn start(
         _store: &ProjectStore,
         _stored: &StoredProject,
@@ -3297,6 +3471,7 @@ fn load_migrate_recover(store: &ProjectStore) -> AppResult<StoredProject> {
                 6 => store.migrate_v6()?,
                 7 => store.migrate_v7()?,
                 8 => store.migrate_v8()?,
+                9 => store.migrate_v9()?,
                 _ => {
                     return Err(StoreError::Validation(
                         ProjectValidationError::UnsupportedSchema {
@@ -3344,6 +3519,9 @@ fn restore_engine(project: &StoredProject) -> AppResult<Engine> {
         main_mix.desired_preview,
     )?;
     let mut realized = SwitcherState::new(inputs, realized_program, realized_preview)?;
+    for config in canonical.stingers() {
+        restore_stinger(&mut show, &mut realized, *config)?;
+    }
     let manual = project.runtime_manual_transitions();
     if let Some(state) = manual.desired {
         show.restore_manual_transition(restored_t_bar(state)?)?;
@@ -3374,6 +3552,41 @@ fn restore_engine(project: &StoredProject) -> AppResult<Engine> {
                 .collect::<AppResult<Vec<_>>>()?,
         },
     )?)
+}
+
+fn restore_stinger(
+    show: &mut ShowState,
+    realized: &mut SwitcherState,
+    config: StingerConfig,
+) -> AppResult<()> {
+    let slot = StingerSlotId::new(config.slot.number())
+        .expect("validated model Stinger slots are in the switcher range");
+    let descriptor = StingerDescriptor::new(
+        config.media_input,
+        config.preload,
+        config.cut_point_frames,
+        match config.audio_policy {
+            ModelStingerAudioPolicy::Muted => StingerAudioPolicy::Muted,
+            ModelStingerAudioPolicy::StingerOnly => StingerAudioPolicy::StingerOnly,
+            ModelStingerAudioPolicy::MixWithProgram => StingerAudioPolicy::MixWithProgram,
+        },
+        match config.missing_media_fallback {
+            StingerMissingMediaFallback::Cut => MissingMediaFallback::Cut,
+            StingerMissingMediaFallback::Fade => MissingMediaFallback::Fade,
+            StingerMissingMediaFallback::KeepProgram => MissingMediaFallback::KeepProgram,
+        },
+    );
+    show.configure_stinger(slot, descriptor)?;
+    realized.configure_stinger(slot, descriptor)?;
+
+    if config.preload {
+        // Native startup resolves every requested source before the first tick.
+        // Until live source-health events are projected into the engine, a
+        // successfully restored input is the deterministic ready state.
+        let _ = show.preload_stinger(slot, true)?;
+        let _ = realized.preload_stinger(slot, true)?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -3734,10 +3947,21 @@ fn process_command(
         write_session_message(writer, session, &WireMessage::CommandResult(result))?;
         return Ok(());
     }
+    if native.is_some()
+        && let Some(result) = native_stinger_mutation_rejection(
+            command,
+            control.borrow().diagnostics().current_revision,
+        )
+    {
+        session.command_completed()?;
+        write_session_message(writer, session, &WireMessage::CommandResult(result))?;
+        return Ok(());
+    }
 
     let execution = {
         let mut control = control.borrow_mut();
         if let Some(native) = native {
+            native.invalidate_projection();
             execute_durable_command_with_ticks(
                 &mut control,
                 store,
@@ -3782,6 +4006,26 @@ fn process_command(
         write_session_message(writer, session, &WireMessage::RuntimeEvent(event))?;
     }
     Ok(())
+}
+
+fn native_stinger_mutation_rejection(
+    command: &CommandMessage,
+    current_revision: u64,
+) -> Option<CommandResult> {
+    matches!(
+        command.payload,
+        CommandPayload::ConfigureStinger { .. } | CommandPayload::RemoveStinger { .. }
+    )
+    .then(|| CommandResult::Rejected {
+        id: command.id.clone(),
+        code: RejectionCode::Unavailable.as_str().to_owned(),
+        message:
+            "live Stinger slot mutation requires a daemon restart when native media is enabled"
+                .to_owned(),
+        fields: Vec::new(),
+        current_revision,
+        retryable: false,
+    })
 }
 
 struct DurableExecution {
@@ -3865,12 +4109,17 @@ fn command_ticks(command: &CommandMessage) -> u32 {
         | CommandPayload::AlphaFade { duration_frames }
         | CommandPayload::Slide { duration_frames }
         | CommandPayload::Zoom { duration_frames }
+        | CommandPayload::Stinger {
+            duration_frames, ..
+        }
         | CommandPayload::Wipe { duration_frames }
         | CommandPayload::FadeToBlack {
             duration_frames, ..
         } => duration_frames,
         CommandPayload::SelectPreview { .. }
         | CommandPayload::Cut
+        | CommandPayload::ConfigureStinger { .. }
+        | CommandPayload::RemoveStinger { .. }
         | CommandPayload::StartManualTransition { .. }
         | CommandPayload::SetManualTransitionPosition { .. }
         | CommandPayload::CommitManualTransition
@@ -3931,6 +4180,7 @@ fn stored_project_with_receipts(
     let realized = snapshot.realized_switcher();
     let mut project = durable.project().clone();
     project.set_main_mix(MainMix::new(desired.program(), desired.preview()));
+    sync_project_stingers(&mut project, desired, realized)?;
     StoredProject::from_project_with_runtime_state(
         project,
         RuntimeRouting {
@@ -3958,6 +4208,47 @@ fn stored_project_with_receipts(
         receipts,
     )
     .map_err(Into::into)
+}
+
+fn sync_project_stingers(
+    project: &mut fm_model::Project,
+    desired: &SwitcherState,
+    realized: &SwitcherState,
+) -> AppResult<()> {
+    for number in 1..=u8::try_from(StingerSlotNumber::COUNT)
+        .expect("Stinger slot count fits the operator-facing number")
+    {
+        let model_slot = StingerSlotNumber::new(number).expect("Stinger slot number is bounded");
+        let slot = StingerSlotId::new(number).expect("Stinger slot number is bounded");
+        let desired_state = desired.stinger(slot);
+        if desired_state != realized.stinger(slot) {
+            return Err(AppFailure(format!(
+                "cannot persist divergent desired and realized Stinger slot {number}"
+            ))
+            .into());
+        }
+        let _ = project.remove_stinger(model_slot);
+        let Some(descriptor) = desired_state.descriptor() else {
+            continue;
+        };
+        project.set_stinger(StingerConfig::new(
+            model_slot,
+            descriptor.media_input,
+            descriptor.preload,
+            descriptor.cut_point_frames,
+            match descriptor.audio_policy {
+                StingerAudioPolicy::Muted => ModelStingerAudioPolicy::Muted,
+                StingerAudioPolicy::StingerOnly => ModelStingerAudioPolicy::StingerOnly,
+                StingerAudioPolicy::MixWithProgram => ModelStingerAudioPolicy::MixWithProgram,
+            },
+            match descriptor.missing_media_fallback {
+                MissingMediaFallback::Cut => StingerMissingMediaFallback::Cut,
+                MissingMediaFallback::Fade => StingerMissingMediaFallback::Fade,
+                MissingMediaFallback::KeepProgram => StingerMissingMediaFallback::KeepProgram,
+            },
+        ));
+    }
+    Ok(())
 }
 
 fn persisted_fade_to_black(state: fm_engine::EngineFadeToBlackState) -> PersistedFadeToBlackState {
@@ -4351,7 +4642,8 @@ mod tests {
     use fm_io_macos::{CameraIdKind, deterministic_camera_id};
     use fm_model::{
         Input, InputAudioStripState, InputGainMilliDb, InputKind, Project, ProjectSettings,
-        SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor,
+        SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, StingerConfig,
+        StingerSlotNumber,
     };
     #[cfg(feature = "native-media")]
     use fm_model::{Rgba8 as ModelRgba8, Scene};
@@ -6466,6 +6758,198 @@ mod tests {
     }
 
     #[test]
+    fn restore_engine_honors_durable_stinger_preload_intent() {
+        let baseline = test_project();
+        let mut project = baseline.project().clone();
+        project.add_stinger(StingerConfig::new(
+            StingerSlotNumber::new(8).unwrap(),
+            test_input_id(2),
+            false,
+            11,
+            ModelStingerAudioPolicy::MixWithProgram,
+            StingerMissingMediaFallback::KeepProgram,
+        ));
+        project.add_stinger(StingerConfig::new(
+            StingerSlotNumber::new(1).unwrap(),
+            test_input_id(2),
+            true,
+            1,
+            ModelStingerAudioPolicy::Muted,
+            StingerMissingMediaFallback::Cut,
+        ));
+        let durable = StoredProject::from_project(
+            project,
+            baseline.runtime_routing(),
+            baseline.position(),
+            baseline.idempotency_receipts().to_vec(),
+        )
+        .unwrap();
+
+        let snapshot = restore_engine(&durable).unwrap().snapshot().unwrap();
+        let deferred_slot = StingerSlotId::new(8).unwrap();
+        let deferred = StingerDescriptor::new(
+            test_input_id(2),
+            false,
+            11,
+            StingerAudioPolicy::MixWithProgram,
+            MissingMediaFallback::KeepProgram,
+        );
+        let preloaded_slot = StingerSlotId::new(1).unwrap();
+        let preloaded = StingerDescriptor::new(
+            test_input_id(2),
+            true,
+            1,
+            StingerAudioPolicy::Muted,
+            MissingMediaFallback::Cut,
+        );
+        for state in [
+            snapshot.show().desired_switcher(),
+            snapshot.realized_switcher(),
+        ] {
+            assert_eq!(state.stinger(deferred_slot).descriptor(), Some(&deferred));
+            assert_eq!(
+                state.stinger(deferred_slot).preload_state(),
+                fm_switcher::StingerPreloadState::NotRequested
+            );
+            assert_eq!(state.stinger(preloaded_slot).descriptor(), Some(&preloaded));
+            assert_eq!(
+                state.stinger(preloaded_slot).preload_state(),
+                fm_switcher::StingerPreloadState::Ready
+            );
+        }
+    }
+
+    #[cfg(feature = "native-media")]
+    #[test]
+    fn native_video_ring_partition_preserves_one_aggregate_gpu_limit() {
+        let defaults = NativeSourceLimits::default();
+        let (ordinary, stingers) = partition_native_source_limits(1_920, 1_080, 1).unwrap();
+        let expected_stinger =
+            1_920_u64 * 1_080 * 8 * u64::from(defaults.max_video_frames_per_source.get());
+
+        assert_eq!(stingers.max_retained_rgba16f_bytes, expected_stinger);
+        assert_eq!(
+            ordinary.max_retained_rgba16f_bytes + stingers.max_retained_rgba16f_bytes,
+            defaults.max_retained_rgba16f_bytes
+        );
+        assert_eq!(
+            partition_native_source_limits(1_920, 1_080, 5)
+                .unwrap_err()
+                .to_string(),
+            format!(
+                "native Stinger rings require {} retained bytes, exceeding aggregate limit {}",
+                expected_stinger * 5,
+                defaults.max_retained_rgba16f_bytes
+            )
+        );
+    }
+
+    #[cfg(feature = "native-media")]
+    #[test]
+    fn native_stinger_source_validation_bounds_preload_kinds_and_audio() {
+        let baseline = test_project();
+        let mut project = baseline.project().clone();
+        project.add_stinger(StingerConfig::new(
+            StingerSlotNumber::new(1).unwrap(),
+            test_input_id(2),
+            true,
+            1,
+            ModelStingerAudioPolicy::Muted,
+            StingerMissingMediaFallback::Cut,
+        ));
+        let durable = StoredProject::from_project(
+            project,
+            baseline.runtime_routing(),
+            baseline.position(),
+            Vec::new(),
+        )
+        .unwrap();
+        let mut source = SimulatedVideoSource::new(
+            1,
+            1,
+            FrameRate::new(25, 1).unwrap(),
+            native_clock_domain(),
+            SourcePattern::Solid(Rgba8::new(0, 0, 0, 0)),
+        )
+        .unwrap();
+        let retained = NativeResolvedSource::RetainedFrame {
+            input: test_input_id(2),
+            frame: source.next_frame().unwrap().unwrap(),
+        };
+        validate_native_stinger_sources(&durable, &[retained]).unwrap();
+
+        validate_native_stinger_sources(
+            &durable,
+            &[NativeResolvedSource::LocalVideo {
+                input: test_input_id(2),
+                path: PathBuf::from("/secret/stinger.mov"),
+            }],
+        )
+        .unwrap();
+
+        let mut audible_project = baseline.project().clone();
+        audible_project.add_stinger(StingerConfig::new(
+            StingerSlotNumber::new(1).unwrap(),
+            test_input_id(2),
+            true,
+            1,
+            ModelStingerAudioPolicy::StingerOnly,
+            StingerMissingMediaFallback::Cut,
+        ));
+        let audible = StoredProject::from_project(
+            audible_project,
+            baseline.runtime_routing(),
+            baseline.position(),
+            Vec::new(),
+        )
+        .unwrap();
+        validate_native_stinger_sources(
+            &audible,
+            &[NativeResolvedSource::LocalVideo {
+                input: test_input_id(2),
+                path: PathBuf::from("/secret/stinger.mov"),
+            }],
+        )
+        .unwrap();
+
+        let error = validate_native_stinger_sources(
+            &durable,
+            &[NativeResolvedSource::LiveFrame {
+                input: test_input_id(2),
+                frame: source.next_frame().unwrap().unwrap(),
+            }],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("is live and cannot be preloaded"));
+
+        let mut deferred_project = baseline.project().clone();
+        deferred_project.add_stinger(StingerConfig::new(
+            StingerSlotNumber::new(1).unwrap(),
+            test_input_id(2),
+            false,
+            1,
+            ModelStingerAudioPolicy::Muted,
+            StingerMissingMediaFallback::Cut,
+        ));
+        let deferred = StoredProject::from_project(
+            deferred_project,
+            baseline.runtime_routing(),
+            baseline.position(),
+            baseline.idempotency_receipts().to_vec(),
+        )
+        .unwrap();
+        validate_native_stinger_sources(
+            &deferred,
+            &[NativeResolvedSource::LocalVideo {
+                input: test_input_id(2),
+                path: PathBuf::from("/secret/stinger.mov"),
+            }],
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn alpha_fade_settles_before_checkpoint_and_restores_exact_routing() {
         let mut durable = test_project();
         let mut control = test_control(&durable);
@@ -6946,6 +7430,38 @@ mod tests {
 
     fn test_input_id(value: u128) -> InputId {
         InputId::new(NonZeroU128::new(value).unwrap())
+    }
+
+    #[test]
+    fn native_stinger_slot_mutations_are_restart_required_before_authority_changes() {
+        let slot = fm_protocol::WireStingerSlotId::new(8).unwrap();
+        for payload in [
+            CommandPayload::ConfigureStinger {
+                slot,
+                media_input: fm_protocol::WireInputId::from_domain(test_input_id(2)),
+                preload: true,
+                cut_point_frames: 3,
+                audio_policy: fm_protocol::StingerAudioPolicy::Muted,
+                missing_media_fallback: fm_protocol::StingerMissingMediaFallback::Cut,
+            },
+            CommandPayload::RemoveStinger { slot },
+        ] {
+            let result = native_stinger_mutation_rejection(
+                &test_command("native", "native-key", payload),
+                7,
+            )
+            .unwrap();
+            assert!(matches!(
+                result,
+                CommandResult::Rejected {
+                    ref code,
+                    ref message,
+                    current_revision: 7,
+                    retryable: false,
+                    ..
+                } if code == "unavailable" && message.contains("daemon restart")
+            ));
+        }
     }
 
     fn test_control(project: &StoredProject) -> ControlService<Policy> {

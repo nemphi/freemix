@@ -4,7 +4,8 @@ use crate::{
     EventMessage, EventPayload, FadeToBlackState, HandshakeOutcome, HandshakeRequest,
     HandshakeResponse, HeartbeatMessage, ManualTransitionKind, ManualTransitionStatus,
     ResumeCursor, RuntimeEventMessage, RuntimeFailureDisposition, RuntimeLifecycleEvent,
-    ServerHello, ServerIdentity, SnapshotMessage, SnapshotReason, StructuredError, WireMessage,
+    ServerHello, ServerIdentity, SnapshotMessage, SnapshotReason, StingerAudioPolicy,
+    StingerMissingMediaFallback, StingerReadiness, StingerStatus, StructuredError, WireMessage,
 };
 
 use super::value::{
@@ -188,6 +189,16 @@ fn encode_command(record: &mut Record, message: &CommandMessage) -> Result<(), C
             record.field("payload", "zoom")?;
             record.field("duration_frames", duration_frames)?;
         }
+        CommandPayload::Stinger {
+            slot,
+            duration_frames,
+        } => {
+            record.field("payload", "stinger")?;
+            record.field("slot", slot)?;
+            record.field("duration_frames", duration_frames)?;
+        }
+        payload @ (CommandPayload::ConfigureStinger { .. }
+        | CommandPayload::RemoveStinger { .. }) => encode_stinger_mutation(record, payload)?,
         CommandPayload::Wipe { duration_frames } => {
             record.field("payload", "wipe")?;
             record.field("duration_frames", duration_frames)?;
@@ -223,6 +234,45 @@ fn encode_command(record: &mut Record, message: &CommandMessage) -> Result<(), C
         }
     }
     Ok(())
+}
+
+fn encode_stinger_mutation(record: &mut Record, payload: CommandPayload) -> Result<(), CodecError> {
+    let CommandPayload::ConfigureStinger {
+        slot,
+        media_input,
+        preload,
+        cut_point_frames,
+        audio_policy,
+        missing_media_fallback,
+    } = payload
+    else {
+        let CommandPayload::RemoveStinger { slot } = payload else {
+            unreachable!("only Stinger mutation payloads are delegated")
+        };
+        record.field("payload", "remove_stinger")?;
+        return record.field("slot", slot);
+    };
+    record.field("payload", "configure_stinger")?;
+    record.field("slot", slot)?;
+    record.field("media_input", media_input)?;
+    record.field("preload", u8::from(preload))?;
+    record.field("cut_point_frames", cut_point_frames)?;
+    record.field(
+        "audio_policy",
+        match audio_policy {
+            StingerAudioPolicy::Muted => "muted",
+            StingerAudioPolicy::StingerOnly => "stinger_only",
+            StingerAudioPolicy::MixWithProgram => "mix_with_program",
+        },
+    )?;
+    record.field(
+        "missing_media_fallback",
+        match missing_media_fallback {
+            StingerMissingMediaFallback::Cut => "cut",
+            StingerMissingMediaFallback::Fade => "fade",
+            StingerMissingMediaFallback::KeepProgram => "keep_program",
+        },
+    )
 }
 
 fn encode_result(record: &mut Record, message: &CommandResult) -> Result<(), CodecError> {
@@ -296,13 +346,66 @@ fn encode_snapshot(record: &mut Record, message: &SnapshotMessage) -> Result<(),
         record,
         message.realized_fade_to_black,
         FadeToBlackStateFields::Realized,
-    )
+    )?;
+    encode_stingers(record, message.stingers.as_deref())
+}
+
+fn encode_stingers(
+    record: &mut Record,
+    stingers: Option<&[StingerStatus]>,
+) -> Result<(), CodecError> {
+    let Some(stingers) = stingers else {
+        return Ok(());
+    };
+    if stingers.len() > 8 {
+        return Err(CodecError::TooManyItems("stingers"));
+    }
+    let mut seen = [false; 8];
+    for status in stingers {
+        let index = usize::from(status.slot.number() - 1);
+        if seen[index] {
+            return Err(CodecError::InvalidField {
+                field: "?stingers",
+                value: format!("duplicate slot {}", status.slot.number()),
+            });
+        }
+        seen[index] = true;
+    }
+    let value = stingers
+        .iter()
+        .map(|status| {
+            format!(
+                "{}:{}:{}:{}:{}:{}:{}",
+                status.slot.number(),
+                status.media_input,
+                u8::from(status.preload),
+                status.cut_point_frames,
+                match status.audio_policy {
+                    StingerAudioPolicy::Muted => "muted",
+                    StingerAudioPolicy::StingerOnly => "stinger_only",
+                    StingerAudioPolicy::MixWithProgram => "mix_with_program",
+                },
+                match status.missing_media_fallback {
+                    StingerMissingMediaFallback::Cut => "cut",
+                    StingerMissingMediaFallback::Fade => "fade",
+                    StingerMissingMediaFallback::KeepProgram => "keep_program",
+                },
+                match status.readiness {
+                    StingerReadiness::NotRequested => "not_requested",
+                    StingerReadiness::Ready => "ready",
+                    StingerReadiness::Missing => "missing",
+                },
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    record.field_string("?stingers", value)
 }
 
 fn encode_event(record: &mut Record, message: &EventMessage) -> Result<(), CodecError> {
     record.kind("event");
     encode_cursor(record, &message.cursor)?;
-    match message.payload {
+    match &message.payload {
         EventPayload::DesiredSwitcher {
             program,
             preview,
@@ -312,8 +415,30 @@ fn encode_event(record: &mut Record, message: &EventMessage) -> Result<(), Codec
             record.field("event", "desired_switcher")?;
             record.field("program", program)?;
             record.field("preview", preview)?;
-            encode_manual_status(record, manual_transition, ManualStatusFields::Unqualified)?;
-            encode_fade_to_black_state(record, fade_to_black, FadeToBlackStateFields::Unqualified)?;
+            encode_manual_status(record, *manual_transition, ManualStatusFields::Unqualified)?;
+            encode_fade_to_black_state(
+                record,
+                *fade_to_black,
+                FadeToBlackStateFields::Unqualified,
+            )?;
+        }
+        EventPayload::StingerSlotsChanged {
+            program,
+            preview,
+            manual_transition,
+            fade_to_black,
+            stingers,
+        } => {
+            record.field("event", "stinger_slots_changed")?;
+            record.field("program", program)?;
+            record.field("preview", preview)?;
+            encode_manual_status(record, *manual_transition, ManualStatusFields::Unqualified)?;
+            encode_fade_to_black_state(
+                record,
+                *fade_to_black,
+                FadeToBlackStateFields::Unqualified,
+            )?;
+            encode_stingers(record, Some(stingers))?;
         }
     }
     Ok(())

@@ -8,8 +8,8 @@ use fm_command::{
 };
 use fm_scheduler::{FrameNumber, FrameScheduler, PlanGeneration};
 use fm_switcher::{
-    FadeToBlackFrame, FadeToBlackPosition, ProgramFrame, SwitcherCommand, SwitcherError,
-    SwitcherEvent, SwitcherState, TBarPosition, TransitionKind,
+    FadeToBlackFrame, FadeToBlackPosition, ProgramFrame, StingerDescriptor, StingerSlotId,
+    SwitcherCommand, SwitcherError, SwitcherEvent, SwitcherState, TBarPosition, TransitionKind,
 };
 use fm_types::{FrameRate, InputId};
 
@@ -81,6 +81,17 @@ pub enum EngineCommand {
     },
     Zoom {
         duration_frames: u32,
+    },
+    Stinger {
+        slot: StingerSlotId,
+        duration_frames: u32,
+    },
+    ConfigureStinger {
+        slot: StingerSlotId,
+        descriptor: StingerDescriptor,
+    },
+    RemoveStinger {
+        slot: StingerSlotId,
     },
     Wipe {
         duration_frames: u32,
@@ -543,6 +554,12 @@ impl Engine {
                 EngineCommand::AlphaFade { .. } => Some(TransitionKind::AlphaFade),
                 EngineCommand::Slide { .. } => Some(TransitionKind::Slide),
                 EngineCommand::Zoom { .. } => Some(TransitionKind::Zoom),
+                EngineCommand::Stinger { slot, .. } => {
+                    stinger_runtime_transition(self.commands.state(), slot)
+                }
+                EngineCommand::ConfigureStinger { .. } | EngineCommand::RemoveStinger { .. } => {
+                    None
+                }
                 EngineCommand::Wipe { .. } => Some(TransitionKind::Wipe),
                 EngineCommand::SelectPreview(_)
                 | EngineCommand::Cut
@@ -745,6 +762,7 @@ fn validate_idle_restore(
         || show.desired_switcher().fade_to_black() != realized_switcher.fade_to_black()
         || show.desired_switcher().fade_to_black_position()
             != realized_switcher.fade_to_black_position()
+        || show.desired_switcher().stingers() != realized_switcher.stingers()
     {
         return Err(SnapshotError::MismatchedSwitcherRouting);
     }
@@ -820,6 +838,12 @@ impl Mutation<ShowState, EngineEvent, EngineAcceptance> for EngineMutation {
         state: &mut ShowState,
         events: &mut Vec<EngineEvent>,
     ) -> Result<EngineAcceptance, Rejection> {
+        if matches!(
+            self.command,
+            EngineCommand::ConfigureStinger { .. } | EngineCommand::RemoveStinger { .. }
+        ) {
+            return apply_stinger_mutation(state, events, self);
+        }
         let switcher_command = match self.command {
             EngineCommand::SelectPreview(input) => SwitcherCommand::SelectPreview(input),
             EngineCommand::Cut => SwitcherCommand::Cut,
@@ -838,6 +862,49 @@ impl Mutation<ShowState, EngineEvent, EngineAcceptance> for EngineMutation {
             EngineCommand::Zoom { duration_frames } => {
                 validate_transition_duration("zoom", duration_frames)?;
                 SwitcherCommand::Cut
+            }
+            EngineCommand::Stinger {
+                slot,
+                duration_frames,
+            } => {
+                validate_transition_duration("stinger", duration_frames)?;
+                match state.desired_switcher().stinger_playback_decision(slot) {
+                    fm_switcher::StingerPlaybackDecision::Play => {
+                        let descriptor = state
+                            .desired_switcher()
+                            .stinger(slot)
+                            .descriptor()
+                            .expect("playable stinger has a descriptor");
+                        if descriptor.cut_point_frames > duration_frames {
+                            return Err(switcher_rejection(
+                                SwitcherError::StingerCutPointOutOfRange {
+                                    slot,
+                                    cut_point_frames: descriptor.cut_point_frames,
+                                    duration_frames,
+                                },
+                            ));
+                        }
+                        SwitcherCommand::Cut
+                    }
+                    fm_switcher::StingerPlaybackDecision::Fallback(
+                        fm_switcher::MissingMediaFallback::KeepProgram,
+                    ) => {
+                        events.push(EngineEvent::DesiredSwitcherChanged(self.command));
+                        return Ok(EngineAcceptance {
+                            target_frame: self.target_frame,
+                        });
+                    }
+                    fm_switcher::StingerPlaybackDecision::Fallback(
+                        fm_switcher::MissingMediaFallback::Cut
+                        | fm_switcher::MissingMediaFallback::Fade,
+                    ) => SwitcherCommand::Cut,
+                    fm_switcher::StingerPlaybackDecision::Unconfigured => {
+                        return Err(switcher_rejection(SwitcherError::UnconfiguredStinger(slot)));
+                    }
+                }
+            }
+            EngineCommand::ConfigureStinger { .. } | EngineCommand::RemoveStinger { .. } => {
+                unreachable!("Stinger mutations return before switcher command mapping")
             }
             EngineCommand::Wipe { duration_frames } => {
                 validate_transition_duration("wipe", duration_frames)?;
@@ -874,6 +941,39 @@ impl Mutation<ShowState, EngineEvent, EngineAcceptance> for EngineMutation {
     }
 }
 
+fn apply_stinger_mutation(
+    state: &mut ShowState,
+    events: &mut Vec<EngineEvent>,
+    mutation: EngineMutation,
+) -> Result<EngineAcceptance, Rejection> {
+    if state.desired_switcher().t_bar().is_some() {
+        return Err(Rejection::new(
+            RejectionCode::Conflict,
+            "Stinger slot configuration cannot change during a manual transition",
+        ));
+    }
+    match mutation.command {
+        EngineCommand::ConfigureStinger { slot, descriptor } => {
+            state
+                .desired_switcher_mut()
+                .configure_stinger(slot, descriptor)
+                .map_err(switcher_rejection)?;
+            if descriptor.preload {
+                let _ = state
+                    .desired_switcher_mut()
+                    .preload_stinger(slot, true)
+                    .map_err(switcher_rejection)?;
+            }
+        }
+        EngineCommand::RemoveStinger { slot } => state.remove_stinger(slot),
+        _ => unreachable!("only Stinger mutation commands are delegated"),
+    }
+    events.push(EngineEvent::DesiredSwitcherChanged(mutation.command));
+    Ok(EngineAcceptance {
+        target_frame: mutation.target_frame,
+    })
+}
+
 fn apply_runtime(
     switcher: &mut SwitcherState,
     command: EngineCommand,
@@ -906,6 +1006,25 @@ fn apply_runtime(
             kind: TransitionKind::Zoom,
             duration_frames,
         },
+        EngineCommand::Stinger {
+            slot,
+            duration_frames,
+        } => SwitcherCommand::Transition {
+            kind: TransitionKind::Stinger(slot),
+            duration_frames,
+        },
+        EngineCommand::ConfigureStinger { slot, descriptor } => {
+            switcher.configure_stinger(slot, descriptor)?;
+            let mut events = Vec::new();
+            if descriptor.preload {
+                events.push(switcher.preload_stinger(slot, true)?);
+            }
+            return Ok(events);
+        }
+        EngineCommand::RemoveStinger { slot } => {
+            switcher.remove_stinger(slot);
+            return Ok(Vec::new());
+        }
         EngineCommand::Wipe { duration_frames } => SwitcherCommand::Wipe { duration_frames },
         EngineCommand::FadeToBlack { .. } => {
             unreachable!("Fade-to-Black commands return before switcher command mapping")
@@ -963,6 +1082,22 @@ fn validate_transition_duration(name: &str, duration_frames: u32) -> Result<(), 
     Ok(())
 }
 
+fn stinger_runtime_transition(
+    show: &ShowState,
+    slot: fm_switcher::StingerSlotId,
+) -> Option<TransitionKind> {
+    match show.desired_switcher().stinger_playback_decision(slot) {
+        fm_switcher::StingerPlaybackDecision::Play => Some(TransitionKind::Stinger(slot)),
+        fm_switcher::StingerPlaybackDecision::Fallback(fm_switcher::MissingMediaFallback::Fade) => {
+            Some(TransitionKind::Fade)
+        }
+        fm_switcher::StingerPlaybackDecision::Fallback(
+            fm_switcher::MissingMediaFallback::Cut | fm_switcher::MissingMediaFallback::KeepProgram,
+        )
+        | fm_switcher::StingerPlaybackDecision::Unconfigured => None,
+    }
+}
+
 const fn manual_transition_kind(kind: EngineManualTransitionKind) -> TransitionKind {
     match kind {
         EngineManualTransitionKind::Fade => TransitionKind::Fade,
@@ -997,11 +1132,14 @@ fn engine_manual_state(state: fm_switcher::TBarState) -> EngineManualTransitionS
 
 fn switcher_rejection(error: SwitcherError) -> Rejection {
     let code = match error {
-        SwitcherError::UnknownInput(_) => RejectionCode::NotFound,
+        SwitcherError::UnknownInput(_) | SwitcherError::UnconfiguredStinger(_) => {
+            RejectionCode::NotFound
+        }
         SwitcherError::TransitionInProgress => RejectionCode::Conflict,
         SwitcherError::UnsupportedManualTransitionKind
         | SwitcherError::InvalidManualTransitionRoute
-        | SwitcherError::ZeroDuration => RejectionCode::InvalidCommand,
+        | SwitcherError::ZeroDuration
+        | SwitcherError::StingerCutPointOutOfRange { .. } => RejectionCode::InvalidCommand,
     };
     Rejection::new(code, error.to_string())
 }

@@ -12,9 +12,10 @@ use std::{
 use fm_color::{ColorPipeline, NativeImportNormalizer, working_color_metadata};
 use fm_compositor::{
     CpuSourceFrame, CropRect, FadeToBlackPlan, FadeToBlackPosition, NativeCompositionRenderer,
-    NativeFadeToBlackRenderer, NativeSourceFrame, NativeTransitionRenderer, OutputTarget, RectMask,
-    Rgba8, Rotation, Scene, SourceId, SourceLayer, Transform, TransitionKind, TransitionPlan,
-    compile_scene, execute_cpu, execute_transition, image_from_cpu_frame,
+    NativeFadeToBlackRenderer, NativeSourceFrame, NativeStingerRenderer, NativeTransitionRenderer,
+    OutputTarget, RectMask, Rgba8, Rotation, Scene, SourceId, SourceLayer, StingerFramePlan,
+    Transform, TransitionKind, TransitionPlan, compile_scene, execute_cpu, execute_stinger_frame,
+    execute_transition, image_from_cpu_frame,
 };
 use fm_frame::{
     AlphaMode, ChromaLocation, ClockDomainId, ColorMetadata, ColorPrimaries, CpuVideoFrame,
@@ -561,6 +562,55 @@ fn native_metal_zoom_matches_cpu_at_odd_centered_extents() {
             let expected = execute_transition(plan, &from_image, &to_image).unwrap();
             let output = renderer
                 .render(&context, plan, from.texture(), to.texture())
+                .await
+                .unwrap();
+            let actual = context.readback(&output).await.unwrap();
+            assert_rgba16f_matches_cpu(&actual, &expected);
+        }
+    });
+}
+
+#[test]
+#[ignore = "requires a native macOS Metal adapter"]
+fn native_metal_stinger_matches_cpu_before_and_at_the_cut_point() {
+    block_on(async {
+        let program_cpu = frame(
+            20,
+            &[
+                255, 255, 255, 255, 64, 64, 64, 255, 32, 16, 8, 128, 0, 0, 0, 0,
+            ],
+        );
+        let preview_cpu = frame(
+            21,
+            &[0, 0, 0, 255, 192, 192, 192, 255, 8, 16, 32, 128, 0, 0, 0, 0],
+        );
+        let media_cpu = frame(
+            22,
+            &[0, 0, 0, 0, 255, 0, 0, 128, 0, 255, 0, 192, 0, 0, 255, 255],
+        );
+        let program_image = canonical_cpu_image(&program_cpu);
+        let preview_image = canonical_cpu_image(&preview_cpu);
+        let media_image = canonical_cpu_image(&media_cpu);
+
+        let context = NativeContext::new([NativeBackend::Metal]).await.unwrap();
+        let normalizer = NativeImportNormalizer::new(&context).await.unwrap();
+        let program = normalizer.normalize(&context, &program_cpu).await.unwrap();
+        let preview = normalizer.normalize(&context, &preview_cpu).await.unwrap();
+        let media = normalizer.normalize(&context, &media_cpu).await.unwrap();
+        let renderer = NativeStingerRenderer::new(&context).await.unwrap();
+
+        for frame_index in [0, 1] {
+            let plan = StingerFramePlan::compile(frame_index, 2, 1).unwrap();
+            let expected =
+                execute_stinger_frame(plan, &program_image, &preview_image, &media_image).unwrap();
+            let output = renderer
+                .render(
+                    &context,
+                    plan,
+                    program.texture(),
+                    preview.texture(),
+                    media.texture(),
+                )
                 .await
                 .unwrap();
             let actual = context.readback(&output).await.unwrap();

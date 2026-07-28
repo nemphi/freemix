@@ -1123,6 +1123,15 @@ impl MasterMixer {
         Ok(())
     }
 
+    /// Clears gain-ramp and delay history while preserving configured strip
+    /// state, mappings, delay lengths, and clipping policy.
+    pub fn reset_runtime_state(&mut self) {
+        for strip in self.inputs.values_mut() {
+            strip.ramp = GainRamp::immediate(strip.state.gain);
+            strip.delay.reset();
+        }
+    }
+
     /// Renders submitted blocks into the Master bus.
     ///
     /// Inputs not submitted for this call contribute silence. Every submitted
@@ -2323,6 +2332,47 @@ mod tests {
                 duration_nanos: 1_000_000,
             })
         );
+    }
+
+    #[test]
+    fn reset_runtime_state_clears_delay_and_finishes_configured_gain() {
+        let format = mono_format();
+        let id = input_id(1);
+        let mut mixer = MasterMixer::new(format.clone()).unwrap();
+        mixer
+            .add_input(
+                id,
+                format.clone(),
+                ChannelMapping::identity(format.channels.clone()).unwrap(),
+                InputState::default(),
+            )
+            .unwrap();
+        mixer.set_input_delay(id, 2).unwrap();
+        let impulse = canonical_block(timing_for_samples(0, 2), &format, vec![vec![1.0, 0.0]]);
+        let first = mixer
+            .mix_timed(timing_for_samples(0, 2), 2, &[(id, &impulse)], Some(id))
+            .unwrap();
+        assert_eq!(first.block.plane(0).unwrap(), &[0.0, 0.0]);
+        mixer
+            .set_input_state(
+                id,
+                InputState {
+                    gain: Gain::SILENCE,
+                    ..InputState::default()
+                },
+                2,
+            )
+            .unwrap();
+
+        mixer.reset_runtime_state();
+
+        assert_eq!(mixer.current_linear_gain(id), Some(0.0));
+        assert_eq!(mixer.input_delay_samples(id), Some(2));
+        let silence = canonical_block(timing_for_samples(1, 2), &format, vec![vec![0.0, 0.0]]);
+        let replay = mixer
+            .mix_timed(timing_for_samples(1, 2), 2, &[(id, &silence)], Some(id))
+            .unwrap();
+        assert_eq!(replay.block.plane(0).unwrap(), &[0.0, 0.0]);
     }
 
     #[test]

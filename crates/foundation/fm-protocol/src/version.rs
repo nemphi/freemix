@@ -8,7 +8,10 @@ pub const ALPHA_FADE_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1,
 pub const MANUAL_ALPHA_FADE_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 7);
 pub const SLIDE_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 8);
 pub const ZOOM_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 9);
-pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ZOOM_PROTOCOL_VERSION;
+pub const STINGER_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 10);
+pub const STINGER_STATUS_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 11);
+pub const STINGER_CONFIGURATION_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 12);
+pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = STINGER_CONFIGURATION_PROTOCOL_VERSION;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ProtocolVersion {

@@ -172,6 +172,9 @@ impl Session {
             | CommandPayload::AlphaFade { .. }
             | CommandPayload::Slide { .. }
             | CommandPayload::Zoom { .. }
+            | CommandPayload::Stinger { .. }
+            | CommandPayload::ConfigureStinger { .. }
+            | CommandPayload::RemoveStinger { .. }
             | CommandPayload::Wipe { .. }
             | CommandPayload::FadeToBlack { .. }
             | CommandPayload::StartManualTransition { .. }

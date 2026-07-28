@@ -16,8 +16,9 @@ use fm_protocol::{
     ClientType, CommandMessage, CommandPayload, CommandResult, DurableGap, EngineIdentity,
     EventMessage, FADE_TO_BLACK_PROTOCOL_VERSION, HandshakeOutcome, HandshakeRequest,
     HandshakeResponse, HeartbeatMessage, MANUAL_TRANSITION_PROTOCOL_VERSION, ProtocolVersion,
-    ResumeCursor, Role, RuntimeEventMessage, RuntimeLifecycleEvent, ServerHello, ServerIdentity,
-    SnapshotMessage, StructuredError, WireMessage, negotiate_version,
+    ResumeCursor, Role, RuntimeEventMessage, RuntimeLifecycleEvent,
+    STINGER_STATUS_PROTOCOL_VERSION, ServerHello, ServerIdentity, SnapshotMessage, StructuredError,
+    WireMessage, negotiate_version,
 };
 use fm_types::ProjectId;
 use fm_ui_model::{
@@ -720,6 +721,11 @@ impl Client {
                 "protocol 1.5 snapshot omitted fade-to-black state",
             ));
         }
+        if supports_stinger_status(session.protocol) && snapshot.stingers.is_none() {
+            return Err(ClientError::InvalidSnapshot(
+                "protocol 1.11 snapshot omitted Stinger status",
+            ));
+        }
         self.model.install_snapshot(ProjectSnapshot::from_protocol(
             self.config.project_id,
             snapshot,
@@ -751,10 +757,21 @@ impl Client {
             .as_ref()
             .ok_or(ClientError::InvalidSnapshot("event has no session"))?
             .protocol;
+        let expected_revision = current
+            .revision
+            .get()
+            .checked_add(1)
+            .ok_or(ClientError::InvalidSnapshot("event revision overflow"))?;
+        if !WireMessage::Event(event.clone()).is_compatible_with(protocol) {
+            return self.require_resync(expected_revision, event.cursor.revision);
+        }
         if supports_manual_state(protocol)
             && matches!(
-                event.payload,
+                &event.payload,
                 fm_protocol::EventPayload::DesiredSwitcher {
+                    manual_transition: None,
+                    ..
+                } | fm_protocol::EventPayload::StingerSlotsChanged {
                     manual_transition: None,
                     ..
                 }
@@ -766,8 +783,11 @@ impl Client {
         }
         if supports_fade_to_black_state(protocol)
             && matches!(
-                event.payload,
+                &event.payload,
                 fm_protocol::EventPayload::DesiredSwitcher {
+                    fade_to_black: None,
+                    ..
+                } | fm_protocol::EventPayload::StingerSlotsChanged {
                     fade_to_black: None,
                     ..
                 }
@@ -777,11 +797,6 @@ impl Client {
                 "protocol 1.5 event omitted fade-to-black state",
             ));
         }
-        let expected_revision = current
-            .revision
-            .get()
-            .checked_add(1)
-            .ok_or(ClientError::InvalidSnapshot("event revision overflow"))?;
         if event.cursor.revision < expected_revision {
             return Err(ClientError::StaleEvent {
                 expected_revision,
@@ -982,6 +997,9 @@ impl Client {
             | CommandPayload::AlphaFade { .. }
             | CommandPayload::Slide { .. }
             | CommandPayload::Zoom { .. }
+            | CommandPayload::Stinger { .. }
+            | CommandPayload::ConfigureStinger { .. }
+            | CommandPayload::RemoveStinger { .. }
             | CommandPayload::Wipe { .. }
             | CommandPayload::FadeToBlack { .. }
             | CommandPayload::StartManualTransition { .. }
@@ -1296,6 +1314,11 @@ const fn supports_manual_state(version: ProtocolVersion) -> bool {
 const fn supports_fade_to_black_state(version: ProtocolVersion) -> bool {
     version.major == FADE_TO_BLACK_PROTOCOL_VERSION.major
         && version.minor >= FADE_TO_BLACK_PROTOCOL_VERSION.minor
+}
+
+const fn supports_stinger_status(version: ProtocolVersion) -> bool {
+    version.major == STINGER_STATUS_PROTOCOL_VERSION.major
+        && version.minor >= STINGER_STATUS_PROTOCOL_VERSION.minor
 }
 
 fn engine_identity(server: &ServerIdentity) -> EngineIdentity {

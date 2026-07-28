@@ -11,8 +11,10 @@ use fm_protocol::{
     HandshakeResponse, MANUAL_ALPHA_FADE_PROTOCOL_VERSION, MANUAL_TRANSITION_PROTOCOL_VERSION,
     ManualTransitionKind, ManualTransitionPosition, ManualTransitionState, ManualTransitionStatus,
     ProtocolVersion, ResumeCursor, Role, RuntimeEventMessage, RuntimeLifecycleEvent,
-    SLIDE_PROTOCOL_VERSION, ServerIdentity, SnapshotMessage, SnapshotReason, WIPE_PROTOCOL_VERSION,
-    WireInputId, WireMessage, ZOOM_PROTOCOL_VERSION,
+    SLIDE_PROTOCOL_VERSION, STINGER_CONFIGURATION_PROTOCOL_VERSION, STINGER_PROTOCOL_VERSION,
+    STINGER_STATUS_PROTOCOL_VERSION, ServerIdentity, SnapshotMessage, SnapshotReason,
+    StingerAudioPolicy, StingerMissingMediaFallback, StingerReadiness, StingerStatus,
+    WIPE_PROTOCOL_VERSION, WireInputId, WireMessage, WireStingerSlotId, ZOOM_PROTOCOL_VERSION,
 };
 use fm_types::ProjectId;
 use fm_ui_model::ManualTransitionStatus as ModelManualTransitionStatus;
@@ -102,6 +104,7 @@ fn snapshot(revision: u64) -> SnapshotMessage {
         realized_manual_transition: Some(ManualTransitionStatus::Inactive),
         desired_fade_to_black: Some(live_fade_to_black()),
         realized_fade_to_black: Some(live_fade_to_black()),
+        stingers: Some(Vec::new()),
     }
 }
 
@@ -325,6 +328,41 @@ fn protocol_1_5_requires_and_reduces_exact_fade_to_black_state() {
             .realized_fade_to_black,
         fade_to_black(false, 12_345)
     );
+}
+
+#[test]
+fn protocol_1_11_requires_and_reduces_exact_stinger_status() {
+    let mut client = Client::new(config(4)).unwrap();
+    client.start_connect().unwrap();
+    client.transport_connected().unwrap();
+    client.accept_handshake(handshake(4, None)).unwrap();
+
+    let mut incomplete = snapshot(4);
+    incomplete.stingers = None;
+    assert!(matches!(
+        client.apply_snapshot(incomplete),
+        Err(ClientError::InvalidSnapshot(
+            "protocol 1.11 snapshot omitted Stinger status"
+        ))
+    ));
+
+    let status = StingerStatus {
+        slot: WireStingerSlotId::new(8).unwrap(),
+        media_input: input(2),
+        preload: true,
+        cut_point_frames: 7,
+        audio_policy: StingerAudioPolicy::StingerOnly,
+        missing_media_fallback: StingerMissingMediaFallback::KeepProgram,
+        readiness: StingerReadiness::Missing,
+    };
+    let mut complete = snapshot(4);
+    complete.stingers = Some(vec![status]);
+    client.apply_snapshot(complete).unwrap();
+    let projected = &client.model().view().unwrap().stingers;
+    assert_eq!(projected.len(), 1);
+    assert_eq!(projected[0].slot, 8);
+    assert_eq!(projected[0].media_input, input(2).to_domain());
+    assert_eq!(projected[0].readiness, StingerReadiness::Missing);
 }
 
 #[test]
@@ -832,7 +870,7 @@ fn zoom_is_queued_only_on_protocol_1_9() {
             None,
         )
         .unwrap();
-    assert_eq!(command.protocol, ZOOM_PROTOCOL_VERSION);
+    assert_eq!(command.protocol, CURRENT_PROTOCOL_VERSION);
 
     let mut old = Client::new(config(2)).unwrap();
     old.start_connect().unwrap();
@@ -853,6 +891,156 @@ fn zoom_is_queued_only_on_protocol_1_9() {
         })
     );
     assert_eq!(old.outbound_len(), 0);
+}
+
+#[test]
+fn stinger_is_queued_only_on_protocol_1_10() {
+    let mut current = ready_client(1);
+    let command = current
+        .queue_command(
+            CommandPayload::Stinger {
+                slot: WireStingerSlotId::new(2).unwrap(),
+                duration_frames: 45,
+            },
+            "stinger-2",
+            Some(4),
+            None,
+        )
+        .unwrap();
+    assert_eq!(command.protocol, CURRENT_PROTOCOL_VERSION);
+
+    let mut old = Client::new(config(2)).unwrap();
+    old.start_connect().unwrap();
+    old.transport_connected().unwrap();
+    old.accept_handshake(handshake_version(ZOOM_PROTOCOL_VERSION, 4, None))
+        .unwrap();
+    old.apply_snapshot(snapshot(4)).unwrap();
+    assert_eq!(
+        old.queue_command(
+            CommandPayload::Stinger {
+                slot: WireStingerSlotId::new(2).unwrap(),
+                duration_frames: 3,
+            },
+            "unsupported-stinger",
+            Some(4),
+            None,
+        ),
+        Err(ClientError::UnsupportedCommandVersion {
+            negotiated: ZOOM_PROTOCOL_VERSION,
+            required: STINGER_PROTOCOL_VERSION,
+        })
+    );
+    assert_eq!(old.outbound_len(), 0);
+}
+
+#[test]
+fn stinger_slot_mutation_requires_1_12_and_event_updates_authoritative_slots() {
+    let payload = CommandPayload::ConfigureStinger {
+        slot: WireStingerSlotId::new(8).unwrap(),
+        media_input: input(2),
+        preload: true,
+        cut_point_frames: 9,
+        audio_policy: StingerAudioPolicy::MixWithProgram,
+        missing_media_fallback: StingerMissingMediaFallback::KeepProgram,
+    };
+    let mut current = ready_client(1);
+    assert_eq!(
+        current
+            .queue_command(payload, "configure-stinger-8", Some(4), None)
+            .unwrap()
+            .protocol,
+        STINGER_CONFIGURATION_PROTOCOL_VERSION
+    );
+
+    let mut old = Client::new(config(2)).unwrap();
+    old.start_connect().unwrap();
+    old.transport_connected().unwrap();
+    old.accept_handshake(handshake_version(STINGER_STATUS_PROTOCOL_VERSION, 4, None))
+        .unwrap();
+    old.apply_snapshot(snapshot(4)).unwrap();
+    assert_eq!(
+        old.queue_command(payload, "unsupported-configure", Some(4), None),
+        Err(ClientError::UnsupportedCommandVersion {
+            negotiated: STINGER_STATUS_PROTOCOL_VERSION,
+            required: STINGER_CONFIGURATION_PROTOCOL_VERSION,
+        })
+    );
+
+    let mut receiving = ready_client(3);
+    receiving
+        .apply_event(EventMessage {
+            cursor: EventCursor {
+                engine: engine(),
+                revision: 5,
+            },
+            payload: EventPayload::StingerSlotsChanged {
+                program: input(1),
+                preview: input(2),
+                manual_transition: Some(ManualTransitionStatus::Inactive),
+                fade_to_black: Some(live_fade_to_black()),
+                stingers: vec![StingerStatus {
+                    slot: WireStingerSlotId::new(8).unwrap(),
+                    media_input: input(2),
+                    preload: true,
+                    cut_point_frames: 9,
+                    audio_policy: StingerAudioPolicy::MixWithProgram,
+                    missing_media_fallback: StingerMissingMediaFallback::KeepProgram,
+                    readiness: StingerReadiness::Ready,
+                }],
+            },
+        })
+        .unwrap();
+    let view = receiving.model().view().unwrap();
+    assert_eq!(view.stingers.len(), 1);
+    assert_eq!(view.stingers[0].slot, 8);
+}
+
+#[test]
+fn protocol_1_11_client_resyncs_without_applying_stinger_slot_mutation() {
+    let mut client = Client::new(config(2)).unwrap();
+    client.start_connect().unwrap();
+    client.transport_connected().unwrap();
+    client
+        .accept_handshake(handshake_version(STINGER_STATUS_PROTOCOL_VERSION, 4, None))
+        .unwrap();
+    client.apply_snapshot(snapshot(4)).unwrap();
+
+    assert_eq!(
+        client.apply_event(EventMessage {
+            cursor: EventCursor {
+                engine: engine(),
+                revision: 5,
+            },
+            payload: EventPayload::StingerSlotsChanged {
+                program: input(1),
+                preview: input(2),
+                manual_transition: Some(ManualTransitionStatus::Inactive),
+                fade_to_black: Some(live_fade_to_black()),
+                stingers: vec![StingerStatus {
+                    slot: WireStingerSlotId::new(8).unwrap(),
+                    media_input: input(2),
+                    preload: true,
+                    cut_point_frames: 9,
+                    audio_policy: StingerAudioPolicy::MixWithProgram,
+                    missing_media_fallback: StingerMissingMediaFallback::KeepProgram,
+                    readiness: StingerReadiness::Ready,
+                }],
+            },
+        }),
+        Err(ClientError::ResyncRequired {
+            expected_revision: 5,
+            received_revision: 5,
+        })
+    );
+    assert_eq!(
+        client.state(),
+        &ConnectionState::ResyncRequired {
+            expected_revision: 5,
+            received_revision: 5,
+        }
+    );
+    assert_eq!(client.last_applied_cursor().unwrap().revision, 4);
+    assert!(client.model().view().unwrap().stingers.is_empty());
 }
 
 #[test]

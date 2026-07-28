@@ -276,19 +276,47 @@ impl SwitcherState {
     }
 
     /// Configures a stinger slot and clears any readiness result for its previous media.
-    pub fn configure_stinger(&mut self, slot: StingerSlotId, descriptor: StingerDescriptor) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SwitcherError::UnknownInput`] when the media input is not part
+    /// of this mix.
+    pub fn configure_stinger(
+        &mut self,
+        slot: StingerSlotId,
+        descriptor: StingerDescriptor,
+    ) -> Result<(), SwitcherError> {
+        self.require_input(descriptor.media_input)?;
         self.stingers[slot.index()].configure(descriptor);
+        Ok(())
+    }
+
+    /// Removes one Stinger slot and its readiness state.
+    pub fn remove_stinger(&mut self, slot: StingerSlotId) {
+        self.stingers[slot.index()].clear();
     }
 
     /// Records the deterministic result of preloading a stinger's media.
-    pub fn preload_stinger(&mut self, slot: StingerSlotId, media_available: bool) -> SwitcherEvent {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SwitcherError::UnconfiguredStinger`] when the slot has no
+    /// retained media descriptor.
+    pub fn preload_stinger(
+        &mut self,
+        slot: StingerSlotId,
+        media_available: bool,
+    ) -> Result<SwitcherEvent, SwitcherError> {
+        if self.stinger(slot).descriptor().is_none() {
+            return Err(SwitcherError::UnconfiguredStinger(slot));
+        }
         let state = if media_available {
             StingerPreloadState::Ready
         } else {
             StingerPreloadState::Missing
         };
         self.stingers[slot.index()].set_preload_state(state);
-        SwitcherEvent::StingerPreloadChanged { slot, state }
+        Ok(SwitcherEvent::StingerPreloadChanged { slot, state })
     }
 
     #[must_use]
@@ -481,7 +509,23 @@ impl SwitcherState {
                 StingerPlaybackDecision::Fallback(fallback) => {
                     return self.apply_stinger_fallback(slot, fallback, duration_frames);
                 }
-                StingerPlaybackDecision::Play | StingerPlaybackDecision::Unconfigured => {}
+                StingerPlaybackDecision::Play => {
+                    let cut_point_frames = self
+                        .stinger(slot)
+                        .descriptor()
+                        .expect("playable stinger has a descriptor")
+                        .cut_point_frames;
+                    if cut_point_frames > duration_frames {
+                        return Err(SwitcherError::StingerCutPointOutOfRange {
+                            slot,
+                            cut_point_frames,
+                            duration_frames,
+                        });
+                    }
+                }
+                StingerPlaybackDecision::Unconfigured => {
+                    return Err(SwitcherError::UnconfiguredStinger(slot));
+                }
             }
         }
         self.transition = Some(TransitionState::new(

@@ -29,6 +29,7 @@ fn snapshot(project_id: ProjectId, revision: u64) -> ProjectSnapshot {
         },
         show_name: "Show".into(),
         inputs: vec![input(1), input(2), input(3)],
+        stingers: Vec::new(),
         switcher: SwitcherState {
             desired: BusSelection::new(input(1), input(2)),
             realized: BusSelection::new(input(1), input(2)),
@@ -247,7 +248,7 @@ fn rejects_gaps_without_advancing_and_recovers_when_missing_event_arrives() {
     let change = desired(BusSelection::new(input(2), input(1)));
 
     assert_eq!(
-        model.apply_event(event(project_id, identity.clone(), 6, change)),
+        model.apply_event(event(project_id, identity.clone(), 6, change.clone())),
         Err(ModelError::RevisionGap {
             expected: Revision::new(5),
             observed: Revision::new(6),
@@ -275,7 +276,7 @@ fn rejects_project_and_engine_identity_changes() {
             project(11),
             engine("engine-a", 1, "log-a"),
             5,
-            change,
+            change.clone(),
         )),
         Err(ModelError::ProjectMismatch { .. })
     ));

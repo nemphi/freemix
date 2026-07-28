@@ -6,7 +6,8 @@ use fm_types::InputId;
 use crate::{
     ALPHA_FADE_PROTOCOL_VERSION, BASE_PROTOCOL_VERSION, FADE_TO_BLACK_PROTOCOL_VERSION,
     MANUAL_ALPHA_FADE_PROTOCOL_VERSION, MANUAL_TRANSITION_PROTOCOL_VERSION, ProtocolVersion,
-    SLIDE_PROTOCOL_VERSION, WIPE_PROTOCOL_VERSION, ZOOM_PROTOCOL_VERSION,
+    SLIDE_PROTOCOL_VERSION, STINGER_CONFIGURATION_PROTOCOL_VERSION, STINGER_PROTOCOL_VERSION,
+    WIPE_PROTOCOL_VERSION, ZOOM_PROTOCOL_VERSION,
 };
 
 /// Stable identity of one project's durable state on one server.
@@ -205,6 +206,32 @@ impl fmt::Display for WireInputId {
     }
 }
 
+/// Stable one-based Stinger slot number carried on the wire.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct WireStingerSlotId(u8);
+
+impl WireStingerSlotId {
+    #[must_use]
+    pub const fn new(number: u8) -> Option<Self> {
+        if number >= 1 && number <= 8 {
+            Some(Self(number))
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub const fn number(self) -> u8 {
+        self.0
+    }
+}
+
+impl fmt::Display for WireStingerSlotId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ManualTransitionKind {
     Fade,
@@ -281,17 +308,83 @@ pub struct FadeToBlackState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CommandPayload {
-    SelectPreview { input: WireInputId },
+pub enum StingerAudioPolicy {
+    Muted,
+    StingerOnly,
+    MixWithProgram,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StingerMissingMediaFallback {
     Cut,
-    Fade { duration_frames: u32 },
-    AlphaFade { duration_frames: u32 },
-    Slide { duration_frames: u32 },
-    Zoom { duration_frames: u32 },
-    Wipe { duration_frames: u32 },
-    FadeToBlack { active: bool, duration_frames: u32 },
-    StartManualTransition { kind: ManualTransitionKind },
-    SetManualTransitionPosition { position: ManualTransitionPosition },
+    Fade,
+    KeepProgram,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StingerReadiness {
+    NotRequested,
+    Ready,
+    Missing,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StingerStatus {
+    pub slot: WireStingerSlotId,
+    pub media_input: WireInputId,
+    pub preload: bool,
+    pub cut_point_frames: u32,
+    pub audio_policy: StingerAudioPolicy,
+    pub missing_media_fallback: StingerMissingMediaFallback,
+    pub readiness: StingerReadiness,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommandPayload {
+    SelectPreview {
+        input: WireInputId,
+    },
+    Cut,
+    Fade {
+        duration_frames: u32,
+    },
+    AlphaFade {
+        duration_frames: u32,
+    },
+    Slide {
+        duration_frames: u32,
+    },
+    Zoom {
+        duration_frames: u32,
+    },
+    Stinger {
+        slot: WireStingerSlotId,
+        duration_frames: u32,
+    },
+    ConfigureStinger {
+        slot: WireStingerSlotId,
+        media_input: WireInputId,
+        preload: bool,
+        cut_point_frames: u32,
+        audio_policy: StingerAudioPolicy,
+        missing_media_fallback: StingerMissingMediaFallback,
+    },
+    RemoveStinger {
+        slot: WireStingerSlotId,
+    },
+    Wipe {
+        duration_frames: u32,
+    },
+    FadeToBlack {
+        active: bool,
+        duration_frames: u32,
+    },
+    StartManualTransition {
+        kind: ManualTransitionKind,
+    },
+    SetManualTransitionPosition {
+        position: ManualTransitionPosition,
+    },
     CommitManualTransition,
     CancelManualTransition,
 }
@@ -304,6 +397,10 @@ impl CommandPayload {
             Self::AlphaFade { .. } => ALPHA_FADE_PROTOCOL_VERSION,
             Self::Slide { .. } => SLIDE_PROTOCOL_VERSION,
             Self::Zoom { .. } => ZOOM_PROTOCOL_VERSION,
+            Self::Stinger { .. } => STINGER_PROTOCOL_VERSION,
+            Self::ConfigureStinger { .. } | Self::RemoveStinger { .. } => {
+                STINGER_CONFIGURATION_PROTOCOL_VERSION
+            }
             Self::Wipe { .. } => WIPE_PROTOCOL_VERSION,
             Self::FadeToBlack { .. } => FADE_TO_BLACK_PROTOCOL_VERSION,
             Self::StartManualTransition {
@@ -407,10 +504,12 @@ pub struct SnapshotMessage {
     pub desired_fade_to_black: Option<FadeToBlackState>,
     /// `None` means the protocol extension was omitted for an older peer.
     pub realized_fade_to_black: Option<FadeToBlackState>,
+    /// `None` means the protocol extension was omitted for a pre-1.11 peer.
+    pub stingers: Option<Vec<StingerStatus>>,
 }
 
 /// A durable state change. Runtime progress uses [`RuntimeEventMessage`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EventPayload {
     DesiredSwitcher {
         program: WireInputId,
@@ -419,6 +518,13 @@ pub enum EventPayload {
         manual_transition: Option<ManualTransitionStatus>,
         /// `None` means the protocol extension was omitted for an older peer.
         fade_to_black: Option<FadeToBlackState>,
+    },
+    StingerSlotsChanged {
+        program: WireInputId,
+        preview: WireInputId,
+        manual_transition: Option<ManualTransitionStatus>,
+        fade_to_black: Option<FadeToBlackState>,
+        stingers: Vec<StingerStatus>,
     },
 }
 
@@ -541,10 +647,34 @@ pub enum WireMessage {
 }
 
 impl WireMessage {
+    /// Reports whether this message can be represented without losing state for
+    /// one negotiated peer.
+    #[must_use]
+    pub const fn is_compatible_with(&self, version: ProtocolVersion) -> bool {
+        !matches!(
+            self,
+            Self::Event(EventMessage {
+                payload: EventPayload::StingerSlotsChanged { .. },
+                ..
+            }) if version.major != crate::STINGER_CONFIGURATION_PROTOCOL_VERSION.major
+                || version.minor < crate::STINGER_CONFIGURATION_PROTOCOL_VERSION.minor
+        )
+    }
+
     /// Returns the projection safe to send to one negotiated peer.
+    ///
+    /// Callers must first verify [`Self::is_compatible_with`]. This projection
+    /// only removes optional fields; it never advances an older peer across a
+    /// state change that peer cannot represent.
     #[must_use]
     pub fn compatible_with(&self, version: ProtocolVersion) -> Self {
         let mut message = self.clone();
+        if (version.major != crate::STINGER_STATUS_PROTOCOL_VERSION.major
+            || version.minor < crate::STINGER_STATUS_PROTOCOL_VERSION.minor)
+            && let Self::Snapshot(snapshot) = &mut message
+        {
+            snapshot.stingers = None;
+        }
         if version.major != FADE_TO_BLACK_PROTOCOL_VERSION.major
             || version.minor < FADE_TO_BLACK_PROTOCOL_VERSION.minor
         {

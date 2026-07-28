@@ -706,6 +706,14 @@ fn sequential_video_windows_match_leading_decode_and_have_sticky_eos() {
         [0, 1, 2, 3, 4]
     );
 
+    cursor.restart();
+    let replay = cursor.decode_up_to(NonZeroU32::new(2).unwrap()).unwrap();
+    assert_eq!(replay.frames, leading.video[..2]);
+    assert!(!replay.end_of_stream);
+    let replay_tail = cursor.decode_up_to(NonZeroU32::new(3).unwrap()).unwrap();
+    assert_eq!(replay_tail.frames, leading.video[2..]);
+    assert!(replay_tail.end_of_stream);
+
     std::fs::remove_file(&path).unwrap();
     let sticky = cursor.decode_up_to(NonZeroU32::new(1).unwrap()).unwrap();
     assert!(sticky.frames.is_empty());
@@ -843,6 +851,11 @@ fn sequential_audio_windows_match_leading_decode_and_keep_global_timing() {
             pair[1].timing().presentation_timestamp().as_nanos()
         );
     }
+
+    cursor.restart();
+    let replay = cursor.decode_up_to(NonZeroU32::new(2).unwrap()).unwrap();
+    assert_eq!(replay.blocks, leading.audio[..2]);
+    assert!(!replay.end_of_stream);
 }
 
 #[test]

@@ -24,7 +24,8 @@ use fm_protocol::{
     CURRENT_PROTOCOL_VERSION, ClientHello, ClientType, CommandMessage, CommandPayload,
     CommandResult, EventCursor, HandshakeOutcome, ManualTransitionKind, ManualTransitionPosition,
     ManualTransitionStatus, ProtocolVersion, Role, RuntimeLifecycleEvent, ServerHello,
-    SnapshotReason, WireInputId, WireMessage, decode_line, encode_line,
+    SnapshotReason, StingerAudioPolicy, StingerMissingMediaFallback, WireInputId, WireMessage,
+    WireStingerSlotId, decode_line, encode_line,
 };
 use fm_types::{
     AudioFormat, BusId, ChannelLayout, ColorMetadata, FrameRate, InputId, OutputId, PixelFormat,
@@ -550,6 +551,188 @@ fn commands_survive_restart_resume_and_duplicate_replay() {
 }
 
 #[test]
+fn live_stinger_slot_mutations_fire_immediately_and_survive_restart() {
+    let directory = TestDirectory::new("live-stinger-configuration");
+    let project_path = directory.project_path();
+    create_project(&project_path);
+
+    let daemon = Daemon::start(&project_path);
+    let mut client = daemon.connect();
+    assert_eq!(
+        client
+            .handshake_version(CURRENT_PROTOCOL_VERSION, None)
+            .negotiated,
+        CURRENT_PROTOCOL_VERSION
+    );
+    assert!(matches!(client.receive(), WireMessage::Snapshot(_)));
+
+    configure_and_fire_stinger(&mut client);
+    replace_live_stinger(&mut client);
+    drop(client);
+    daemon.wait_success();
+
+    let persisted = ProjectStore::new(&project_path).unwrap().load().unwrap();
+    assert_eq!(persisted.position().revision, 3);
+    assert_eq!(persisted.idempotency_receipts().len(), 3);
+    assert_eq!(
+        (
+            persisted.runtime_routing().desired_program_id,
+            persisted.runtime_routing().realized_program_id,
+            persisted.runtime_routing().desired_preview_id,
+            persisted.runtime_routing().realized_preview_id,
+        ),
+        (
+            Some(domain_input(2)),
+            Some(domain_input(2)),
+            Some(domain_input(1)),
+            Some(domain_input(1)),
+        )
+    );
+    let replacement = persisted.project().stingers()[0];
+    assert_eq!(replacement.slot.number(), 8);
+    assert_eq!(replacement.media_input, domain_input(2));
+    assert!(!replacement.preload);
+    assert_eq!(replacement.cut_point_frames, 7);
+    assert_eq!(
+        replacement.audio_policy,
+        fm_model::StingerAudioPolicy::Muted
+    );
+    assert_eq!(
+        replacement.missing_media_fallback,
+        fm_model::StingerMissingMediaFallback::KeepProgram
+    );
+
+    let daemon = Daemon::start(&project_path);
+    let mut client = daemon.connect();
+    assert_eq!(
+        client
+            .handshake_version(CURRENT_PROTOCOL_VERSION, None)
+            .current_revision,
+        3
+    );
+    let WireMessage::Snapshot(snapshot) = client.receive() else {
+        panic!("expected restarted snapshot");
+    };
+    let restarted = &snapshot.stingers.as_ref().unwrap()[0];
+    assert_eq!(restarted.slot.number(), 8);
+    assert_eq!(restarted.media_input, input(2));
+    assert!(!restarted.preload);
+    assert_eq!(restarted.cut_point_frames, 7);
+    assert_eq!(restarted.audio_policy, StingerAudioPolicy::Muted);
+    assert_eq!(
+        restarted.missing_media_fallback,
+        StingerMissingMediaFallback::KeepProgram
+    );
+    assert_eq!(
+        restarted.readiness,
+        fm_protocol::StingerReadiness::NotRequested
+    );
+
+    remove_live_stinger(&mut client);
+    drop(client);
+    daemon.wait_success();
+
+    let persisted = ProjectStore::new(&project_path).unwrap().load().unwrap();
+    assert_eq!(persisted.position().revision, 4);
+    assert_eq!(persisted.idempotency_receipts().len(), 4);
+    assert!(persisted.project().stingers().is_empty());
+
+    let daemon = Daemon::start(&project_path);
+    let mut client = daemon.connect();
+    assert_eq!(
+        client
+            .handshake_version(CURRENT_PROTOCOL_VERSION, None)
+            .current_revision,
+        4
+    );
+    let WireMessage::Snapshot(snapshot) = client.receive() else {
+        panic!("expected second restarted snapshot");
+    };
+    assert_eq!(snapshot.stingers, Some(Vec::new()));
+    drop(client);
+    daemon.wait_success();
+}
+
+fn configure_and_fire_stinger(client: &mut Client) {
+    client.send(&command_version(
+        CURRENT_PROTOCOL_VERSION,
+        "configure-stinger",
+        "configure-stinger-key",
+        CommandPayload::ConfigureStinger {
+            slot: WireStingerSlotId::new(8).unwrap(),
+            media_input: input(3),
+            preload: true,
+            cut_point_frames: 1,
+            audio_policy: StingerAudioPolicy::MixWithProgram,
+            missing_media_fallback: StingerMissingMediaFallback::Cut,
+        },
+    ));
+    assert!(matches!(
+        client.receive(),
+        WireMessage::CommandResult(CommandResult::Accepted { revision: 1, .. })
+    ));
+    assert!(matches!(
+        client.receive(),
+        WireMessage::Event(fm_protocol::EventMessage {
+            payload: fm_protocol::EventPayload::StingerSlotsChanged { .. },
+            ..
+        })
+    ));
+    assert!(matches!(
+        client.receive(),
+        WireMessage::RuntimeEvent(fm_protocol::RuntimeEventMessage { revision: 1, .. })
+    ));
+    client.send(&command_version(
+        CURRENT_PROTOCOL_VERSION,
+        "fire-stinger",
+        "fire-stinger-key",
+        CommandPayload::Stinger {
+            slot: WireStingerSlotId::new(8).unwrap(),
+            duration_frames: 2,
+        },
+    ));
+    assert!(matches!(
+        client.next_result(),
+        CommandResult::Accepted { revision: 2, .. }
+    ));
+}
+
+fn replace_live_stinger(client: &mut Client) {
+    client.send(&command_version(
+        CURRENT_PROTOCOL_VERSION,
+        "replace-stinger",
+        "replace-stinger-key",
+        CommandPayload::ConfigureStinger {
+            slot: WireStingerSlotId::new(8).unwrap(),
+            media_input: input(2),
+            preload: false,
+            cut_point_frames: 7,
+            audio_policy: StingerAudioPolicy::Muted,
+            missing_media_fallback: StingerMissingMediaFallback::KeepProgram,
+        },
+    ));
+    assert!(matches!(
+        client.next_result(),
+        CommandResult::Accepted { revision: 3, .. }
+    ));
+}
+
+fn remove_live_stinger(client: &mut Client) {
+    client.send(&command_version(
+        CURRENT_PROTOCOL_VERSION,
+        "remove-stinger",
+        "remove-stinger-key",
+        CommandPayload::RemoveStinger {
+            slot: WireStingerSlotId::new(8).unwrap(),
+        },
+    ));
+    assert!(matches!(
+        client.next_result(),
+        CommandResult::Accepted { revision: 4, .. }
+    ));
+}
+
+#[test]
 fn slide_command_settles_and_survives_daemon_restart() {
     let directory = TestDirectory::new("slide-restart");
     let project_path = directory.project_path();
@@ -834,7 +1017,7 @@ fn v2_project_migrates_and_serves() {
     daemon.wait_success();
 
     let migrated = ProjectStore::new(project_path).unwrap().load().unwrap();
-    assert_eq!(migrated.schema_version(), 9);
+    assert_eq!(migrated.schema_version(), 10);
     assert_eq!(migrated.project().name(), "Legacy V2");
 }
 
@@ -862,7 +1045,7 @@ fn v3_project_migrates_and_serves() {
     daemon.wait_success();
 
     let migrated = ProjectStore::new(project_path).unwrap().load().unwrap();
-    assert_eq!(migrated.schema_version(), 9);
+    assert_eq!(migrated.schema_version(), 10);
     assert_eq!(migrated.project().name(), "Frozen V3 Scene");
     let scene = &migrated.project().scenes()[0];
     assert_eq!(scene.background, Rgba8::OPAQUE_BLACK);
@@ -891,7 +1074,7 @@ fn v5_project_migrates_without_losing_manual_transition_state() {
     daemon.wait_success();
 
     let migrated = ProjectStore::new(project_path).unwrap().load().unwrap();
-    assert_eq!(migrated.schema_version(), 9);
+    assert_eq!(migrated.schema_version(), 10);
     assert_eq!(migrated.project().scenes()[0].layers[0].mask, None);
     let transitions = migrated.runtime_manual_transitions();
     let desired = transitions.desired.unwrap();
@@ -910,11 +1093,10 @@ fn v8_project_migrates_losslessly_before_daemon_start() {
     let project_path = directory.project_path();
     create_project(&project_path);
     let manifest_path = project_path.join("project.json");
-    let source = fs::read_to_string(&manifest_path).unwrap().replacen(
-        "\"schema_version\": 9",
-        "\"schema_version\": 8",
-        1,
-    );
+    let source = fs::read_to_string(&manifest_path)
+        .unwrap()
+        .replacen("\"schema_version\": 10", "\"schema_version\": 8", 1)
+        .replace(",\n    \"stingers\": []", "");
     fs::write(&manifest_path, source).unwrap();
 
     let daemon = Daemon::start(&project_path);
@@ -925,7 +1107,7 @@ fn v8_project_migrates_losslessly_before_daemon_start() {
     daemon.wait_success();
 
     let migrated = ProjectStore::new(project_path).unwrap().load().unwrap();
-    assert_eq!(migrated.schema_version(), 9);
+    assert_eq!(migrated.schema_version(), 10);
     assert_eq!(migrated.project().name(), "Process Test");
 }
 
@@ -952,7 +1134,7 @@ fn v1_project_is_rejected_as_unsupported() {
     assert!(
         String::from_utf8(output.stderr)
             .unwrap()
-            .contains("unsupported schema 1; expected 9")
+            .contains("unsupported schema 1; expected 10")
     );
 }
 

@@ -27,7 +27,13 @@ use fm_protocol::{
     CommandMessage, CommandPayload, CommandResult, EngineIdentity, EventCursor, EventMessage,
     EventPayload, FadeToBlackPosition, FadeToBlackState, FieldIssue, ManualTransitionKind,
     ManualTransitionPosition, ManualTransitionState, ManualTransitionStatus, RuntimeEventMessage,
-    RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage, WireInputId, WireMessage,
+    RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage,
+    StingerAudioPolicy as ProtocolStingerAudioPolicy,
+    StingerMissingMediaFallback as ProtocolStingerFallback, StingerReadiness, StingerStatus,
+    WireInputId, WireMessage, WireStingerSlotId,
+};
+use fm_switcher::{
+    MissingMediaFallback, StingerAudioPolicy, StingerDescriptor, StingerPreloadState, StingerSlotId,
 };
 
 /// Target-free authorization called before an engine command is constructed or validated.
@@ -554,6 +560,18 @@ impl<A: AuthorizationHook> ControlService<A> {
         self.engine.next_frame_deadline().map_err(Into::into)
     }
 
+    /// Projects the next deterministic frame without advancing authority state.
+    ///
+    /// This is intended for bounded media preparation that must complete before
+    /// the authoritative tick is realized.
+    ///
+    /// # Errors
+    ///
+    /// Returns an engine tick error when the projected frame cannot advance.
+    pub fn project_next_frame(&self) -> Result<FrameResult, ControlError> {
+        self.engine.clone().tick().map_err(Into::into)
+    }
+
     /// Captures the current engine only when it is at an idle frame boundary.
     ///
     /// # Errors
@@ -1018,6 +1036,9 @@ const fn command_class(payload: CommandPayload) -> CommandClass {
         | CommandPayload::AlphaFade { .. }
         | CommandPayload::Slide { .. }
         | CommandPayload::Zoom { .. }
+        | CommandPayload::Stinger { .. }
+        | CommandPayload::ConfigureStinger { .. }
+        | CommandPayload::RemoveStinger { .. }
         | CommandPayload::Wipe { .. }
         | CommandPayload::FadeToBlack { .. }
         | CommandPayload::StartManualTransition { .. }
@@ -1037,6 +1058,44 @@ fn engine_command(payload: CommandPayload) -> EngineCommand {
         }
         CommandPayload::Slide { duration_frames } => EngineCommand::Slide { duration_frames },
         CommandPayload::Zoom { duration_frames } => EngineCommand::Zoom { duration_frames },
+        CommandPayload::Stinger {
+            slot,
+            duration_frames,
+        } => EngineCommand::Stinger {
+            slot: fm_switcher::StingerSlotId::new(slot.number())
+                .expect("wire Stinger slots are bounded"),
+            duration_frames,
+        },
+        CommandPayload::ConfigureStinger {
+            slot,
+            media_input,
+            preload,
+            cut_point_frames,
+            audio_policy,
+            missing_media_fallback,
+        } => EngineCommand::ConfigureStinger {
+            slot: StingerSlotId::new(slot.number()).expect("wire Stinger slots are bounded"),
+            descriptor: StingerDescriptor::new(
+                media_input.to_domain(),
+                preload,
+                cut_point_frames,
+                match audio_policy {
+                    ProtocolStingerAudioPolicy::Muted => StingerAudioPolicy::Muted,
+                    ProtocolStingerAudioPolicy::StingerOnly => StingerAudioPolicy::StingerOnly,
+                    ProtocolStingerAudioPolicy::MixWithProgram => {
+                        StingerAudioPolicy::MixWithProgram
+                    }
+                },
+                match missing_media_fallback {
+                    ProtocolStingerFallback::Cut => MissingMediaFallback::Cut,
+                    ProtocolStingerFallback::Fade => MissingMediaFallback::Fade,
+                    ProtocolStingerFallback::KeepProgram => MissingMediaFallback::KeepProgram,
+                },
+            ),
+        },
+        CommandPayload::RemoveStinger { slot } => EngineCommand::RemoveStinger {
+            slot: StingerSlotId::new(slot.number()).expect("wire Stinger slots are bounded"),
+        },
         CommandPayload::Wipe { duration_frames } => EngineCommand::Wipe { duration_frames },
         CommandPayload::FadeToBlack {
             active,
@@ -1069,6 +1128,7 @@ const fn is_program_transition(command: EngineCommand) -> bool {
             | EngineCommand::AlphaFade { .. }
             | EngineCommand::Slide { .. }
             | EngineCommand::Zoom { .. }
+            | EngineCommand::Stinger { .. }
             | EngineCommand::Wipe { .. }
     )
 }
@@ -1121,16 +1181,38 @@ fn engine_submission(
 ) -> CommandSubmission {
     let result = command_result(&outcome.receipt);
     let events = if !outcome.replayed && outcome.receipt.accepted().is_some() {
+        let stinger_slots_changed = outcome.events.iter().any(|event| {
+            matches!(
+                event.payload,
+                EngineEvent::DesiredSwitcherChanged(
+                    EngineCommand::ConfigureStinger { .. } | EngineCommand::RemoveStinger { .. }
+                )
+            )
+        });
+        let program = WireInputId::from_domain(engine.show().desired_switcher().program());
+        let preview = WireInputId::from_domain(engine.show().desired_switcher().preview());
+        let manual_transition = Some(protocol_manual_status(engine.desired_manual_transition()));
+        let fade_to_black = Some(protocol_fade_to_black_state(engine.desired_fade_to_black()));
         vec![EventMessage {
             cursor: EventCursor {
                 engine: identity.clone(),
                 revision: engine.revision().get(),
             },
-            payload: EventPayload::DesiredSwitcher {
-                program: WireInputId::from_domain(engine.show().desired_switcher().program()),
-                preview: WireInputId::from_domain(engine.show().desired_switcher().preview()),
-                manual_transition: Some(protocol_manual_status(engine.desired_manual_transition())),
-                fade_to_black: Some(protocol_fade_to_black_state(engine.desired_fade_to_black())),
+            payload: if stinger_slots_changed {
+                EventPayload::StingerSlotsChanged {
+                    program,
+                    preview,
+                    manual_transition,
+                    fade_to_black,
+                    stingers: protocol_desired_stingers(engine),
+                }
+            } else {
+                EventPayload::DesiredSwitcher {
+                    program,
+                    preview,
+                    manual_transition,
+                    fade_to_black,
+                }
             },
         }]
     } else {
@@ -1185,6 +1267,7 @@ fn snapshot_record(engine: &Engine, identity: &EngineIdentity) -> SnapshotRecord
         realized_fade_to_black: Some(protocol_fade_to_black_state(
             engine.realized_fade_to_black(),
         )),
+        stingers: Some(protocol_stingers(engine)),
     };
     SnapshotRecord {
         cursor: EventCursor {
@@ -1193,6 +1276,77 @@ fn snapshot_record(engine: &Engine, identity: &EngineIdentity) -> SnapshotRecord
         },
         snapshot,
     }
+}
+
+fn protocol_stingers(engine: &Engine) -> Vec<StingerStatus> {
+    engine
+        .show()
+        .desired_switcher()
+        .stingers()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, desired)| {
+            let descriptor = desired.descriptor()?;
+            let slot = StingerSlotId::from_index(index).expect("Stinger array index is bounded");
+            let realized = engine.realized_switcher().stinger(slot);
+            Some(protocol_stinger_status(
+                slot,
+                descriptor,
+                if realized.descriptor() == Some(descriptor) {
+                    realized.preload_state()
+                } else {
+                    StingerPreloadState::NotRequested
+                },
+            ))
+        })
+        .collect()
+}
+
+fn protocol_stinger_status(
+    slot: StingerSlotId,
+    descriptor: &StingerDescriptor,
+    readiness: StingerPreloadState,
+) -> StingerStatus {
+    StingerStatus {
+        slot: WireStingerSlotId::new(slot.number()).expect("domain Stinger slot is bounded"),
+        media_input: WireInputId::from_domain(descriptor.media_input),
+        preload: descriptor.preload,
+        cut_point_frames: descriptor.cut_point_frames,
+        audio_policy: match descriptor.audio_policy {
+            StingerAudioPolicy::Muted => ProtocolStingerAudioPolicy::Muted,
+            StingerAudioPolicy::StingerOnly => ProtocolStingerAudioPolicy::StingerOnly,
+            StingerAudioPolicy::MixWithProgram => ProtocolStingerAudioPolicy::MixWithProgram,
+        },
+        missing_media_fallback: match descriptor.missing_media_fallback {
+            MissingMediaFallback::Cut => ProtocolStingerFallback::Cut,
+            MissingMediaFallback::Fade => ProtocolStingerFallback::Fade,
+            MissingMediaFallback::KeepProgram => ProtocolStingerFallback::KeepProgram,
+        },
+        readiness: match readiness {
+            StingerPreloadState::NotRequested => StingerReadiness::NotRequested,
+            StingerPreloadState::Ready => StingerReadiness::Ready,
+            StingerPreloadState::Missing => StingerReadiness::Missing,
+        },
+    }
+}
+
+fn protocol_desired_stingers(engine: &Engine) -> Vec<StingerStatus> {
+    engine
+        .show()
+        .desired_switcher()
+        .stingers()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, desired)| {
+            let descriptor = desired.descriptor()?;
+            let slot = StingerSlotId::from_index(index).expect("Stinger array index is bounded");
+            Some(protocol_stinger_status(
+                slot,
+                descriptor,
+                desired.preload_state(),
+            ))
+        })
+        .collect()
 }
 
 fn protocol_manual_status(state: Option<EngineManualTransitionState>) -> ManualTransitionStatus {

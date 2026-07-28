@@ -102,6 +102,20 @@ impl FakeRemoteServer {
         Self { address, worker }
     }
 
+    fn start_old_without_stinger() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || serve_old_daemon_without_stinger(&listener));
+        Self { address, worker }
+    }
+
+    fn start_stinger() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || serve_stinger(&listener));
+        Self { address, worker }
+    }
+
     fn start_fade_to_black() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -467,6 +481,32 @@ fn serve_old_daemon_without_zoom(listener: &TcpListener) {
     );
 }
 
+fn serve_old_daemon_without_stinger(listener: &TcpListener) {
+    let engine = EngineIdentity {
+        engine_id: "project-42".into(),
+        state_epoch: 1,
+        log_id: "fake-remote-log".into(),
+    };
+    let (stream, _) = listener.accept().unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(stream);
+    assert_client_hello(read_message(&mut reader));
+    write_handshake_version_with_fade_to_black(
+        &mut writer,
+        &engine,
+        0,
+        fm_protocol::ZOOM_PROTOCOL_VERSION,
+        live_fade_to_black(),
+    );
+
+    let mut unexpected = String::new();
+    assert_eq!(reader.read_line(&mut unexpected).unwrap(), 0);
+    assert!(
+        unexpected.is_empty(),
+        "protocol 1.10 command reached a 1.9 daemon"
+    );
+}
+
 fn serve_alpha_fade(listener: &TcpListener) {
     serve_automatic_transition(
         listener,
@@ -491,6 +531,18 @@ fn serve_zoom(listener: &TcpListener) {
         fm_protocol::ZOOM_PROTOCOL_VERSION,
         CommandPayload::Zoom { duration_frames: 3 },
         "remote-zoom",
+    );
+}
+
+fn serve_stinger(listener: &TcpListener) {
+    serve_automatic_transition(
+        listener,
+        fm_protocol::STINGER_PROTOCOL_VERSION,
+        CommandPayload::Stinger {
+            slot: fm_protocol::WireStingerSlotId::new(8).unwrap(),
+            duration_frames: 3,
+        },
+        "remote-stinger",
     );
 }
 
@@ -840,6 +892,7 @@ fn write_handshake_version_with_manual(
             realized_manual_transition: (negotiated.minor >= 4).then_some(manual_transition),
             desired_fade_to_black: None,
             realized_fade_to_black: None,
+            stingers: None,
         }),
     );
 }
@@ -878,6 +931,7 @@ fn write_handshake_version_with_fade_to_black(
             realized_manual_transition: Some(fm_protocol::ManualTransitionStatus::Inactive),
             desired_fade_to_black: Some(fade_to_black),
             realized_fade_to_black: Some(fade_to_black),
+            stingers: Some(Vec::new()),
         }),
     );
 }
@@ -1160,6 +1214,24 @@ fn cli_does_not_send_zoom_to_a_protocol_1_8_daemon() {
 }
 
 #[test]
+fn cli_does_not_send_stinger_to_a_protocol_1_9_daemon() {
+    let server = FakeRemoteServer::start_old_without_stinger();
+    let output = invoke(&[
+        "remote-stinger",
+        &server.address(),
+        "8",
+        "3",
+        "--key",
+        "unsupported-stinger",
+    ]);
+    assert_failure_contains(
+        &output,
+        "command requires protocol 1.10, but the session negotiated 1.9",
+    );
+    server.finish();
+}
+
+#[test]
 fn cli_does_not_send_manual_alpha_fade_to_a_protocol_1_6_daemon() {
     let server = FakeRemoteServer::start_old_without_manual_alpha_fade();
     let output = invoke(&[
@@ -1236,6 +1308,23 @@ fn remote_zoom_preserves_duration_and_protocol() {
         "3",
         "--key",
         "remote-zoom",
+        "--expect",
+        "0",
+    ]);
+    assert_success(&output);
+    server.finish();
+}
+
+#[test]
+fn remote_stinger_preserves_slot_duration_and_protocol() {
+    let server = FakeRemoteServer::start_stinger();
+    let output = invoke(&[
+        "remote-stinger",
+        &server.address(),
+        "8",
+        "3",
+        "--key",
+        "remote-stinger",
         "--expect",
         "0",
     ]);
@@ -1455,6 +1544,83 @@ fn local_zoom_settles_and_preserves_idempotency_contract() {
     assert_success(&duplicate);
     assert_eq!(stdout(&duplicate), zoom_status);
     assert_eq!(manifest(&context.project), zoom_manifest);
+
+    fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
+fn local_configured_stinger_settles_and_preserves_idempotency_contract() {
+    let context = ContractContext::new();
+    assert_success(&invoke(&["new", context.project_path()]));
+    let configured = invoke(&[
+        "stinger-configure",
+        context.project_path(),
+        "8",
+        "2",
+        "true",
+        "1",
+        "muted",
+        "cut",
+    ]);
+    assert_success(&configured);
+    assert!(stdout(&configured).contains("Stingers=[8:2:preload:1:muted:cut]"));
+
+    let stinger = invoke(&[
+        "stinger",
+        context.project_path(),
+        "8",
+        "3",
+        "--key",
+        "stinger-eight",
+        "--expect",
+        "0",
+    ]);
+    assert_success(&stinger);
+    let stinger_status = stdout(&stinger);
+    assert_status(&stinger_status, 1, 3, 2, 2, 1, 1);
+    let stinger_manifest = manifest(&context.project);
+    assert!(stinger_manifest.contains(r#""slot": 8"#));
+    assert!(stinger_manifest.contains(r#""cut_point_frames": 1"#));
+
+    let duplicate = invoke(&[
+        "stinger",
+        context.project_path(),
+        "8",
+        "99",
+        "--key",
+        "stinger-eight",
+        "--expect",
+        "0",
+    ]);
+    assert_success(&duplicate);
+    assert_eq!(stdout(&duplicate), stinger_status);
+    assert_eq!(manifest(&context.project), stinger_manifest);
+
+    let reconfigured = invoke(&[
+        "stinger-configure",
+        context.project_path(),
+        "8",
+        "1",
+        "false",
+        "9",
+        "mix-with-program",
+        "keep-program",
+    ]);
+    assert_success(&reconfigured);
+    assert_status(&stdout(&reconfigured), 1, 3, 2, 2, 1, 1);
+    assert!(
+        stdout(&reconfigured).contains("Stingers=[8:1:deferred:9:mix-with-program:keep-program]")
+    );
+    let reconfigured_manifest = manifest(&context.project);
+    assert_eq!(reconfigured_manifest.matches(r#""slot": 8"#).count(), 1);
+    assert!(reconfigured_manifest.contains(r#""preload": false"#));
+    assert!(reconfigured_manifest.contains(r#""cut_point_frames": 9"#));
+
+    let removed = invoke(&["stinger-remove", context.project_path(), "8"]);
+    assert_success(&removed);
+    assert_status(&stdout(&removed), 1, 3, 2, 2, 1, 1);
+    assert!(stdout(&removed).contains("Stingers=[]"));
+    assert!(manifest(&context.project).contains(r#""stingers": []"#));
 
     fs::remove_dir_all(context.root).unwrap();
 }
@@ -2211,7 +2377,7 @@ fn supported_legacy_manifest_is_migrated_before_cli_load() {
     assert!(migrated_status.contains("project_id=42 show=\"Legacy CLI\""));
     assert_status(&migrated_status, 0, 0, 1, 1, 2, 2);
     let migrated = manifest(&project);
-    assert!(migrated.starts_with("{\n  \"schema_version\": 9,"));
+    assert!(migrated.starts_with("{\n  \"schema_version\": 10,"));
     assert!(migrated.contains(r#""type": "simulated""#));
 
     assert_success(&invoke(&[
@@ -2234,11 +2400,13 @@ fn schema_v8_manifest_is_migrated_before_cli_load() {
     let project = root.join("v8.freemix");
     fs::create_dir_all(&root).unwrap();
     assert_success(&invoke(&["new", project.to_str().unwrap()]));
-    let legacy = manifest(&project).replacen("\"schema_version\": 9", "\"schema_version\": 8", 1);
+    let legacy = manifest(&project)
+        .replacen("\"schema_version\": 10", "\"schema_version\": 8", 1)
+        .replace(",\n    \"stingers\": []", "");
     fs::write(project.join("project.json"), legacy).unwrap();
 
     assert!(status(&project).contains("show=\"FreeMix Show\""));
-    assert!(manifest(&project).starts_with("{\n  \"schema_version\": 9,"));
+    assert!(manifest(&project).starts_with("{\n  \"schema_version\": 10,"));
 
     fs::remove_dir_all(root).unwrap();
 }
@@ -2257,7 +2425,7 @@ fn schema_v5_manual_state_migrates_then_mutates_and_restarts_exactly() {
     let migrated = status(&project);
     assert!(migrated.contains("TBar(desired=fade:1->2@6250, realized=fade:1->2@6250)"));
     let migrated_manifest = manifest(&project);
-    assert!(migrated_manifest.starts_with("{\n  \"schema_version\": 9,"));
+    assert!(migrated_manifest.starts_with("{\n  \"schema_version\": 10,"));
     assert!(migrated_manifest.contains(r#""mask": null"#));
     assert!(migrated_manifest.contains(
         r#""desired": {"kind": "fade", "from_id": 1, "to_id": 2, "interval_start_basis_points": 0, "position_basis_points": 6250}"#
@@ -2309,7 +2477,7 @@ fn schema_v3_manifest_is_migrated_before_cli_load() {
     let migrated_status = status(&project);
     assert!(migrated_status.contains("show=\"Frozen V3 Scene\""));
     let migrated = manifest(&project);
-    assert!(migrated.starts_with("{\n  \"schema_version\": 9,"));
+    assert!(migrated.starts_with("{\n  \"schema_version\": 10,"));
     assert!(migrated.contains(r#""background": {"red": 0, "green": 0, "blue": 0, "alpha": 255}"#));
     assert!(migrated.contains(
         r#""geometry": {"translation_x": 0, "translation_y": 0, "width": 3840, "height": 2160, "rotation": "deg0"}"#
@@ -2329,7 +2497,7 @@ fn schema_v1_manifest_is_rejected_without_mutation() {
 
     let result = invoke(&["status", project.to_str().unwrap()]);
 
-    assert_failure_contains(&result, "unsupported schema 1; expected 9");
+    assert_failure_contains(&result, "unsupported schema 1; expected 10");
     assert_eq!(manifest(&project), original);
     fs::remove_dir_all(root).unwrap();
 }

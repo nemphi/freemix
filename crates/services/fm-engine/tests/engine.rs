@@ -11,7 +11,8 @@ use fm_engine::{
 };
 use fm_scheduler::FrameNumber;
 use fm_switcher::{
-    FadeToBlackPosition, FadeToBlackTarget, SwitcherEvent, SwitcherState, TBarPosition, TBarState,
+    FadeToBlackPosition, FadeToBlackTarget, MissingMediaFallback, StingerAudioPolicy,
+    StingerDescriptor, StingerSlotId, SwitcherEvent, SwitcherState, TBarPosition, TBarState,
     TransitionKind,
 };
 use fm_types::{FrameRate, InputId};
@@ -36,6 +37,34 @@ fn engine() -> Engine {
         FrameRate::new(25, 1).unwrap(),
         domain(),
     )
+}
+
+fn stinger_engine(
+    media_available: bool,
+    cut_point_frames: u32,
+    fallback: MissingMediaFallback,
+) -> Engine {
+    let mut show = ShowState::new(
+        "stinger show",
+        vec![input(1), input(2), input(3)],
+        input(1),
+        input(2),
+    )
+    .unwrap();
+    let slot = StingerSlotId::new(1).unwrap();
+    show.configure_stinger(
+        slot,
+        StingerDescriptor::new(
+            input(3),
+            true,
+            cut_point_frames,
+            StingerAudioPolicy::MixWithProgram,
+            fallback,
+        ),
+    )
+    .unwrap();
+    show.preload_stinger(slot, media_available).unwrap();
+    Engine::new(show, FrameRate::new(25, 1).unwrap(), domain())
 }
 
 fn envelope(key: &str, command: EngineCommand) -> CommandEnvelope<EngineCommand> {
@@ -963,6 +992,303 @@ fn zoom_is_idempotent_and_realizes_on_exact_frame_boundaries() {
 }
 
 #[test]
+fn ready_stinger_is_idempotent_and_realizes_on_exact_media_frames() {
+    let mut engine = stinger_engine(true, 1, MissingMediaFallback::KeepProgram);
+    let slot = StingerSlotId::new(1).unwrap();
+    let command = envelope(
+        "stinger",
+        EngineCommand::Stinger {
+            slot,
+            duration_frames: 3,
+        },
+    );
+    let first = engine.execute(command.clone(), 0).unwrap();
+    let duplicate = engine.execute(command, 0).unwrap();
+
+    assert_eq!(first.receipt.accepted().unwrap().revision, Revision::new(1));
+    assert!(duplicate.replayed);
+    assert_eq!(duplicate.receipt, first.receipt);
+    assert_eq!(engine.show().desired_switcher().program(), input(2));
+
+    for (start, end) in [(0, 1), (1, 2), (2, 3)] {
+        let frame = engine.tick().unwrap();
+        assert_eq!(
+            frame.program.transition_kind,
+            Some(TransitionKind::Stinger(slot))
+        );
+        assert_eq!(
+            (
+                frame.program.mix_start_numerator,
+                frame.program.mix_end_numerator
+            ),
+            (start, end)
+        );
+        assert_eq!(
+            engine
+                .realized_switcher()
+                .stinger(slot)
+                .descriptor()
+                .unwrap()
+                .media_input,
+            input(3)
+        );
+    }
+    let endpoint = engine.tick().unwrap();
+    assert_eq!(endpoint.program.primary, input(2));
+    assert_eq!(endpoint.program.transition_kind, None);
+    assert!(engine.snapshot().is_ok());
+}
+
+#[test]
+fn stinger_slots_configure_replace_and_remove_at_idle_boundaries() {
+    let mut engine = engine();
+    let slot = StingerSlotId::new(8).unwrap();
+    let first = StingerDescriptor::new(
+        input(3),
+        true,
+        2,
+        StingerAudioPolicy::MixWithProgram,
+        MissingMediaFallback::Fade,
+    );
+    engine
+        .execute(
+            envelope(
+                "configure-stinger",
+                EngineCommand::ConfigureStinger {
+                    slot,
+                    descriptor: first,
+                },
+            ),
+            0,
+        )
+        .unwrap();
+    assert_eq!(
+        engine.show().desired_switcher().stinger(slot).descriptor(),
+        Some(&first)
+    );
+    assert_eq!(
+        engine
+            .show()
+            .desired_switcher()
+            .stinger(slot)
+            .preload_state(),
+        fm_switcher::StingerPreloadState::Ready
+    );
+    assert_eq!(engine.snapshot(), Err(SnapshotError::WorkInFlight));
+    engine.tick().unwrap();
+    assert_eq!(
+        engine.realized_switcher().stinger(slot),
+        engine.show().desired_switcher().stinger(slot)
+    );
+
+    let replacement = StingerDescriptor::new(
+        input(2),
+        false,
+        7,
+        StingerAudioPolicy::Muted,
+        MissingMediaFallback::KeepProgram,
+    );
+    engine
+        .execute(
+            envelope(
+                "replace-stinger",
+                EngineCommand::ConfigureStinger {
+                    slot,
+                    descriptor: replacement,
+                },
+            ),
+            0,
+        )
+        .unwrap();
+    engine.tick().unwrap();
+    assert_eq!(
+        engine.realized_switcher().stinger(slot).descriptor(),
+        Some(&replacement)
+    );
+    assert_eq!(
+        engine.realized_switcher().stinger(slot).preload_state(),
+        fm_switcher::StingerPreloadState::NotRequested
+    );
+
+    engine
+        .execute(
+            envelope("remove-stinger", EngineCommand::RemoveStinger { slot }),
+            0,
+        )
+        .unwrap();
+    engine.tick().unwrap();
+    assert_eq!(engine.realized_switcher().stinger(slot).descriptor(), None);
+    assert_eq!(
+        engine.show().desired_switcher().stinger(slot),
+        engine.realized_switcher().stinger(slot)
+    );
+}
+
+#[test]
+fn stinger_slot_mutation_rejects_unknown_media_and_active_transitions() {
+    let slot = StingerSlotId::new(1).unwrap();
+    let mut engine = engine();
+    let unknown = engine
+        .execute(
+            envelope(
+                "unknown-media",
+                EngineCommand::ConfigureStinger {
+                    slot,
+                    descriptor: StingerDescriptor::new(
+                        input(99),
+                        true,
+                        1,
+                        StingerAudioPolicy::Muted,
+                        MissingMediaFallback::Cut,
+                    ),
+                },
+            ),
+            0,
+        )
+        .unwrap();
+    assert_eq!(
+        unknown.receipt.rejected().unwrap().rejection.code,
+        RejectionCode::NotFound
+    );
+
+    engine
+        .execute(
+            envelope("fade", EngineCommand::Fade { duration_frames: 2 }),
+            0,
+        )
+        .unwrap();
+    let automatic = engine
+        .execute(
+            envelope("remove-automatic", EngineCommand::RemoveStinger { slot }),
+            0,
+        )
+        .unwrap();
+    assert_eq!(
+        automatic.receipt.rejected().unwrap().rejection.code,
+        RejectionCode::Conflict
+    );
+    for _ in 0..2 {
+        engine.tick().unwrap();
+    }
+
+    engine
+        .execute(
+            envelope(
+                "manual",
+                EngineCommand::StartManualTransition {
+                    kind: EngineManualTransitionKind::Fade,
+                },
+            ),
+            0,
+        )
+        .unwrap();
+    engine.tick().unwrap();
+    let manual = engine
+        .execute(
+            envelope("remove-manual", EngineCommand::RemoveStinger { slot }),
+            0,
+        )
+        .unwrap();
+    assert_eq!(
+        manual.receipt.rejected().unwrap().rejection.code,
+        RejectionCode::Conflict
+    );
+}
+
+#[test]
+fn stinger_rejects_unconfigured_or_out_of_range_work_before_scheduling() {
+    let slot = StingerSlotId::new(1).unwrap();
+    let mut unconfigured = engine();
+    let outcome = unconfigured
+        .execute(
+            envelope(
+                "unconfigured-stinger",
+                EngineCommand::Stinger {
+                    slot,
+                    duration_frames: 2,
+                },
+            ),
+            0,
+        )
+        .unwrap();
+    assert_eq!(
+        outcome.receipt.rejected().unwrap().rejection.code,
+        RejectionCode::NotFound
+    );
+    unconfigured.tick().unwrap();
+    assert_eq!(unconfigured.realized_switcher().program(), input(1));
+
+    let mut invalid_cut = stinger_engine(true, 3, MissingMediaFallback::Cut);
+    let outcome = invalid_cut
+        .execute(
+            envelope(
+                "invalid-stinger-cut",
+                EngineCommand::Stinger {
+                    slot,
+                    duration_frames: 2,
+                },
+            ),
+            0,
+        )
+        .unwrap();
+    assert_eq!(
+        outcome.receipt.rejected().unwrap().rejection.code,
+        RejectionCode::InvalidCommand
+    );
+    invalid_cut.tick().unwrap();
+    assert_eq!(invalid_cut.realized_switcher().program(), input(1));
+}
+
+#[test]
+fn missing_stinger_media_applies_keep_or_fade_fallback_without_stale_busy_state() {
+    let slot = StingerSlotId::new(1).unwrap();
+    let mut keep = stinger_engine(false, 1, MissingMediaFallback::KeepProgram);
+    keep.execute(
+        envelope(
+            "keep-program",
+            EngineCommand::Stinger {
+                slot,
+                duration_frames: 3,
+            },
+        ),
+        0,
+    )
+    .unwrap();
+    assert_eq!(keep.show().desired_switcher().program(), input(1));
+    let frame = keep.tick().unwrap();
+    assert_eq!(frame.program.transition_kind, None);
+    assert!(matches!(
+        frame.events.as_slice(),
+        [SwitcherEvent::StingerFallbackApplied {
+            fallback: MissingMediaFallback::KeepProgram,
+            ..
+        }]
+    ));
+    assert!(keep.snapshot().is_ok());
+
+    let mut fade = stinger_engine(false, 1, MissingMediaFallback::Fade);
+    fade.execute(
+        envelope(
+            "fallback-fade",
+            EngineCommand::Stinger {
+                slot,
+                duration_frames: 2,
+            },
+        ),
+        0,
+    )
+    .unwrap();
+    assert_eq!(fade.show().desired_switcher().program(), input(2));
+    for _ in 0..2 {
+        assert_eq!(
+            fade.tick().unwrap().program.transition_kind,
+            Some(TransitionKind::Fade)
+        );
+    }
+    assert!(fade.snapshot().is_ok());
+}
+
+#[test]
 fn idle_snapshot_restores_state_counters_timeline_and_receipts() {
     let mut engine = engine();
     let original = engine
@@ -1066,6 +1392,37 @@ fn persisted_restore_rejects_mismatched_idle_routing() {
 
     assert_eq!(
         restore_persisted(&snapshot, realized, restore_state(&snapshot)).unwrap_err(),
+        SnapshotError::MismatchedSwitcherRouting
+    );
+}
+
+#[test]
+fn persisted_restore_rejects_mismatched_stinger_configuration_or_readiness() {
+    let snapshot = engine().snapshot().unwrap();
+    let mut show = snapshot.show().clone();
+    let slot = StingerSlotId::new(1).unwrap();
+    show.configure_stinger(
+        slot,
+        StingerDescriptor::new(
+            input(3),
+            true,
+            2,
+            StingerAudioPolicy::Muted,
+            MissingMediaFallback::Cut,
+        ),
+    )
+    .unwrap();
+    show.preload_stinger(slot, true).unwrap();
+
+    assert_eq!(
+        Engine::restore_persisted(
+            show,
+            snapshot.realized_switcher().clone(),
+            snapshot.frame_rate(),
+            domain(),
+            restore_state(&snapshot),
+        )
+        .unwrap_err(),
         SnapshotError::MismatchedSwitcherRouting
     );
 }

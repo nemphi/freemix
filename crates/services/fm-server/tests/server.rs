@@ -6,8 +6,10 @@ use fm_protocol::{
     CommandPayload, EngineIdentity, EventCursor, EventMessage, EventPayload,
     FADE_TO_BLACK_PROTOCOL_VERSION, MANUAL_ALPHA_FADE_PROTOCOL_VERSION,
     MANUAL_TRANSITION_PROTOCOL_VERSION, ManualTransitionKind, ManualTransitionStatus,
-    ProtocolVersion, Role, SLIDE_PROTOCOL_VERSION, SnapshotMessage, WIPE_PROTOCOL_VERSION,
-    WireInputId, ZOOM_PROTOCOL_VERSION,
+    ProtocolVersion, Role, SLIDE_PROTOCOL_VERSION, STINGER_PROTOCOL_VERSION,
+    STINGER_STATUS_PROTOCOL_VERSION, SnapshotMessage, StingerAudioPolicy,
+    StingerMissingMediaFallback, StingerReadiness, StingerStatus, WIPE_PROTOCOL_VERSION,
+    WireInputId, WireStingerSlotId, ZOOM_PROTOCOL_VERSION,
 };
 use fm_server::{
     AuthenticationMode, ConfigError, ControlPlane, DisconnectReason, HandshakeError, HealthState,
@@ -74,6 +76,7 @@ fn control() -> FakeControl {
         realized_manual_transition: Some(ManualTransitionStatus::Inactive),
         desired_fade_to_black: None,
         realized_fade_to_black: None,
+        stingers: None,
     };
     let events = [3, 4]
         .map(|revision| EventMessage {
@@ -213,6 +216,61 @@ fn handshake_delegates_snapshot_and_resume_selection() {
         .unwrap();
     assert!(resumed.server_hello.resume);
     assert!(matches!(resumed.sync, SyncPayload::Resume(events) if events.len() == 2));
+}
+
+#[test]
+fn protocol_1_11_resume_falls_back_to_snapshot_across_stinger_slot_mutation() {
+    let mut control = control();
+    let stinger = StingerStatus {
+        slot: WireStingerSlotId::new(8).unwrap(),
+        media_input: input(2),
+        preload: false,
+        cut_point_frames: 7,
+        audio_policy: StingerAudioPolicy::Muted,
+        missing_media_fallback: StingerMissingMediaFallback::KeepProgram,
+        readiness: StingerReadiness::NotRequested,
+    };
+    control.snapshot.stingers = Some(vec![stinger]);
+    control.events = vec![EventMessage {
+        cursor: EventCursor {
+            engine: engine(),
+            revision: 4,
+        },
+        payload: EventPayload::StingerSlotsChanged {
+            program: input(1),
+            preview: input(2),
+            manual_transition: Some(ManualTransitionStatus::Inactive),
+            fade_to_black: None,
+            stingers: vec![stinger],
+        },
+    }];
+    let config = ServerConfig::new(
+        ServerMode::Production,
+        AuthenticationMode::Required,
+        IpAddr::from([127, 0, 0, 1]),
+        vec![CURRENT_PROTOCOL_VERSION],
+        "capabilities-v1",
+    );
+    let mut server = Server::new(config, control).unwrap();
+    server.mark_ready().unwrap();
+    let mut request = hello(
+        Role::Viewer,
+        Some(EventCursor {
+            engine: engine(),
+            revision: 3,
+        }),
+    );
+    request.versions = vec![STINGER_STATUS_PROTOCOL_VERSION];
+
+    let outcome = server
+        .handshake(&request, &principal(AuthRole::Viewer), 10)
+        .unwrap();
+    assert!(!outcome.server_hello.resume);
+    let SyncPayload::Snapshot(snapshot) = outcome.sync else {
+        panic!("incompatible resume must fall back to a snapshot");
+    };
+    assert_eq!(snapshot.stingers, Some(vec![stinger]));
+    assert_eq!(snapshot.revision, 4);
 }
 
 #[test]
@@ -534,6 +592,39 @@ fn zoom_requires_protocol_1_9() {
         Err(SessionError::UnsupportedCommandVersion {
             negotiated: SLIDE_PROTOCOL_VERSION,
             required: ZOOM_PROTOCOL_VERSION,
+        })
+    );
+    assert_eq!(session.accounting().inbound_commands_admitted_total, 0);
+    assert_eq!(session.accounting().inbound_commands_inflight, 0);
+}
+
+#[test]
+fn stinger_requires_protocol_1_10() {
+    let server = ready_server(ServerConfig::new(
+        ServerMode::Production,
+        AuthenticationMode::Required,
+        IpAddr::from([127, 0, 0, 1]),
+        vec![CURRENT_PROTOCOL_VERSION],
+        "capabilities-v1",
+    ));
+    let mut old_hello = hello(Role::Operator, None);
+    old_hello.versions = vec![ZOOM_PROTOCOL_VERSION];
+    let outcome = server
+        .handshake(&old_hello, &principal(AuthRole::Operator), 0)
+        .unwrap();
+    assert_eq!(outcome.server_hello.negotiated, ZOOM_PROTOCOL_VERSION);
+
+    let mut session = outcome.session;
+    let mut command = command(CommandPayload::Stinger {
+        slot: WireStingerSlotId::new(1).unwrap(),
+        duration_frames: 30,
+    });
+    command.protocol = ZOOM_PROTOCOL_VERSION;
+    assert_eq!(
+        session.admit_command(&command, 10, 0),
+        Err(SessionError::UnsupportedCommandVersion {
+            negotiated: ZOOM_PROTOCOL_VERSION,
+            required: STINGER_PROTOCOL_VERSION,
         })
     );
     assert_eq!(session.accounting().inbound_commands_admitted_total, 0);

@@ -44,6 +44,7 @@ pub(crate) fn validate_project(project: &Project) -> Vec<ValidationError> {
     validate_inputs(project, &mut errors);
     validate_input_audio_strips(project, &mut errors);
     validate_main_mix(project, &mut errors);
+    validate_stingers(project, &mut errors);
     validate_scenes(project, &mut errors);
     validate_buses(project, &mut errors);
     validate_outputs(project, &mut errors);
@@ -51,6 +52,32 @@ pub(crate) fn validate_project(project: &Project) -> Vec<ValidationError> {
     mark_audio_input_cycles(project, &mut errors);
     mark_bus_cycles(project, &mut errors);
     errors
+}
+
+fn validate_stingers(project: &Project, errors: &mut Vec<ValidationError>) {
+    for (index, stinger) in project.stingers().iter().enumerate() {
+        if project.stingers()[..index]
+            .iter()
+            .any(|previous| previous.slot == stinger.slot)
+        {
+            errors.push(ValidationError {
+                entity: None,
+                field: "stingers.slot",
+                kind: ValidationErrorKind::DuplicateId,
+            });
+        }
+        if !project
+            .inputs()
+            .iter()
+            .any(|input| input.id == stinger.media_input)
+        {
+            errors.push(ValidationError {
+                entity: None,
+                field: "stingers.media_input",
+                kind: ValidationErrorKind::MissingReference(EntityRef::Input(stinger.media_input)),
+            });
+        }
+    }
 }
 
 fn validate_input_audio_strips(project: &Project, errors: &mut Vec<ValidationError>) {

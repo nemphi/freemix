@@ -6,6 +6,7 @@ mod fade_to_black;
 mod native;
 mod plan;
 mod scene;
+mod stinger;
 mod transition;
 
 pub use cpu::{
@@ -19,8 +20,8 @@ pub use fade_to_black::{
 #[cfg(feature = "native-wgpu")]
 pub use native::{
     MAX_NATIVE_TRANSFORM_DIMENSION, NativeCompositionError, NativeCompositionRenderer,
-    NativeFadeToBlackError, NativeFadeToBlackRenderer, NativeSourceFrame, NativeTransitionError,
-    NativeTransitionRenderer,
+    NativeFadeToBlackError, NativeFadeToBlackRenderer, NativeSourceFrame, NativeStingerError,
+    NativeStingerRenderer, NativeTransitionError, NativeTransitionRenderer,
 };
 pub use plan::{
     CompilationReport, CompositionPlan, PlanError, PlanLayer, ReportEntry, compile_scene,
@@ -28,6 +29,10 @@ pub use plan::{
 pub use scene::{
     ChromaKey, Effect, InclusionError, Key, LumaKey, OutputInclusion, OutputTarget, RectMask,
     SafeAreaGuide, Scene, SceneError, SourceId, SourceLayer,
+};
+pub use stinger::{
+    StingerBase, StingerFramePlan, StingerFrameRole, StingerPlanError, StingerRenderError,
+    execute_stinger_frame,
 };
 pub use transition::{TransitionError, TransitionKind, TransitionPlan, execute_transition};
 

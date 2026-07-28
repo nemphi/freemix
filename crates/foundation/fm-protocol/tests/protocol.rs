@@ -12,10 +12,12 @@ use fm_protocol::{
     MAX_FIELDS_PER_MESSAGE, MAX_LINE_BYTES, MAX_LIST_ITEMS, MAX_MESSAGES_PER_PUSH,
     ManualTransitionKind, ManualTransitionPosition, ManualTransitionState, ManualTransitionStatus,
     ProtocolVersion, ResumeCursor, Role, RuntimeDomainBoundary, RuntimeEventMessage,
-    RuntimeFailureDisposition, RuntimeLifecycleEvent, SLIDE_PROTOCOL_VERSION, ServerHello,
-    ServerIdentity, SnapshotMessage, SnapshotReason, StructuredError, WIPE_PROTOCOL_VERSION,
-    WireInputId, WireMessage, ZOOM_PROTOCOL_VERSION, choose_handshake_outcome, decode_line,
-    encode_line, negotiate_version,
+    RuntimeFailureDisposition, RuntimeLifecycleEvent, SLIDE_PROTOCOL_VERSION,
+    STINGER_CONFIGURATION_PROTOCOL_VERSION, STINGER_PROTOCOL_VERSION,
+    STINGER_STATUS_PROTOCOL_VERSION, ServerHello, ServerIdentity, SnapshotMessage, SnapshotReason,
+    StingerAudioPolicy, StingerMissingMediaFallback, StingerReadiness, StingerStatus,
+    StructuredError, WIPE_PROTOCOL_VERSION, WireInputId, WireMessage, WireStingerSlotId,
+    ZOOM_PROTOCOL_VERSION, choose_handshake_outcome, decode_line, encode_line, negotiate_version,
 };
 
 fn input(value: u128) -> WireInputId {
@@ -158,6 +160,30 @@ fn additive_zoom_command_has_a_stable_wire_form() {
 }
 
 #[test]
+fn additive_stinger_command_has_a_stable_wire_form_and_bounded_slot() {
+    let fixture = include_str!("fixtures/command_stinger.wire");
+    let message = WireMessage::Command(CommandMessage {
+        protocol: STINGER_PROTOCOL_VERSION,
+        payload: CommandPayload::Stinger {
+            slot: WireStingerSlotId::new(3).unwrap(),
+            duration_frames: 45,
+        },
+        ..command()
+    });
+    assert_eq!(encode_line(&message).unwrap(), fixture);
+    assert_eq!(decode_line(fixture).unwrap(), message);
+
+    let invalid = fixture.replace("slot=3", "slot=9");
+    assert_eq!(
+        decode_line(&invalid),
+        Err(CodecError::InvalidField {
+            field: "slot",
+            value: "9".to_owned(),
+        })
+    );
+}
+
+#[test]
 fn golden_client_hello_fixture_is_stable() {
     let fixture = include_str!("fixtures/client_hello.wire");
     let message = WireMessage::ClientHello(ClientHello {
@@ -243,6 +269,7 @@ fn every_message_variant_round_trips() {
             realized_manual_transition: None,
             desired_fade_to_black: None,
             realized_fade_to_black: None,
+            stingers: None,
         }),
         WireMessage::Event(EventMessage {
             cursor: cursor(),
@@ -341,6 +368,7 @@ fn manual_transition_snapshot_and_events_have_stable_exact_wire_forms() {
                 realized_manual_transition: Some(realized),
                 desired_fade_to_black: None,
                 realized_fade_to_black: None,
+                stingers: None,
             }),
         ),
         (
@@ -411,6 +439,7 @@ fn fade_to_black_command_and_state_have_exact_versioned_wire_forms() {
         realized_manual_transition: Some(ManualTransitionStatus::Inactive),
         desired_fade_to_black: Some(desired),
         realized_fade_to_black: Some(realized),
+        stingers: None,
     });
     let encoded = encode_line(&snapshot).unwrap();
     assert!(encoded.contains("?desired_ftb_target_active=1"));
@@ -435,6 +464,59 @@ fn fade_to_black_command_and_state_have_exact_versioned_wire_forms() {
             realized_fade_to_black: None,
             ..
         })
+    ));
+}
+
+#[test]
+fn stinger_configuration_and_readiness_have_an_additive_snapshot_wire_form() {
+    let message = WireMessage::Snapshot(SnapshotMessage {
+        engine: identity(),
+        revision: 9,
+        show_name: "Stingers".into(),
+        inputs: vec![input(1), input(2)],
+        desired_program: input(1),
+        desired_preview: input(2),
+        realized_program: input(1),
+        realized_preview: input(2),
+        desired_manual_transition: Some(ManualTransitionStatus::Inactive),
+        realized_manual_transition: Some(ManualTransitionStatus::Inactive),
+        desired_fade_to_black: Some(FadeToBlackState {
+            target_active: false,
+            position: FadeToBlackPosition::LIVE,
+        }),
+        realized_fade_to_black: Some(FadeToBlackState {
+            target_active: false,
+            position: FadeToBlackPosition::LIVE,
+        }),
+        stingers: Some(vec![
+            StingerStatus {
+                slot: WireStingerSlotId::new(1).unwrap(),
+                media_input: input(2),
+                preload: true,
+                cut_point_frames: 12,
+                audio_policy: StingerAudioPolicy::MixWithProgram,
+                missing_media_fallback: StingerMissingMediaFallback::Fade,
+                readiness: StingerReadiness::Ready,
+            },
+            StingerStatus {
+                slot: WireStingerSlotId::new(8).unwrap(),
+                media_input: input(1),
+                preload: false,
+                cut_point_frames: 0,
+                audio_policy: StingerAudioPolicy::Muted,
+                missing_media_fallback: StingerMissingMediaFallback::KeepProgram,
+                readiness: StingerReadiness::NotRequested,
+            },
+        ]),
+    });
+    let encoded = encode_line(&message).unwrap();
+    assert!(encoded.contains(
+        "?stingers=1%3A2%3A1%3A12%3Amix_with_program%3Afade%3Aready%2C8%3A1%3A0%3A0%3Amuted%3Akeep_program%3Anot_requested"
+    ));
+    assert_eq!(decode_line(&encoded), Ok(message.clone()));
+    assert!(matches!(
+        message.compatible_with(STINGER_PROTOCOL_VERSION),
+        WireMessage::Snapshot(SnapshotMessage { stingers: None, .. })
     ));
 }
 
@@ -585,7 +667,124 @@ fn command_minimum_versions_gate_additive_transitions() {
     assert_eq!(zoom.minimum_protocol_version(), ZOOM_PROTOCOL_VERSION);
     assert!(!zoom.is_supported_by(SLIDE_PROTOCOL_VERSION));
     assert!(zoom.is_supported_by(CURRENT_PROTOCOL_VERSION));
-    assert_eq!(CURRENT_PROTOCOL_VERSION, ZOOM_PROTOCOL_VERSION);
+
+    let stinger = CommandPayload::Stinger {
+        slot: WireStingerSlotId::new(1).unwrap(),
+        duration_frames: 25,
+    };
+    assert_eq!(STINGER_PROTOCOL_VERSION, ProtocolVersion::new(1, 10));
+    assert_eq!(stinger.minimum_protocol_version(), STINGER_PROTOCOL_VERSION);
+    assert!(!stinger.is_supported_by(ZOOM_PROTOCOL_VERSION));
+    assert!(stinger.is_supported_by(CURRENT_PROTOCOL_VERSION));
+    assert_eq!(STINGER_STATUS_PROTOCOL_VERSION, ProtocolVersion::new(1, 11));
+    assert_eq!(
+        STINGER_CONFIGURATION_PROTOCOL_VERSION,
+        ProtocolVersion::new(1, 12)
+    );
+    assert_eq!(
+        CommandPayload::RemoveStinger {
+            slot: WireStingerSlotId::new(8).unwrap()
+        }
+        .minimum_protocol_version(),
+        STINGER_CONFIGURATION_PROTOCOL_VERSION
+    );
+    assert_eq!(
+        CURRENT_PROTOCOL_VERSION,
+        STINGER_CONFIGURATION_PROTOCOL_VERSION
+    );
+}
+
+#[test]
+fn stinger_slot_mutations_round_trip_exact_configuration() {
+    for (fixture, payload) in [
+        (
+            include_str!("fixtures/command_configure_stinger.wire"),
+            CommandPayload::ConfigureStinger {
+                slot: WireStingerSlotId::new(8).unwrap(),
+                media_input: input(42),
+                preload: true,
+                cut_point_frames: 17,
+                audio_policy: StingerAudioPolicy::MixWithProgram,
+                missing_media_fallback: StingerMissingMediaFallback::KeepProgram,
+            },
+        ),
+        (
+            include_str!("fixtures/command_remove_stinger.wire"),
+            CommandPayload::RemoveStinger {
+                slot: WireStingerSlotId::new(8).unwrap(),
+            },
+        ),
+    ] {
+        let message = WireMessage::Command(CommandMessage {
+            protocol: STINGER_CONFIGURATION_PROTOCOL_VERSION,
+            payload,
+            ..command()
+        });
+        assert_eq!(encode_line(&message).unwrap(), fixture);
+        assert_eq!(decode_line(fixture).unwrap(), message);
+    }
+
+    let event = WireMessage::Event(EventMessage {
+        cursor: cursor(),
+        payload: EventPayload::StingerSlotsChanged {
+            program: input(1),
+            preview: input(2),
+            manual_transition: Some(ManualTransitionStatus::Inactive),
+            fade_to_black: Some(FadeToBlackState {
+                target_active: false,
+                position: FadeToBlackPosition::LIVE,
+            }),
+            stingers: vec![StingerStatus {
+                slot: WireStingerSlotId::new(8).unwrap(),
+                media_input: input(42),
+                preload: true,
+                cut_point_frames: 17,
+                audio_policy: StingerAudioPolicy::MixWithProgram,
+                missing_media_fallback: StingerMissingMediaFallback::KeepProgram,
+                readiness: StingerReadiness::Ready,
+            }],
+        },
+    });
+    let encoded = encode_line(&event).unwrap();
+    assert_eq!(decode_line(&encoded).unwrap(), event);
+    assert!(!event.is_compatible_with(STINGER_STATUS_PROTOCOL_VERSION));
+    assert!(event.is_compatible_with(STINGER_CONFIGURATION_PROTOCOL_VERSION));
+}
+
+#[test]
+fn stinger_projection_encoder_rejects_too_many_or_duplicate_slots() {
+    let status = StingerStatus {
+        slot: WireStingerSlotId::new(1).unwrap(),
+        media_input: input(42),
+        preload: true,
+        cut_point_frames: 17,
+        audio_policy: StingerAudioPolicy::MixWithProgram,
+        missing_media_fallback: StingerMissingMediaFallback::KeepProgram,
+        readiness: StingerReadiness::Ready,
+    };
+    let event = |stingers| {
+        WireMessage::Event(EventMessage {
+            cursor: cursor(),
+            payload: EventPayload::StingerSlotsChanged {
+                program: input(1),
+                preview: input(2),
+                manual_transition: Some(ManualTransitionStatus::Inactive),
+                fade_to_black: None,
+                stingers,
+            },
+        })
+    };
+    assert!(matches!(
+        encode_line(&event(vec![status, status])),
+        Err(CodecError::InvalidField {
+            field: "?stingers",
+            ..
+        })
+    ));
+    assert_eq!(
+        encode_line(&event(vec![status; 9])),
+        Err(CodecError::TooManyItems("stingers"))
+    );
 }
 
 #[test]

@@ -9,7 +9,8 @@ use fm_gpu::{
 use fm_video::{CropRect, Rotation, Transform};
 
 use crate::{
-    CompositionPlan, FadeToBlackPlan, RectMask, SourceId, TransitionKind, TransitionPlan,
+    CompositionPlan, FadeToBlackPlan, RectMask, SourceId, StingerBase, StingerFramePlan,
+    StingerFrameRole, TransitionKind, TransitionPlan,
     transition::{wipe_boundary, zoom_extent},
 };
 
@@ -230,6 +231,29 @@ fn fade_to_black_fragment(@builtin(position) position: vec4<f32>) -> @location(0
         return opaque_black;
     }
     return affine_rgba(source, opaque_black, fade_position);
+}
+";
+
+const STINGER_UNIFORM_SIZE: usize = 16;
+
+const STINGER_FRAGMENT_SHADER: &str = r"
+struct StingerUniform {
+    padding_0: u32,
+    padding_1: u32,
+    padding_2: u32,
+    padding_3: u32,
+};
+
+@group(0) @binding(0) var base_texture: texture_2d<f32>;
+@group(0) @binding(1) var media_texture: texture_2d<f32>;
+@group(0) @binding(2) var<uniform> unused_stinger: StingerUniform;
+
+@fragment
+fn stinger_fragment(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
+    let coordinates = vec2<i32>(position.xy);
+    let base = textureLoad(base_texture, coordinates, 0);
+    let media = textureLoad(media_texture, coordinates, 0);
+    return media + base * (1.0 - media.a);
 }
 ";
 
@@ -697,6 +721,186 @@ impl From<NativeGpuError> for NativeFadeToBlackError {
     fn from(value: NativeGpuError) -> Self {
         Self::Gpu(value)
     }
+}
+
+/// Errors produced by native Stinger frame composition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NativeStingerError {
+    DimensionMismatch {
+        role: StingerFrameRole,
+        expected_width: u32,
+        expected_height: u32,
+        actual_width: u32,
+        actual_height: u32,
+    },
+    ProgramFormat {
+        actual: TextureFormat,
+    },
+    PreviewFormat {
+        actual: TextureFormat,
+    },
+    MediaFormat {
+        actual: TextureFormat,
+    },
+    Gpu(NativeGpuError),
+}
+
+impl fmt::Display for NativeStingerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DimensionMismatch {
+                role,
+                expected_width,
+                expected_height,
+                actual_width,
+                actual_height,
+            } => write!(
+                formatter,
+                "native stinger {role:?} texture is {actual_width}x{actual_height}, expected \
+                 {expected_width}x{expected_height}"
+            ),
+            Self::ProgramFormat { actual } => write!(
+                formatter,
+                "native stinger Program texture has format {actual:?}; expected Rgba16Float"
+            ),
+            Self::PreviewFormat { actual } => write!(
+                formatter,
+                "native stinger Preview texture has format {actual:?}; expected Rgba16Float"
+            ),
+            Self::MediaFormat { actual } => write!(
+                formatter,
+                "native stinger media texture has format {actual:?}; expected Rgba16Float"
+            ),
+            Self::Gpu(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for NativeStingerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Gpu(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<NativeGpuError> for NativeStingerError {
+    fn from(value: NativeGpuError) -> Self {
+        Self::Gpu(value)
+    }
+}
+
+/// Native source-over renderer for one canonical Stinger media frame.
+pub struct NativeStingerRenderer {
+    pipeline: NativeFullscreenPipeline,
+}
+
+impl NativeStingerRenderer {
+    /// Compiles the Stinger source-over shader on an existing native context.
+    ///
+    /// # Errors
+    ///
+    /// Returns a mapped GPU shader or pipeline validation error.
+    pub async fn new(context: &NativeContext) -> Result<Self, NativeStingerError> {
+        let pipeline = context
+            .create_fullscreen_pipeline_with_options(
+                ShaderDescriptor::new(
+                    "fm-compositor native Stinger",
+                    ShaderStage::Fragment,
+                    ShaderLanguage::Wgsl,
+                    "stinger_fragment",
+                    ShaderSource::Text(STINGER_FRAGMENT_SHADER.to_owned()),
+                ),
+                NativeFullscreenPipelineOptions {
+                    target_format: TextureFormat::Rgba16Float,
+                    blend: NativeFullscreenBlend::Replace,
+                    uniform_size: STINGER_UNIFORM_SIZE,
+                    source_extent_policy: NativeSourceExtentPolicy::MatchTarget,
+                },
+            )
+            .await?;
+        Ok(Self { pipeline })
+    }
+
+    /// Composes `media` over Program before the cut point and Preview after it.
+    ///
+    /// Inputs must be equally sized canonical `Rgba16Float`, linear-light,
+    /// premultiplied-alpha textures. The returned texture remains GPU-resident.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed dimension or format error before output allocation, or
+    /// a mapped GPU resource, context, uniform, or validation error.
+    pub async fn render(
+        &self,
+        context: &NativeContext,
+        plan: StingerFramePlan,
+        program: &NativeTexture,
+        preview: &NativeTexture,
+        media: &NativeTexture,
+    ) -> Result<NativeTexture, NativeStingerError> {
+        validate_stinger_dimensions(program, preview, StingerFrameRole::Preview)?;
+        validate_stinger_dimensions(program, media, StingerFrameRole::Media)?;
+        validate_stinger_formats(program, preview, media)?;
+        let base = match plan.base() {
+            StingerBase::Program => program,
+            StingerBase::Preview => preview,
+        };
+        let output = context
+            .create_rgba16_float_render_target(program.width(), program.height())
+            .await?;
+        context
+            .submit_fullscreen(
+                &self.pipeline,
+                base,
+                media,
+                &output,
+                &[0; STINGER_UNIFORM_SIZE],
+            )
+            .await?;
+        Ok(output)
+    }
+}
+
+fn validate_stinger_dimensions(
+    program: &NativeTexture,
+    texture: &NativeTexture,
+    role: StingerFrameRole,
+) -> Result<(), NativeStingerError> {
+    if texture.width() == program.width() && texture.height() == program.height() {
+        return Ok(());
+    }
+    Err(NativeStingerError::DimensionMismatch {
+        role,
+        expected_width: program.width(),
+        expected_height: program.height(),
+        actual_width: texture.width(),
+        actual_height: texture.height(),
+    })
+}
+
+fn validate_stinger_formats(
+    program: &NativeTexture,
+    preview: &NativeTexture,
+    media: &NativeTexture,
+) -> Result<(), NativeStingerError> {
+    if program.format() != TextureFormat::Rgba16Float {
+        return Err(NativeStingerError::ProgramFormat {
+            actual: program.format(),
+        });
+    }
+    if preview.format() != TextureFormat::Rgba16Float {
+        return Err(NativeStingerError::PreviewFormat {
+            actual: preview.format(),
+        });
+    }
+    if media.format() != TextureFormat::Rgba16Float {
+        return Err(NativeStingerError::MediaFormat {
+            actual: media.format(),
+        });
+    }
+    Ok(())
 }
 
 /// Native Fade-to-Black executor for an already composed Program texture.

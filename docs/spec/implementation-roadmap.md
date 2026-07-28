@@ -726,8 +726,10 @@ frame. CPU and simulated paths cover byte-exact endpoints plus odd 5×3
 intermediates. The native wgpu path carries the same explicit geometry in its
 uniform, and a required Metal readback matches the CPU oracle at five progress
 points. Native daemon video planning now preserves Zoom, while Master audio
-uses the existing sample-linear two-source crossfade and continues to reject
-Stinger explicitly. Automatic Zoom is now command-reachable through the engine
+uses the existing sample-linear two-source crossfade. The legacy source-only
+audio planner rejects Stinger without project configuration; the project-aware
+Master path applies the configured policies described below. Automatic Zoom is
+now command-reachable through the engine
 and target-free transition authorization. Additive protocol 1.9 carries its
 exact duration through a byte-stable fixture; client and server admission reject
 it before mutation on older negotiated sessions. Daemon durable execution
@@ -754,9 +756,148 @@ Program recorder, decodes stable white, a Zoom-specific white perimeter with a
 black center, then stable black on a 3×3 luma grid, and verifies the settled
 persisted routing.
 
-Stinger, other transition families, cross-platform/fullscreen evidence, and
-complete `SW-004` acceptance remain pending; parity therefore stays planned.
-Item 5 and RC-007 remain planned.
+Stinger groundwork now defines a validated zero-based media-frame plan
+independent of the generic two-source transition plan. The configured cut point
+is the first media frame drawn over Preview; earlier frames are drawn over
+Program, and a cut point equal to the media length defers the routing swap until
+playback completes. The CPU oracle source-over composites same-size
+premultiplied RGBA, while a dedicated native wgpu renderer applies the same
+equation without CPU readback or a third shader binding. Required Metal oracles
+match the CPU core and the compiled daemon project path before and at the cut.
+Schema 10 durably stores up to eight unique slots with media input, preload
+intent, cut point, audio policy, and missing-media fallback; schema 2–9
+migrations default an empty slot set. Daemon restore configures identical
+desired and realized slot state, and idle restore rejects divergence.
+
+The engine now rejects unconfigured slots and cut points beyond the requested
+duration, applies ready Stingers on exact frame boundaries, and settles
+Cut/Fade/KeepProgram missing-media fallbacks without stale busy state. Additive
+protocol 1.10 carries a one-through-eight slot plus exact duration and rejects
+older peers before mutation. The native compiled project realizes retained
+single-frame Stinger media through exact video base selection and three explicit
+Master policies: base-only `Muted`, media-only `StingerOnly`, and unity
+media-plus-base `MixWithProgram`. Three independent scene roots are included in
+the preflight GPU bound. Restore now honors the durable preload intent:
+unrequested slots remain `NotRequested` and take their configured fallback
+instead of being promoted to Ready.
+
+The FFmpeg adapter now admits an explicit bounded set of straight-alpha YUVA,
+GBRAP, RGBA, and luma-alpha pixel formats into its existing RGBA decode
+contract. Native startup gives every requested local-video Stinger a second
+video playback instance: its decoder worker, GPU ring, and clip-local deadline
+are independent from the same input's ordinary show timeline. The ring retains
+at most eight frames, evicts only before the
+clip-local floor anchor, refills in bounded pages, holds the final frame only
+after confirmed EOS, and restarts its FFmpeg cursor at ordinal zero when a new
+trigger requests a deadline before the retained window. Startup partitions the
+existing 512 MiB RGBA16F source budget between ordinary and unique requested
+Stinger rings, rejecting configurations whose full bounded rings would exceed
+that one aggregate limit instead of silently doubling the budget. Replacement
+pages reserve only their additional charge, and both registries must match the
+project output dimensions before readiness. The daemon caches one read-only
+authority projection per upcoming frame so preparation does not repeatedly
+clone authority state while polling, and asserts that projection matches the
+realized frame.
+
+A hardware-gated Metal/FFmpeg oracle decodes a tagged twelve-frame alpha clip, pages
+beyond the initial eight-frame GPU prefix without exceeding it, observes
+Program/media/Preview composition across the configured cut, proves the
+ordinary input ring was not changed, and verifies a byte-identical retrigger.
+A separate native-daemon process acceptance persists the same twelve-frame
+asset, sends two immediately consecutive protocol 1.10 Stingers through durable and runtime
+realization, records the ordered white/media/black/media/white result, verifies
+the restored routing and revision, then starts a second recording daemon from
+that checkpoint, fires a third Stinger, decodes its recording, and verifies
+revision three plus the opposite settled routing. Live sources and local video
+remain rejected path-free until deterministic live capture exists.
+
+An additional required native-daemon process acceptance configures three
+preload-disabled slots and sends all three missing-readiness policies over
+protocol 1.10. It verifies two `KeepProgram` commands leave white and black
+Program routing unchanged, the `Fade` fallback records an intermediate frame
+before settling on black, the `Cut` fallback returns directly to white, and all
+four accepted revisions checkpoint the final routing without requiring the
+deferred media source.
+
+The local and remote CLI now expose an exact `stinger <slot> <frames>` action,
+restore persisted slot state before local mutation, and reject protocol 1.9
+before a remote write. The offline CLI can also atomically configure, replace,
+or remove any of the eight slots with full-width media input, preload intent,
+cut point, audio policy, and fallback. It validates the canonical project before
+save, preserves routing, manual-transition, Fade-to-Black, revision, frame,
+runtime-generation, and receipt state, and projects every persisted slot field
+in status output. Web exposes typed one-through-eight slot controls only for
+negotiated 1.10 sessions and preserves the exact requested duration.
+Studio and Web advertise 1.11. Studio exposes eight accessible numbered controls with a
+Ready replicated transition-capable session, carries typed slots into the wire
+payload, and keeps an unsupported Stinger at the head of its reconnect FIFO
+through a 1.9 downgrade. Loopback worker evidence observes exact slot, duration,
+pending-command state, durable routing, and runtime realization ordering.
+Additive protocol 1.11 snapshots now project every configured slot field plus
+the realized `NotRequested`, `Ready`, or `Missing` preload state. Protocol 1.10
+peers receive no extension, 1.11 clients reject an omitted or invalid
+projection, and the replicated model validates unique bounded slots and media
+input references. Web and Studio require the selected slot's authoritative
+`Ready` state before enabling its fire action; Studio loopback evidence observes
+the exact projected slot before dispatch. The FFmpeg video and audio cursor
+adapters can restart at clip-local ordinal/sample zero while retaining their
+fixed source identity and bounded audio metadata index; byte/sample oracles
+verify each replay against the original leading decode. The independent native
+Stinger video ring now consumes the video restart primitive for bounded paging
+and retriggering. Additive protocol 1.12 now carries live
+configure-or-replace and remove mutations for any slot, including the complete
+canonical configuration. The
+transition-authorized authority validates the media input, rejects automatic
+or manual transition conflicts, settles desired and realized readiness at an
+idle frame boundary, emits the projected slot event, and checkpoints the exact
+replacement or removal. A non-native daemon process acceptance configures then
+immediately fires a slot, verifies the settled routing, restarts on the
+replacement descriptor, removes it, and verifies a second empty restart.
+Native-media sessions instead return an explicit restart-required
+`unavailable` rejection before authority mutation, because the compiled project
+and preflighted decoder/GPU/audio pools are not yet safe to replace live.
+Native hot slot realization, cross-platform/fullscreen evidence, and complete
+`SW-003`/`SW-004` acceptance remain pending; parity therefore stays planned.
+
+Clip-local Stinger audio is now realized by a second, independently clocked
+Master lane for each unique requested audible media input. Startup partitions
+the existing aggregate retained-audio block, sample, and byte caps between
+ordinary show playback and the Stinger lane, then divides the latter across
+its per-media runtimes; preload-disabled slots do not reduce the ordinary
+budget, and requested video-only slots use explicit clip silence without
+partitioning that budget. Only the selected media runtime is serviced or rendered, so another
+slot's decoder, EOS, or stall cannot delay the active clip. Decoder requests
+remain single-flight and nonblocking, and a retrigger invalidates stale
+generations, restores bounded pre-video positioning, clears synchronizer and
+strip-delay history, and restarts the retained FFmpeg decoder at sample zero.
+Aggregate retention, reservations, stalls, padding, positioning, and peak
+telemetry include every Stinger lane.
+
+The realized policy contract is explicit:
+`Muted` suppresses only the Stinger clip and keeps the selected base,
+`StingerOnly` suppresses the base, and `MixWithProgram` sums both at unity
+before the existing Master output stages. Program is the base before the
+configured video cut and Preview is the base at and after it; that base change
+does not restart or fade the clip. The media input's persisted strip state
+applies to its Stinger bus. Audio before video frame zero is trimmed, delayed
+audio produces clip-local leading silence, clip EOS produces silence or
+base-only output for the remainder of the transition, and a shorter transition
+truncates the clip. Every trigger reanchors sample zero independently while the
+ordinary input cursor, strip-delay history, and inactive-source advancement
+continue on the show timeline. The clip cadence is reanchored to the
+authoritative global trigger frame, so fractional-rate frames consume the exact
+global output sample count without losing clip-local sample zero. Unit oracles
+cover all policies, the exact video cut, 59.94 fps cadence phase, selected-media
+isolation, aggregate retention, and FTB after the Stinger mix. A required
+FFmpeg PCM oracle proves byte-identical first-frame replay for early, delayed,
+and negative-origin audio, including bounded pre-video repositioning and
+sample-boundary phase preservation. A separate required
+Metal/FFmpeg daemon acceptance records frequency-separated Program, Preview,
+leading-clip, and trailing-clip signals through all three policies, two
+replays, checkpoint restore, process restart, and a restored replay; it decodes
+both recordings and verifies revisions and settled routing.
+
+Item 5, item 6, and RC-007 remain planned.
 
 FTB groundwork now includes a switcher-owned bounded automatic control core
 alongside the compositor plan. The controller moves from its current exact

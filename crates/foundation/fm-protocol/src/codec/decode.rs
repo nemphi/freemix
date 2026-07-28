@@ -8,7 +8,9 @@ use crate::{
     HandshakeOutcome, HandshakeRequest, HandshakeResponse, HeartbeatMessage, ManualTransitionKind,
     ManualTransitionPosition, ManualTransitionState, ManualTransitionStatus, ResumeCursor,
     RuntimeEventMessage, RuntimeFailureDisposition, RuntimeLifecycleEvent, ServerHello,
-    ServerIdentity, SnapshotMessage, SnapshotReason, StructuredError, WireInputId, WireMessage,
+    ServerIdentity, SnapshotMessage, SnapshotReason, StingerAudioPolicy,
+    StingerMissingMediaFallback, StingerReadiness, StingerStatus, StructuredError, WireInputId,
+    WireMessage, WireStingerSlotId,
 };
 
 use super::value::{
@@ -318,6 +320,21 @@ fn decode_command(fields: &mut Fields) -> Result<CommandMessage, CodecError> {
         "zoom" => CommandPayload::Zoom {
             duration_frames: fields.parse_required("duration_frames")?,
         },
+        "stinger" => {
+            let number: u8 = fields.parse_required("slot")?;
+            let slot = crate::WireStingerSlotId::new(number).ok_or(CodecError::InvalidField {
+                field: "slot",
+                value: number.to_string(),
+            })?;
+            CommandPayload::Stinger {
+                slot,
+                duration_frames: fields.parse_required("duration_frames")?,
+            }
+        }
+        "configure_stinger" => decode_configure_stinger(fields)?,
+        "remove_stinger" => CommandPayload::RemoveStinger {
+            slot: decode_stinger_slot(fields)?,
+        },
         "wipe" => CommandPayload::Wipe {
             duration_frames: fields.parse_required("duration_frames")?,
         },
@@ -373,6 +390,47 @@ fn decode_command(fields: &mut Fields) -> Result<CommandMessage, CodecError> {
     })
 }
 
+fn decode_configure_stinger(fields: &mut Fields) -> Result<CommandPayload, CodecError> {
+    let audio_policy = fields.required("audio_policy")?;
+    let missing_media_fallback = fields.required("missing_media_fallback")?;
+    Ok(CommandPayload::ConfigureStinger {
+        slot: decode_stinger_slot(fields)?,
+        media_input: fields.input("media_input")?,
+        preload: fields.boolean("preload")?,
+        cut_point_frames: fields.parse_required("cut_point_frames")?,
+        audio_policy: match audio_policy.as_str() {
+            "muted" => StingerAudioPolicy::Muted,
+            "stinger_only" => StingerAudioPolicy::StingerOnly,
+            "mix_with_program" => StingerAudioPolicy::MixWithProgram,
+            _ => {
+                return Err(CodecError::InvalidField {
+                    field: "audio_policy",
+                    value: audio_policy,
+                });
+            }
+        },
+        missing_media_fallback: match missing_media_fallback.as_str() {
+            "cut" => StingerMissingMediaFallback::Cut,
+            "fade" => StingerMissingMediaFallback::Fade,
+            "keep_program" => StingerMissingMediaFallback::KeepProgram,
+            _ => {
+                return Err(CodecError::InvalidField {
+                    field: "missing_media_fallback",
+                    value: missing_media_fallback,
+                });
+            }
+        },
+    })
+}
+
+fn decode_stinger_slot(fields: &mut Fields) -> Result<WireStingerSlotId, CodecError> {
+    let number: u8 = fields.parse_required("slot")?;
+    WireStingerSlotId::new(number).ok_or(CodecError::InvalidField {
+        field: "slot",
+        value: number.to_string(),
+    })
+}
+
 fn decode_result(fields: &mut Fields) -> Result<CommandResult, CodecError> {
     let status = fields.required("status")?;
     match status.as_str() {
@@ -418,7 +476,84 @@ fn decode_snapshot(fields: &mut Fields) -> Result<SnapshotMessage, CodecError> {
             fields,
             FadeToBlackStateFields::Realized,
         )?,
+        stingers: decode_stingers(fields)?,
     })
+}
+
+fn decode_stingers(fields: &mut Fields) -> Result<Option<Vec<StingerStatus>>, CodecError> {
+    let Some(value) = fields.optional("?stingers") else {
+        return Ok(None);
+    };
+    if value.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    let entries: Vec<_> = value.split(',').collect();
+    if entries.len() > 8 {
+        return Err(CodecError::TooManyItems("stingers"));
+    }
+    let mut seen = [false; 8];
+    let mut stingers = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let status = decode_stinger_status(entry).ok_or_else(|| invalid_stingers(&value))?;
+        let slot_index = usize::from(status.slot.number() - 1);
+        if seen[slot_index] {
+            return Err(invalid_stingers(&value));
+        }
+        seen[slot_index] = true;
+        stingers.push(status);
+    }
+    Ok(Some(stingers))
+}
+
+fn decode_stinger_status(entry: &str) -> Option<StingerStatus> {
+    let parts: Vec<_> = entry.split(':').collect();
+    let [
+        slot,
+        media_input,
+        preload,
+        cut_point_frames,
+        audio_policy,
+        fallback,
+        readiness,
+    ] = parts.as_slice()
+    else {
+        return None;
+    };
+    Some(StingerStatus {
+        slot: slot.parse().ok().and_then(WireStingerSlotId::new)?,
+        media_input: parse_input(media_input)?,
+        preload: match *preload {
+            "0" => false,
+            "1" => true,
+            _ => return None,
+        },
+        cut_point_frames: cut_point_frames.parse().ok()?,
+        audio_policy: match *audio_policy {
+            "muted" => StingerAudioPolicy::Muted,
+            "stinger_only" => StingerAudioPolicy::StingerOnly,
+            "mix_with_program" => StingerAudioPolicy::MixWithProgram,
+            _ => return None,
+        },
+        missing_media_fallback: match *fallback {
+            "cut" => StingerMissingMediaFallback::Cut,
+            "fade" => StingerMissingMediaFallback::Fade,
+            "keep_program" => StingerMissingMediaFallback::KeepProgram,
+            _ => return None,
+        },
+        readiness: match *readiness {
+            "not_requested" => StingerReadiness::NotRequested,
+            "ready" => StingerReadiness::Ready,
+            "missing" => StingerReadiness::Missing,
+            _ => return None,
+        },
+    })
+}
+
+fn invalid_stingers(value: &str) -> CodecError {
+    CodecError::InvalidField {
+        field: "?stingers",
+        value: value.to_owned(),
+    }
 }
 
 fn decode_event(fields: &mut Fields) -> Result<EventMessage, CodecError> {
@@ -429,6 +564,13 @@ fn decode_event(fields: &mut Fields) -> Result<EventMessage, CodecError> {
             preview: fields.input("preview")?,
             manual_transition: decode_manual_status(fields, ManualStatusFields::Unqualified)?,
             fade_to_black: decode_fade_to_black_state(fields, FadeToBlackStateFields::Unqualified)?,
+        },
+        "stinger_slots_changed" => EventPayload::StingerSlotsChanged {
+            program: fields.input("program")?,
+            preview: fields.input("preview")?,
+            manual_transition: decode_manual_status(fields, ManualStatusFields::Unqualified)?,
+            fade_to_black: decode_fade_to_black_state(fields, FadeToBlackStateFields::Unqualified)?,
+            stingers: decode_stingers(fields)?.ok_or(CodecError::MissingField("?stingers"))?,
         },
         _ => {
             return Err(CodecError::InvalidField {

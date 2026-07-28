@@ -109,6 +109,7 @@ fn snapshot(revision: u64) -> SnapshotMessage {
         realized_manual_transition: None,
         desired_fade_to_black: None,
         realized_fade_to_black: None,
+        stingers: Some(Vec::new()),
     }
 }
 

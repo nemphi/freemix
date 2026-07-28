@@ -17,7 +17,8 @@ use fm_protocol::{
     ALPHA_FADE_PROTOCOL_VERSION, CommandPayload, CommandResult, DurableGap,
     FADE_TO_BLACK_PROTOCOL_VERSION, MANUAL_ALPHA_FADE_PROTOCOL_VERSION,
     MANUAL_TRANSITION_PROTOCOL_VERSION, ProtocolVersion, SLIDE_PROTOCOL_VERSION,
-    WIPE_PROTOCOL_VERSION, WireInputId, WireMessage, ZOOM_PROTOCOL_VERSION,
+    STINGER_PROTOCOL_VERSION, WIPE_PROTOCOL_VERSION, WireInputId, WireMessage,
+    ZOOM_PROTOCOL_VERSION,
 };
 use fm_ui_egui::{StudioConnectionStatus, StudioIntent, StudioShell, StudioUiState};
 
@@ -1176,6 +1177,13 @@ const fn intent_payload(intent: StudioIntent) -> CommandPayload {
         }
         StudioIntent::Slide { duration_frames } => CommandPayload::Slide { duration_frames },
         StudioIntent::Zoom { duration_frames } => CommandPayload::Zoom { duration_frames },
+        StudioIntent::Stinger {
+            slot,
+            duration_frames,
+        } => CommandPayload::Stinger {
+            slot,
+            duration_frames,
+        },
         StudioIntent::Wipe { duration_frames } => CommandPayload::Wipe { duration_frames },
         StudioIntent::FadeToBlack {
             active,
@@ -1267,6 +1275,10 @@ fn runtime_state(runtime: &mut StudioRuntime, error: Option<String>) -> StudioUi
         session.protocol.major == ZOOM_PROTOCOL_VERSION.major
             && session.protocol.minor >= ZOOM_PROTOCOL_VERSION.minor
     });
+    let supports_stinger = client.session().is_some_and(|session| {
+        session.protocol.major == STINGER_PROTOCOL_VERSION.major
+            && session.protocol.minor >= STINGER_PROTOCOL_VERSION.minor
+    });
     let supports_manual_transition = client.session().is_some_and(|session| {
         session.protocol.major == MANUAL_TRANSITION_PROTOCOL_VERSION.major
             && session.protocol.minor >= MANUAL_TRANSITION_PROTOCOL_VERSION.minor
@@ -1285,6 +1297,7 @@ fn runtime_state(runtime: &mut StudioRuntime, error: Option<String>) -> StudioUi
         .with_alpha_fade_support(supports_alpha_fade)
         .with_slide_support(supports_slide)
         .with_zoom_support(supports_zoom)
+        .with_stinger_support(supports_stinger)
         .with_manual_transition_support(supports_manual_transition)
         .with_manual_alpha_fade_support(supports_manual_alpha_fade)
         .with_fade_to_black_support(supports_fade_to_black);
@@ -1343,6 +1356,7 @@ const fn intent_label(intent: StudioIntent) -> &'static str {
         StudioIntent::AlphaFade { .. } => "AlphaFade",
         StudioIntent::Slide { .. } => "Slide",
         StudioIntent::Zoom { .. } => "Zoom",
+        StudioIntent::Stinger { .. } => "Stinger",
         StudioIntent::Wipe { .. } => "Wipe",
         StudioIntent::FadeToBlack { active: true, .. } => "Fade to Black",
         StudioIntent::FadeToBlack { active: false, .. } => "Fade to Live",
@@ -1393,7 +1407,9 @@ mod tests {
         FadeToBlackPosition, FadeToBlackState, HandshakeOutcome, HandshakeResponse, LineDecoder,
         ManualTransitionKind, ManualTransitionPosition, ManualTransitionState,
         ManualTransitionStatus, ProtocolVersion, Role, RuntimeEventMessage, RuntimeLifecycleEvent,
-        ServerIdentity, SnapshotMessage, SnapshotReason, WireMessage, encode_line,
+        STINGER_STATUS_PROTOCOL_VERSION, ServerIdentity, SnapshotMessage, SnapshotReason,
+        StingerAudioPolicy, StingerMissingMediaFallback, StingerReadiness, StingerStatus,
+        WireMessage, WireStingerSlotId, encode_line,
     };
     use fm_types::{InputId, ProjectId};
 
@@ -1543,6 +1559,21 @@ mod tests {
         assert_eq!(
             intent_payload(StudioIntent::CancelManualTransition),
             CommandPayload::CancelManualTransition
+        );
+    }
+
+    #[test]
+    fn stinger_intent_preserves_typed_slot_and_duration() {
+        let slot = WireStingerSlotId::new(8).unwrap();
+        assert_eq!(
+            intent_payload(StudioIntent::Stinger {
+                slot,
+                duration_frames: u32::MAX,
+            }),
+            CommandPayload::Stinger {
+                slot,
+                duration_frames: u32::MAX,
+            }
         );
     }
 
@@ -1766,6 +1797,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn unsupported_head_stinger_blocks_fifo_until_protocol_1_10() {
+        let stinger = StudioIntent::Stinger {
+            slot: WireStingerSlotId::new(7).unwrap(),
+            duration_frames: 60,
+        };
+        let mut deferred = VecDeque::from([stinger, StudioIntent::Cut]);
+
+        assert_eq!(
+            pop_supported_deferred_intent(&mut deferred, Some(ZOOM_PROTOCOL_VERSION)),
+            None
+        );
+        assert_eq!(deferred, VecDeque::from([stinger, StudioIntent::Cut]));
+        assert_eq!(
+            pop_supported_deferred_intent(&mut deferred, Some(STINGER_PROTOCOL_VERSION)),
+            Some(stinger)
+        );
+        assert_eq!(
+            pop_supported_deferred_intent(&mut deferred, Some(STINGER_PROTOCOL_VERSION)),
+            Some(StudioIntent::Cut)
+        );
+    }
+
     struct FakePeer {
         stream: TcpStream,
         decoder: LineDecoder,
@@ -1860,6 +1914,24 @@ mod tests {
             })
     }
 
+    fn stinger_projection(negotiated: ProtocolVersion) -> Option<Vec<StingerStatus>> {
+        (negotiated.major == STINGER_STATUS_PROTOCOL_VERSION.major
+            && negotiated.minor >= STINGER_STATUS_PROTOCOL_VERSION.minor)
+            .then(|| {
+                (1..=8)
+                    .map(|slot| StingerStatus {
+                        slot: WireStingerSlotId::new(slot).unwrap(),
+                        media_input: wire_input(2),
+                        preload: true,
+                        cut_point_frames: 1,
+                        audio_policy: StingerAudioPolicy::Muted,
+                        missing_media_fallback: StingerMissingMediaFallback::Cut,
+                        readiness: StingerReadiness::Ready,
+                    })
+                    .collect()
+            })
+    }
+
     fn accept_worker_snapshot(listener: &TcpListener) -> FakePeer {
         accept_worker_snapshot_at(listener, 4, 2, 2)
     }
@@ -1921,6 +1993,7 @@ mod tests {
             realized_manual_transition: manual_projection(negotiated),
             desired_fade_to_black: fade_to_black_projection(negotiated),
             realized_fade_to_black: fade_to_black_projection(negotiated),
+            stingers: stinger_projection(negotiated),
         }));
         peer
     }
@@ -2001,6 +2074,7 @@ mod tests {
             realized_manual_transition: manual_projection(negotiated),
             desired_fade_to_black: fade_to_black_projection(negotiated),
             realized_fade_to_black: fade_to_black_projection(negotiated),
+            stingers: stinger_projection(negotiated),
         }));
         peer
     }
@@ -2778,6 +2852,59 @@ mod tests {
     }
 
     #[test]
+    fn worker_stinger_flow_preserves_slot_duration_and_runtime_order() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let slot = WireStingerSlotId::new(8).unwrap();
+        let server = thread::spawn(move || {
+            serve_worker_automatic_transition(
+                &listener,
+                fm_protocol::CURRENT_PROTOCOL_VERSION,
+                CommandPayload::Stinger {
+                    slot,
+                    duration_frames: 45,
+                },
+            );
+        });
+        let (requests, states, worker) = spawn_test_worker(address);
+        wait_until_ready(&states);
+        try_enqueue(
+            &requests,
+            WorkerRequest::Intent(StudioIntent::Stinger {
+                slot,
+                duration_frames: 45,
+            }),
+        )
+        .unwrap();
+
+        let mut pending_seen = false;
+        loop {
+            let state = states.recv_timeout(Duration::from_secs(3)).unwrap();
+            pending_seen |= state.pending_commands == 1;
+            if state.pending_commands == 0
+                && state.view.as_ref().is_some_and(|view| {
+                    view.cursor.revision.get() == 5
+                        && view.switcher.realized.program == wire_input(2).to_domain()
+                        && view.switcher.realized.preview == wire_input(1).to_domain()
+                })
+            {
+                assert!(state.transition_protocol.automatic.stinger());
+                assert!(state.view.as_ref().is_some_and(|view| {
+                    view.stingers.iter().any(|status| {
+                        status.slot == 8 && status.readiness == StingerReadiness::Ready
+                    })
+                }));
+                assert_eq!(state.error, None);
+                break;
+            }
+        }
+        assert!(pending_seen);
+        try_enqueue(&requests, WorkerRequest::Shutdown).unwrap();
+        worker.join().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
     fn worker_fade_to_black_flow_observes_black_and_live_realization() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -3122,6 +3249,48 @@ mod tests {
     }
 
     #[test]
+    fn runtime_state_hides_stinger_after_protocol_1_10_downgrade() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut first =
+                accept_worker_snapshot_version_at(&listener, STINGER_PROTOCOL_VERSION, 4, 2, 2);
+            assert_eq!(first.stream.read(&mut [0_u8; 1]).unwrap(), 0);
+            accept_worker_reconnect_snapshot_version(
+                &listener,
+                ZOOM_PROTOCOL_VERSION,
+                4,
+                (1, 2),
+                (1, 2),
+            );
+        });
+        let config = StudioConfig {
+            connection: ConnectionConfig::Existing(ExistingConfig {
+                address,
+                expected_project_id: test_project_id(),
+            }),
+            client_id: "stinger-support-change".to_owned(),
+            desired_role: Role::Operator,
+            restart_policy: RestartPolicy::default(),
+        };
+        let mut runtime = StudioRuntime::new(config).unwrap();
+        runtime.connect(CONNECT_TIMEOUT).unwrap();
+        let current = runtime_state(&mut runtime, None);
+        assert!(current.transition_protocol.automatic.stinger());
+        assert!(current.transition_protocol.automatic.zoom());
+        assert!(current.can_transition);
+        runtime.session_mut().disconnect().unwrap();
+        runtime
+            .reconnect(Duration::from_millis(250), CONNECT_TIMEOUT)
+            .unwrap();
+        let downgraded = runtime_state(&mut runtime, None);
+        assert!(!downgraded.transition_protocol.automatic.stinger());
+        assert!(downgraded.transition_protocol.automatic.zoom());
+        assert!(downgraded.can_transition, "Cut/Fade permission was lost");
+        server.join().unwrap();
+    }
+
+    #[test]
     fn runtime_state_hides_manual_alpha_fade_after_protocol_1_7_downgrade() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -3209,6 +3378,7 @@ mod tests {
                 realized_manual_transition: Some(ManualTransitionStatus::Inactive),
                 desired_fade_to_black: fade_to_black_projection(FADE_TO_BLACK_PROTOCOL_VERSION),
                 realized_fade_to_black: fade_to_black_projection(FADE_TO_BLACK_PROTOCOL_VERSION),
+                stingers: None,
             }));
         });
         let config = StudioConfig {

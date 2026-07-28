@@ -9,6 +9,7 @@ const V5_SCHEMA_VERSION: u32 = 5;
 const V6_SCHEMA_VERSION: u32 = 6;
 const V7_SCHEMA_VERSION: u32 = 7;
 const V8_SCHEMA_VERSION: u32 = 8;
+const V9_SCHEMA_VERSION: u32 = 9;
 const V3_DEFAULTS: [&str; 8] = [
     "settings.frame_rate=60000/1001",
     "settings.video=1920x1080/nv12/progressive/bt709",
@@ -31,6 +32,7 @@ const V6_DEFAULTS: [&str; 1] = ["scenes.layers.mask=null"];
 const V7_DEFAULTS: [&str; 1] =
     ["input_audio_strips=per-input gain_milli_db=0/muted=false/follow_video=true"];
 const V8_DEFAULTS: [&str; 1] = ["runtime.fade_to_black=live"];
+const V10_DEFAULTS: [&str; 1] = ["stingers=[]"];
 
 /// Summary of an explicitly completed manifest migration.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -78,6 +80,7 @@ impl ProjectStore {
                 .chain(V6_DEFAULTS)
                 .chain(V7_DEFAULTS)
                 .chain(V8_DEFAULTS)
+                .chain(V10_DEFAULTS)
                 .collect(),
         })
     }
@@ -101,6 +104,7 @@ impl ProjectStore {
                 .chain(V6_DEFAULTS)
                 .chain(V7_DEFAULTS)
                 .chain(V8_DEFAULTS)
+                .chain(V10_DEFAULTS)
                 .collect(),
         })
     }
@@ -123,6 +127,7 @@ impl ProjectStore {
                 .chain(V6_DEFAULTS)
                 .chain(V7_DEFAULTS)
                 .chain(V8_DEFAULTS)
+                .chain(V10_DEFAULTS)
                 .collect(),
         })
     }
@@ -147,6 +152,7 @@ impl ProjectStore {
                 .into_iter()
                 .chain(V7_DEFAULTS)
                 .chain(V8_DEFAULTS)
+                .chain(V10_DEFAULTS)
                 .collect(),
         })
     }
@@ -168,7 +174,11 @@ impl ProjectStore {
         Ok(MigrationReport {
             from_schema: V6_SCHEMA_VERSION,
             to_schema: CURRENT_SCHEMA_VERSION,
-            defaulted_fields: V7_DEFAULTS.into_iter().chain(V8_DEFAULTS).collect(),
+            defaulted_fields: V7_DEFAULTS
+                .into_iter()
+                .chain(V8_DEFAULTS)
+                .chain(V10_DEFAULTS)
+                .collect(),
         })
     }
 
@@ -188,7 +198,7 @@ impl ProjectStore {
         Ok(MigrationReport {
             from_schema: V7_SCHEMA_VERSION,
             to_schema: CURRENT_SCHEMA_VERSION,
-            defaulted_fields: V8_DEFAULTS.to_vec(),
+            defaulted_fields: V8_DEFAULTS.into_iter().chain(V10_DEFAULTS).collect(),
         })
     }
 
@@ -209,7 +219,27 @@ impl ProjectStore {
         Ok(MigrationReport {
             from_schema: V8_SCHEMA_VERSION,
             to_schema: CURRENT_SCHEMA_VERSION,
-            defaulted_fields: Vec::new(),
+            defaulted_fields: V10_DEFAULTS.to_vec(),
+        })
+    }
+
+    /// Explicitly migrates a schema-v9 manifest to the current schema.
+    ///
+    /// Existing project and runtime state are preserved exactly and the new
+    /// Stinger slot collection defaults to empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed data, the wrong schema, validation,
+    /// size-limit, or filesystem failures.
+    pub fn migrate_v9(&self) -> Result<MigrationReport, StoreError> {
+        let source = self.read_legacy_manifest()?;
+        let project = json::decode_v9(&source).map_err(StoreError::from_decode)?;
+        self.save(&project)?;
+        Ok(MigrationReport {
+            from_schema: V9_SCHEMA_VERSION,
+            to_schema: CURRENT_SCHEMA_VERSION,
+            defaulted_fields: V10_DEFAULTS.to_vec(),
         })
     }
 

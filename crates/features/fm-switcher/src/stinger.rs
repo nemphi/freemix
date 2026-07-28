@@ -1,3 +1,5 @@
+use fm_types::InputId;
+
 /// Number of independently configured stinger slots.
 pub const STINGER_SLOT_COUNT: usize = 8;
 
@@ -59,9 +61,9 @@ pub enum StingerPreloadState {
 }
 
 /// Configuration retained by a stinger slot independently of media readiness.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StingerDescriptor {
-    pub media: String,
+    pub media_input: InputId,
     pub preload: bool,
     pub cut_point_frames: u32,
     pub audio_policy: StingerAudioPolicy,
@@ -70,15 +72,15 @@ pub struct StingerDescriptor {
 
 impl StingerDescriptor {
     #[must_use]
-    pub fn new(
-        media: impl Into<String>,
+    pub const fn new(
+        media_input: InputId,
         preload: bool,
         cut_point_frames: u32,
         audio_policy: StingerAudioPolicy,
         missing_media_fallback: MissingMediaFallback,
     ) -> Self {
         Self {
-            media: media.into(),
+            media_input,
             preload,
             cut_point_frames,
             audio_policy,
@@ -118,6 +120,11 @@ impl StingerSlotState {
 
     pub(crate) const fn set_preload_state(&mut self, preload_state: StingerPreloadState) {
         self.preload_state = preload_state;
+    }
+
+    pub(crate) const fn clear(&mut self) {
+        self.descriptor = None;
+        self.preload_state = StingerPreloadState::NotRequested;
     }
 }
 

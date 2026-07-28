@@ -247,6 +247,32 @@ fn write_project_collections(output: &mut String, project: &fm_model::Project) {
         output.push_str("\n      }");
     }
     array_end(output, project.outputs().is_empty(), 4);
+    output.push_str(",\n    \"stingers\": [");
+    for (index, stinger) in project.stingers().iter().enumerate() {
+        item_prefix(output, index, 6);
+        let audio_policy = match stinger.audio_policy {
+            fm_model::StingerAudioPolicy::Muted => "muted",
+            fm_model::StingerAudioPolicy::StingerOnly => "stinger_only",
+            fm_model::StingerAudioPolicy::MixWithProgram => "mix_with_program",
+        };
+        let fallback = match stinger.missing_media_fallback {
+            fm_model::StingerMissingMediaFallback::Cut => "cut",
+            fm_model::StingerMissingMediaFallback::Fade => "fade",
+            fm_model::StingerMissingMediaFallback::KeepProgram => "keep_program",
+        };
+        write!(
+            output,
+            "{{\"slot\": {}, \"media_input\": {}, \"preload\": {}, \"cut_point_frames\": {}, \"audio_policy\": \"{}\", \"missing_media_fallback\": \"{}\"}}",
+            stinger.slot.number(),
+            stinger.media_input,
+            stinger.preload,
+            stinger.cut_point_frames,
+            audio_policy,
+            fallback,
+        )
+        .expect("writing to a string cannot fail");
+    }
+    array_end(output, project.stingers().is_empty(), 4);
     output.push(',');
 }
 

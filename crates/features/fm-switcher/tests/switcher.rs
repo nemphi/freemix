@@ -614,16 +614,19 @@ fn all_eight_stinger_slots_retain_independent_configuration() {
 
     for index in 0..STINGER_SLOT_COUNT {
         let slot = StingerSlotId::from_index(index).unwrap();
-        switcher.configure_stinger(
-            slot,
-            StingerDescriptor::new(
-                format!("stinger-{index}.mov"),
-                index % 2 == 0,
-                u32::try_from(index).unwrap() + 5,
-                StingerAudioPolicy::MixWithProgram,
-                MissingMediaFallback::Fade,
-            ),
-        );
+        let media_input = if index % 2 == 0 { input(1) } else { input(2) };
+        switcher
+            .configure_stinger(
+                slot,
+                StingerDescriptor::new(
+                    media_input,
+                    index % 2 == 0,
+                    u32::try_from(index).unwrap() + 5,
+                    StingerAudioPolicy::MixWithProgram,
+                    MissingMediaFallback::Fade,
+                ),
+            )
+            .unwrap();
     }
 
     for index in 0..STINGER_SLOT_COUNT {
@@ -631,7 +634,8 @@ fn all_eight_stinger_slots_retain_independent_configuration() {
             .stinger(StingerSlotId::from_index(index).unwrap())
             .descriptor()
             .unwrap();
-        assert_eq!(descriptor.media, format!("stinger-{index}.mov"));
+        let expected_input = if index % 2 == 0 { input(1) } else { input(2) };
+        assert_eq!(descriptor.media_input, expected_input);
         assert_eq!(
             descriptor.cut_point_frames,
             u32::try_from(index).unwrap() + 5
@@ -643,22 +647,24 @@ fn all_eight_stinger_slots_retain_independent_configuration() {
 fn stinger_preload_and_missing_media_fallback_are_deterministic() {
     let mut switcher = state();
     let slot = StingerSlotId::new(8).unwrap();
-    switcher.configure_stinger(
-        slot,
-        StingerDescriptor::new(
-            "missing.mov",
-            true,
-            12,
-            StingerAudioPolicy::StingerOnly,
-            MissingMediaFallback::KeepProgram,
-        ),
-    );
+    switcher
+        .configure_stinger(
+            slot,
+            StingerDescriptor::new(
+                input(1),
+                true,
+                12,
+                StingerAudioPolicy::StingerOnly,
+                MissingMediaFallback::KeepProgram,
+            ),
+        )
+        .unwrap();
     assert_eq!(
         switcher.stinger(slot).preload_state(),
         StingerPreloadState::NotRequested
     );
     assert_eq!(
-        switcher.preload_stinger(slot, false),
+        switcher.preload_stinger(slot, false).unwrap(),
         SwitcherEvent::StingerPreloadChanged {
             slot,
             state: StingerPreloadState::Missing,
@@ -682,7 +688,7 @@ fn stinger_preload_and_missing_media_fallback_are_deterministic() {
     );
     assert_eq!(switcher.program(), input(1));
 
-    switcher.preload_stinger(slot, true);
+    switcher.preload_stinger(slot, true).unwrap();
     assert_eq!(
         switcher.stinger_playback_decision(slot),
         StingerPlaybackDecision::Play
@@ -700,6 +706,55 @@ fn stinger_preload_and_missing_media_fallback_are_deterministic() {
             ..
         }] if *event_slot == slot
     ));
+}
+
+#[test]
+fn stinger_configuration_and_playback_validate_media_and_timing() {
+    let mut switcher = state();
+    let slot = StingerSlotId::new(1).unwrap();
+    let descriptor = |media_input, cut_point_frames| {
+        StingerDescriptor::new(
+            media_input,
+            true,
+            cut_point_frames,
+            StingerAudioPolicy::Muted,
+            MissingMediaFallback::Cut,
+        )
+    };
+
+    assert_eq!(
+        switcher.configure_stinger(slot, descriptor(input(99), 1)),
+        Err(SwitcherError::UnknownInput(input(99)))
+    );
+    assert!(switcher.stinger(slot).descriptor().is_none());
+    assert_eq!(
+        switcher.preload_stinger(slot, true),
+        Err(SwitcherError::UnconfiguredStinger(slot))
+    );
+    assert_eq!(
+        switcher.apply(SwitcherCommand::Transition {
+            kind: TransitionKind::Stinger(slot),
+            duration_frames: 2,
+        }),
+        Err(SwitcherError::UnconfiguredStinger(slot))
+    );
+
+    switcher
+        .configure_stinger(slot, descriptor(input(3), 3))
+        .unwrap();
+    switcher.preload_stinger(slot, true).unwrap();
+    assert_eq!(
+        switcher.apply(SwitcherCommand::Transition {
+            kind: TransitionKind::Stinger(slot),
+            duration_frames: 2,
+        }),
+        Err(SwitcherError::StingerCutPointOutOfRange {
+            slot,
+            cut_point_frames: 3,
+            duration_frames: 2,
+        })
+    );
+    assert!(switcher.transition().is_none());
 }
 
 #[test]

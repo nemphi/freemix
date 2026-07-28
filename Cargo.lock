@@ -880,6 +880,7 @@ dependencies = [
  "fm-command",
  "fm-engine",
  "fm-protocol",
+ "fm-switcher",
  "fm-types",
 ]
 

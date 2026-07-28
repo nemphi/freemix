@@ -9,7 +9,8 @@ use fm_model::{
     AudioBus, BusSend, CropRect, Input, InputAudioStripState, InputGainMilliDb, InputKind, Layer,
     LayerGeometry, MainMix, Output, Project, ProjectSettings, RectMask, RestartPolicy, Rgba8,
     Rotation, Scene, SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef,
-    StartupPolicy,
+    StartupPolicy, StingerAudioPolicy, StingerConfig, StingerMissingMediaFallback,
+    StingerSlotNumber,
 };
 use fm_persistence::{ProjectPosition, ProjectStore, RuntimeRouting, StoreError, StoredProject};
 use fm_types::{
@@ -171,6 +172,22 @@ fn rich_project() -> Project {
     for input in rich_inputs(high) {
         project.add_input(input);
     }
+    project.add_stinger(StingerConfig::new(
+        StingerSlotNumber::new(1).unwrap(),
+        input_id(high + 1),
+        true,
+        17,
+        StingerAudioPolicy::StingerOnly,
+        StingerMissingMediaFallback::Fade,
+    ));
+    project.add_stinger(StingerConfig::new(
+        StingerSlotNumber::new(8).unwrap(),
+        input_id(high + 5),
+        false,
+        0,
+        StingerAudioPolicy::MixWithProgram,
+        StingerMissingMediaFallback::KeepProgram,
+    ));
 
     project.add_scene(Scene {
         id: scene_id(high + 10),
@@ -323,8 +340,15 @@ fn schema_v6_defaults_audio_strips_for_every_input_kind_without_losing_masks() {
     let current = fs::read_to_string(store.manifest_path()).unwrap();
     let strips_start = current.find(",\n    \"input_audio_strips\": [").unwrap();
     let scenes_start = current.find(",\n    \"scenes\": [").unwrap();
-    let legacy = format!("{}{}", &current[..strips_start], &current[scenes_start..])
-        .replacen("\"schema_version\": 9", "\"schema_version\": 6", 1)
+    let without_strips = format!("{}{}", &current[..strips_start], &current[scenes_start..]);
+    let stingers_start = without_strips.find(",\n    \"stingers\": [").unwrap();
+    let main_mix_start = without_strips.find(",\n    \"main_mix\": ").unwrap();
+    let legacy = format!(
+        "{}{}",
+        &without_strips[..stingers_start],
+        &without_strips[main_mix_start..]
+    )
+        .replacen("\"schema_version\": 10", "\"schema_version\": 6", 1)
         .replacen(
             "    \"fade_to_black\": {\n      \"desired\": {\"target_active\": false, \"position_numerator\": 0},\n      \"realized\": {\"target_active\": false, \"position_numerator\": 0}\n    },\n",
             "",
@@ -558,7 +582,7 @@ fn golden_v2_manifest_migrates_with_cli_defaults_and_main_mix() {
     let report = store.migrate_v2().unwrap();
     let migrated = store.load().unwrap();
 
-    assert_eq!((report.from_schema(), report.to_schema()), (2, 9));
+    assert_eq!((report.from_schema(), report.to_schema()), (2, 10));
     assert_eq!(
         migrated.project().settings().frame_rate,
         FrameRate::new(60_000, 1_001).unwrap()
@@ -604,7 +628,7 @@ fn frozen_v3_manifest_migrates_with_composition_defaults_only() {
     second.migrate_v3().unwrap();
     let migrated = store.load().unwrap();
 
-    assert_eq!((report.from_schema(), report.to_schema()), (3, 9));
+    assert_eq!((report.from_schema(), report.to_schema()), (3, 10));
     assert_eq!(
         report.defaulted_fields(),
         [
@@ -617,6 +641,7 @@ fn frozen_v3_manifest_migrates_with_composition_defaults_only() {
             "scenes.layers.mask=null",
             "input_audio_strips=per-input gain_milli_db=0/muted=false/follow_video=true",
             "runtime.fade_to_black=live",
+            "stingers=[]",
         ]
     );
     let scene = &migrated.project().scenes()[0];

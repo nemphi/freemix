@@ -2,10 +2,11 @@ use fm_types::{AudioFormat, BusId, FrameRate, InputId, OutputId, ProjectId, Scen
 
 use crate::{ValidationError, validation::validate_project};
 
-pub const CURRENT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(9);
+pub const CURRENT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(10);
 pub const OLDEST_SUPPORTED_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(2);
-pub const SUPPORTED_SCHEMA_VERSIONS: [SchemaVersion; 8] = [
+pub const SUPPORTED_SCHEMA_VERSIONS: [SchemaVersion; 9] = [
     CURRENT_SCHEMA_VERSION,
+    SchemaVersion::new(9),
     SchemaVersion::new(8),
     SchemaVersion::new(7),
     SchemaVersion::new(6),
@@ -88,6 +89,7 @@ pub struct Project {
     audio_buses: Vec<AudioBus>,
     outputs: Vec<Output>,
     main_mix: Option<MainMix>,
+    stingers: Vec<StingerConfig>,
     restart_policy: RestartPolicy,
 }
 
@@ -105,6 +107,7 @@ impl Project {
             audio_buses: Vec::new(),
             outputs: Vec::new(),
             main_mix: None,
+            stingers: Vec::new(),
             restart_policy: RestartPolicy::default(),
         }
     }
@@ -168,6 +171,11 @@ impl Project {
     }
 
     #[must_use]
+    pub fn stingers(&self) -> &[StingerConfig] {
+        &self.stingers
+    }
+
+    #[must_use]
     pub const fn restart_policy(&self) -> RestartPolicy {
         self.restart_policy
     }
@@ -209,6 +217,32 @@ impl Project {
 
     pub fn set_main_mix(&mut self, main_mix: MainMix) {
         self.main_mix = Some(main_mix);
+    }
+
+    pub fn add_stinger(&mut self, stinger: StingerConfig) {
+        self.stingers.push(stinger);
+    }
+
+    /// Inserts or replaces one Stinger slot while preserving slot order.
+    pub fn set_stinger(&mut self, stinger: StingerConfig) {
+        if let Some(configured) = self
+            .stingers
+            .iter_mut()
+            .find(|configured| configured.slot == stinger.slot)
+        {
+            *configured = stinger;
+        } else {
+            self.stingers.push(stinger);
+        }
+    }
+
+    /// Removes one configured Stinger slot.
+    pub fn remove_stinger(&mut self, slot: StingerSlotNumber) -> Option<StingerConfig> {
+        let index = self
+            .stingers
+            .iter()
+            .position(|configured| configured.slot == slot)?;
+        Some(self.stingers.remove(index))
     }
 
     #[must_use]
@@ -417,6 +451,74 @@ impl SimulatedAudio {
 pub struct MainMix {
     pub desired_program: InputId,
     pub desired_preview: InputId,
+}
+
+/// One-based operator-facing Stinger slot number.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct StingerSlotNumber(u8);
+
+impl StingerSlotNumber {
+    pub const COUNT: usize = 8;
+
+    #[must_use]
+    pub const fn new(number: u8) -> Option<Self> {
+        if number >= 1 && number <= 8 {
+            Some(Self(number))
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub const fn number(self) -> u8 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StingerAudioPolicy {
+    Muted,
+    StingerOnly,
+    MixWithProgram,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StingerMissingMediaFallback {
+    Cut,
+    Fade,
+    KeepProgram,
+}
+
+/// Durable configuration for one of the eight Stinger slots.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StingerConfig {
+    pub slot: StingerSlotNumber,
+    pub media_input: InputId,
+    pub preload: bool,
+    pub cut_point_frames: u32,
+    pub audio_policy: StingerAudioPolicy,
+    pub missing_media_fallback: StingerMissingMediaFallback,
+}
+
+impl StingerConfig {
+    #[must_use]
+    pub const fn new(
+        slot: StingerSlotNumber,
+        media_input: InputId,
+        preload: bool,
+        cut_point_frames: u32,
+        audio_policy: StingerAudioPolicy,
+        missing_media_fallback: StingerMissingMediaFallback,
+    ) -> Self {
+        Self {
+            slot,
+            media_input,
+            preload,
+            cut_point_frames,
+            audio_policy,
+            missing_media_fallback,
+        }
+    }
 }
 
 impl MainMix {

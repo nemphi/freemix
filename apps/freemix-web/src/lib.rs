@@ -4,11 +4,12 @@ use std::fmt;
 use std::net::Ipv6Addr;
 
 use fm_client::ClientConfig;
-use fm_protocol::{ClientType, ProtocolVersion, Role, ZOOM_PROTOCOL_VERSION};
+use fm_protocol::{CURRENT_PROTOCOL_VERSION, ClientType, ProtocolVersion, Role};
 use fm_types::ProjectId;
 
 mod fade_to_black;
 mod manual_transition;
+mod stinger;
 mod transition;
 
 pub use fade_to_black::{
@@ -18,10 +19,11 @@ pub use manual_transition::{
     ManualTransitionControl, ManualTransitionModel, ManualTransitionMotion,
     ManualTransitionPresentation, ManualTransitionProjection,
 };
+pub use stinger::{StingerControl, StingerControls};
 pub use transition::{TransitionControl, TransitionControlState, TransitionControls};
 
 /// Protocol versions implemented by this control surface.
-pub const SUPPORTED_PROTOCOL_VERSIONS: [ProtocolVersion; 1] = [ZOOM_PROTOCOL_VERSION];
+pub const SUPPORTED_PROTOCOL_VERSIONS: [ProtocolVersion; 1] = [CURRENT_PROTOCOL_VERSION];
 
 /// A semantic panel that can appear in a role-scoped route.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -484,6 +486,6 @@ mod tests {
         assert_eq!(config.client.client_id, "web-console-1");
         assert_eq!(config.client.project_id, project_id());
         assert_eq!(config.client.build, "freemix-web 0.1.0");
-        assert_eq!(config.client.supported_versions, [ZOOM_PROTOCOL_VERSION]);
+        assert_eq!(config.client.supported_versions, [CURRENT_PROTOCOL_VERSION]);
     }
 }

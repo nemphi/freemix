@@ -11,6 +11,7 @@ fm-clock = { path = "../../media/fm-clock" }
 fm-command = { path = "../../foundation/fm-command" }
 fm-engine = { path = "../fm-engine" }
 fm-protocol = { path = "../../foundation/fm-protocol" }
+fm-switcher = { path = "../../features/fm-switcher" }
 
 [dev-dependencies]
 fm-types = { path = "../../foundation/fm-types" }

@@ -6,7 +6,9 @@
 use egui::{
     Button, Color32, DragValue, Frame, Grid, Margin, RichText, ScrollArea, Stroke, Ui, Vec2,
 };
-use fm_protocol::{ManualTransitionKind, ManualTransitionPosition};
+use fm_protocol::{
+    ManualTransitionKind, ManualTransitionPosition, StingerReadiness, WireStingerSlotId,
+};
 use fm_types::InputId;
 use fm_ui_model::{ClientView, ManualTransitionStatus, SwitcherState};
 
@@ -41,6 +43,11 @@ pub enum StudioIntent {
     Slide { duration_frames: u32 },
     /// Performs a centered Zoom transition with a duration in frames.
     Zoom { duration_frames: u32 },
+    /// Fires one of eight configured Stinger slots.
+    Stinger {
+        slot: WireStingerSlotId,
+        duration_frames: u32,
+    },
     /// Performs a Wipe transition with a duration in frames.
     Wipe { duration_frames: u32 },
     /// Fades realized Program video and audio to black or back to live.
@@ -179,6 +186,13 @@ impl StudioUiState {
         self
     }
 
+    /// Publishes whether the negotiated protocol can carry Stinger commands.
+    #[must_use]
+    pub const fn with_stinger_support(mut self, supported: bool) -> Self {
+        self.transition_protocol.automatic.additive.stinger = supported;
+        self
+    }
+
     /// Publishes whether the negotiated protocol carries manual T-bar state and commands.
     #[must_use]
     pub const fn with_manual_transition_support(mut self, supported: bool) -> Self {
@@ -243,6 +257,7 @@ pub struct AutomaticTransitionProtocolSupport {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct AdditiveAutomaticTransitionProtocolSupport {
     zoom: bool,
+    stinger: bool,
 }
 
 impl AutomaticTransitionProtocolSupport {
@@ -258,10 +273,19 @@ impl AutomaticTransitionProtocolSupport {
     pub const fn zoom(self) -> bool {
         self.additive.zoom
     }
+
+    /// Returns whether the negotiated protocol can carry Stinger commands.
+    #[must_use]
+    pub const fn stinger(self) -> bool {
+        self.additive.stinger
+    }
 }
 
 impl AdditiveAutomaticTransitionProtocolSupport {
-    const NONE: Self = Self { zoom: false };
+    const NONE: Self = Self {
+        zoom: false,
+        stinger: false,
+    };
 }
 
 /// Pure transition-control availability derived from one UI state.
@@ -276,7 +300,13 @@ pub struct TransitionAvailability {
 struct TransitionBaseAvailability {
     basic: bool,
     slide: bool,
+    additive: AdditiveTransitionAvailability,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AdditiveTransitionAvailability {
     zoom: bool,
+    stinger: bool,
 }
 
 impl TransitionAvailability {
@@ -295,7 +325,13 @@ impl TransitionAvailability {
     /// Returns whether automatic Zoom is available.
     #[must_use]
     pub const fn zoom(self) -> bool {
-        self.base.zoom
+        self.base.additive.zoom
+    }
+
+    /// Returns whether numbered Stinger controls are available.
+    #[must_use]
+    pub const fn stinger(self) -> bool {
+        self.base.additive.stinger
     }
 }
 
@@ -357,7 +393,10 @@ pub const fn transition_availability(gate: TransitionGate) -> TransitionAvailabi
         base: TransitionBaseAvailability {
             basic: base,
             slide: base && gate.protocol_support.slide,
-            zoom: base && gate.protocol_support.zoom(),
+            additive: AdditiveTransitionAvailability {
+                zoom: base && gate.protocol_support.zoom(),
+                stinger: base && gate.protocol_support.stinger(),
+            },
         },
         alpha_fade: base && gate.protocol_support.alpha_fade,
         wipe: base && gate.protocol_support.wipe,
@@ -897,6 +936,25 @@ fn draw_transition_row(
                         duration_frames: shell.transition_duration_frames,
                     });
                 }
+                for slot in 1..=8 {
+                    let ready = state.view.as_ref().is_some_and(|view| {
+                        view.stingers.iter().any(|status| {
+                            status.slot == slot && status.readiness == StingerReadiness::Ready
+                        })
+                    });
+                    if transition_button(
+                        ui,
+                        availability.stinger() && ready,
+                        &format!("S{slot}"),
+                        &format!("Fire Stinger slot {slot}"),
+                    ) {
+                        intents.push(StudioIntent::Stinger {
+                            slot: WireStingerSlotId::new(slot)
+                                .expect("Studio renders only Stinger slots 1 through 8"),
+                            duration_frames: shell.transition_duration_frames,
+                        });
+                    }
+                }
                 if transition_button(ui, availability.basic(), "CUT", "Cut Preview to Program") {
                     intents.push(StudioIntent::Cut);
                 }
@@ -1204,7 +1262,10 @@ mod tests {
                 base: TransitionBaseAvailability {
                     basic: true,
                     slide: false,
-                    zoom: false,
+                    additive: AdditiveTransitionAvailability {
+                        zoom: false,
+                        stinger: false,
+                    },
                 },
                 alpha_fade: false,
                 wipe: false,
@@ -1214,7 +1275,10 @@ mod tests {
             wipe: true,
             alpha_fade: true,
             slide: true,
-            additive: AdditiveAutomaticTransitionProtocolSupport { zoom: true },
+            additive: AdditiveAutomaticTransitionProtocolSupport {
+                zoom: true,
+                stinger: true,
+            },
         };
         let supported = transition_availability(TransitionGate {
             protocol_support: all_protocols,
@@ -1224,6 +1288,7 @@ mod tests {
         assert!(supported.alpha_fade);
         assert!(supported.slide());
         assert!(supported.zoom());
+        assert!(supported.stinger());
         assert!(supported.basic());
         for gate in [
             TransitionGate {
@@ -1248,7 +1313,10 @@ mod tests {
                     base: TransitionBaseAvailability {
                         basic: false,
                         slide: false,
-                        zoom: false,
+                        additive: AdditiveTransitionAvailability {
+                            zoom: false,
+                            stinger: false,
+                        },
                     },
                     alpha_fade: false,
                     wipe: false,
@@ -1394,6 +1462,16 @@ mod tests {
         );
         assert_ne!(
             StudioIntent::Zoom {
+                duration_frames: 30
+            },
+            StudioIntent::Stinger {
+                slot: WireStingerSlotId::new(1).unwrap(),
+                duration_frames: 30
+            }
+        );
+        assert_ne!(
+            StudioIntent::Stinger {
+                slot: WireStingerSlotId::new(1).unwrap(),
                 duration_frames: 30
             },
             StudioIntent::Wipe {

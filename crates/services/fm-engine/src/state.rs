@@ -1,7 +1,7 @@
 use core::fmt;
 use std::collections::HashSet;
 
-use fm_switcher::{SwitcherState, TBarState};
+use fm_switcher::{StingerDescriptor, StingerSlotId, SwitcherEvent, SwitcherState, TBarState};
 use fm_types::InputId;
 
 use crate::ShowError;
@@ -76,6 +76,42 @@ impl ShowState {
     /// Restores a settled desired Fade-to-Black endpoint from a checkpoint.
     pub fn restore_fade_to_black(&mut self, active: bool) {
         let _ = self.desired_switcher.set_fade_to_black(active);
+    }
+
+    /// Configures one durable Stinger slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShowError::Switcher`] when the descriptor references an input
+    /// outside this show.
+    pub fn configure_stinger(
+        &mut self,
+        slot: StingerSlotId,
+        descriptor: StingerDescriptor,
+    ) -> Result<(), ShowError> {
+        self.desired_switcher
+            .configure_stinger(slot, descriptor)
+            .map_err(ShowError::Switcher)
+    }
+
+    /// Removes one durable Stinger slot and its readiness state.
+    pub fn remove_stinger(&mut self, slot: StingerSlotId) {
+        self.desired_switcher.remove_stinger(slot);
+    }
+
+    /// Records whether one configured Stinger media input is ready.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShowError::Switcher`] when the slot is unconfigured.
+    pub fn preload_stinger(
+        &mut self,
+        slot: StingerSlotId,
+        media_available: bool,
+    ) -> Result<SwitcherEvent, ShowError> {
+        self.desired_switcher
+            .preload_stinger(slot, media_available)
+            .map_err(ShowError::Switcher)
     }
 
     pub(crate) const fn desired_switcher_mut(&mut self) -> &mut SwitcherState {

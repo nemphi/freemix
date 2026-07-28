@@ -5,7 +5,7 @@ mod reader;
 use crate::ProjectValidationError;
 
 pub(crate) use decoder::{
-    decode, decode_v2, decode_v3, decode_v4, decode_v5, decode_v6, decode_v7, decode_v8,
+    decode, decode_v2, decode_v3, decode_v4, decode_v5, decode_v6, decode_v7, decode_v8, decode_v9,
 };
 pub(crate) use encoder::encode;
 

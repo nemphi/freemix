@@ -8,6 +8,7 @@ pub use project::{
     MigrationInput, OLDEST_SUPPORTED_SCHEMA_VERSION, Output, OutputFormat, Project,
     ProjectSettings, RectMask, RestartPolicy, Rgba8, Rotation, SUPPORTED_SCHEMA_VERSIONS, Scene,
     SchemaVersion, SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef,
-    StartupPolicy,
+    StartupPolicy, StingerAudioPolicy, StingerConfig, StingerMissingMediaFallback,
+    StingerSlotNumber,
 };
 pub use validation::{EntityRef, ValidationError, ValidationErrorKind};
