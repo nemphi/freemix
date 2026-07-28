@@ -742,11 +742,17 @@ Web now advertises protocol 1.9 and exposes an accessible semantic Zoom action
 with the shared bounded duration only when Ready, authorized, and negotiated at
 1.9. Downgrade and reconnect tests hide Zoom without disabling Slide or older
 transition controls. It remains a transport-free model with no browser network
-runtime.
+runtime. Studio now also advertises protocol 1.9 and presents a Zoom action
+alongside the existing automatic transitions using the shared bounded duration.
+Its availability requires Ready state, a replicated view, transition
+permission, and negotiated 1.9 support. The worker maps the typed intent to the
+exact command, preserves a blocked Zoom at the head of its reconnect FIFO
+through a 1.8 downgrade, and a loopback worker test observes the duration,
+envelope, durable event, and runtime realization ordering.
 
-Zoom Studio controls, configured-output evidence, Stinger, other transition
-families, cross-platform/fullscreen evidence, and complete `SW-004` acceptance
-remain pending; parity therefore stays planned. Item 5 and RC-007 remain planned.
+Zoom configured-output evidence, Stinger, other transition families,
+cross-platform/fullscreen evidence, and complete `SW-004` acceptance remain
+pending; parity therefore stays planned. Item 5 and RC-007 remain planned.
 
 FTB groundwork now includes a switcher-owned bounded automatic control core
 alongside the compositor plan. The controller moves from its current exact

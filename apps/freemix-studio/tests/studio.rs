@@ -19,8 +19,8 @@ use fm_protocol::{
     CapabilityReportSummary, CommandPayload, CommandResult, EngineIdentity, EventCursor,
     EventMessage, EventPayload, FADE_TO_BLACK_PROTOCOL_VERSION, FadeToBlackPosition,
     FadeToBlackState, HandshakeOutcome, HandshakeResponse, LineDecoder, ManualTransitionStatus,
-    ProtocolVersion, Role, RuntimeEventMessage, RuntimeLifecycleEvent, SLIDE_PROTOCOL_VERSION,
-    ServerIdentity, SnapshotMessage, SnapshotReason, WireInputId, WireMessage, encode_line,
+    ProtocolVersion, Role, RuntimeEventMessage, RuntimeLifecycleEvent, ServerIdentity,
+    SnapshotMessage, SnapshotReason, WireInputId, WireMessage, ZOOM_PROTOCOL_VERSION, encode_line,
 };
 use fm_types::ProjectId;
 use freemix_studio::{
@@ -191,7 +191,7 @@ fn serve_snapshot_then_resume(listener: &TcpListener) {
     let WireMessage::HandshakeRequest(request) = first.receive() else {
         panic!("expected modern handshake request");
     };
-    assert_eq!(request.versions, vec![SLIDE_PROTOCOL_VERSION]);
+    assert_eq!(request.versions, vec![ZOOM_PROTOCOL_VERSION]);
     assert_eq!(request.resume_cursor, None);
     first.send(&WireMessage::HandshakeResponse(handshake(
         project_id(),
@@ -346,7 +346,7 @@ fn existing_runtime_negotiates_fade_to_black_protocol_with_a_1_5_peer() {
         let WireMessage::HandshakeRequest(request) = peer.receive() else {
             panic!("expected modern handshake request");
         };
-        assert_eq!(request.versions, vec![SLIDE_PROTOCOL_VERSION]);
+        assert_eq!(request.versions, vec![ZOOM_PROTOCOL_VERSION]);
         peer.send(&WireMessage::HandshakeResponse(handshake_version(
             FADE_TO_BLACK_PROTOCOL_VERSION,
             project_id(),

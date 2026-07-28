@@ -17,7 +17,7 @@ use fm_protocol::{
     ALPHA_FADE_PROTOCOL_VERSION, CommandPayload, CommandResult, DurableGap,
     FADE_TO_BLACK_PROTOCOL_VERSION, MANUAL_ALPHA_FADE_PROTOCOL_VERSION,
     MANUAL_TRANSITION_PROTOCOL_VERSION, ProtocolVersion, SLIDE_PROTOCOL_VERSION,
-    WIPE_PROTOCOL_VERSION, WireInputId, WireMessage,
+    WIPE_PROTOCOL_VERSION, WireInputId, WireMessage, ZOOM_PROTOCOL_VERSION,
 };
 use fm_ui_egui::{StudioConnectionStatus, StudioIntent, StudioShell, StudioUiState};
 
@@ -1175,6 +1175,7 @@ const fn intent_payload(intent: StudioIntent) -> CommandPayload {
             CommandPayload::AlphaFade { duration_frames }
         }
         StudioIntent::Slide { duration_frames } => CommandPayload::Slide { duration_frames },
+        StudioIntent::Zoom { duration_frames } => CommandPayload::Zoom { duration_frames },
         StudioIntent::Wipe { duration_frames } => CommandPayload::Wipe { duration_frames },
         StudioIntent::FadeToBlack {
             active,
@@ -1262,6 +1263,10 @@ fn runtime_state(runtime: &mut StudioRuntime, error: Option<String>) -> StudioUi
         session.protocol.major == SLIDE_PROTOCOL_VERSION.major
             && session.protocol.minor >= SLIDE_PROTOCOL_VERSION.minor
     });
+    let supports_zoom = client.session().is_some_and(|session| {
+        session.protocol.major == ZOOM_PROTOCOL_VERSION.major
+            && session.protocol.minor >= ZOOM_PROTOCOL_VERSION.minor
+    });
     let supports_manual_transition = client.session().is_some_and(|session| {
         session.protocol.major == MANUAL_TRANSITION_PROTOCOL_VERSION.major
             && session.protocol.minor >= MANUAL_TRANSITION_PROTOCOL_VERSION.minor
@@ -1279,6 +1284,7 @@ fn runtime_state(runtime: &mut StudioRuntime, error: Option<String>) -> StudioUi
         .with_wipe_support(supports_wipe)
         .with_alpha_fade_support(supports_alpha_fade)
         .with_slide_support(supports_slide)
+        .with_zoom_support(supports_zoom)
         .with_manual_transition_support(supports_manual_transition)
         .with_manual_alpha_fade_support(supports_manual_alpha_fade)
         .with_fade_to_black_support(supports_fade_to_black);
@@ -1336,6 +1342,7 @@ const fn intent_label(intent: StudioIntent) -> &'static str {
         StudioIntent::Fade { .. } => "Fade",
         StudioIntent::AlphaFade { .. } => "AlphaFade",
         StudioIntent::Slide { .. } => "Slide",
+        StudioIntent::Zoom { .. } => "Zoom",
         StudioIntent::Wipe { .. } => "Wipe",
         StudioIntent::FadeToBlack { active: true, .. } => "Fade to Black",
         StudioIntent::FadeToBlack { active: false, .. } => "Fade to Live",
@@ -1474,6 +1481,14 @@ mod tests {
                 duration_frames: u32::MAX,
             }),
             CommandPayload::Slide {
+                duration_frames: u32::MAX,
+            }
+        );
+        assert_eq!(
+            intent_payload(StudioIntent::Zoom {
+                duration_frames: u32::MAX,
+            }),
+            CommandPayload::Zoom {
                 duration_frames: u32::MAX,
             }
         );
@@ -1725,6 +1740,28 @@ mod tests {
         );
         assert_eq!(
             pop_supported_deferred_intent(&mut deferred, Some(SLIDE_PROTOCOL_VERSION)),
+            Some(StudioIntent::Cut)
+        );
+    }
+
+    #[test]
+    fn unsupported_head_zoom_blocks_fifo_until_protocol_1_9() {
+        let zoom = StudioIntent::Zoom {
+            duration_frames: 60,
+        };
+        let mut deferred = VecDeque::from([zoom, StudioIntent::Cut]);
+
+        assert_eq!(
+            pop_supported_deferred_intent(&mut deferred, Some(SLIDE_PROTOCOL_VERSION)),
+            None
+        );
+        assert_eq!(deferred, VecDeque::from([zoom, StudioIntent::Cut]));
+        assert_eq!(
+            pop_supported_deferred_intent(&mut deferred, Some(ZOOM_PROTOCOL_VERSION)),
+            Some(zoom)
+        );
+        assert_eq!(
+            pop_supported_deferred_intent(&mut deferred, Some(ZOOM_PROTOCOL_VERSION)),
             Some(StudioIntent::Cut)
         );
     }
@@ -2696,6 +2733,51 @@ mod tests {
     }
 
     #[test]
+    fn worker_zoom_flow_preserves_protocol_duration_and_runtime_order() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            serve_worker_automatic_transition(
+                &listener,
+                ZOOM_PROTOCOL_VERSION,
+                CommandPayload::Zoom {
+                    duration_frames: 45,
+                },
+            );
+        });
+        let (requests, states, worker) = spawn_test_worker(address);
+        wait_until_ready(&states);
+        try_enqueue(
+            &requests,
+            WorkerRequest::Intent(StudioIntent::Zoom {
+                duration_frames: 45,
+            }),
+        )
+        .unwrap();
+
+        let mut pending_seen = false;
+        loop {
+            let state = states.recv_timeout(Duration::from_secs(3)).unwrap();
+            pending_seen |= state.pending_commands == 1;
+            if state.pending_commands == 0
+                && state.view.as_ref().is_some_and(|view| {
+                    view.cursor.revision.get() == 5
+                        && view.switcher.realized.program == wire_input(2).to_domain()
+                        && view.switcher.realized.preview == wire_input(1).to_domain()
+                })
+            {
+                assert!(state.transition_protocol.automatic.zoom());
+                assert_eq!(state.error, None);
+                break;
+            }
+        }
+        assert!(pending_seen);
+        try_enqueue(&requests, WorkerRequest::Shutdown).unwrap();
+        worker.join().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
     fn worker_fade_to_black_flow_observes_black_and_live_realization() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -2993,6 +3075,48 @@ mod tests {
         let downgraded = runtime_state(&mut runtime, None);
         assert!(!downgraded.transition_protocol.automatic.slide);
         assert!(downgraded.transition_protocol.automatic.alpha_fade);
+        assert!(downgraded.can_transition, "Cut/Fade permission was lost");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn runtime_state_hides_zoom_after_protocol_1_9_downgrade() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut first =
+                accept_worker_snapshot_version_at(&listener, ZOOM_PROTOCOL_VERSION, 4, 2, 2);
+            assert_eq!(first.stream.read(&mut [0_u8; 1]).unwrap(), 0);
+            accept_worker_reconnect_snapshot_version(
+                &listener,
+                SLIDE_PROTOCOL_VERSION,
+                4,
+                (1, 2),
+                (1, 2),
+            );
+        });
+        let config = StudioConfig {
+            connection: ConnectionConfig::Existing(ExistingConfig {
+                address,
+                expected_project_id: test_project_id(),
+            }),
+            client_id: "zoom-support-change".to_owned(),
+            desired_role: Role::Operator,
+            restart_policy: RestartPolicy::default(),
+        };
+        let mut runtime = StudioRuntime::new(config).unwrap();
+        runtime.connect(CONNECT_TIMEOUT).unwrap();
+        let current = runtime_state(&mut runtime, None);
+        assert!(current.transition_protocol.automatic.zoom());
+        assert!(current.transition_protocol.automatic.slide);
+        assert!(current.can_transition);
+        runtime.session_mut().disconnect().unwrap();
+        runtime
+            .reconnect(Duration::from_millis(250), CONNECT_TIMEOUT)
+            .unwrap();
+        let downgraded = runtime_state(&mut runtime, None);
+        assert!(!downgraded.transition_protocol.automatic.zoom());
+        assert!(downgraded.transition_protocol.automatic.slide);
         assert!(downgraded.can_transition, "Cut/Fade permission was lost");
         server.join().unwrap();
     }

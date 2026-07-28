@@ -39,6 +39,8 @@ pub enum StudioIntent {
     AlphaFade { duration_frames: u32 },
     /// Performs a horizontal Slide transition with a duration in frames.
     Slide { duration_frames: u32 },
+    /// Performs a centered Zoom transition with a duration in frames.
+    Zoom { duration_frames: u32 },
     /// Performs a Wipe transition with a duration in frames.
     Wipe { duration_frames: u32 },
     /// Fades realized Program video and audio to black or back to live.
@@ -170,6 +172,13 @@ impl StudioUiState {
         self
     }
 
+    /// Publishes whether the negotiated protocol can carry Zoom commands.
+    #[must_use]
+    pub const fn with_zoom_support(mut self, supported: bool) -> Self {
+        self.transition_protocol.automatic.additive.zoom = supported;
+        self
+    }
+
     /// Publishes whether the negotiated protocol carries manual T-bar state and commands.
     #[must_use]
     pub const fn with_manual_transition_support(mut self, supported: bool) -> Self {
@@ -228,6 +237,12 @@ pub struct AutomaticTransitionProtocolSupport {
     pub wipe: bool,
     pub alpha_fade: bool,
     pub slide: bool,
+    additive: AdditiveAutomaticTransitionProtocolSupport,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct AdditiveAutomaticTransitionProtocolSupport {
+    zoom: bool,
 }
 
 impl AutomaticTransitionProtocolSupport {
@@ -235,7 +250,18 @@ impl AutomaticTransitionProtocolSupport {
         wipe: false,
         alpha_fade: false,
         slide: false,
+        additive: AdditiveAutomaticTransitionProtocolSupport::NONE,
     };
+
+    /// Returns whether the negotiated protocol can carry Zoom commands.
+    #[must_use]
+    pub const fn zoom(self) -> bool {
+        self.additive.zoom
+    }
+}
+
+impl AdditiveAutomaticTransitionProtocolSupport {
+    const NONE: Self = Self { zoom: false };
 }
 
 /// Pure transition-control availability derived from one UI state.
@@ -250,6 +276,7 @@ pub struct TransitionAvailability {
 struct TransitionBaseAvailability {
     basic: bool,
     slide: bool,
+    zoom: bool,
 }
 
 impl TransitionAvailability {
@@ -263,6 +290,12 @@ impl TransitionAvailability {
     #[must_use]
     pub const fn slide(self) -> bool {
         self.base.slide
+    }
+
+    /// Returns whether automatic Zoom is available.
+    #[must_use]
+    pub const fn zoom(self) -> bool {
+        self.base.zoom
     }
 }
 
@@ -324,6 +357,7 @@ pub const fn transition_availability(gate: TransitionGate) -> TransitionAvailabi
         base: TransitionBaseAvailability {
             basic: base,
             slide: base && gate.protocol_support.slide,
+            zoom: base && gate.protocol_support.zoom(),
         },
         alpha_fade: base && gate.protocol_support.alpha_fade,
         wipe: base && gate.protocol_support.wipe,
@@ -838,67 +872,40 @@ fn draw_transition_row(
         .show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("TRANSITION").small().strong().color(AMBER));
-                if ui
-                    .add_enabled(
-                        availability.alpha_fade,
-                        Button::new(RichText::new("ALPHA").strong())
-                            .fill(Color32::from_rgb(98, 66, 17))
-                            .min_size(Vec2::new(92.0, 32.0)),
-                    )
-                    .on_hover_text("AlphaFade Preview to Program")
-                    .clicked()
-                {
+                if transition_button(
+                    ui,
+                    availability.alpha_fade,
+                    "ALPHA",
+                    "AlphaFade Preview to Program",
+                ) {
                     intents.push(StudioIntent::AlphaFade {
                         duration_frames: shell.transition_duration_frames,
                     });
                 }
-                if ui
-                    .add_enabled(
-                        availability.slide(),
-                        Button::new(RichText::new("SLIDE").strong())
-                            .fill(Color32::from_rgb(98, 66, 17))
-                            .min_size(Vec2::new(92.0, 32.0)),
-                    )
-                    .on_hover_text("Slide Preview to Program")
-                    .clicked()
-                {
+                if transition_button(
+                    ui,
+                    availability.slide(),
+                    "SLIDE",
+                    "Slide Preview to Program",
+                ) {
                     intents.push(StudioIntent::Slide {
                         duration_frames: shell.transition_duration_frames,
                     });
                 }
-                if ui
-                    .add_enabled(
-                        availability.basic(),
-                        Button::new(RichText::new("CUT").strong())
-                            .fill(Color32::from_rgb(98, 66, 17))
-                            .min_size(Vec2::new(92.0, 32.0)),
-                    )
-                    .clicked()
-                {
+                if transition_button(ui, availability.zoom(), "ZOOM", "Zoom Preview to Program") {
+                    intents.push(StudioIntent::Zoom {
+                        duration_frames: shell.transition_duration_frames,
+                    });
+                }
+                if transition_button(ui, availability.basic(), "CUT", "Cut Preview to Program") {
                     intents.push(StudioIntent::Cut);
                 }
-                if ui
-                    .add_enabled(
-                        availability.basic(),
-                        Button::new(RichText::new("FADE").strong())
-                            .fill(Color32::from_rgb(98, 66, 17))
-                            .min_size(Vec2::new(92.0, 32.0)),
-                    )
-                    .clicked()
-                {
+                if transition_button(ui, availability.basic(), "FADE", "Fade Preview to Program") {
                     intents.push(StudioIntent::Fade {
                         duration_frames: shell.transition_duration_frames,
                     });
                 }
-                if ui
-                    .add_enabled(
-                        availability.wipe,
-                        Button::new(RichText::new("WIPE").strong())
-                            .fill(Color32::from_rgb(98, 66, 17))
-                            .min_size(Vec2::new(92.0, 32.0)),
-                    )
-                    .clicked()
-                {
+                if transition_button(ui, availability.wipe, "WIPE", "Wipe Preview to Program") {
                     intents.push(StudioIntent::Wipe {
                         duration_frames: shell.transition_duration_frames,
                     });
@@ -917,6 +924,17 @@ fn draw_transition_row(
                 shell.set_transition_duration_frames(shell.transition_duration_frames);
             });
         });
+}
+
+fn transition_button(ui: &mut Ui, enabled: bool, label: &str, hover_text: &str) -> bool {
+    ui.add_enabled(
+        enabled,
+        Button::new(RichText::new(label).strong())
+            .fill(Color32::from_rgb(98, 66, 17))
+            .min_size(Vec2::new(92.0, 32.0)),
+    )
+    .on_hover_text(hover_text)
+    .clicked()
 }
 
 fn draw_inputs(ui: &mut Ui, state: &StudioUiState, intents: &mut Vec<StudioIntent>) {
@@ -1186,6 +1204,7 @@ mod tests {
                 base: TransitionBaseAvailability {
                     basic: true,
                     slide: false,
+                    zoom: false,
                 },
                 alpha_fade: false,
                 wipe: false,
@@ -1195,6 +1214,7 @@ mod tests {
             wipe: true,
             alpha_fade: true,
             slide: true,
+            additive: AdditiveAutomaticTransitionProtocolSupport { zoom: true },
         };
         let supported = transition_availability(TransitionGate {
             protocol_support: all_protocols,
@@ -1203,6 +1223,7 @@ mod tests {
         assert!(supported.wipe);
         assert!(supported.alpha_fade);
         assert!(supported.slide());
+        assert!(supported.zoom());
         assert!(supported.basic());
         for gate in [
             TransitionGate {
@@ -1227,6 +1248,7 @@ mod tests {
                     base: TransitionBaseAvailability {
                         basic: false,
                         slide: false,
+                        zoom: false,
                     },
                     alpha_fade: false,
                     wipe: false,
@@ -1364,6 +1386,14 @@ mod tests {
         );
         assert_ne!(
             StudioIntent::Slide {
+                duration_frames: 30
+            },
+            StudioIntent::Zoom {
+                duration_frames: 30
+            }
+        );
+        assert_ne!(
+            StudioIntent::Zoom {
                 duration_frames: 30
             },
             StudioIntent::Wipe {
