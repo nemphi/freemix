@@ -9,13 +9,12 @@ use std::{
     thread,
 };
 
-use fm_color::{ColorPipeline, LinearFrame, NativeImportNormalizer, working_color_metadata};
+use fm_color::{ColorPipeline, NativeImportNormalizer, working_color_metadata};
 use fm_compositor::{
     CpuSourceFrame, CropRect, FadeToBlackPlan, FadeToBlackPosition, NativeCompositionRenderer,
     NativeFadeToBlackRenderer, NativeSourceFrame, NativeTransitionRenderer, OutputTarget, RectMask,
     Rgba8, Rotation, Scene, SourceId, SourceLayer, Transform, TransitionKind, TransitionPlan,
-    compile_scene, execute_cpu, execute_fade_to_black_cpu, execute_transition,
-    image_from_cpu_frame,
+    compile_scene, execute_cpu, execute_transition, image_from_cpu_frame,
 };
 use fm_frame::{
     AlphaMode, ChromaLocation, ClockDomainId, ColorMetadata, ColorPrimaries, CpuVideoFrame,
@@ -23,7 +22,10 @@ use fm_frame::{
     NormalizedDuration, NormalizedTimestamp, OriginalTimestamp, PixelFormat, SequenceNumber,
     SignalRange, TimeBase, TransferFunction, VideoDimensions, VideoFrameMetadata,
 };
-use fm_gpu::{NativeBackend, NativeContext, NativeTexture, TextureFormat};
+use fm_gpu::{
+    NativeBackend, NativeContext, NativeTexture, ShaderDescriptor, ShaderLanguage, ShaderSource,
+    ShaderStage, TextureFormat,
+};
 use fm_video::ImageFrame;
 use half::f16;
 
@@ -145,31 +147,104 @@ fn assert_rgba16f_matches_cpu(output: &fm_gpu::NativeTextureReadback, expected: 
     }
 }
 
-fn assert_rgba16f_matches_linear(output: &fm_gpu::NativeTextureReadback, expected: &LinearFrame) {
-    assert_eq!(output.format, TextureFormat::Rgba16Float);
-    assert_eq!(
-        (output.width, output.height),
-        (expected.width(), expected.height())
-    );
-    assert_eq!(output.stride, expected.width() * 8);
-    for (pixel_index, (actual, expected)) in output
+/// One binary16 ULP at the magnitude of a nonnegative expected component.
+///
+/// This admits one storage step around a reference value when affine evaluation
+/// or contraction differs, without a fixed tolerance that grows loose near zero.
+fn positive_half_ulp(expected: f16) -> f32 {
+    assert!(!expected.is_sign_negative() && expected.is_finite());
+    let magnitude_bits = expected.to_bits();
+    f16::from_bits(magnitude_bits + 1).to_f32() - expected.to_f32()
+}
+
+fn readback_half_bits(output: &fm_gpu::NativeTextureReadback) -> Vec<[u16; 4]> {
+    output
         .bytes
         .chunks_exact(8)
-        .zip(expected.pixels())
-        .enumerate()
-    {
-        for (component_index, (actual, expected)) in actual
-            .chunks_exact(2)
-            .zip([expected.r, expected.g, expected.b, expected.a])
-            .enumerate()
-        {
-            let actual = f16::from_bits(u16::from_le_bytes([actual[0], actual[1]])).to_f32();
+        .map(|pixel| {
+            core::array::from_fn(|component| {
+                let offset = component * 2;
+                u16::from_le_bytes([pixel[offset], pixel[offset + 1]])
+            })
+        })
+        .collect()
+}
+
+fn assert_rgba16f_matches_half_bits(
+    output: &fm_gpu::NativeTextureReadback,
+    expected: &[[u16; 4]],
+    case: &str,
+) {
+    assert_eq!(output.format, TextureFormat::Rgba16Float);
+    let actual = readback_half_bits(output);
+    assert_eq!(actual.len(), expected.len());
+    for (pixel_index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+        for (component_index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+            let actual = f16::from_bits(actual);
+            let expected = f16::from_bits(expected);
+            let tolerance = positive_half_ulp(expected);
             assert!(
-                (actual - expected).abs() <= 0.002,
-                "pixel {pixel_index}, component {component_index}: GPU {actual}, CPU {expected}"
+                (actual.to_f32() - expected.to_f32()).abs() <= tolerance,
+                "{case}, pixel {pixel_index}, component {component_index}: GPU half {actual}, expected half {expected}, tolerance {tolerance}"
             );
         }
     }
+}
+
+async fn direct_rgba16f_test_source(context: &NativeContext) -> NativeTexture {
+    let first = context
+        .create_rgba16_float_render_target(1, 1)
+        .await
+        .unwrap();
+    let second = context
+        .create_rgba16_float_render_target(1, 1)
+        .await
+        .unwrap();
+    let program = context
+        .create_rgba16_float_render_target(1, 1)
+        .await
+        .unwrap();
+    let source_shader = r"
+struct SeedUniform {
+    padding: vec4<u32>,
+};
+
+@group(0) @binding(0) var first_texture: texture_2d<f32>;
+@group(0) @binding(1) var second_texture: texture_2d<f32>;
+@group(0) @binding(2) var<uniform> seed: SeedUniform;
+
+@fragment
+fn seed_fragment(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
+    if seed.padding.x != 0u {
+        return textureLoad(first_texture, vec2<i32>(position.xy), 0)
+            + textureLoad(second_texture, vec2<i32>(position.xy), 0);
+    }
+    return vec4<f32>(4.0, 1.5, 0.25, 0.5);
+}
+";
+    let seed_pipeline = context
+        .create_fullscreen_pipeline_for_format(
+            ShaderDescriptor::new(
+                "fm-compositor direct RGBA16F test source",
+                ShaderStage::Fragment,
+                ShaderLanguage::Wgsl,
+                "seed_fragment",
+                ShaderSource::Text(source_shader.to_owned()),
+            ),
+            TextureFormat::Rgba16Float,
+        )
+        .await
+        .unwrap();
+    context
+        .submit_fullscreen(&seed_pipeline, &first, &second, &program, &[0; 16])
+        .await
+        .unwrap();
+    let source_readback = context.readback(&program).await.unwrap();
+    assert_eq!(
+        readback_half_bits(&source_readback),
+        vec![[0x4400, 0x3e00, 0x3400, 0x3800]]
+    );
+    program
 }
 
 async fn assert_composition_case(
@@ -313,40 +388,68 @@ fn native_metal_cut_and_fade_match_cpu_linear_frames() {
 
 #[test]
 #[ignore = "requires a native macOS Metal adapter"]
-fn native_metal_fade_to_black_matches_the_cpu_oracle() {
+fn native_metal_fade_to_black_matches_direct_half_expectations() {
     block_on(async {
-        let program_cpu = frame(
-            21,
-            &[
-                255, 255, 255, 255, 96, 32, 8, 128, 0, 0, 0, 0, 12, 48, 200, 64,
-            ],
-        );
-        let cpu_pipeline = ColorPipeline::new(source_metadata().color(), working_color_metadata());
-        let program_linear = cpu_pipeline
-            .decode_cpu_payload(program_cpu.payload())
-            .unwrap()
-            .frame;
-
         let context = NativeContext::new([NativeBackend::Metal]).await.unwrap();
-        let normalizer = NativeImportNormalizer::new(&context).await.unwrap();
-        let program = normalizer.normalize(&context, &program_cpu).await.unwrap();
+        let program = direct_rgba16f_test_source(&context).await;
         let renderer = NativeFadeToBlackRenderer::new(&context).await.unwrap();
 
         let position =
             |numerator, denominator| FadeToBlackPosition::compile(numerator, denominator).unwrap();
-        for plan in [
-            FadeToBlackPlan::new(position(0, 1), position(1, 1), position(0, 1)),
-            FadeToBlackPlan::new(position(0, 1), position(1, 1), position(1, 2)),
-            FadeToBlackPlan::new(position(3, 4), position(1, 4), position(1, 2)),
-            FadeToBlackPlan::new(position(1, 1), position(1, 1), position(2, 3)),
-        ] {
-            let expected = execute_fade_to_black_cpu(plan, &program_linear).unwrap();
-            let output = renderer
-                .render(&context, plan, program.texture())
-                .await
-                .unwrap();
+        let start = position(1, 8);
+        let end = position(5, 6);
+        let cases: [(&str, FadeToBlackPlan, [u16; 4], bool); 7] = [
+            (
+                "exact live",
+                FadeToBlackPlan::new(position(0, 1), position(1, 1), position(0, 1)),
+                [0x4400, 0x3e00, 0x3400, 0x3800],
+                true,
+            ),
+            (
+                "exact black",
+                FadeToBlackPlan::new(position(0, 1), position(1, 1), position(1, 1)),
+                [0x0000, 0x0000, 0x0000, 0x3c00],
+                true,
+            ),
+            (
+                "nontrivial hold",
+                FadeToBlackPlan::new(position(1, 4), position(1, 4), position(2, 3)),
+                [0x4200, 0x3c80, 0x3200, 0x3900],
+                false,
+            ),
+            (
+                "forward 1/3",
+                FadeToBlackPlan::new(start, end, position(1, 3)),
+                [0x411c, 0x3bab, 0x311c, 0x3972],
+                false,
+            ),
+            (
+                "forward 2/3",
+                FadeToBlackPlan::new(start, end, position(2, 3)),
+                [0x3e72, 0x38d5, 0x2e72, 0x3a64],
+                false,
+            ),
+            (
+                "reverse 1/3",
+                FadeToBlackPlan::new(end, start, position(1, 3)),
+                [0x3e72, 0x38d5, 0x2e72, 0x3a64],
+                false,
+            ),
+            (
+                "reverse 2/3",
+                FadeToBlackPlan::new(end, start, position(2, 3)),
+                [0x411c, 0x3bab, 0x311c, 0x3972],
+                false,
+            ),
+        ];
+        for (case, plan, expected, exact) in cases {
+            let output = renderer.render(&context, plan, &program).await.unwrap();
             let actual = context.readback(&output).await.unwrap();
-            assert_rgba16f_matches_linear(&actual, &expected);
+            if exact {
+                assert_eq!(readback_half_bits(&actual), vec![expected], "{case}");
+            } else {
+                assert_rgba16f_matches_half_bits(&actual, &[expected], case);
+            }
         }
     });
 }

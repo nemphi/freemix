@@ -161,6 +161,14 @@ fn ratio(numerator: u32, denominator: u32) -> f32 {
     return f32(numerator) / f32(denominator);
 }
 
+fn affine_scalar(from: f32, to: f32, progress: f32) -> f32 {
+    return from + (to - from) * progress;
+}
+
+fn affine_rgba(from: vec4<f32>, to: vec4<f32>, progress: f32) -> vec4<f32> {
+    return from + (to - from) * progress;
+}
+
 @fragment
 fn fade_to_black_fragment(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let coordinates = vec2<i32>(position.xy);
@@ -171,7 +179,7 @@ fn fade_to_black_fragment(@builtin(position) position: vec4<f32>) -> @location(0
     if ftb.progress_numerator == ftb.progress_denominator {
         fade_position = end;
     } else if ftb.progress_numerator != 0u {
-        fade_position = mix(
+        fade_position = affine_scalar(
             start,
             end,
             ratio(ftb.progress_numerator, ftb.progress_denominator),
@@ -180,10 +188,11 @@ fn fade_to_black_fragment(@builtin(position) position: vec4<f32>) -> @location(0
     if fade_position <= 0.0 {
         return source;
     }
+    let opaque_black = vec4<f32>(0.0, 0.0, 0.0, 1.0);
     if fade_position >= 1.0 {
-        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+        return opaque_black;
     }
-    return mix(source, vec4<f32>(0.0, 0.0, 0.0, 1.0), fade_position);
+    return affine_rgba(source, opaque_black, fade_position);
 }
 ";
 
@@ -689,8 +698,10 @@ impl NativeFadeToBlackRenderer {
     ///
     /// `program` must be the already composed canonical `Rgba16Float`,
     /// linear-light, premultiplied-alpha Program texture. The returned texture
-    /// has the same dimensions and remains GPU-resident. This operation does
-    /// not inspect or alter audio.
+    /// has the same dimensions and remains GPU-resident. Non-endpoint ratio and
+    /// affine evaluation use GPU `f32` arithmetic, which a backend may contract,
+    /// followed by binary16 render-target storage. This operation does not
+    /// inspect or alter audio.
     ///
     /// # Errors
     ///
@@ -1128,6 +1139,29 @@ mod tests {
             validate_fade_to_black_format(TextureFormat::Rgba16Float),
             Ok(())
         );
+    }
+
+    #[test]
+    fn fade_to_black_shader_uses_directional_affine_opaque_black() {
+        assert_eq!(
+            FADE_TO_BLACK_FRAGMENT_SHADER
+                .match_indices("return from + (to - from) * progress;")
+                .count(),
+            2
+        );
+        assert!(
+            FADE_TO_BLACK_FRAGMENT_SHADER
+                .contains("fade_position = affine_scalar(\n            start,\n            end,")
+        );
+        assert!(
+            FADE_TO_BLACK_FRAGMENT_SHADER
+                .contains("let opaque_black = vec4<f32>(0.0, 0.0, 0.0, 1.0);")
+        );
+        assert!(
+            FADE_TO_BLACK_FRAGMENT_SHADER
+                .contains("return affine_rgba(source, opaque_black, fade_position);")
+        );
+        assert!(!FADE_TO_BLACK_FRAGMENT_SHADER.contains("mix("));
     }
 
     #[test]

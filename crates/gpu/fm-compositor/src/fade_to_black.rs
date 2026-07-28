@@ -4,11 +4,11 @@ use fm_color::{ColorError, LinearFrame, LinearRgba};
 
 /// Largest denominator accepted by the Fade-to-Black planning primitive.
 ///
-/// Each numerator and denominator remains exactly representable by the `f32`
-/// arithmetic used by the CPU oracle and WGSL implementation.
+/// Each stored numerator and denominator is exactly representable as `f32`.
+/// Their ratio and any later interpolation can require rounding.
 pub const MAX_FADE_TO_BLACK_DENOMINATOR: u32 = u16::MAX as u32;
 
-/// An exact rational position in the closed Fade-to-Black interval `[0, 1]`.
+/// An exact integer-rational encoding in the closed Fade-to-Black interval `[0, 1]`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FadeToBlackPosition {
     numerator: u16,
@@ -73,6 +73,8 @@ impl FadeToBlackPosition {
 ///
 /// `progress` interpolates from `start` to `end`. Equal endpoints hold the
 /// current FTB position, and a start greater than the end reverses toward live.
+/// The three integer-rational values are retained exactly; resolving a
+/// non-endpoint position uses rounded `f32` ratio and affine arithmetic.
 /// This is compositor work only: the plan contains no clock, audio, routing, or
 /// operator state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -119,7 +121,7 @@ impl FadeToBlackPlan {
             return self.end.as_f32();
         }
         let start = self.start.as_f32();
-        (self.end.as_f32() - start).mul_add(self.progress.as_f32(), start)
+        affine(start, self.end.as_f32(), self.progress.as_f32())
     }
 }
 
@@ -162,7 +164,9 @@ impl std::error::Error for FadeToBlackPlanError {}
 /// color-space conversion. RGB is attenuated while alpha approaches one.
 /// Making the full endpoint opaque is deliberate output behavior: transparent
 /// Program pixels cannot reveal a downstream surface while FTB is engaged.
-/// Exact live and black endpoints bypass interpolation.
+/// Exact live and black endpoints bypass interpolation. Intermediate CPU
+/// components use rounded `f32` affine arithmetic; a native `Rgba16Float`
+/// target additionally rounds each stored component to binary16.
 ///
 /// # Errors
 ///
@@ -186,10 +190,10 @@ pub fn execute_fade_to_black_cpu(
             .copied()
             .map(|pixel| {
                 LinearRgba::new(
-                    mix(pixel.r, 0.0, position),
-                    mix(pixel.g, 0.0, position),
-                    mix(pixel.b, 0.0, position),
-                    mix(pixel.a, 1.0, position),
+                    affine(pixel.r, 0.0, position),
+                    affine(pixel.g, 0.0, position),
+                    affine(pixel.b, 0.0, position),
+                    affine(pixel.a, 1.0, position),
                 )
             })
             .collect()
@@ -197,12 +201,14 @@ pub fn execute_fade_to_black_cpu(
     LinearFrame::new(source.width(), source.height(), pixels)
 }
 
-fn mix(from: f32, to: f32, progress: f32) -> f32 {
-    (to - from).mul_add(progress, from)
+fn affine(from: f32, to: f32, progress: f32) -> f32 {
+    from + (to - from) * progress
 }
 
 #[cfg(test)]
 mod tests {
+    use half::f16;
+
     use super::*;
 
     fn position(numerator: u32, denominator: u32) -> FadeToBlackPosition {
@@ -274,6 +280,39 @@ mod tests {
             hold_output.pixel(0, 0),
             Some(LinearRgba::new(3.0, 1.125, 0.1875, 0.625))
         );
+    }
+
+    #[test]
+    fn asymmetric_progress_has_independent_half_float_expectations() {
+        let source = LinearFrame::new(1, 1, vec![LinearRgba::new(4.0, 1.5, 0.25, 0.5)]).unwrap();
+        let forward_start = position(1, 8);
+        let forward_end = position(5, 6);
+        let cases = [
+            (
+                FadeToBlackPlan::new(forward_start, forward_end, position(1, 3)),
+                [0x411c, 0x3bab, 0x311c, 0x3972],
+            ),
+            (
+                FadeToBlackPlan::new(forward_start, forward_end, position(2, 3)),
+                [0x3e72, 0x38d5, 0x2e72, 0x3a64],
+            ),
+            (
+                FadeToBlackPlan::new(forward_end, forward_start, position(1, 3)),
+                [0x3e72, 0x38d5, 0x2e72, 0x3a64],
+            ),
+            (
+                FadeToBlackPlan::new(forward_end, forward_start, position(2, 3)),
+                [0x411c, 0x3bab, 0x311c, 0x3972],
+            ),
+        ];
+
+        for (plan, expected) in cases {
+            let output = execute_fade_to_black_cpu(plan, &source).unwrap();
+            let pixel = output.pixel(0, 0).unwrap();
+            let actual = [pixel.r, pixel.g, pixel.b, pixel.a]
+                .map(|component| f16::from_f32(component).to_bits());
+            assert_eq!(actual, expected, "{plan:?}");
+        }
     }
 
     #[test]
