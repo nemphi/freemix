@@ -7,8 +7,8 @@ use std::{
 
 use fm_model::{
     AudioBus, BusSend, CropRect, Input, InputKind, Layer, LayerGeometry, MainMix, Output, Project,
-    ProjectSettings, RestartPolicy, Rgba8, Rotation, Scene, SimulatedAudio, SimulatedInput,
-    SimulatedVideo, SolidColor, SourceRef, StartupPolicy,
+    ProjectSettings, RectMask, RestartPolicy, Rgba8, Rotation, Scene, SimulatedAudio,
+    SimulatedInput, SimulatedVideo, SolidColor, SourceRef, StartupPolicy,
 };
 use fm_persistence::{ProjectPosition, ProjectStore, RuntimeRouting, StoreError, StoredProject};
 use fm_types::{
@@ -181,6 +181,7 @@ fn rich_project() -> Project {
             enabled: true,
             geometry: LayerGeometry::new(-20, 30, 1920, 1080, Rotation::Deg90),
             crop: Some(CropRect::new(10, 20, 1000, 700)),
+            mask: Some(RectMask::new(11, 12, 500, 300).inverted(true)),
             opacity: 200,
             z_order: -7,
         }],
@@ -196,6 +197,7 @@ fn rich_project() -> Project {
                 enabled: true,
                 geometry: LayerGeometry::new(0, 0, 3840, 2160, Rotation::Deg0),
                 crop: None,
+                mask: None,
                 opacity: u8::MAX,
                 z_order: 3,
             },
@@ -205,6 +207,7 @@ fn rich_project() -> Project {
                 enabled: false,
                 geometry: LayerGeometry::new(100, -200, 640, 360, Rotation::Deg270),
                 crop: Some(CropRect::new(1, 2, 3, 4)),
+                mask: Some(RectMask::new(1, 1, 2, 3)),
                 opacity: 127,
                 z_order: 3,
             },
@@ -277,6 +280,14 @@ fn complete_project_round_trip_preserves_formats_graph_capabilities_and_u128_ids
     );
     assert_eq!(loaded.project().settings(), &rich_settings());
     assert_eq!(loaded.runtime_routing(), expected.runtime_routing());
+    assert_eq!(
+        loaded.project().scenes()[0].layers[0].mask,
+        Some(RectMask::new(11, 12, 500, 300).inverted(true))
+    );
+    assert_eq!(
+        loaded.project().scenes()[1].layers[1].mask,
+        Some(RectMask::new(1, 1, 2, 3))
+    );
     assert!(matches!(
         loaded.project().inputs()[6].kind,
         InputKind::Scene {
@@ -288,7 +299,7 @@ fn complete_project_round_trip_preserves_formats_graph_capabilities_and_u128_ids
 }
 
 #[test]
-fn display_p3_bt709_round_trips_in_schema_v4() {
+fn display_p3_bt709_round_trips_in_current_schema() {
     let temp = TestDirectory::new("bt709-transfer");
     let store = temp.store("show");
     let mut settings = rich_settings();
@@ -316,7 +327,7 @@ fn display_p3_bt709_round_trips_in_schema_v4() {
 }
 
 #[test]
-fn v4_encoding_is_deterministic_for_the_complete_model() {
+fn current_encoding_is_deterministic_for_the_complete_model() {
     let temp = TestDirectory::new("deterministic-rich");
     let first = temp.store("first");
     let second = temp.store("second");
@@ -371,7 +382,7 @@ fn malformed_enum_format_and_reference_are_rejected() {
 }
 
 #[test]
-fn strict_v4_composition_parser_rejects_unknown_values_ranges_and_fields() {
+fn strict_composition_parser_rejects_unknown_values_ranges_and_fields() {
     let temp = TestDirectory::new("strict-composition");
     let store = temp.store("show");
     store.save(&stored_rich_project()).unwrap();
@@ -410,6 +421,35 @@ fn strict_v4_composition_parser_rejects_unknown_values_ranges_and_fields() {
 }
 
 #[test]
+fn strict_rect_mask_parser_rejects_malformed_and_out_of_bounds_values() {
+    let temp = TestDirectory::new("strict-mask");
+    let store = temp.store("show");
+    store.save(&stored_rich_project()).unwrap();
+    let valid = fs::read_to_string(store.manifest_path()).unwrap();
+
+    for malformed in [
+        valid.replacen("\"invert\": true", "\"invert\": 1", 1),
+        valid.replacen("\"invert\": true", "\"invert\": true, \"feather\": 1", 1),
+        valid.replacen("\"width\": 500", "\"width\": -1", 1),
+    ] {
+        fs::write(store.manifest_path(), malformed).unwrap();
+        assert!(matches!(
+            store.load(),
+            Err(StoreError::MalformedManifest { .. })
+        ));
+    }
+
+    for invalid in [
+        valid.replacen("\"width\": 500", "\"width\": 0", 1),
+        valid.replacen("\"width\": 500", "\"width\": 1000", 1),
+        valid.replacen("\"x\": 11", "\"x\": 4294967295", 1),
+    ] {
+        fs::write(store.manifest_path(), invalid).unwrap();
+        assert!(matches!(store.load(), Err(StoreError::Validation(_))));
+    }
+}
+
+#[test]
 fn golden_v2_manifest_migrates_with_cli_defaults_and_main_mix() {
     let temp = TestDirectory::new("v2-migration");
     let store = temp.store("show");
@@ -423,7 +463,7 @@ fn golden_v2_manifest_migrates_with_cli_defaults_and_main_mix() {
     let report = store.migrate_v2().unwrap();
     let migrated = store.load().unwrap();
 
-    assert_eq!((report.from_schema(), report.to_schema()), (2, 5));
+    assert_eq!((report.from_schema(), report.to_schema()), (2, 6));
     assert_eq!(
         migrated.project().settings().frame_rate,
         FrameRate::new(60_000, 1_001).unwrap()
@@ -469,7 +509,7 @@ fn frozen_v3_manifest_migrates_with_composition_defaults_only() {
     second.migrate_v3().unwrap();
     let migrated = store.load().unwrap();
 
-    assert_eq!((report.from_schema(), report.to_schema()), (3, 5));
+    assert_eq!((report.from_schema(), report.to_schema()), (3, 6));
     assert_eq!(
         report.defaulted_fields(),
         [
@@ -479,6 +519,7 @@ fn frozen_v3_manifest_migrates_with_composition_defaults_only() {
             "scenes.layers.opacity=255",
             "scenes.layers.z_order=0",
             "runtime.manual_transitions=inactive",
+            "scenes.layers.mask=null",
         ]
     );
     let scene = &migrated.project().scenes()[0];
@@ -488,6 +529,7 @@ fn frozen_v3_manifest_migrates_with_composition_defaults_only() {
         LayerGeometry::new(0, 0, 3840, 2160, Rotation::Deg0)
     );
     assert_eq!(scene.layers[0].crop, None);
+    assert_eq!(scene.layers[0].mask, None);
     assert_eq!(scene.layers[0].opacity, u8::MAX);
     assert_eq!(scene.layers[0].z_order, 0);
     assert_eq!(scene.layers[1].z_order, 0);

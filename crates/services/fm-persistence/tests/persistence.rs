@@ -233,15 +233,57 @@ fn schema_v4_migrates_with_inactive_manual_transition_defaults() {
     let report = store.migrate_v4().unwrap();
     let migrated = store.load().unwrap();
 
-    assert_eq!((report.from_schema(), report.to_schema()), (4, 5));
+    assert_eq!((report.from_schema(), report.to_schema()), (4, 6));
     assert_eq!(
         report.defaulted_fields(),
-        ["runtime.manual_transitions=inactive"]
+        [
+            "runtime.manual_transitions=inactive",
+            "scenes.layers.mask=null"
+        ]
     );
     assert_eq!(
         migrated.runtime_manual_transitions(),
         RuntimeManualTransitions::default()
     );
+}
+
+#[test]
+fn schema_v5_migration_preserves_manual_state_and_defaults_no_mask() {
+    let temp = TestDirectory::new("schema-v5");
+    let root = temp.project_path("show");
+    write_manifest(&root, include_str!("fixtures/schema-v5.json"));
+    let store = ProjectStore::new(root).unwrap();
+
+    let report = store.migrate_v5().unwrap();
+    let migrated = store.load().unwrap();
+
+    assert_eq!((report.from_schema(), report.to_schema()), (5, 6));
+    assert_eq!(report.defaulted_fields(), ["scenes.layers.mask=null"]);
+    assert_eq!(migrated.project().scenes()[0].layers[0].mask, None);
+    let transitions = migrated.runtime_manual_transitions();
+    assert_eq!(
+        transitions.desired,
+        ManualTransitionState::new(
+            ManualTransitionKind::Fade,
+            migrated.runtime_routing().desired_program_id.unwrap(),
+            migrated.runtime_routing().desired_preview_id.unwrap(),
+            0,
+            6_250,
+        )
+    );
+    assert_eq!(
+        transitions.realized,
+        ManualTransitionState::new(
+            ManualTransitionKind::Fade,
+            migrated.runtime_routing().realized_program_id.unwrap(),
+            migrated.runtime_routing().realized_preview_id.unwrap(),
+            6_250,
+            6_250,
+        )
+    );
+    let encoded = fs::read_to_string(store.manifest_path()).unwrap();
+    assert!(encoded.starts_with("{\n  \"schema_version\": 6,"));
+    assert!(encoded.contains("\"mask\": null"));
 }
 
 #[test]
@@ -347,8 +389,8 @@ fn explicit_unsupported_schema_is_reported_before_missing_current_fields() {
 fn strict_parser_rejects_unknown_duplicate_and_wrong_typed_fields() {
     let temp = TestDirectory::new("strict");
     for (name, manifest) in [
-        ("unknown", "{\"schema_version\":5,\"unknown\":true}"),
-        ("duplicate", "{\"schema_version\":5,\"schema_version\":5}"),
+        ("unknown", "{\"schema_version\":6,\"unknown\":true}"),
+        ("duplicate", "{\"schema_version\":6,\"schema_version\":6}"),
         ("wrong-type", "{\"schema_version\":\"1\"}"),
         ("object-trailing-comma", "{\"schema_version\":2,}"),
         (

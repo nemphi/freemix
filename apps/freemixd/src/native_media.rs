@@ -39,8 +39,9 @@ use fm_color::{
 use fm_compositor::{
     CompositionPlan, NativeCompositionError, NativeCompositionRenderer, NativeSourceFrame,
     NativeTransitionError, NativeTransitionRenderer, OutputTarget, PlanError,
-    Rgba8 as CompositorRgba8, Rotation as CompositorRotation, Scene as CompositorScene, SourceId,
-    SourceLayer, Transform, TransitionError, TransitionKind, TransitionPlan, compile_scene,
+    RectMask as CompositorRectMask, Rgba8 as CompositorRgba8, Rotation as CompositorRotation,
+    Scene as CompositorScene, SourceId, SourceLayer, Transform, TransitionError, TransitionKind,
+    TransitionPlan, compile_scene,
 };
 use fm_engine::FrameResult;
 use fm_frame::{
@@ -63,7 +64,7 @@ const SOURCE_REFILL_MAX_PAGE: u32 = 4;
 const AUDIO_REFILL_LOW_WATERMARK: usize = 8;
 const NATIVE_AUDIO_SCRATCH_PLANE_SETS: usize = 5;
 
-/// Resource bounds applied while compiling schema-v4 native scenes.
+/// Resource bounds applied while compiling native scenes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NativeProjectLimits {
     pub max_reachable_scenes: usize,
@@ -230,7 +231,7 @@ impl Error for NativeProjectPlanError {
     }
 }
 
-/// Immutable, bounded native realization plan for one schema-v4 project.
+/// Immutable, bounded native realization plan for one canonical project.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeProjectPlan {
     video_routes: BTreeMap<InputId, NativeVideoRoute>,
@@ -339,7 +340,29 @@ impl NativeProjectPlan {
                 error,
             })?;
             let mut tokens = BTreeMap::new();
-            for layer in &model.layers {
+            for (layer_index, layer) in model.layers.iter().enumerate() {
+                let (source_width, source_height) = layer
+                    .crop
+                    .map_or((dimensions.width(), dimensions.height()), |crop| {
+                        (crop.width, crop.height)
+                    });
+                if layer.mask.is_some_and(|mask| {
+                    mask.width == 0
+                        || mask.height == 0
+                        || mask
+                            .x
+                            .checked_add(mask.width)
+                            .is_none_or(|right| right > source_width)
+                        || mask
+                            .y
+                            .checked_add(mask.height)
+                            .is_none_or(|bottom| bottom > source_height)
+                }) {
+                    return Err(NativeProjectPlanError::Composition {
+                        scene: scene_id,
+                        error: PlanError::InvalidMask { layer: layer_index },
+                    });
+                }
                 let token = if layer.enabled {
                     let source = resolve_scene_source(layer.source, &inputs, &scene_models)?;
                     if let Some(token) = tokens.get(&source) {
@@ -382,6 +405,12 @@ impl NativeProjectPlan {
                         crop.width,
                         crop.height,
                     ));
+                }
+                if let Some(mask) = layer.mask {
+                    native_layer = native_layer.with_mask(
+                        CompositorRectMask::new(mask.x, mask.y, mask.width, mask.height)
+                            .inverted(mask.invert),
+                    );
                 }
                 scene.push_layer(native_layer);
             }
@@ -5203,6 +5232,7 @@ mod tests {
             enabled: true,
             geometry: LayerGeometry::new(0, 0, 4, 2, Rotation::Deg0),
             crop: None,
+            mask: None,
             opacity: u8::MAX,
             z_order,
         }
@@ -5661,6 +5691,7 @@ mod tests {
                 enabled: true,
                 geometry: LayerGeometry::new(-7, 9, 3, 2, Rotation::Deg270),
                 crop: Some(fm_model::CropRect::new(1, 0, 2, 2)),
+                mask: Some(fm_model::RectMask::new(1, 0, 1, 2).inverted(true)),
                 opacity: 123,
                 z_order: -4,
             }],
@@ -5683,7 +5714,111 @@ mod tests {
             mapped.crop(),
             Some(fm_compositor::CropRect::new(1, 0, 2, 2))
         );
+        assert_eq!(
+            mapped.mask(),
+            Some(fm_compositor::RectMask::new(1, 0, 1, 2).inverted(true))
+        );
         assert_eq!(mapped.opacity(), 123);
+    }
+
+    #[test]
+    fn native_project_plan_admits_mask_bounds_without_changing_resource_accounting() {
+        let build = |mask| {
+            let mut project = native_plan_project(4, 2);
+            add_leaf(&mut project, input(1));
+            add_scene_input(&mut project, input(2), scene(10), Some(input(1)));
+            project.add_scene(ModelScene {
+                id: scene(10),
+                name: "mask admission".into(),
+                background: ModelRgba8::OPAQUE_BLACK,
+                layers: vec![Layer {
+                    name: "masked".into(),
+                    source: SourceRef::Input(input(1)),
+                    enabled: true,
+                    geometry: LayerGeometry::new(1, 0, 3, 2, Rotation::Deg180),
+                    crop: Some(fm_model::CropRect::new(1, 0, 3, 2)),
+                    mask,
+                    opacity: u8::MAX,
+                    z_order: 0,
+                }],
+            });
+            project
+        };
+
+        let unmasked =
+            NativeProjectPlan::compile(&build(None), NativeProjectLimits::default()).unwrap();
+        let masked = NativeProjectPlan::compile(
+            &build(Some(fm_model::RectMask::new(1, 0, 1, 2))),
+            NativeProjectLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                masked.active_layer_count(),
+                masked.peak_rgba16f_targets(),
+                masked.transient_rgba16f_bytes(),
+            ),
+            (
+                unmasked.active_layer_count(),
+                unmasked.peak_rgba16f_targets(),
+                unmasked.transient_rgba16f_bytes(),
+            )
+        );
+
+        let source_token = masked.scenes[0].sources[0].0;
+        let source = fm_compositor::ImageFrame::new(
+            4,
+            2,
+            16,
+            [
+                CompositorRgba8::new(255, 0, 0, 255),
+                CompositorRgba8::new(255, 255, 0, 255),
+                CompositorRgba8::new(0, 0, 255, 255),
+                CompositorRgba8::new(255, 0, 255, 255),
+                CompositorRgba8::new(0, 255, 255, 255),
+                CompositorRgba8::new(255, 255, 255, 255),
+                CompositorRgba8::new(0, 255, 0, 255),
+                CompositorRgba8::new(128, 128, 128, 255),
+            ]
+            .into_iter()
+            .flat_map(fm_compositor::Rgba8::to_bytes)
+            .collect(),
+        )
+        .unwrap();
+        let output = fm_compositor::execute_cpu(
+            &masked.scenes[0].composition,
+            &[fm_compositor::CpuSourceFrame::new(source_token, &source)],
+        )
+        .unwrap();
+        assert_eq!(
+            (0..8)
+                .map(|index| output.pixel(index % 4, index / 4).unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                CompositorRgba8::new(0, 0, 0, 255),
+                CompositorRgba8::new(0, 0, 0, 255),
+                CompositorRgba8::new(0, 255, 0, 255),
+                CompositorRgba8::new(0, 0, 0, 255),
+                CompositorRgba8::new(0, 0, 0, 255),
+                CompositorRgba8::new(0, 0, 0, 255),
+                CompositorRgba8::new(0, 0, 255, 255),
+                CompositorRgba8::new(0, 0, 0, 255),
+            ]
+        );
+
+        for invalid in [
+            fm_model::RectMask::new(0, 0, 0, 1),
+            fm_model::RectMask::new(3, 0, 1, 1),
+            fm_model::RectMask::new(u32::MAX, 0, 2, 1),
+        ] {
+            assert!(matches!(
+                NativeProjectPlan::compile(&build(Some(invalid)), NativeProjectLimits::default()),
+                Err(NativeProjectPlanError::Composition {
+                    error: PlanError::InvalidMask { layer: 0 },
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]

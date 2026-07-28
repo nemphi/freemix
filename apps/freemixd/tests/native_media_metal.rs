@@ -960,6 +960,7 @@ fn metal_scene_layer(
         enabled: true,
         geometry,
         crop,
+        mask: None,
         opacity: u8::MAX,
         z_order,
     }

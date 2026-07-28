@@ -273,6 +273,17 @@ fn write_scenes(output: &mut String, project: &fm_model::Project) {
             } else {
                 output.push_str("null");
             }
+            output.push_str(",\n            \"mask\": ");
+            if let Some(mask) = layer.mask {
+                write!(
+                    output,
+                    "{{\"x\": {}, \"y\": {}, \"width\": {}, \"height\": {}, \"invert\": {}}}",
+                    mask.x, mask.y, mask.width, mask.height, mask.invert,
+                )
+                .expect("writing to a string cannot fail");
+            } else {
+                output.push_str("null");
+            }
             write!(
                 output,
                 ",\n            \"opacity\": {},\n            \"z_order\": {}\n          }}",

@@ -298,6 +298,31 @@ fn validate_scenes(project: &Project, errors: &mut Vec<ValidationError>) {
                     kind: ValidationErrorKind::OutOfRange,
                 });
             }
+            let (source_width, source_height) = layer.crop.map_or(
+                (
+                    project.settings().video.dimensions.width(),
+                    project.settings().video.dimensions.height(),
+                ),
+                |crop| (crop.width, crop.height),
+            );
+            if layer.mask.is_some_and(|mask| {
+                mask.width == 0
+                    || mask.height == 0
+                    || mask
+                        .x
+                        .checked_add(mask.width)
+                        .is_none_or(|right| right > source_width)
+                    || mask
+                        .y
+                        .checked_add(mask.height)
+                        .is_none_or(|bottom| bottom > source_height)
+            }) {
+                errors.push(ValidationError {
+                    entity,
+                    field: "layers.mask",
+                    kind: ValidationErrorKind::OutOfRange,
+                });
+            }
             match layer.source {
                 SourceRef::Input(id) if !project.inputs().iter().any(|input| input.id == id) => {
                     errors.push(ValidationError {

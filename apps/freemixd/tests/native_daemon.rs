@@ -22,8 +22,8 @@ use std::{
 #[cfg(target_os = "macos")]
 use fm_io_macos::{CameraIdKind, deterministic_camera_id};
 use fm_model::{
-    Input, InputKind, Layer, LayerGeometry, MainMix, Project, ProjectSettings, Rgba8, Rotation,
-    Scene, SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef,
+    Input, InputKind, Layer, LayerGeometry, MainMix, Project, ProjectSettings, RectMask, Rgba8,
+    Rotation, Scene, SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef,
 };
 use fm_persistence::{ProjectPosition, ProjectStore, RuntimeRouting, StoredProject};
 #[cfg(target_os = "macos")]
@@ -488,6 +488,10 @@ fn native_scene_daemon_checkpoints_and_restarts_from_scene_routes() {
         assert_eq!(
             persisted.runtime_routing().realized_preview_id,
             Some(input(4))
+        );
+        assert_eq!(
+            persisted.project().scenes()[2].layers[1].mask,
+            Some(RectMask::new(8, 4, 32, 24).inverted(true))
         );
     }
 }
@@ -1980,7 +1984,10 @@ fn save_scene_generator_project(path: &Path) {
         background: Rgba8::OPAQUE_BLACK,
         layers: vec![
             scene_layer(SourceRef::Scene(scene_id(10)), 0),
-            scene_layer(SourceRef::Input(input(2)), 1),
+            Layer {
+                mask: Some(RectMask::new(8, 4, 32, 24).inverted(true)),
+                ..scene_layer(SourceRef::Input(input(2)), 1)
+            },
         ],
     });
     project.set_main_mix(MainMix::new(input(3), input(4)));
@@ -2006,6 +2013,7 @@ fn scene_layer(source: SourceRef, z_order: i32) -> Layer {
         enabled: true,
         geometry: LayerGeometry::new(0, 0, 64, 48, Rotation::Deg0),
         crop: None,
+        mask: None,
         opacity: u8::MAX,
         z_order,
     }

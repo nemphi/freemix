@@ -3292,6 +3292,7 @@ fn load_migrate_recover(store: &ProjectStore) -> AppResult<StoredProject> {
                 2 => store.migrate_v2()?,
                 3 => store.migrate_v3()?,
                 4 => store.migrate_v4()?,
+                5 => store.migrate_v5()?,
                 _ => {
                     return Err(StoreError::Validation(
                         ProjectValidationError::UnsupportedSchema {

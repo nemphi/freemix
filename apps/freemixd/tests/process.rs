@@ -13,8 +13,8 @@ use fm_client::{
 };
 use fm_model::{
     AudioBus, Input, InputKind, Layer, LayerGeometry, MainMix, Output, Project, ProjectSettings,
-    RestartPolicy, Rgba8, Rotation, Scene, SimulatedAudio, SimulatedInput, SimulatedVideo,
-    SolidColor, SourceRef, StartupPolicy,
+    RectMask, RestartPolicy, Rgba8, Rotation, Scene, SimulatedAudio, SimulatedInput,
+    SimulatedVideo, SolidColor, SourceRef, StartupPolicy,
 };
 use fm_persistence::{
     ManualTransitionKind as PersistedManualTransitionKind, ProjectPosition, ProjectStore,
@@ -476,6 +476,10 @@ fn commands_survive_restart_resume_and_duplicate_replay() {
         Some(domain_input(3))
     );
     assert_eq!(persisted.idempotency_receipts().len(), 3);
+    assert_eq!(
+        persisted.project().scenes()[0].layers[0].mask,
+        Some(RectMask::new(100, 50, 1_000, 600).inverted(true))
+    );
     let mut expected_project = canonical_project();
     expected_project.set_main_mix(MainMix::new(domain_input(1), domain_input(3)));
     assert_eq!(persisted.project(), &expected_project);
@@ -682,7 +686,7 @@ fn v2_project_migrates_and_serves() {
     daemon.wait_success();
 
     let migrated = ProjectStore::new(project_path).unwrap().load().unwrap();
-    assert_eq!(migrated.schema_version(), 5);
+    assert_eq!(migrated.schema_version(), 6);
     assert_eq!(migrated.project().name(), "Legacy V2");
 }
 
@@ -710,7 +714,7 @@ fn v3_project_migrates_and_serves() {
     daemon.wait_success();
 
     let migrated = ProjectStore::new(project_path).unwrap().load().unwrap();
-    assert_eq!(migrated.schema_version(), 5);
+    assert_eq!(migrated.schema_version(), 6);
     assert_eq!(migrated.project().name(), "Frozen V3 Scene");
     let scene = &migrated.project().scenes()[0];
     assert_eq!(scene.background, Rgba8::OPAQUE_BLACK);
@@ -718,6 +722,38 @@ fn v3_project_migrates_and_serves() {
         scene.layers[0].geometry,
         LayerGeometry::new(0, 0, 3_840, 2_160, Rotation::Deg0)
     );
+}
+
+#[test]
+fn v5_project_migrates_without_losing_manual_transition_state() {
+    let directory = TestDirectory::new("v5-migration");
+    let project_path = directory.project_path();
+    fs::create_dir(&project_path).unwrap();
+    fs::write(
+        project_path.join("project.json"),
+        include_str!("../../../crates/services/fm-persistence/tests/fixtures/schema-v5.json"),
+    )
+    .unwrap();
+
+    let daemon = Daemon::start(&project_path);
+    let mut client = daemon.connect();
+    assert_eq!(client.handshake(None).current_revision, 0);
+    assert!(matches!(client.receive(), WireMessage::Snapshot(_)));
+    drop(client);
+    daemon.wait_success();
+
+    let migrated = ProjectStore::new(project_path).unwrap().load().unwrap();
+    assert_eq!(migrated.schema_version(), 6);
+    assert_eq!(migrated.project().scenes()[0].layers[0].mask, None);
+    let transitions = migrated.runtime_manual_transitions();
+    let desired = transitions.desired.unwrap();
+    let realized = transitions.realized.unwrap();
+    assert_eq!(desired.kind, PersistedManualTransitionKind::Fade);
+    assert_eq!(desired.interval_start_basis_points, 0);
+    assert_eq!(desired.position_basis_points, 6_250);
+    assert_eq!(realized.kind, PersistedManualTransitionKind::Fade);
+    assert_eq!(realized.interval_start_basis_points, 6_250);
+    assert_eq!(realized.position_basis_points, 6_250);
 }
 
 #[test]
@@ -743,7 +779,7 @@ fn v1_project_is_rejected_as_unsupported() {
     assert!(
         String::from_utf8(output.stderr)
             .unwrap()
-            .contains("unsupported schema 1; expected 5")
+            .contains("unsupported schema 1; expected 6")
     );
 }
 
@@ -912,6 +948,7 @@ fn canonical_project() -> Project {
             enabled: true,
             geometry: LayerGeometry::new(0, 0, 1_280, 720, Rotation::Deg0),
             crop: None,
+            mask: Some(RectMask::new(100, 50, 1_000, 600).inverted(true)),
             opacity: u8::MAX,
             z_order: 0,
         }],

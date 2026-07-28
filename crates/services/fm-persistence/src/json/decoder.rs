@@ -5,8 +5,8 @@ use std::{
 
 use fm_model::{
     AudioBus, BusSend, CropRect, Input, InputKind, Layer, LayerGeometry, MainMix, Output, Project,
-    ProjectSettings, RestartPolicy, Rgba8, Rotation, Scene, SimulatedAudio, SimulatedInput,
-    SimulatedVideo, SolidColor, SourceRef, StartupPolicy,
+    ProjectSettings, RectMask, RestartPolicy, Rgba8, Rotation, Scene, SimulatedAudio,
+    SimulatedInput, SimulatedVideo, SolidColor, SourceRef, StartupPolicy,
 };
 use fm_types::{
     AudioFormat, BusId, Channel, ChannelLayout, ChromaLocation, ColorMetadata, ColorPrimaries,
@@ -28,6 +28,7 @@ use super::{
 const V2_SCHEMA_VERSION: u32 = 2;
 const V3_SCHEMA_VERSION: u32 = 3;
 const V4_SCHEMA_VERSION: u32 = 4;
+const V5_SCHEMA_VERSION: u32 = 5;
 
 pub(crate) fn decode(source: &str) -> Result<StoredProject, DecodeError> {
     let mut root = Object::new(Reader::new(source).document()?, "manifest")?;
@@ -40,7 +41,7 @@ pub(crate) fn decode(source: &str) -> Result<StoredProject, DecodeError> {
             },
         ));
     }
-    let project = ProjectDto::parse(root.take("project")?, false)?.into_domain();
+    let project = ProjectDto::parse(root.take("project")?, false, true)?.into_domain();
     let (routing, manual_transitions, position, receipts) =
         parse_runtime(root.take("runtime")?, true)?;
     root.finish()?;
@@ -69,7 +70,7 @@ pub(crate) fn decode_v3(source: &str) -> Result<StoredProject, DecodeError> {
             },
         ));
     }
-    let project = ProjectDto::parse(root.take("project")?, true)?.into_domain();
+    let project = ProjectDto::parse(root.take("project")?, true, false)?.into_domain();
     let (routing, _, position, receipts) = parse_runtime(root.take("runtime")?, false)?;
     root.finish()?;
     StoredProject::from_project(project, routing, position, receipts)
@@ -87,11 +88,36 @@ pub(crate) fn decode_v4(source: &str) -> Result<StoredProject, DecodeError> {
             },
         ));
     }
-    let project = ProjectDto::parse(root.take("project")?, false)?.into_domain();
+    let project = ProjectDto::parse(root.take("project")?, false, false)?.into_domain();
     let (routing, _, position, receipts) = parse_runtime(root.take("runtime")?, false)?;
     root.finish()?;
     StoredProject::from_project(project, routing, position, receipts)
         .map_err(DecodeError::Validation)
+}
+
+pub(crate) fn decode_v5(source: &str) -> Result<StoredProject, DecodeError> {
+    let mut root = Object::new(Reader::new(source).document()?, "manifest")?;
+    let schema = root.u32("schema_version")?;
+    if schema != V5_SCHEMA_VERSION {
+        return Err(DecodeError::Validation(
+            ProjectValidationError::UnsupportedSchema {
+                found: schema,
+                supported: V5_SCHEMA_VERSION,
+            },
+        ));
+    }
+    let project = ProjectDto::parse(root.take("project")?, false, false)?.into_domain();
+    let (routing, manual_transitions, position, receipts) =
+        parse_runtime(root.take("runtime")?, true)?;
+    root.finish()?;
+    StoredProject::from_project_with_manual_transitions(
+        project,
+        routing,
+        manual_transitions,
+        position,
+        receipts,
+    )
+    .map_err(DecodeError::Validation)
 }
 
 struct ProjectDto {
@@ -107,7 +133,7 @@ struct ProjectDto {
 }
 
 impl ProjectDto {
-    fn parse(value: Value, schema_v3: bool) -> Result<Self, DecodeError> {
+    fn parse(value: Value, schema_v3: bool, schema_v6: bool) -> Result<Self, DecodeError> {
         let mut object = Object::new(value, "project")?;
         let id = ProjectId::new(object.nonzero_u128("id")?);
         let name = object.string("name")?;
@@ -122,7 +148,13 @@ impl ProjectDto {
             settings,
             inputs,
             scenes: parse_array(object.take("scenes")?, "scenes", |value| {
-                parse_scene(value, schema_v3, dimensions.width(), dimensions.height())
+                parse_scene(
+                    value,
+                    schema_v3,
+                    schema_v6,
+                    dimensions.width(),
+                    dimensions.height(),
+                )
             })?,
             audio_buses: parse_array(object.take("audio_buses")?, "audio_buses", parse_bus)?,
             outputs: parse_array(object.take("outputs")?, "outputs", parse_output)?,
@@ -359,6 +391,7 @@ fn parse_simulated_audio(value: Value) -> Result<SimulatedAudio, DecodeError> {
 fn parse_scene(
     value: Value,
     schema_v3: bool,
+    schema_v6: bool,
     canvas_width: u32,
     canvas_height: u32,
 ) -> Result<Scene, DecodeError> {
@@ -375,7 +408,7 @@ fn parse_scene(
         name,
         background,
         layers: parse_array(object.take("layers")?, "layers", |value| {
-            parse_layer(value, schema_v3, canvas_width, canvas_height)
+            parse_layer(value, schema_v3, schema_v6, canvas_width, canvas_height)
         })?,
     };
     object.finish()?;
@@ -385,6 +418,7 @@ fn parse_scene(
 fn parse_layer(
     value: Value,
     schema_v3: bool,
+    schema_v6: bool,
     canvas_width: u32,
     canvas_height: u32,
 ) -> Result<Layer, DecodeError> {
@@ -392,9 +426,10 @@ fn parse_layer(
     let name = object.string("name")?;
     let source = parse_source(object.take("source")?)?;
     let enabled = object.boolean("enabled")?;
-    let (geometry, crop, opacity, z_order) = if schema_v3 {
+    let (geometry, crop, mask, opacity, z_order) = if schema_v3 {
         (
             LayerGeometry::new(0, 0, canvas_width, canvas_height, Rotation::Deg0),
+            None,
             None,
             u8::MAX,
             0,
@@ -403,6 +438,11 @@ fn parse_layer(
         (
             parse_geometry(object.take("geometry")?)?,
             parse_optional(object.take("crop")?, parse_crop)?,
+            if schema_v6 {
+                parse_optional(object.take("mask")?, parse_mask)?
+            } else {
+                None
+            },
             object.u8("opacity")?,
             object.i32("z_order")?,
         )
@@ -413,6 +453,7 @@ fn parse_layer(
         enabled,
         geometry,
         crop,
+        mask,
         opacity,
         z_order,
     };
@@ -461,6 +502,19 @@ fn parse_crop(value: Value) -> Result<CropRect, DecodeError> {
     );
     object.finish()?;
     Ok(crop)
+}
+
+fn parse_mask(value: Value) -> Result<RectMask, DecodeError> {
+    let mut object = Object::new(value, "rectangular mask")?;
+    let mask = RectMask::new(
+        object.u32("x")?,
+        object.u32("y")?,
+        object.u32("width")?,
+        object.u32("height")?,
+    )
+    .inverted(object.boolean("invert")?);
+    object.finish()?;
+    Ok(mask)
 }
 
 fn parse_source(value: Value) -> Result<SourceRef, DecodeError> {

@@ -1,0 +1,86 @@
+{
+  "schema_version": 5,
+  "project": {
+    "id": 9005,
+    "name": "Schema V5 Manual Fixture",
+    "settings": {
+      "frame_rate": {"numerator": 30, "denominator": 1},
+      "video": {
+        "width": 4,
+        "height": 2,
+        "frame_rate": {"numerator": 30, "denominator": 1},
+        "pixel_format": "rgba8",
+        "scan": "progressive",
+        "color": {
+          "primaries": "bt709",
+          "transfer": "bt1886",
+          "matrix": "bt709",
+          "range": "limited",
+          "chroma_location": "left"
+        }
+      },
+      "audio": {
+        "sample_rate_hz": 48000,
+        "sample_format": "f32",
+        "channels": ["left", "right"]
+      }
+    },
+    "inputs": [
+      {
+        "id": 1,
+        "name": "Input 1",
+        "kind": {"type": "simulated", "video": {"type": "bars"}, "audio": {"type": "silence"}},
+        "required_capabilities": []
+      },
+      {
+        "id": 2,
+        "name": "Input 2",
+        "kind": {"type": "simulated", "video": {"type": "solid", "red": 24, "green": 48, "blue": 72, "alpha": 255}, "audio": {"type": "silence"}},
+        "required_capabilities": []
+      }
+    ],
+    "scenes": [
+      {
+        "id": 10,
+        "name": "Legacy scene",
+        "background": {"red": 0, "green": 0, "blue": 0, "alpha": 255},
+        "layers": [
+          {
+            "name": "Legacy layer",
+            "source": {"type": "input", "id": 1},
+            "enabled": true,
+            "geometry": {"translation_x": 0, "translation_y": 0, "width": 4, "height": 2, "rotation": "deg0"},
+            "crop": {"x": 1, "y": 0, "width": 3, "height": 2},
+            "opacity": 255,
+            "z_order": 0
+          }
+        ]
+      }
+    ],
+    "audio_buses": [],
+    "outputs": [],
+    "main_mix": {"desired_program": 1, "desired_preview": 2},
+    "restart_policy": {"type": "never"}
+  },
+  "runtime": {
+    "routing": {
+      "desired_program_id": 1,
+      "realized_program_id": 1,
+      "desired_preview_id": 2,
+      "realized_preview_id": 2
+    },
+    "manual_transitions": {
+      "desired": {"kind": "fade", "from_id": 1, "to_id": 2, "interval_start_basis_points": 0, "position_basis_points": 6250},
+      "realized": {"kind": "fade", "from_id": 1, "to_id": 2, "interval_start_basis_points": 6250, "position_basis_points": 6250}
+    },
+    "position": {
+      "revision": 0,
+      "state_epoch": 2,
+      "event_sequence": 0,
+      "frames_rendered": 120,
+      "runtime_generation": 0,
+      "clock_time_nanos": 3966666666
+    },
+    "idempotency_receipts": []
+  }
+}

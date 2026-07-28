@@ -5,6 +5,7 @@ use crate::{CURRENT_SCHEMA_VERSION, MAX_MANIFEST_BYTES, ProjectStore, StoreError
 const V2_SCHEMA_VERSION: u32 = 2;
 const V3_SCHEMA_VERSION: u32 = 3;
 const V4_SCHEMA_VERSION: u32 = 4;
+const V5_SCHEMA_VERSION: u32 = 5;
 const V3_DEFAULTS: [&str; 8] = [
     "settings.frame_rate=60000/1001",
     "settings.video=1920x1080/nv12/progressive/bt709",
@@ -23,6 +24,7 @@ const V4_DEFAULTS: [&str; 5] = [
     "scenes.layers.z_order=0",
 ];
 const V5_DEFAULTS: [&str; 1] = ["runtime.manual_transitions=inactive"];
+const V6_DEFAULTS: [&str; 1] = ["scenes.layers.mask=null"];
 
 /// Summary of an explicitly completed manifest migration.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -67,6 +69,7 @@ impl ProjectStore {
                 .into_iter()
                 .chain(V4_DEFAULTS)
                 .chain(V5_DEFAULTS)
+                .chain(V6_DEFAULTS)
                 .collect(),
         })
     }
@@ -84,7 +87,11 @@ impl ProjectStore {
         Ok(MigrationReport {
             from_schema: V3_SCHEMA_VERSION,
             to_schema: CURRENT_SCHEMA_VERSION,
-            defaulted_fields: V4_DEFAULTS.into_iter().chain(V5_DEFAULTS).collect(),
+            defaulted_fields: V4_DEFAULTS
+                .into_iter()
+                .chain(V5_DEFAULTS)
+                .chain(V6_DEFAULTS)
+                .collect(),
         })
     }
 
@@ -101,7 +108,27 @@ impl ProjectStore {
         Ok(MigrationReport {
             from_schema: V4_SCHEMA_VERSION,
             to_schema: CURRENT_SCHEMA_VERSION,
-            defaulted_fields: V5_DEFAULTS.to_vec(),
+            defaulted_fields: V5_DEFAULTS.into_iter().chain(V6_DEFAULTS).collect(),
+        })
+    }
+
+    /// Explicitly migrates a schema-v5 manifest to the canonical schema.
+    ///
+    /// Exact desired and realized manual-transition state is preserved while
+    /// every existing layer receives the explicit no-mask default.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed data, the wrong schema, validation,
+    /// size-limit, or filesystem failures.
+    pub fn migrate_v5(&self) -> Result<MigrationReport, StoreError> {
+        let source = self.read_legacy_manifest()?;
+        let project = json::decode_v5(&source).map_err(StoreError::from_decode)?;
+        self.save(&project)?;
+        Ok(MigrationReport {
+            from_schema: V5_SCHEMA_VERSION,
+            to_schema: CURRENT_SCHEMA_VERSION,
+            defaulted_fields: V6_DEFAULTS.to_vec(),
         })
     }
 

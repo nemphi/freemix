@@ -81,20 +81,25 @@ native `CompositionPlan` layers with crop, nearest scaling, quarter-turn
 rotation, translation, opacity, stable z-order, premultiplied source-over, and
 canonical RGBA16F inputs. It also executes hard-edged rectangular masks in
 half-open post-crop source space, with exact CPU-oracle coverage and ignored
-native Metal readback coverage that was not run because no adapter was
-available. Schema v4 now persists each scene background and each layer's
-explicit input/scene source, geometry, crop, opacity, and z-order.
+native Metal readback coverage that remains opt-in and is not claimed without
+an adapter. Schema v6 persists each scene background and each layer's explicit
+input/scene source, geometry, crop, optional hard-edged rectangular mask,
+opacity, and z-order. Mask bounds are validated against the effective
+post-crop source dimensions before native planning; inversion does not change
+planner capacity or transient-resource accounting. The explicit v5-to-v6
+migration defaults existing layers to no mask while preserving exact desired
+and realized manual-transition state.
 `InputKind::Scene` explicitly routes a `SceneId` plus an optional audio
 `InputId`, while every persisted output explicitly routes a video `SceneId` and
 audio `BusId`. The explicit v3-to-v4 migration supplies opaque-black,
 canvas-identity, no-crop, full-opacity, and zero-z-order defaults while
 preserving legacy sources and layer counts; outputs are preserved as declared
-and are not inferred. Native `freemixd` now consumes this visual model through
-the bounded schema-v4 scene planner described under Phase 3 item 4 instead of
-rejecting scene inputs. Schema persistence and `freemixd` planner routing for
-masks, feathered or non-rectangular masks, keys, effects, per-output
-realization, live edits, and cross-platform or hardware certification remain
-outside this item, so its parity rows remain planned.
+and are not inferred. Native `freemixd` now consumes this visual model,
+including the persisted rectangular mask, through the bounded scene planner
+described under Phase 3 item 4 instead of rejecting scene inputs. Feathered or
+non-rectangular masks, keys, effects, per-output realization, live
+edits/replanning, and cross-platform or hardware certification remain outside
+this item, so its parity rows remain planned.
 
 Current implementation boundary for item 5: `freemix-studio` opens a native
 `eframe`/wgpu shell by default with responsive Program/Preview monitor wells,
@@ -183,8 +188,9 @@ crossfade two sources with sample-linear gains from each interval's explicit
 start/end mix endpoints. Identical terminals collapse to one unity-gain source.
 Automatic Fade and held or reversed Fade and Wipe T-bar movement propagate exact
 endpoints. The manual-transition core is exposed through `EngineCommand` and
-protocol 1.4, and schema v5 preserves exact desired and realized manual state
-across replay-safe daemon restart. The CLI can load, save, and migrate that
+protocol 1.4, and schema v6 preserves exact desired and realized manual state
+across replay-safe daemon restart, including through the explicit v5-to-v6
+no-mask migration. The CLI can load, save, and migrate that
 state, but has no manual-transition commands; Studio and Web remain on protocol
 1.3 without T-bar controls. Missing local audio, stills, scene silence, and
 configured simulated silence produce silence; unsupported simulated sine audio
@@ -467,7 +473,7 @@ camera alongside one uninterrupted camera, aggregate multi-camera startup
 cleanup and shutdown cancellation, frame conservation, and helper reaping. The
 hermetic daemon process exercises generated camera metadata plus selected GPU
 ingest, frame conservation, source timing, checkpointing, and cleanup. Separate
-protocol and capture-node tests cover metadata boundaries, and schema-v4
+protocol and capture-node tests cover metadata boundaries, and schema-v6
 persistence round-trips Display-P3/BT.709. Separate native Metal readback tests
 compare color conversions across supported primary/transfer combinations
 against CPU oracles; this does not claim that every combination traverses and
@@ -488,7 +494,7 @@ and screen/window/application-audio capture. Items 1 and 2, plus `IN-001`,
 `IN-005`, and `IN-011`, therefore remain incomplete and planned.
 
 Current implementation boundary for item 4: native `freemixd` now realizes
-schema-v4 scene inputs through an immutable `NativeProjectPlan` compiled before
+schema-v6 scene inputs through an immutable `NativeProjectPlan` compiled before
 opening media or GPU resources. The planner rejects missing references and
 video/audio cycles, bounds reachable scenes and total enabled layers at 64 each,
 and enforces a default 512 MiB peak transient RGBA16F budget. It maps full-width
@@ -512,13 +518,17 @@ Wipe plus 96 completion-fenced frames without production readback; a daemon test
 checkpoints and restarts from scene Program/Preview routes. These are macOS/Metal
 and hermetic diagnostics, not cross-platform certification. Independently,
 `fm-compositor` executes hard-edged rectangular masks in half-open post-crop
-source space, with exact CPU-oracle coverage and ignored native Metal readback
-coverage that was not run because no adapter was available. Schema persistence
-and `freemixd` planner routing for masks, feathered or non-rectangular masks,
-keys, effect stacks, a ten-layer product limit, per-output scene
-realization/routing, live scene edits/replanning, and cross-platform or hardware
-certification remain. Item 4 and its parity rows therefore remain incomplete
-and planned.
+source space. Schema v6 persists an optional mask per layer and native
+`freemixd` maps it into the immutable plan after strict post-crop bounds
+validation. CPU-oracle tests cover crop, half-open edges, inversion, rotation,
+translation, and stable resource accounting; ignored native Metal readback
+coverage remains opt-in and is not claimed without an adapter. The explicit
+v5-to-v6 migration supplies a no-mask default without changing desired or
+realized T-bar runtime state, and daemon checkpoint/restart tests preserve
+masks. Feathered or non-rectangular masks, keys, effect stacks, a ten-layer
+product limit, per-output scene realization/routing, live scene
+edits/replanning, and cross-platform or hardware certification remain. Item 4
+and its parity rows therefore remain incomplete and planned.
 
 Current implementation boundary for item 5: horizontal Wipe now flows through
 local and remote CLI commands, `fm-control`, `EngineCommand`, the switcher,

@@ -2,10 +2,11 @@ use fm_types::{AudioFormat, BusId, FrameRate, InputId, OutputId, ProjectId, Scen
 
 use crate::{ValidationError, validation::validate_project};
 
-pub const CURRENT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(5);
+pub const CURRENT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(6);
 pub const OLDEST_SUPPORTED_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(2);
-pub const SUPPORTED_SCHEMA_VERSIONS: [SchemaVersion; 4] = [
+pub const SUPPORTED_SCHEMA_VERSIONS: [SchemaVersion; 5] = [
     CURRENT_SCHEMA_VERSION,
+    SchemaVersion::new(5),
     SchemaVersion::new(4),
     SchemaVersion::new(3),
     OLDEST_SUPPORTED_SCHEMA_VERSION,
@@ -377,6 +378,7 @@ pub struct Layer {
     pub enabled: bool,
     pub geometry: LayerGeometry,
     pub crop: Option<CropRect>,
+    pub mask: Option<RectMask>,
     pub opacity: u8,
     pub z_order: i32,
 }
@@ -435,6 +437,35 @@ impl CropRect {
             width,
             height,
         }
+    }
+}
+
+/// A hard-edged rectangular mask in half-open post-crop source space.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RectMask {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+    pub invert: bool,
+}
+
+impl RectMask {
+    #[must_use]
+    pub const fn new(x: u32, y: u32, width: u32, height: u32) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+            invert: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn inverted(mut self, invert: bool) -> Self {
+        self.invert = invert;
+        self
     }
 }
 

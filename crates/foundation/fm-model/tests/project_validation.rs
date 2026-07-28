@@ -3,8 +3,8 @@ use std::num::NonZeroU128;
 use fm_model::{
     AudioBus, BusSend, CURRENT_SCHEMA_VERSION, CropRect, EntityRef, Input, InputKind, Layer,
     LayerGeometry, MainMix, MigrationInput, OLDEST_SUPPORTED_SCHEMA_VERSION, Output, OutputFormat,
-    Project, ProjectSettings, RestartPolicy, Rgba8, Rotation, SUPPORTED_SCHEMA_VERSIONS, Scene,
-    SchemaVersion, SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef,
+    Project, ProjectSettings, RectMask, RestartPolicy, Rgba8, Rotation, SUPPORTED_SCHEMA_VERSIONS,
+    Scene, SchemaVersion, SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef,
     StartupPolicy, ValidationErrorKind,
 };
 use fm_types::{
@@ -62,6 +62,7 @@ fn layer(name: &str, source: SourceRef) -> Layer {
         enabled: true,
         geometry: identity_geometry(),
         crop: None,
+        mask: None,
         opacity: u8::MAX,
         z_order: 0,
     }
@@ -244,11 +245,12 @@ fn duplicate_routes_are_rejected() {
 
 #[test]
 fn schema_support_window_is_current_through_oldest_supported() {
-    assert_eq!(CURRENT_SCHEMA_VERSION, SchemaVersion::new(5));
+    assert_eq!(CURRENT_SCHEMA_VERSION, SchemaVersion::new(6));
     assert_eq!(OLDEST_SUPPORTED_SCHEMA_VERSION, SchemaVersion::new(2));
     assert_eq!(
         SUPPORTED_SCHEMA_VERSIONS,
         [
+            SchemaVersion::new(6),
             SchemaVersion::new(5),
             SchemaVersion::new(4),
             SchemaVersion::new(3),
@@ -259,11 +261,59 @@ fn schema_support_window_is_current_through_oldest_supported() {
     assert!(!CURRENT_SCHEMA_VERSION.requires_migration());
     assert!(SchemaVersion::new(2).requires_migration());
     assert!(!SchemaVersion::new(1).is_supported());
-    assert!(!SchemaVersion::new(6).is_supported());
+    assert!(!SchemaVersion::new(7).is_supported());
 
     let input = MigrationInput::new(SchemaVersion::new(2), ("format-neutral", 7_u8));
     assert_eq!(input.schema_version(), SchemaVersion::new(2));
     assert_eq!(input.into_representation(), ("format-neutral", 7));
+}
+
+#[test]
+fn rectangular_masks_use_half_open_post_crop_source_bounds() {
+    let project_with_mask = |mask| {
+        let mut project = Project::new(project_id(99), "Mask bounds", settings());
+        project.add_input(Input {
+            id: input_id(99),
+            name: "Source".into(),
+            kind: InputKind::Color,
+            required_capabilities: Vec::new(),
+        });
+        let mut masked = layer("Masked", SourceRef::Input(input_id(99)));
+        masked.crop = Some(CropRect::new(100, 50, 300, 200));
+        masked.mask = Some(mask);
+        project.add_scene(Scene {
+            id: scene_id(99),
+            name: "Masked scene".into(),
+            background: Rgba8::OPAQUE_BLACK,
+            layers: vec![masked],
+        });
+        project
+    };
+
+    assert_eq!(
+        project_with_mask(RectMask::new(299, 199, 1, 1).inverted(true)).validate(),
+        Ok(())
+    );
+
+    for mask in [
+        RectMask::new(0, 0, 0, 1),
+        RectMask::new(0, 0, 1, 0),
+        RectMask::new(300, 0, 1, 1),
+        RectMask::new(0, 200, 1, 1),
+        RectMask::new(u32::MAX, 0, 2, 1),
+        RectMask::new(0, u32::MAX, 1, 2),
+    ] {
+        assert!(
+            project_with_mask(mask)
+                .validate()
+                .unwrap_err()
+                .iter()
+                .any(|error| {
+                    error.field == "layers.mask" && error.kind == ValidationErrorKind::OutOfRange
+                }),
+            "mask {mask:?} was accepted"
+        );
+    }
 }
 
 #[test]
