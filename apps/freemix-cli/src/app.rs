@@ -100,6 +100,20 @@ pub fn run(command: Command) -> AppResult<()> {
             key,
             expected_revision,
         )?,
+        Command::AlphaFade {
+            path,
+            frames,
+            key,
+            expected_revision,
+        } => mutate(
+            &path,
+            EngineCommand::AlphaFade {
+                duration_frames: frames,
+            },
+            frames,
+            key,
+            expected_revision,
+        )?,
         Command::Wipe {
             path,
             frames,
@@ -177,6 +191,19 @@ pub fn run(command: Command) -> AppResult<()> {
         } => remote::execute(
             address,
             fm_protocol::CommandPayload::Fade {
+                duration_frames: frames,
+            },
+            key,
+            expected_revision,
+        )?,
+        Command::RemoteAlphaFade {
+            address,
+            frames,
+            key,
+            expected_revision,
+        } => remote::execute(
+            address,
+            fm_protocol::CommandPayload::AlphaFade {
                 duration_frames: frames,
             },
             key,
@@ -774,6 +801,7 @@ Usage:
   freemix-cli preview <show.freemix> <input> [--key <key>] [--expect <revision>]
   freemix-cli cut <show.freemix> [--key <key>] [--expect <revision>]
   freemix-cli fade <show.freemix> <frames> [--key <key>] [--expect <revision>]
+  freemix-cli alpha-fade <show.freemix> <frames> [--key <key>] [--expect <revision>]
   freemix-cli wipe <show.freemix> <frames> [--key <key>] [--expect <revision>]
   freemix-cli tbar-start <show.freemix> <fade|wipe> [--key <key>] [--expect <revision>]
   freemix-cli tbar-position <show.freemix> <basis-points:0..=10000> [--key <key>] [--expect <revision>]
@@ -784,6 +812,7 @@ Usage:
   freemix-cli remote-preview <127.0.0.1:port> <input> [--key <key>] [--expect <revision>]
   freemix-cli remote-cut <127.0.0.1:port> [--key <key>] [--expect <revision>]
   freemix-cli remote-fade <127.0.0.1:port> <frames> [--key <key>] [--expect <revision>]
+  freemix-cli remote-alpha-fade <127.0.0.1:port> <frames> [--key <key>] [--expect <revision>]
   freemix-cli remote-wipe <127.0.0.1:port> <frames> [--key <key>] [--expect <revision>]
   freemix-cli remote-tbar-start <127.0.0.1:port> <fade|wipe> [--key <key>] [--expect <revision>]
   freemix-cli remote-tbar-position <127.0.0.1:port> <basis-points:0..=10000> [--key <key>] [--expect <revision>]

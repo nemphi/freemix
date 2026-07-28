@@ -645,9 +645,12 @@ additive protocol 1.6 `AlphaFade` command. Server admission rejects the command
 from older negotiated peers before control mutation; the client preserves the
 exact duration and applies the same version gate. Daemon durable execution
 projects all requested frames before saving, then a focused checkpoint test
-restores the settled Program/Preview routing and engine counters exactly. CLI,
-Studio, and Web operator controls, manual T-bar AlphaFade, and configured-output
-process acceptance remain absent.
+restores the settled Program/Preview routing and engine counters exactly. The
+CLI now exposes matching local and remote `alpha-fade ... <frames>` commands.
+Local execution settles and saves the bundle with replay-safe idempotency;
+remote execution preserves the exact duration and refuses to transmit after a
+protocol 1.5 downgrade. Studio and Web operator controls, manual T-bar
+AlphaFade, and configured-output process acceptance remain absent.
 
 The remaining AlphaFade operator and output path, stinger, Slide/Zoom, other
 transition families, cross-platform/fullscreen evidence, and complete `SW-004`

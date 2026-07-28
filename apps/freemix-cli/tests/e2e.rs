@@ -60,6 +60,20 @@ impl FakeRemoteServer {
         Self { address, worker }
     }
 
+    fn start_old_without_alpha_fade() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || serve_old_daemon_without_alpha_fade(&listener));
+        Self { address, worker }
+    }
+
+    fn start_alpha_fade() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || serve_alpha_fade(&listener));
+        Self { address, worker }
+    }
+
     fn start_fade_to_black() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -264,7 +278,13 @@ fn serve_fade_to_black(listener: &TcpListener) {
     let mut writer = stream.try_clone().unwrap();
     let mut reader = BufReader::new(stream);
     assert_client_hello(read_message(&mut reader));
-    write_handshake_version_with_fade_to_black(&mut writer, &engine, 0, live_fade_to_black());
+    write_handshake_version_with_fade_to_black(
+        &mut writer,
+        &engine,
+        0,
+        fm_protocol::FADE_TO_BLACK_PROTOCOL_VERSION,
+        live_fade_to_black(),
+    );
 
     let WireMessage::Command(command) = read_message(&mut reader) else {
         panic!("expected remote FTB command");
@@ -322,6 +342,114 @@ fn serve_fade_to_black(listener: &TcpListener) {
                     target_active: true,
                     position: fm_protocol::FadeToBlackPosition::BLACK,
                 }),
+            },
+        }),
+    );
+}
+
+fn serve_old_daemon_without_alpha_fade(listener: &TcpListener) {
+    let engine = EngineIdentity {
+        engine_id: "project-42".into(),
+        state_epoch: 1,
+        log_id: "fake-remote-log".into(),
+    };
+    let (stream, _) = listener.accept().unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(stream);
+    assert_client_hello(read_message(&mut reader));
+    write_handshake_version_with_fade_to_black(
+        &mut writer,
+        &engine,
+        0,
+        fm_protocol::FADE_TO_BLACK_PROTOCOL_VERSION,
+        live_fade_to_black(),
+    );
+
+    let mut unexpected = String::new();
+    assert_eq!(reader.read_line(&mut unexpected).unwrap(), 0);
+    assert!(
+        unexpected.is_empty(),
+        "protocol 1.6 command reached a 1.5 daemon"
+    );
+}
+
+fn serve_alpha_fade(listener: &TcpListener) {
+    let engine = EngineIdentity {
+        engine_id: "project-42".into(),
+        state_epoch: 1,
+        log_id: "fake-remote-log".into(),
+    };
+    let (stream, _) = listener.accept().unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(stream);
+    assert_client_hello(read_message(&mut reader));
+    write_handshake_version_with_fade_to_black(
+        &mut writer,
+        &engine,
+        0,
+        fm_protocol::ALPHA_FADE_PROTOCOL_VERSION,
+        live_fade_to_black(),
+    );
+
+    let WireMessage::Command(command) = read_message(&mut reader) else {
+        panic!("expected remote AlphaFade command");
+    };
+    assert_eq!(command.protocol, fm_protocol::ALPHA_FADE_PROTOCOL_VERSION);
+    assert_eq!(
+        command.payload,
+        CommandPayload::AlphaFade { duration_frames: 3 }
+    );
+    assert_eq!(command.idempotency_key, "remote-alpha-fade");
+    assert_eq!(command.expected_revision, Some(0));
+    write_message(
+        &mut writer,
+        &WireMessage::CommandResult(CommandResult::Accepted {
+            id: command.id,
+            revision: 1,
+            scheduled_frame: Some(1),
+        }),
+    );
+    write_message(
+        &mut writer,
+        &WireMessage::Event(EventMessage {
+            cursor: EventCursor {
+                engine: engine.clone(),
+                revision: 1,
+            },
+            payload: EventPayload::DesiredSwitcher {
+                program: input(2),
+                preview: input(1),
+                manual_transition: Some(fm_protocol::ManualTransitionStatus::Inactive),
+                fade_to_black: Some(live_fade_to_black()),
+            },
+        }),
+    );
+    write_message(
+        &mut writer,
+        &WireMessage::RuntimeEvent(RuntimeEventMessage {
+            server: server_identity(&engine),
+            revision: 1,
+            generation: 1,
+            sequence: 1,
+            event: RuntimeLifecycleEvent::Scheduled {
+                domains: vec![RuntimeDomainBoundary {
+                    domain: "switcher".into(),
+                    boundary: 1,
+                }],
+            },
+        }),
+    );
+    write_message(
+        &mut writer,
+        &WireMessage::RuntimeEvent(RuntimeEventMessage {
+            server: server_identity(&engine),
+            revision: 1,
+            generation: 1,
+            sequence: 2,
+            event: RuntimeLifecycleEvent::Realized {
+                domain: "switcher".into(),
+                manual_transition: Some(fm_protocol::ManualTransitionStatus::Inactive),
+                fade_to_black: Some(live_fade_to_black()),
             },
         }),
     );
@@ -491,12 +619,13 @@ fn write_handshake_version_with_fade_to_black(
     writer: &mut TcpStream,
     engine: &EngineIdentity,
     revision: u64,
+    negotiated: ProtocolVersion,
     fade_to_black: fm_protocol::FadeToBlackState,
 ) {
     write_message(
         writer,
         &WireMessage::ServerHello(ServerHello {
-            negotiated: fm_protocol::FADE_TO_BLACK_PROTOCOL_VERSION,
+            negotiated,
             granted_role: Role::Operator,
             permissions: vec!["switcher.write".into()],
             capabilities_digest: "fake-capabilities".into(),
@@ -751,6 +880,39 @@ fn cli_does_not_send_fade_to_black_to_a_protocol_1_4_daemon() {
 }
 
 #[test]
+fn cli_does_not_send_alpha_fade_to_a_protocol_1_5_daemon() {
+    let server = FakeRemoteServer::start_old_without_alpha_fade();
+    let output = invoke(&[
+        "remote-alpha-fade",
+        &server.address(),
+        "3",
+        "--key",
+        "unsupported-alpha-fade",
+    ]);
+    assert_failure_contains(
+        &output,
+        "command requires protocol 1.6, but the session negotiated 1.5",
+    );
+    server.finish();
+}
+
+#[test]
+fn remote_alpha_fade_preserves_duration_and_protocol() {
+    let server = FakeRemoteServer::start_alpha_fade();
+    let output = invoke(&[
+        "remote-alpha-fade",
+        &server.address(),
+        "3",
+        "--key",
+        "remote-alpha-fade",
+        "--expect",
+        "0",
+    ]);
+    assert_success(&output);
+    server.finish();
+}
+
+#[test]
 fn remote_fade_to_black_preserves_target_duration_and_replicated_state() {
     let server = FakeRemoteServer::start_fade_to_black();
     let output = invoke(&[
@@ -857,6 +1019,41 @@ fn local_wipe_preserves_duration_and_idempotency_contract() {
     assert_success(&duplicate);
     assert_eq!(stdout(&duplicate), wipe_status);
     assert_eq!(manifest(&context.project), wipe_manifest);
+
+    fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
+fn local_alpha_fade_settles_and_preserves_idempotency_contract() {
+    let context = ContractContext::new();
+    assert_success(&invoke(&["new", context.project_path()]));
+
+    let alpha_fade = invoke(&[
+        "alpha-fade",
+        context.project_path(),
+        "3",
+        "--key",
+        "alpha-fade-three",
+        "--expect",
+        "0",
+    ]);
+    assert_success(&alpha_fade);
+    let alpha_fade_status = stdout(&alpha_fade);
+    assert_status(&alpha_fade_status, 1, 3, 2, 2, 1, 1);
+    let alpha_fade_manifest = manifest(&context.project);
+
+    let duplicate = invoke(&[
+        "alpha-fade",
+        context.project_path(),
+        "99",
+        "--key",
+        "alpha-fade-three",
+        "--expect",
+        "0",
+    ]);
+    assert_success(&duplicate);
+    assert_eq!(stdout(&duplicate), alpha_fade_status);
+    assert_eq!(manifest(&context.project), alpha_fade_manifest);
 
     fs::remove_dir_all(context.root).unwrap();
 }

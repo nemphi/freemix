@@ -53,6 +53,12 @@ pub enum Command {
         key: Option<String>,
         expected_revision: Option<u64>,
     },
+    AlphaFade {
+        path: PathBuf,
+        frames: u32,
+        key: Option<String>,
+        expected_revision: Option<u64>,
+    },
     Wipe {
         path: PathBuf,
         frames: u32,
@@ -87,6 +93,12 @@ pub enum Command {
         expected_revision: Option<u64>,
     },
     RemoteFade {
+        address: SocketAddr,
+        frames: u32,
+        key: Option<String>,
+        expected_revision: Option<u64>,
+    },
+    RemoteAlphaFade {
         address: SocketAddr,
         frames: u32,
         key: Option<String>,
@@ -209,28 +221,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
                 expected_revision,
             })
         }
-        "fade" => {
-            let path = required_path(&mut arguments, "project path")?;
-            let frames = number(&required(&mut arguments, "frames")?, "frames")?;
-            let (key, expected_revision) = command_options(arguments)?;
-            Ok(Command::Fade {
-                path,
-                frames,
-                key,
-                expected_revision,
-            })
-        }
-        "wipe" => {
-            let path = required_path(&mut arguments, "project path")?;
-            let frames = number(&required(&mut arguments, "frames")?, "frames")?;
-            let (key, expected_revision) = command_options(arguments)?;
-            Ok(Command::Wipe {
-                path,
-                frames,
-                key,
-                expected_revision,
-            })
-        }
+        "fade" | "alpha-fade" | "wipe" => parse_local_timed_transition(&command, arguments),
         "tbar-start" | "tbar-position" | "tbar-commit" | "tbar-cancel" => {
             parse_local_t_bar(&command, arguments)
         }
@@ -238,8 +229,9 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
         "remote-status" => parse_remote_status(arguments),
         "remote-preview" => parse_remote_preview(arguments),
         "remote-cut" => parse_remote_cut(arguments),
-        "remote-fade" => parse_remote_fade(arguments),
-        "remote-wipe" => parse_remote_wipe(arguments),
+        "remote-fade" | "remote-alpha-fade" | "remote-wipe" => {
+            parse_remote_timed_transition(&command, arguments)
+        }
         "remote-tbar-start"
         | "remote-tbar-position"
         | "remote-tbar-commit"
@@ -289,6 +281,36 @@ fn parse_new(mut arguments: impl Iterator<Item = String>) -> Result<Command, Arg
         }
     }
     Ok(Command::New { path, name })
+}
+
+fn parse_local_timed_transition(
+    command: &str,
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Command, ArgsError> {
+    let path = required_path(&mut arguments, "project path")?;
+    let frames = number(&required(&mut arguments, "frames")?, "frames")?;
+    let (key, expected_revision) = command_options(arguments)?;
+    Ok(match command {
+        "fade" => Command::Fade {
+            path,
+            frames,
+            key,
+            expected_revision,
+        },
+        "alpha-fade" => Command::AlphaFade {
+            path,
+            frames,
+            key,
+            expected_revision,
+        },
+        "wipe" => Command::Wipe {
+            path,
+            frames,
+            key,
+            expected_revision,
+        },
+        _ => unreachable!("caller only dispatches timed local transitions"),
+    })
 }
 
 fn parse_local_t_bar(
@@ -398,27 +420,33 @@ fn parse_remote_cut(mut arguments: impl Iterator<Item = String>) -> Result<Comma
     })
 }
 
-fn parse_remote_fade(mut arguments: impl Iterator<Item = String>) -> Result<Command, ArgsError> {
+fn parse_remote_timed_transition(
+    command: &str,
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Command, ArgsError> {
     let address = socket_address(&required(&mut arguments, "address")?)?;
     let frames = number(&required(&mut arguments, "frames")?, "frames")?;
     let (key, expected_revision) = command_options(arguments)?;
-    Ok(Command::RemoteFade {
-        address,
-        frames,
-        key,
-        expected_revision,
-    })
-}
-
-fn parse_remote_wipe(mut arguments: impl Iterator<Item = String>) -> Result<Command, ArgsError> {
-    let address = socket_address(&required(&mut arguments, "address")?)?;
-    let frames = number(&required(&mut arguments, "frames")?, "frames")?;
-    let (key, expected_revision) = command_options(arguments)?;
-    Ok(Command::RemoteWipe {
-        address,
-        frames,
-        key,
-        expected_revision,
+    Ok(match command {
+        "remote-fade" => Command::RemoteFade {
+            address,
+            frames,
+            key,
+            expected_revision,
+        },
+        "remote-alpha-fade" => Command::RemoteAlphaFade {
+            address,
+            frames,
+            key,
+            expected_revision,
+        },
+        "remote-wipe" => Command::RemoteWipe {
+            address,
+            frames,
+            key,
+            expected_revision,
+        },
+        _ => unreachable!("caller only dispatches timed remote transitions"),
     })
 }
 
@@ -579,6 +607,42 @@ mod tests {
                 address: "127.0.0.1:9123".parse().unwrap(),
                 frames: 12,
                 key: Some("remote-wipe".into()),
+                expected_revision: None,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_local_and_remote_alpha_fade() {
+        assert_eq!(
+            parse(strings(&[
+                "alpha-fade",
+                "show.freemix",
+                "45",
+                "--key",
+                "alpha-fade-1",
+                "--expect",
+                "4",
+            ])),
+            Ok(Command::AlphaFade {
+                path: "show.freemix".into(),
+                frames: 45,
+                key: Some("alpha-fade-1".into()),
+                expected_revision: Some(4),
+            })
+        );
+        assert_eq!(
+            parse(strings(&[
+                "remote-alpha-fade",
+                "127.0.0.1:9123",
+                "12",
+                "--key",
+                "remote-alpha-fade",
+            ])),
+            Ok(Command::RemoteAlphaFade {
+                address: "127.0.0.1:9123".parse().unwrap(),
+                frames: 12,
+                key: Some("remote-alpha-fade".into()),
                 expected_revision: None,
             })
         );
