@@ -812,6 +812,56 @@ impl ClockMappedAudioSynchronizer {
         Ok(())
     }
 
+    /// Writes a plan at `output_offset` in preallocated planar vectors without
+    /// advancing synchronizer state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an output-shape error or [`AudioSynchronizerError::StaleRenderPlan`].
+    pub fn render_planned_planes(
+        &self,
+        plan: AudioRenderPlan,
+        output: &mut [Vec<f32>],
+        output_offset: usize,
+    ) -> Result<(), AudioSynchronizerError> {
+        self.validate_plan(plan)?;
+        let channels = self.channel_layout.channels().len();
+        if output.len() != channels {
+            return Err(AudioSynchronizerError::OutputPlaneCountMismatch {
+                expected: channels,
+                actual: output.len(),
+            });
+        }
+        let required = output_offset
+            .checked_add(plan.output_samples)
+            .ok_or(AudioSynchronizerError::ArithmeticOverflow)?;
+        for (plane, samples) in output.iter().enumerate() {
+            if samples.len() < required {
+                return Err(AudioSynchronizerError::OutputPlaneLengthMismatch {
+                    plane,
+                    expected: required,
+                    actual: samples.len(),
+                });
+            }
+        }
+        for output_sample in 0..plan.output_samples {
+            let phase = self.phases[output_sample];
+            for (channel, plane) in output.iter_mut().enumerate() {
+                let first = f64::from(self.buffered_sample(channel, phase.source_sample));
+                let value = if phase.fraction == 0.0 {
+                    first
+                } else {
+                    let second = f64::from(
+                        self.buffered_sample(channel, phase.source_sample.saturating_add(1)),
+                    );
+                    first + (second - first) * phase.fraction
+                };
+                plane[output_offset + output_sample] = interpolated_sample(value);
+            }
+        }
+        Ok(())
+    }
+
     /// Verifies that a render plan can still be committed without changing state.
     ///
     /// # Errors

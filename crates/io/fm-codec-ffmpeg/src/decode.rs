@@ -13,6 +13,8 @@ use serde_json::{Map, Value};
 
 use crate::{Adapter, Error, LimitKind, Source, StreamInfo, StreamSelector, Tool, Unsupported};
 
+const AUDIO_POSITION_PROBE_BLOCKS: usize = 32;
+
 /// One selected, non-empty bounded stream sequence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SequenceRequest {
@@ -46,6 +48,16 @@ pub struct DecodedVideoWindow {
 #[derive(Clone, Debug, PartialEq)]
 pub struct DecodedAudioWindow {
     pub blocks: Vec<AudioBlock>,
+    pub end_of_stream: bool,
+}
+
+/// Result of bounded metadata-only positioning on a local audio cursor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AudioCursorPosition {
+    pub skipped_blocks: usize,
+    pub skipped_samples: usize,
+    pub next_block: usize,
+    pub next_sample: usize,
     pub end_of_stream: bool,
 }
 
@@ -747,6 +759,108 @@ impl LocalVideoDecoder {
 }
 
 impl LocalAudioDecoder {
+    /// Skips complete audio blocks ending at or before `target_sample` without
+    /// decoding their PCM. The block containing the target remains next.
+    ///
+    /// Metadata probing is bounded by `max_skip_blocks`; cursor state changes
+    /// only after the full positioning operation succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed metadata, timeline, process, or block-limit error. A
+    /// target beyond the bounded probe returns [`Error::LimitExceeded`] and
+    /// leaves the cursor unchanged.
+    pub fn skip_complete_blocks_to_sample_bounded(
+        &mut self,
+        target_sample: usize,
+        max_skip_blocks: usize,
+    ) -> Result<AudioCursorPosition, Error> {
+        if max_skip_blocks == 0 {
+            return Err(Error::InvalidConfig);
+        }
+        if target_sample <= self.absolute_sample_position || self.end_of_stream {
+            return Ok(AudioCursorPosition {
+                skipped_blocks: 0,
+                skipped_samples: 0,
+                next_block: self.ordinal,
+                next_sample: self.absolute_sample_position,
+                end_of_stream: self.end_of_stream,
+            });
+        }
+
+        let initial_ordinal = self.ordinal;
+        let initial_sample = self.absolute_sample_position;
+        let mut ordinal = initial_ordinal;
+        let mut sample = initial_sample;
+        let mut end_of_stream = false;
+        let per_probe = usize::try_from(self.adapter.limits().max_audio_blocks)
+            .map_err(|_| Error::InvalidConfig)?
+            .min(AUDIO_POSITION_PROBE_BLOCKS);
+
+        while sample < target_sample && ordinal - initial_ordinal < max_skip_blocks {
+            let remaining = max_skip_blocks - (ordinal - initial_ordinal);
+            let requested = remaining.min(per_probe);
+            let prepared = self.adapter.prepare_audio_window(
+                &self.source,
+                self.stream.clone(),
+                ordinal,
+                requested,
+                CountRequirement::CursorUpTo,
+            )?;
+            if prepared.start_sample != sample {
+                return Err(Error::InvalidTimeline);
+            }
+            let mut skipped = 0_usize;
+            let mut skipped_samples = 0_usize;
+            for record in prepared.records.iter().take(prepared.count) {
+                let block_samples = record.sample_count.ok_or(Error::MalformedProbe)?;
+                let block_end = sample
+                    .checked_add(skipped_samples)
+                    .and_then(|position| position.checked_add(block_samples))
+                    .ok_or(Error::InvalidTimeline)?;
+                if block_end > target_sample {
+                    break;
+                }
+                skipped += 1;
+                skipped_samples = skipped_samples
+                    .checked_add(block_samples)
+                    .ok_or(Error::InvalidTimeline)?;
+            }
+            if skipped == 0 {
+                break;
+            }
+            ordinal = ordinal.checked_add(skipped).ok_or(Error::InvalidTimeline)?;
+            sample = sample
+                .checked_add(skipped_samples)
+                .ok_or(Error::InvalidTimeline)?;
+            end_of_stream = prepared.end_of_stream && skipped == prepared.count;
+            if skipped < prepared.count || end_of_stream {
+                break;
+            }
+        }
+
+        if sample < target_sample && !end_of_stream && ordinal - initial_ordinal == max_skip_blocks
+        {
+            return Err(Error::LimitExceeded {
+                kind: LimitKind::AudioBlocks,
+                actual: u64::try_from(max_skip_blocks)
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(1),
+                maximum: u64::try_from(max_skip_blocks).unwrap_or(u64::MAX),
+            });
+        }
+        self.ordinal = ordinal;
+        self.absolute_sample_position = sample;
+        self.end_of_stream = end_of_stream;
+        Ok(AudioCursorPosition {
+            skipped_blocks: ordinal - initial_ordinal,
+            skipped_samples: sample - initial_sample,
+            next_block: ordinal,
+            next_sample: sample,
+            end_of_stream,
+        })
+    }
+
     /// Decodes the next non-overlapping window, shortening only at proven EOS.
     ///
     /// Cursor state advances only after the complete window has been decoded

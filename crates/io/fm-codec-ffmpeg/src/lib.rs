@@ -37,8 +37,8 @@ use std::os::windows::fs::MetadataExt;
 
 pub use config::{Config, Executable, Limits};
 pub use decode::{
-    DecodeRequest, DecodedAudioWindow, DecodedSequence, DecodedVideoWindow, LocalAudioDecoder,
-    LocalVideoDecoder, SequenceRequest,
+    AudioCursorPosition, DecodeRequest, DecodedAudioWindow, DecodedSequence, DecodedVideoWindow,
+    LocalAudioDecoder, LocalVideoDecoder, SequenceRequest,
 };
 pub use error::{Error, LimitKind, Tool, UnavailableReason, Unsupported};
 pub use probe::{FormatInfo, Probe, StreamInfo, StreamKind, StreamSelector};

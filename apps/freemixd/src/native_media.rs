@@ -22,8 +22,9 @@ use std::{
 };
 
 use fm_audio::{
-    AudioCadenceOrigin, AudioSynchronizerLimits, ChannelMap, ClockMappedAudioSynchronizer,
-    InputState, MasterAudioInterval, MasterMixer, SourceGain,
+    AudioCadenceOrigin, AudioRenderPlan, AudioSynchronizerLimits, ChannelMap,
+    ClockMappedAudioSynchronizer, InputState, MasterAudioInterval, MasterMixer, PlanarAudioSource,
+    SourceGain,
 };
 use fm_clock::{ClockDomainId as MappingClockDomainId, ClockMapping, ClockSnapshot, ClockTime};
 #[cfg(test)]
@@ -60,6 +61,7 @@ const NATIVE_PROJECT_IN_FLIGHT_SLOTS: usize = 1;
 const SOURCE_REFILL_LOW_WATERMARK: usize = 4;
 const SOURCE_REFILL_MAX_PAGE: u32 = 4;
 const AUDIO_REFILL_LOW_WATERMARK: usize = 8;
+const NATIVE_AUDIO_SCRATCH_PLANE_SETS: usize = 5;
 
 /// Resource bounds applied while compiling schema-v4 native scenes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1355,6 +1357,8 @@ pub struct NativeAudioLimits {
     pub max_retained_blocks: usize,
     pub max_retained_samples: usize,
     pub max_retained_bytes: usize,
+    pub max_position_blocks: usize,
+    pub max_leading_silence_samples: u64,
     pub sink_blocks: usize,
 }
 
@@ -1367,6 +1371,8 @@ impl Default for NativeAudioLimits {
             max_retained_blocks: 1024,
             max_retained_samples: 1024 * 1024,
             max_retained_bytes: 32 * 1024 * 1024,
+            max_position_blocks: 4_096,
+            max_leading_silence_samples: 48_000 * 60,
             sink_blocks: 8,
         }
     }
@@ -1519,8 +1525,9 @@ struct NativeAudioSource {
     synchronizer: Option<ClockMappedAudioSynchronizer>,
     next_sample: u64,
     next_sequence: u64,
+    audio_start_master_sample: u64,
     end_of_stream: bool,
-    in_flight: Option<NonZeroU32>,
+    in_flight: Option<NativeAudioReservation>,
 }
 
 impl NativeAudioSource {
@@ -1530,6 +1537,7 @@ impl NativeAudioSource {
             synchronizer: None,
             next_sample: 0,
             next_sequence: 0,
+            audio_start_master_sample: 0,
             end_of_stream: true,
             in_flight: None,
         }
@@ -1539,6 +1547,7 @@ impl NativeAudioSource {
         synchronizer: ClockMappedAudioSynchronizer,
         next_sample: u64,
         next_sequence: u64,
+        audio_start_master_sample: u64,
         end_of_stream: bool,
     ) -> Self {
         Self {
@@ -1546,6 +1555,7 @@ impl NativeAudioSource {
             synchronizer: Some(synchronizer),
             next_sample,
             next_sequence,
+            audio_start_master_sample,
             end_of_stream,
             in_flight: None,
         }
@@ -1559,12 +1569,95 @@ struct NativeAudioCharge {
     bytes: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeAudioReservation {
+    count: NonZeroU32,
+    charge: NativeAudioCharge,
+}
+
+/// Mutation-point pressure and alignment telemetry for native audio.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NativeAudioTelemetry {
+    pub reservation_requests: u64,
+    pub reserved_blocks: usize,
+    pub reserved_samples: usize,
+    pub reserved_bytes: usize,
+    pub peak_reserved_blocks: usize,
+    pub peak_reserved_samples: usize,
+    pub peak_reserved_bytes: usize,
+    pub source_stalls: u64,
+    pub positioned_blocks: u64,
+    pub positioned_samples: u64,
+    pub leading_silence_samples: u64,
+    pub eos_padding_blocks: u64,
+    pub eos_padding_samples: u64,
+    pub peak_retained_blocks: usize,
+    pub peak_retained_samples: usize,
+    pub peak_retained_bytes: usize,
+}
+
+struct NativeAudioScratch {
+    primary: Vec<Vec<f32>>,
+    secondary: Vec<Vec<f32>>,
+    silence: Vec<Vec<f32>>,
+    discard: Vec<Vec<f32>>,
+    mix: Vec<Vec<f32>>,
+    plans: Vec<(InputId, AudioRenderPlan)>,
+    uncovered: Vec<InputId>,
+    padding_requests: Vec<(InputId, u64)>,
+    padding: Vec<StagedAudioPadding>,
+    completed: Vec<NativeAudioDecodeResult>,
+    validated: Vec<ValidatedCompletedAudioPage>,
+    inputs: Vec<InputId>,
+}
+
+struct StagedAudioPadding {
+    input: InputId,
+    block: AudioBlock,
+    page: ValidatedAudioPage,
+}
+
+struct ValidatedCompletedAudioPage {
+    input: InputId,
+    reservation: NativeAudioReservation,
+    window: DecodedAudioWindow,
+    page: ValidatedAudioPage,
+}
+
+impl NativeAudioScratch {
+    fn new(channels: usize, samples: usize, sources: usize) -> Self {
+        let planes = || vec![vec![0.0; samples]; channels];
+        Self {
+            primary: planes(),
+            secondary: planes(),
+            silence: planes(),
+            discard: planes(),
+            mix: planes(),
+            plans: Vec::with_capacity(sources),
+            uncovered: Vec::with_capacity(sources),
+            padding_requests: Vec::with_capacity(sources),
+            padding: Vec::with_capacity(sources),
+            completed: Vec::with_capacity(sources),
+            validated: Vec::with_capacity(sources),
+            inputs: Vec::with_capacity(sources),
+        }
+    }
+}
+
 impl NativeAudioCharge {
     fn checked_add(self, other: Self) -> Option<Self> {
         Some(Self {
             blocks: self.blocks.checked_add(other.blocks)?,
             samples: self.samples.checked_add(other.samples)?,
             bytes: self.bytes.checked_add(other.bytes)?,
+        })
+    }
+
+    fn checked_sub(self, other: Self) -> Option<Self> {
+        Some(Self {
+            blocks: self.blocks.checked_sub(other.blocks)?,
+            samples: self.samples.checked_sub(other.samples)?,
+            bytes: self.bytes.checked_sub(other.bytes)?,
         })
     }
 }
@@ -1580,7 +1673,7 @@ struct NativeAudioDecodeRequest {
 #[derive(Debug)]
 struct NativeAudioDecodeResult {
     input: InputId,
-    count: NonZeroU32,
+    reservation: NativeAudioReservation,
     window: Result<DecodedAudioWindow, fm_codec_ffmpeg::Error>,
 }
 
@@ -1616,7 +1709,15 @@ impl NativeAudioDecodeWorker {
                     if result_sender
                         .send(NativeAudioDecodeResult {
                             input: request.input,
-                            count: request.count,
+                            reservation: NativeAudioReservation {
+                                count: request.count,
+                                charge: NativeAudioCharge {
+                                    blocks: usize::try_from(request.count.get())
+                                        .unwrap_or(usize::MAX),
+                                    samples: request.max_samples,
+                                    bytes: request.max_bytes,
+                                },
+                            },
                             window,
                         })
                         .is_err()
@@ -1670,10 +1771,13 @@ pub struct NativeMasterRuntime {
     expected_next_frame: u64,
     ready_frame: Option<(u64, u64, u64)>,
     mixer: MasterMixer,
+    pending_mixer: MasterMixer,
     sink: CollectingAudioSink,
     sources: BTreeMap<InputId, NativeAudioSource>,
     worker: NativeAudioDecodeWorker,
     limits: NativeAudioLimits,
+    scratch: NativeAudioScratch,
+    audio_telemetry: NativeAudioTelemetry,
     failed: bool,
 }
 
@@ -1695,7 +1799,6 @@ impl NativeMasterRuntime {
         expected_next_frame: u64,
         limits: NativeAudioLimits,
     ) -> Result<Self, NativeMasterError> {
-        validate_audio_limits(limits, format.channels.channels().len())?;
         if format.sample_format != SampleFormat::F32 {
             return Err(NativeMasterError::InvalidFormat);
         }
@@ -1704,15 +1807,31 @@ impl NativeMasterRuntime {
         let mut sources = BTreeMap::new();
         let mut decoders = BTreeMap::new();
         let mut retained = NativeAudioCharge::default();
+        let mut audio_telemetry = NativeAudioTelemetry::default();
         let source_slots = resolved.len().max(1);
-        let source_sample_capacity = limits.max_retained_samples / source_slots;
-        let source_byte_capacity = limits.max_retained_bytes / source_slots;
         let output_samples = u128::from(format.sample_rate.hertz())
             .checked_mul(u128::from(frame_rate.denominator()))
             .ok_or(NativeMasterError::BoundsExceeded)?
             .div_ceil(u128::from(frame_rate.numerator()));
         let output_samples =
             usize::try_from(output_samples).map_err(|_| NativeMasterError::BoundsExceeded)?;
+        validate_audio_limits(limits, format.channels.channels().len(), output_samples)?;
+        let scratch_samples = output_samples
+            .checked_mul(NATIVE_AUDIO_SCRATCH_PLANE_SETS)
+            .ok_or(NativeMasterError::BoundsExceeded)?;
+        let scratch_bytes = audio_sample_bytes(scratch_samples, format.channels.channels().len())?;
+        let source_sample_capacity = limits
+            .max_retained_samples
+            .checked_sub(scratch_samples)
+            .map(|samples| samples / source_slots)
+            .filter(|samples| *samples != 0)
+            .ok_or(NativeMasterError::InvalidLimits)?;
+        let source_byte_capacity = limits
+            .max_retained_bytes
+            .checked_sub(scratch_bytes)
+            .map(|bytes| bytes / source_slots)
+            .filter(|bytes| *bytes != 0)
+            .ok_or(NativeMasterError::InvalidLimits)?;
         let (master_start_sample, _) = absolute_frame_sample_span(
             expected_next_frame,
             format.sample_rate.hertz(),
@@ -1768,40 +1887,20 @@ impl NativeMasterRuntime {
             let mut decoder = adapter
                 .open_local_audio(path, clock_domain, StreamSelector::Best)
                 .map_err(|error| NativeMasterError::Ffmpeg { input, error })?;
-            let page_bytes = audio_sample_bytes(
+            let first_page_bytes = audio_sample_bytes(
                 limits.max_samples_per_page,
                 format.channels.channels().len(),
             )?;
-            let window = decoder
+            let first_window = decoder
                 .decode_up_to_bounded(
-                    limits.max_blocks_per_page,
+                    NonZeroU32::MIN,
                     limits.max_samples_per_page,
-                    page_bytes,
+                    first_page_bytes,
                 )
                 .map_err(|error| NativeMasterError::Ffmpeg { input, error })?;
-            validate_audio_window_contract(input, &window, limits.max_blocks_per_page)?;
-            let first_audio_pts = window
-                .blocks
-                .first()
-                .map(|block| block.timing().presentation_timestamp().as_nanos());
-            if let Some(first_audio_pts) = first_audio_pts {
-                let mut video_decoder = adapter
-                    .open_local_video(path, clock_domain, StreamSelector::Best)
-                    .map_err(|error| NativeMasterError::Ffmpeg { input, error })?;
-                let first_video = video_decoder
-                    .decode_up_to(NonZeroU32::MIN)
-                    .map_err(|error| NativeMasterError::Ffmpeg { input, error })?;
-                let first_video_pts = first_video
-                    .frames
-                    .first()
-                    .map(|frame| frame.timing().presentation_timestamp().as_nanos())
-                    .ok_or(NativeMasterError::InvalidTimeline { input })?;
-                if first_audio_pts != first_video_pts {
-                    return Err(NativeMasterError::InvalidTimeline { input });
-                }
-            }
-            let Some(first) = window.blocks.first() else {
-                if !window.end_of_stream {
+            validate_audio_window_contract(input, &first_window, NonZeroU32::MIN)?;
+            let Some(first_audio) = first_window.blocks.first() else {
+                if !first_window.end_of_stream {
                     return Err(NativeMasterError::DecodeContract { input });
                 }
                 mixer.add_input(
@@ -1816,20 +1915,102 @@ impl NativeMasterRuntime {
                 sources.insert(input, NativeAudioSource::silence());
                 continue;
             };
-            if first.timing().clock_domain() != clock_domain {
+            let mut video_decoder = adapter
+                .open_local_video(path, clock_domain, StreamSelector::Best)
+                .map_err(|error| NativeMasterError::Ffmpeg { input, error })?;
+            let first_video = video_decoder
+                .decode_up_to(NonZeroU32::MIN)
+                .map_err(|error| NativeMasterError::Ffmpeg { input, error })?;
+            let first_video_pts = first_video
+                .frames
+                .first()
+                .map(|frame| frame.timing().presentation_timestamp().as_nanos())
+                .ok_or(NativeMasterError::InvalidTimeline { input })?;
+            if first_audio.timing().clock_domain() != clock_domain {
                 return Err(NativeMasterError::InvalidTimeline { input });
             }
-            let source_origin_sample =
-                original_timestamp_samples(first.timing(), first.sample_rate().hertz())
+            let media_audio_origin_sample =
+                original_timestamp_samples(first_audio.timing(), first_audio.sample_rate().hertz())
                     .and_then(|sample| u64::try_from(sample).ok())
                     .ok_or(NativeMasterError::InvalidTimeline { input })?;
-            let source_origin_timestamp = first.timing().presentation_timestamp();
-            let first_pts = source_origin_timestamp.as_nanos();
-            let (source_anchor, master_anchor) = if first_pts >= 0 {
-                (u64::try_from(first_pts).unwrap_or(u64::MAX), 0)
+            let media_audio_origin_timestamp = first_audio.timing().presentation_timestamp();
+            let source_rate = first_audio.sample_rate();
+            let source_layout = first_audio.channel_layout().clone();
+            let audio_offset = media_audio_origin_timestamp
+                .as_nanos()
+                .checked_sub(first_video_pts)
+                .ok_or(NativeMasterError::InvalidTimeline { input })?;
+            let audio_start_master_sample = if audio_offset <= 0 {
+                0
             } else {
-                (0, first_pts.unsigned_abs())
+                cadence_sample_at_or_after(audio_offset, format.sample_rate.hertz())?
             };
+            if audio_start_master_sample > limits.max_leading_silence_samples {
+                return Err(NativeMasterError::BoundsExceeded);
+            }
+            let target_source_timestamp = first_video_pts
+                .checked_add(master_start_timestamp)
+                .ok_or(NativeMasterError::InvalidTimeline { input })?
+                .max(media_audio_origin_timestamp.as_nanos());
+            let target_source_sample = cadence_sample_at_timestamp(
+                AudioCadenceOrigin::new(media_audio_origin_timestamp, media_audio_origin_sample),
+                target_source_timestamp,
+                source_rate.hertz(),
+            )?;
+            let target_ordinal = target_source_sample
+                .checked_sub(media_audio_origin_sample)
+                .and_then(|sample| usize::try_from(sample).ok())
+                .ok_or(NativeMasterError::InvalidTimeline { input })?;
+            let first_samples = first_audio.sample_count();
+            let mut positioned_end_of_stream = first_window.end_of_stream;
+            let mut positioned_next_sequence = first_audio
+                .timing()
+                .sequence()
+                .get()
+                .checked_add(1)
+                .ok_or(NativeMasterError::InvalidTimeline { input })?;
+            let window = if target_ordinal < first_samples {
+                first_window
+            } else {
+                let position = decoder
+                    .skip_complete_blocks_to_sample_bounded(
+                        target_ordinal,
+                        limits.max_position_blocks,
+                    )
+                    .map_err(|error| NativeMasterError::Ffmpeg { input, error })?;
+                audio_telemetry.positioned_blocks = audio_telemetry
+                    .positioned_blocks
+                    .saturating_add(u64::try_from(position.skipped_blocks).unwrap_or(u64::MAX));
+                audio_telemetry.positioned_samples = audio_telemetry
+                    .positioned_samples
+                    .saturating_add(u64::try_from(position.skipped_samples).unwrap_or(u64::MAX));
+                positioned_end_of_stream = position.end_of_stream;
+                positioned_next_sequence = u64::try_from(position.next_block)
+                    .map_err(|_| NativeMasterError::InvalidTimeline { input })?;
+                if position.end_of_stream {
+                    DecodedAudioWindow {
+                        blocks: Vec::new(),
+                        end_of_stream: true,
+                    }
+                } else {
+                    let page = decoder
+                        .decode_up_to_bounded(
+                            limits.max_blocks_per_page,
+                            limits.max_samples_per_page,
+                            first_page_bytes,
+                        )
+                        .map_err(|error| NativeMasterError::Ffmpeg { input, error })?;
+                    validate_audio_window_contract(input, &page, limits.max_blocks_per_page)?;
+                    page
+                }
+            };
+            let sync_master_sample = master_start_sample.max(audio_start_master_sample);
+            let sync_master_timestamp = normalized_sample_endpoint(
+                i128::from(sync_master_sample),
+                format.sample_rate.hertz(),
+            )
+            .ok_or(NativeMasterError::BoundsExceeded)?;
+            let (source_anchor, master_anchor) = nonnegative_mapping_anchors(first_video_pts, 0)?;
             let mapping = ClockMapping::new(
                 ClockSnapshot::new(mapping_domain, ClockTime::from_nanos(source_anchor)),
                 ClockSnapshot::new(mapping_domain, ClockTime::from_nanos(master_anchor)),
@@ -1842,26 +2023,60 @@ impl NativeMasterRuntime {
                 source_byte_capacity,
                 output_samples,
             )?;
-            let mut synchronizer = ClockMappedAudioSynchronizer::new(
-                first.sample_rate(),
-                format.sample_rate,
-                first.channel_layout().clone(),
-                mapping,
-                AudioCadenceOrigin::new(source_origin_timestamp, source_origin_sample),
+            let sync_source_origin = if let Some(block) = window.blocks.first() {
                 AudioCadenceOrigin::new(
-                    NormalizedTimestamp::from_nanos(master_start_timestamp),
-                    master_start_sample,
+                    block.timing().presentation_timestamp(),
+                    original_timestamp_samples(block.timing(), source_rate.hertz())
+                        .and_then(|sample| u64::try_from(sample).ok())
+                        .ok_or(NativeMasterError::InvalidTimeline { input })?,
+                )
+            } else {
+                let sample = media_audio_origin_sample
+                    .checked_add(
+                        u64::try_from(target_ordinal)
+                            .map_err(|_| NativeMasterError::InvalidTimeline { input })?,
+                    )
+                    .ok_or(NativeMasterError::InvalidTimeline { input })?;
+                AudioCadenceOrigin::new(
+                    cadence_timestamp_at_sample(
+                        AudioCadenceOrigin::new(
+                            media_audio_origin_timestamp,
+                            media_audio_origin_sample,
+                        ),
+                        sample,
+                        source_rate.hertz(),
+                    )?,
+                    sample,
+                )
+            };
+            let mut synchronizer = ClockMappedAudioSynchronizer::new(
+                source_rate,
+                format.sample_rate,
+                source_layout.clone(),
+                mapping,
+                sync_source_origin,
+                AudioCadenceOrigin::new(
+                    NormalizedTimestamp::from_nanos(sync_master_timestamp),
+                    sync_master_sample,
                 ),
                 synchronizer_limits,
             )?;
             synchronizer.preflight_push_batch(&window.blocks)?;
             synchronizer.push_batch(&window.blocks)?;
-            let page = validate_initial_audio_page(
-                input,
-                &window.blocks,
-                source_origin_sample,
-                clock_domain,
-            )?;
+            let page = if window.blocks.is_empty() {
+                ValidatedAudioPage {
+                    next_sample: synchronizer.source_origin().sample_index(),
+                    next_sequence: positioned_next_sequence,
+                    charge: NativeAudioCharge::default(),
+                }
+            } else {
+                validate_initial_audio_page(
+                    input,
+                    &window.blocks,
+                    synchronizer.source_origin().sample_index(),
+                    clock_domain,
+                )?
+            };
             validate_page_bounds(&page, limits)?;
             retained = retained
                 .checked_add(page.charge)
@@ -1870,12 +2085,12 @@ impl NativeMasterRuntime {
             let mixer_format = AudioFormat {
                 sample_rate: format.sample_rate,
                 sample_format: SampleFormat::F32,
-                channels: first.channel_layout().clone(),
+                channels: source_layout.clone(),
             };
             mixer.add_input(
                 input,
                 mixer_format,
-                ChannelMap::matching_labels(first.channel_layout(), &format.channels)?,
+                ChannelMap::matching_labels(&source_layout, &format.channels)?,
                 InputState {
                     follow_video: true,
                     ..InputState::default()
@@ -1887,7 +2102,8 @@ impl NativeMasterRuntime {
                     synchronizer,
                     page.next_sample,
                     page.next_sequence,
-                    window.end_of_stream,
+                    audio_start_master_sample,
+                    window.end_of_stream || positioned_end_of_stream,
                 ),
             );
             if !window.end_of_stream {
@@ -1897,6 +2113,13 @@ impl NativeMasterRuntime {
 
         let worker = NativeAudioDecodeWorker::spawn(decoders)?;
         let sink = CollectingAudioSink::new(limits.sink_blocks, OverflowPolicy::DropOldest)?;
+        observe_retained_peak(&mut audio_telemetry, retained);
+        let pending_mixer = mixer.clone();
+        let scratch = NativeAudioScratch::new(
+            format.channels.channels().len(),
+            output_samples,
+            sources.len(),
+        );
         Ok(Self {
             format,
             frame_rate,
@@ -1904,10 +2127,13 @@ impl NativeMasterRuntime {
             expected_next_frame,
             ready_frame: None,
             mixer,
+            pending_mixer,
             sink,
             sources,
             worker,
             limits,
+            scratch,
+            audio_telemetry,
             failed: false,
         })
     }
@@ -1952,7 +2178,26 @@ impl NativeMasterRuntime {
                     ..InputState::default()
                 },
             )?;
+            runtime.pending_mixer.add_input(
+                input,
+                format.clone(),
+                map.clone(),
+                InputState {
+                    follow_video: true,
+                    ..InputState::default()
+                },
+            )?;
             runtime.sources.insert(input, NativeAudioSource::silence());
+        }
+        let source_count = runtime.sources.len();
+        if runtime.scratch.plans.capacity() < source_count {
+            runtime.scratch.plans.reserve(source_count);
+            runtime.scratch.uncovered.reserve(source_count);
+            runtime.scratch.padding_requests.reserve(source_count);
+            runtime.scratch.padding.reserve(source_count);
+            runtime.scratch.completed.reserve(source_count);
+            runtime.scratch.validated.reserve(source_count);
+            runtime.scratch.inputs.reserve(source_count);
         }
         Ok(runtime)
     }
@@ -1988,11 +2233,16 @@ impl NativeMasterRuntime {
     }
 
     #[must_use]
+    pub const fn audio_telemetry(&self) -> NativeAudioTelemetry {
+        self.audio_telemetry
+    }
+
+    #[must_use]
     pub fn collected_audio(&self) -> impl ExactSizeIterator<Item = &AudioBlock> {
         self.sink.iter()
     }
 
-    /// Drains completed pages, evicts every source to the next absolute frame
+    /// Drains completed pages, plans every source for the next absolute frame
     /// interval, and schedules at most one bounded page per source.
     ///
     /// `false` means a non-EOS source does not yet cover the interval and the
@@ -2020,71 +2270,129 @@ impl NativeMasterRuntime {
             self.frame_rate,
         )?;
         self.commit_completed_pages()?;
-        let timing = output_audio_timing(
-            self.expected_next_frame,
-            start_sample,
-            end_sample,
-            self.format.sample_rate.hertz(),
-            self.clock_domain,
-        )?;
-        let samples = usize::try_from(end_sample - start_sample)
-            .map_err(|_| NativeMasterError::BoundsExceeded)?;
-        let interval = master_audio_interval(timing);
-        let mut covered = true;
-        for source in self.sources.values_mut() {
-            if source.explicit_silence {
-                continue;
-            }
-            loop {
+        loop {
+            self.scratch.uncovered.clear();
+            self.scratch.padding_requests.clear();
+            for (&input, source) in &mut self.sources {
+                if source.explicit_silence || end_sample <= source.audio_start_master_sample {
+                    continue;
+                }
+                let render_start = start_sample.max(source.audio_start_master_sample);
+                let render_samples = usize::try_from(end_sample - render_start)
+                    .map_err(|_| NativeMasterError::BoundsExceeded)?;
+                let render_timing = output_audio_timing(
+                    self.expected_next_frame,
+                    render_start,
+                    end_sample,
+                    self.format.sample_rate.hertz(),
+                    self.clock_domain,
+                )?;
                 let synchronizer = source
                     .synchronizer
                     .as_mut()
                     .ok_or(NativeMasterError::InvalidFormat)?;
-                match synchronizer.plan_render(interval, samples) {
-                    Ok(_) => break,
+                match synchronizer.plan_render(master_audio_interval(render_timing), render_samples)
+                {
+                    Ok(_) => {}
                     Err(fm_audio::AudioSynchronizerError::NeedMoreInput {
                         required_sample,
                         ..
                     }) if source.end_of_stream => {
-                        push_eos_silence(source, required_sample)?;
+                        self.scratch.padding_requests.push((input, required_sample));
                     }
                     Err(fm_audio::AudioSynchronizerError::NeedMoreInput { .. }) => {
-                        covered = false;
-                        break;
+                        self.scratch.uncovered.push(input);
                     }
                     Err(error) => return Err(error.into()),
                 }
             }
+            if self.scratch.padding_requests.is_empty() {
+                break;
+            }
+            self.commit_staged_eos_padding()?;
         }
-        self.schedule_refills(!covered)?;
+        self.audio_telemetry.source_stalls = self
+            .audio_telemetry
+            .source_stalls
+            .saturating_add(u64::try_from(self.scratch.uncovered.len()).unwrap_or(u64::MAX));
+        self.schedule_refills(end_sample)?;
+        let covered = self.scratch.uncovered.is_empty();
         self.ready_frame = covered.then_some((self.expected_next_frame, start_sample, end_sample));
         Ok(covered)
     }
 
+    fn commit_staged_eos_padding(&mut self) -> Result<(), NativeMasterError> {
+        self.scratch.padding.clear();
+        let mut retained = self.retained_charge();
+        for &(input, required_sample) in &self.scratch.padding_requests {
+            let source = self
+                .sources
+                .get(&input)
+                .ok_or(NativeMasterError::DecodeContract { input })?;
+            let block = eos_silence_block(source, required_sample, self.limits)?;
+            source
+                .synchronizer
+                .as_ref()
+                .ok_or(NativeMasterError::InvalidFormat)?
+                .preflight_push_batch(core::slice::from_ref(&block))?;
+            let page = validate_audio_page(
+                input,
+                source,
+                core::slice::from_ref(&block),
+                self.clock_domain,
+            )?;
+            validate_page_bounds(&page, self.limits)?;
+            retained = retained
+                .checked_add(page.charge)
+                .ok_or(NativeMasterError::BoundsExceeded)?;
+            validate_retained_bounds(retained, self.limits)?;
+            self.scratch
+                .padding
+                .push(StagedAudioPadding { input, block, page });
+        }
+        for staged in &self.scratch.padding {
+            let source =
+                self.sources
+                    .get_mut(&staged.input)
+                    .ok_or(NativeMasterError::DecodeContract {
+                        input: staged.input,
+                    })?;
+            commit_audio_page(source, core::slice::from_ref(&staged.block), staged.page)?;
+            self.audio_telemetry.eos_padding_blocks =
+                self.audio_telemetry.eos_padding_blocks.saturating_add(1);
+            self.audio_telemetry.eos_padding_samples = self
+                .audio_telemetry
+                .eos_padding_samples
+                .saturating_add(u64::try_from(staged.block.sample_count()).unwrap_or(u64::MAX));
+        }
+        observe_retained_peak(&mut self.audio_telemetry, retained);
+        Ok(())
+    }
+
     fn commit_completed_pages(&mut self) -> Result<(), NativeMasterError> {
-        let mut completed = Vec::with_capacity(self.sources.len());
+        self.scratch.completed.clear();
         loop {
             match self.worker.results.try_recv() {
-                Ok(result) => completed.push(result),
+                Ok(result) => self.scratch.completed.push(result),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     return Err(self.worker.disconnected_error());
                 }
             }
         }
-        let mut validated = Vec::with_capacity(completed.len());
+        self.scratch.validated.clear();
         let mut retained = self.retained_charge();
-        for completed in completed {
+        while let Some(completed) = self.scratch.completed.pop() {
             let input = completed.input;
             let window = completed
                 .window
                 .map_err(|error| NativeMasterError::Ffmpeg { input, error })?;
-            validate_audio_window_contract(input, &window, completed.count)?;
+            validate_audio_window_contract(input, &window, completed.reservation.count)?;
             let source = self
                 .sources
                 .get(&input)
                 .ok_or(NativeMasterError::DecodeContract { input })?;
-            if source.in_flight != Some(completed.count) || source.end_of_stream {
+            if source.in_flight != Some(completed.reservation) || source.end_of_stream {
                 return Err(NativeMasterError::DecodeContract { input });
             }
             let page = validate_audio_page(input, source, &window.blocks, self.clock_domain)?;
@@ -2093,42 +2401,40 @@ impl NativeMasterRuntime {
                 .checked_add(page.charge)
                 .ok_or(NativeMasterError::BoundsExceeded)?;
             validate_retained_bounds(retained, self.limits)?;
-            validated.push((input, completed.count, window, page));
+            self.scratch.validated.push(ValidatedCompletedAudioPage {
+                input,
+                reservation: completed.reservation,
+                window,
+                page,
+            });
         }
-        for (input, _count, window, page) in validated {
-            let source = self
-                .sources
-                .get_mut(&input)
-                .ok_or(NativeMasterError::DecodeContract { input })?;
-            commit_audio_page(source, &window.blocks, page)?;
+        while let Some(validated) = self.scratch.validated.pop() {
+            let source = self.sources.get_mut(&validated.input).ok_or(
+                NativeMasterError::DecodeContract {
+                    input: validated.input,
+                },
+            )?;
+            commit_audio_page(source, &validated.window.blocks, validated.page)?;
             source.in_flight = None;
-            source.end_of_stream = window.end_of_stream;
+            source.end_of_stream = validated.window.end_of_stream;
+            self.release_reservation(validated.reservation.charge)?;
         }
+        observe_retained_peak(&mut self.audio_telemetry, retained);
         Ok(())
     }
 
-    fn schedule_refills(&mut self, needs_coverage: bool) -> Result<(), NativeMasterError> {
+    fn schedule_refills(&mut self, requested_end: u64) -> Result<(), NativeMasterError> {
         let mut reserved = self
             .sources
             .values()
-            .filter_map(|source| {
-                let synchronizer = source.synchronizer.as_ref()?;
-                source.in_flight.map(|_| NativeAudioCharge {
-                    blocks: usize::try_from(self.limits.max_blocks_per_page.get())
-                        .unwrap_or(usize::MAX),
-                    samples: self.limits.max_samples_per_page,
-                    bytes: audio_sample_bytes(
-                        self.limits.max_samples_per_page,
-                        synchronizer.channel_layout().channels().len(),
-                    )
-                    .unwrap_or(usize::MAX),
-                })
-            })
+            .filter_map(|source| source.in_flight.map(|reservation| reservation.charge))
             .try_fold(NativeAudioCharge::default(), NativeAudioCharge::checked_add)
             .ok_or(NativeMasterError::BoundsExceeded)?;
         let retained = self.retained_charge();
-        let inputs = self.sources.keys().copied().collect::<Vec<_>>();
-        for input in inputs {
+        self.scratch.inputs.clear();
+        self.scratch.inputs.extend(self.sources.keys().copied());
+        for index in 0..self.scratch.inputs.len() {
+            let input = self.scratch.inputs[index];
             let source = self
                 .sources
                 .get(&input)
@@ -2141,8 +2447,10 @@ impl NativeMasterRuntime {
                 .as_ref()
                 .ok_or(NativeMasterError::InvalidFormat)?;
             let occupancy = synchronizer.telemetry();
+            let needs_coverage = self.scratch.uncovered.contains(&input);
             if source.end_of_stream
                 || source.in_flight.is_some()
+                || (!needs_coverage && requested_end <= source.audio_start_master_sample)
                 || (!needs_coverage && occupancy.buffered_blocks() > AUDIO_REFILL_LOW_WATERMARK)
             {
                 continue;
@@ -2159,18 +2467,26 @@ impl NativeMasterRuntime {
                 continue;
             };
             let reservation = NativeAudioCharge {
-                blocks: usize::try_from(self.limits.max_blocks_per_page.get())
-                    .map_err(|_| NativeMasterError::BoundsExceeded)?,
-                samples: self.limits.max_samples_per_page,
+                blocks: count.get() as usize,
+                samples: proportional_page_samples(count, self.limits)?,
                 bytes: audio_sample_bytes(
-                    self.limits.max_samples_per_page,
+                    proportional_page_samples(count, self.limits)?,
                     synchronizer.channel_layout().channels().len(),
                 )?,
             };
             let allocated = retained
                 .checked_add(reserved)
                 .and_then(|charge| charge.checked_add(reservation));
+            let source_limits = synchronizer.limits();
             if allocated.is_none_or(|charge| validate_retained_bounds(charge, self.limits).is_err())
+                || occupancy
+                    .buffered_samples()
+                    .checked_add(reservation.samples)
+                    .is_none_or(|samples| samples > source_limits.max_samples())
+                || occupancy
+                    .buffered_bytes()
+                    .checked_add(reservation.bytes)
+                    .is_none_or(|bytes| bytes > source_limits.max_bytes())
             {
                 if needs_coverage {
                     return Err(NativeMasterError::BoundsExceeded);
@@ -2180,7 +2496,7 @@ impl NativeMasterRuntime {
             let request = NativeAudioDecodeRequest {
                 input,
                 count,
-                max_samples: self.limits.max_samples_per_page,
+                max_samples: reservation.samples,
                 max_bytes: reservation.bytes,
             };
             let Some(sender) = self.worker.requests.as_ref() else {
@@ -2196,10 +2512,14 @@ impl NativeMasterRuntime {
             self.sources
                 .get_mut(&input)
                 .ok_or(NativeMasterError::DecodeContract { input })?
-                .in_flight = Some(count);
+                .in_flight = Some(NativeAudioReservation {
+                count,
+                charge: reservation,
+            });
             reserved = reserved
                 .checked_add(reservation)
                 .ok_or(NativeMasterError::BoundsExceeded)?;
+            self.record_reservation(reservation);
         }
         Ok(())
     }
@@ -2226,6 +2546,50 @@ impl NativeMasterRuntime {
                     None => total,
                 }
             })
+    }
+
+    fn record_reservation(&mut self, charge: NativeAudioCharge) {
+        self.audio_telemetry.reservation_requests =
+            self.audio_telemetry.reservation_requests.saturating_add(1);
+        self.audio_telemetry.reserved_blocks = self
+            .audio_telemetry
+            .reserved_blocks
+            .saturating_add(charge.blocks);
+        self.audio_telemetry.reserved_samples = self
+            .audio_telemetry
+            .reserved_samples
+            .saturating_add(charge.samples);
+        self.audio_telemetry.reserved_bytes = self
+            .audio_telemetry
+            .reserved_bytes
+            .saturating_add(charge.bytes);
+        self.audio_telemetry.peak_reserved_blocks = self
+            .audio_telemetry
+            .peak_reserved_blocks
+            .max(self.audio_telemetry.reserved_blocks);
+        self.audio_telemetry.peak_reserved_samples = self
+            .audio_telemetry
+            .peak_reserved_samples
+            .max(self.audio_telemetry.reserved_samples);
+        self.audio_telemetry.peak_reserved_bytes = self
+            .audio_telemetry
+            .peak_reserved_bytes
+            .max(self.audio_telemetry.reserved_bytes);
+    }
+
+    fn release_reservation(&mut self, charge: NativeAudioCharge) -> Result<(), NativeMasterError> {
+        let current = NativeAudioCharge {
+            blocks: self.audio_telemetry.reserved_blocks,
+            samples: self.audio_telemetry.reserved_samples,
+            bytes: self.audio_telemetry.reserved_bytes,
+        };
+        let next = current
+            .checked_sub(charge)
+            .ok_or(NativeMasterError::BoundsExceeded)?;
+        self.audio_telemetry.reserved_blocks = next.blocks;
+        self.audio_telemetry.reserved_samples = next.samples;
+        self.audio_telemetry.reserved_bytes = next.bytes;
+        Ok(())
     }
 
     /// Mixes the serviced Program interval, retains a copy in the bounded fake
@@ -2322,85 +2686,164 @@ impl NativeMasterRuntime {
         if self.sink.policy() == OverflowPolicy::Reject && self.sink.len() == self.sink.capacity() {
             return Err(NativeMasterError::SinkRejected);
         }
-        let interval = master_audio_interval(timing);
-        let mut render_plans = BTreeMap::new();
-        let mut source_blocks = BTreeMap::new();
+        let plan = native_audio_mix_plan(frame.program)?;
+        self.scratch.plans.clear();
+        for plane in &mut self.scratch.primary {
+            plane[..samples].fill(0.0);
+        }
+        for plane in &mut self.scratch.secondary {
+            plane[..samples].fill(0.0);
+        }
         for (&input, source) in &mut self.sources {
             if source.explicit_silence {
-                source_blocks.insert(
-                    input,
-                    AudioBlock::new(
-                        timing,
-                        self.format.sample_rate,
-                        self.format.channels.clone(),
-                        vec![vec![0.0; samples]; self.format.channels.channels().len()],
-                    )?,
-                );
                 continue;
             }
+            let output = if input == plan.primary {
+                &mut self.scratch.primary
+            } else if plan
+                .secondary
+                .is_some_and(|(secondary, _)| input == secondary)
+            {
+                &mut self.scratch.secondary
+            } else {
+                for plane in &mut self.scratch.discard {
+                    plane[..samples].fill(0.0);
+                }
+                &mut self.scratch.discard
+            };
+            if end_sample <= source.audio_start_master_sample {
+                continue;
+            }
+            let render_start = start_sample.max(source.audio_start_master_sample);
+            let output_offset = usize::try_from(render_start - start_sample)
+                .map_err(|_| NativeMasterError::BoundsExceeded)?;
+            let render_samples = samples
+                .checked_sub(output_offset)
+                .ok_or(NativeMasterError::BoundsExceeded)?;
+            let render_timing = output_audio_timing(
+                actual,
+                render_start,
+                end_sample,
+                self.format.sample_rate.hertz(),
+                self.clock_domain,
+            )?;
             let synchronizer = source
                 .synchronizer
                 .as_mut()
                 .ok_or(NativeMasterError::InvalidFormat)?;
-            let render_plan = synchronizer.plan_render(interval, samples)?;
-            let layout = synchronizer.channel_layout().clone();
-            let mut planes = vec![vec![0.0; samples]; layout.channels().len()];
-            let mut output = planes.iter_mut().map(Vec::as_mut_slice).collect::<Vec<_>>();
-            synchronizer.render_planned_into(render_plan, &mut output)?;
-            source_blocks.insert(
-                input,
-                AudioBlock::new(timing, self.format.sample_rate, layout, planes)?,
-            );
-            render_plans.insert(input, render_plan);
+            let render_plan =
+                synchronizer.plan_render(master_audio_interval(render_timing), render_samples)?;
+            synchronizer.render_planned_planes(render_plan, output, output_offset)?;
+            self.scratch.plans.push((input, render_plan));
         }
-        let plan = native_audio_mix_plan(frame.program)?;
-        let primary_block =
-            source_blocks
+        self.pending_mixer.copy_runtime_state_from(&self.mixer)?;
+        let primary_source =
+            self.sources
                 .get(&plan.primary)
                 .ok_or(NativeMasterError::DecodeContract {
                     input: plan.primary,
                 })?;
-        let mut next_mixer = self.mixer.clone();
-        let output = if let Some((secondary, secondary_gain)) = plan.secondary {
-            let secondary_block = source_blocks
+        let primary_layout = primary_source.synchronizer.as_ref().map_or(
+            &self.format.channels,
+            ClockMappedAudioSynchronizer::channel_layout,
+        );
+        let primary_planes = if primary_source.explicit_silence {
+            &self.scratch.silence
+        } else {
+            &self.scratch.primary
+        };
+        let primary_submission = PlanarAudioSource {
+            input: plan.primary,
+            sample_rate: self.format.sample_rate,
+            channel_layout: primary_layout,
+            planes: primary_planes,
+            samples,
+            source_gain: plan.primary_gain,
+        };
+        if let Some((secondary, secondary_gain)) = plan.secondary {
+            let secondary_source = self
+                .sources
                 .get(&secondary)
                 .ok_or(NativeMasterError::DecodeContract { input: secondary })?;
-            next_mixer.mix_timed_with_source_gains(
+            let secondary_layout = secondary_source.synchronizer.as_ref().map_or(
+                &self.format.channels,
+                ClockMappedAudioSynchronizer::channel_layout,
+            );
+            let secondary_planes = if secondary_source.explicit_silence {
+                &self.scratch.silence
+            } else {
+                &self.scratch.secondary
+            };
+            self.pending_mixer.mix_planar_timed_into(
                 timing,
                 samples,
                 &[
-                    (plan.primary, primary_block, plan.primary_gain),
-                    (secondary, secondary_block, secondary_gain),
+                    primary_submission,
+                    PlanarAudioSource {
+                        input: secondary,
+                        sample_rate: self.format.sample_rate,
+                        channel_layout: secondary_layout,
+                        planes: secondary_planes,
+                        samples,
+                        source_gain: secondary_gain,
+                    },
                 ],
                 &[plan.primary, secondary],
-            )?
+                &mut self.scratch.mix,
+            )?;
         } else {
-            next_mixer.mix_timed(
+            self.pending_mixer.mix_planar_timed_into(
                 timing,
                 samples,
-                &[(plan.primary, primary_block)],
-                Some(plan.primary),
-            )?
-        };
-        let block = output.block;
-        for (&input, &render_plan) in &render_plans {
+                &[primary_submission],
+                &[plan.primary],
+                &mut self.scratch.mix,
+            )?;
+        }
+        for &(input, render_plan) in &self.scratch.plans {
             self.sources
                 .get(&input)
                 .and_then(|source| source.synchronizer.as_ref())
                 .ok_or(NativeMasterError::DecodeContract { input })?
                 .preflight_commit_render(render_plan)?;
         }
-        for (input, render_plan) in render_plans {
+        for &(input, render_plan) in &self.scratch.plans {
             self.sources
                 .get_mut(&input)
                 .and_then(|source| source.synchronizer.as_mut())
                 .ok_or(NativeMasterError::DecodeContract { input })?
                 .commit_render(render_plan)?;
         }
+        // Canonical ownership is required by the returned/recorded frame. The
+        // diagnostic collecting sink also retains its own bounded clone; these
+        // are the only per-frame PCM allocations after reusable scratch render.
+        let block = AudioBlock::new(
+            timing,
+            self.format.sample_rate,
+            self.format.channels.clone(),
+            self.scratch
+                .mix
+                .iter()
+                .map(|plane| plane[..samples].to_vec())
+                .collect(),
+        )?;
         self.sink
             .collect(block.clone())
             .map_err(|_| NativeMasterError::SinkRejected)?;
-        self.mixer = next_mixer;
+        let leading = self
+            .sources
+            .values()
+            .filter(|source| !source.explicit_silence)
+            .fold(0_u64, |total, source| {
+                let end = end_sample.min(source.audio_start_master_sample);
+                let start = start_sample.min(end);
+                total.saturating_add(end - start)
+            });
+        self.audio_telemetry.leading_silence_samples = self
+            .audio_telemetry
+            .leading_silence_samples
+            .saturating_add(leading);
+        core::mem::swap(&mut self.mixer, &mut self.pending_mixer);
         self.expected_next_frame = self
             .expected_next_frame
             .checked_add(1)
@@ -2413,14 +2856,18 @@ impl NativeMasterRuntime {
 fn validate_audio_limits(
     limits: NativeAudioLimits,
     channels: usize,
+    output_samples: usize,
 ) -> Result<(), NativeMasterError> {
     let page_blocks = usize::try_from(limits.max_blocks_per_page.get()).unwrap_or(usize::MAX);
     let source_blocks = usize::try_from(limits.max_blocks_per_source.get()).unwrap_or(usize::MAX);
     if page_blocks > source_blocks
         || limits.max_samples_per_page == 0
+        || limits.max_samples_per_page < output_samples
         || limits.max_retained_blocks == 0
         || limits.max_retained_samples < limits.max_samples_per_page
         || limits.max_retained_bytes < audio_sample_bytes(limits.max_samples_per_page, channels)?
+        || limits.max_position_blocks == 0
+        || limits.max_leading_silence_samples == 0
         || limits.sink_blocks == 0
     {
         return Err(NativeMasterError::InvalidLimits);
@@ -2630,6 +3077,98 @@ fn audio_sample_bytes(samples: usize, channels: usize) -> Result<usize, NativeMa
         .ok_or(NativeMasterError::BoundsExceeded)
 }
 
+fn proportional_page_samples(
+    count: NonZeroU32,
+    limits: NativeAudioLimits,
+) -> Result<usize, NativeMasterError> {
+    limits
+        .max_samples_per_page
+        .checked_mul(count.get() as usize)
+        .and_then(|samples| samples.checked_add(limits.max_blocks_per_page.get() as usize - 1))
+        .map(|samples| samples / limits.max_blocks_per_page.get() as usize)
+        .filter(|samples| *samples != 0)
+        .ok_or(NativeMasterError::BoundsExceeded)
+}
+
+fn observe_retained_peak(telemetry: &mut NativeAudioTelemetry, charge: NativeAudioCharge) {
+    telemetry.peak_retained_blocks = telemetry.peak_retained_blocks.max(charge.blocks);
+    telemetry.peak_retained_samples = telemetry.peak_retained_samples.max(charge.samples);
+    telemetry.peak_retained_bytes = telemetry.peak_retained_bytes.max(charge.bytes);
+}
+
+fn nonnegative_mapping_anchors(source: i64, master: i64) -> Result<(u64, u64), NativeMasterError> {
+    let shift = -i128::from(source).min(i128::from(master)).min(0);
+    Ok((
+        u64::try_from(i128::from(source) + shift).map_err(|_| NativeMasterError::BoundsExceeded)?,
+        u64::try_from(i128::from(master) + shift).map_err(|_| NativeMasterError::BoundsExceeded)?,
+    ))
+}
+
+fn cadence_sample_at_or_after(timestamp: i64, sample_rate: u32) -> Result<u64, NativeMasterError> {
+    let timestamp = u128::try_from(timestamp).map_err(|_| NativeMasterError::BoundsExceeded)?;
+    let sample = timestamp
+        .checked_mul(u128::from(sample_rate))
+        .and_then(|value| value.checked_add(999_999_999))
+        .ok_or(NativeMasterError::BoundsExceeded)?
+        / 1_000_000_000;
+    u64::try_from(sample).map_err(|_| NativeMasterError::BoundsExceeded)
+}
+
+fn cadence_sample_at_timestamp(
+    origin: AudioCadenceOrigin,
+    timestamp: i64,
+    sample_rate: u32,
+) -> Result<u64, NativeMasterError> {
+    let origin_boundary = i128::from(origin.sample_index())
+        .checked_mul(1_000_000_000)
+        .ok_or(NativeMasterError::BoundsExceeded)?
+        / i128::from(sample_rate);
+    let absolute_position = i128::from(timestamp)
+        .checked_sub(i128::from(origin.timestamp().as_nanos()))
+        .and_then(|elapsed| elapsed.checked_add(origin_boundary))
+        .ok_or(NativeMasterError::BoundsExceeded)?;
+    let numerator = absolute_position
+        .checked_add(1)
+        .and_then(|value| value.checked_mul(i128::from(sample_rate)))
+        .and_then(|value| value.checked_sub(1))
+        .ok_or(NativeMasterError::BoundsExceeded)?;
+    let sample = floor_div_i128(numerator, 1_000_000_000)?;
+    u64::try_from(sample).map_err(|_| NativeMasterError::BoundsExceeded)
+}
+
+fn cadence_timestamp_at_sample(
+    origin: AudioCadenceOrigin,
+    sample: u64,
+    sample_rate: u32,
+) -> Result<NormalizedTimestamp, NativeMasterError> {
+    let origin_boundary =
+        normalized_sample_endpoint(i128::from(origin.sample_index()), sample_rate)
+            .ok_or(NativeMasterError::BoundsExceeded)?;
+    let sample_boundary = normalized_sample_endpoint(i128::from(sample), sample_rate)
+        .ok_or(NativeMasterError::BoundsExceeded)?;
+    let timestamp = origin
+        .timestamp()
+        .as_nanos()
+        .checked_add(sample_boundary - origin_boundary)
+        .ok_or(NativeMasterError::BoundsExceeded)?;
+    Ok(NormalizedTimestamp::from_nanos(timestamp))
+}
+
+fn floor_div_i128(numerator: i128, denominator: i128) -> Result<i128, NativeMasterError> {
+    if denominator <= 0 {
+        return Err(NativeMasterError::BoundsExceeded);
+    }
+    let quotient = numerator / denominator;
+    let remainder = numerator % denominator;
+    if remainder < 0 {
+        quotient
+            .checked_sub(1)
+            .ok_or(NativeMasterError::BoundsExceeded)
+    } else {
+        Ok(quotient)
+    }
+}
+
 fn absolute_frame_sample_span(
     frame: u64,
     sample_rate: u32,
@@ -2687,13 +3226,14 @@ fn master_audio_interval(timing: MediaTiming) -> MasterAudioInterval {
     )
 }
 
-fn push_eos_silence(
-    source: &mut NativeAudioSource,
+fn eos_silence_block(
+    source: &NativeAudioSource,
     required_sample: u64,
-) -> Result<(), NativeMasterError> {
+    limits: NativeAudioLimits,
+) -> Result<AudioBlock, NativeMasterError> {
     let synchronizer = source
         .synchronizer
-        .as_mut()
+        .as_ref()
         .ok_or(NativeMasterError::InvalidFormat)?;
     let samples = required_sample
         .checked_sub(source.next_sample)
@@ -2701,7 +3241,8 @@ fn push_eos_silence(
         .ok_or(NativeMasterError::BoundsExceeded)?;
     let samples = usize::try_from(samples)
         .map_err(|_| NativeMasterError::BoundsExceeded)?
-        .min(fm_audio::MAX_SAMPLES_PER_BLOCK);
+        .min(fm_audio::MAX_SAMPLES_PER_BLOCK)
+        .min(limits.max_samples_per_page);
     let end_sample = source
         .next_sample
         .checked_add(u64::try_from(samples).map_err(|_| NativeMasterError::BoundsExceeded)?)
@@ -2734,19 +3275,12 @@ fn push_eos_silence(
         ClockDomainId::new(synchronizer.mapping().source_domain().get()),
         SequenceNumber::new(source.next_sequence),
     )?;
-    let block = AudioBlock::new(
+    Ok(AudioBlock::new(
         timing,
         rate,
         synchronizer.channel_layout().clone(),
         vec![vec![0.0; samples]; synchronizer.channel_layout().channels().len()],
-    )?;
-    synchronizer.push(&block)?;
-    source.next_sample = end_sample;
-    source.next_sequence = source
-        .next_sequence
-        .checked_add(1)
-        .ok_or(NativeMasterError::BoundsExceeded)?;
-    Ok(())
+    )?)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4469,7 +5003,7 @@ impl NativeMediaRuntime {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU128;
+    use std::{num::NonZeroU128, process::Command, thread, time::Duration};
 
     use fm_clock::ClockDomainId as EngineClockDomainId;
     use fm_command::{
@@ -4711,6 +5245,7 @@ mod tests {
             synchronizer,
             next_sample,
             u64::try_from(chunks.len()).unwrap(),
+            0,
             end_of_stream,
         )
     }
@@ -4794,6 +5329,7 @@ mod tests {
                 ),
             );
         }
+        let pending_mixer = mixer.clone();
         NativeMasterRuntime {
             format,
             frame_rate: FrameRate::new(25, 1).unwrap(),
@@ -4801,6 +5337,7 @@ mod tests {
             expected_next_frame: 0,
             ready_frame: None,
             mixer,
+            pending_mixer,
             sink: CollectingAudioSink::new(sink_blocks, OverflowPolicy::DropOldest).unwrap(),
             sources: audio_sources,
             worker: NativeAudioDecodeWorker::spawn(BTreeMap::new()).unwrap(),
@@ -4808,6 +5345,8 @@ mod tests {
                 sink_blocks,
                 ..NativeAudioLimits::default()
             },
+            scratch: NativeAudioScratch::new(1, fm_audio::MAX_SAMPLES_PER_BLOCK, sources.len()),
+            audio_telemetry: NativeAudioTelemetry::default(),
             failed: false,
         }
     }
@@ -4826,6 +5365,7 @@ mod tests {
                 },
             )
             .unwrap();
+        let pending_mixer = mixer.clone();
         NativeMasterRuntime {
             format,
             frame_rate: FrameRate::new(25, 1).unwrap(),
@@ -4833,6 +5373,7 @@ mod tests {
             expected_next_frame: 0,
             ready_frame: None,
             mixer,
+            pending_mixer,
             sink: CollectingAudioSink::new(sink_blocks, OverflowPolicy::DropOldest).unwrap(),
             sources: BTreeMap::from([(input, NativeAudioSource::silence())]),
             worker: NativeAudioDecodeWorker::spawn(BTreeMap::new()).unwrap(),
@@ -4840,6 +5381,8 @@ mod tests {
                 sink_blocks,
                 ..NativeAudioLimits::default()
             },
+            scratch: NativeAudioScratch::new(1, fm_audio::MAX_SAMPLES_PER_BLOCK, 1),
+            audio_telemetry: NativeAudioTelemetry::default(),
             failed: false,
         }
     }
@@ -5952,6 +6495,195 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires FFmpeg and ffprobe"]
+    fn deep_restored_44_1k_nonzero_pts_positions_without_pcm_prefix_and_preserves_phase() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("deep-restored.nut");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:size=64x48:rate=25:d=15",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=44100:duration=15",
+                "-filter_complex",
+                "[0:v]setpts=PTS+2/TB[v];[1:a]asetpts=PTS+2/TB[a]",
+                "-map",
+                "[v]",
+                "-map",
+                "[a]",
+                "-c:v",
+                "ffv1",
+                "-c:a",
+                "pcm_s16le",
+                "-f",
+                "nut",
+            ])
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let adapter = Adapter::new(fm_codec_ffmpeg::Config {
+            allowed_root: Some(directory.path().to_owned()),
+            ..fm_codec_ffmpeg::Config::default()
+        })
+        .unwrap();
+        let source_id = input(1);
+        let restored_frame = 251;
+        let clock_domain = ClockDomainId::new(NonZeroU128::new(9).unwrap());
+        let mut master = NativeMasterRuntime::preflight_local_blocking(
+            Some(&adapter),
+            &[NativeResolvedSource::LocalVideo {
+                input: source_id,
+                path,
+            }],
+            mono_audio_format(),
+            FrameRate::new(25, 1).unwrap(),
+            clock_domain,
+            restored_frame,
+            NativeAudioLimits::default(),
+        )
+        .unwrap();
+        let telemetry = master.audio_telemetry();
+        assert!(telemetry.positioned_samples > 400_000);
+        assert!(master.retained_samples() <= NativeAudioLimits::default().max_samples_per_page);
+        let synchronizer = master.sources[&source_id].synchronizer.as_ref().unwrap();
+        assert!(synchronizer.source_origin().timestamp().as_nanos() > 10_000_000_000);
+
+        assert!(master.service_next_frame().unwrap());
+        let block = master
+            .render_frame_audio(&frame_result(restored_frame, source_id, None))
+            .unwrap();
+        let first = block.plane(0).unwrap()[0];
+        let second = block.plane(0).unwrap()[1];
+        let expected_first = 0.125 * (std::f64::consts::TAU * 440.0 * 10.04).sin();
+        let expected_second =
+            0.125 * (std::f64::consts::TAU * 440.0 * (10.04 + 1.0 / 48_000.0)).sin();
+        assert!((f64::from(first) - expected_first).abs() < 0.003);
+        assert!((f64::from(second) - expected_second).abs() < 0.003);
+    }
+
+    #[test]
+    #[ignore = "requires FFmpeg with AAC and ffprobe"]
+    #[allow(clippy::too_many_lines)]
+    fn aac_media_timeline_offsets_trim_early_audio_and_pad_delayed_audio() {
+        let directory = tempfile::tempdir().unwrap();
+        for (name, audio_pts, delayed) in [
+            ("early.mp4", "PTS+1.95/TB", false),
+            ("delayed.mp4", "PTS+2.05/TB", true),
+        ] {
+            let path = directory.path().join(name);
+            let filter = format!("[0:v]setpts=PTS+2/TB[v];[1:a]asetpts={audio_pts}[a]");
+            let status = Command::new("ffmpeg")
+                .args([
+                    "-nostdin",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "color=c=black:size=64x48:rate=25:d=3",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=440:sample_rate=44100:duration=3",
+                    "-filter_complex",
+                    &filter,
+                    "-map",
+                    "[v]",
+                    "-map",
+                    "[a]",
+                    "-c:v",
+                    "mpeg4",
+                    "-c:a",
+                    "aac",
+                ])
+                .arg(&path)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            let adapter = Adapter::new(fm_codec_ffmpeg::Config {
+                allowed_root: Some(directory.path().to_owned()),
+                ..fm_codec_ffmpeg::Config::default()
+            })
+            .unwrap();
+            let source_id = input(1);
+            let clock_domain = ClockDomainId::new(NonZeroU128::new(9).unwrap());
+            let mut master = NativeMasterRuntime::preflight_local_blocking(
+                Some(&adapter),
+                &[NativeResolvedSource::LocalVideo {
+                    input: source_id,
+                    path,
+                }],
+                mono_audio_format(),
+                FrameRate::new(25, 1).unwrap(),
+                clock_domain,
+                0,
+                NativeAudioLimits::default(),
+            )
+            .unwrap();
+            assert!(master.service_next_frame().unwrap());
+            let first = master
+                .render_frame_audio(&frame_result(0, source_id, None))
+                .unwrap();
+            if delayed {
+                let onset = master.sources[&source_id].audio_start_master_sample;
+                let first_silence = usize::try_from(onset.min(1_920)).unwrap();
+                assert!(
+                    first.plane(0).unwrap()[..first_silence]
+                        .iter()
+                        .all(|sample| sample.abs() < 1.0e-7)
+                );
+                let mut ready = false;
+                for _ in 0..1_000 {
+                    if master.service_next_frame().unwrap() {
+                        ready = true;
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+                assert!(ready);
+                let second = master
+                    .render_frame_audio(&frame_result(1, source_id, None))
+                    .unwrap();
+                if onset > 1_920 {
+                    let second_silence = usize::try_from(onset - 1_920).unwrap();
+                    assert!(
+                        second.plane(0).unwrap()[..second_silence]
+                            .iter()
+                            .all(|sample| sample.abs() < 1.0e-7)
+                    );
+                }
+                assert!(
+                    second
+                        .plane(0)
+                        .unwrap()
+                        .iter()
+                        .any(|sample| sample.abs() > 0.01)
+                );
+                assert!(master.audio_telemetry().leading_silence_samples >= onset);
+            } else {
+                assert!(
+                    first.plane(0).unwrap()[32..]
+                        .iter()
+                        .any(|sample| sample.abs() > 0.01)
+                );
+                assert_eq!(master.audio_telemetry().leading_silence_samples, 0);
+            }
+        }
+    }
+
+    #[test]
     fn uncovered_tiny_blocks_fail_at_the_per_source_ring_bound() {
         let source_id = input(1);
         let mut master = silent_test_master(source_id, 1);
@@ -5968,6 +6700,105 @@ mod tests {
             master.service_next_frame(),
             Err(NativeMasterError::BoundsExceeded)
         ));
+    }
+
+    #[test]
+    fn only_uncovered_source_bypasses_watermark_and_reserves_actual_count() {
+        let starved = input(1);
+        let covered = input(2);
+        let mut master = audio_test_master(&[(starved, 0.1), (covered, 0.2)], 1);
+        master.sources.insert(
+            starved,
+            audio_source(
+                (0..30).map(|sample| audio_chunk(sample, &[0.1])).collect(),
+                false,
+            ),
+        );
+        master.sources.insert(
+            covered,
+            audio_source(
+                (0..9)
+                    .map(|block| audio_chunk(block * 300, &[0.2; 300]))
+                    .collect(),
+                false,
+            ),
+        );
+
+        assert!(!master.service_next_frame().unwrap());
+        assert_eq!(
+            master.sources[&starved]
+                .in_flight
+                .map(|reservation| reservation.count.get()),
+            Some(2)
+        );
+        assert!(master.sources[&covered].in_flight.is_none());
+        let telemetry = master.audio_telemetry();
+        assert_eq!(telemetry.reservation_requests, 1);
+        assert_eq!(telemetry.reserved_blocks, 2);
+        assert_eq!(telemetry.peak_reserved_blocks, 2);
+        assert_eq!(telemetry.source_stalls, 1);
+    }
+
+    #[test]
+    fn eos_padding_preflights_all_sources_before_any_commit() {
+        let first = input(1);
+        let second = input(2);
+        let mut master = audio_test_master(&[(first, 0.1), (second, 0.2)], 1);
+        master.frame_rate = FrameRate::new(12_000, 1).unwrap();
+        master
+            .sources
+            .insert(first, audio_source(vec![audio_chunk(0, &[0.1; 3])], true));
+        master
+            .sources
+            .insert(second, audio_source(vec![audio_chunk(0, &[0.2; 3])], true));
+        master.limits.max_retained_samples = 7;
+        master.limits.max_retained_bytes = 7 * size_of::<f32>();
+        let before = [first, second].map(|input| {
+            master.sources[&input]
+                .synchronizer
+                .as_ref()
+                .unwrap()
+                .telemetry()
+        });
+
+        assert!(matches!(
+            master.service_next_frame(),
+            Err(NativeMasterError::BoundsExceeded)
+        ));
+        for (input, expected) in [first, second].into_iter().zip(before) {
+            assert_eq!(
+                master.sources[&input]
+                    .synchronizer
+                    .as_ref()
+                    .unwrap()
+                    .telemetry(),
+                expected
+            );
+        }
+        assert_eq!(master.audio_telemetry().eos_padding_blocks, 0);
+    }
+
+    #[test]
+    fn runtime_reuses_source_discard_mix_and_plan_scratch() {
+        let active = input(1);
+        let inactive = input(2);
+        let mut master = audio_test_master(&[(active, 0.1), (inactive, 0.2)], 2);
+        let primary = master.scratch.primary[0].as_ptr();
+        let discard = master.scratch.discard[0].as_ptr();
+        let mix = master.scratch.mix[0].as_ptr();
+        let plan_capacity = master.scratch.plans.capacity();
+
+        for frame in 0..2 {
+            assert!(master.service_next_frame().unwrap());
+            master
+                .render_frame_audio(&frame_result(frame, active, None))
+                .unwrap();
+        }
+
+        assert_eq!(master.scratch.primary[0].as_ptr(), primary);
+        assert_eq!(master.scratch.discard[0].as_ptr(), discard);
+        assert_eq!(master.scratch.mix[0].as_ptr(), mix);
+        assert_eq!(master.scratch.plans.capacity(), plan_capacity);
     }
 
     #[test]

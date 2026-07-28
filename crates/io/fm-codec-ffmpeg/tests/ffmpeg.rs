@@ -717,6 +717,54 @@ fn bounded_audio_window_rejects_before_decode_without_advancing() {
 }
 
 #[test]
+fn bounded_audio_cursor_position_skips_pcm_and_is_transactional() {
+    let _guard = ffmpeg_test_guard();
+    let Some(_) = require_ffmpeg() else {
+        return;
+    };
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("audio-position.nut");
+    generate_asset(&path);
+    let adapter = Adapter::new(Config {
+        allowed_root: Some(directory.path().to_owned()),
+        ..Config::default()
+    })
+    .unwrap();
+    let clock = ClockDomainId::new(NonZeroU128::new(53).unwrap());
+
+    let mut bounded = adapter
+        .open_local_audio(&path, clock, StreamSelector::Best)
+        .unwrap();
+    bounded.decode_up_to(NonZeroU32::MIN).unwrap();
+    assert!(matches!(
+        bounded.skip_complete_blocks_to_sample_bounded(10 * 1_024, 1),
+        Err(Error::LimitExceeded {
+            kind: LimitKind::AudioBlocks,
+            ..
+        })
+    ));
+    assert_eq!(
+        bounded.decode_up_to(NonZeroU32::MIN).unwrap().blocks[0]
+            .timing()
+            .sequence()
+            .get(),
+        1
+    );
+
+    let mut positioned = adapter
+        .open_local_audio(&path, clock, StreamSelector::Best)
+        .unwrap();
+    positioned.decode_up_to(NonZeroU32::MIN).unwrap();
+    let position = positioned
+        .skip_complete_blocks_to_sample_bounded(10 * 1_024, 16)
+        .unwrap();
+    assert_eq!(position.skipped_blocks, 9);
+    assert_eq!(position.skipped_samples, 9 * 1_024);
+    let next = positioned.decode_up_to(NonZeroU32::MIN).unwrap();
+    assert_eq!(next.blocks[0].timing().sequence().get(), 10);
+}
+
+#[test]
 fn audio_full_final_eos_is_sticky() {
     let _guard = ffmpeg_test_guard();
     let Some(_) = require_ffmpeg() else {

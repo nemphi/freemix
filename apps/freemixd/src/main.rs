@@ -1165,11 +1165,17 @@ impl NativeRuntimeTelemetry {
         self.audio_retained_blocks = saturating_u64(master.retained_blocks());
         self.audio_peak_retained_blocks = self
             .audio_peak_retained_blocks
-            .max(self.audio_retained_blocks);
+            .max(self.audio_retained_blocks)
+            .max(saturating_u64(
+                master.audio_telemetry().peak_retained_blocks,
+            ));
         self.audio_retained_samples = saturating_u64(master.retained_samples());
         self.audio_peak_retained_samples = self
             .audio_peak_retained_samples
-            .max(self.audio_retained_samples);
+            .max(self.audio_retained_samples)
+            .max(saturating_u64(
+                master.audio_telemetry().peak_retained_samples,
+            ));
         self.audio_sink_depth = saturating_u64(master.sink_len());
         let sink = master.sink_telemetry();
         self.audio_sink_peak_depth = saturating_u64(sink.high_watermark());

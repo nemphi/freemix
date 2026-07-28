@@ -4,7 +4,7 @@
 //! work. Its planar `f32` path is suitable for simulation and as a reference
 //! against which later real-time backends can be tested.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 
 use fm_types::{AudioFormat, ChannelLayout, FrameRate, InputId, SampleFormat, SampleRate};
@@ -767,6 +767,17 @@ pub struct TimedMasterOutput {
     pub meters: MeterReadings,
 }
 
+/// One borrowed planar source for allocation-free Master mixing.
+#[derive(Clone, Copy, Debug)]
+pub struct PlanarAudioSource<'a> {
+    pub input: InputId,
+    pub sample_rate: SampleRate,
+    pub channel_layout: &'a ChannelLayout,
+    pub planes: &'a [Vec<f32>],
+    pub samples: usize,
+    pub source_gain: SourceGain,
+}
+
 trait MixerBlockView {
     fn sample_rate(&self) -> SampleRate;
     fn channel_layout(&self) -> &ChannelLayout;
@@ -841,6 +852,38 @@ impl MixerBlockView for fm_frame::AudioBlock {
 
     fn planes(&self) -> &[Vec<f32>] {
         self.planes()
+    }
+}
+
+impl MixerBlockView for PlanarAudioSource<'_> {
+    fn sample_rate(&self) -> SampleRate {
+        self.sample_rate
+    }
+
+    fn channel_layout(&self) -> &ChannelLayout {
+        self.channel_layout
+    }
+
+    fn sample_count(&self) -> usize {
+        self.samples
+    }
+
+    fn planes(&self) -> &[Vec<f32>] {
+        self.planes
+    }
+}
+
+impl<'a> MixerSubmission<PlanarAudioSource<'a>> for PlanarAudioSource<'a> {
+    fn input(&self) -> InputId {
+        self.input
+    }
+
+    fn block(&self) -> &PlanarAudioSource<'a> {
+        self
+    }
+
+    fn source_gain(&self) -> SourceGain {
+        self.source_gain
     }
 }
 
@@ -972,6 +1015,31 @@ impl MasterMixer {
         Ok(())
     }
 
+    /// Copies mutable strip and clipping state from an identically configured mixer.
+    ///
+    /// This performs no allocation and is intended for reusable transactional
+    /// mixer pairs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AudioError::FormatMismatch`] unless both mixers have identical
+    /// formats and configured input strips.
+    pub fn copy_runtime_state_from(&mut self, other: &Self) -> Result<(), AudioError> {
+        if self.format != other.format || self.inputs.len() != other.inputs.len() {
+            return Err(AudioError::FormatMismatch);
+        }
+        for (id, strip) in &mut self.inputs {
+            let source = other.inputs.get(id).ok_or(AudioError::FormatMismatch)?;
+            if strip.format != source.format || strip.map != source.map {
+                return Err(AudioError::FormatMismatch);
+            }
+            strip.state = source.state;
+            strip.ramp = source.ramp;
+        }
+        self.clipping_policy = other.clipping_policy;
+        Ok(())
+    }
+
     /// Renders submitted blocks into the Master bus.
     ///
     /// Inputs not submitted for this call contribute silence. Every submitted
@@ -1050,6 +1118,30 @@ impl MasterMixer {
         self.timed_output(output_timing, mixed)
     }
 
+    /// Mixes borrowed planar sources into caller-owned preallocated planes.
+    ///
+    /// Only the first `samples` values of each source and output plane are used.
+    /// Validation completes before output or strip-ramp state changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation errors as [`Self::mix_timed_with_source_gains`]
+    /// plus output plane shape errors.
+    pub fn mix_planar_timed_into(
+        &mut self,
+        output_timing: fm_frame::MediaTiming,
+        samples: usize,
+        sources: &[PlanarAudioSource<'_>],
+        active_video_inputs: &[InputId],
+        output: &mut [Vec<f32>],
+    ) -> Result<(), AudioError> {
+        validate_sample_count(samples)?;
+        validate_canonical_output(&self.format, samples)?;
+        validate_timed_duration(output_timing, self.format.sample_rate, samples)?;
+        self.mix_block_views_into(samples, sources, active_video_inputs, output, false)
+            .map(drop)
+    }
+
     fn timed_output(
         &self,
         output_timing: fm_frame::MediaTiming,
@@ -1073,12 +1165,34 @@ impl MasterMixer {
         blocks: &[S],
         active_video_inputs: &[InputId],
     ) -> Result<MixedMaster, AudioError> {
+        let channels = self.format.channels.channels().len();
+        let mut output = vec![vec![0.0; samples]; channels];
+        let meters = self
+            .mix_block_views_into(samples, blocks, active_video_inputs, &mut output, true)?
+            .expect("metering was requested");
+        Ok(MixedMaster {
+            planes: output,
+            meters,
+        })
+    }
+
+    #[allow(clippy::needless_range_loop)]
+    fn mix_block_views_into<B: MixerBlockView, S: MixerSubmission<B>>(
+        &mut self,
+        samples: usize,
+        blocks: &[S],
+        active_video_inputs: &[InputId],
+        output: &mut [Vec<f32>],
+        measure_output: bool,
+    ) -> Result<Option<MeterReadings>, AudioError> {
         validate_sample_count(samples)?;
-        let mut seen = BTreeSet::new();
-        for submission in blocks {
+        for (index, submission) in blocks.iter().enumerate() {
             let id = submission.input();
             let block = submission.block();
-            if !seen.insert(id) {
+            if blocks[..index]
+                .iter()
+                .any(|previous| previous.input() == id)
+            {
                 return Err(AudioError::DuplicateInput(id));
             }
             let strip = self.inputs.get(&id).ok_or(AudioError::UnknownInput(id))?;
@@ -1093,12 +1207,28 @@ impl MasterMixer {
                     actual: block.sample_count(),
                 });
             }
-            validate_finite_samples(block.planes())?;
+            validate_finite_sample_prefix(block.planes(), samples)?;
         }
 
         let channels = self.format.channels.channels().len();
-        let mut output = vec![vec![0.0; samples]; channels];
-        let mut next_ramps = Vec::with_capacity(self.inputs.len());
+        if output.len() != channels {
+            return Err(AudioError::PlaneCountMismatch {
+                expected: channels,
+                actual: output.len(),
+            });
+        }
+        for (plane, values) in output.iter().enumerate() {
+            if values.len() < samples {
+                return Err(AudioError::PlaneLengthMismatch {
+                    plane,
+                    expected: samples,
+                    actual: values.len(),
+                });
+            }
+        }
+        for plane in output.iter_mut() {
+            plane[..samples].fill(0.0);
+        }
         for (id, strip) in &self.inputs {
             let block = blocks.iter().find_map(|submission| {
                 (submission.input() == *id).then(|| (submission.block(), submission.source_gain()))
@@ -1109,7 +1239,7 @@ impl MasterMixer {
             if let Some((block, source_gain)) = block
                 && audible
             {
-                for (sample, _) in block.planes()[0].iter().enumerate() {
+                for sample in 0..samples {
                     let strip_gain = ramp.next();
                     let source_gain = source_gain.at_sample(sample, samples);
                     for route in &strip.map.routes {
@@ -1124,28 +1254,23 @@ impl MasterMixer {
                     ramp.next();
                 }
             }
-            next_ramps.push((*id, ramp));
         }
 
         if self.clipping_policy == ClippingPolicy::Clamp {
-            for plane in &mut output {
-                for sample in plane {
+            for plane in output.iter_mut() {
+                for sample in &mut plane[..samples] {
                     *sample = sample.clamp(-1.0, 1.0);
                 }
             }
         }
-        validate_finite_samples(&output)?;
-        let meters = measure_planes(&output);
-        for (id, ramp) in next_ramps {
-            self.inputs
-                .get_mut(&id)
-                .expect("ramp belongs to a configured input")
-                .ramp = ramp;
+        validate_finite_sample_prefix(output, samples)?;
+        let meters = measure_output.then(|| measure_plane_prefix(output, samples));
+        for strip in self.inputs.values_mut() {
+            for _ in 0..samples {
+                strip.ramp.next();
+            }
         }
-        Ok(MixedMaster {
-            planes: output,
-            meters,
-        })
+        Ok(meters)
     }
 }
 
@@ -1265,13 +1390,46 @@ fn validate_sample_count(samples: usize) -> Result<(), AudioError> {
     Ok(())
 }
 
-fn validate_finite_samples(planes: &[Vec<f32>]) -> Result<(), AudioError> {
+fn validate_finite_sample_prefix(planes: &[Vec<f32>], samples: usize) -> Result<(), AudioError> {
     for (channel, plane) in planes.iter().enumerate() {
-        if let Some(sample) = plane.iter().position(|value| !value.is_finite()) {
+        if plane.len() < samples {
+            return Err(AudioError::PlaneLengthMismatch {
+                plane: channel,
+                expected: samples,
+                actual: plane.len(),
+            });
+        }
+        if let Some(sample) = plane[..samples].iter().position(|value| !value.is_finite()) {
             return Err(AudioError::NonFiniteSample { channel, sample });
         }
     }
     Ok(())
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn measure_plane_prefix(planes: &[Vec<f32>], samples: usize) -> MeterReadings {
+    let channels = planes
+        .iter()
+        .map(|plane| {
+            if samples == 0 {
+                return ChannelMeter::default();
+            }
+            let mut peak = 0.0_f32;
+            let mut squares = 0.0_f64;
+            for sample in &plane[..samples] {
+                peak = peak.max(sample.abs());
+                squares += f64::from(*sample) * f64::from(*sample);
+            }
+            let sample_count = f64::from(
+                u32::try_from(samples).expect("audio plane length is bounded below u32::MAX"),
+            );
+            ChannelMeter {
+                peak,
+                rms: (squares / sample_count).sqrt() as f32,
+            }
+        })
+        .collect();
+    MeterReadings { channels }
 }
 
 fn validate_canonical_output(format: &AudioFormat, samples: usize) -> Result<(), AudioError> {
@@ -1517,6 +1675,68 @@ mod tests {
             output.meters.channels(),
             &[ChannelMeter::default(), ChannelMeter::default()]
         );
+    }
+
+    #[test]
+    fn planar_mix_reuses_caller_storage_and_copies_transactional_state() {
+        let format = mono_format();
+        let source = input_id(1);
+        let mut mixer = MasterMixer::new(format.clone()).unwrap();
+        mixer
+            .add_input(
+                source,
+                format.clone(),
+                ChannelMap::identity(1).unwrap(),
+                InputState::default(),
+            )
+            .unwrap();
+        mixer
+            .set_input_state(
+                source,
+                InputState {
+                    gain: Gain::SILENCE,
+                    ..InputState::default()
+                },
+                4,
+            )
+            .unwrap();
+        let mut pending = MasterMixer::new(format.clone()).unwrap();
+        pending
+            .add_input(
+                source,
+                format.clone(),
+                ChannelMap::identity(1).unwrap(),
+                InputState::default(),
+            )
+            .unwrap();
+        pending.copy_runtime_state_from(&mixer).unwrap();
+        let planes = vec![vec![1.0, 1.0, f32::NAN, f32::NAN]];
+        let mut output = vec![vec![9.0; 8]];
+        let pointer = output[0].as_ptr();
+
+        pending
+            .mix_planar_timed_into(
+                timing_for_samples(0, 2),
+                2,
+                &[PlanarAudioSource {
+                    input: source,
+                    sample_rate: format.sample_rate,
+                    channel_layout: &format.channels,
+                    planes: &planes,
+                    samples: 2,
+                    source_gain: SourceGain::UNITY,
+                }],
+                &[source],
+                &mut output,
+            )
+            .unwrap();
+
+        assert_eq!(output[0].as_ptr(), pointer);
+        assert_close(output[0][0], 0.75);
+        assert_close(output[0][1], 0.5);
+        assert_close(output[0][2], 9.0);
+        assert_eq!(mixer.current_linear_gain(source), Some(1.0));
+        assert_eq!(pending.current_linear_gain(source), Some(0.5));
     }
 
     #[test]
