@@ -609,7 +609,7 @@ impl TcpSession {
     ///
     /// # Errors
     ///
-    /// Returns an error when there is no negotiated session, the queue is
+    /// Returns an error when there is no established current-protocol session, the queue is
     /// full, or the heartbeat sequence is exhausted.
     pub fn queue_heartbeat(
         &mut self,

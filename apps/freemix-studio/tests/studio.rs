@@ -63,13 +63,13 @@ fn handshake(project: ProjectId, revision: u64, outcome: HandshakeOutcome) -> Ha
 }
 
 fn handshake_version(
-    negotiated: ProtocolVersion,
+    protocol: ProtocolVersion,
     project: ProjectId,
     revision: u64,
     outcome: HandshakeOutcome,
 ) -> HandshakeResponse {
     HandshakeResponse {
-        negotiated,
+        protocol,
         granted_role: Role::Operator,
         permissions: vec!["switcher.take".to_owned()],
         capabilities: CapabilityReportSummary {
@@ -91,6 +91,7 @@ fn snapshot(revision: u64) -> SnapshotMessage {
         revision,
         show_name: "Studio test".to_owned(),
         inputs: vec![input(1), input(2)],
+        input_audio_strips: input_audio_strips(),
         desired_program: input(1),
         desired_preview: input(2),
         realized_program: input(1),
@@ -126,8 +127,22 @@ fn event(revision: u64) -> EventMessage {
                 position: FadeToBlackPosition::LIVE,
             },
             overlays: OverlayStatus::empty_channels(),
+            input_audio_strips: input_audio_strips(),
         },
     }
+}
+
+fn input_audio_strips() -> Vec<fm_protocol::InputAudioStripStatus> {
+    [input(1), input(2)]
+        .into_iter()
+        .map(|input| fm_protocol::InputAudioStripStatus {
+            input,
+            gain_millidb: 0,
+            muted: false,
+            follow_video: true,
+            delay_samples: 0,
+        })
+        .collect()
 }
 
 fn runtime_event(revision: u64) -> RuntimeEventMessage {
@@ -207,7 +222,7 @@ fn serve_snapshot_then_resume(listener: &TcpListener) {
     let WireMessage::HandshakeRequest(request) = first.receive() else {
         panic!("expected modern handshake request");
     };
-    assert_eq!(request.versions, vec![CURRENT_PROTOCOL_VERSION]);
+    assert_eq!(request.protocol, CURRENT_PROTOCOL_VERSION);
     assert_eq!(request.resume_cursor, None);
     first.send(&WireMessage::HandshakeResponse(handshake(
         project_id(),
@@ -362,7 +377,7 @@ fn existing_runtime_negotiates_the_current_contract() {
         let WireMessage::HandshakeRequest(request) = peer.receive() else {
             panic!("expected modern handshake request");
         };
-        assert_eq!(request.versions, vec![CURRENT_PROTOCOL_VERSION]);
+        assert_eq!(request.protocol, CURRENT_PROTOCOL_VERSION);
         peer.send(&WireMessage::HandshakeResponse(handshake_version(
             CURRENT_PROTOCOL_VERSION,
             project_id(),

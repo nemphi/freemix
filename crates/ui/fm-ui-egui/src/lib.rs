@@ -32,6 +32,14 @@ const NARROW_MONITOR_WIDTH: f32 = 700.0;
 /// Operator actions emitted by [`StudioShell`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StudioIntent {
+    /// Replaces one input's exact Master strip controls atomically.
+    SetInputAudioStrip {
+        input: InputId,
+        gain_millidb: i32,
+        muted: bool,
+        follow_video: bool,
+        delay_samples: u32,
+    },
     /// Selects an input on the Preview bus.
     SelectPreview(InputId),
     /// Performs an immediate Cut transition.
@@ -141,6 +149,7 @@ pub struct StudioUiState {
     pub view: Option<ClientView>,
     pub can_select_preview: bool,
     pub can_transition: bool,
+    pub can_control_audio: bool,
     pub pending_commands: usize,
     pub notice: Option<String>,
     pub error: Option<String>,
@@ -155,6 +164,7 @@ impl StudioUiState {
             view: None,
             can_select_preview: false,
             can_transition: false,
+            can_control_audio: false,
             pending_commands: 0,
             notice: None,
             error: None,
@@ -177,6 +187,13 @@ impl StudioUiState {
     ) -> Self {
         self.can_select_preview = can_select_preview;
         self.can_transition = can_transition;
+        self
+    }
+
+    /// Applies the negotiated audio-control permission.
+    #[must_use]
+    pub const fn with_audio_permission(mut self, can_control_audio: bool) -> Self {
+        self.can_control_audio = can_control_audio;
         self
     }
 }
@@ -476,10 +493,76 @@ impl StudioShell {
                 ui.add_space(8.0);
                 draw_manual_transition(ui, state, &mut intents);
                 ui.add_space(8.0);
+                draw_input_audio_strips(ui, state, &mut intents);
+                ui.add_space(8.0);
                 draw_inputs(ui, state, &mut intents);
             });
         intents
     }
+}
+
+fn draw_input_audio_strips(ui: &mut Ui, state: &StudioUiState, intents: &mut Vec<StudioIntent>) {
+    let enabled = state.connection_status.controls_enabled()
+        && state.can_control_audio
+        && state.view.is_some();
+    Frame::new()
+        .fill(GRAPHITE_RAISED)
+        .stroke(Stroke::new(1.0, Color32::from_rgb(67, 61, 44)))
+        .inner_margin(Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("INPUT AUDIO").small().strong().color(AMBER));
+                let Some(view) = &state.view else {
+                    ui.label(RichText::new("UNAVAILABLE").small().color(MUTED));
+                    return;
+                };
+                for status in &view.input_audio_strips {
+                    ui.label(RichText::new(label_for_input(view, status.input)).small());
+                    let mut gain_millidb = status.gain_millidb;
+                    let mut muted = status.muted;
+                    let mut follow_video = status.follow_video;
+                    let mut delay_samples = status.delay_samples;
+                    let gain_changed = ui
+                        .add_enabled(
+                            enabled,
+                            DragValue::new(&mut gain_millidb)
+                                .range(-96_000..=24_000)
+                                .suffix(" mdB")
+                                .speed(100.0),
+                        )
+                        .on_hover_text("Input gain in one-thousandth of a decibel")
+                        .changed();
+                    let mute_changed = ui
+                        .add_enabled(enabled, egui::Checkbox::new(&mut muted, "MUTE"))
+                        .changed();
+                    let follow_changed = ui
+                        .add_enabled(
+                            enabled,
+                            egui::Checkbox::new(&mut follow_video, "FOLLOW VIDEO"),
+                        )
+                        .changed();
+                    let delay_changed = ui
+                        .add_enabled(
+                            enabled,
+                            DragValue::new(&mut delay_samples)
+                                .range(0..=48_000)
+                                .suffix(" SAMPLES")
+                                .speed(48.0),
+                        )
+                        .on_hover_text("Input delay at the 48 kHz Master sample rate")
+                        .changed();
+                    if gain_changed || mute_changed || follow_changed || delay_changed {
+                        intents.push(StudioIntent::SetInputAudioStrip {
+                            input: status.input,
+                            gain_millidb,
+                            muted,
+                            follow_video,
+                            delay_samples,
+                        });
+                    }
+                }
+            });
+        });
 }
 
 fn draw_overlays(
@@ -1451,6 +1534,22 @@ mod tests {
 
     #[test]
     fn intents_are_typed_and_comparable() {
+        assert_eq!(
+            StudioIntent::SetInputAudioStrip {
+                input: input(9),
+                gain_millidb: -6_000,
+                muted: true,
+                follow_video: false,
+                delay_samples: 2_400,
+            },
+            StudioIntent::SetInputAudioStrip {
+                input: input(9),
+                gain_millidb: -6_000,
+                muted: true,
+                follow_video: false,
+                delay_samples: 2_400,
+            }
+        );
         assert_eq!(
             StudioIntent::SelectPreview(input(9)),
             StudioIntent::SelectPreview(input(9))

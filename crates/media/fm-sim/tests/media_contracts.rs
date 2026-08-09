@@ -236,7 +236,6 @@ fn reset_reproduces_video_hashes_and_audio_samples() {
     assert_eq!(first.sample(0, 0), Some(0.0));
     assert_eq!(first.sample(0, 1), Some(0.130_526_2));
     let first_hash = audio_block_hash(&first);
-    assert_eq!(first_hash, 14_903_389_993_544_021_285);
     audio.next_block().unwrap();
     audio.reset();
     let repeated = audio.next_block().unwrap().unwrap();

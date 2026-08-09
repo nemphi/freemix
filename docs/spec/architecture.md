@@ -127,7 +127,7 @@ action merely because its acknowledgement was lost.
 
 During current development, loading accepts the exact current schema only.
 Breaking schema changes replace the contract and its current-state coverage in
-place; version migration policy begins when the 1.0 contract is frozen.
+place; old-version loading is outside this development contract.
 
 ## 5. Graph model
 

@@ -9,7 +9,7 @@ use fm_types::InputId;
 use fm_ui_model::{ActiveManualTransition, BusSelection, ManualTransitionStatus, SwitcherState};
 use freemix_web::{
     ManualTransitionControl, ManualTransitionModel, ManualTransitionMotion,
-    ManualTransitionProjection, SUPPORTED_PROTOCOL_VERSIONS, TransitionControlState,
+    ManualTransitionProjection, TransitionControlState,
 };
 
 fn input(value: u128) -> InputId {
@@ -52,15 +52,6 @@ fn active(
 
 fn ready_session() -> Session {
     session(CURRENT_PROTOCOL_VERSION, &["transition"])
-}
-
-#[test]
-fn web_handshake_advertises_only_current_protocol() {
-    assert_eq!(
-        SUPPORTED_PROTOCOL_VERSIONS,
-        [fm_protocol::CURRENT_PROTOCOL_VERSION]
-    );
-    assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(2, 2));
 }
 
 #[test]

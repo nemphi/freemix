@@ -1,21 +1,21 @@
 use core::{num::NonZeroU128, str::FromStr};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     CapabilityReportMessage, CapabilityReportSummary, CodecError, CommandMessage, CommandPayload,
     CommandResult, DurableEventBatch, DurableGap, EngineIdentity, ErrorMessage, EventCursor,
     EventMessage, EventPayload, FadeToBlackPosition, FadeToBlackState, HandshakeOutcome,
-    HandshakeRequest, HandshakeResponse, HeartbeatMessage, ManualTransitionKind,
-    ManualTransitionPosition, ManualTransitionState, ManualTransitionStatus, OverlayStatus,
-    ResumeCursor, RuntimeEventMessage, RuntimeFailureDisposition, RuntimeLifecycleEvent,
-    ServerIdentity, SnapshotMessage, SnapshotReason, StingerAudioPolicy,
+    HandshakeRequest, HandshakeResponse, HeartbeatMessage, InputAudioStripStatus,
+    ManualTransitionKind, ManualTransitionPosition, ManualTransitionState, ManualTransitionStatus,
+    OverlayStatus, ResumeCursor, RuntimeEventMessage, RuntimeFailureDisposition,
+    RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage, SnapshotReason, StingerAudioPolicy,
     StingerMissingMediaFallback, StingerReadiness, StingerStatus, StructuredError, WireInputId,
     WireMessage, WireOutputId, WireOverlayChannelId, WireStingerSlotId,
 };
 
 use super::value::{
     parse_client_type, parse_durable_events, parse_field_issues, parse_role, parse_runtime_domains,
-    parse_string_list, parse_version, parse_versions, unescape,
+    parse_string_list, parse_version, unescape,
 };
 use super::{
     MAX_FIELD_NAME_BYTES, MAX_FIELD_VALUE_BYTES, MAX_FIELDS_PER_MESSAGE, MAX_LINE_BYTES,
@@ -24,8 +24,7 @@ use super::{
 
 /// Decodes exactly one newline-terminated wire record.
 ///
-/// Unknown fields prefixed with `?` are treated as optional extensions and
-/// ignored. Other unknown fields are rejected.
+/// Unknown fields are rejected by the exact-current contract.
 ///
 /// # Errors
 ///
@@ -209,7 +208,7 @@ impl Fields {
 }
 
 const fn valid_field_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'?')
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
 }
 
 fn decode_identity(fields: &mut Fields) -> Result<EngineIdentity, CodecError> {
@@ -250,6 +249,13 @@ fn decode_command_payload(
     payload_name: String,
 ) -> Result<CommandPayload, CodecError> {
     Ok(match payload_name.as_str() {
+        "input_audio_strip" => CommandPayload::SetInputAudioStrip {
+            input: fields.input("input")?,
+            gain_millidb: fields.parse_required("gain_millidb")?,
+            muted: fields.boolean("muted")?,
+            follow_video: fields.boolean("follow_video")?,
+            delay_samples: fields.parse_required("delay_samples")?,
+        },
         "select_preview" => CommandPayload::SelectPreview {
             input: fields.input("input")?,
         },
@@ -514,6 +520,7 @@ fn decode_snapshot(fields: &mut Fields) -> Result<SnapshotMessage, CodecError> {
         revision: fields.parse_required("revision")?,
         show_name: fields.required("show_name")?,
         inputs,
+        input_audio_strips: decode_input_audio_strips(fields)?,
         desired_program: fields.input("desired_program")?,
         desired_preview: fields.input("desired_preview")?,
         realized_program: fields.input("realized_program")?,
@@ -529,6 +536,62 @@ fn decode_snapshot(fields: &mut Fields) -> Result<SnapshotMessage, CodecError> {
         desired_overlays: decode_overlays(fields, "desired_overlays")?,
         realized_overlays: decode_overlays(fields, "realized_overlays")?,
     })
+}
+
+fn decode_input_audio_strips(
+    fields: &mut Fields,
+) -> Result<Vec<InputAudioStripStatus>, CodecError> {
+    let value = fields.required("input_audio_strips")?;
+    if value.is_empty() || value.split(',').take(MAX_LIST_ITEMS + 1).count() > MAX_LIST_ITEMS {
+        return Err(CodecError::InvalidField {
+            field: "input_audio_strips",
+            value,
+        });
+    }
+    let mut inputs = BTreeSet::new();
+    value
+        .split(',')
+        .map(|entry| {
+            let invalid = || CodecError::InvalidField {
+                field: "input_audio_strips",
+                value: entry.to_owned(),
+            };
+            let mut parts = entry.split(':');
+            let input = parts.next().ok_or_else(invalid)?;
+            let gain_millidb = parts.next().ok_or_else(invalid)?;
+            let muted = parts.next().ok_or_else(invalid)?;
+            let follow_video = parts.next().ok_or_else(invalid)?;
+            let delay_samples = parts.next().ok_or_else(invalid)?;
+            if parts.next().is_some() {
+                return Err(invalid());
+            }
+            let status = InputAudioStripStatus {
+                input: parse_input(input).ok_or_else(invalid)?,
+                gain_millidb: gain_millidb.parse().map_err(|_| invalid())?,
+                muted: match muted {
+                    "0" => false,
+                    "1" => true,
+                    _ => return Err(invalid()),
+                },
+                follow_video: match follow_video {
+                    "0" => false,
+                    "1" => true,
+                    _ => return Err(invalid()),
+                },
+                delay_samples: delay_samples.parse().map_err(|_| invalid())?,
+            };
+            if !(-96_000..=24_000).contains(&status.gain_millidb)
+                || status.delay_samples > 48_000
+                || !inputs.insert(status.input.get())
+            {
+                return Err(CodecError::InvalidField {
+                    field: "input_audio_strips",
+                    value: entry.to_owned(),
+                });
+            }
+            Ok(status)
+        })
+        .collect()
 }
 
 fn decode_overlays(
@@ -674,7 +737,7 @@ fn decode_overlay_queue(
 }
 
 fn decode_stingers(fields: &mut Fields) -> Result<Vec<StingerStatus>, CodecError> {
-    let value = fields.required("?stingers")?;
+    let value = fields.required("stingers")?;
     if value.is_empty() {
         return Ok(Vec::new());
     }
@@ -742,7 +805,7 @@ fn decode_stinger_status(entry: &str) -> Option<StingerStatus> {
 
 fn invalid_stingers(value: &str) -> CodecError {
     CodecError::InvalidField {
-        field: "?stingers",
+        field: "stingers",
         value: value.to_owned(),
     }
 }
@@ -756,6 +819,7 @@ fn decode_event(fields: &mut Fields) -> Result<EventMessage, CodecError> {
             manual_transition: decode_manual_status(fields, ManualStatusFields::Unqualified)?,
             fade_to_black: decode_fade_to_black_state(fields, FadeToBlackStateFields::Unqualified)?,
             overlays: decode_overlays(fields, "overlays")?,
+            input_audio_strips: decode_input_audio_strips(fields)?,
         },
         "stinger_slots_changed" => EventPayload::StingerSlotsChanged {
             program: fields.input("program")?,
@@ -764,6 +828,7 @@ fn decode_event(fields: &mut Fields) -> Result<EventMessage, CodecError> {
             fade_to_black: decode_fade_to_black_state(fields, FadeToBlackStateFields::Unqualified)?,
             stingers: decode_stingers(fields)?,
             overlays: decode_overlays(fields, "overlays")?,
+            input_audio_strips: decode_input_audio_strips(fields)?,
         },
         _ => {
             return Err(CodecError::InvalidField {
@@ -834,7 +899,11 @@ fn decode_resume_cursor(
 }
 
 fn decode_handshake_request(fields: &mut Fields) -> Result<HandshakeRequest, CodecError> {
-    let versions = parse_versions(&fields.required("versions")?)?;
+    let protocol_value = fields.required("protocol")?;
+    let protocol = parse_version(&protocol_value).ok_or(CodecError::InvalidField {
+        field: "protocol",
+        value: protocol_value,
+    })?;
     let client_type_value = fields.required("client_type")?;
     let client_type = parse_client_type(&client_type_value).ok_or(CodecError::InvalidField {
         field: "client_type",
@@ -851,7 +920,7 @@ fn decode_handshake_request(fields: &mut Fields) -> Result<HandshakeRequest, Cod
         None
     };
     Ok(HandshakeRequest {
-        versions,
+        protocol,
         build: fields.required("build")?,
         client_type,
         desired_role,
@@ -861,7 +930,7 @@ fn decode_handshake_request(fields: &mut Fields) -> Result<HandshakeRequest, Cod
 
 fn decode_handshake_response(fields: &mut Fields) -> Result<HandshakeResponse, CodecError> {
     let protocol_value = fields.required("protocol")?;
-    let negotiated = parse_version(&protocol_value).ok_or(CodecError::InvalidField {
+    let protocol = parse_version(&protocol_value).ok_or(CodecError::InvalidField {
         field: "protocol",
         value: protocol_value,
     })?;
@@ -905,7 +974,7 @@ fn decode_handshake_response(fields: &mut Fields) -> Result<HandshakeResponse, C
         }
     };
     Ok(HandshakeResponse {
-        negotiated,
+        protocol,
         granted_role,
         permissions,
         capabilities,
@@ -1013,28 +1082,28 @@ fn decode_manual_status(
 ) -> Result<ManualTransitionStatus, CodecError> {
     let (active, kind, from, to, interval_start, position) = match names {
         ManualStatusFields::Desired => (
-            "?desired_manual_active",
-            "?desired_manual_kind",
-            "?desired_manual_from",
-            "?desired_manual_to",
-            "?desired_manual_interval_start_basis_points",
-            "?desired_manual_position_basis_points",
+            "desired_manual_active",
+            "desired_manual_kind",
+            "desired_manual_from",
+            "desired_manual_to",
+            "desired_manual_interval_start_basis_points",
+            "desired_manual_position_basis_points",
         ),
         ManualStatusFields::Realized => (
-            "?realized_manual_active",
-            "?realized_manual_kind",
-            "?realized_manual_from",
-            "?realized_manual_to",
-            "?realized_manual_interval_start_basis_points",
-            "?realized_manual_position_basis_points",
+            "realized_manual_active",
+            "realized_manual_kind",
+            "realized_manual_from",
+            "realized_manual_to",
+            "realized_manual_interval_start_basis_points",
+            "realized_manual_position_basis_points",
         ),
         ManualStatusFields::Unqualified => (
-            "?manual_active",
-            "?manual_kind",
-            "?manual_from",
-            "?manual_to",
-            "?manual_interval_start_basis_points",
-            "?manual_position_basis_points",
+            "manual_active",
+            "manual_kind",
+            "manual_from",
+            "manual_to",
+            "manual_interval_start_basis_points",
+            "manual_position_basis_points",
         ),
     };
     let active_value = fields.boolean(active)?;
@@ -1097,14 +1166,14 @@ fn decode_fade_to_black_state(
 ) -> Result<FadeToBlackState, CodecError> {
     let (target_active, position) = match names {
         FadeToBlackStateFields::Desired => (
-            "?desired_ftb_target_active",
-            "?desired_ftb_position_numerator",
+            "desired_ftb_target_active",
+            "desired_ftb_position_numerator",
         ),
         FadeToBlackStateFields::Realized => (
-            "?realized_ftb_target_active",
-            "?realized_ftb_position_numerator",
+            "realized_ftb_target_active",
+            "realized_ftb_position_numerator",
         ),
-        FadeToBlackStateFields::Unqualified => ("?ftb_target_active", "?ftb_position_numerator"),
+        FadeToBlackStateFields::Unqualified => ("ftb_target_active", "ftb_position_numerator"),
     };
     Ok(FadeToBlackState {
         target_active: fields.boolean(target_active)?,

@@ -2,7 +2,7 @@ use std::{error::Error, fmt, num::NonZeroU128, sync::mpsc::TryRecvError};
 
 use fm_auth::{Policy, Principal, Role, SessionId, UserId};
 use fm_clock::ClockDomainId;
-use fm_engine::{Engine, EngineManualTransitionKind, ShowState};
+use fm_engine::{Engine, EngineInputAudioStripState, EngineManualTransitionKind, ShowState};
 use fm_protocol::{
     CommandMessage, CommandPayload, CommandResult, EngineIdentity, EventCursor,
     ManualTransitionKind, ManualTransitionPosition, ManualTransitionStatus, RuntimeLifecycleEvent,
@@ -1210,7 +1210,80 @@ fn command_result_is_represented_before_its_events() {
                 position: fm_protocol::FadeToBlackPosition::LIVE,
             },
             overlays: fm_protocol::OverlayStatus::empty_channels(),
+            input_audio_strips: [input(1), input(2), input(3)]
+                .into_iter()
+                .map(|input| fm_protocol::InputAudioStripStatus {
+                    input: WireInputId::from_domain(input),
+                    gain_millidb: 0,
+                    muted: false,
+                    follow_video: true,
+                    delay_samples: 0,
+                })
+                .collect(),
         }
+    );
+}
+
+#[test]
+fn input_audio_strip_flows_through_authorization_snapshot_event_and_frame() {
+    let mut control = service(8, 8);
+    let server = server_identity();
+    let submission = control
+        .submit(
+            &principal(Role::Operator),
+            command(
+                "audio-strip",
+                "audio-strip-key",
+                CommandPayload::SetInputAudioStrip {
+                    input: WireInputId::from_domain(input(2)),
+                    gain_millidb: -6_000,
+                    muted: true,
+                    follow_video: false,
+                    delay_samples: 2_400,
+                },
+            ),
+            0,
+        )
+        .unwrap();
+    assert!(matches!(
+        submission.output.result,
+        CommandResult::Accepted { .. }
+    ));
+    let EventPayload::DesiredSwitcher {
+        input_audio_strips, ..
+    } = &submission.output.events[0].payload
+    else {
+        panic!("expected desired-state event")
+    };
+    assert!(input_audio_strips.iter().any(|status| {
+        status.input == WireInputId::from_domain(input(2))
+            && status.gain_millidb == -6_000
+            && status.muted
+            && !status.follow_video
+            && status.delay_samples == 2_400
+    }));
+    assert!(
+        control
+            .snapshot()
+            .snapshot
+            .input_audio_strips
+            .iter()
+            .any(|status| status.input == WireInputId::from_domain(input(2))
+                && status.delay_samples == 2_400)
+    );
+
+    let tick = control.tick(&server).unwrap();
+    assert_eq!(
+        tick.frame.input_audio_strip_updates,
+        [(
+            input(2),
+            EngineInputAudioStripState {
+                gain_millidb: -6_000,
+                muted: true,
+                follow_video: false,
+                delay_samples: 2_400,
+            }
+        )]
     );
 }
 

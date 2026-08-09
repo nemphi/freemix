@@ -477,14 +477,14 @@ fn explicit_unsupported_schema_is_reported_before_missing_current_fields() {
 fn strict_parser_rejects_unknown_duplicate_and_wrong_typed_fields() {
     let temp = TestDirectory::new("strict");
     for (name, manifest) in [
-        ("unknown", "{\"schema_version\":13,\"unknown\":true}"),
-        ("duplicate", "{\"schema_version\":13,\"schema_version\":13}"),
+        ("unknown", "{\"schema_version\":14,\"unknown\":true}"),
+        ("duplicate", "{\"schema_version\":14,\"schema_version\":14}"),
         ("wrong-type", "{\"schema_version\":\"1\"}"),
-        ("object-trailing-comma", "{\"schema_version\":13,}"),
+        ("object-trailing-comma", "{\"schema_version\":14,}"),
         (
             "array-trailing-comma",
             r#"{
-              "schema_version": 13,
+              "schema_version": 14,
               "project_id": 1,
               "show_name": "Trailing",
               "input_ids": [1,],

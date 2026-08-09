@@ -73,6 +73,14 @@ pub enum Command {
     Status {
         path: PathBuf,
     },
+    AudioStrip {
+        path: PathBuf,
+        input: u128,
+        gain_millidb: i32,
+        muted: bool,
+        follow_video: bool,
+        delay_samples: u32,
+    },
     Preview {
         path: PathBuf,
         input: u128,
@@ -206,6 +214,16 @@ pub enum Command {
     },
     RemoteStatus {
         address: SocketAddr,
+    },
+    RemoteAudioStrip {
+        address: SocketAddr,
+        input: u128,
+        gain_millidb: i32,
+        muted: bool,
+        follow_video: bool,
+        delay_samples: u32,
+        key: Option<String>,
+        expected_revision: Option<u64>,
     },
     RemotePreview {
         address: SocketAddr,
@@ -403,6 +421,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
             reject_extra(&mut arguments)?;
             Ok(Command::Status { path })
         }
+        "audio-strip" => parse_audio_strip(arguments),
         "preview" => {
             let path = required_path(&mut arguments, "project path")?;
             let input = number(&required(&mut arguments, "input")?, "input")?;
@@ -438,6 +457,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
         }
         "ftb" => parse_local_fade_to_black(arguments),
         "remote-status" => parse_remote_status(arguments),
+        "remote-audio-strip" => parse_remote_audio_strip(arguments),
         "remote-preview" => parse_remote_preview(arguments),
         "remote-cut" => parse_remote_cut(arguments),
         "remote-fade" | "remote-alpha-fade" | "remote-slide" | "remote-zoom" | "remote-wipe" => {
@@ -489,6 +509,24 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
         "help" | "--help" | "-h" => Ok(Command::Help),
         _ => Err(ArgsError::UnknownCommand(command)),
     }
+}
+
+fn parse_audio_strip(mut arguments: impl Iterator<Item = String>) -> Result<Command, ArgsError> {
+    let path = required_path(&mut arguments, "project path")?;
+    let input = number(&required(&mut arguments, "input")?, "input")?;
+    let gain_millidb = number(&required(&mut arguments, "gain millidB")?, "gain millidB")?;
+    let muted = boolean_choice(&required(&mut arguments, "muted")?, "muted")?;
+    let follow_video = boolean_choice(&required(&mut arguments, "follow video")?, "follow video")?;
+    let delay_samples = number(&required(&mut arguments, "delay samples")?, "delay samples")?;
+    reject_extra(&mut arguments)?;
+    Ok(Command::AudioStrip {
+        path,
+        input,
+        gain_millidb,
+        muted,
+        follow_video,
+        delay_samples,
+    })
 }
 
 fn parse_local_overlay(
@@ -903,6 +941,28 @@ fn parse_remote_status(mut arguments: impl Iterator<Item = String>) -> Result<Co
     Ok(Command::RemoteStatus { address })
 }
 
+fn parse_remote_audio_strip(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Command, ArgsError> {
+    let address = socket_address(&required(&mut arguments, "address")?)?;
+    let input = number(&required(&mut arguments, "input")?, "input")?;
+    let gain_millidb = number(&required(&mut arguments, "gain millidB")?, "gain millidB")?;
+    let muted = boolean_choice(&required(&mut arguments, "muted")?, "muted")?;
+    let follow_video = boolean_choice(&required(&mut arguments, "follow video")?, "follow video")?;
+    let delay_samples = number(&required(&mut arguments, "delay samples")?, "delay samples")?;
+    let (key, expected_revision) = command_options(arguments)?;
+    Ok(Command::RemoteAudioStrip {
+        address,
+        input,
+        gain_millidb,
+        muted,
+        follow_video,
+        delay_samples,
+        key,
+        expected_revision,
+    })
+}
+
 fn parse_remote_preview(mut arguments: impl Iterator<Item = String>) -> Result<Command, ArgsError> {
     let address = socket_address(&required(&mut arguments, "address")?)?;
     let input = number(&required(&mut arguments, "input")?, "input")?;
@@ -1036,6 +1096,17 @@ where
         field,
         value: value.to_owned(),
     })
+}
+
+fn boolean_choice(value: &str, field: &'static str) -> Result<bool, ArgsError> {
+    match value {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        _ => Err(ArgsError::InvalidChoice {
+            field,
+            value: value.to_owned(),
+        }),
+    }
 }
 
 fn socket_address(value: &str) -> Result<SocketAddr, ArgsError> {
@@ -1661,6 +1732,58 @@ mod tests {
         assert_eq!(
             parse(strings(&["status", "show.freemix", "extra"])),
             Err(ArgsError::UnexpectedArgument("extra".into()))
+        );
+    }
+
+    #[test]
+    fn audio_strip_parses_exact_project_input_and_controls() {
+        assert_eq!(
+            parse(strings(&[
+                "audio-strip",
+                "show.freemix",
+                "7",
+                "-6000",
+                "on",
+                "off",
+                "48000",
+            ])),
+            Ok(Command::AudioStrip {
+                path: PathBuf::from("show.freemix"),
+                input: 7,
+                gain_millidb: -6_000,
+                muted: true,
+                follow_video: false,
+                delay_samples: 48_000,
+            })
+        );
+    }
+
+    #[test]
+    fn remote_audio_strip_parses_command_options() {
+        assert_eq!(
+            parse(strings(&[
+                "remote-audio-strip",
+                "127.0.0.1:9123",
+                "7",
+                "-6000",
+                "off",
+                "on",
+                "2400",
+                "--key",
+                "delay",
+                "--expect",
+                "3",
+            ])),
+            Ok(Command::RemoteAudioStrip {
+                address: "127.0.0.1:9123".parse().unwrap(),
+                input: 7,
+                gain_millidb: -6_000,
+                muted: false,
+                follow_video: true,
+                delay_samples: 2_400,
+                key: Some("delay".into()),
+                expected_revision: Some(3),
+            })
         );
     }
 

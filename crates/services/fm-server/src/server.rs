@@ -2,8 +2,8 @@ use std::{error::Error, fmt};
 
 use fm_auth::{Permission, Policy, Principal, PrincipalKind, Role as AuthRole};
 use fm_protocol::{
-    EngineIdentity, EventCursor, HandshakeRequest, Role as ProtocolRole, ServerHello,
-    negotiate_version,
+    CURRENT_PROTOCOL_VERSION, EngineIdentity, EventCursor, HandshakeRequest, Role as ProtocolRole,
+    ServerHello,
 };
 
 use crate::{
@@ -111,8 +111,9 @@ impl<C: ControlPlane> Server<C> {
             return Err(HandshakeError::DevelopmentPrincipalDenied);
         }
 
-        let negotiated = negotiate_version(&hello.versions, &self.config.supported_versions)
-            .map_err(|_| HandshakeError::IncompatibleVersion)?;
+        if hello.protocol != CURRENT_PROTOCOL_VERSION {
+            return Err(HandshakeError::IncompatibleVersion);
+        }
         let requested_role =
             map_role(hello.desired_role).ok_or(HandshakeError::RoleDenied(hello.desired_role))?;
         if !principal.roles().contains(&requested_role)
@@ -145,7 +146,7 @@ impl<C: ControlPlane> Server<C> {
             .collect();
         let sync = initial.payload;
         let server_hello = ServerHello {
-            negotiated,
+            protocol: CURRENT_PROTOCOL_VERSION,
             granted_role: hello.desired_role,
             permissions,
             capabilities_digest: self.config.capabilities_digest.clone(),
@@ -154,7 +155,7 @@ impl<C: ControlPlane> Server<C> {
             resume: sync.is_resume(),
         };
         let session = Session::new(
-            negotiated,
+            CURRENT_PROTOCOL_VERSION,
             initial.engine,
             initial.current_revision,
             scoped_principal,
@@ -201,6 +202,7 @@ const fn permission_name(permission: Permission) -> &'static str {
         Permission::ViewStatus => "view_status",
         Permission::SelectPreview => "select_preview",
         Permission::Transition => "transition",
+        Permission::ControlAudio => "control_audio",
         Permission::EditProject => "edit_project",
         Permission::ManageUsers => "manage_users",
     }

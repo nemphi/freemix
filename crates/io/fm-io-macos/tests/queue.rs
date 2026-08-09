@@ -4,7 +4,7 @@ use fm_frame::ClockDomainId;
 use fm_io_macos::protocol::FrameReader;
 
 // Queue drop-oldest accounting is exercised by the crate's internal queue test
-// path; this integration test keeps a portable multi-record parser regression.
+// path; this integration test keeps portable multi-record parser coverage.
 #[test]
 fn portable_fake_framed_child_stream_is_continuously_drained() {
     let mut stream = b"FMCAMF3\0".to_vec();

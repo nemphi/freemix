@@ -75,7 +75,7 @@ impl WindowCounter {
 #[derive(Clone, Debug)]
 pub struct Session {
     state: SessionState,
-    negotiated: ProtocolVersion,
+    protocol: ProtocolVersion,
     engine: EngineIdentity,
     current_revision: u64,
     principal: Principal,
@@ -90,7 +90,7 @@ pub struct Session {
 
 impl Session {
     pub(crate) fn new(
-        negotiated: ProtocolVersion,
+        protocol: ProtocolVersion,
         engine: EngineIdentity,
         current_revision: u64,
         principal: Principal,
@@ -100,7 +100,7 @@ impl Session {
     ) -> Self {
         Self {
             state: SessionState::Connected,
-            negotiated,
+            protocol,
             engine,
             current_revision,
             principal,
@@ -125,8 +125,8 @@ impl Session {
     }
 
     #[must_use]
-    pub const fn negotiated_version(&self) -> ProtocolVersion {
-        self.negotiated
+    pub const fn protocol_version(&self) -> ProtocolVersion {
+        self.protocol
     }
 
     #[must_use]
@@ -166,6 +166,7 @@ impl Session {
         self.ensure_connected()?;
 
         let class = match command.payload {
+            CommandPayload::SetInputAudioStrip { .. } => CommandClass::ControlAudio,
             CommandPayload::SelectPreview { .. } => CommandClass::SelectPreview,
             CommandPayload::Cut
             | CommandPayload::Fade { .. }
@@ -192,9 +193,9 @@ impl Session {
         };
         self.policy.authorize(&self.principal, class)?;
 
-        if command.protocol != self.negotiated {
+        if command.protocol != self.protocol {
             return Err(SessionError::ProtocolMismatch {
-                expected: self.negotiated,
+                expected: self.protocol,
                 received: command.protocol,
             });
         }

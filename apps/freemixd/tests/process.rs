@@ -135,7 +135,7 @@ struct Client {
 }
 
 struct TestHandshake {
-    negotiated: ProtocolVersion,
+    protocol: ProtocolVersion,
     engine: EngineIdentity,
     current_revision: u64,
     resume: bool,
@@ -186,7 +186,7 @@ impl Client {
             revision: cursor.revision,
         });
         self.send(&WireMessage::HandshakeRequest(HandshakeRequest {
-            versions: vec![version],
+            protocol: version,
             build: "process-test".into(),
             client_type: ClientType::Integration,
             desired_role: Role::Operator,
@@ -197,7 +197,7 @@ impl Client {
         };
         let resume = matches!(response.outcome, HandshakeOutcome::Resume { .. });
         TestHandshake {
-            negotiated: response.negotiated,
+            protocol: response.protocol,
             engine: EngineIdentity {
                 engine_id: response.server.engine_id,
                 state_epoch: response.server.state_epoch,
@@ -279,7 +279,6 @@ fn current_client_handshake_heartbeat_and_resume_use_ordered_wire_records() {
     create_project(&project_path);
 
     let mut protocol_client = ProtocolClient::new(ClientConfig::new(
-        vec![CURRENT_PROTOCOL_VERSION],
         "process-test",
         ClientType::Integration,
         Role::Operator,
@@ -365,7 +364,6 @@ fn current_client_receives_structured_handshake_rejection() {
     let project_path = directory.project_path();
     create_project(&project_path);
     let mut protocol_client = ProtocolClient::new(ClientConfig::new(
-        vec![CURRENT_PROTOCOL_VERSION],
         "process-test",
         ClientType::Integration,
         Role::Replay,
@@ -513,7 +511,7 @@ fn live_stinger_slot_mutations_fire_immediately_and_survive_restart() {
     assert_eq!(
         client
             .handshake_version(CURRENT_PROTOCOL_VERSION, None)
-            .negotiated,
+            .protocol,
         CURRENT_PROTOCOL_VERSION
     );
     assert!(matches!(client.receive(), WireMessage::Snapshot(_)));
@@ -693,7 +691,7 @@ fn slide_command_settles_and_survives_daemon_restart() {
     let daemon = Daemon::start(&project_path);
     let mut client = daemon.connect();
     let initial = client.handshake_version(CURRENT_PROTOCOL_VERSION, None);
-    assert_eq!(initial.negotiated, CURRENT_PROTOCOL_VERSION);
+    assert_eq!(initial.protocol, CURRENT_PROTOCOL_VERSION);
     assert!(matches!(client.receive(), WireMessage::Snapshot(_)));
 
     client.send(&command_version(
@@ -749,7 +747,7 @@ fn zoom_command_settles_and_survives_daemon_restart() {
     let daemon = Daemon::start(&project_path);
     let mut client = daemon.connect();
     let initial = client.handshake_version(CURRENT_PROTOCOL_VERSION, None);
-    assert_eq!(initial.negotiated, CURRENT_PROTOCOL_VERSION);
+    assert_eq!(initial.protocol, CURRENT_PROTOCOL_VERSION);
     assert!(matches!(client.receive(), WireMessage::Snapshot(_)));
 
     client.send(&command_version(
@@ -818,7 +816,7 @@ fn manual_alpha_fade_state_and_receipts_survive_restart_through_commit_and_cance
         let daemon = Daemon::start(&project_path);
         let mut client = daemon.connect();
         let hello = client.handshake_version(CURRENT_PROTOCOL_VERSION, None);
-        assert_eq!(hello.negotiated, CURRENT_PROTOCOL_VERSION);
+        assert_eq!(hello.protocol, CURRENT_PROTOCOL_VERSION);
         assert!(matches!(client.receive(), WireMessage::Snapshot(_)));
 
         client.send(&command_version(
@@ -942,7 +940,7 @@ fn incompatible_handshake_returns_protocol_error() {
     let daemon = Daemon::start(&project_path);
     let mut client = daemon.connect();
     client.send(&WireMessage::HandshakeRequest(HandshakeRequest {
-        versions: vec![ProtocolVersion::new(99, 0)],
+        protocol: ProtocolVersion::new(99, 0),
         build: "future".into(),
         client_type: ClientType::Integration,
         desired_role: Role::Operator,

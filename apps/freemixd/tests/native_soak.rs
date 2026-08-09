@@ -273,7 +273,7 @@ impl SoakClient {
 
     fn handshake(&mut self) -> Result<HandshakeState, String> {
         self.send(&WireMessage::HandshakeRequest(HandshakeRequest {
-            versions: vec![CURRENT_PROTOCOL_VERSION],
+            protocol: CURRENT_PROTOCOL_VERSION,
             build: "phase2-native-soak-v1".into(),
             client_type: ClientType::Integration,
             desired_role: Role::Operator,
@@ -284,13 +284,13 @@ impl SoakClient {
         let WireMessage::HandshakeResponse(response) = response else {
             return Err("expected HandshakeResponse after HandshakeRequest".into());
         };
-        if response.negotiated != CURRENT_PROTOCOL_VERSION
+        if response.protocol != CURRENT_PROTOCOL_VERSION
             || response.granted_role != Role::Operator
             || !matches!(response.outcome, HandshakeOutcome::Snapshot { .. })
         {
             return Err(format!(
                 "unexpected handshake negotiation: version={:?}, role={:?}",
-                response.negotiated, response.granted_role
+                response.protocol, response.granted_role
             ));
         }
         let snapshot = self.receive_before(deadline, "Snapshot")?;
@@ -453,6 +453,7 @@ fn validate_durable_event(
                     position: FadeToBlackPosition::LIVE,
                 },
                 overlays: OverlayStatus::empty_channels(),
+                input_audio_strips: input_audio_strips(expected_program, expected_preview),
             })
     {
         return Err(format!(
@@ -460,6 +461,21 @@ fn validate_durable_event(
         ));
     }
     Ok(())
+}
+
+fn input_audio_strips(first: InputId, second: InputId) -> Vec<fm_protocol::InputAudioStripStatus> {
+    let mut inputs = [first, second];
+    inputs.sort();
+    inputs
+        .into_iter()
+        .map(|input| fm_protocol::InputAudioStripStatus {
+            input: WireInputId::from_domain(input),
+            gain_millidb: 0,
+            muted: false,
+            follow_video: true,
+            delay_samples: 0,
+        })
+        .collect()
 }
 
 fn validate_runtime_event(

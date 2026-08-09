@@ -132,6 +132,15 @@ pub struct OverlayStatus {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InputAudioStripStatus {
+    pub input: InputId,
+    pub gain_millidb: i32,
+    pub muted: bool,
+    pub follow_video: bool,
+    pub delay_samples: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ActiveManualTransition {
     pub kind: ManualTransitionKind,
     pub from: InputId,
@@ -168,6 +177,7 @@ pub struct ProjectSnapshot {
     pub cursor: ProjectCursor,
     pub show_name: String,
     pub inputs: Vec<InputId>,
+    pub input_audio_strips: Vec<InputAudioStripStatus>,
     pub stingers: Vec<StingerStatus>,
     pub desired_overlays: Vec<OverlayStatus>,
     pub realized_overlays: Vec<OverlayStatus>,
@@ -181,6 +191,7 @@ impl ProjectSnapshot {
         let stingers = protocol_stingers(message.stingers);
         let desired_overlays = protocol_overlays(message.desired_overlays);
         let realized_overlays = protocol_overlays(message.realized_overlays);
+        let input_audio_strips = protocol_input_audio_strips(message.input_audio_strips);
         Self {
             cursor: ProjectCursor {
                 project_id,
@@ -193,6 +204,7 @@ impl ProjectSnapshot {
                 .into_iter()
                 .map(fm_protocol::WireInputId::to_domain)
                 .collect(),
+            input_audio_strips,
             stingers,
             desired_overlays,
             realized_overlays,
@@ -227,6 +239,7 @@ pub enum DurableChange {
         manual_transition: ManualTransitionStatus,
         fade_to_black: FadeToBlackState,
         overlays: Vec<OverlayStatus>,
+        input_audio_strips: Vec<InputAudioStripStatus>,
     },
     StingerSlotsChanged {
         selection: BusSelection,
@@ -234,6 +247,7 @@ pub enum DurableChange {
         fade_to_black: FadeToBlackState,
         stingers: Vec<StingerStatus>,
         overlays: Vec<OverlayStatus>,
+        input_audio_strips: Vec<InputAudioStripStatus>,
     },
 }
 
@@ -255,11 +269,13 @@ impl DurableProjectEvent {
                 manual_transition,
                 fade_to_black,
                 overlays,
+                input_audio_strips,
             } => DurableChange::DesiredSwitcher {
                 selection: BusSelection::new(program.to_domain(), preview.to_domain()),
                 manual_transition: manual_status_from_protocol(manual_transition),
                 fade_to_black: fade_to_black_from_protocol(fade_to_black),
                 overlays: protocol_overlays(overlays),
+                input_audio_strips: protocol_input_audio_strips(input_audio_strips),
             },
             EventPayload::StingerSlotsChanged {
                 program,
@@ -268,12 +284,14 @@ impl DurableProjectEvent {
                 fade_to_black,
                 stingers,
                 overlays,
+                input_audio_strips,
             } => DurableChange::StingerSlotsChanged {
                 selection: BusSelection::new(program.to_domain(), preview.to_domain()),
                 manual_transition: manual_status_from_protocol(manual_transition),
                 fade_to_black: fade_to_black_from_protocol(fade_to_black),
                 stingers: protocol_stingers(stingers),
                 overlays: protocol_overlays(overlays),
+                input_audio_strips: protocol_input_audio_strips(input_audio_strips),
             },
         };
         Self {
@@ -327,6 +345,7 @@ pub struct RuntimeRealization {
 pub struct ProjectState {
     show_name: String,
     inputs: Vec<InputId>,
+    input_audio_strips: Vec<InputAudioStripStatus>,
     stingers: Vec<StingerStatus>,
     desired_overlays: Vec<OverlayStatus>,
     realized_overlays: Vec<OverlayStatus>,
@@ -342,6 +361,11 @@ impl ProjectState {
     #[must_use]
     pub fn inputs(&self) -> &[InputId] {
         &self.inputs
+    }
+
+    #[must_use]
+    pub fn input_audio_strips(&self) -> &[InputAudioStripStatus] {
+        &self.input_audio_strips
     }
 
     #[must_use]
@@ -371,6 +395,7 @@ pub struct ClientView {
     pub cursor: ProjectCursor,
     pub show_name: String,
     pub inputs: Vec<InputId>,
+    pub input_audio_strips: Vec<InputAudioStripStatus>,
     pub stingers: Vec<StingerStatus>,
     pub desired_overlays: Vec<OverlayStatus>,
     pub realized_overlays: Vec<OverlayStatus>,
@@ -547,6 +572,7 @@ pub enum ModelError {
     },
     RevisionExhausted,
     DuplicateInput(InputId),
+    InvalidInputAudioStrips,
     DuplicateStingerSlot(u8),
     InvalidStingerSlot(u8),
     InvalidOverlayCount(usize),
@@ -623,6 +649,9 @@ impl fmt::Display for ModelError {
             ),
             Self::RevisionExhausted => formatter.write_str("revision counter is exhausted"),
             Self::DuplicateInput(input) => write!(formatter, "snapshot repeats input {input}"),
+            Self::InvalidInputAudioStrips => formatter.write_str(
+                "input audio strips must contain each show input exactly once with gain in -96000..=24000 millidB and delay in 0..=48000 samples",
+            ),
             Self::DuplicateStingerSlot(slot) => {
                 write!(formatter, "snapshot repeats Stinger slot {slot}")
             }
@@ -733,6 +762,7 @@ impl ClientModel {
             cursor,
             show_name: state.show_name.clone(),
             inputs: state.inputs.clone(),
+            input_audio_strips: state.input_audio_strips.clone(),
             stingers: state.stingers.clone(),
             desired_overlays: state.desired_overlays.clone(),
             realized_overlays: state.realized_overlays.clone(),
@@ -906,6 +936,7 @@ impl ClientModel {
         self.state = Some(ProjectState {
             show_name: snapshot.show_name,
             inputs: snapshot.inputs,
+            input_audio_strips: snapshot.input_audio_strips,
             stingers: snapshot.stingers,
             desired_overlays: snapshot.desired_overlays,
             realized_overlays: snapshot.realized_overlays,
@@ -1278,6 +1309,7 @@ fn validate_snapshot_inputs(snapshot: &ProjectSnapshot) -> Result<(), ModelError
         }
     }
     validate_stingers(&snapshot.stingers, &inputs)?;
+    validate_input_audio_strips(&snapshot.input_audio_strips, &inputs)?;
     validate_overlays(&snapshot.desired_overlays, &inputs)?;
     validate_overlays(&snapshot.realized_overlays, &inputs)?;
     validate_manual_transition(
@@ -1361,25 +1393,53 @@ fn validate_stingers(
     Ok(())
 }
 
+fn validate_input_audio_strips(
+    strips: &[InputAudioStripStatus],
+    inputs: &HashSet<InputId>,
+) -> Result<(), ModelError> {
+    if strips.len() != inputs.len() {
+        return Err(ModelError::InvalidInputAudioStrips);
+    }
+    let mut seen = HashSet::with_capacity(strips.len());
+    if strips.iter().any(|status| {
+        !(-96_000..=24_000).contains(&status.gain_millidb)
+            || status.delay_samples > 48_000
+            || !inputs.contains(&status.input)
+            || !seen.insert(status.input)
+    }) {
+        return Err(ModelError::InvalidInputAudioStrips);
+    }
+    Ok(())
+}
+
 fn validate_change(change: &DurableChange, inputs: &[InputId]) -> Result<(), ModelError> {
-    let (selection, manual_transition, stingers, overlays) = match change {
+    let (selection, manual_transition, stingers, overlays, input_audio_strips) = match change {
         DurableChange::DesiredSwitcher {
             selection,
             manual_transition,
             overlays,
+            input_audio_strips,
             ..
-        } => (*selection, *manual_transition, None, overlays),
+        } => (
+            *selection,
+            *manual_transition,
+            None,
+            overlays,
+            input_audio_strips,
+        ),
         DurableChange::StingerSlotsChanged {
             selection,
             manual_transition,
             stingers,
             overlays,
+            input_audio_strips,
             ..
         } => (
             *selection,
             *manual_transition,
             Some(stingers.as_slice()),
             overlays,
+            input_audio_strips,
         ),
     };
     for input in [selection.program, selection.preview] {
@@ -1393,6 +1453,7 @@ fn validate_change(change: &DurableChange, inputs: &[InputId]) -> Result<(), Mod
         validate_stingers(stingers, &input_set)?;
     }
     validate_overlays(overlays, &input_set)?;
+    validate_input_audio_strips(input_audio_strips, &input_set)?;
     Ok(())
 }
 
@@ -1412,11 +1473,13 @@ fn apply_change(state: &mut ProjectState, change: DurableChange) {
             manual_transition,
             fade_to_black,
             overlays,
+            input_audio_strips,
         } => {
             state.switcher.desired = selection;
             state.switcher.desired_manual_transition = manual_transition;
             state.switcher.desired_fade_to_black = fade_to_black;
             state.desired_overlays = overlays;
+            state.input_audio_strips = input_audio_strips;
         }
         DurableChange::StingerSlotsChanged {
             selection,
@@ -1424,12 +1487,14 @@ fn apply_change(state: &mut ProjectState, change: DurableChange) {
             fade_to_black,
             stingers,
             overlays,
+            input_audio_strips,
         } => {
             state.switcher.desired = selection;
             state.switcher.desired_manual_transition = manual_transition;
             state.switcher.desired_fade_to_black = fade_to_black;
             state.stingers = stingers;
             state.desired_overlays = overlays;
+            state.input_audio_strips = input_audio_strips;
         }
     }
 }
@@ -1445,6 +1510,21 @@ fn protocol_stingers(stingers: Vec<fm_protocol::StingerStatus>) -> Vec<StingerSt
             audio_policy: status.audio_policy,
             missing_media_fallback: status.missing_media_fallback,
             readiness: status.readiness,
+        })
+        .collect()
+}
+
+fn protocol_input_audio_strips(
+    strips: Vec<fm_protocol::InputAudioStripStatus>,
+) -> Vec<InputAudioStripStatus> {
+    strips
+        .into_iter()
+        .map(|status| InputAudioStripStatus {
+            input: status.input.to_domain(),
+            gain_millidb: status.gain_millidb,
+            muted: status.muted,
+            follow_video: status.follow_video,
+            delay_samples: status.delay_samples,
         })
         .collect()
 }

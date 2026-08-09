@@ -19,14 +19,14 @@ use fm_auth::{AuthorizationDenial, CommandClass, Policy, Principal};
 use fm_command::{CommandReceipt, DurableEvent, IdempotencyKey, RejectionCode};
 use fm_engine::{
     Engine, EngineAcceptance, EngineCommand, EngineCommandOutcome, EngineError, EngineEvent,
-    EngineFadeToBlackState, EngineManualTransitionKind, EngineManualTransitionPosition,
-    EngineManualTransitionState, EnginePrepareOutcome, EngineSnapshot, FrameResult,
-    PreparedEngineExecution, SnapshotError,
+    EngineFadeToBlackState, EngineInputAudioStripState, EngineManualTransitionKind,
+    EngineManualTransitionPosition, EngineManualTransitionState, EnginePrepareOutcome,
+    EngineSnapshot, FrameResult, PreparedEngineExecution, SnapshotError,
 };
 use fm_protocol::{
     CommandMessage, CommandPayload, CommandResult, EngineIdentity, EventCursor, EventMessage,
-    EventPayload, FadeToBlackPosition, FadeToBlackState, FieldIssue, ManualTransitionKind,
-    ManualTransitionPosition, ManualTransitionState, ManualTransitionStatus,
+    EventPayload, FadeToBlackPosition, FadeToBlackState, FieldIssue, InputAudioStripStatus,
+    ManualTransitionKind, ManualTransitionPosition, ManualTransitionState, ManualTransitionStatus,
     OverlayBorderPreset as ProtocolOverlayBorder, OverlayPositionPreset as ProtocolOverlayPosition,
     OverlayStatus, OverlayTransitionKind as ProtocolOverlayTransition, RuntimeEventMessage,
     RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage,
@@ -918,34 +918,28 @@ impl<A: AuthorizationHook> ControlService<A> {
                 }
             } else if publish_runtime_realization {
                 runtime_events.push(
-                    self.runtime_realized(server, pending.revision, generation)
-                        .map_err(TickWithRealizerError::Tick)?,
+                    self.runtime_realized(
+                        server,
+                        pending.revision,
+                        generation,
+                        runtime_domain(pending.command),
+                    )
+                    .map_err(TickWithRealizerError::Tick)?,
                 );
             }
         }
 
-        let completed_transition = (self.engine.realized_switcher().transition().is_none()
-            && self.engine.realized_switcher().program()
-                == self.engine.show().desired_switcher().program()
-            && self.engine.realized_switcher().preview()
-                == self.engine.show().desired_switcher().preview())
-        .then(|| self.active_transition.take())
-        .flatten();
-        let completed_fade_to_black =
-            (!self.engine.realized_switcher().fade_to_black_is_automatic()
-                && self.engine.realized_fade_to_black() == self.engine.desired_fade_to_black())
-            .then(|| self.active_fade_to_black.take())
-            .flatten();
-        let mut completions = [completed_transition, completed_fade_to_black]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
-        completions.sort_by_key(|operation| operation.generation);
+        let completions = self.take_completed_switcher_operations();
         if publish_runtime_realization {
             for operation in completions {
                 runtime_events.push(
-                    self.runtime_realized(server, operation.revision, current_generation)
-                        .map_err(TickWithRealizerError::Tick)?,
+                    self.runtime_realized(
+                        server,
+                        operation.revision,
+                        current_generation,
+                        "switcher",
+                    )
+                    .map_err(TickWithRealizerError::Tick)?,
                 );
             }
         }
@@ -964,14 +958,35 @@ impl<A: AuthorizationHook> ControlService<A> {
         })
     }
 
+    fn take_completed_switcher_operations(&mut self) -> Vec<ActiveTransition> {
+        let transition = (self.engine.realized_switcher().transition().is_none()
+            && self.engine.realized_switcher().program()
+                == self.engine.show().desired_switcher().program()
+            && self.engine.realized_switcher().preview()
+                == self.engine.show().desired_switcher().preview())
+        .then(|| self.active_transition.take())
+        .flatten();
+        let fade_to_black = (!self.engine.realized_switcher().fade_to_black_is_automatic()
+            && self.engine.realized_fade_to_black() == self.engine.desired_fade_to_black())
+        .then(|| self.active_fade_to_black.take())
+        .flatten();
+        let mut completed = [transition, fade_to_black]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        completed.sort_by_key(|operation| operation.generation);
+        completed
+    }
+
     fn runtime_realized(
         &mut self,
         server: &ServerIdentity,
         revision: u64,
         generation: u64,
+        domain: &'static str,
     ) -> Result<RuntimeEventMessage, ControlError> {
         let event = RuntimeLifecycleEvent::Realized {
-            domain: "switcher".to_owned(),
+            domain: domain.to_owned(),
             manual_transition: protocol_manual_status(self.engine.realized_manual_transition()),
             fade_to_black: protocol_fade_to_black_state(self.engine.realized_fade_to_black()),
         };
@@ -1044,8 +1059,16 @@ impl<A: AuthorizationHook> ControlService<A> {
     }
 }
 
+const fn runtime_domain(command: EngineCommand) -> &'static str {
+    match command {
+        EngineCommand::SetInputAudioStrip { .. } => "audio",
+        _ => "switcher",
+    }
+}
+
 const fn command_class(payload: CommandPayload) -> CommandClass {
     match payload {
+        CommandPayload::SetInputAudioStrip { .. } => CommandClass::ControlAudio,
         CommandPayload::SelectPreview { .. } => CommandClass::SelectPreview,
         CommandPayload::Cut
         | CommandPayload::Fade { .. }
@@ -1074,6 +1097,21 @@ const fn command_class(payload: CommandPayload) -> CommandClass {
 
 fn engine_command(payload: CommandPayload) -> EngineCommand {
     match payload {
+        CommandPayload::SetInputAudioStrip {
+            input,
+            gain_millidb,
+            muted,
+            follow_video,
+            delay_samples,
+        } => EngineCommand::SetInputAudioStrip {
+            input: input.to_domain(),
+            state: EngineInputAudioStripState {
+                gain_millidb,
+                muted,
+                follow_video,
+                delay_samples,
+            },
+        },
         CommandPayload::SelectPreview { input } => EngineCommand::SelectPreview(input.to_domain()),
         CommandPayload::Cut => EngineCommand::Cut,
         CommandPayload::Fade { duration_frames } => EngineCommand::Fade { duration_frames },
@@ -1294,6 +1332,7 @@ fn engine_submission(
         let manual_transition = protocol_manual_status(engine.desired_manual_transition());
         let fade_to_black = protocol_fade_to_black_state(engine.desired_fade_to_black());
         let overlays = protocol_overlays(engine.show().desired_switcher().overlays());
+        let input_audio_strips = protocol_input_audio_strips(engine);
         vec![EventMessage {
             cursor: EventCursor {
                 engine: identity.clone(),
@@ -1307,6 +1346,7 @@ fn engine_submission(
                     fade_to_black,
                     stingers: protocol_desired_stingers(engine),
                     overlays,
+                    input_audio_strips,
                 }
             } else {
                 EventPayload::DesiredSwitcher {
@@ -1315,6 +1355,7 @@ fn engine_submission(
                     manual_transition,
                     fade_to_black,
                     overlays,
+                    input_audio_strips,
                 }
             },
         }]
@@ -1358,6 +1399,7 @@ fn snapshot_record(engine: &Engine, identity: &EngineIdentity) -> SnapshotRecord
             .copied()
             .map(WireInputId::from_domain)
             .collect(),
+        input_audio_strips: protocol_input_audio_strips(engine),
         desired_program: WireInputId::from_domain(engine.show().desired_switcher().program()),
         desired_preview: WireInputId::from_domain(engine.show().desired_switcher().preview()),
         realized_program: WireInputId::from_domain(engine.realized_switcher().program()),
@@ -1377,6 +1419,21 @@ fn snapshot_record(engine: &Engine, identity: &EngineIdentity) -> SnapshotRecord
         },
         snapshot,
     }
+}
+
+fn protocol_input_audio_strips(engine: &Engine) -> Vec<InputAudioStripStatus> {
+    engine
+        .show()
+        .input_audio_strips()
+        .iter()
+        .map(|(&input, &state)| InputAudioStripStatus {
+            input: WireInputId::from_domain(input),
+            gain_millidb: state.gain_millidb,
+            muted: state.muted,
+            follow_video: state.follow_video,
+            delay_samples: state.delay_samples,
+        })
+        .collect()
 }
 
 fn protocol_overlays(overlays: &[OverlayChannelState; 8]) -> Vec<OverlayStatus> {

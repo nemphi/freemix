@@ -13,13 +13,14 @@ use fm_command::{
     RejectedReceipt, Rejection, RejectionCode, Revision, RuntimeGeneration, StateEpoch,
 };
 use fm_engine::{
-    Engine, EngineAcceptance, EngineCommand, EngineFadeToBlackState, EngineManualTransitionKind,
-    EngineManualTransitionPosition, EngineRestoreState, ShowState,
+    Engine, EngineAcceptance, EngineCommand, EngineFadeToBlackState, EngineInputAudioStripState,
+    EngineManualTransitionKind, EngineManualTransitionPosition, EngineRestoreState, ShowState,
 };
 use fm_model::{
-    Input, InputKind, MainMix, Project, ProjectSettings, SimulatedAudio, SimulatedInput,
-    SimulatedVideo, SolidColor, StingerAudioPolicy as ModelStingerAudioPolicy, StingerConfig,
-    StingerMissingMediaFallback, StingerSlotNumber,
+    Input, InputAudioStripState, InputDelaySamples, InputGainMilliDb, InputKind, MainMix, Project,
+    ProjectSettings, SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor,
+    StingerAudioPolicy as ModelStingerAudioPolicy, StingerConfig, StingerMissingMediaFallback,
+    StingerSlotNumber,
 };
 use fm_persistence::{
     FadeToBlackState as PersistedFadeToBlackState, IdempotencyReceipt,
@@ -77,6 +78,23 @@ pub fn run(command: Command) -> AppResult<()> {
             print_status(&project);
         }
         Command::Status { path } => print_status(&load_engine(&path)?),
+        Command::AudioStrip {
+            path,
+            input,
+            gain_millidb,
+            muted,
+            follow_video,
+            delay_samples,
+        } => mutate(
+            &path,
+            EngineCommand::SetInputAudioStrip {
+                input: input_id(input)?,
+                state: engine_audio_strip_state(gain_millidb, muted, follow_video, delay_samples)?,
+            },
+            1,
+            None,
+            None,
+        )?,
         Command::Preview {
             path,
             input,
@@ -369,6 +387,34 @@ pub fn run(command: Command) -> AppResult<()> {
             expected_revision,
         )?,
         Command::RemoteStatus { address } => remote::status(address)?,
+        Command::RemoteAudioStrip {
+            address,
+            input,
+            gain_millidb,
+            muted,
+            follow_video,
+            delay_samples,
+            key,
+            expected_revision,
+        } => remote::execute(
+            address,
+            fm_protocol::CommandPayload::SetInputAudioStrip {
+                input: fm_protocol::WireInputId::new(
+                    NonZeroU128::new(input)
+                        .ok_or_else(|| AppFailure("input ID must be nonzero".into()))?,
+                ),
+                gain_millidb: InputGainMilliDb::new(gain_millidb)
+                    .ok_or_else(|| AppFailure("gain must be in -96000..=24000 millidB".into()))?
+                    .get(),
+                muted,
+                follow_video,
+                delay_samples: InputDelaySamples::new(delay_samples)
+                    .ok_or_else(|| AppFailure("delay samples must be in 0..=48000".into()))?
+                    .get(),
+            },
+            key,
+            expected_revision,
+        )?,
         Command::RemotePreview {
             address,
             input,
@@ -708,12 +754,13 @@ fn default_project(name: String) -> AppResult<ProjectEngine> {
 fn engine_from_project(project: Project) -> AppResult<ProjectEngine> {
     let main_mix = required_main_mix(&project)?;
     let inputs = project.inputs().iter().map(|input| input.id).collect();
-    let show = ShowState::new(
+    let mut show = ShowState::new(
         project.name(),
         inputs,
         main_mix.desired_program,
         main_mix.desired_preview,
     )?;
+    restore_input_audio_strips(&mut show, &project)?;
     let engine = Engine::new(show, project.settings().frame_rate, clock_domain());
     Ok(ProjectEngine { project, engine })
 }
@@ -906,6 +953,7 @@ fn save_engine(path: &Path, project_engine: &ProjectEngine) -> AppResult<()> {
     let realized = snapshot.realized_switcher();
     let mut project = project_engine.project.clone();
     project.set_main_mix(MainMix::new(desired.program(), desired.preview()));
+    sync_input_audio_strips(&mut project, snapshot.show())?;
     let stored = StoredProject::from_project_with_complete_runtime_state(
         project,
         RuntimeRouting {
@@ -988,6 +1036,7 @@ fn load_engine(path: &Path) -> AppResult<ProjectEngine> {
         main_mix.desired_program,
         main_mix.desired_preview,
     )?;
+    restore_input_audio_strips(&mut show, &project)?;
     let mut realized = SwitcherState::new(inputs, realized_program, realized_preview)?;
     for config in project.stingers() {
         restore_stinger(&mut show, &mut realized, *config)?;
@@ -1024,6 +1073,59 @@ fn load_engine(path: &Path) -> AppResult<ProjectEngine> {
         },
     )?;
     Ok(ProjectEngine { project, engine })
+}
+
+fn engine_audio_strip_state(
+    gain_millidb: i32,
+    muted: bool,
+    follow_video: bool,
+    delay_samples: u32,
+) -> AppResult<EngineInputAudioStripState> {
+    Ok(EngineInputAudioStripState {
+        gain_millidb: InputGainMilliDb::new(gain_millidb)
+            .ok_or_else(|| AppFailure("gain must be in -96000..=24000 millidB".into()))?
+            .get(),
+        muted,
+        follow_video,
+        delay_samples: InputDelaySamples::new(delay_samples)
+            .ok_or_else(|| AppFailure("delay samples must be in 0..=48000".into()))?
+            .get(),
+    })
+}
+
+fn restore_input_audio_strips(show: &mut ShowState, project: &Project) -> AppResult<()> {
+    for strip in project.input_audio_strips() {
+        show.set_input_audio_strip(
+            strip.input,
+            EngineInputAudioStripState {
+                gain_millidb: strip.state.gain.get(),
+                muted: strip.state.muted,
+                follow_video: strip.state.follow_video,
+                delay_samples: strip.state.delay_samples.get(),
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn sync_input_audio_strips(project: &mut Project, show: &ShowState) -> AppResult<()> {
+    for (&input, &state) in show.input_audio_strips() {
+        project.input_audio_strip(input).ok_or_else(|| {
+            AppFailure(format!("project is missing audio strip for input {input}"))
+        })?;
+        let strip = InputAudioStripState {
+            gain: InputGainMilliDb::new(state.gain_millidb)
+                .expect("engine input audio gain is bounded by the model contract"),
+            muted: state.muted,
+            follow_video: state.follow_video,
+            delay_samples: InputDelaySamples::new(state.delay_samples)
+                .expect("engine input audio delay is bounded by the model contract"),
+        };
+        if !project.set_input_audio_strip(input, strip) {
+            return Err(AppFailure(format!("project is missing input {input}")).into());
+        }
+    }
+    Ok(())
 }
 
 fn persisted_overlays(desired: &SwitcherState, realized: &SwitcherState) -> RuntimeOverlays {
@@ -1284,7 +1386,7 @@ fn print_status(project: &ProjectEngine) {
     let desired = engine.show().desired_switcher();
     let realized = engine.realized_switcher();
     println!(
-        "project_id={} show={:?} revision={} frame={} Program(desired={}, realized={}) Preview(desired={}, realized={}) TBar(desired={}, realized={}) FTB(desired={}, realized={}) Overlays(desired={}, realized={}) Stingers={}",
+        "project_id={} show={:?} revision={} frame={} Program(desired={}, realized={}) Preview(desired={}, realized={}) TBar(desired={}, realized={}) FTB(desired={}, realized={}) Overlays(desired={}, realized={}) AudioStrips={} Stingers={}",
         project.project.id(),
         engine.show().name(),
         engine.revision(),
@@ -1299,8 +1401,32 @@ fn print_status(project: &ProjectEngine) {
         format_fade_to_black(engine.realized_fade_to_black()),
         format_overlays(desired.overlays()),
         format_overlays(realized.overlays()),
+        format_audio_strips(&project.project),
         format_stingers(project.project.stingers()),
     );
+}
+
+fn format_audio_strips(project: &Project) -> String {
+    let strips = project
+        .input_audio_strips()
+        .iter()
+        .map(|strip| {
+            format!(
+                "{}:gain_mdb={}:delay_samples={}:{}:{}",
+                strip.input,
+                strip.state.gain.get(),
+                strip.state.delay_samples.get(),
+                if strip.state.muted { "muted" } else { "live" },
+                if strip.state.follow_video {
+                    "afv"
+                } else {
+                    "always"
+                },
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{strips}]")
 }
 
 fn format_overlays(overlays: &[OverlayChannelState; 8]) -> String {
@@ -1411,6 +1537,7 @@ FreeMix deterministic MVP
 Usage:
   freemix-cli new <show.freemix> [--name <name>]
   freemix-cli status <show.freemix>
+  freemix-cli audio-strip <show.freemix> <input> <gain-millidb:-96000..=24000> <muted:on|off> <follow-video:on|off> <delay-samples:0..=48000>
   freemix-cli preview <show.freemix> <input> [--key <key>] [--expect <revision>]
   freemix-cli cut <show.freemix> [--key <key>] [--expect <revision>]
   freemix-cli fade <show.freemix> <frames> [--key <key>] [--expect <revision>]
@@ -1435,6 +1562,7 @@ Usage:
   freemix-cli tbar-cancel <show.freemix> [--key <key>] [--expect <revision>]
   freemix-cli ftb <show.freemix> <live|black> <frames> [--key <key>] [--expect <revision>]
   freemix-cli remote-status <127.0.0.1:port>
+  freemix-cli remote-audio-strip <127.0.0.1:port> <input> <gain-millidb:-96000..=24000> <muted:on|off> <follow-video:on|off> <delay-samples:0..=48000> [--key <key>] [--expect <revision>]
   freemix-cli remote-preview <127.0.0.1:port> <input> [--key <key>] [--expect <revision>]
   freemix-cli remote-cut <127.0.0.1:port> [--key <key>] [--expect <revision>]
   freemix-cli remote-fade <127.0.0.1:port> <frames> [--key <key>] [--expect <revision>]

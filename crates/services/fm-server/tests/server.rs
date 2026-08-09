@@ -64,6 +64,7 @@ fn control() -> FakeControl {
         revision: 4,
         show_name: "show".into(),
         inputs: vec![input(1), input(2)],
+        input_audio_strips: input_audio_strips(),
         desired_program: input(1),
         desired_preview: input(2),
         realized_program: input(1),
@@ -97,6 +98,7 @@ fn control() -> FakeControl {
                     position: FadeToBlackPosition::LIVE,
                 },
                 overlays: fm_protocol::OverlayStatus::empty_channels(),
+                input_audio_strips: input_audio_strips(),
             },
         })
         .to_vec();
@@ -107,12 +109,24 @@ fn control() -> FakeControl {
     }
 }
 
+fn input_audio_strips() -> Vec<fm_protocol::InputAudioStripStatus> {
+    [input(1), input(2)]
+        .into_iter()
+        .map(|input| fm_protocol::InputAudioStripStatus {
+            input,
+            gain_millidb: 0,
+            muted: false,
+            follow_video: true,
+            delay_samples: 0,
+        })
+        .collect()
+}
+
 fn config() -> ServerConfig {
     ServerConfig::new(
         ServerMode::Production,
         AuthenticationMode::Required,
         IpAddr::from([127, 0, 0, 1]),
-        vec![CURRENT_PROTOCOL_VERSION],
         "capabilities-v1",
     )
 }
@@ -135,7 +149,7 @@ fn development_principal(role: AuthRole) -> Principal {
 
 fn hello(role: Role, cursor: Option<EventCursor>) -> HandshakeRequest {
     HandshakeRequest {
-        versions: vec![CURRENT_PROTOCOL_VERSION],
+        protocol: CURRENT_PROTOCOL_VERSION,
         build: "test".into(),
         client_type: ClientType::Cli,
         desired_role: role,
@@ -161,7 +175,7 @@ fn ready_server(config: ServerConfig) -> Server<FakeControl> {
 fn incompatible_versions_are_rejected() {
     let server = ready_server(config());
     let mut hello = hello(Role::Viewer, None);
-    hello.versions = vec![ProtocolVersion::new(99, 0)];
+    hello.protocol = ProtocolVersion::new(99, 0);
 
     assert!(matches!(
         server.handshake(&hello, &principal(AuthRole::Viewer), 0),
@@ -175,7 +189,6 @@ fn development_auth_requires_development_mode_and_loopback() {
         ServerMode::Production,
         AuthenticationMode::Development,
         IpAddr::from([127, 0, 0, 1]),
-        vec![CURRENT_PROTOCOL_VERSION],
         "digest",
     );
     assert_eq!(
@@ -187,7 +200,6 @@ fn development_auth_requires_development_mode_and_loopback() {
         ServerMode::Development,
         AuthenticationMode::Development,
         IpAddr::from([0, 0, 0, 0]),
-        vec![CURRENT_PROTOCOL_VERSION],
         "digest",
     );
     assert_eq!(
@@ -215,7 +227,7 @@ fn handshake_delegates_snapshot_and_resume_selection() {
     let snapshot = server
         .handshake(&hello(Role::Viewer, None), &principal(AuthRole::Viewer), 10)
         .unwrap();
-    assert_eq!(snapshot.server_hello.negotiated, CURRENT_PROTOCOL_VERSION);
+    assert_eq!(snapshot.server_hello.protocol, CURRENT_PROTOCOL_VERSION);
     assert!(!snapshot.server_hello.resume);
     assert!(matches!(snapshot.sync, SyncPayload::Snapshot(_)));
 
@@ -277,13 +289,11 @@ fn wipe_uses_transition_authorization_and_fade_rate_accounting() {
         ServerMode::Production,
         AuthenticationMode::Required,
         IpAddr::from([127, 0, 0, 1]),
-        vec![CURRENT_PROTOCOL_VERSION],
         "capabilities-v1",
     )
     .with_session_limits(limits);
     let server = ready_server(current_config);
-    let mut current_hello = hello(Role::Operator, None);
-    current_hello.versions = vec![CURRENT_PROTOCOL_VERSION];
+    let current_hello = hello(Role::Operator, None);
     let mut operator = server
         .handshake(&current_hello, &principal(AuthRole::Operator), 0)
         .unwrap()

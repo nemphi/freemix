@@ -15,10 +15,13 @@ use fm_switcher::{
 };
 use fm_types::{FrameRate, InputId, OutputId};
 
-use crate::{EngineError, ShowState, SnapshotError};
+use crate::{EngineError, EngineInputAudioStripState, ShowState, SnapshotError};
 
 type RuntimeScheduler = FrameScheduler<(), (), EngineCommand, ()>;
 const MAX_TRANSITION_DURATION_FRAMES: u32 = 3_600;
+pub const MAX_INPUT_AUDIO_DELAY_SAMPLES: u32 = 48_000;
+pub const MIN_INPUT_AUDIO_GAIN_MILLIDB: i32 = -96_000;
+pub const MAX_INPUT_AUDIO_GAIN_MILLIDB: i32 = 24_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EngineManualTransitionKind {
@@ -70,6 +73,10 @@ pub struct EngineFadeToBlackState {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EngineCommand {
+    SetInputAudioStrip {
+        input: InputId,
+        state: EngineInputAudioStripState,
+    },
     SelectPreview(InputId),
     Cut,
     Fade {
@@ -256,6 +263,7 @@ pub struct FrameResult {
     pub fade_to_black: FadeToBlackFrame,
     pub overlays: [OverlayChannelState; OVERLAY_CHANNEL_COUNT],
     pub events: Vec<SwitcherEvent>,
+    pub input_audio_strip_updates: Vec<(InputId, EngineInputAudioStripState)>,
     pub revision: Revision,
     pub runtime_generation: RuntimeGeneration,
 }
@@ -597,7 +605,8 @@ impl Engine {
                 EngineCommand::ConfigureStinger { .. } | EngineCommand::RemoveStinger { .. } => {
                     None
                 }
-                EngineCommand::TakeOverlay { .. }
+                EngineCommand::SetInputAudioStrip { .. }
+                | EngineCommand::TakeOverlay { .. }
                 | EngineCommand::UpdateOverlay { .. }
                 | EngineCommand::OverlayOff { .. }
                 | EngineCommand::ConfigureOverlayTransition { .. }
@@ -651,7 +660,11 @@ impl Engine {
         self.pending_actions = self.pending_actions.saturating_sub(tick.actions.len());
 
         let mut events = Vec::new();
+        let mut input_audio_strip_updates = Vec::new();
         for scheduled in tick.actions {
+            if let EngineCommand::SetInputAudioStrip { input, state } = scheduled.action {
+                input_audio_strip_updates.push((input, state));
+            }
             let command_events = apply_runtime(&mut self.realized_switcher, scheduled.action)?;
             events.extend(command_events);
             self.runtime_generation = self.runtime_generation.checked_next()?;
@@ -674,6 +687,7 @@ impl Engine {
             fade_to_black,
             overlays,
             events,
+            input_audio_strip_updates,
             revision: self.commands.revision(),
             runtime_generation: self.runtime_generation,
         })
@@ -894,6 +908,43 @@ impl Mutation<ShowState, EngineEvent, EngineAcceptance> for EngineMutation {
         ) {
             return apply_stinger_mutation(state, events, self);
         }
+        if let EngineCommand::SetInputAudioStrip {
+            input,
+            state: strip_state,
+        } = self.command
+        {
+            if !(MIN_INPUT_AUDIO_GAIN_MILLIDB..=MAX_INPUT_AUDIO_GAIN_MILLIDB)
+                .contains(&strip_state.gain_millidb)
+            {
+                return Err(Rejection::new(
+                    RejectionCode::InvalidCommand,
+                    format!(
+                        "input audio gain must be between {MIN_INPUT_AUDIO_GAIN_MILLIDB} and \
+                         {MAX_INPUT_AUDIO_GAIN_MILLIDB} millidB"
+                    ),
+                ));
+            }
+            if strip_state.delay_samples > MAX_INPUT_AUDIO_DELAY_SAMPLES {
+                return Err(Rejection::new(
+                    RejectionCode::InvalidCommand,
+                    format!(
+                        "input audio delay must not exceed {MAX_INPUT_AUDIO_DELAY_SAMPLES} samples"
+                    ),
+                ));
+            }
+            state
+                .set_input_audio_strip(input, strip_state)
+                .map_err(|_| {
+                    Rejection::new(
+                        RejectionCode::InvalidCommand,
+                        format!("input {input} is not part of this show"),
+                    )
+                })?;
+            events.push(EngineEvent::DesiredSwitcherChanged(self.command));
+            return Ok(EngineAcceptance {
+                target_frame: self.target_frame,
+            });
+        }
         if matches!(
             self.command,
             EngineCommand::TakeOverlay { .. }
@@ -911,6 +962,9 @@ impl Mutation<ShowState, EngineEvent, EngineAcceptance> for EngineMutation {
             return apply_fade_to_black_mutation(state, events, self);
         }
         let switcher_command = match self.command {
+            EngineCommand::SetInputAudioStrip { .. } => {
+                unreachable!("audio-strip mutations return before switcher command mapping")
+            }
             EngineCommand::SelectPreview(input) => SwitcherCommand::SelectPreview(input),
             EngineCommand::Cut => SwitcherCommand::Cut,
             EngineCommand::Fade { duration_frames } => {
@@ -1124,6 +1178,9 @@ fn apply_runtime(
     switcher: &mut SwitcherState,
     command: EngineCommand,
 ) -> Result<Vec<SwitcherEvent>, SwitcherError> {
+    if matches!(command, EngineCommand::SetInputAudioStrip { .. }) {
+        return Ok(Vec::new());
+    }
     if let EngineCommand::FadeToBlack {
         active,
         duration_frames,
@@ -1137,6 +1194,9 @@ fn apply_runtime(
         return apply_runtime_overlay(switcher, command);
     }
     switcher.apply(match command {
+        EngineCommand::SetInputAudioStrip { .. } => {
+            unreachable!("audio-strip commands return before switcher command mapping")
+        }
         EngineCommand::SelectPreview(input) => SwitcherCommand::SelectPreview(input),
         EngineCommand::Cut => SwitcherCommand::Cut,
         EngineCommand::Fade { duration_frames } => SwitcherCommand::Transition {

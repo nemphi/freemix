@@ -1,10 +1,10 @@
 use std::{collections::BTreeMap, num::NonZeroU128};
 
 use fm_model::{
-    AudioBus, BusSend, CropRect, Input, InputAudioStrip, InputAudioStripState, InputGainMilliDb,
-    InputKind, Layer, LayerGeometry, MainMix, Output, Project, ProjectSettings, RectMask,
-    RestartPolicy, Rgba8, Rotation, Scene, SimulatedAudio, SimulatedInput, SimulatedVideo,
-    SolidColor, SourceRef, StartupPolicy, StingerAudioPolicy, StingerConfig,
+    AudioBus, BusSend, CropRect, Input, InputAudioStrip, InputAudioStripState, InputDelaySamples,
+    InputGainMilliDb, InputKind, Layer, LayerGeometry, MainMix, Output, Project, ProjectSettings,
+    RectMask, RestartPolicy, Rgba8, Rotation, Scene, SimulatedAudio, SimulatedInput,
+    SimulatedVideo, SolidColor, SourceRef, StartupPolicy, StingerAudioPolicy, StingerConfig,
     StingerMissingMediaFallback, StingerSlotNumber,
 };
 use fm_types::{
@@ -189,6 +189,14 @@ fn parse_input_audio_strip(value: Value) -> Result<InputAudioStrip, DecodeError>
         input,
         state: InputAudioStripState {
             gain,
+            delay_samples: InputDelaySamples::new(object.u32("delay_samples")?).ok_or_else(
+                || {
+                    syntax(format!(
+                        "input delay_samples must not exceed {}",
+                        InputDelaySamples::MAX
+                    ))
+                },
+            )?,
             muted: object.boolean("muted")?,
             follow_video: object.boolean("follow_video")?,
         },

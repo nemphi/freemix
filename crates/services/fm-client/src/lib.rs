@@ -13,10 +13,11 @@ use std::fmt;
 
 use fm_command::{CommandId, Revision};
 use fm_protocol::{
-    ClientType, CommandMessage, CommandPayload, CommandResult, DurableGap, EngineIdentity,
-    EventMessage, HandshakeOutcome, HandshakeRequest, HandshakeResponse, HeartbeatMessage,
-    ProtocolVersion, ResumeCursor, Role, RuntimeEventMessage, RuntimeLifecycleEvent, ServerHello,
-    ServerIdentity, SnapshotMessage, StructuredError, WireMessage, negotiate_version,
+    CURRENT_PROTOCOL_VERSION, ClientType, CommandMessage, CommandPayload, CommandResult,
+    DurableGap, EngineIdentity, EventMessage, HandshakeOutcome, HandshakeRequest,
+    HandshakeResponse, HeartbeatMessage, ProtocolVersion, ResumeCursor, Role, RuntimeEventMessage,
+    RuntimeLifecycleEvent, ServerHello, ServerIdentity, SnapshotMessage, StructuredError,
+    WireMessage,
 };
 use fm_types::ProjectId;
 use fm_ui_model::{
@@ -32,7 +33,6 @@ pub const MAX_COMPLETED_COMMAND_CAPACITY: usize = 65_536;
 /// Static client settings. An external scheduler supplies all clock behavior.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClientConfig {
-    pub supported_versions: Vec<ProtocolVersion>,
     pub build: String,
     pub client_type: ClientType,
     pub desired_role: Role,
@@ -50,7 +50,6 @@ impl ClientConfig {
     /// Creates settings with conservative queue and reconnect defaults.
     #[must_use]
     pub fn new(
-        supported_versions: Vec<ProtocolVersion>,
         build: impl Into<String>,
         client_type: ClientType,
         desired_role: Role,
@@ -58,7 +57,6 @@ impl ClientConfig {
         project_id: ProjectId,
     ) -> Self {
         Self {
-            supported_versions,
             build: build.into(),
             client_type,
             desired_role,
@@ -101,7 +99,7 @@ pub enum ConnectionState {
         received_revision: u64,
     },
     Incompatible {
-        negotiated: ProtocolVersion,
+        protocol: ProtocolVersion,
     },
 }
 
@@ -332,13 +330,8 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// Rejects settings that cannot provide bounded operation or negotiation.
+    /// Rejects settings that cannot provide bounded operation.
     pub fn new(config: ClientConfig) -> Result<Self, ClientError> {
-        if config.supported_versions.is_empty() {
-            return Err(ClientError::InvalidConfig(
-                "at least one supported protocol version is required",
-            ));
-        }
         if config.client_id.is_empty() {
             return Err(ClientError::InvalidConfig("client ID must not be empty"));
         }
@@ -456,7 +449,7 @@ impl Client {
             return Err(self.invalid_state("report transport connected"));
         }
         let request = HandshakeRequest {
-            versions: self.config.supported_versions.clone(),
+            protocol: CURRENT_PROTOCOL_VERSION,
             build: self.config.build.clone(),
             client_type: self.config.client_type,
             desired_role: self.config.desired_role,
@@ -543,13 +536,11 @@ impl Client {
         if self.state != ConnectionState::AwaitingHandshake {
             return Err(self.invalid_state("accept a handshake"));
         }
-        if negotiate_version(&self.config.supported_versions, &[response.negotiated])
-            != Ok(response.negotiated)
-        {
+        if response.protocol != CURRENT_PROTOCOL_VERSION {
             self.state = ConnectionState::Incompatible {
-                negotiated: response.negotiated,
+                protocol: response.protocol,
             };
-            return Err(ClientError::IncompatibleProtocol(response.negotiated));
+            return Err(ClientError::IncompatibleProtocol(response.protocol));
         }
         if response.server.project_id != self.config.project_id.to_string() {
             return Err(ClientError::InvalidHandshake(
@@ -586,7 +577,7 @@ impl Client {
             self.reset_runtime_sequences();
         }
         self.model.observe_server(&ServerHello {
-            negotiated: response.negotiated,
+            protocol: response.protocol,
             granted_role: response.granted_role,
             permissions: response.permissions.clone(),
             capabilities_digest: response.capabilities.digest.clone(),
@@ -595,7 +586,7 @@ impl Client {
             resume,
         })?;
         self.session = Some(Session {
-            protocol: response.negotiated,
+            protocol: response.protocol,
             granted_role: response.granted_role,
             permissions: response.permissions,
             server: response.server,
@@ -603,12 +594,12 @@ impl Client {
         });
         for record in self.commands.values_mut() {
             if record.status.is_active() {
-                record.command.protocol = response.negotiated;
+                record.command.protocol = response.protocol;
             }
         }
         for item in &mut self.outbound {
             if let Outbound::Command(command) = item {
-                command.protocol = response.negotiated;
+                command.protocol = response.protocol;
             }
         }
         let mode = if resume {
@@ -851,7 +842,8 @@ impl Client {
             CommandPayload::SelectPreview { input } => {
                 Some(OptimisticChange::DesiredPreview(input.to_domain()))
             }
-            CommandPayload::Cut
+            CommandPayload::SetInputAudioStrip { .. }
+            | CommandPayload::Cut
             | CommandPayload::Fade { .. }
             | CommandPayload::AlphaFade { .. }
             | CommandPayload::Slide { .. }
@@ -925,7 +917,7 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// Requires a negotiated session, queue space, and sequence capacity.
+    /// Requires an established current-protocol session, queue space, and sequence capacity.
     pub fn queue_heartbeat(&mut self, sent_at_ms: u64) -> Result<HeartbeatMessage, ClientError> {
         if !matches!(
             self.state,

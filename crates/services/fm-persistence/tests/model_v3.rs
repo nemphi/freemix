@@ -6,11 +6,11 @@ use std::{
 };
 
 use fm_model::{
-    AudioBus, BusSend, CropRect, Input, InputAudioStripState, InputGainMilliDb, InputKind, Layer,
-    LayerGeometry, MainMix, Output, Project, ProjectSettings, RectMask, RestartPolicy, Rgba8,
-    Rotation, Scene, SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef,
-    StartupPolicy, StingerAudioPolicy, StingerConfig, StingerMissingMediaFallback,
-    StingerSlotNumber,
+    AudioBus, BusSend, CropRect, Input, InputAudioStripState, InputDelaySamples, InputGainMilliDb,
+    InputKind, Layer, LayerGeometry, MainMix, Output, Project, ProjectSettings, RectMask,
+    RestartPolicy, Rgba8, Rotation, Scene, SimulatedAudio, SimulatedInput, SimulatedVideo,
+    SolidColor, SourceRef, StartupPolicy, StingerAudioPolicy, StingerConfig,
+    StingerMissingMediaFallback, StingerSlotNumber,
 };
 use fm_persistence::{ProjectPosition, ProjectStore, RuntimeRouting, StoreError, StoredProject};
 use fm_types::{
@@ -278,13 +278,14 @@ fn stored_rich_project() -> StoredProject {
 }
 
 #[test]
-fn input_audio_strips_round_trip_exactly_and_reject_malformed_gain() {
+fn input_audio_strips_round_trip_exactly_and_reject_malformed_values() {
     let temp = TestDirectory::new("input-audio-strips");
     let store = temp.store("show");
     let mut project = rich_project();
     let input = project.inputs()[1].id;
     let state = InputAudioStripState {
         gain: InputGainMilliDb::new(-12_345).unwrap(),
+        delay_samples: InputDelaySamples::new(1_200).unwrap(),
         muted: true,
         follow_video: false,
     };
@@ -302,7 +303,9 @@ fn input_audio_strips_round_trip_exactly_and_reject_malformed_gain() {
     assert_eq!(loaded.project().input_audio_strip(input), Some(state));
     let encoded = fs::read_to_string(store.manifest_path()).unwrap();
     assert!(
-        encoded.contains("\"gain_milli_db\": -12345, \"muted\": true, \"follow_video\": false")
+        encoded.contains(
+            "\"gain_milli_db\": -12345, \"delay_samples\": 1200, \"muted\": true, \"follow_video\": false"
+        )
     );
 
     let strip_line = encoded
@@ -316,6 +319,8 @@ fn input_audio_strips_round_trip_exactly_and_reject_malformed_gain() {
             "\"gain_milli_db\": \"-12345\"",
             1,
         ),
+        encoded.replacen("\"delay_samples\": 1200", "\"delay_samples\": 48001", 1),
+        encoded.replacen("\"delay_samples\": 1200", "\"delay_samples\": \"1200\"", 1),
         encoded.replacen(
             &format!("\"input\": {input}, \"gain_milli_db\": -12345"),
             "\"input\": 999, \"gain_milli_db\": -12345",

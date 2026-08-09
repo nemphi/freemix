@@ -57,7 +57,7 @@ impl Remote {
         stream.set_nodelay(true)?;
         let mut remote = Self::uninitialized(stream)?;
         remote.write(&WireMessage::HandshakeRequest(HandshakeRequest {
-            versions: vec![CURRENT_PROTOCOL_VERSION],
+            protocol: CURRENT_PROTOCOL_VERSION,
             build: format!("freemix-cli-{}", env!("CARGO_PKG_VERSION")),
             client_type: ClientType::Cli,
             desired_role: Role::Operator,
@@ -85,7 +85,6 @@ impl Remote {
 
         let project_id = project_id(&response.server)?;
         let mut client = Client::new(ClientConfig::new(
-            vec![CURRENT_PROTOCOL_VERSION],
             env!("CARGO_PKG_VERSION"),
             ClientType::Cli,
             Role::Operator,
@@ -123,7 +122,6 @@ impl Remote {
             writer: stream.try_clone()?,
             reader: BufReader::new(stream),
             client: Client::new(ClientConfig::new(
-                vec![CURRENT_PROTOCOL_VERSION],
                 env!("CARGO_PKG_VERSION"),
                 ClientType::Cli,
                 Role::Operator,
@@ -226,10 +224,7 @@ impl Remote {
                 ))
                 .into());
             }
-            let realized = matches!(
-                &runtime.event,
-                RuntimeLifecycleEvent::Realized { domain, .. } if domain == "switcher"
-            );
+            let realized = matches!(&runtime.event, RuntimeLifecycleEvent::Realized { .. });
             self.client.intake(WireMessage::RuntimeEvent(runtime))?;
             if realized {
                 break;
@@ -251,7 +246,7 @@ impl Remote {
             .ok_or_else(|| RemoteFailure("remote project cursor is unavailable".into()))?;
         let switcher = state.switcher();
         println!(
-            "project_id={} show={:?} revision={} frame=unavailable Program(desired={}, realized={}) Preview(desired={}, realized={}) TBar(desired={}, realized={}) FTB(desired={}, realized={}) Overlays(desired={}, realized={})",
+            "project_id={} show={:?} revision={} frame=unavailable Program(desired={}, realized={}) Preview(desired={}, realized={}) TBar(desired={}, realized={}) FTB(desired={}, realized={}) AudioStrips={} Overlays(desired={}, realized={})",
             self.project_id,
             state.show_name(),
             cursor.revision,
@@ -263,6 +258,7 @@ impl Remote {
             format_manual_transition(switcher.realized_manual_transition),
             format_fade_to_black(switcher.desired_fade_to_black),
             format_fade_to_black(switcher.realized_fade_to_black),
+            format_input_audio_strips(state.input_audio_strips()),
             format_overlays(state.desired_overlays()),
             format_overlays(state.realized_overlays()),
         );
@@ -283,6 +279,26 @@ impl Remote {
         }
         Ok(decode_line(&line)?)
     }
+}
+
+fn format_input_audio_strips(strips: &[fm_ui_model::InputAudioStripStatus]) -> String {
+    format!(
+        "[{}]",
+        strips
+            .iter()
+            .map(|status| {
+                format!(
+                    "{}:{}:{}:{}:{}",
+                    status.input,
+                    status.gain_millidb,
+                    status.muted,
+                    status.follow_video,
+                    status.delay_samples
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    )
 }
 
 fn format_fade_to_black(state: FadeToBlackState) -> String {

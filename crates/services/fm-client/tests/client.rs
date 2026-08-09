@@ -43,7 +43,6 @@ fn server() -> ServerIdentity {
 
 fn config(capacity: usize) -> ClientConfig {
     let mut config = ClientConfig::new(
-        vec![CURRENT_PROTOCOL_VERSION],
         "diagnostic 0.1",
         ClientType::Cli,
         Role::Operator,
@@ -61,12 +60,12 @@ fn handshake(revision: u64, resume: Option<ResumeCursor>) -> HandshakeResponse {
 }
 
 fn handshake_version(
-    negotiated: ProtocolVersion,
+    protocol: ProtocolVersion,
     revision: u64,
     resume: Option<ResumeCursor>,
 ) -> HandshakeResponse {
     HandshakeResponse {
-        negotiated,
+        protocol,
         granted_role: Role::Operator,
         permissions: vec!["switcher.take".to_owned()],
         capabilities: CapabilityReportSummary {
@@ -93,6 +92,7 @@ fn snapshot(revision: u64) -> SnapshotMessage {
         revision,
         show_name: "Show".to_owned(),
         inputs: vec![input(1), input(2)],
+        input_audio_strips: input_audio_strips(),
         desired_program: input(1),
         desired_preview: input(2),
         realized_program: input(1),
@@ -105,6 +105,19 @@ fn snapshot(revision: u64) -> SnapshotMessage {
         desired_overlays: fm_protocol::OverlayStatus::empty_channels(),
         realized_overlays: fm_protocol::OverlayStatus::empty_channels(),
     }
+}
+
+fn input_audio_strips() -> Vec<fm_protocol::InputAudioStripStatus> {
+    [input(1), input(2)]
+        .into_iter()
+        .map(|input| fm_protocol::InputAudioStripStatus {
+            input,
+            gain_millidb: 0,
+            muted: false,
+            follow_video: true,
+            delay_samples: 0,
+        })
+        .collect()
 }
 
 fn live_fade_to_black() -> FadeToBlackState {
@@ -211,6 +224,7 @@ fn connect_snapshot_resume_and_reconnect_are_deterministic() {
                 manual_transition: ManualTransitionStatus::Inactive,
                 fade_to_black: live_fade_to_black(),
                 overlays: fm_protocol::OverlayStatus::empty_channels(),
+                input_audio_strips: input_audio_strips(),
             },
         })
         .unwrap();
@@ -252,6 +266,7 @@ fn current_contract_reduces_exact_fade_to_black_state() {
                 manual_transition: ManualTransitionStatus::Inactive,
                 fade_to_black: fade_to_black(false, 12_345),
                 overlays: fm_protocol::OverlayStatus::empty_channels(),
+                input_audio_strips: input_audio_strips(),
             },
         })
         .unwrap();
@@ -320,7 +335,7 @@ fn incompatible_handshake_is_terminal_until_configuration_changes() {
     client.start_connect().unwrap();
     client.transport_connected().unwrap();
     let mut incompatible = handshake(0, None);
-    incompatible.negotiated = ProtocolVersion::new(99, 0);
+    incompatible.protocol = ProtocolVersion::new(99, 0);
     assert_eq!(
         client.accept_handshake(incompatible),
         Err(ClientError::IncompatibleProtocol(ProtocolVersion::new(
@@ -330,7 +345,7 @@ fn incompatible_handshake_is_terminal_until_configuration_changes() {
     assert_eq!(
         client.state(),
         &ConnectionState::Incompatible {
-            negotiated: ProtocolVersion::new(99, 0)
+            protocol: ProtocolVersion::new(99, 0)
         }
     );
 }
@@ -692,6 +707,7 @@ fn event_gap_requests_snapshot_resync() {
                 manual_transition: ManualTransitionStatus::Inactive,
                 fade_to_black: live_fade_to_black(),
                 overlays: fm_protocol::OverlayStatus::empty_channels(),
+                input_audio_strips: input_audio_strips(),
             },
         })
         .unwrap_err();
@@ -785,6 +801,7 @@ fn reconnecting_second_client_reduces_exact_desired_and_realized_manual_state() 
                 manual_transition: active_manual(0, 2_500),
                 fade_to_black: live_fade_to_black(),
                 overlays: fm_protocol::OverlayStatus::empty_channels(),
+                input_audio_strips: input_audio_strips(),
             },
         })
         .unwrap();
@@ -897,6 +914,7 @@ fn runtime_sequence_gap_does_not_request_durable_resync() {
                 manual_transition: ManualTransitionStatus::Inactive,
                 fade_to_black: live_fade_to_black(),
                 overlays: fm_protocol::OverlayStatus::empty_channels(),
+                input_audio_strips: input_audio_strips(),
             },
         })
         .unwrap();

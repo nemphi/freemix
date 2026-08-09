@@ -6,8 +6,9 @@ use fm_command::{
     StateEpoch,
 };
 use fm_engine::{
-    Engine, EngineCommand, EngineError, EngineManualTransitionKind, EngineManualTransitionPosition,
-    EnginePrepareOutcome, EngineRestoreState, EngineSnapshot, ShowState, SnapshotError,
+    Engine, EngineCommand, EngineError, EngineInputAudioStripState, EngineManualTransitionKind,
+    EngineManualTransitionPosition, EnginePrepareOutcome, EngineRestoreState, EngineSnapshot,
+    MAX_INPUT_AUDIO_DELAY_SAMPLES, MAX_INPUT_AUDIO_GAIN_MILLIDB, ShowState, SnapshotError,
 };
 use fm_scheduler::FrameNumber;
 use fm_switcher::{
@@ -100,6 +101,85 @@ fn restore_persisted(
         domain(),
         restore_state,
     )
+}
+
+#[test]
+fn input_audio_strip_is_durable_and_realized_on_its_scheduled_frame() {
+    let mut engine = engine();
+    let state = EngineInputAudioStripState {
+        gain_millidb: -6_000,
+        muted: true,
+        follow_video: false,
+        delay_samples: 2_400,
+    };
+    let accepted = engine
+        .execute(
+            envelope(
+                "audio-strip",
+                EngineCommand::SetInputAudioStrip {
+                    input: input(2),
+                    state,
+                },
+            ),
+            0,
+        )
+        .unwrap();
+    assert!(accepted.receipt.accepted().is_some());
+    assert_eq!(engine.show().input_audio_strip(input(2)), Some(state));
+    assert!(matches!(
+        engine.snapshot(),
+        Err(SnapshotError::WorkInFlight)
+    ));
+
+    let frame = engine.tick().unwrap();
+    assert_eq!(frame.input_audio_strip_updates, [(input(2), state)]);
+    let snapshot = engine.snapshot().unwrap();
+    assert_eq!(snapshot.show().input_audio_strip(input(2)), Some(state));
+    let restored = restore_persisted(
+        &snapshot,
+        snapshot.realized_switcher().clone(),
+        restore_state(&snapshot),
+    )
+    .unwrap();
+    assert_eq!(restored.show().input_audio_strip(input(2)), Some(state));
+}
+
+#[test]
+fn input_audio_strip_rejects_unknown_inputs_and_out_of_range_values() {
+    for (key, input, gain_millidb, delay_samples) in [
+        ("unknown-strip", input(99), 0, 1),
+        (
+            "large-delay",
+            input(1),
+            0,
+            MAX_INPUT_AUDIO_DELAY_SAMPLES + 1,
+        ),
+        ("large-gain", input(1), MAX_INPUT_AUDIO_GAIN_MILLIDB + 1, 0),
+    ] {
+        let mut engine = engine();
+        let outcome = engine
+            .execute(
+                envelope(
+                    key,
+                    EngineCommand::SetInputAudioStrip {
+                        input,
+                        state: EngineInputAudioStripState {
+                            gain_millidb,
+                            muted: false,
+                            follow_video: true,
+                            delay_samples,
+                        },
+                    },
+                ),
+                0,
+            )
+            .unwrap();
+        assert_eq!(
+            outcome.receipt.rejected().unwrap().rejection.code,
+            RejectionCode::InvalidCommand
+        );
+        assert_eq!(engine.revision(), Revision::default());
+    }
 }
 
 #[test]

@@ -1,16 +1,17 @@
+use std::collections::BTreeSet;
+
 use crate::{
     CapabilityReportMessage, CapabilityReportSummary, CommandMessage, CommandPayload,
     CommandResult, DurableEventBatch, DurableGap, EngineIdentity, ErrorMessage, EventCursor,
     EventMessage, EventPayload, FadeToBlackState, HandshakeOutcome, HandshakeRequest,
-    HandshakeResponse, HeartbeatMessage, ManualTransitionKind, ManualTransitionStatus,
-    OverlayStatus, ResumeCursor, RuntimeEventMessage, RuntimeFailureDisposition,
-    RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage, SnapshotReason, StingerAudioPolicy,
-    StingerMissingMediaFallback, StingerReadiness, StingerStatus, StructuredError, WireMessage,
+    HandshakeResponse, HeartbeatMessage, InputAudioStripStatus, ManualTransitionKind,
+    ManualTransitionStatus, OverlayStatus, ResumeCursor, RuntimeEventMessage,
+    RuntimeFailureDisposition, RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage,
+    SnapshotReason, StingerAudioPolicy, StingerMissingMediaFallback, StingerReadiness,
+    StingerStatus, StructuredError, WireMessage,
 };
 
-use super::value::{
-    client_type, durable_events, field_issues, role, runtime_domains, string_list, versions,
-};
+use super::value::{client_type, durable_events, field_issues, role, runtime_domains, string_list};
 use super::{CodecError, MAX_FIELD_VALUE_BYTES, MAX_LINE_BYTES, MAX_LIST_ITEMS};
 
 /// Encodes one message as a single newline-terminated record.
@@ -138,6 +139,20 @@ fn encode_command(record: &mut Record, message: &CommandMessage) -> Result<(), C
     record.optional("expected_revision", message.expected_revision)?;
     record.optional("deadline_ms", message.deadline_ms)?;
     match message.payload {
+        CommandPayload::SetInputAudioStrip {
+            input,
+            gain_millidb,
+            muted,
+            follow_video,
+            delay_samples,
+        } => {
+            record.field("payload", "input_audio_strip")?;
+            record.field("input", input)?;
+            record.field("gain_millidb", gain_millidb)?;
+            record.field("muted", u8::from(muted))?;
+            record.field("follow_video", u8::from(follow_video))?;
+            record.field("delay_samples", delay_samples)?;
+        }
         CommandPayload::SelectPreview { input } => {
             record.field("payload", "select_preview")?;
             record.field("input", input)?;
@@ -371,6 +386,7 @@ fn encode_snapshot(record: &mut Record, message: &SnapshotMessage) -> Result<(),
             .collect::<Vec<_>>()
             .join(","),
     )?;
+    encode_input_audio_strips(record, &message.input_audio_strips)?;
     record.field("desired_program", message.desired_program)?;
     record.field("desired_preview", message.desired_preview)?;
     record.field("realized_program", message.realized_program)?;
@@ -453,6 +469,49 @@ fn encode_overlays(
     record.field_string(field, value)
 }
 
+fn encode_input_audio_strips(
+    record: &mut Record,
+    strips: &[InputAudioStripStatus],
+) -> Result<(), CodecError> {
+    check_count(strips.len(), "input audio strips")?;
+    let mut inputs = BTreeSet::new();
+    for status in strips {
+        if !(-96_000..=24_000).contains(&status.gain_millidb)
+            || status.delay_samples > 48_000
+            || !inputs.insert(status.input.get())
+        {
+            return Err(CodecError::InvalidField {
+                field: "input_audio_strips",
+                value: format!(
+                    "{}:{}:{}:{}:{}",
+                    status.input,
+                    status.gain_millidb,
+                    u8::from(status.muted),
+                    u8::from(status.follow_video),
+                    status.delay_samples
+                ),
+            });
+        }
+    }
+    record.field_string(
+        "input_audio_strips",
+        strips
+            .iter()
+            .map(|status| {
+                format!(
+                    "{}:{}:{}:{}:{}",
+                    status.input,
+                    status.gain_millidb,
+                    u8::from(status.muted),
+                    u8::from(status.follow_video),
+                    status.delay_samples
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+    )
+}
+
 const fn overlay_position(position: crate::OverlayPositionPreset) -> &'static str {
     match position {
         crate::OverlayPositionPreset::FullFrame => "full_frame",
@@ -480,7 +539,7 @@ fn encode_stingers(record: &mut Record, stingers: &[StingerStatus]) -> Result<()
         let index = usize::from(status.slot.number() - 1);
         if seen[index] {
             return Err(CodecError::InvalidField {
-                field: "?stingers",
+                field: "stingers",
                 value: format!("duplicate slot {}", status.slot.number()),
             });
         }
@@ -514,7 +573,7 @@ fn encode_stingers(record: &mut Record, stingers: &[StingerStatus]) -> Result<()
         })
         .collect::<Vec<_>>()
         .join(",");
-    record.field_string("?stingers", value)
+    record.field_string("stingers", value)
 }
 
 fn encode_event(record: &mut Record, message: &EventMessage) -> Result<(), CodecError> {
@@ -527,6 +586,7 @@ fn encode_event(record: &mut Record, message: &EventMessage) -> Result<(), Codec
             manual_transition,
             fade_to_black,
             overlays,
+            input_audio_strips,
         } => {
             record.field("event", "desired_switcher")?;
             record.field("program", program)?;
@@ -538,6 +598,7 @@ fn encode_event(record: &mut Record, message: &EventMessage) -> Result<(), Codec
                 FadeToBlackStateFields::Unqualified,
             )?;
             encode_overlays(record, "overlays", overlays)?;
+            encode_input_audio_strips(record, input_audio_strips)?;
         }
         EventPayload::StingerSlotsChanged {
             program,
@@ -546,6 +607,7 @@ fn encode_event(record: &mut Record, message: &EventMessage) -> Result<(), Codec
             fade_to_black,
             stingers,
             overlays,
+            input_audio_strips,
         } => {
             record.field("event", "stinger_slots_changed")?;
             record.field("program", program)?;
@@ -558,6 +620,7 @@ fn encode_event(record: &mut Record, message: &EventMessage) -> Result<(), Codec
             )?;
             encode_stingers(record, stingers)?;
             encode_overlays(record, "overlays", overlays)?;
+            encode_input_audio_strips(record, input_audio_strips)?;
         }
     }
     Ok(())
@@ -607,8 +670,7 @@ fn encode_handshake_request(
     message: &HandshakeRequest,
 ) -> Result<(), CodecError> {
     record.kind("handshake_request");
-    check_count(message.versions.len(), "versions")?;
-    record.field("versions", versions(&message.versions))?;
+    record.field("protocol", message.protocol)?;
     record.field_str("build", &message.build)?;
     record.field("client_type", client_type(message.client_type))?;
     record.field("desired_role", role(message.desired_role))?;
@@ -624,7 +686,7 @@ fn encode_handshake_response(
     message: &HandshakeResponse,
 ) -> Result<(), CodecError> {
     record.kind("handshake_response");
-    record.field("protocol", message.negotiated)?;
+    record.field("protocol", message.protocol)?;
     record.field("granted_role", role(message.granted_role))?;
     record.field_string("permissions", string_list(&message.permissions)?)?;
     encode_capability_summary(record, &message.capabilities)?;
@@ -748,28 +810,28 @@ fn encode_manual_status(
 ) -> Result<(), CodecError> {
     let (active, kind, from, to, interval_start, position) = match fields {
         ManualStatusFields::Desired => (
-            "?desired_manual_active",
-            "?desired_manual_kind",
-            "?desired_manual_from",
-            "?desired_manual_to",
-            "?desired_manual_interval_start_basis_points",
-            "?desired_manual_position_basis_points",
+            "desired_manual_active",
+            "desired_manual_kind",
+            "desired_manual_from",
+            "desired_manual_to",
+            "desired_manual_interval_start_basis_points",
+            "desired_manual_position_basis_points",
         ),
         ManualStatusFields::Realized => (
-            "?realized_manual_active",
-            "?realized_manual_kind",
-            "?realized_manual_from",
-            "?realized_manual_to",
-            "?realized_manual_interval_start_basis_points",
-            "?realized_manual_position_basis_points",
+            "realized_manual_active",
+            "realized_manual_kind",
+            "realized_manual_from",
+            "realized_manual_to",
+            "realized_manual_interval_start_basis_points",
+            "realized_manual_position_basis_points",
         ),
         ManualStatusFields::Unqualified => (
-            "?manual_active",
-            "?manual_kind",
-            "?manual_from",
-            "?manual_to",
-            "?manual_interval_start_basis_points",
-            "?manual_position_basis_points",
+            "manual_active",
+            "manual_kind",
+            "manual_from",
+            "manual_to",
+            "manual_interval_start_basis_points",
+            "manual_position_basis_points",
         ),
     };
     match status {
@@ -806,14 +868,14 @@ fn encode_fade_to_black_state(
 ) -> Result<(), CodecError> {
     let (target_active, position) = match fields {
         FadeToBlackStateFields::Desired => (
-            "?desired_ftb_target_active",
-            "?desired_ftb_position_numerator",
+            "desired_ftb_target_active",
+            "desired_ftb_position_numerator",
         ),
         FadeToBlackStateFields::Realized => (
-            "?realized_ftb_target_active",
-            "?realized_ftb_position_numerator",
+            "realized_ftb_target_active",
+            "realized_ftb_position_numerator",
         ),
-        FadeToBlackStateFields::Unqualified => ("?ftb_target_active", "?ftb_position_numerator"),
+        FadeToBlackStateFields::Unqualified => ("ftb_target_active", "ftb_position_numerator"),
     };
     record.field(target_active, u8::from(state.target_active))?;
     record.field(position, state.position.numerator())

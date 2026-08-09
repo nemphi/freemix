@@ -76,33 +76,6 @@ pub(super) fn parse_role(value: &str) -> Option<Role> {
     }
 }
 
-pub(super) fn versions(values: &[ProtocolVersion]) -> String {
-    values
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-pub(super) fn parse_versions(value: &str) -> Result<Vec<ProtocolVersion>, CodecError> {
-    if value.is_empty() {
-        return Err(CodecError::InvalidField {
-            field: "versions",
-            value: value.to_owned(),
-        });
-    }
-    check_items(value, ',', MAX_LIST_ITEMS, "versions")?;
-    value
-        .split(',')
-        .map(|version| {
-            parse_version(version).ok_or_else(|| CodecError::InvalidField {
-                field: "versions",
-                value: value.to_owned(),
-            })
-        })
-        .collect()
-}
-
 pub(super) fn parse_version(value: &str) -> Option<ProtocolVersion> {
     let (major, minor) = value.split_once('.')?;
     Some(ProtocolVersion::new(

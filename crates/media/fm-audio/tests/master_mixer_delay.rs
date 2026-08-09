@@ -51,7 +51,7 @@ fn timing(sequence: u64, samples: usize) -> MediaTiming {
     .unwrap()
 }
 
-fn legacy_block(format: &AudioFormat, planes: Vec<Vec<f32>>) -> AudioBlock {
+fn planar_block(format: &AudioFormat, planes: Vec<Vec<f32>>) -> AudioBlock {
     AudioBlock::from_planar(format.clone(), planes).unwrap()
 }
 
@@ -84,11 +84,11 @@ fn mono_mixer(delay_samples: usize) -> (MasterMixer, InputId) {
 }
 
 #[test]
-fn legacy_delay_is_exact_across_arbitrary_boundaries_and_omitted_tail() {
+fn planar_delay_is_exact_across_arbitrary_boundaries_and_omitted_tail() {
     let format = mono_format();
     let (mut mixer, id) = mono_mixer(3);
-    let first = legacy_block(&format, vec![vec![1.0, 2.0]]);
-    let second = legacy_block(&format, vec![vec![3.0, 4.0, 5.0, 6.0, 7.0]]);
+    let first = planar_block(&format, vec![vec![1.0, 2.0]]);
+    let second = planar_block(&format, vec![vec![3.0, 4.0, 5.0, 6.0, 7.0]]);
 
     assert_eq!(
         mixer.mix(2, &[(id, &first)], None).unwrap().block.plane(0),
@@ -109,20 +109,9 @@ fn legacy_delay_is_exact_across_arbitrary_boundaries_and_omitted_tail() {
 }
 
 #[test]
-fn zero_delay_preserves_all_master_mix_api_results() {
+fn zero_delay_preserves_timed_master_mix_results() {
     let format = mono_format();
-    let legacy = legacy_block(&format, vec![vec![0.25, -0.5]]);
     let canonical = timed_block(&format, 0, vec![vec![0.25, -0.5]]);
-
-    let (mut legacy_mixer, id) = mono_mixer(0);
-    assert_eq!(
-        legacy_mixer
-            .mix(2, &[(id, &legacy)], None)
-            .unwrap()
-            .block
-            .plane(0),
-        Some(&[0.25, -0.5][..])
-    );
 
     let (mut timed_mixer, id) = mono_mixer(0);
     assert_eq!(
@@ -229,8 +218,8 @@ fn aliases_own_independent_delay_histories() {
         .add_input_alias(alias, source, InputState::default())
         .unwrap();
     mixer.set_input_delay(alias, 3).unwrap();
-    let source_block = legacy_block(&format, vec![vec![1.0, 0.0, 0.0, 0.0]]);
-    let alias_block = legacy_block(&format, vec![vec![2.0, 0.0, 0.0, 0.0]]);
+    let source_block = planar_block(&format, vec![vec![1.0, 0.0, 0.0, 0.0]]);
+    let alias_block = planar_block(&format, vec![vec![2.0, 0.0, 0.0, 0.0]]);
 
     let output = mixer
         .mix(4, &[(source, &source_block), (alias, &alias_block)], None)
@@ -272,8 +261,8 @@ fn muted_and_inactive_afv_strips_advance_without_contributing() {
             .unwrap();
         mixer.set_input_delay(id, 2).unwrap();
     }
-    let muted_block = legacy_block(&format, vec![vec![1.0, 0.0]]);
-    let afv_block = legacy_block(&format, vec![vec![2.0, 0.0]]);
+    let muted_block = planar_block(&format, vec![vec![1.0, 0.0]]);
+    let afv_block = planar_block(&format, vec![vec![2.0, 0.0]]);
     assert_eq!(
         mixer
             .mix(2, &[(muted, &muted_block), (afv, &afv_block)], None,)
@@ -330,7 +319,7 @@ fn source_gain_envelope_applies_to_current_interval_after_delay() {
 fn changing_delay_resets_history_and_preserves_gain_ramp_contract() {
     let format = mono_format();
     let (mut mixer, id) = mono_mixer(2);
-    let impulse = legacy_block(&format, vec![vec![1.0]]);
+    let impulse = planar_block(&format, vec![vec![1.0]]);
     assert_eq!(
         mixer
             .mix(1, &[(id, &impulse)], None)
@@ -340,7 +329,7 @@ fn changing_delay_resets_history_and_preserves_gain_ramp_contract() {
         Some(&[0.0][..])
     );
     mixer.set_input_delay(id, 2).unwrap();
-    let silence = legacy_block(&format, vec![vec![0.0]]);
+    let silence = planar_block(&format, vec![vec![0.0]]);
     assert_eq!(
         mixer
             .mix(1, &[(id, &silence)], None)
@@ -369,7 +358,7 @@ fn changing_delay_resets_history_and_preserves_gain_ramp_contract() {
             2,
         )
         .unwrap();
-    let unity = legacy_block(&format, vec![vec![1.0, 1.0]]);
+    let unity = planar_block(&format, vec![vec![1.0, 1.0]]);
     let output = mixer.mix(2, &[(id, &unity)], None).unwrap();
 
     assert_eq!(output.block.plane(0), Some(&[0.0, 0.0][..]));
@@ -452,7 +441,7 @@ fn failed_validation_and_numeric_render_do_not_advance_delay_or_ramp() {
         )
         .unwrap();
     mixer.set_input_delay(id, 1).unwrap();
-    let maximum = legacy_block(&format, vec![vec![f32::MAX]]);
+    let maximum = planar_block(&format, vec![vec![f32::MAX]]);
     mixer.mix(1, &[(id, &maximum)], None).unwrap();
     mixer
         .set_input_state(
@@ -486,7 +475,7 @@ fn failed_validation_and_numeric_render_do_not_advance_delay_or_ramp() {
         Err(AudioError::NonFiniteSample { .. })
     ));
     assert_eq!(output, vec![vec![9.0]]);
-    let silence = legacy_block(&format, vec![vec![0.0]]);
+    let silence = planar_block(&format, vec![vec![0.0]]);
     assert!(matches!(
         mixer.mix(1, &[(id, &silence)], None),
         Err(AudioError::NonFiniteSample { .. })
@@ -519,12 +508,12 @@ fn copy_runtime_state_copies_delay_history_and_requires_matching_delay() {
     let format = mono_format();
     let id = input(1);
     let (mut source, _) = mono_mixer(2);
-    let priming = legacy_block(&format, vec![vec![1.0, 2.0, 3.0]]);
+    let priming = planar_block(&format, vec![vec![1.0, 2.0, 3.0]]);
     source.mix(3, &[(id, &priming)], None).unwrap();
 
     let (mut destination, _) = mono_mixer(2);
     destination.copy_runtime_state_from(&source).unwrap();
-    let continuation = legacy_block(&format, vec![vec![4.0, 5.0]]);
+    let continuation = planar_block(&format, vec![vec![4.0, 5.0]]);
     assert_eq!(
         destination.mix(2, &[(id, &continuation)], None).unwrap(),
         source.mix(2, &[(id, &continuation)], None).unwrap()
@@ -566,7 +555,7 @@ fn raw_multichannel_delay_precedes_channel_mapping() {
         .add_input(id, input_format.clone(), mapping, InputState::default())
         .unwrap();
     mixer.set_input_delay(id, 2).unwrap();
-    let block = legacy_block(
+    let block = planar_block(
         &input_format,
         vec![vec![1.0, 2.0, 3.0], vec![10.0, 20.0, 30.0]],
     );
@@ -582,7 +571,7 @@ fn raw_multichannel_delay_precedes_channel_mapping() {
 }
 
 #[test]
-fn delay_bounds_and_empty_legacy_intervals_are_exact() {
+fn delay_bounds_and_empty_planar_intervals_are_exact() {
     let format = mono_format();
     let mut mixer = MasterMixer::new(format.clone()).unwrap();
     let id = input(1);
@@ -627,7 +616,7 @@ fn delay_bounds_and_empty_legacy_intervals_are_exact() {
 
     let mut samples = vec![0.0; MAX_SAMPLES_PER_BLOCK];
     samples[0] = 1.0;
-    let maximum = legacy_block(&mono_format(), vec![samples]);
+    let maximum = planar_block(&mono_format(), vec![samples]);
     let leading = mixer
         .mix(MAX_SAMPLES_PER_BLOCK, &[(id, &maximum)], None)
         .unwrap();

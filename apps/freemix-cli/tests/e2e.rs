@@ -61,6 +61,13 @@ impl FakeRemoteServer {
         Self { address, worker }
     }
 
+    fn start_audio_strip() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || serve_audio_strip(&listener));
+        Self { address, worker }
+    }
+
     fn start_stinger() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -196,6 +203,7 @@ fn serve_premature_event(listener: &TcpListener, kind: PrematureEvent) {
                 manual_transition: fm_protocol::ManualTransitionStatus::Inactive,
                 fade_to_black: live_fade_to_black(),
                 overlays: OverlayStatus::empty_channels(),
+                input_audio_strips: input_audio_strips(),
             },
         }),
         PrematureEvent::Runtime => WireMessage::RuntimeEvent(RuntimeEventMessage {
@@ -268,6 +276,7 @@ fn serve_fade_to_black(listener: &TcpListener) {
                     position: fm_protocol::FadeToBlackPosition::LIVE,
                 },
                 overlays: OverlayStatus::empty_channels(),
+                input_audio_strips: input_audio_strips(),
             },
         }),
     );
@@ -317,6 +326,89 @@ fn serve_zoom(listener: &TcpListener) {
     );
 }
 
+fn serve_audio_strip(listener: &TcpListener) {
+    let engine = EngineIdentity {
+        engine_id: "project-42".into(),
+        state_epoch: 1,
+        log_id: "fake-remote-log".into(),
+    };
+    let (stream, _) = listener.accept().unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(stream);
+    assert_handshake_request(read_message(&mut reader));
+    write_handshake(&mut writer, &engine, 0);
+
+    let WireMessage::Command(command) = read_message(&mut reader) else {
+        panic!("expected remote input-audio-strip command");
+    };
+    assert_command(
+        &command,
+        CommandPayload::SetInputAudioStrip {
+            input: input(2),
+            gain_millidb: -6_000,
+            muted: true,
+            follow_video: false,
+            delay_samples: 2_400,
+        },
+        "remote-audio-strip",
+        0,
+    );
+    write_message(
+        &mut writer,
+        &WireMessage::CommandResult(CommandResult::Accepted {
+            id: command.id,
+            revision: 1,
+            scheduled_frame: Some(1),
+        }),
+    );
+    write_message(
+        &mut writer,
+        &WireMessage::Event(EventMessage {
+            cursor: EventCursor {
+                engine: engine.clone(),
+                revision: 1,
+            },
+            payload: EventPayload::DesiredSwitcher {
+                program: input(1),
+                preview: input(2),
+                manual_transition: fm_protocol::ManualTransitionStatus::Inactive,
+                fade_to_black: live_fade_to_black(),
+                overlays: OverlayStatus::empty_channels(),
+                input_audio_strips: vec![
+                    fm_protocol::InputAudioStripStatus {
+                        input: input(1),
+                        gain_millidb: 0,
+                        muted: false,
+                        follow_video: true,
+                        delay_samples: 0,
+                    },
+                    fm_protocol::InputAudioStripStatus {
+                        input: input(2),
+                        gain_millidb: -6_000,
+                        muted: true,
+                        follow_video: false,
+                        delay_samples: 2_400,
+                    },
+                ],
+            },
+        }),
+    );
+    write_message(
+        &mut writer,
+        &WireMessage::RuntimeEvent(RuntimeEventMessage {
+            server: server_identity(&engine),
+            revision: 1,
+            generation: 1,
+            sequence: 1,
+            event: RuntimeLifecycleEvent::Realized {
+                domain: "audio".into(),
+                manual_transition: fm_protocol::ManualTransitionStatus::Inactive,
+                fade_to_black: live_fade_to_black(),
+            },
+        }),
+    );
+}
+
 fn serve_stinger(listener: &TcpListener) {
     serve_automatic_transition(
         listener,
@@ -331,7 +423,7 @@ fn serve_stinger(listener: &TcpListener) {
 
 fn serve_automatic_transition(
     listener: &TcpListener,
-    negotiated: ProtocolVersion,
+    protocol: ProtocolVersion,
     expected_payload: CommandPayload,
     expected_key: &str,
 ) {
@@ -348,14 +440,14 @@ fn serve_automatic_transition(
         &mut writer,
         &engine,
         0,
-        negotiated,
+        protocol,
         live_fade_to_black(),
     );
 
     let WireMessage::Command(command) = read_message(&mut reader) else {
         panic!("expected remote automatic transition command");
     };
-    assert_eq!(command.protocol, negotiated);
+    assert_eq!(command.protocol, protocol);
     assert_eq!(command.payload, expected_payload);
     assert_eq!(command.idempotency_key, expected_key);
     assert_eq!(command.expected_revision, Some(0));
@@ -380,6 +472,7 @@ fn serve_automatic_transition(
                 manual_transition: fm_protocol::ManualTransitionStatus::Inactive,
                 fade_to_black: live_fade_to_black(),
                 overlays: OverlayStatus::empty_channels(),
+                input_audio_strips: input_audio_strips(),
             },
         }),
     );
@@ -473,6 +566,7 @@ fn serve_manual_alpha_fade(listener: &TcpListener) {
                 manual_transition,
                 fade_to_black: live_fade_to_black(),
                 overlays: OverlayStatus::empty_channels(),
+                input_audio_strips: input_audio_strips(),
             },
         }),
     );
@@ -558,6 +652,7 @@ fn serve_manual_position(listener: &TcpListener) {
                 manual_transition: fm_protocol::ManualTransitionStatus::Active(desired_state),
                 fade_to_black: live_fade_to_black(),
                 overlays: OverlayStatus::empty_channels(),
+                input_audio_strips: input_audio_strips(),
             },
         }),
     );
@@ -586,7 +681,7 @@ fn assert_handshake_request(message: WireMessage) {
     let WireMessage::HandshakeRequest(hello) = message else {
         panic!("expected handshake request");
     };
-    assert_eq!(hello.versions, vec![CURRENT_PROTOCOL_VERSION]);
+    assert_eq!(hello.protocol, CURRENT_PROTOCOL_VERSION);
     assert_eq!(hello.client_type, ClientType::Cli);
     assert_eq!(hello.desired_role, Role::Operator);
     assert_eq!(hello.resume_cursor, None);
@@ -600,13 +695,13 @@ fn write_handshake_version(
     writer: &mut TcpStream,
     engine: &EngineIdentity,
     revision: u64,
-    negotiated: ProtocolVersion,
+    protocol: ProtocolVersion,
 ) {
     write_handshake_version_with_manual(
         writer,
         engine,
         revision,
-        negotiated,
+        protocol,
         fm_protocol::ManualTransitionStatus::Inactive,
     );
 }
@@ -615,13 +710,13 @@ fn write_handshake_version_with_manual(
     writer: &mut TcpStream,
     engine: &EngineIdentity,
     revision: u64,
-    negotiated: ProtocolVersion,
+    protocol: ProtocolVersion,
     manual_transition: fm_protocol::ManualTransitionStatus,
 ) {
     write_message(
         writer,
         &WireMessage::HandshakeResponse(HandshakeResponse {
-            negotiated,
+            protocol,
             granted_role: Role::Operator,
             permissions: vec!["switcher.write".into()],
             capabilities: CapabilityReportSummary {
@@ -646,6 +741,7 @@ fn write_handshake_version_with_manual(
             revision,
             show_name: "Remote Contract".into(),
             inputs: vec![input(1), input(2)],
+            input_audio_strips: input_audio_strips(),
             desired_program: input(1),
             desired_preview: preview,
             realized_program: input(1),
@@ -665,13 +761,13 @@ fn write_handshake_version_with_fade_to_black(
     writer: &mut TcpStream,
     engine: &EngineIdentity,
     revision: u64,
-    negotiated: ProtocolVersion,
+    protocol: ProtocolVersion,
     fade_to_black: fm_protocol::FadeToBlackState,
 ) {
     write_message(
         writer,
         &WireMessage::HandshakeResponse(HandshakeResponse {
-            negotiated,
+            protocol,
             granted_role: Role::Operator,
             permissions: vec!["switcher.write".into()],
             capabilities: CapabilityReportSummary {
@@ -695,6 +791,7 @@ fn write_handshake_version_with_fade_to_black(
             revision,
             show_name: "Remote Contract".into(),
             inputs: vec![input(1), input(2)],
+            input_audio_strips: input_audio_strips(),
             desired_program: input(1),
             desired_preview: input(2),
             realized_program: input(1),
@@ -750,6 +847,7 @@ fn write_command_events(
                 manual_transition: fm_protocol::ManualTransitionStatus::Inactive,
                 fade_to_black: live_fade_to_black(),
                 overlays: OverlayStatus::empty_channels(),
+                input_audio_strips: input_audio_strips(),
             },
         }),
     );
@@ -816,6 +914,19 @@ fn write_message(writer: &mut TcpStream, message: &WireMessage) {
 
 fn input(value: u128) -> WireInputId {
     WireInputId::new(NonZeroU128::new(value).unwrap())
+}
+
+fn input_audio_strips() -> Vec<fm_protocol::InputAudioStripStatus> {
+    [input(1), input(2)]
+        .into_iter()
+        .map(|input| fm_protocol::InputAudioStripStatus {
+            input,
+            gain_millidb: 0,
+            muted: false,
+            follow_video: true,
+            delay_samples: 0,
+        })
+        .collect()
 }
 
 #[test]
@@ -949,6 +1060,27 @@ fn remote_zoom_preserves_duration_and_protocol() {
         "0",
     ]);
     assert_success(&output);
+    server.finish();
+}
+
+#[test]
+fn remote_audio_strip_preserves_controls_and_replicated_state() {
+    let server = FakeRemoteServer::start_audio_strip();
+    let output = invoke(&[
+        "remote-audio-strip",
+        &server.address(),
+        "2",
+        "-6000",
+        "on",
+        "off",
+        "2400",
+        "--key",
+        "remote-audio-strip",
+        "--expect",
+        "0",
+    ]);
+    assert_success(&output);
+    assert!(stdout(&output).contains("AudioStrips=[1:0:false:true:0,2:-6000:true:false:2400]"));
     server.finish();
 }
 

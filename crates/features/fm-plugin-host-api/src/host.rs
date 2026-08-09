@@ -1,6 +1,6 @@
 use crate::exchange::validate_capabilities;
 use crate::{
-    ApiCompatibility, CapabilityDecision, CapabilityId, CommandEnvelope, CrashReport, Deadline,
+    ApiVersion, CapabilityDecision, CapabilityId, CommandEnvelope, CrashReport, Deadline,
     ExchangeError, HeartbeatMessage, PluginId, PluginManifest, PluginState, ProtocolLimits,
     QuarantineReason, Rejection, RejectionCode, Revision, StateEpoch, StateSnapshot,
 };
@@ -152,7 +152,7 @@ impl PluginRecord {
 #[derive(Clone, Debug)]
 struct HostState {
     plugins: HashMap<PluginId, PluginRecord>,
-    compatibility: ApiCompatibility,
+    api_version: ApiVersion,
     limits: ProtocolLimits,
 }
 
@@ -184,19 +184,16 @@ impl PluginHost {
     ///
     /// Returns [`HostError::InvalidLimits`] when protocol limits are unsafe.
     pub fn new(
-        compatibility: ApiCompatibility,
+        api_version: ApiVersion,
         limits: ProtocolLimits,
         state_epoch: StateEpoch,
     ) -> Result<Self, HostError> {
         let limits = limits.validate().map_err(HostError::InvalidLimits)?;
-        if compatibility.minimum_minor > compatibility.maximum_minor {
-            return Err(HostError::InvalidCompatibility);
-        }
         Ok(Self {
             commands: CommandState::new(
                 HostState {
                     plugins: HashMap::new(),
-                    compatibility,
+                    api_version,
                     limits,
                 },
                 state_epoch,
@@ -242,16 +239,12 @@ impl PluginHost {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HostError {
     InvalidLimits(ExchangeError),
-    InvalidCompatibility,
 }
 
 impl fmt::Display for HostError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidLimits(error) => error.fmt(formatter),
-            Self::InvalidCompatibility => {
-                formatter.write_str("minimum API minor version exceeds maximum")
-            }
         }
     }
 }
@@ -366,10 +359,10 @@ fn validate(
     events: &mut Vec<PluginEvent>,
     plugin_id: &PluginId,
 ) -> Result<PluginCommandResult, Rejection> {
-    let compatibility = state.compatibility;
+    let api_version = state.api_version;
     let record = plugin_mut(state, plugin_id)?;
     require_state(record, &[PluginState::Discovered], PluginState::Validated)?;
-    if !compatibility.supports(record.manifest.api_version) {
+    if record.manifest.api_version != api_version {
         return Err(rejection(
             RejectionCode::InvalidCommand,
             "plugin API version is not supported",
@@ -394,7 +387,7 @@ fn load(
         if snapshot.version() != record.manifest.state_version {
             return Err(rejection(
                 RejectionCode::InvalidCommand,
-                "snapshot must be migrated to the manifest state version before load",
+                "snapshot state version does not match the current manifest",
             ));
         }
         record.snapshot = Some(snapshot);

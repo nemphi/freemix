@@ -1,15 +1,35 @@
 use core::fmt;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use fm_switcher::{StingerDescriptor, StingerSlotId, SwitcherEvent, SwitcherState, TBarState};
 use fm_types::InputId;
 
 use crate::ShowError;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EngineInputAudioStripState {
+    pub gain_millidb: i32,
+    pub muted: bool,
+    pub follow_video: bool,
+    pub delay_samples: u32,
+}
+
+impl Default for EngineInputAudioStripState {
+    fn default() -> Self {
+        Self {
+            gain_millidb: 0,
+            muted: false,
+            follow_video: true,
+            delay_samples: 0,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ShowState {
     name: String,
     inputs: Vec<InputId>,
+    input_audio_strips: BTreeMap<InputId, EngineInputAudioStripState>,
     desired_switcher: SwitcherState,
 }
 
@@ -41,6 +61,11 @@ impl ShowState {
             SwitcherState::new(inputs.clone(), program, preview).map_err(ShowError::Switcher)?;
         Ok(Self {
             name,
+            input_audio_strips: inputs
+                .iter()
+                .copied()
+                .map(|input| (input, EngineInputAudioStripState::default()))
+                .collect(),
             inputs,
             desired_switcher,
         })
@@ -59,6 +84,34 @@ impl ShowState {
     #[must_use]
     pub const fn desired_switcher(&self) -> &SwitcherState {
         &self.desired_switcher
+    }
+
+    #[must_use]
+    pub fn input_audio_strip(&self, input: InputId) -> Option<EngineInputAudioStripState> {
+        self.input_audio_strips.get(&input).copied()
+    }
+
+    #[must_use]
+    pub fn input_audio_strips(&self) -> &BTreeMap<InputId, EngineInputAudioStripState> {
+        &self.input_audio_strips
+    }
+
+    /// Sets the exact desired Master strip state for one show input.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShowError::UnknownInput`] when the input is outside this show.
+    pub fn set_input_audio_strip(
+        &mut self,
+        input: InputId,
+        state: EngineInputAudioStripState,
+    ) -> Result<(), ShowError> {
+        let strip = self
+            .input_audio_strips
+            .get_mut(&input)
+            .ok_or(ShowError::UnknownInput(input))?;
+        *strip = state;
+        Ok(())
     }
 
     /// Restores exact desired manual-transition state from a checkpoint.

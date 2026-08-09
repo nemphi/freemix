@@ -2,7 +2,7 @@ use fm_types::{AudioFormat, BusId, FrameRate, InputId, OutputId, ProjectId, Scen
 
 use crate::{ValidationError, validation::validate_project};
 
-pub const CURRENT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(13);
+pub const CURRENT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(14);
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct SchemaVersion(u32);
@@ -294,10 +294,34 @@ impl InputGainMilliDb {
     }
 }
 
+/// Exact nonnegative per-input delay in 48 kHz samples.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct InputDelaySamples(u32);
+
+impl InputDelaySamples {
+    pub const MAX: u32 = 48_000;
+    pub const ZERO: Self = Self(0);
+
+    #[must_use]
+    pub const fn new(value: u32) -> Option<Self> {
+        if value <= Self::MAX {
+            Some(Self(value))
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
 /// Persisted user controls for one input's Master mixer strip.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InputAudioStripState {
     pub gain: InputGainMilliDb,
+    pub delay_samples: InputDelaySamples,
     pub muted: bool,
     pub follow_video: bool,
 }
@@ -306,6 +330,7 @@ impl Default for InputAudioStripState {
     fn default() -> Self {
         Self {
             gain: InputGainMilliDb::UNITY,
+            delay_samples: InputDelaySamples::ZERO,
             muted: false,
             follow_video: true,
         }

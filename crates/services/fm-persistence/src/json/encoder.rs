@@ -250,9 +250,10 @@ fn write_project_collections(output: &mut String, project: &fm_model::Project) {
         item_prefix(output, index, 6);
         write!(
             output,
-            "{{\"input\": {}, \"gain_milli_db\": {}, \"muted\": {}, \"follow_video\": {}}}",
+            "{{\"input\": {}, \"gain_milli_db\": {}, \"delay_samples\": {}, \"muted\": {}, \"follow_video\": {}}}",
             strip.input,
             strip.state.gain.get(),
+            strip.state.delay_samples.get(),
             strip.state.muted,
             strip.state.follow_video,
         )

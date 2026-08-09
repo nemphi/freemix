@@ -82,7 +82,7 @@ pub enum Role {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServerHello {
-    pub negotiated: ProtocolVersion,
+    pub protocol: ProtocolVersion,
     pub granted_role: Role,
     pub permissions: Vec<String>,
     pub capabilities_digest: String,
@@ -93,7 +93,7 @@ pub struct ServerHello {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HandshakeRequest {
-    pub versions: Vec<ProtocolVersion>,
+    pub protocol: ProtocolVersion,
     pub build: String,
     pub client_type: ClientType,
     pub desired_role: Role,
@@ -117,7 +117,7 @@ pub enum HandshakeOutcome {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HandshakeResponse {
-    pub negotiated: ProtocolVersion,
+    pub protocol: ProtocolVersion,
     pub granted_role: Role,
     pub permissions: Vec<String>,
     pub capabilities: CapabilityReportSummary,
@@ -441,6 +441,13 @@ impl OverlayStatus {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CommandPayload {
+    SetInputAudioStrip {
+        input: WireInputId,
+        gain_millidb: i32,
+        muted: bool,
+        follow_video: bool,
+        delay_samples: u32,
+    },
     SelectPreview {
         input: WireInputId,
     },
@@ -588,12 +595,22 @@ pub enum CommandResult {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InputAudioStripStatus {
+    pub input: WireInputId,
+    pub gain_millidb: i32,
+    pub muted: bool,
+    pub follow_video: bool,
+    pub delay_samples: u32,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SnapshotMessage {
     pub engine: EngineIdentity,
     pub revision: u64,
     pub show_name: String,
     pub inputs: Vec<WireInputId>,
+    pub input_audio_strips: Vec<InputAudioStripStatus>,
     pub desired_program: WireInputId,
     pub desired_preview: WireInputId,
     pub realized_program: WireInputId,
@@ -616,6 +633,7 @@ pub enum EventPayload {
         manual_transition: ManualTransitionStatus,
         fade_to_black: FadeToBlackState,
         overlays: Vec<OverlayStatus>,
+        input_audio_strips: Vec<InputAudioStripStatus>,
     },
     StingerSlotsChanged {
         program: WireInputId,
@@ -624,6 +642,7 @@ pub enum EventPayload {
         fade_to_black: FadeToBlackState,
         stingers: Vec<StingerStatus>,
         overlays: Vec<OverlayStatus>,
+        input_audio_strips: Vec<InputAudioStripStatus>,
     },
 }
 

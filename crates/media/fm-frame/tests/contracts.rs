@@ -123,8 +123,8 @@ fn cpu_video_validates_format_stride_and_allocation_limits() {
 fn cpu_video_metadata_is_unresolved_until_valid_attachment() {
     let dimensions = VideoDimensions::new(1, 1).unwrap();
     let payload = CpuVideoPayload::allocate(PixelFormat::Rgba8, dimensions).unwrap();
-    let legacy = CpuVideoFrame::new(timing(), payload.clone());
-    assert_eq!(legacy.metadata(), None);
+    let unannotated = CpuVideoFrame::new(timing(), payload.clone());
+    assert_eq!(unannotated.metadata(), None);
 
     let color = ColorMetadata {
         primaries: ColorPrimaries::Bt709,

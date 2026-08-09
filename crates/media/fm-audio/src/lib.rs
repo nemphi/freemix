@@ -318,10 +318,10 @@ impl Gain {
     }
 }
 
-/// An immutable, owned planar `f32` reference/generator audio block.
+/// An immutable, owned planar `f32` DSP/generator block.
 ///
-/// Timed media interchange uses [`fm_frame::AudioBlock`]. This legacy block is
-/// retained for reference generators and existing callers.
+/// Timed media interchange uses [`fm_frame::AudioBlock`]; this type is for
+/// deterministic signal generation and untimed DSP calls.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AudioBlock {
     format: AudioFormat,
@@ -2136,95 +2136,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rendered.block.plane(0).unwrap(), &[0.375, 0.5]);
-    }
-
-    #[test]
-    fn timed_gain_mute_afv_ramps_and_meters_match_legacy_mix() {
-        let format = mono_format();
-        let gain_id = input_id(1);
-        let muted_id = input_id(2);
-        let afv_id = input_id(3);
-        let planes = vec![vec![0.5, -0.5, 0.25, -0.25]];
-        let legacy_block = AudioBlock::from_planar(format.clone(), planes.clone()).unwrap();
-        let timed_block = canonical_block(timing(1), &format, planes);
-        let mut legacy_mixer = MasterMixer::new(format.clone()).unwrap();
-        legacy_mixer.set_clipping_policy(ClippingPolicy::Allow);
-        for (id, state) in [
-            (gain_id, InputState::default()),
-            (
-                muted_id,
-                InputState {
-                    muted: true,
-                    ..InputState::default()
-                },
-            ),
-            (
-                afv_id,
-                InputState {
-                    follow_video: true,
-                    ..InputState::default()
-                },
-            ),
-        ] {
-            legacy_mixer
-                .add_input(
-                    id,
-                    format.clone(),
-                    ChannelMapping::identity(mono_format().channels).unwrap(),
-                    state,
-                )
-                .unwrap();
-        }
-        legacy_mixer
-            .set_input_state(
-                gain_id,
-                InputState {
-                    gain: Gain::SILENCE,
-                    ..InputState::default()
-                },
-                4,
-            )
-            .unwrap();
-        let mut timed_mixer = legacy_mixer.clone();
-
-        let legacy = legacy_mixer
-            .mix(
-                4,
-                &[
-                    (gain_id, &legacy_block),
-                    (muted_id, &legacy_block),
-                    (afv_id, &legacy_block),
-                ],
-                Some(afv_id),
-            )
-            .unwrap();
-        let timed = timed_mixer
-            .mix_timed(
-                timing_for_samples(2, 4),
-                4,
-                &[
-                    (gain_id, &timed_block),
-                    (muted_id, &timed_block),
-                    (afv_id, &timed_block),
-                ],
-                Some(afv_id),
-            )
-            .unwrap();
-
-        assert_eq!(timed.block.planes(), legacy.block.planes());
-        assert_eq!(timed.meters, legacy.meters);
-        assert_eq!(
-            timed_mixer.current_linear_gain(gain_id),
-            legacy_mixer.current_linear_gain(gain_id)
-        );
-        assert_eq!(
-            timed_mixer.current_linear_gain(muted_id),
-            legacy_mixer.current_linear_gain(muted_id)
-        );
-        assert_eq!(
-            timed_mixer.current_linear_gain(afv_id),
-            legacy_mixer.current_linear_gain(afv_id)
-        );
     }
 
     #[test]

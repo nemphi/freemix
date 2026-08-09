@@ -20,9 +20,9 @@ into control messages.
 ## 2. Connection sequence
 
 1. Client resolves the engine and validates TLS identity.
-2. Client sends protocol versions, build, client type, desired role, and cached
+2. Client sends the current protocol identifier, build, client type, desired role, and cached
    cursor `(engine_id, state_epoch, log_id, revision)`.
-3. Server authenticates and returns negotiated version, permissions,
+3. Server authenticates, requires the exact current protocol, and returns permissions,
    capabilities digest, engine identity, and current revision.
 4. Server sends missing ordered events or a fresh snapshot.
 5. Client builds its read model and subscribes to selected telemetry.
@@ -69,6 +69,10 @@ Rules:
   value. Intermediate intents do not advance durable revision; the final
   commit does.
 - Command permissions are checked before validation reveals sensitive details.
+- The current input-audio mutation replaces one complete Master strip
+  atomically: gain in `-96000..=24000` milli-dB, mute, follow-video, and delay
+  in `0..=48000` samples. Snapshots and durable events always carry one complete
+  strip for every show input; partial audio-strip patches are not accepted.
 
 Command results are ordered before any event bearing the same accepted revision
 on that connection. State events are globally ordered within one
@@ -102,14 +106,14 @@ Slow clients receive coalesced latest data, never unbounded queues.
 
 ## 5. Versioning
 
-- Protocol uses explicit major/minor.
-- Major changes may remove or reinterpret fields.
-- Minor changes only add optional messages/fields or capabilities.
-- Unknown fields and events are preserved/ignored according to the serialization
-  contract.
-- Server supports the current and previous protocol major during an upgrade
-  window.
-- Golden wire fixtures and cross-version client/server tests run in CI.
+- Protocol uses one explicit current-development major/minor identifier.
+- Any wire change may replace that identifier and contract in place.
+- Client and server accept only the exact current identifier; there is no
+  downgrade negotiation or upgrade window during current development.
+- Unknown fields, events, and message kinds are rejected.
+- Tests generate current records through the current encoder, round-trip them,
+  and mutate them to cover malformed input. No historical wire fixtures or
+  cross-version matrix is retained.
 - Domain models do not derive their wire schema directly.
 
 ## 6. Authentication and authorization
@@ -155,7 +159,7 @@ persistent TCP/tally model to FreeMix commands/events. It:
 - exposes the complete documented vMix 29 XML state and HTTP function surface;
 - maps tally/activator subscriptions;
 - never weakens authentication by default; and
-- passes golden compatibility fixtures for the persistent TCP command/response
+- passes exact-current contract coverage for the persistent TCP command/response
   and subscription semantics.
 
 This adapter is isolated from the native protocol and is not the basis of new

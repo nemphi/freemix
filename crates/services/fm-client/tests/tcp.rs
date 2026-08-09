@@ -56,7 +56,6 @@ fn client(capacity: usize) -> Client {
 
 fn client_with_completed_history(capacity: usize, completed_command_capacity: usize) -> Client {
     let mut config = ClientConfig::new(
-        vec![CURRENT_PROTOCOL_VERSION],
         "tcp-test",
         ClientType::Integration,
         Role::Operator,
@@ -75,12 +74,12 @@ fn handshake(revision: u64, outcome: HandshakeOutcome) -> HandshakeResponse {
 }
 
 fn handshake_version(
-    negotiated: ProtocolVersion,
+    protocol: ProtocolVersion,
     revision: u64,
     outcome: HandshakeOutcome,
 ) -> HandshakeResponse {
     HandshakeResponse {
-        negotiated,
+        protocol,
         granted_role: Role::Operator,
         permissions: vec!["switcher.take".to_owned()],
         capabilities: CapabilityReportSummary {
@@ -102,6 +101,7 @@ fn snapshot(revision: u64) -> SnapshotMessage {
         revision,
         show_name: "Show".to_owned(),
         inputs: vec![input(1), input(2)],
+        input_audio_strips: input_audio_strips(),
         desired_program: input(1),
         desired_preview: input(2),
         realized_program: input(1),
@@ -137,6 +137,7 @@ fn event(revision: u64) -> EventMessage {
                 position: FadeToBlackPosition::LIVE,
             },
             overlays: OverlayStatus::empty_channels(),
+            input_audio_strips: input_audio_strips(),
         },
     }
 }
@@ -164,14 +165,14 @@ fn accept_snapshot(peer: &mut Peer, revision: u64) -> HandshakeRequest {
 
 fn accept_snapshot_version(
     peer: &mut Peer,
-    negotiated: ProtocolVersion,
+    protocol: ProtocolVersion,
     revision: u64,
 ) -> HandshakeRequest {
     let WireMessage::HandshakeRequest(request) = peer.receive() else {
         panic!("adapter emitted a non-current or invalid handshake")
     };
     peer.send(&WireMessage::HandshakeResponse(handshake_version(
-        negotiated,
+        protocol,
         revision,
         HandshakeOutcome::Snapshot {
             reason: SnapshotReason::NoCursor,
@@ -187,7 +188,7 @@ fn accept_resume(peer: &mut Peer, revision: u64) -> ResumeCursor {
 
 fn accept_resume_version(
     peer: &mut Peer,
-    negotiated: ProtocolVersion,
+    protocol: ProtocolVersion,
     revision: u64,
 ) -> ResumeCursor {
     let WireMessage::HandshakeRequest(request) = peer.receive() else {
@@ -195,7 +196,7 @@ fn accept_resume_version(
     };
     let cursor = request.resume_cursor.expect("resume cursor");
     peer.send(&WireMessage::HandshakeResponse(handshake_version(
-        negotiated,
+        protocol,
         revision,
         HandshakeOutcome::Resume {
             cursor: cursor.clone(),
@@ -623,7 +624,7 @@ fn incompatible_handshake_remains_terminal_after_socket_close() {
                 reason: SnapshotReason::NoCursor,
             },
         );
-        response.negotiated = ProtocolVersion::new(2, 3);
+        response.protocol = ProtocolVersion::new(99, 0);
         peer.send(&WireMessage::HandshakeResponse(response));
         assert_eq!(peer.stream.read(&mut [0_u8; 1]).unwrap(), 0);
     });
@@ -632,13 +633,16 @@ fn incompatible_handshake_remains_terminal_after_socket_close() {
     assert!(matches!(
         session.connect(address, CONNECT_TIMEOUT),
         Err(TcpSessionError::Client(ClientError::IncompatibleProtocol(
-            ProtocolVersion { major: 2, minor: 3 }
+            ProtocolVersion {
+                major: 99,
+                minor: 0
+            }
         )))
     ));
     assert_eq!(
         session.client().state(),
         &ConnectionState::Incompatible {
-            negotiated: ProtocolVersion::new(2, 3)
+            protocol: ProtocolVersion::new(99, 0)
         }
     );
     assert_eq!(session.reconnect_backoff(), None);
@@ -887,6 +891,7 @@ fn model_error_forces_snapshot_and_preserves_unresolved_command() {
                     position: FadeToBlackPosition::LIVE,
                 },
                 overlays: OverlayStatus::empty_channels(),
+                input_audio_strips: input_audio_strips(),
             },
         }));
         assert_eq!(first.stream.read(&mut [0_u8; 1]).unwrap(), 0);
@@ -928,4 +933,17 @@ fn model_error_forces_snapshot_and_preserves_unresolved_command() {
         }
     ));
     server_thread.join().unwrap();
+}
+
+fn input_audio_strips() -> Vec<fm_protocol::InputAudioStripStatus> {
+    [input(1), input(2)]
+        .into_iter()
+        .map(|input| fm_protocol::InputAudioStripStatus {
+            input,
+            gain_millidb: 0,
+            muted: false,
+            follow_video: true,
+            delay_samples: 0,
+        })
+        .collect()
 }

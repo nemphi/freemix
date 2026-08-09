@@ -3871,7 +3871,7 @@ impl StudioClient {
 
     fn handshake_with_digest(&mut self) -> (String, SnapshotMessage) {
         self.send(&WireMessage::HandshakeRequest(HandshakeRequest {
-            versions: vec![CURRENT_PROTOCOL_VERSION],
+            protocol: CURRENT_PROTOCOL_VERSION,
             build: "native-daemon-process-test".into(),
             client_type: ClientType::Studio,
             desired_role: Role::Operator,

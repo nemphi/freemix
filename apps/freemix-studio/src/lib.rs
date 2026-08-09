@@ -17,11 +17,9 @@ pub use supervisor::{
 };
 
 use fm_client::ClientConfig;
-use fm_protocol::{CURRENT_PROTOCOL_VERSION, ClientType, ProtocolVersion, Role};
+use fm_protocol::{ClientType, Role};
 use fm_types::ProjectId;
 
-/// Protocol versions implemented by the native Studio.
-pub const SUPPORTED_PROTOCOL_VERSIONS: [ProtocolVersion; 1] = [CURRENT_PROTOCOL_VERSION];
 pub const DEFAULT_DAEMON: &str = "freemixd";
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:0";
 
@@ -33,7 +31,6 @@ pub fn native_client_config(
     project_id: ProjectId,
 ) -> ClientConfig {
     ClientConfig::new(
-        SUPPORTED_PROTOCOL_VERSIONS.to_vec(),
         concat!("freemix-studio ", env!("CARGO_PKG_VERSION")),
         ClientType::Studio,
         desired_role,

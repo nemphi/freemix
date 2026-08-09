@@ -1153,6 +1153,19 @@ fn result_id(result: &CommandResult) -> &str {
 
 const fn intent_payload(intent: StudioIntent) -> CommandPayload {
     match intent {
+        StudioIntent::SetInputAudioStrip {
+            input,
+            gain_millidb,
+            muted,
+            follow_video,
+            delay_samples,
+        } => CommandPayload::SetInputAudioStrip {
+            input: WireInputId::from_domain(input),
+            gain_millidb,
+            muted,
+            follow_video,
+            delay_samples,
+        },
         StudioIntent::SelectPreview(input) => CommandPayload::SelectPreview {
             input: WireInputId::from_domain(input),
         },
@@ -1246,8 +1259,11 @@ fn runtime_state(runtime: &mut StudioRuntime, error: Option<String>) -> StudioUi
         .session()
         .map(|session| session.permissions.as_slice());
     let (can_select_preview, can_transition) = switcher_permissions(permissions);
+    let can_control_audio =
+        permissions.is_some_and(|values| values.iter().any(|value| value == "control_audio"));
     let mut state = StudioUiState::new(connection_status)
-        .with_switcher_permissions(can_select_preview, can_transition);
+        .with_switcher_permissions(can_select_preview, can_transition)
+        .with_audio_permission(can_control_audio);
     if connection_status == StudioConnectionStatus::Ready {
         state.view = client.model().view();
     }
@@ -1299,5 +1315,35 @@ fn publish_recovery_runtime(
             &recovery.deferred_intents,
             recovery.error(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::num::NonZeroU128;
+
+    use fm_types::InputId;
+
+    use super::*;
+
+    #[test]
+    fn input_audio_strip_intent_maps_to_the_exact_wire_command() {
+        let input = InputId::new(NonZeroU128::new(7).unwrap());
+        assert_eq!(
+            intent_payload(StudioIntent::SetInputAudioStrip {
+                input,
+                gain_millidb: -6_000,
+                muted: true,
+                follow_video: false,
+                delay_samples: 2_400,
+            }),
+            CommandPayload::SetInputAudioStrip {
+                input: WireInputId::from_domain(input),
+                gain_millidb: -6_000,
+                muted: true,
+                follow_video: false,
+                delay_samples: 2_400,
+            }
+        );
     }
 }

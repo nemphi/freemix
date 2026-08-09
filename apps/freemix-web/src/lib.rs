@@ -4,15 +4,17 @@ use std::fmt;
 use std::net::Ipv6Addr;
 
 use fm_client::ClientConfig;
-use fm_protocol::{CURRENT_PROTOCOL_VERSION, ClientType, ProtocolVersion, Role};
+use fm_protocol::{ClientType, Role};
 use fm_types::ProjectId;
 
+mod audio_strip;
 mod fade_to_black;
 mod manual_transition;
 mod overlay;
 mod stinger;
 mod transition;
 
+pub use audio_strip::AudioStripControls;
 pub use fade_to_black::{
     FadeToBlackControl, FadeToBlackModel, FadeToBlackPresentation, FadeToBlackProjection,
 };
@@ -23,9 +25,6 @@ pub use manual_transition::{
 pub use overlay::{OverlayControl, OverlayControls};
 pub use stinger::{StingerControl, StingerControls};
 pub use transition::{TransitionControl, TransitionControlState, TransitionControls};
-
-/// Protocol versions implemented by this control surface.
-pub const SUPPORTED_PROTOCOL_VERSIONS: [ProtocolVersion; 1] = [CURRENT_PROTOCOL_VERSION];
 
 /// A semantic panel that can appear in a role-scoped route.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -366,7 +365,6 @@ pub fn client_config(
     project_id: ProjectId,
 ) -> ClientConfig {
     ClientConfig::new(
-        SUPPORTED_PROTOCOL_VERSIONS.to_vec(),
         concat!("freemix-web ", env!("CARGO_PKG_VERSION")),
         ClientType::Web,
         desired_role,
@@ -479,15 +477,10 @@ mod tests {
             config.connection_url.as_str(),
             "wss://control.example.test/ws"
         );
-        assert_eq!(
-            config.client.supported_versions,
-            SUPPORTED_PROTOCOL_VERSIONS
-        );
         assert_eq!(config.client.client_type, ClientType::Web);
         assert_eq!(config.client.desired_role, Role::Operator);
         assert_eq!(config.client.client_id, "web-console-1");
         assert_eq!(config.client.project_id, project_id());
         assert_eq!(config.client.build, "freemix-web 0.1.0");
-        assert_eq!(config.client.supported_versions, [CURRENT_PROTOCOL_VERSION]);
     }
 }

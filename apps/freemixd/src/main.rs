@@ -36,10 +36,14 @@ use fm_control::{
 };
 #[cfg(feature = "native-media")]
 use fm_engine::FrameResult;
-use fm_engine::{Engine, EngineAcceptance, EngineRestoreState, EngineSnapshot, ShowState};
+use fm_engine::{
+    Engine, EngineAcceptance, EngineInputAudioStripState, EngineRestoreState, EngineSnapshot,
+    ShowState,
+};
 use fm_model::{
-    MainMix, StingerAudioPolicy as ModelStingerAudioPolicy, StingerConfig,
-    StingerMissingMediaFallback, StingerSlotNumber,
+    InputAudioStripState, InputDelaySamples, InputGainMilliDb, MainMix,
+    StingerAudioPolicy as ModelStingerAudioPolicy, StingerConfig, StingerMissingMediaFallback,
+    StingerSlotNumber,
 };
 use fm_persistence::{
     FadeToBlackState as PersistedFadeToBlackState, IdempotencyReceipt,
@@ -112,8 +116,8 @@ use fm_sim::{Rgba8, SimulatedVideoSource, SourcePattern};
 #[cfg(feature = "native-media")]
 use freemixd::native_media::{
     NativeAudioLimits, NativeMasterError, NativeMasterRuntime, NativeMediaRuntime,
-    NativeProgramReadback, NativeProjectLimits, NativeProjectPlan, NativeResolvedSource,
-    NativeSourceLimits, NativeSourceRenderError,
+    NativeOutputFrame, NativeProgramReadback, NativeProjectLimits, NativeProjectPlan,
+    NativeResolvedSource, NativeSourceLimits, NativeSourceRenderError,
 };
 #[cfg(feature = "native-media")]
 use stinger_mutation::{NativeStingerMutation, NativeStingerRetirements};
@@ -246,6 +250,7 @@ struct NativeDaemon {
     pacer_start_offset: Duration,
     origin: Instant,
     latest_output: Option<NativeTexture>,
+    latest_project_outputs: Vec<NativeOutputFrame>,
     master: NativeMasterRuntime,
     project_plan: NativeProjectPlan,
     playback: freemixd::native_media::NativeSourcePlayback,
@@ -1723,6 +1728,7 @@ impl NativeDaemon {
             pacer_start_offset,
             origin,
             latest_output: None,
+            latest_project_outputs: Vec::new(),
             master,
             project_plan,
             playback,
@@ -1906,38 +1912,67 @@ impl NativeDaemon {
         let registry = self.playback.registry();
         let stinger_registry = self.stingers.registry();
         let master = &mut self.master;
-        let project_plan = &self.project_plan;
+        let project_plan = &mut self.project_plan;
         let projected_frame = self.projected_frame.as_ref();
         let latest_output = &mut self.latest_output;
+        let latest_project_outputs = &mut self.latest_project_outputs;
         let mut audio = None;
         let outcome = control.tick_with_realizer(server, |frame| {
             debug_assert_eq!(projected_frame, Some(frame));
-            let output = runtime
-                .render_project_frame_result_with_stingers_blocking(
-                    registry,
-                    stinger_registry,
-                    project_plan,
-                    frame,
-                )
-                .map_err(NativeRealizationError::Video)?;
+            for &(input, state) in &frame.input_audio_strip_updates {
+                let strip = model_audio_strip_state(state);
+                master
+                    .set_input_audio_strip(input, strip)
+                    .map_err(NativeRealizationError::Audio)?;
+                project_plan
+                    .set_input_audio_strip(input, strip)
+                    .map_err(NativeRealizationError::Audio)?;
+            }
+            if project_plan.output_ids().is_empty() {
+                let output = runtime
+                    .render_project_frame_result_with_stingers_blocking(
+                        registry,
+                        stinger_registry,
+                        project_plan,
+                        frame,
+                    )
+                    .map_err(NativeRealizationError::Video)?;
+                *latest_output = Some(output);
+                latest_project_outputs.clear();
+            } else {
+                let outputs = runtime
+                    .render_project_outputs_with_stingers_blocking(
+                        registry,
+                        stinger_registry,
+                        project_plan,
+                        frame,
+                    )
+                    .map_err(NativeRealizationError::Video)?;
+                *latest_project_outputs = outputs;
+                *latest_output = None;
+            }
             let block = master
                 .render_project_frame_audio(frame, project_plan)
                 .map_err(NativeRealizationError::Audio)?;
-            *latest_output = Some(output);
             audio = Some(block);
             Ok::<(), NativeRealizationError>(())
         })?;
         self.install_stinger_mutation()?;
         self.projected_frame = None;
         self.pacer.advance()?;
+        let latest_program = self
+            .latest_project_outputs
+            .first()
+            .map(NativeOutputFrame::texture)
+            .or(self.latest_output.as_ref());
         #[cfg(all(feature = "macos-program-surface", target_os = "macos"))]
-        if let (Some(program), Some(output)) = (&mut self.program, self.latest_output.as_ref()) {
+        if let (Some(program), Some(output)) = (&mut self.program, latest_program) {
             program
                 .present_latest(self.runtime.context(), output)
                 .map_err(|error| -> Box<dyn Error> { Box::new(AppFailure(error)) })?;
         }
         if let (Some(recorder), Some(output), Some(audio)) =
-            (&mut self.recorder, self.latest_output.as_ref(), audio)
+            (&mut self.recorder, latest_program, audio)
         {
             recorder.capture(&self.runtime, output, audio);
         }
@@ -3392,7 +3427,6 @@ fn serve_inner(
         ServerMode::Development,
         AuthenticationMode::Development,
         listen.ip(),
-        vec![PROTOCOL_VERSION],
         capabilities_digest,
     );
     let mut server = Server::new(config, ControlHandle(Rc::clone(&control)))?;
@@ -3534,6 +3568,7 @@ fn restore_engine(project: &StoredProject) -> AppResult<Engine> {
         main_mix.desired_program,
         main_mix.desired_preview,
     )?;
+    restore_input_audio_strips(&mut show, canonical)?;
     let mut realized = SwitcherState::new(inputs, realized_program, realized_preview)?;
     for config in canonical.stingers() {
         restore_stinger(&mut show, &mut realized, *config)?;
@@ -3604,6 +3639,32 @@ fn restore_stinger(
         let _ = realized.preload_stinger(slot, true)?;
     }
     Ok(())
+}
+
+fn restore_input_audio_strips(show: &mut ShowState, project: &fm_model::Project) -> AppResult<()> {
+    for strip in project.input_audio_strips() {
+        show.set_input_audio_strip(
+            strip.input,
+            EngineInputAudioStripState {
+                gain_millidb: strip.state.gain.get(),
+                muted: strip.state.muted,
+                follow_video: strip.state.follow_video,
+                delay_samples: strip.state.delay_samples.get(),
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn model_audio_strip_state(state: EngineInputAudioStripState) -> InputAudioStripState {
+    InputAudioStripState {
+        gain: InputGainMilliDb::new(state.gain_millidb)
+            .expect("engine input audio gain is bounded by the model contract"),
+        muted: state.muted,
+        follow_video: state.follow_video,
+        delay_samples: InputDelaySamples::new(state.delay_samples)
+            .expect("engine input audio delay is bounded by the model contract"),
+    }
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -3792,7 +3853,7 @@ fn handshake_response(
     outcome: ProtocolHandshakeOutcome,
 ) -> HandshakeResponse {
     HandshakeResponse {
-        negotiated: hello.negotiated,
+        protocol: hello.protocol,
         granted_role: hello.granted_role,
         permissions: hello.permissions.clone(),
         capabilities: CapabilityReportSummary {
@@ -3818,11 +3879,7 @@ fn rejected_handshake_response(
 ) -> HandshakeResponse {
     let diagnostics = control.borrow().diagnostics();
     HandshakeResponse {
-        negotiated: fm_protocol::negotiate_version(
-            &hello.versions,
-            &server.config().supported_versions,
-        )
-        .unwrap_or(PROTOCOL_VERSION),
+        protocol: PROTOCOL_VERSION,
         granted_role: hello.desired_role,
         permissions: Vec::new(),
         capabilities: CapabilityReportSummary {
@@ -4300,7 +4357,8 @@ fn command_ticks(
                 OverlayChannelId::new(channel.number()).expect("wire overlay channels are bounded");
             prepared.overlay_transition_ticks(channel)
         }
-        CommandPayload::SelectPreview { .. }
+        CommandPayload::SetInputAudioStrip { .. }
+        | CommandPayload::SelectPreview { .. }
         | CommandPayload::Cut
         | CommandPayload::ConfigureStinger { .. }
         | CommandPayload::RemoveStinger { .. }
@@ -4370,6 +4428,13 @@ fn stored_project_with_receipts(
     let realized = snapshot.realized_switcher();
     let mut project = durable.project().clone();
     project.set_main_mix(MainMix::new(desired.program(), desired.preview()));
+    for (&input, &state) in show.input_audio_strips() {
+        if !project.set_input_audio_strip(input, model_audio_strip_state(state)) {
+            return Err(
+                AppFailure(format!("project is missing audio strip for input {input}")).into(),
+            );
+        }
+    }
     sync_project_stingers(&mut project, desired, realized)?;
     StoredProject::from_project_with_complete_runtime_state(
         project,
@@ -7476,6 +7541,46 @@ mod tests {
     }
 
     #[test]
+    fn audio_strip_command_checkpoints_every_control() {
+        let mut durable = test_project();
+        let mut control = test_control(&durable);
+        let server = test_server(&control);
+        execute_durable_command(
+            &mut control,
+            &CountingSaver::default(),
+            &mut durable,
+            &operator(),
+            &server,
+            &test_command(
+                "audio-strip",
+                "audio-strip-key",
+                CommandPayload::SetInputAudioStrip {
+                    input: fm_protocol::WireInputId::from_domain(test_input_id(1)),
+                    gain_millidb: -9_000,
+                    muted: true,
+                    follow_video: false,
+                    delay_samples: 1_200,
+                },
+            ),
+            0,
+        )
+        .unwrap();
+        control.tick(&server).unwrap();
+
+        let checkpoint =
+            stored_project_checkpoint(&durable, &control.idle_engine_snapshot().unwrap()).unwrap();
+        assert_eq!(
+            checkpoint.project().input_audio_strip(test_input_id(1)),
+            Some(InputAudioStripState {
+                gain: InputGainMilliDb::new(-9_000).unwrap(),
+                muted: true,
+                follow_video: false,
+                delay_samples: InputDelaySamples::new(1_200).unwrap(),
+            })
+        );
+    }
+
+    #[test]
     fn authorization_denial_is_saved_before_becoming_replayable() {
         let mut durable = test_project();
         let mut control = test_control(&durable);
@@ -7637,6 +7742,7 @@ mod tests {
             test_input_id(1),
             InputAudioStripState {
                 gain: InputGainMilliDb::new(-3_000).unwrap(),
+                delay_samples: Default::default(),
                 muted: false,
                 follow_video: true,
             },

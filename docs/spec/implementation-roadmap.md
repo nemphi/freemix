@@ -13,12 +13,13 @@ the same phase order but narrow certified devices and overlap less.
 Phases ship vertical slices. Do not build every input before one end-to-end
 camera-to-display-to-record path is reliable.
 
-During current development, the repository carries one project schema and one
-wire protocol only. Breaking changes replace that contract in place: do not add
-schema migrations, protocol downgrade projections, legacy API facades,
+During current development, the repository carries one project schema, one wire
+protocol, and one exact plugin ABI/state-snapshot version only. Breaking changes
+replace those contracts in place: do not add schema or snapshot migrations,
+protocol downgrade projections, plugin ABI ranges, legacy API facades,
 compatibility fixtures, or backward-regression gates. Delete superseded paths
-and update current-contract coverage. Version compatibility policy begins only
-when Phase 9 explicitly freezes the 1.0 contract.
+and update current-contract coverage. Version compatibility policy is outside
+this development roadmap.
 
 ## 2. Phase 0 — feasibility and constraints (6–10 weeks)
 
@@ -32,7 +33,7 @@ Build disposable prototypes, not production abstractions.
 5. Prototype engine/studio process separation and local shared preview.
 6. Validate FFmpeg/GStreamer/vendor SDK redistribution and codec patent posture.
 7. Acquire representative GPU, capture, audio, controller, and storage hardware.
-8. Freeze the vMix 29 compatibility ledger and tag every row with acceptance
+8. Freeze the vMix 29 feature-parity ledger and tag every row with acceptance
    owner and applicable platform.
 
 Exit:
@@ -193,17 +194,26 @@ decoded source, including an inactive one, advances on every Master interval so
 later switching does not replay stale audio.
 
 The current schema also persists one exact per-input audio strip as bounded
-integer milli-dB gain (`-96000..=24000`), mute, and follow-video. Native daemon
-preflight transactionally maps those records
-to `fm-audio::Gain` and constructs both Master mixer copies with the target
-gain applied immediately rather than as a restart ramp. Checkpoint/restart
-keeps the strips because engine routing projection clones the canonical
-project. Persistence, generated-audio, AFV selected/inactive, mute, immediate
-startup gain, and failed-preflight no-partial-state tests cover this slice.
-There are still no live strip commands or operator controls, meters in the
-studio, pan/solo/PFL, realized strip delay, labels/groups, bus sends,
-microphone automix, device-audio path, or acceptance evidence. Phase 2 item 7
-is partial, Phase 3 item 3 is partial, and `AU-001`/`AU-007` remain planned.
+integer milli-dB gain (`-96000..=24000`), mute, follow-video, and a bounded
+0–48,000-sample delay. Native daemon preflight transactionally maps those
+records to `fm-audio::Gain` and constructs both Master mixer copies with the
+target gain and delay applied immediately. Protocol 2.5 carries authoritative
+full-strip status in snapshots and durable events plus one permission-gated
+atomic live strip command. The engine schedules accepted gain, mute,
+follow-video, and delay changes together at a frame boundary, and
+native realization updates active and pending Master/Stinger mixers and the
+checkpoint project atomically. Local and remote CLI commands, Studio controls,
+and the Web semantic control model expose the same bounded mutation. Restart
+restores engine desired state from the canonical strips and checkpoints it back
+to the project. Current-contract persistence, generated-audio, AFV
+selected/inactive, mute, immediate startup gain/delay, live full-strip realization,
+and failed-preflight no-partial-state tests cover this slice.
+
+There are still no audio meters in Studio, pan/solo/PFL, labels/groups, bus
+sends, microphone automix, device-audio path,
+device-clock correction, native EQ/gate/compressor/limiter, or acceptance
+evidence. Phase 2 item 7 is partial, Phase 3 item 3 is partial, and
+`AU-001`/`AU-007` remain planned.
 
 The worker and synchronizer retain bounded blocks, samples, and bytes. Refills
 reserve capacity before nonblocking dispatch, prioritize uncovered sources, and
@@ -396,12 +406,11 @@ fade-out channels active until their zero-opacity endpoint, and rejects idle
 snapshots while any channel is moving. Every channel also owns a bounded
 64-source FIFO queue and deterministic full-frame, top-left, top-right,
 bottom-left, and bottom-right position presets plus none/thin-white/thick-white
-inset-border presets. Schema 13 persists the complete desired and realized
-arrays, appearance, and queue state and accepts schema 13 only. Protocol 2.2
-carries opacity, transition kind, duration, Take, Update, Off, output inclusion,
-transition/appearance configuration, Queue, and Take Next commands and
-negotiates protocol 2.2 only; no migration, downgrade projection, or
-compatibility facade is retained.
+inset-border presets. Schema 14 persists the complete desired and realized
+arrays, appearance, queue state, and exact per-input audio strips, and accepts schema
+14 only. Protocol 2.5 carries opacity, transition kind, duration, Take, Update,
+Off, output inclusion, transition/appearance configuration, Queue, Take Next,
+and atomic per-input audio-strip commands and state, and accepts protocol 2.5 only.
 
 Control authorization treats overlay mutations as transition operations. The
 client/UI reducer validates exactly eight unique channels, active-source
@@ -410,18 +419,24 @@ cover Take, Update, Off, inclusion, Queue, Take Next, and Cut/Fade/appearance
 configuration; status prints both desired and realized arrays with opacity,
 transition, appearance, and queue state. Web exposes transport-free semantic
 controls, and Studio exposes Take Preview, Queue Preview, Take Next, Off, and
-per-channel Cut/Fade/position/border controls for all eight channels. The native daemon includes
-active channels selected for its canonical Program output as scene-execution
-roots, composites them source-over in channel order after the Program
-transition or Stinger and before Fade-to-Black, applies the exact per-frame
-channel opacity, realizes position presets as deterministic one-third-frame PiP
-geometry, draws scale-aware inset white border presets in both the CPU oracle and
-native WGSL compositor, and budgets the additional GPU target.
+per-channel Cut/Fade/position/border controls for all eight channels. The native
+daemon derives a stable realization for every configured project output, unions
+their active overlay sources into one scene-execution closure, renders the
+authoritative Program transition or Stinger base once, and then produces and
+retains one independent GPU texture per output. Each output composites only its
+included channels source-over in channel order before Fade-to-Black, using the
+exact per-frame opacity, deterministic one-third-frame PiP geometry, and
+scale-aware inset white border presets implemented by both the CPU oracle and
+native WGSL compositor. Resource planning charges the shared base, per-output
+composition and final targets, and the prior retained output set. The existing
+fullscreen and recorder consumers select the first configured output
+deterministically; an output-less headless project retains its unbound Program
+path.
 
 This completes the independent source, on/off, per-output-inclusion,
-Cut/Fade-duration, position/border, and bounded FIFO queue slices. Multiple
-simultaneous native output realizers and profile-wide hardware acceptance
-evidence remain, so item 6 and `SW-005` stay planned.
+Cut/Fade-duration, position/border, bounded FIFO queue, and simultaneous native
+output-realization slices. Profile-wide hardware acceptance evidence remains,
+so `SW-005` stays planned.
 
 Current implementation boundary for item 3: `fm-audio` provides a bounded,
 deterministic planar-F32 sample-delay primitive with immutable channel count and
@@ -430,11 +445,23 @@ output, allocation-free steady-state processing, and explicit reset. The
 reference `MasterMixer` now gives every logical strip independent raw-planar
 delay history before channel mapping and gains, advances that history with
 submitted PCM or silence on every successful Master interval, and bounds total
-retained history per mixer. Delay configuration is an in-memory mixer API with
-transactional allocation and leading-silence reset; it is not connected to
-device audio, project persistence, daemon/protocol commands, native DSP, or
-operator UI. This remains a partial item 3 slice and does not complete or change
-the status of any `AU-*` parity row.
+retained history per mixer. Schema 14 gives every persisted input strip an exact
+0–48,000-sample delay and rejects missing, wrong-typed, or out-of-range values.
+Native project compilation carries that value into physical and scene-alias
+strips, and native Master/Stinger preflight applies it transactionally to both
+active and pending mixers before gain, mute, follow-video, and source envelopes.
+The engine owns the live desired full-strip map and emits frame-boundary
+realization updates. Protocol 2.5 snapshots and events replicate the complete
+map; its `SetInputAudioStrip` command atomically carries gain, mute,
+follow-video, and delay and is authorized by the dedicated audio-control
+permission. The daemon applies each update transactionally to every active and
+pending ordinary/Stinger mixer before checkpointing the canonical project. The
+local and remote CLI expose the command and exact status; Studio renders Ready-
+and permission-gated per-input controls; Web exposes the equivalent
+transport-free semantic controls. Device audio and clocks, drift correction,
+channel mapping, native EQ/gate/compressor/limiter, meters, and hardware
+acceptance remain. This is still a partial item 3 slice and does not
+complete or change the status of any `AU-*` parity row.
 
 Current implementation boundary for item 1: `fm-io-macos` is the first native
 platform leaf. An isolated Swift helper uses `AVFoundation` to enumerate camera
@@ -947,7 +974,7 @@ runtime confirmations.
 `fm-control` authorizes FTB as a transition, tracks it independently from
 Program transitions, preserves monotonic runtime generation/sequence ordering
 through overlap and reversal, and emits deterministic supersession. The client
-and UI reducer require complete state on negotiated 1.5 sessions and retain
+and UI reducer require complete state on the exact current protocol and retain
 exact desired and realized FTB projections by durable revision.
 
 The current schema persists only settled live or black checkpoints and rejects
@@ -1071,17 +1098,16 @@ Parallel adapters, each with its own certification:
 
 Exit: each adapter ships only with a platform-specific conformance report.
 
-## 11. Phase 9 — full parity and compatibility (12–20 weeks)
+## 11. Phase 9 — full parity and release certification (12–20 weeks)
 
-1. Close remaining `P2` rows: presentation/DVD/import/legacy surfaces according
+1. Close remaining `P2` rows: presentation/DVD/import surfaces according
    to legal platform scope.
 2. Add vMix HTTP/TCP/tally compatibility adapter.
 3. Complete virtual sets, advanced title import, social moderation adapters.
 4. Complete localization and accessibility audit.
 5. Exercise every universal acceptance scenario on each applicable Tier-1 OS.
 6. Run 72-hour release soak and disaster-recovery drills.
-7. External security, broadcast-operator, and hardware compatibility review.
-8. Freeze 1.0 project/plugin/protocol compatibility policy.
+7. External security, broadcast-operator, and hardware conformance review.
 
 Exit: no unclassified vMix 29 public feature and no incomplete P0/P1/P2 row
 without a documented legal/platform exception.

@@ -5,10 +5,11 @@ use fm_auth::{
     PairingError, Permission, Policy, Principal, PrincipalKind, Role, SessionId, UserId,
 };
 
-const COMMANDS: [CommandClass; 5] = [
+const COMMANDS: [CommandClass; 6] = [
     CommandClass::ViewStatus,
     CommandClass::SelectPreview,
     CommandClass::Transition,
+    CommandClass::ControlAudio,
     CommandClass::EditProject,
     CommandClass::ManageUsers,
 ];
@@ -42,11 +43,11 @@ fn stable_identity_validation_rejects_ambiguous_values() {
 fn production_role_matrix_is_least_privilege() {
     let policy = Policy::production();
     let cases = [
-        (Role::Viewer, [true, false, false, false, false]),
-        (Role::Graphics, [true, false, false, true, false]),
-        (Role::Audio, [true, false, false, true, false]),
-        (Role::Operator, [true, true, true, false, false]),
-        (Role::Admin, [true, true, true, true, true]),
+        (Role::Viewer, [true, false, false, false, false, false]),
+        (Role::Graphics, [true, false, false, false, true, false]),
+        (Role::Audio, [true, false, false, true, true, false]),
+        (Role::Operator, [true, true, true, true, false, false]),
+        (Role::Admin, [true, true, true, true, true, true]),
     ];
 
     for (role, expected) in cases {
@@ -82,6 +83,7 @@ fn multiple_roles_union_their_permissions() {
             Permission::ViewStatus,
             Permission::SelectPreview,
             Permission::Transition,
+            Permission::ControlAudio,
             Permission::EditProject,
         ])
     );

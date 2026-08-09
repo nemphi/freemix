@@ -172,5 +172,5 @@ blocking work on media threads.
 - Feature-powerset and minimal-build checks weekly.
 - Exact-current project/protocol contract coverage.
 - Installer, update, rollback, signing, and SBOM checks.
-- No known P0/P1 parity regression, unexplained performance regression over 5%,
+- No known P0/P1 parity loss, unexplained performance degradation over 5%,
   or untriaged soak failure at release.

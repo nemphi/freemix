@@ -37,6 +37,19 @@ fn overlays() -> Vec<OverlayStatus> {
         .collect()
 }
 
+fn input_audio_strips() -> Vec<InputAudioStripStatus> {
+    [input(1), input(2), input(3)]
+        .into_iter()
+        .map(|input| InputAudioStripStatus {
+            input,
+            gain_millidb: 0,
+            muted: false,
+            follow_video: true,
+            delay_samples: 0,
+        })
+        .collect()
+}
+
 fn snapshot(project_id: ProjectId, revision: u64) -> ProjectSnapshot {
     ProjectSnapshot {
         cursor: ProjectCursor {
@@ -46,6 +59,7 @@ fn snapshot(project_id: ProjectId, revision: u64) -> ProjectSnapshot {
         },
         show_name: "Show".into(),
         inputs: vec![input(1), input(2), input(3)],
+        input_audio_strips: input_audio_strips(),
         stingers: Vec::new(),
         desired_overlays: overlays(),
         realized_overlays: overlays(),
@@ -110,6 +124,7 @@ fn desired(selection: BusSelection) -> DurableChange {
             position: FadeToBlackPosition::LIVE,
         },
         overlays: overlays(),
+        input_audio_strips: input_audio_strips(),
     }
 }
 
@@ -177,6 +192,7 @@ fn reduces_exact_desired_and_realized_fade_to_black_state() {
                 manual_transition: ManualTransitionStatus::Inactive,
                 fade_to_black: fade_to_black(false, 12_345),
                 overlays: overlays(),
+                input_audio_strips: input_audio_strips(),
             },
         ))
         .unwrap();

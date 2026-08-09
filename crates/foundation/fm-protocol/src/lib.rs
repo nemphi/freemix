@@ -13,12 +13,13 @@ pub use dto::{
     CapabilityReportMessage, CapabilityReportSummary, ClientType, CommandMessage, CommandPayload,
     CommandResult, DurableEvent, DurableEventBatch, DurableGap, EngineIdentity, ErrorMessage,
     EventCursor, EventMessage, EventPayload, FadeToBlackPosition, FadeToBlackState, FieldIssue,
-    HandshakeOutcome, HandshakeRequest, HandshakeResponse, HeartbeatMessage, ManualTransitionKind,
-    ManualTransitionPosition, ManualTransitionState, ManualTransitionStatus, OverlayBorderPreset,
-    OverlayPositionPreset, OverlayStatus, OverlayTransitionKind, ResumeCursor, Role,
-    RuntimeDomainBoundary, RuntimeEventMessage, RuntimeFailureDisposition, RuntimeLifecycleEvent,
-    ServerHello, ServerIdentity, SnapshotMessage, SnapshotReason, StingerAudioPolicy,
-    StingerMissingMediaFallback, StingerReadiness, StingerStatus, StructuredError, WireInputId,
-    WireMessage, WireOutputId, WireOverlayChannelId, WireStingerSlotId, choose_handshake_outcome,
+    HandshakeOutcome, HandshakeRequest, HandshakeResponse, HeartbeatMessage, InputAudioStripStatus,
+    ManualTransitionKind, ManualTransitionPosition, ManualTransitionState, ManualTransitionStatus,
+    OverlayBorderPreset, OverlayPositionPreset, OverlayStatus, OverlayTransitionKind, ResumeCursor,
+    Role, RuntimeDomainBoundary, RuntimeEventMessage, RuntimeFailureDisposition,
+    RuntimeLifecycleEvent, ServerHello, ServerIdentity, SnapshotMessage, SnapshotReason,
+    StingerAudioPolicy, StingerMissingMediaFallback, StingerReadiness, StingerStatus,
+    StructuredError, WireInputId, WireMessage, WireOutputId, WireOverlayChannelId,
+    WireStingerSlotId, choose_handshake_outcome,
 };
-pub use version::{CURRENT_PROTOCOL_VERSION, NegotiationError, ProtocolVersion, negotiate_version};
+pub use version::{CURRENT_PROTOCOL_VERSION, ProtocolVersion};

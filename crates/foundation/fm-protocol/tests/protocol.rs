@@ -2,20 +2,34 @@ use core::{fmt::Write, num::NonZeroU128};
 
 use fm_command::{Deadline, Revision, StateEpoch};
 use fm_protocol::{
-    CURRENT_PROTOCOL_VERSION, CodecError, CommandMessage, CommandPayload, CommandResult,
+    CURRENT_PROTOCOL_VERSION, CapabilityReportMessage, CapabilityReportSummary, CodecError,
+    CommandMessage, CommandPayload, CommandResult, DurableEvent, DurableEventBatch, DurableGap,
     EngineIdentity, ErrorMessage, EventCursor, EventMessage, EventPayload, FadeToBlackPosition,
-    FadeToBlackState, FieldIssue, HandshakeOutcome, LineDecoder, MAX_FIELD_VALUE_BYTES,
-    MAX_FIELDS_PER_MESSAGE, MAX_LINE_BYTES, MAX_LIST_ITEMS, MAX_MESSAGES_PER_PUSH,
-    ManualTransitionStatus, OverlayStatus, OverlayTransitionKind, ProtocolVersion, ResumeCursor,
-    RuntimeDomainBoundary, RuntimeEventMessage, RuntimeFailureDisposition, RuntimeLifecycleEvent,
-    ServerIdentity, SnapshotMessage, SnapshotReason, StingerAudioPolicy,
+    FadeToBlackState, FieldIssue, HandshakeOutcome, HeartbeatMessage, InputAudioStripStatus,
+    LineDecoder, MAX_FIELD_VALUE_BYTES, MAX_FIELDS_PER_MESSAGE, MAX_LINE_BYTES, MAX_LIST_ITEMS,
+    MAX_MESSAGES_PER_PUSH, ManualTransitionStatus, OverlayStatus, OverlayTransitionKind,
+    ResumeCursor, RuntimeDomainBoundary, RuntimeEventMessage, RuntimeFailureDisposition,
+    RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage, SnapshotReason, StingerAudioPolicy,
     StingerMissingMediaFallback, StingerReadiness, StingerStatus, StructuredError, WireInputId,
     WireMessage, WireOutputId, WireOverlayChannelId, WireStingerSlotId, choose_handshake_outcome,
-    decode_line, encode_line, negotiate_version,
+    decode_line, encode_line,
 };
 
 fn input(value: u128) -> WireInputId {
     WireInputId::new(NonZeroU128::new(value).unwrap())
+}
+
+fn input_audio_strips(values: &[u128]) -> Vec<InputAudioStripStatus> {
+    values
+        .iter()
+        .map(|&value| InputAudioStripStatus {
+            input: input(value),
+            gain_millidb: 0,
+            muted: false,
+            follow_video: true,
+            delay_samples: 0,
+        })
+        .collect()
 }
 
 fn output(value: u128) -> WireOutputId {
@@ -81,6 +95,16 @@ fn command() -> CommandMessage {
 #[allow(clippy::too_many_lines)]
 fn every_message_variant_round_trips() {
     let messages = vec![
+        WireMessage::Command(CommandMessage {
+            payload: CommandPayload::SetInputAudioStrip {
+                input: input(42),
+                gain_millidb: -6_000,
+                muted: true,
+                follow_video: false,
+                delay_samples: 2_400,
+            },
+            ..command()
+        }),
         WireMessage::Command(CommandMessage {
             payload: CommandPayload::Cut,
             expected_revision: None,
@@ -190,6 +214,7 @@ fn every_message_variant_round_trips() {
             revision: 9,
             show_name: "My Show\nA".to_owned(),
             inputs: vec![input(1), input(2)],
+            input_audio_strips: input_audio_strips(&[1, 2]),
             desired_program: input(2),
             desired_preview: input(1),
             realized_program: input(1),
@@ -219,12 +244,81 @@ fn every_message_variant_round_trips() {
                     position: FadeToBlackPosition::LIVE,
                 },
                 overlays: OverlayStatus::empty_channels(),
+                input_audio_strips: input_audio_strips(&[1, 2]),
             },
         }),
     ];
     for message in messages {
         let encoded = encode_line(&message).unwrap();
         assert_eq!(decode_line(&encoded).unwrap(), message);
+    }
+}
+
+#[test]
+fn input_audio_strip_status_rejects_duplicates_and_out_of_range_controls() {
+    let strip_event = |input_audio_strips| {
+        WireMessage::Event(EventMessage {
+            cursor: cursor(),
+            payload: EventPayload::DesiredSwitcher {
+                program: input(1),
+                preview: input(2),
+                manual_transition: ManualTransitionStatus::Inactive,
+                fade_to_black: FadeToBlackState {
+                    target_active: false,
+                    position: FadeToBlackPosition::LIVE,
+                },
+                overlays: OverlayStatus::empty_channels(),
+                input_audio_strips,
+            },
+        })
+    };
+
+    let duplicate = strip_event(vec![
+        InputAudioStripStatus {
+            input: input(1),
+            gain_millidb: 0,
+            muted: false,
+            follow_video: true,
+            delay_samples: 0,
+        },
+        InputAudioStripStatus {
+            input: input(1),
+            gain_millidb: -6_000,
+            muted: true,
+            follow_video: false,
+            delay_samples: 1,
+        },
+    ]);
+    assert!(matches!(
+        encode_line(&duplicate),
+        Err(CodecError::InvalidField {
+            field: "input_audio_strips",
+            ..
+        })
+    ));
+
+    let valid = encode_line(&strip_event(input_audio_strips(&[1, 2]))).unwrap();
+    for malformed in [
+        valid.replace(
+            "1%3A0%3A0%3A1%3A0%2C2%3A0%3A0%3A1%3A0",
+            "1%3A0%3A0%3A1%3A0%2C1%3A0%3A0%3A1%3A0",
+        ),
+        valid.replace(
+            "1%3A0%3A0%3A1%3A0%2C2%3A0%3A0%3A1%3A0",
+            "1%3A0%3A0%3A1%3A0%2C2%3A0%3A0%3A1%3A48001",
+        ),
+        valid.replace(
+            "1%3A0%3A0%3A1%3A0%2C2%3A0%3A0%3A1%3A0",
+            "1%3A0%3A0%3A1%3A0%2C2%3A24001%3A0%3A1%3A0",
+        ),
+    ] {
+        assert!(matches!(
+            decode_line(&malformed),
+            Err(CodecError::InvalidField {
+                field: "input_audio_strips",
+                ..
+            })
+        ));
     }
 }
 
@@ -272,6 +366,7 @@ fn stinger_slot_mutations_round_trip_exact_configuration() {
                 readiness: StingerReadiness::Ready,
             }],
             overlays: OverlayStatus::empty_channels(),
+            input_audio_strips: input_audio_strips(&[1, 2, 42]),
         },
     });
     let encoded = encode_line(&event).unwrap();
@@ -302,13 +397,14 @@ fn stinger_encoder_rejects_too_many_or_duplicate_slots() {
                 },
                 stingers,
                 overlays: OverlayStatus::empty_channels(),
+                input_audio_strips: input_audio_strips(&[1, 2]),
             },
         })
     };
     assert!(matches!(
         encode_line(&event(vec![status, status])),
         Err(CodecError::InvalidField {
-            field: "?stingers",
+            field: "stingers",
             ..
         })
     ));
@@ -320,7 +416,13 @@ fn stinger_encoder_rejects_too_many_or_duplicate_slots() {
 
 #[test]
 fn decoder_rejects_out_of_range_manual_position() {
-    let fixture = include_str!("fixtures/command_manual_position.wire");
+    let fixture = encode_line(&WireMessage::Command(CommandMessage {
+        payload: CommandPayload::SetManualTransitionPosition {
+            position: fm_protocol::ManualTransitionPosition::new(6_250).unwrap(),
+        },
+        ..command()
+    }))
+    .unwrap();
     let invalid = fixture.replace("position_basis_points=6250", "position_basis_points=10001");
     assert!(matches!(
         decode_line(&invalid),
@@ -333,13 +435,7 @@ fn decoder_rejects_out_of_range_manual_position() {
 
 #[test]
 fn exact_contract_rejects_every_unknown_field() {
-    let fixture = include_str!("fixtures/command_select.wire");
-    let optional = fixture.replace('\n', "\t?future=value\n");
-    assert_eq!(
-        decode_line(&optional),
-        Err(CodecError::UnknownField("?future".to_owned()))
-    );
-
+    let fixture = encode_line(&WireMessage::Command(command())).unwrap();
     let required = fixture.replace('\n', "\tfuture=value\n");
     assert_eq!(
         decode_line(&required),
@@ -349,7 +445,7 @@ fn exact_contract_rejects_every_unknown_field() {
 
 #[test]
 fn decoder_rejects_truncation_duplicates_and_invalid_values() {
-    let fixture = include_str!("fixtures/command_select.wire");
+    let fixture = encode_line(&WireMessage::Command(command())).unwrap();
     assert_eq!(
         decode_line(fixture.trim_end()),
         Err(CodecError::MissingNewline)
@@ -368,9 +464,8 @@ fn decoder_rejects_truncation_duplicates_and_invalid_values() {
 
 #[test]
 fn streaming_decoder_handles_split_and_multiple_records() {
-    let command = include_str!("fixtures/command_select.wire");
-    let second_command = include_str!("fixtures/command_select.wire");
-    let bytes = format!("{command}{second_command}");
+    let command = encode_line(&WireMessage::Command(command())).unwrap();
+    let bytes = format!("{command}{command}");
     let split = bytes.len() / 3;
     let mut decoder = LineDecoder::new();
     assert!(decoder.push(&bytes.as_bytes()[..split]).unwrap().is_empty());
@@ -381,19 +476,6 @@ fn streaming_decoder_handles_split_and_multiple_records() {
     let mut incomplete = LineDecoder::new();
     incomplete.push(b"command").unwrap();
     assert_eq!(incomplete.finish(), Err(CodecError::TrailingData));
-}
-
-#[test]
-fn version_negotiation_accepts_only_the_exact_current_contract() {
-    assert_eq!(
-        negotiate_version(
-            &[ProtocolVersion::new(2, 3), CURRENT_PROTOCOL_VERSION],
-            &[CURRENT_PROTOCOL_VERSION]
-        )
-        .unwrap(),
-        CURRENT_PROTOCOL_VERSION
-    );
-    assert!(negotiate_version(&[ProtocolVersion::new(2, 3)], &[CURRENT_PROTOCOL_VERSION]).is_err());
 }
 
 #[test]
@@ -517,8 +599,26 @@ fn runtime_scheduled_domain_bounds_are_enforced() {
         .map(|index| format!("domain-{index}%7E{index}"))
         .collect::<Vec<_>>()
         .join("%2C");
-    let oversized = include_str!("fixtures/runtime_event.wire")
-        .replace("video%7E900%2Caudio%7E48000", &domains);
+    let current = encode_line(&WireMessage::RuntimeEvent(RuntimeEventMessage {
+        server: server_identity(),
+        revision: 1_843,
+        generation: 12,
+        sequence: 3,
+        event: RuntimeLifecycleEvent::Scheduled {
+            domains: vec![
+                RuntimeDomainBoundary {
+                    domain: "video".into(),
+                    boundary: 900,
+                },
+                RuntimeDomainBoundary {
+                    domain: "audio".into(),
+                    boundary: 48_000,
+                },
+            ],
+        },
+    }))
+    .unwrap();
+    let oversized = current.replace("video%7E900%2Caudio%7E48000", &domains);
     assert_eq!(
         decode_line(&oversized),
         Err(CodecError::TooManyItems("domains"))
@@ -527,8 +627,17 @@ fn runtime_scheduled_domain_bounds_are_enforced() {
 
 #[test]
 fn durable_gaps_are_structural_and_batches_cannot_hide_sequence_gaps() {
-    let malformed_batch =
-        include_str!("fixtures/durable_event_batch.wire").replace("events=0%7E", "events=1%7E");
+    let batch = WireMessage::DurableEventBatch(DurableEventBatch {
+        cursor: resume_cursor(),
+        events: vec![DurableEvent {
+            sequence: 0,
+            event_type: "switcher.desired".into(),
+            payload: "program=2&preview=1".into(),
+        }],
+    });
+    let malformed_batch = encode_line(&batch)
+        .unwrap()
+        .replace("events=0%7E", "events=1%7E");
     assert!(matches!(
         decode_line(&malformed_batch),
         Err(CodecError::InvalidField {
@@ -537,7 +646,13 @@ fn durable_gaps_are_structural_and_batches_cannot_hide_sequence_gaps() {
         })
     ));
 
-    let not_a_gap = include_str!("fixtures/durable_gap.wire").replace(
+    let gap = WireMessage::DurableGap(DurableGap {
+        server: server_identity(),
+        requested_after_revision: 1_800,
+        available_from_revision: 1_820,
+        current_revision: 1_845,
+    });
+    let not_a_gap = encode_line(&gap).unwrap().replace(
         "requested_after_revision=1800",
         "requested_after_revision=1819",
     );
@@ -555,13 +670,13 @@ fn streaming_and_field_bounds_are_enforced_before_growth() {
     let mut decoder = LineDecoder::new();
     let oversized = vec![b'x'; MAX_LINE_BYTES + 1];
     assert_eq!(decoder.push(&oversized), Err(CodecError::LineTooLong));
-    assert_eq!(
-        decoder
-            .push(include_bytes!("fixtures/error.wire"))
-            .unwrap()
-            .len(),
-        1
-    );
+    let error = encode_line(&WireMessage::Error(ErrorMessage {
+        request_id: Some("01K:test".into()),
+        current_revision: Some(1_845),
+        error: structured_error(),
+    }))
+    .unwrap();
+    assert_eq!(decoder.push(error.as_bytes()).unwrap().len(), 1);
 
     let oversized_field = format!(
         "error\trequest_id={}\tcode=e\tmessage=m\tfields=\tretryable=0\n",
@@ -596,7 +711,7 @@ fn streaming_and_field_bounds_are_enforced_before_growth() {
 
     let mut fields = String::new();
     for index in 0..=MAX_FIELDS_PER_MESSAGE {
-        write!(fields, "\t?field{index}=x").unwrap();
+        write!(fields, "\tfield{index}=x").unwrap();
     }
     let too_many_fields = format!("error{fields}\n");
     assert_eq!(
@@ -614,14 +729,29 @@ fn streaming_and_field_bounds_are_enforced_before_growth() {
 
 #[test]
 fn phase_one_records_reject_malformed_and_unknown_required_fields() {
-    let missing_project =
-        include_str!("fixtures/heartbeat.wire").replace("\tproject_id=project-9", "");
+    let heartbeat = WireMessage::Heartbeat(HeartbeatMessage {
+        server: server_identity(),
+        sequence: 88,
+        sent_at_ms: 1_720_000_000_000,
+        last_applied: Some(resume_cursor()),
+    });
+    let missing_project = encode_line(&heartbeat)
+        .unwrap()
+        .replace("\tproject_id=project-9", "");
     assert_eq!(
         decode_line(&missing_project),
         Err(CodecError::MissingField("project_id"))
     );
 
-    let malformed_events = include_str!("fixtures/durable_event_batch.wire").replace(
+    let batch = WireMessage::DurableEventBatch(DurableEventBatch {
+        cursor: resume_cursor(),
+        events: vec![DurableEvent {
+            sequence: 0,
+            event_type: "switcher.desired".into(),
+            payload: "program=2&preview=1".into(),
+        }],
+    });
+    let malformed_events = encode_line(&batch).unwrap().replace(
         "0%7Eswitcher.desired%7Eprogram%253D2%2526preview%253D1",
         "broken",
     );
@@ -633,8 +763,20 @@ fn phase_one_records_reject_malformed_and_unknown_required_fields() {
         })
     ));
 
-    let unknown =
-        include_str!("fixtures/capability_report.wire").replace('\n', "\tfuture_required=1\n");
+    let report = WireMessage::CapabilityReport(CapabilityReportMessage {
+        server: server_identity(),
+        revision: 1_845,
+        summary: CapabilityReportSummary {
+            digest: "sha256:abc".into(),
+            total: 4,
+            available: 3,
+            degraded: 1,
+            unavailable: 0,
+        },
+    });
+    let unknown = encode_line(&report)
+        .unwrap()
+        .replace('\n', "\tfuture_required=1\n");
     assert_eq!(
         decode_line(&unknown),
         Err(CodecError::UnknownField("future_required".to_owned()))

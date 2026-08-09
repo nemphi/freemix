@@ -41,7 +41,7 @@ behavior.
 | IN-027 | P1 | Per-input triggers | Ordered delayed actions on Transition In/Out, Overlay In/Out, Completion, Countdown Completed/Time/Remaining, Playback Time/Remaining, Call Connected/Disconnected, Zoom active-speaker/while-in-output/self, and Replay Events Completed |
 | IN-028 | P1 | PTZ cameras | Network-controlled/UVC PTZ supports pan/tilt/zoom/focus/speed, presets as virtual inputs, joystick/mouse/shortcut operation; serial-only and additional ONVIF breadth are FreeMix extensions |
 | IN-029 | P2 | Named Zoom meeting integration | Authorized SDK adapter joins Meetings/Events/Sessions, searches and assigns multiple participants, exposes camera/share/audio, switches camera/share, provides chat/manager/return feed, and emits active-speaker triggers |
-| IN-030 | P2 | Legacy compatibility inputs | Windows-only plugin may import documented Flash/SWF/FLV and WPF/XAML-era assets; unsupported active content receives a safe migration report |
+| IN-030 | P2 | Archived-format inputs | Windows-only plugin may import documented Flash/SWF/FLV and WPF/XAML-era assets; unsupported active content receives a safe conversion report |
 
 ## 2. Switching, composition, and video processing
 
@@ -134,7 +134,7 @@ behavior.
 | RC-009 | P2 | vMix API compatibility adapter | Full documented vMix 29 HTTP function/state XML plus persistent TCP command, tally, and activator subscription semantics map to stable FreeMix behavior; extensions are separately namespaced |
 | RC-010 | P1 | Macros and scripts | Typed command sequences, conditions, timers, retries, variables, cancellation, permissions, and execution log |
 | RC-011 | P1 | Sandboxed scripting | Wasm component or similarly isolated runtime; no ambient filesystem/network; declared capabilities |
-| RC-012 | P1 | Project presets and bundles | Save/open/append, autosave, media relink, portable bundle, schema migration, templates, and recent projects |
+| RC-012 | P1 | Project presets and bundles | Save/open/append, autosave, media relink, portable bundle, templates, and recent projects |
 | RC-013 | P1 | Import/export settings | Merge strategy, preview changes, conflict report, secrets excluded or separately encrypted |
 | RC-014 | P1 | Tally and web monitor | Phone tally, low-latency preview, labels, full-screen mode, reconnect, and role-limited shortcuts |
 | RC-015 | P1 | Statistics and alerts | FPS, drops, sync, queues, GPU/CPU/disk/network, input/output health, hardware encoder session inventory/capacity, thresholds, notifications, and support bundle |

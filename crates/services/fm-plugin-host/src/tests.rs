@@ -81,7 +81,7 @@ fn artifact(plugin_name: &str, key: &str) -> PluginArtifact {
     let api = fm_plugin_api::PluginManifest::new(
         plugin_id(plugin_name),
         plugin_version,
-        AbiVersionRange::exact(version(1, 1, 0)),
+        version(1, 1, 0),
         plugin_name,
     )
     .unwrap();
@@ -99,7 +99,7 @@ fn artifact(plugin_name: &str, key: &str) -> PluginArtifact {
 
 fn discovery_policy() -> DiscoveryPolicy {
     DiscoveryPolicy {
-        host_abi: AbiVersionRange::new(version(1, 0, 0), version(1, 9, 0)).unwrap(),
+        host_abi: version(1, 1, 0),
         granted_capabilities: CapabilitySet::default(),
         maximum_budget: ResourceBudget::new(2_048, 1_000, 100),
     }
@@ -138,7 +138,7 @@ fn discovery_checks_duplicates_signatures_api_budget_and_provider() {
     let mut bad_signature = artifact("bad-signature", "plugin.bad-signature");
     bad_signature.signature = Signature::new(b"wrong".to_vec()).unwrap();
     let mut bad_api = artifact("bad-api", "plugin.bad-api");
-    bad_api.manifest.api.abi = AbiVersionRange::exact(version(2, 0, 0));
+    bad_api.manifest.api.abi_version = version(2, 0, 0);
     let mut excessive = artifact("excessive", "plugin.excessive");
     excessive.manifest.budget.memory_bytes = 2_049;
     let mut impersonator = artifact("impersonator", "plugin.impersonator");

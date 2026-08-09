@@ -80,37 +80,6 @@ impl ApiVersion {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ApiCompatibility {
-    pub major: u16,
-    pub minimum_minor: u16,
-    pub maximum_minor: u16,
-}
-
-impl ApiCompatibility {
-    #[must_use]
-    pub const fn new(major: u16, minimum_minor: u16, maximum_minor: u16) -> Self {
-        Self {
-            major,
-            minimum_minor,
-            maximum_minor,
-        }
-    }
-
-    #[must_use]
-    pub const fn supports(self, version: ApiVersion) -> bool {
-        version.major == self.major
-            && version.minor >= self.minimum_minor
-            && version.minor <= self.maximum_minor
-    }
-}
-
-impl Default for ApiCompatibility {
-    fn default() -> Self {
-        Self::new(1, 0, 0)
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct StateVersion(u32);
 
@@ -123,14 +92,6 @@ impl StateVersion {
     #[must_use]
     pub const fn get(self) -> u32 {
         self.0
-    }
-
-    #[must_use]
-    pub const fn checked_next(self) -> Option<Self> {
-        match self.0.checked_add(1) {
-            Some(value) => Some(Self(value)),
-            None => None,
-        }
     }
 }
 

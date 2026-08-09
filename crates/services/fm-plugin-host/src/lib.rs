@@ -13,9 +13,7 @@ pub use discovery::{
     SignatureError, SignatureVerifier,
 };
 pub use fm_capabilities::{Capability, CapabilityRegistry};
-pub use fm_plugin_api::{
-    AbiVersion, AbiVersionRange, CapabilityGrant, CapabilitySet, PluginId, StatusCode,
-};
+pub use fm_plugin_api::{AbiVersion, CapabilityGrant, CapabilitySet, PluginId, StatusCode};
 pub use ipc::{BoundedIpcQueue, IpcLimits, IpcMessage, QueueError};
 pub use supervisor::{
     AuditEvent, AuditRecord, BudgetResource, ChildController, ChildError, ChildEvent, ChildId,

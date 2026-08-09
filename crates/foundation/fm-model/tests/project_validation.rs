@@ -2,11 +2,11 @@ use std::num::NonZeroU128;
 
 use fm_model::{
     AudioBus, BusSend, CURRENT_SCHEMA_VERSION, CropRect, EntityRef, Input, InputAudioStripState,
-    InputGainMilliDb, InputKind, Layer, LayerGeometry, MainMix, Output, OutputFormat, Project,
-    ProjectSettings, RectMask, RestartPolicy, Rgba8, Rotation, Scene, SchemaVersion,
-    SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef, StartupPolicy,
-    StingerAudioPolicy, StingerConfig, StingerMissingMediaFallback, StingerSlotNumber,
-    ValidationErrorKind,
+    InputDelaySamples, InputGainMilliDb, InputKind, Layer, LayerGeometry, MainMix, Output,
+    OutputFormat, Project, ProjectSettings, RectMask, RestartPolicy, Rgba8, Rotation, Scene,
+    SchemaVersion, SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef,
+    StartupPolicy, StingerAudioPolicy, StingerConfig, StingerMissingMediaFallback,
+    StingerSlotNumber, ValidationErrorKind,
 };
 use fm_types::{
     AudioFormat, BusId, ChannelLayout, ColorMetadata, FrameRate, InputId, OutputId, PixelFormat,
@@ -246,7 +246,7 @@ fn duplicate_routes_are_rejected() {
 
 #[test]
 fn project_uses_the_current_schema_contract() {
-    assert_eq!(CURRENT_SCHEMA_VERSION, SchemaVersion::new(13));
+    assert_eq!(CURRENT_SCHEMA_VERSION, SchemaVersion::new(14));
     assert_eq!(valid_project().schema_version(), CURRENT_SCHEMA_VERSION);
 }
 
@@ -322,10 +322,19 @@ fn persisted_input_gain_is_exact_and_bounded() {
     );
     assert_eq!(InputGainMilliDb::new(InputGainMilliDb::MIN - 1), None);
     assert_eq!(InputGainMilliDb::new(InputGainMilliDb::MAX + 1), None);
+    assert_eq!(InputDelaySamples::new(0), Some(InputDelaySamples::ZERO));
+    assert_eq!(
+        InputDelaySamples::new(InputDelaySamples::MAX)
+            .unwrap()
+            .get(),
+        48_000
+    );
+    assert_eq!(InputDelaySamples::new(InputDelaySamples::MAX + 1), None);
     assert_eq!(
         InputAudioStripState::default(),
         InputAudioStripState {
             gain: InputGainMilliDb::UNITY,
+            delay_samples: InputDelaySamples::ZERO,
             muted: false,
             follow_video: true,
         }
