@@ -68,6 +68,8 @@ use freemixd::ReadinessRecord;
 
 #[cfg(feature = "macos-program-surface")]
 mod program_surface;
+#[cfg(feature = "native-media")]
+mod stinger_mutation;
 
 #[cfg(feature = "native-media")]
 use fm_codec_ffmpeg::{
@@ -108,6 +110,10 @@ use freemixd::native_media::{
     NativeAudioLimits, NativeMasterError, NativeMasterRuntime, NativeMediaRuntime,
     NativeProgramReadback, NativeProjectLimits, NativeProjectPlan, NativeResolvedSource,
     NativeSourceLimits, NativeSourceRenderError,
+};
+#[cfg(feature = "native-media")]
+use stinger_mutation::{
+    NativeMutationFailure, NativeStingerMutation, NativeStingerRetirements,
 };
 
 const DEFAULT_LISTEN: &str = "127.0.0.1:0";
@@ -247,7 +253,11 @@ struct NativeDaemon {
     playback: freemixd::native_media::NativeSourcePlayback,
     stingers: freemixd::native_media::NativeSourcePlayback,
     projected_frame: Option<FrameResult>,
-    runtime: NativeMediaRuntime,
+    runtime: Arc<NativeMediaRuntime>,
+    resolved_sources: Arc<Vec<NativeResolvedSource>>,
+    assets_root: PathBuf,
+    pending_stinger_mutation: Option<NativeStingerMutation>,
+    stinger_retirements: NativeStingerRetirements,
     recorder: Option<NativeProgramRecorder>,
     telemetry: NativeRuntimeTelemetry,
     telemetry_emitted: bool,
@@ -1691,12 +1701,12 @@ impl NativeDaemon {
             stored.position().frames_rendered,
             NativeAudioLimits::default(),
         )?;
-        let runtime = match context {
+        let runtime = Arc::new(match context {
             Some(context) => NativeMediaRuntime::from_context_blocking(context)?,
             None => NativeMediaRuntime::new_blocking([platform_native_backend()])?,
-        };
+        });
         let (playback, stingers) =
-            preflight_native_video(&runtime, adapter.as_ref(), sources, stored)?;
+            preflight_native_video(&runtime, adapter.as_ref(), sources.clone(), stored)?;
         #[cfg(target_os = "macos")]
         resolution.cameras.mark_preflight_frames_ingested();
         let pacer = FramePacer::restore(
@@ -1718,6 +1728,10 @@ impl NativeDaemon {
             stingers,
             projected_frame: None,
             runtime,
+            resolved_sources: Arc::new(sources),
+            assets_root: store.assets_root().to_path_buf(),
+            pending_stinger_mutation: None,
+            stinger_retirements: NativeStingerRetirements::start()?,
             recorder: None,
             telemetry,
             telemetry_emitted: false,
@@ -1798,6 +1812,15 @@ impl NativeDaemon {
         control: &mut ControlService<Policy>,
         server: &ServerIdentity,
     ) -> AppResult<()> {
+        let _ = self.tick_if_due_collect(control, server)?;
+        Ok(())
+    }
+
+    fn tick_if_due_collect(
+        &mut self,
+        control: &mut ControlService<Policy>,
+        server: &ServerIdentity,
+    ) -> AppResult<Option<Vec<RuntimeEventMessage>>> {
         #[cfg(all(feature = "macos-program-surface", target_os = "macos"))]
         if let Some(program) = &mut self.program {
             program
@@ -1808,14 +1831,13 @@ impl NativeDaemon {
         let host_deadline = self.next_deadline()?;
         let now = Instant::now();
         if now < host_deadline {
-            return Ok(());
+            return Ok(None);
         }
         if !covered {
-            return Ok(());
+            return Ok(None);
         }
         self.telemetry.observe_host_lateness(host_deadline, now);
-        self.realize_one(control, server)?;
-        Ok(())
+        self.realize_one(control, server).map(Some)
     }
 
     fn wait_and_tick(
@@ -1904,6 +1926,7 @@ impl NativeDaemon {
             audio = Some(block);
             Ok::<(), NativeRealizationError>(())
         })?;
+        self.install_stinger_mutation()?;
         self.projected_frame = None;
         self.pacer.advance()?;
         #[cfg(all(feature = "macos-program-surface", target_os = "macos"))]
@@ -2096,6 +2119,30 @@ fn preflight_native_video(
     freemixd::native_media::NativeSourcePlayback,
     freemixd::native_media::NativeSourcePlayback,
 )> {
+    let (stingers, playback_limit) =
+        preflight_native_stinger_video(runtime, adapter, &sources, stored)?;
+    let playback = runtime.preflight_resolved_source_playback_mixed_blocking(
+        adapter,
+        sources,
+        native_clock_domain(),
+        StreamSelector::Best,
+        NativeSourceLimits {
+            max_retained_rgba16f_bytes: playback_limit,
+            ..NativeSourceLimits::default()
+        },
+    )?;
+    let expected = stored.project().settings().video.dimensions;
+    validate_native_video_dimensions("media source", playback.registry(), expected)?;
+    Ok((playback, stingers))
+}
+
+#[cfg(feature = "native-media")]
+fn preflight_native_stinger_video(
+    runtime: &NativeMediaRuntime,
+    adapter: Option<&Adapter>,
+    sources: &[NativeResolvedSource],
+    stored: &StoredProject,
+) -> AppResult<(freemixd::native_media::NativeSourcePlayback, u64)> {
     let stinger_inputs = stored
         .project()
         .stingers()
@@ -2126,19 +2173,10 @@ fn preflight_native_video(
     for input in stinger_inputs {
         stingers.enable_stinger_source(input)?;
     }
-    let playback = runtime.preflight_resolved_source_playback_mixed_blocking(
-        adapter,
-        sources,
-        native_clock_domain(),
-        StreamSelector::Best,
-        playback_limits,
-    )?;
-    validate_native_video_dimensions("media source", playback.registry(), expected)?;
     validate_native_video_dimensions("Stinger", stingers.registry(), expected)?;
-    Ok((playback, stingers))
+    Ok((stingers, playback_limits.max_retained_rgba16f_bytes))
 }
 
-#[cfg(feature = "native-media")]
 fn validate_native_video_dimensions(
     label: &str,
     registry: &freemixd::native_media::NativeSourceRegistry,
@@ -2161,6 +2199,9 @@ fn validate_native_video_dimensions(
 #[cfg(feature = "native-media")]
 impl Drop for NativeDaemon {
     fn drop(&mut self) {
+        if let Some(mutation) = self.pending_stinger_mutation.take() {
+            let _ = self.stinger_retirements.discard(mutation);
+        }
         let _ = self.finalize_recorder();
         self.emit_camera_source_telemetry();
         #[cfg(target_os = "macos")]
@@ -3947,35 +3988,60 @@ fn process_command(
         write_session_message(writer, session, &WireMessage::CommandResult(result))?;
         return Ok(());
     }
-    if native.is_some()
-        && let Some(result) = native_stinger_mutation_rejection(
-            command,
-            control.borrow().diagnostics().current_revision,
-        )
-    {
-        session.command_completed()?;
-        write_session_message(writer, session, &WireMessage::CommandResult(result))?;
-        return Ok(());
-    }
-
     let execution = {
         let mut control = control.borrow_mut();
         if let Some(native) = native {
             native.invalidate_projection();
-            execute_durable_command_with_ticks(
-                &mut control,
-                store,
-                durable,
-                principal,
-                server,
-                command,
-                now,
-                |control, server| {
-                    native
-                        .wait_and_tick(control, server, process_shutdown)?
-                        .map_or_else(|| Ok(control.tick_for_shutdown(server)?.runtime_events), Ok)
-                },
-            )?
+            if is_stinger_mutation(command) {
+                match execute_native_stinger_mutation(
+                    &mut control,
+                    store,
+                    durable,
+                    principal,
+                    server,
+                    command,
+                    now,
+                    native,
+                    process_shutdown,
+                )? {
+                    Ok(execution) => execution,
+                    Err(failure) => {
+                        drop(control);
+                        session.command_completed()?;
+                        write_session_message(
+                            writer,
+                            session,
+                            &WireMessage::CommandResult(failure.result),
+                        )?;
+                        for event in failure.runtime_events {
+                            write_session_message(
+                                writer,
+                                session,
+                                &WireMessage::RuntimeEvent(event),
+                            )?;
+                        }
+                        return Ok(());
+                    }
+                }
+            } else {
+                execute_durable_command_with_ticks(
+                    &mut control,
+                    store,
+                    durable,
+                    principal,
+                    server,
+                    command,
+                    now,
+                    |control, server| {
+                        native
+                            .wait_and_tick(control, server, process_shutdown)?
+                            .map_or_else(
+                                || Ok(control.tick_for_shutdown(server)?.runtime_events),
+                                Ok,
+                            )
+                    },
+                )?
+            }
         } else {
             execute_durable_command(
                 &mut control,
@@ -4008,24 +4074,186 @@ fn process_command(
     Ok(())
 }
 
-fn native_stinger_mutation_rejection(
-    command: &CommandMessage,
-    current_revision: u64,
-) -> Option<CommandResult> {
+fn is_stinger_mutation(command: &CommandMessage) -> bool {
     matches!(
         command.payload,
         CommandPayload::ConfigureStinger { .. } | CommandPayload::RemoveStinger { .. }
     )
-    .then(|| CommandResult::Rejected {
+}
+
+#[cfg(feature = "native-media")]
+fn native_stinger_preflight_rejection(
+    command: &CommandMessage,
+    current_revision: u64,
+) -> CommandResult {
+    CommandResult::Rejected {
         id: command.id.clone(),
         code: RejectionCode::Unavailable.as_str().to_owned(),
-        message:
-            "live Stinger slot mutation requires a daemon restart when native media is enabled"
-                .to_owned(),
+        message: "native Stinger resources could not be prepared".to_owned(),
         fields: Vec::new(),
         current_revision,
         retryable: false,
-    })
+    }
+}
+
+struct NativeMutationFailure {
+    result: CommandResult,
+    runtime_events: Vec<RuntimeEventMessage>,
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[cfg(feature = "native-media")]
+fn execute_native_stinger_mutation(
+    control: &mut ControlService<Policy>,
+    store: &ProjectStore,
+    durable: &mut StoredProject,
+    principal: &Principal,
+    server: &ServerIdentity,
+    command: &CommandMessage,
+    now_millis: u64,
+    native: &mut NativeDaemon,
+    process_shutdown: Option<&ProcessShutdown>,
+) -> AppResult<Result<DurableExecution, NativeMutationFailure>> {
+    let first_preparation = control.prepare_submit(principal, command.clone(), now_millis)?;
+    let first_prepared = match first_preparation {
+        PrepareSubmitOutcome::Replayed(submission) => {
+            return Ok(Ok(DurableExecution {
+                submission,
+                runtime_events: Vec::new(),
+            }));
+        }
+        PrepareSubmitOutcome::Prepared(prepared) => prepared,
+    };
+    if !first_prepared.submission().is_accepted() {
+        let projected = first_prepared.project(0)?;
+        let updated = stored_project_from_snapshot(
+            durable,
+            &projected,
+            command,
+            &first_prepared.output().result,
+        )?;
+        store.save(&updated)?;
+        let submission = first_prepared.commit()?;
+        *durable = updated;
+        return Ok(Ok(DurableExecution {
+            submission,
+            runtime_events: Vec::new(),
+        }));
+    }
+
+    let first_projected = first_prepared.project(1)?;
+    let candidate = stored_project_from_snapshot(
+        durable,
+        &first_projected,
+        command,
+        &first_prepared.output().result,
+    )?;
+    drop(first_prepared);
+
+    let (mutation, mut preflight_runtime_events) = match native
+        .preflight_stinger_mutation_with_ticks(
+            candidate.clone(),
+            control,
+            server,
+            process_shutdown,
+        )? {
+        Some((mutation, events)) => (mutation, events),
+        None => (Err(()), Vec::new()),
+    };
+    let mutation = match mutation {
+        Ok(mutation) => mutation,
+        Err(()) => {
+            return Ok(Err(NativeMutationFailure {
+                result: native_stinger_preflight_rejection(
+                    command,
+                    control.diagnostics().current_revision,
+                ),
+                runtime_events: preflight_runtime_events,
+            }));
+        }
+    };
+
+    let second_preparation = control.prepare_submit(principal, command.clone(), now_millis)?;
+    let second_prepared = match second_preparation {
+        PrepareSubmitOutcome::Replayed(submission) => {
+            native.stinger_retirements.discard(mutation)?;
+            return Ok(Ok(DurableExecution {
+                submission,
+                runtime_events: preflight_runtime_events,
+            }));
+        }
+        PrepareSubmitOutcome::Prepared(prepared) => prepared,
+    };
+    if !second_prepared.submission().is_accepted() {
+        native.stinger_retirements.discard(mutation)?;
+        let projected = second_prepared.project(0)?;
+        let updated = stored_project_from_snapshot(
+            durable,
+            &projected,
+            command,
+            &second_prepared.output().result,
+        )?;
+        store.save(&updated)?;
+        let submission = second_prepared.commit()?;
+        *durable = updated;
+        return Ok(Ok(DurableExecution {
+            submission,
+            runtime_events: preflight_runtime_events,
+        }));
+    }
+
+    let projected = second_prepared.project(1)?;
+    let updated = stored_project_from_snapshot(
+        durable,
+        &projected,
+        command,
+        &second_prepared.output().result,
+    )?;
+    if candidate.project().stingers() != updated.project().stingers()
+        || native
+            .playback
+            .validate_retained_byte_limit(mutation.ordinary_video_limit)
+            .is_err()
+    {
+        drop(second_prepared);
+        native.stinger_retirements.discard(mutation)?;
+        return Ok(Err(NativeMutationFailure {
+            result: native_stinger_preflight_rejection(
+                command,
+                control.diagnostics().current_revision,
+            ),
+            runtime_events: preflight_runtime_events,
+        }));
+    }
+    store.save(&updated)?;
+    let submission = second_prepared.commit()?;
+    native.stage_stinger_mutation(mutation);
+    let runtime_events = match native.wait_and_tick(control, server, process_shutdown)? {
+        Some(events) => events,
+        None => control.tick_for_shutdown(server)?.runtime_events,
+    };
+    preflight_runtime_events.extend(runtime_events);
+    *durable = updated;
+    Ok(Ok(DurableExecution {
+        submission,
+        runtime_events: preflight_runtime_events,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(not(feature = "native-media"))]
+fn execute_native_stinger_mutation(
+    _control: &mut ControlService<Policy>,
+    _store: &ProjectStore,
+    _durable: &mut StoredProject,
+    _principal: &Principal,
+    _server: &ServerIdentity,
+    _command: &CommandMessage,
+    _now_millis: u64,
+    _native: &mut NativeDaemon,
+    _process_shutdown: Option<&ProcessShutdown>,
+) -> AppResult<Result<DurableExecution, NativeMutationFailure>> {
+    Err(AppFailure("native-media support was not compiled in".into()).into())
 }
 
 struct DurableExecution {
@@ -6846,6 +7074,20 @@ mod tests {
 
     #[cfg(feature = "native-media")]
     #[test]
+    fn native_stinger_retirement_preflight_gate_is_bounded() {
+        let retirements = NativeStingerRetirements::start().unwrap();
+        retirements
+            .pending
+            .store(NATIVE_STINGER_RETIREMENT_LIMIT - 1, AtomicOrdering::Release);
+        assert!(retirements.can_accept());
+        retirements
+            .pending
+            .store(NATIVE_STINGER_RETIREMENT_LIMIT, AtomicOrdering::Release);
+        assert!(!retirements.can_accept());
+    }
+
+    #[cfg(feature = "native-media")]
+    #[test]
     fn native_stinger_source_validation_bounds_preload_kinds_and_audio() {
         let baseline = test_project();
         let mut project = baseline.project().clone();
@@ -6878,14 +7120,19 @@ mod tests {
         };
         validate_native_stinger_sources(&durable, &[retained]).unwrap();
 
-        validate_native_stinger_sources(
+        let local = NativeResolvedSource::LocalVideo {
+            input: test_input_id(2),
+            path: PathBuf::from("/secret/stinger.mov"),
+        };
+        validate_native_stinger_sources(&durable, std::slice::from_ref(&local)).unwrap();
+        assert!(native_stinger_requires_ffmpeg(
             &durable,
-            &[NativeResolvedSource::LocalVideo {
-                input: test_input_id(2),
-                path: PathBuf::from("/secret/stinger.mov"),
-            }],
-        )
-        .unwrap();
+            std::slice::from_ref(&local)
+        ));
+        assert!(!native_stinger_requires_ffmpeg(
+            &baseline,
+            std::slice::from_ref(&local)
+        ));
 
         let mut audible_project = baseline.project().clone();
         audible_project.add_stinger(StingerConfig::new(
@@ -6939,14 +7186,8 @@ mod tests {
             baseline.idempotency_receipts().to_vec(),
         )
         .unwrap();
-        validate_native_stinger_sources(
-            &deferred,
-            &[NativeResolvedSource::LocalVideo {
-                input: test_input_id(2),
-                path: PathBuf::from("/secret/stinger.mov"),
-            }],
-        )
-        .unwrap();
+        validate_native_stinger_sources(&deferred, std::slice::from_ref(&local)).unwrap();
+        assert!(!native_stinger_requires_ffmpeg(&deferred, &[local]));
     }
 
     #[test]
@@ -7432,8 +7673,9 @@ mod tests {
         InputId::new(NonZeroU128::new(value).unwrap())
     }
 
+    #[cfg(feature = "native-media")]
     #[test]
-    fn native_stinger_slot_mutations_are_restart_required_before_authority_changes() {
+    fn native_stinger_preflight_rejections_are_path_free_and_retryable_by_resubmission() {
         let slot = fm_protocol::WireStingerSlotId::new(8).unwrap();
         for payload in [
             CommandPayload::ConfigureStinger {
@@ -7446,11 +7688,10 @@ mod tests {
             },
             CommandPayload::RemoveStinger { slot },
         ] {
-            let result = native_stinger_mutation_rejection(
+            let result = native_stinger_preflight_rejection(
                 &test_command("native", "native-key", payload),
                 7,
-            )
-            .unwrap();
+            );
             assert!(matches!(
                 result,
                 CommandResult::Rejected {
@@ -7459,7 +7700,8 @@ mod tests {
                     current_revision: 7,
                     retryable: false,
                     ..
-                } if code == "unavailable" && message.contains("daemon restart")
+                } if code == "unavailable"
+                    && message == "native Stinger resources could not be prepared"
             ));
         }
     }

@@ -31,7 +31,8 @@ use fm_persistence::{ProjectPosition, ProjectStore, RuntimeRouting, StoredProjec
 use fm_protocol::{
     CURRENT_PROTOCOL_VERSION, ClientHello, ClientType, CommandMessage, CommandPayload,
     CommandResult, ManualTransitionKind, ManualTransitionPosition, Role, RuntimeLifecycleEvent,
-    SnapshotMessage, WireInputId, WireMessage, WireStingerSlotId, decode_line, encode_line,
+    SnapshotMessage, StingerStatus, WireInputId, WireMessage, WireStingerSlotId, decode_line,
+    encode_line,
 };
 use fm_types::{
     AudioFormat, ChannelLayout, ColorMetadata, FrameRate, InputId, PixelFormat, ProjectId,
@@ -369,13 +370,301 @@ fn native_media_daemon_refills_beyond_startup_prefix_and_checkpoints_once() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn native_daemon_rejects_live_stinger_mutation_without_durable_change() {
+fn native_daemon_hot_configures_fires_replaces_removes_and_restarts_stinger() {
     let _hardware_lock = NATIVE_MEDIA_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let directory = tempfile::tempdir().unwrap();
     let project_path = directory.path().join("native-stinger-rejection.freemix");
     save_generator_project(&project_path);
+    let before = ProjectStore::new(&project_path).unwrap().load().unwrap();
+
+    let Some(daemon) = require_native(NativeDaemonProcess::start(&project_path, true)) else {
+        return;
+    };
+    let mut client = StudioClient::connect(daemon.address);
+    let initial = client.handshake();
+    assert_eq!(initial.revision, 0);
+    assert_eq!(initial.revision, 0);
+    let configured = client.command(
+        "native-configure-stinger",
+        "native-configure-stinger-key",
+        CommandPayload::ConfigureStinger {
+            slot: WireStingerSlotId::new(8).unwrap(),
+            media_input: WireInputId::from_domain(input(2)),
+            preload: true,
+            cut_point_frames: 7,
+            audio_policy: fm_protocol::StingerAudioPolicy::Muted,
+            missing_media_fallback: fm_protocol::StingerMissingMediaFallback::KeepProgram,
+        },
+    );
+    assert_eq!(configured.revision, 1);
+    let configured_slot = configured
+        .stingers
+        .as_ref()
+        .and_then(|stingers| stingers.iter().find(|stinger| stinger.slot.number() == 8))
+        .expect("configure projects slot 8");
+    assert_eq!(
+        configured_slot.readiness,
+        fm_protocol::StingerReadiness::Ready
+    );
+    let fired = client.command(
+        "native-fire-stinger",
+        "native-fire-stinger-key",
+        CommandPayload::Stinger {
+            slot: WireStingerSlotId::new(8).unwrap(),
+            duration_frames: 7,
+        },
+    );
+    assert_eq!(fired.revision, 2);
+    let after_first_fire = ProjectStore::new(&project_path).unwrap().load().unwrap();
+    assert_eq!(
+        (
+            after_first_fire.runtime_routing().desired_program_id,
+            after_first_fire.runtime_routing().realized_program_id,
+            after_first_fire.runtime_routing().desired_preview_id,
+            after_first_fire.runtime_routing().realized_preview_id,
+        ),
+        (
+            Some(input(2)),
+            Some(input(2)),
+            Some(input(1)),
+            Some(input(1)),
+        )
+    );
+    let replaced = client.command(
+        "native-replace-stinger",
+        "native-replace-stinger-key",
+        CommandPayload::ConfigureStinger {
+            slot: WireStingerSlotId::new(8).unwrap(),
+            media_input: WireInputId::from_domain(input(1)),
+            preload: true,
+            cut_point_frames: 3,
+            audio_policy: fm_protocol::StingerAudioPolicy::Muted,
+            missing_media_fallback: fm_protocol::StingerMissingMediaFallback::Cut,
+        },
+    );
+    assert_eq!(replaced.revision, 3);
+    let replaced_slot = replaced
+        .stingers
+        .as_ref()
+        .and_then(|stingers| stingers.iter().find(|stinger| stinger.slot.number() == 8))
+        .expect("replacement projects slot 8");
+    assert_eq!(
+        replaced_slot.media_input,
+        WireInputId::from_domain(input(1))
+    );
+    assert_eq!(
+        replaced_slot.readiness,
+        fm_protocol::StingerReadiness::Ready
+    );
+    let fired_replacement = client.command(
+        "native-fire-replacement",
+        "native-fire-replacement-key",
+        CommandPayload::Stinger {
+            slot: WireStingerSlotId::new(8).unwrap(),
+            duration_frames: 4,
+        },
+    );
+    assert_eq!(fired_replacement.revision, 4);
+    let after_replacement_fire = ProjectStore::new(&project_path).unwrap().load().unwrap();
+    assert_eq!(
+        (
+            after_replacement_fire.runtime_routing().desired_program_id,
+            after_replacement_fire.runtime_routing().realized_program_id,
+            after_replacement_fire.runtime_routing().desired_preview_id,
+            after_replacement_fire.runtime_routing().realized_preview_id,
+        ),
+        (
+            Some(input(1)),
+            Some(input(1)),
+            Some(input(2)),
+            Some(input(2)),
+        )
+    );
+    let removed = client.command(
+        "native-remove-stinger",
+        "native-remove-stinger-key",
+        CommandPayload::RemoveStinger {
+            slot: WireStingerSlotId::new(8).unwrap(),
+        },
+    );
+    assert_eq!(removed.revision, 5);
+    assert_eq!(removed.stingers, Some(Vec::new()));
+
+    drop(client);
+    let output = daemon.wait();
+    assert!(
+        output.status.success(),
+        "native daemon failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let after = ProjectStore::new(&project_path).unwrap().load().unwrap();
+    assert_eq!(after.position().revision, 5);
+    assert_eq!(after.idempotency_receipts().len(), 5);
+    assert!(after.project().stingers().is_empty());
+    assert_eq!(after.project(), before.project());
+
+    let Some(restarted) = require_native(NativeDaemonProcess::start(&project_path, true)) else {
+        return;
+    };
+    let mut restarted_client = StudioClient::connect(restarted.address);
+    let snapshot = restarted_client.handshake();
+    assert_eq!(snapshot.revision, 5);
+    assert_eq!(snapshot.stingers, Some(Vec::new()));
+    drop(restarted_client);
+    let output = restarted.wait();
+    assert!(
+        output.status.success(),
+        "restarted native daemon failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires FFmpeg with local video/audio and a native macOS Metal adapter"]
+fn native_daemon_hot_replaces_audible_local_stinger_pool() {
+    let _hardware_lock = NATIVE_MEDIA_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let directory = tempfile::tempdir().unwrap();
+    let project_path = directory
+        .path()
+        .join("native-audible-stinger-hot-swap.freemix");
+    if require_native(prepare_audible_stinger_project(&project_path)).is_none() {
+        return;
+    }
+    let store = ProjectStore::new(&project_path).unwrap();
+    let stored = store.load().unwrap();
+    let mut project = stored.project().clone();
+    project.add_input(Input {
+        id: input(4),
+        name: "Audible Stinger replacement".into(),
+        kind: InputKind::Media {
+            asset_uri: "asset://stinger.mov".into(),
+        },
+        required_capabilities: Vec::new(),
+    });
+    let expanded = StoredProject::from_project(
+        project,
+        stored.runtime_routing(),
+        stored.position(),
+        stored.idempotency_receipts().to_vec(),
+    )
+    .unwrap();
+    store.save(&expanded).unwrap();
+
+    let Some(daemon) = require_native(NativeDaemonProcess::start(&project_path, true)) else {
+        return;
+    };
+    let mut client = StudioClient::connect(daemon.address);
+    assert_eq!(client.handshake().revision, 0);
+    let replaced = client.command(
+        "replace-audible-stinger",
+        "replace-audible-stinger-key",
+        CommandPayload::ConfigureStinger {
+            slot: WireStingerSlotId::new(2).unwrap(),
+            media_input: WireInputId::from_domain(input(4)),
+            preload: true,
+            cut_point_frames: 6,
+            audio_policy: fm_protocol::StingerAudioPolicy::StingerOnly,
+            missing_media_fallback: fm_protocol::StingerMissingMediaFallback::Cut,
+        },
+    );
+    assert_eq!(replaced.revision, 1);
+    let slot = replaced
+        .stingers
+        .as_ref()
+        .and_then(|stingers| stingers.iter().find(|stinger| stinger.slot.number() == 2))
+        .expect("audible replacement projects slot 2");
+    assert_eq!(slot.media_input, WireInputId::from_domain(input(4)));
+    assert_eq!(slot.readiness, fm_protocol::StingerReadiness::Ready);
+    let fired = client.command(
+        "fire-audible-replacement",
+        "fire-audible-replacement-key",
+        CommandPayload::Stinger {
+            slot: WireStingerSlotId::new(2).unwrap(),
+            duration_frames: 12,
+        },
+    );
+    assert_eq!(fired.revision, 2);
+    let removed = client.command(
+        "remove-audible-replacement",
+        "remove-audible-replacement-key",
+        CommandPayload::RemoveStinger {
+            slot: WireStingerSlotId::new(2).unwrap(),
+        },
+    );
+    assert_eq!(removed.revision, 3);
+    assert!(
+        removed
+            .stingers
+            .as_ref()
+            .is_some_and(|stingers| stingers.iter().all(|stinger| stinger.slot.number() != 2))
+    );
+    drop(client);
+
+    let output = daemon.wait();
+    assert!(
+        output.status.success(),
+        "native audible hot swap failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let diagnostic = telemetry_diagnostic(&stderr);
+    assert!(
+        diagnostic_value(diagnostic, "audio_observed_peak_retained_blocks")
+            .parse::<usize>()
+            .unwrap()
+            <= 1_024
+    );
+    assert!(
+        diagnostic_value(diagnostic, "audio_observed_peak_retained_samples")
+            .parse::<usize>()
+            .unwrap()
+            <= 1_024 * 1_024
+    );
+    assert!(
+        diagnostic_value(diagnostic, "audio_observed_peak_retained_bytes")
+            .parse::<usize>()
+            .unwrap()
+            <= 32 * 1_024 * 1_024
+    );
+    let persisted = store.load().unwrap();
+    assert_eq!(persisted.position().revision, 3);
+    assert_eq!(persisted.idempotency_receipts().len(), 3);
+    assert!(
+        persisted
+            .project()
+            .stingers()
+            .iter()
+            .all(|stinger| stinger.slot.number() != 2)
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn native_stinger_preflight_failure_rolls_back_and_keeps_show_cursor_live() {
+    let _hardware_lock = NATIVE_MEDIA_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let directory = tempfile::tempdir().unwrap();
+    let project_path = directory.path().join("native-stinger-rollback.freemix");
+    let rate = FrameRate::new(25, 1).unwrap();
+    save_generator_project_with_sources_and_dimensions(
+        &project_path,
+        rate,
+        0,
+        VideoDimensions::new(2_900, 2_900).unwrap(),
+        [
+            (input(1), SimulatedVideo::Bars),
+            (
+                input(2),
+                SimulatedVideo::Solid(SolidColor::new(24, 80, 160, 255)),
+            ),
+        ],
+    );
     let manifest_path = project_path.join("project.json");
     let before_bytes = fs::read(&manifest_path).unwrap();
     let before = ProjectStore::new(&project_path).unwrap().load().unwrap();
@@ -388,28 +677,29 @@ fn native_daemon_rejects_live_stinger_mutation_without_durable_change() {
     assert_eq!(initial.revision, 0);
     client.send(&WireMessage::Command(CommandMessage {
         protocol: CURRENT_PROTOCOL_VERSION,
-        id: "native-configure-stinger".into(),
-        idempotency_key: "native-configure-stinger-key".into(),
+        id: "oversized-stinger".into(),
+        idempotency_key: "oversized-stinger-key".into(),
         expected_revision: Some(0),
         deadline_ms: None,
         payload: CommandPayload::ConfigureStinger {
-            slot: WireStingerSlotId::new(8).unwrap(),
+            slot: WireStingerSlotId::new(1).unwrap(),
             media_input: WireInputId::from_domain(input(2)),
-            preload: false,
-            cut_point_frames: 7,
+            preload: true,
+            cut_point_frames: 1,
             audio_policy: fm_protocol::StingerAudioPolicy::Muted,
-            missing_media_fallback: fm_protocol::StingerMissingMediaFallback::KeepProgram,
+            missing_media_fallback: fm_protocol::StingerMissingMediaFallback::Cut,
         },
     }));
-    let rejected = client.receive_until("native Stinger rejection", |message| {
-        if let WireMessage::CommandResult(result @ CommandResult::Rejected { id, .. }) = message
-            && id == "native-configure-stinger"
-        {
-            Some(result.clone())
-        } else {
-            None
-        }
-    });
+    let rejected =
+        client.receive_until("path-free native Stinger preflight rejection", |message| {
+            if let WireMessage::CommandResult(result @ CommandResult::Rejected { id, .. }) = message
+                && id == "oversized-stinger"
+            {
+                Some(result.clone())
+            } else {
+                None
+            }
+        });
     assert!(matches!(
         rejected,
         CommandResult::Rejected {
@@ -418,21 +708,38 @@ fn native_daemon_rejects_live_stinger_mutation_without_durable_change() {
             current_revision: 0,
             retryable: false,
             ..
-        } if code == "unavailable" && message.contains("restart")
+        } if code == "unavailable"
+            && message == "native Stinger resources could not be prepared"
     ));
     assert_eq!(fs::read(&manifest_path).unwrap(), before_bytes);
+    let rolled_back = ProjectStore::new(&project_path).unwrap().load().unwrap();
+    assert_eq!(rolled_back, before);
+    assert!(rolled_back.idempotency_receipts().is_empty());
 
     drop(client);
+    let mut resumed = StudioClient::connect(daemon.address);
+    let snapshot = resumed.handshake();
+    assert_eq!(snapshot.revision, 0);
+    assert_eq!(snapshot.stingers, Some(Vec::new()));
+    let cut = resumed.command(
+        "post-rollback-cut",
+        "post-rollback-cut-key",
+        CommandPayload::Cut,
+    );
+    assert_eq!(cut.revision, 1);
+    assert!(cut.scheduled_frame > 0);
+    drop(resumed);
+
     let output = daemon.wait();
     assert!(
         output.status.success(),
-        "native daemon failed: {}",
+        "native daemon failed after rollback: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let after = ProjectStore::new(&project_path).unwrap().load().unwrap();
-    assert_eq!(after.position().revision, 0);
-    assert!(after.idempotency_receipts().is_empty());
-    assert_eq!(after.project(), before.project());
+    let persisted = ProjectStore::new(&project_path).unwrap().load().unwrap();
+    assert_eq!(persisted.position().revision, 1);
+    assert_eq!(persisted.idempotency_receipts().len(), 1);
+    assert!(persisted.project().stingers().is_empty());
 }
 
 #[cfg(target_os = "macos")]
@@ -3529,6 +3836,7 @@ struct CommandOutcome {
     revision: u64,
     scheduled_frame: u64,
     elapsed: Duration,
+    stingers: Option<Vec<StingerStatus>>,
 }
 
 #[cfg(target_os = "macos")]
@@ -3604,6 +3912,7 @@ impl StudioClient {
         let mut accepted = None;
         let mut durable_revisions = HashSet::new();
         let mut realized_revisions = HashSet::new();
+        let mut stingers = None;
         for _ in 0..4_096 {
             let message =
                 self.try_receive_before(deadline, "accepted result and runtime realization")?;
@@ -3625,6 +3934,13 @@ impl StudioClient {
                 }
                 WireMessage::Event(event) => {
                     durable_revisions.insert(event.cursor.revision);
+                    if let fm_protocol::EventPayload::StingerSlotsChanged {
+                        stingers: projected,
+                        ..
+                    } = event.payload
+                    {
+                        stingers = Some(projected);
+                    }
                 }
                 WireMessage::RuntimeEvent(event)
                     if matches!(
@@ -3644,6 +3960,7 @@ impl StudioClient {
                     revision,
                     scheduled_frame,
                     elapsed: started.elapsed(),
+                    stingers,
                 });
             }
         }
@@ -4035,13 +4352,29 @@ fn save_generator_project_with_sources(
     frames_rendered: u64,
     sources: [(InputId, SimulatedVideo); 2],
 ) {
+    save_generator_project_with_sources_and_dimensions(
+        path,
+        rate,
+        frames_rendered,
+        VideoDimensions::new(64, 48).unwrap(),
+        sources,
+    );
+}
+
+fn save_generator_project_with_sources_and_dimensions(
+    path: &Path,
+    rate: FrameRate,
+    frames_rendered: u64,
+    dimensions: VideoDimensions,
+    sources: [(InputId, SimulatedVideo); 2],
+) {
     let mut project = Project::new(
         ProjectId::new(NonZeroU128::new(7_002).unwrap()),
         "Native generator daemon test",
         ProjectSettings {
             frame_rate: rate,
             video: VideoFormat {
-                dimensions: VideoDimensions::new(64, 48).unwrap(),
+                dimensions,
                 frame_rate: rate,
                 pixel_format: PixelFormat::Rgba8,
                 scan: ScanMode::Progressive,

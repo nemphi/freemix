@@ -853,19 +853,35 @@ idle frame boundary, emits the projected slot event, and checkpoints the exact
 replacement or removal. A non-native daemon process acceptance configures then
 immediately fires a slot, verifies the settled routing, restarts on the
 replacement descriptor, removes it, and verifies a second empty restart.
-Native-media sessions instead return an explicit restart-required
-`unavailable` rejection before authority mutation, because the compiled project
-and preflighted decoder/GPU/audio pools are not yet safe to replace live.
-Native hot slot realization, cross-platform/fullscreen evidence, and complete
-`SW-003`/`SW-004` acceptance remain pending; parity therefore stays planned.
+Native-media sessions now perform the same mutations without rebuilding the
+ordinary show runtime. They classify and abort an initial prepared authority
+submission, preflight the complete candidate Stinger project/video/audio pools
+on a background worker while native frames continue ticking, then prepare and
+revalidate again before any save or commit. Failed resource preflight returns a
+path-free `unavailable` result without a receipt, revision, file, projection, or
+runtime change. After the authoritative idle frame realizes successfully, the
+daemon atomically swaps only the Stinger plan and independent pools, re-limits
+future ordinary GPU refills inside the existing aggregate bound, and transfers
+old decoder/GPU/audio ownership to a bounded two-worker/two-queued-pool
+retirement owner. Retirement never joins on the render thread or daemon
+shutdown. A native generator-process acceptance covers Ready configure, fire,
+Ready replacement, second fire, removal, exact routing, persistence, and
+restart; a separate aggregate-limit rejection acceptance covers
+manifest/receipt/revision rollback and continued show scheduling. An opt-in
+Metal/FFmpeg acceptance hot replaces an audible local-media lane, fires it,
+removes it, and checks aggregate audio telemetry. Cross-platform/fullscreen
+evidence and complete `SW-003`/`SW-004` acceptance remain pending; parity
+therefore stays planned.
 
 Clip-local Stinger audio is now realized by a second, independently clocked
-Master lane for each unique requested audible media input. Startup partitions
-the existing aggregate retained-audio block, sample, and byte caps between
-ordinary show playback and the Stinger lane, then divides the latter across
-its per-media runtimes; preload-disabled slots do not reduce the ordinary
-budget, and requested video-only slots use explicit clip silence without
-partitioning that budget. Only the selected media runtime is serviced or rendered, so another
+Master lane for each unique requested audible media input. Native startup
+reserves half of the existing aggregate retained-audio block, sample, and byte
+caps for ordinary show playback and half for current or future hot Stinger
+lanes, then divides the latter across its per-media runtimes. This fixed
+reservation prevents adding the first audible slot from rebuilding or
+relimiting ordinary synchronizers, cursors, or strip-delay history. Requested
+video-only slots use explicit clip silence inside the reserved Stinger side.
+Only the selected media runtime is serviced or rendered, so another
 slot's decoder, EOS, or stall cannot delay the active clip. Decoder requests
 remain single-flight and nonblocking, and a retrigger invalidates stale
 generations, restores bounded pre-video positioning, clears synchronizer and

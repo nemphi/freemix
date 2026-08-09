@@ -1559,6 +1559,38 @@ impl NativeSourcePlayback {
         &self.registry
     }
 
+    /// Verifies that the current ring can continue under a lower aggregate
+    /// retained-byte limit.
+    ///
+    /// This does not mutate playback. Callers may therefore preflight a
+    /// replacement pool transactionally before applying the new limit at an
+    /// idle frame boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns the retained-byte bound error when current textures already
+    /// exceed `maximum`.
+    pub fn validate_retained_byte_limit(
+        &self,
+        maximum: u64,
+    ) -> Result<(), NativeSourcePlaybackError> {
+        if self.registry.retained_rgba16f_bytes > maximum {
+            return Err(NativeSourceError::RetainedBytesExceeded {
+                required: self.registry.retained_rgba16f_bytes,
+                maximum,
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Applies a retained-byte limit previously accepted by
+    /// [`Self::validate_retained_byte_limit`].
+    pub fn set_retained_byte_limit(&mut self, maximum: u64) {
+        debug_assert!(self.registry.retained_rgba16f_bytes <= maximum);
+        self.registry.limits.max_retained_rgba16f_bytes = maximum;
+    }
+
     /// Stops the decode worker and consumes playback into its current registry.
     #[must_use]
     pub fn into_registry(self) -> NativeSourceRegistry {
@@ -2267,6 +2299,12 @@ struct NativeStingerAudioPlayback {
     ready: Option<NativeStingerAudioRequest>,
 }
 
+/// A transactionally preflighted replacement for the independent Stinger
+/// audio lanes owned by [`NativeMasterRuntime`].
+pub struct NativeStingerAudioRuntime {
+    playback: Option<NativeStingerAudioPlayback>,
+}
+
 /// Independent bounded CPU audio playback and Master mixing runtime.
 ///
 /// It is intentionally separate from [`NativeSourceRegistry`]. Decoder work is
@@ -2710,29 +2748,10 @@ impl NativeMasterRuntime {
         if project.audio_routes.len() > MAX_NATIVE_AUDIO_STRIPS {
             return Err(NativeMasterError::BoundsExceeded);
         }
-        let requested_stinger_inputs = project
-            .stingers
-            .values()
-            .filter(|config| {
-                config.preload && config.audio_policy != ModelStingerAudioPolicy::Muted
-            })
-            .map(|config| config.media_input)
-            .collect::<BTreeSet<_>>();
-        let mut stinger_inputs = BTreeSet::new();
-        let mut silent_stinger_inputs = BTreeSet::new();
-        for &input in &requested_stinger_inputs {
-            let source = resolved
-                .iter()
-                .find(|source| source.input() == input)
-                .ok_or(NativeMasterError::MissingAudioRoute { input })?;
-            if native_source_has_audio(adapter, source)? {
-                stinger_inputs.insert(input);
-            } else {
-                silent_stinger_inputs.insert(input);
-            }
-        }
-        let (ordinary_limits, stinger_limits) =
-            partition_native_audio_limits(limits, !stinger_inputs.is_empty())?;
+        // Native sessions reserve a fixed half of the aggregate retained
+        // budget for hot-added Stinger audio. This keeps a later slot mutation
+        // from rebuilding or shrinking the ordinary show timeline.
+        let (ordinary_limits, _) = partition_native_audio_limits(limits, true)?;
         let mut runtime = Self::preflight_local_blocking(
             adapter,
             resolved,
@@ -2743,46 +2762,30 @@ impl NativeMasterRuntime {
             ordinary_limits,
         )?;
         runtime.realize_project_audio(project)?;
-        if !requested_stinger_inputs.is_empty() {
-            let per_source_limits = (!stinger_inputs.is_empty())
-                .then(|| partition_stinger_audio_limits(stinger_limits, stinger_inputs.len()))
-                .transpose()?;
-            let mut masters = BTreeMap::new();
-            for input in stinger_inputs {
-                let stinger_source = resolved
-                    .iter()
-                    .find(|source| source.input() == input)
-                    .cloned()
-                    .ok_or(NativeMasterError::MissingAudioRoute { input })?;
-                let mut stinger_master = Self::preflight_local_blocking_with_decoder_retention(
-                    adapter,
-                    &[stinger_source],
-                    format.clone(),
-                    frame_rate,
-                    clock_domain,
-                    0,
-                    per_source_limits.ok_or(NativeMasterError::InvalidLimits)?,
-                    true,
-                )?;
-                if stinger_master.mixer.input_state(input).is_none() {
-                    continue;
-                }
-                let state = native_input_state(project, input)?;
-                stinger_master.mixer.set_input_state(input, state, 0)?;
-                stinger_master
-                    .pending_mixer
-                    .set_input_state(input, state, 0)?;
-                stinger_master.collect_output = false;
-                masters.insert(input, Box::new(stinger_master));
-            }
-            runtime.stinger_audio = Some(NativeStingerAudioPlayback {
-                masters,
-                silent_inputs: silent_stinger_inputs,
-                active_trigger: None,
-                ready: None,
-            });
-        }
+        runtime.stinger_audio = NativeStingerAudioRuntime::preflight_project_local_blocking(
+            adapter,
+            resolved,
+            project,
+            format,
+            frame_rate,
+            clock_domain,
+            limits,
+        )?
+        .playback;
         Ok(runtime)
+    }
+
+    /// Replaces only clip-local Stinger audio ownership. Ordinary source
+    /// cursors, synchronizers, strip delay, mixer state, and sink ownership are
+    /// untouched.
+    #[must_use]
+    pub fn replace_stinger_audio(
+        &mut self,
+        replacement: NativeStingerAudioRuntime,
+    ) -> NativeStingerAudioRuntime {
+        NativeStingerAudioRuntime {
+            playback: core::mem::replace(&mut self.stinger_audio, replacement.playback),
+        }
     }
 
     fn realize_project_audio(
@@ -3677,6 +3680,91 @@ impl NativeMasterRuntime {
             .ok_or(NativeMasterError::BoundsExceeded)?;
         self.ready_frame = None;
         Ok(block)
+    }
+}
+
+impl NativeStingerAudioRuntime {
+    /// Preflights only the clip-local audio lanes for one complete desired
+    /// Stinger projection. No ordinary show cursor or mixer is opened.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same bounded probe/decode/setup failures as native Master
+    /// startup.
+    #[allow(clippy::too_many_arguments)]
+    pub fn preflight_project_local_blocking(
+        adapter: Option<&Adapter>,
+        resolved: &[NativeResolvedSource],
+        project: &NativeProjectPlan,
+        format: &AudioFormat,
+        frame_rate: FrameRate,
+        clock_domain: ClockDomainId,
+        limits: NativeAudioLimits,
+    ) -> Result<Self, NativeMasterError> {
+        let requested_stinger_inputs = project
+            .stingers
+            .values()
+            .filter(|config| {
+                config.preload && config.audio_policy != ModelStingerAudioPolicy::Muted
+            })
+            .map(|config| config.media_input)
+            .collect::<BTreeSet<_>>();
+        let mut stinger_inputs = BTreeSet::new();
+        let mut silent_stinger_inputs = BTreeSet::new();
+        for &input in &requested_stinger_inputs {
+            let source = resolved
+                .iter()
+                .find(|source| source.input() == input)
+                .ok_or(NativeMasterError::MissingAudioRoute { input })?;
+            if native_source_has_audio(adapter, source)? {
+                stinger_inputs.insert(input);
+            } else {
+                silent_stinger_inputs.insert(input);
+            }
+        }
+        let (_, stinger_limits) = partition_native_audio_limits(limits, true)?;
+        let mut playback = None;
+        if !requested_stinger_inputs.is_empty() {
+            let per_source_limits = (!stinger_inputs.is_empty())
+                .then(|| partition_stinger_audio_limits(stinger_limits, stinger_inputs.len()))
+                .transpose()?;
+            let mut masters = BTreeMap::new();
+            for input in stinger_inputs {
+                let stinger_source = resolved
+                    .iter()
+                    .find(|source| source.input() == input)
+                    .cloned()
+                    .ok_or(NativeMasterError::MissingAudioRoute { input })?;
+                let mut stinger_master =
+                    NativeMasterRuntime::preflight_local_blocking_with_decoder_retention(
+                        adapter,
+                        &[stinger_source],
+                        format.clone(),
+                        frame_rate,
+                        clock_domain,
+                        0,
+                        per_source_limits.ok_or(NativeMasterError::InvalidLimits)?,
+                        true,
+                    )?;
+                if stinger_master.mixer.input_state(input).is_none() {
+                    continue;
+                }
+                let state = native_input_state(project, input)?;
+                stinger_master.mixer.set_input_state(input, state, 0)?;
+                stinger_master
+                    .pending_mixer
+                    .set_input_state(input, state, 0)?;
+                stinger_master.collect_output = false;
+                masters.insert(input, Box::new(stinger_master));
+            }
+            playback = Some(NativeStingerAudioPlayback {
+                masters,
+                silent_inputs: silent_stinger_inputs,
+                active_trigger: None,
+                ready: None,
+            });
+        }
+        Ok(Self { playback })
     }
 }
 
@@ -8478,6 +8566,30 @@ mod tests {
     }
 
     #[test]
+    fn source_playback_relimit_is_transactional_and_bounds_future_refills() {
+        let mut playback = source_playback_for_pin_test(NativeVideoSourceKind::Retained, true);
+        playback.registry.retained_rgba16f_bytes = 64;
+        assert!(matches!(
+            playback.validate_retained_byte_limit(63),
+            Err(NativeSourcePlaybackError::Source(
+                NativeSourceError::RetainedBytesExceeded {
+                    required: 64,
+                    maximum: 63,
+                }
+            ))
+        ));
+        assert_eq!(
+            playback.registry.limits.max_retained_rgba16f_bytes,
+            NativeSourceLimits::DEFAULT_MAX_RETAINED_RGBA16F_BYTES
+        );
+
+        playback.validate_retained_byte_limit(64).unwrap();
+        playback.set_retained_byte_limit(64);
+        assert_eq!(playback.registry.limits.max_retained_rgba16f_bytes, 64);
+        assert_eq!(playback.registry.retained_rgba16f_bytes, 64);
+    }
+
+    #[test]
     fn stinger_pin_requires_bounded_eos_and_rejects_live_sources() {
         let source = input(1);
         let mut complete = source_playback_for_pin_test(NativeVideoSourceKind::Decoded, true);
@@ -10019,7 +10131,7 @@ mod tests {
     }
 
     #[test]
-    fn video_only_stinger_audio_uses_silence_without_splitting_retention() {
+    fn native_master_reserves_hot_stinger_budget_without_rebuilding_ordinary_cursor() {
         let program = input(1);
         let preview = input(2);
         let media = input(3);
@@ -10054,7 +10166,8 @@ mod tests {
             limits,
         )
         .unwrap();
-        assert_eq!(master.limits, limits);
+        let (ordinary_limits, _) = partition_native_audio_limits(limits, true).unwrap();
+        assert_eq!(master.limits, ordinary_limits);
         let playback = master.stinger_audio.as_ref().unwrap();
         assert!(playback.masters.is_empty());
         assert_eq!(playback.silent_inputs, BTreeSet::from([media]));
@@ -10077,6 +10190,70 @@ mod tests {
                 .unwrap()
                 .iter()
                 .all(|sample| *sample == 0.0)
+        );
+        assert_eq!(master.expected_next_frame(), 1);
+
+        let mut replacement_project = native_plan_project(4, 2);
+        for source in [program, preview, media] {
+            add_leaf(&mut replacement_project, source);
+        }
+        let replacement_project =
+            NativeProjectPlan::compile(&replacement_project, NativeProjectLimits::default())
+                .unwrap();
+        let replacement = NativeStingerAudioRuntime::preflight_project_local_blocking(
+            None,
+            &resolved,
+            &replacement_project,
+            &mono_audio_format(),
+            FrameRate::new(25, 1).unwrap(),
+            clock,
+            limits,
+        )
+        .unwrap();
+        let retired = master.replace_stinger_audio(replacement);
+        assert_eq!(master.expected_next_frame(), 1);
+        assert_eq!(master.sink_len(), 1);
+        assert!(master.stinger_audio.is_none());
+        assert!(retired.playback.is_some());
+        assert!(master.retained_blocks() <= limits.max_retained_blocks);
+        assert!(master.retained_samples() <= limits.max_retained_samples);
+        assert!(master.retained_bytes() <= limits.max_retained_bytes);
+    }
+
+    #[test]
+    fn reserved_hot_stinger_audio_budget_still_admits_maximum_silent_sources() {
+        let clock = ClockDomainId::new(NonZeroU128::new(19).unwrap());
+        let mut project = native_plan_project(4, 2);
+        let resolved = (1..=NativeSourceLimits::DEFAULT_MAX_MEDIA_INPUTS)
+            .map(|number| {
+                let source = input(u128::try_from(number).unwrap());
+                add_leaf(&mut project, source);
+                NativeResolvedSource::RetainedFrame {
+                    input: source,
+                    frame: retained_frame(clock, 0, 0),
+                }
+            })
+            .collect::<Vec<_>>();
+        let project = NativeProjectPlan::compile(&project, NativeProjectLimits::default()).unwrap();
+        let limits = NativeAudioLimits::default();
+        let master = NativeMasterRuntime::preflight_project_local_blocking(
+            None,
+            &resolved,
+            &project,
+            &mono_audio_format(),
+            FrameRate::new(25, 1).unwrap(),
+            clock,
+            0,
+            limits,
+        )
+        .unwrap();
+        assert_eq!(
+            master.sources.len(),
+            NativeSourceLimits::DEFAULT_MAX_MEDIA_INPUTS
+        );
+        assert_eq!(
+            master.limits,
+            partition_native_audio_limits(limits, true).unwrap().0
         );
     }
 
