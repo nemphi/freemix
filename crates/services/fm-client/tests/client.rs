@@ -330,21 +330,19 @@ fn current_contract_reduces_exact_stinger_status() {
 }
 
 #[test]
-fn incompatible_handshake_is_terminal_until_configuration_changes() {
+fn protocol_mismatch_is_terminal_until_configuration_changes() {
     let mut client = Client::new(config(2)).unwrap();
     client.start_connect().unwrap();
     client.transport_connected().unwrap();
-    let mut incompatible = handshake(0, None);
-    incompatible.protocol = ProtocolVersion::new(99, 0);
+    let mut mismatched = handshake(0, None);
+    mismatched.protocol = ProtocolVersion::new(99, 0);
     assert_eq!(
-        client.accept_handshake(incompatible),
-        Err(ClientError::IncompatibleProtocol(ProtocolVersion::new(
-            99, 0
-        )))
+        client.accept_handshake(mismatched),
+        Err(ClientError::ProtocolMismatch(ProtocolVersion::new(99, 0)))
     );
     assert_eq!(
         client.state(),
-        &ConnectionState::Incompatible {
+        &ConnectionState::ProtocolMismatch {
             protocol: ProtocolVersion::new(99, 0)
         }
     );

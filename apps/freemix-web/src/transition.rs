@@ -76,7 +76,7 @@ impl TransitionControls {
             duration_frames.clamp(Self::MIN_DURATION_FRAMES, Self::MAX_DURATION_FRAMES);
     }
 
-    /// Derives visibility and interactivity from the active negotiated session.
+    /// Derives visibility and interactivity from the accepted current-contract session.
     #[must_use]
     pub fn control_state(
         &self,

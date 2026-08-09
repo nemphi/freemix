@@ -1238,7 +1238,7 @@ const fn lifecycle_status(lifecycle: LifecycleState) -> StudioConnectionStatus {
         LifecycleState::Synchronizing => StudioConnectionStatus::Synchronizing,
         LifecycleState::Ready => StudioConnectionStatus::Ready,
         LifecycleState::Backoff(_) => StudioConnectionStatus::Backoff,
-        LifecycleState::Incompatible => StudioConnectionStatus::Incompatible,
+        LifecycleState::ProtocolMismatch => StudioConnectionStatus::ProtocolMismatch,
         LifecycleState::DaemonExited { .. }
         | LifecycleState::DaemonFailed
         | LifecycleState::RestartLimitReached

@@ -76,6 +76,8 @@ const SOURCE_REFILL_LOW_WATERMARK: usize = 4;
 const SOURCE_REFILL_MAX_PAGE: u32 = 4;
 const AUDIO_REFILL_LOW_WATERMARK: usize = 8;
 const MAX_NATIVE_AUDIO_STRIPS: usize = NativeSourceLimits::DEFAULT_MAX_MEDIA_INPUTS;
+/// Five milliseconds at the fixed 48 kHz project Master rate.
+const LIVE_INPUT_GAIN_RAMP_SAMPLES: usize = 240;
 
 /// Resource bounds applied while compiling native scenes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3043,8 +3045,8 @@ impl NativeMasterRuntime {
         pending_mixer
             .set_input_delay(input, delay)
             .map_err(|_| NativeMasterError::BoundsExceeded)?;
-        mixer.set_input_state(input, state, 0)?;
-        pending_mixer.set_input_state(input, state, 0)?;
+        mixer.set_input_state(input, state, LIVE_INPUT_GAIN_RAMP_SAMPLES)?;
+        pending_mixer.set_input_state(input, state, LIVE_INPUT_GAIN_RAMP_SAMPLES)?;
 
         let mut stinger_mixers = Vec::new();
         if let Some(playback) = &self.stinger_audio {
@@ -3060,8 +3062,12 @@ impl NativeMasterRuntime {
                 stinger_pending_mixer
                     .set_input_delay(input, delay)
                     .map_err(|_| NativeMasterError::BoundsExceeded)?;
-                stinger_mixer.set_input_state(input, state, 0)?;
-                stinger_pending_mixer.set_input_state(input, state, 0)?;
+                stinger_mixer.set_input_state(input, state, LIVE_INPUT_GAIN_RAMP_SAMPLES)?;
+                stinger_pending_mixer.set_input_state(
+                    input,
+                    state,
+                    LIVE_INPUT_GAIN_RAMP_SAMPLES,
+                )?;
                 stinger_mixers.push((media, stinger_mixer, stinger_pending_mixer));
             }
         }
@@ -8463,26 +8469,46 @@ mod tests {
             NativeProjectPlan::compile(&project, NativeProjectLimits::default()).unwrap();
         let mut master = audio_test_master(&[(source, 1.0)], 2);
         master.realize_project_audio(&plan).unwrap();
+        master.stinger_audio = Some(NativeStingerAudioPlayback {
+            masters: BTreeMap::from([(source, Box::new(audio_test_master(&[(source, 1.0)], 2)))]),
+            silent_inputs: BTreeSet::new(),
+            active_trigger: None,
+            ready: None,
+        });
 
         let updated = InputAudioStripState {
             gain: InputGainMilliDb::new(-6_000).unwrap(),
-            muted: true,
+            muted: false,
             follow_video: false,
             delay_samples: InputDelaySamples::new(2).unwrap(),
         };
+        let target = native_audio_input_state(updated).unwrap();
+        assert_eq!(master.mixer.current_linear_gain(source), Some(1.0));
         master.set_input_audio_strip(source, updated).unwrap();
         plan.set_input_audio_strip(source, updated).unwrap();
         assert_eq!(master.mixer.input_delay_samples(source), Some(2));
         assert_eq!(master.pending_mixer.input_delay_samples(source), Some(2));
-        assert_eq!(
-            master.mixer.input_state(source),
-            Some(native_audio_input_state(updated).unwrap())
-        );
-        assert_eq!(
-            master.pending_mixer.input_state(source),
-            Some(native_audio_input_state(updated).unwrap())
-        );
+        assert_eq!(master.mixer.input_state(source), Some(target));
+        assert_eq!(master.pending_mixer.input_state(source), Some(target));
+        assert_eq!(master.mixer.current_linear_gain(source), Some(1.0));
+        assert_eq!(master.pending_mixer.current_linear_gain(source), Some(1.0));
+        let stinger = &master.stinger_audio.as_ref().unwrap().masters[&source];
+        assert_eq!(stinger.mixer.input_delay_samples(source), Some(2));
+        assert_eq!(stinger.pending_mixer.input_delay_samples(source), Some(2));
+        assert_eq!(stinger.mixer.input_state(source), Some(target));
+        assert_eq!(stinger.pending_mixer.input_state(source), Some(target));
+        assert_eq!(stinger.mixer.current_linear_gain(source), Some(1.0));
+        assert_eq!(stinger.pending_mixer.current_linear_gain(source), Some(1.0));
         assert_eq!(plan.audio_strip(source), Some(updated));
+
+        assert!(master.service_next_frame().unwrap());
+        master
+            .render_project_frame_audio(&frame_result(0, source, None), &plan)
+            .unwrap();
+        assert!(
+            (master.mixer.current_linear_gain(source).unwrap() - target.gain.linear()).abs()
+                < 1.0e-6
+        );
 
         let before = master.mixer.input_delay_samples(source);
         assert!(matches!(

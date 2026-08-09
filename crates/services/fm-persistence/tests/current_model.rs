@@ -337,7 +337,7 @@ fn input_audio_strips_round_trip_exactly_and_reject_malformed_values() {
 }
 
 #[test]
-fn complete_project_round_trip_preserves_formats_graph_capabilities_and_u128_ids() {
+fn current_project_round_trip_preserves_formats_graph_capabilities_and_u128_ids() {
     let temp = TestDirectory::new("rich-round-trip");
     let store = temp.store("show");
     let expected = stored_rich_project();

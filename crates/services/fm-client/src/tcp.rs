@@ -913,7 +913,7 @@ impl TcpSession {
     fn connect_client_error(&mut self, error: ClientError) -> TcpSessionError {
         if matches!(
             self.client.state(),
-            crate::ConnectionState::Incompatible { .. }
+            crate::ConnectionState::ProtocolMismatch { .. }
         ) {
             if let Some(connection) = self.connection.take() {
                 connection.shutdown();

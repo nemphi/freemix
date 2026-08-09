@@ -420,7 +420,7 @@ fn malformed_and_truncated_manifests_never_return_a_project() {
     let truncated_root = temp.project_path("truncated");
     write_manifest(
         &truncated_root,
-        "{\"schema_version\":2,\"show_name\":\"unfinished",
+        &format!("{{\"schema_version\":{CURRENT_SCHEMA_VERSION},\"show_name\":\"unfinished"),
     );
     let truncated = ProjectStore::new(truncated_root)
         .unwrap()
@@ -457,19 +457,20 @@ fn manifest_just_over_size_limit_is_rejected() {
 }
 
 #[test]
-fn explicit_unsupported_schema_is_reported_before_missing_current_fields() {
-    let temp = TestDirectory::new("unsupported-schema");
+fn non_current_schema_is_reported_before_missing_current_fields() {
+    let temp = TestDirectory::new("non-current-schema");
     let root = temp.project_path("show");
-    write_manifest(&root, r#"{"schema_version":1}"#);
+    let non_current = CURRENT_SCHEMA_VERSION.checked_add(1).unwrap();
+    write_manifest(&root, &format!(r#"{{"schema_version":{non_current}}}"#));
 
     assert!(matches!(
         ProjectStore::new(root).unwrap().load(),
         Err(StoreError::Validation(
             ProjectValidationError::UnsupportedSchema {
-                found: 1,
+                found,
                 supported: CURRENT_SCHEMA_VERSION
             }
-        ))
+        )) if found == non_current
     ));
 }
 
@@ -477,14 +478,29 @@ fn explicit_unsupported_schema_is_reported_before_missing_current_fields() {
 fn strict_parser_rejects_unknown_duplicate_and_wrong_typed_fields() {
     let temp = TestDirectory::new("strict");
     for (name, manifest) in [
-        ("unknown", "{\"schema_version\":14,\"unknown\":true}"),
-        ("duplicate", "{\"schema_version\":14,\"schema_version\":14}"),
-        ("wrong-type", "{\"schema_version\":\"1\"}"),
-        ("object-trailing-comma", "{\"schema_version\":14,}"),
+        (
+            "unknown",
+            format!("{{\"schema_version\":{CURRENT_SCHEMA_VERSION},\"unknown\":true}}"),
+        ),
+        (
+            "duplicate",
+            format!(
+                "{{\"schema_version\":{CURRENT_SCHEMA_VERSION},\"schema_version\":{CURRENT_SCHEMA_VERSION}}}"
+            ),
+        ),
+        (
+            "wrong-type",
+            format!("{{\"schema_version\":\"{CURRENT_SCHEMA_VERSION}\"}}"),
+        ),
+        (
+            "object-trailing-comma",
+            format!("{{\"schema_version\":{CURRENT_SCHEMA_VERSION},}}"),
+        ),
         (
             "array-trailing-comma",
-            r#"{
-              "schema_version": 14,
+            format!(
+                r#"{{
+              "schema_version": {CURRENT_SCHEMA_VERSION},
               "project_id": 1,
               "show_name": "Trailing",
               "input_ids": [1,],
@@ -495,11 +511,12 @@ fn strict_parser_rejects_unknown_duplicate_and_wrong_typed_fields() {
               "revision": 0,
               "state_epoch": 0,
               "event_sequence": 0
-            }"#,
+            }}"#
+            ),
         ),
     ] {
         let root = temp.project_path(name);
-        write_manifest(&root, manifest);
+        write_manifest(&root, &manifest);
         assert!(matches!(
             ProjectStore::new(root).unwrap().load(),
             Err(StoreError::MalformedManifest { .. })

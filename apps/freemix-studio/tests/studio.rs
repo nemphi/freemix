@@ -371,7 +371,7 @@ fn existing_runtime_rejects_wrong_project_handshake() {
 }
 
 #[test]
-fn existing_runtime_negotiates_the_current_contract() {
+fn existing_runtime_accepts_the_current_contract() {
     let (address, server_thread) = spawn_server(|listener| {
         let mut peer = Peer::accept(&listener);
         let WireMessage::HandshakeRequest(request) = peer.receive() else {

@@ -98,7 +98,7 @@ pub enum ConnectionState {
         expected_revision: u64,
         received_revision: u64,
     },
-    Incompatible {
+    ProtocolMismatch {
         protocol: ProtocolVersion,
     },
 }
@@ -169,7 +169,7 @@ pub enum ClientError {
         operation: &'static str,
         state: ConnectionState,
     },
-    IncompatibleProtocol(ProtocolVersion),
+    ProtocolMismatch(ProtocolVersion),
     HandshakeRejected(StructuredError),
     InvalidHandshake(&'static str),
     InvalidSnapshot(&'static str),
@@ -222,8 +222,8 @@ impl fmt::Display for ClientError {
             Self::InvalidState { operation, state } => {
                 write!(formatter, "cannot {operation} while client is {state:?}")
             }
-            Self::IncompatibleProtocol(version) => {
-                write!(formatter, "server selected incompatible protocol {version}")
+            Self::ProtocolMismatch(version) => {
+                write!(formatter, "server selected non-current protocol {version}")
             }
             Self::HandshakeRejected(error) => {
                 write!(
@@ -530,17 +530,17 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// Rejects incompatible versions, project identities, resume cursors, and
+    /// Rejects non-current versions, project identities, resume cursors, and
     /// structured handshake failures.
     pub fn accept_handshake(&mut self, response: HandshakeResponse) -> Result<(), ClientError> {
         if self.state != ConnectionState::AwaitingHandshake {
             return Err(self.invalid_state("accept a handshake"));
         }
         if response.protocol != CURRENT_PROTOCOL_VERSION {
-            self.state = ConnectionState::Incompatible {
+            self.state = ConnectionState::ProtocolMismatch {
                 protocol: response.protocol,
             };
-            return Err(ClientError::IncompatibleProtocol(response.protocol));
+            return Err(ClientError::ProtocolMismatch(response.protocol));
         }
         if response.server.project_id != self.config.project_id.to_string() {
             return Err(ClientError::InvalidHandshake(

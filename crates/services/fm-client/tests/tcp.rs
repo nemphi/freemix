@@ -614,7 +614,7 @@ fn wrong_first_record_and_wrong_project_reject_current_handshake() {
 }
 
 #[test]
-fn incompatible_handshake_remains_terminal_after_socket_close() {
+fn protocol_mismatch_remains_terminal_after_socket_close() {
     let (address, server_thread) = spawn_server(|listener| {
         let mut peer = Peer::accept(&listener);
         assert!(matches!(peer.receive(), WireMessage::HandshakeRequest(_)));
@@ -632,7 +632,7 @@ fn incompatible_handshake_remains_terminal_after_socket_close() {
 
     assert!(matches!(
         session.connect(address, CONNECT_TIMEOUT),
-        Err(TcpSessionError::Client(ClientError::IncompatibleProtocol(
+        Err(TcpSessionError::Client(ClientError::ProtocolMismatch(
             ProtocolVersion {
                 major: 99,
                 minor: 0
@@ -641,7 +641,7 @@ fn incompatible_handshake_remains_terminal_after_socket_close() {
     ));
     assert_eq!(
         session.client().state(),
-        &ConnectionState::Incompatible {
+        &ConnectionState::ProtocolMismatch {
             protocol: ProtocolVersion::new(99, 0)
         }
     );

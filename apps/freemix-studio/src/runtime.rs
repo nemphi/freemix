@@ -22,7 +22,7 @@ pub enum LifecycleState {
     Ready,
     Backoff(ReconnectBackoff),
     ResyncRequired,
-    Incompatible,
+    ProtocolMismatch,
 }
 
 #[derive(Debug)]
@@ -188,7 +188,7 @@ impl StudioRuntime {
             ConnectionState::Ready => LifecycleState::Ready,
             ConnectionState::Backoff(backoff) => LifecycleState::Backoff(*backoff),
             ConnectionState::ResyncRequired { .. } => LifecycleState::ResyncRequired,
-            ConnectionState::Incompatible { .. } => LifecycleState::Incompatible,
+            ConnectionState::ProtocolMismatch { .. } => LifecycleState::ProtocolMismatch,
         })
     }
 

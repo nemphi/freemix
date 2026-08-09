@@ -115,8 +115,8 @@ pub enum StudioConnectionStatus {
     Disconnected,
     /// Connection or synchronization failed.
     Failed,
-    /// The peer protocol is incompatible with this studio.
-    Incompatible,
+    /// The peer did not select the exact current protocol.
+    ProtocolMismatch,
 }
 
 impl StudioConnectionStatus {
@@ -131,7 +131,7 @@ impl StudioConnectionStatus {
             Self::Backoff => "RETRY BACKOFF",
             Self::Disconnected => "DISCONNECTED",
             Self::Failed => "FAILED",
-            Self::Incompatible => "INCOMPATIBLE",
+            Self::ProtocolMismatch => "PROTOCOL MISMATCH",
         }
     }
 
@@ -178,7 +178,7 @@ impl StudioUiState {
         self
     }
 
-    /// Applies the switcher permissions negotiated for the active session.
+    /// Applies the switcher permissions granted for the active session.
     #[must_use]
     pub const fn with_switcher_permissions(
         mut self,
@@ -190,7 +190,7 @@ impl StudioUiState {
         self
     }
 
-    /// Applies the negotiated audio-control permission.
+    /// Applies the granted audio-control permission.
     #[must_use]
     pub const fn with_audio_permission(mut self, can_control_audio: bool) -> Self {
         self.can_control_audio = can_control_audio;
@@ -1218,7 +1218,7 @@ fn label_for_input(view: &ClientView, input: InputId) -> String {
 const fn connection_color(status: StudioConnectionStatus) -> Color32 {
     match status {
         StudioConnectionStatus::Ready => PREVIEW,
-        StudioConnectionStatus::Failed | StudioConnectionStatus::Incompatible => ERROR,
+        StudioConnectionStatus::Failed | StudioConnectionStatus::ProtocolMismatch => ERROR,
         StudioConnectionStatus::Disconnected => MUTED,
         StudioConnectionStatus::Launching
         | StudioConnectionStatus::Connecting
@@ -1294,7 +1294,7 @@ mod tests {
             StudioConnectionStatus::Backoff,
             StudioConnectionStatus::Disconnected,
             StudioConnectionStatus::Failed,
-            StudioConnectionStatus::Incompatible,
+            StudioConnectionStatus::ProtocolMismatch,
         ];
         assert!(StudioConnectionStatus::Ready.controls_enabled());
         for status in statuses {

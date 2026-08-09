@@ -289,7 +289,7 @@ impl SoakClient {
             || !matches!(response.outcome, HandshakeOutcome::Snapshot { .. })
         {
             return Err(format!(
-                "unexpected handshake negotiation: version={:?}, role={:?}",
+                "unexpected current-contract handshake: version={:?}, role={:?}",
                 response.protocol, response.granted_role
             ));
         }
@@ -1737,5 +1737,5 @@ fn telemetry_parser_requires_one_v4_record_and_extracts_soak_fields() {
         })
     );
     assert!(parse_telemetry(&format!("{line}\n{line}")).is_err());
-    assert!(parse_telemetry(&line.replacen("v=4", "v=3", 1)).is_err());
+    assert!(parse_telemetry(&line.replacen("v=4", "v=999", 1)).is_err());
 }

@@ -136,7 +136,7 @@ impl ManualTransitionModel {
         self.realized
     }
 
-    /// Derives visibility and interactivity from the negotiated session and replicated state.
+    /// Derives visibility and interactivity from the accepted current-contract session and state.
     #[must_use]
     pub fn control_state(
         self,

@@ -202,7 +202,10 @@ full-strip status in snapshots and durable events plus one permission-gated
 atomic live strip command. The engine schedules accepted gain, mute,
 follow-video, and delay changes together at a frame boundary, and
 native realization updates active and pending Master/Stinger mixers and the
-checkpoint project atomically. Local and remote CLI commands, Studio controls,
+checkpoint project atomically. Live gain changes then ramp linearly over 240
+samples (5 ms at the 48 kHz project Master rate) while mute, follow-video, and
+delay take effect at the next rendered sample; restored strips remain immediate.
+Local and remote CLI commands, Studio controls,
 and the Web semantic control model expose the same bounded mutation. Restart
 restores engine desired state from the canonical strips and checkpoints it back
 to the project. Current-contract persistence, generated-audio, AFV
@@ -455,9 +458,10 @@ realization updates. Protocol 2.5 snapshots and events replicate the complete
 map; its `SetInputAudioStrip` command atomically carries gain, mute,
 follow-video, and delay and is authorized by the dedicated audio-control
 permission. The daemon applies each update transactionally to every active and
-pending ordinary/Stinger mixer before checkpointing the canonical project. The
-local and remote CLI expose the command and exact status; Studio renders Ready-
-and permission-gated per-input controls; Web exposes the equivalent
+pending ordinary/Stinger mixer, with a 240-sample linear live gain ramp and
+next-sample mute/follow-video/delay changes, before checkpointing the canonical
+project. The local and remote CLI expose the command and exact status; Studio
+renders Ready- and permission-gated per-input controls; Web exposes the equivalent
 transport-free semantic controls. Device audio and clocks, drift correction,
 channel mapping, native EQ/gate/compressor/limiter, meters, and hardware
 acceptance remain. This is still a partial item 3 slice and does not

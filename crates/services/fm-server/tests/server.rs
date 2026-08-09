@@ -172,14 +172,14 @@ fn ready_server(config: ServerConfig) -> Server<FakeControl> {
 }
 
 #[test]
-fn incompatible_versions_are_rejected() {
+fn non_current_versions_are_rejected() {
     let server = ready_server(config());
     let mut hello = hello(Role::Viewer, None);
     hello.protocol = ProtocolVersion::new(99, 0);
 
     assert!(matches!(
         server.handshake(&hello, &principal(AuthRole::Viewer), 0),
-        Err(HandshakeError::IncompatibleVersion)
+        Err(HandshakeError::ProtocolMismatch)
     ));
 }
 

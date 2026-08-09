@@ -933,8 +933,8 @@ fn manual_alpha_fade_state_and_receipts_survive_restart_through_commit_and_cance
 }
 
 #[test]
-fn incompatible_handshake_returns_protocol_error() {
-    let directory = TestDirectory::new("incompatible");
+fn non_current_handshake_returns_protocol_mismatch() {
+    let directory = TestDirectory::new("protocol-mismatch");
     let project_path = directory.project_path();
     create_project(&project_path);
     let daemon = Daemon::start(&project_path);
@@ -949,7 +949,7 @@ fn incompatible_handshake_returns_protocol_error() {
     assert!(matches!(
         client.receive(),
         WireMessage::HandshakeResponse(response)
-            if matches!(&response.outcome, HandshakeOutcome::Rejected { error } if error.code == "incompatible_version")
+            if matches!(&response.outcome, HandshakeOutcome::Rejected { error } if error.code == "protocol_mismatch")
     ));
     drop(client);
     daemon.wait_success();

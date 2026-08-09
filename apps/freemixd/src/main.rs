@@ -4849,7 +4849,7 @@ fn client_write_error(error: std::io::Error) -> Box<dyn Error> {
 
 fn handshake_code(error: &HandshakeError<Infallible>) -> &'static str {
     match error {
-        HandshakeError::IncompatibleVersion => "incompatible_version",
+        HandshakeError::ProtocolMismatch => "protocol_mismatch",
         HandshakeError::NotReady(_) => "not_ready",
         HandshakeError::DevelopmentPrincipalDenied | HandshakeError::RoleDenied(_) => {
             "permission_denied"

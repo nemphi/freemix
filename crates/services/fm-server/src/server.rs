@@ -90,7 +90,7 @@ impl<C> Server<C> {
 }
 
 impl<C: ControlPlane> Server<C> {
-    /// Negotiates, authorizes, and obtains initial state from the control plane.
+    /// Accepts the exact current contract, authorizes, and obtains initial state.
     ///
     /// # Errors
     ///
@@ -112,7 +112,7 @@ impl<C: ControlPlane> Server<C> {
         }
 
         if hello.protocol != CURRENT_PROTOCOL_VERSION {
-            return Err(HandshakeError::IncompatibleVersion);
+            return Err(HandshakeError::ProtocolMismatch);
         }
         let requested_role =
             map_role(hello.desired_role).ok_or(HandshakeError::RoleDenied(hello.desired_role))?;
@@ -243,7 +243,7 @@ fn validate_initial_sync<E>(
 #[derive(Debug)]
 pub enum HandshakeError<E> {
     NotReady(ReadinessState),
-    IncompatibleVersion,
+    ProtocolMismatch,
     DevelopmentPrincipalDenied,
     RoleDenied(ProtocolRole),
     Control(E),
@@ -254,8 +254,8 @@ impl<E: fmt::Display> fmt::Display for HandshakeError<E> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotReady(state) => write!(formatter, "server is not ready: {}", state.as_str()),
-            Self::IncompatibleVersion => {
-                formatter.write_str("client and server protocol versions are incompatible")
+            Self::ProtocolMismatch => {
+                formatter.write_str("client did not request the exact current protocol")
             }
             Self::DevelopmentPrincipalDenied => {
                 formatter.write_str("development principal is disabled")

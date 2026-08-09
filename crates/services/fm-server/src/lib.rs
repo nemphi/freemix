@@ -1,4 +1,4 @@
-//! Transport-independent server sessions and resume negotiation.
+//! Transport-independent exact-current server sessions and resume selection.
 
 mod config;
 mod control;
