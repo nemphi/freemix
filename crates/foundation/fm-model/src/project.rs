@@ -2,7 +2,7 @@ use fm_types::{AudioFormat, BusId, FrameRate, InputId, OutputId, ProjectId, Scen
 
 use crate::{ValidationError, validation::validate_project};
 
-pub const CURRENT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(14);
+pub const CURRENT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(15);
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct SchemaVersion(u32);
@@ -294,6 +294,32 @@ impl InputGainMilliDb {
     }
 }
 
+/// Exact persisted stereo balance in one-hundredth of a percent.
+///
+/// `-10000` is full left, zero is centered, and `10000` is full right.
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub struct InputBalanceBasisPoints(i32);
+
+impl InputBalanceBasisPoints {
+    pub const MIN: i32 = -10_000;
+    pub const MAX: i32 = 10_000;
+    pub const CENTER: Self = Self(0);
+
+    #[must_use]
+    pub const fn new(value: i32) -> Option<Self> {
+        if value >= Self::MIN && value <= Self::MAX {
+            Some(Self(value))
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub const fn get(self) -> i32 {
+        self.0
+    }
+}
+
 /// Exact nonnegative per-input delay in 48 kHz samples.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct InputDelaySamples(u32);
@@ -321,6 +347,7 @@ impl InputDelaySamples {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InputAudioStripState {
     pub gain: InputGainMilliDb,
+    pub balance: InputBalanceBasisPoints,
     pub delay_samples: InputDelaySamples,
     pub muted: bool,
     pub follow_video: bool,
@@ -330,6 +357,7 @@ impl Default for InputAudioStripState {
     fn default() -> Self {
         Self {
             gain: InputGainMilliDb::UNITY,
+            balance: InputBalanceBasisPoints::CENTER,
             delay_samples: InputDelaySamples::ZERO,
             muted: false,
             follow_video: true,

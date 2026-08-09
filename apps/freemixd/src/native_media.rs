@@ -22,9 +22,9 @@ use std::{
 };
 
 use fm_audio::{
-    AudioCadenceOrigin, AudioRenderPlan, AudioSilenceSpan, AudioSynchronizerLimits, ChannelMapping,
-    ClippingPolicy, ClockMappedAudioSynchronizer, InputState, MAX_CHANNEL_MAPPING_CHANNELS,
-    MasterAudioInterval, MasterMixer, PlanarAudioSource, SourceGain,
+    AudioCadenceOrigin, AudioRenderPlan, AudioSilenceSpan, AudioSynchronizerLimits, Balance,
+    ChannelMapping, ClippingPolicy, ClockMappedAudioSynchronizer, InputState,
+    MAX_CHANNEL_MAPPING_CHANNELS, MasterAudioInterval, MasterMixer, PlanarAudioSource, SourceGain,
 };
 use fm_clock::{
     ClockDomainId as MappingClockDomainId, ClockMapping, ClockSnapshot, ClockTime, FrameCadence,
@@ -4789,6 +4789,8 @@ fn native_audio_input_state(state: InputAudioStripState) -> Result<InputState, N
         gain: fm_audio::Gain::from_db(
             f32::from(whole_db) + f32::from(fractional_milli_db) / 1_000.0,
         )?,
+        balance: Balance::from_basis_points(state.balance.get())
+            .ok_or(NativeMasterError::InvalidFormat)?,
         muted: state.muted,
         follow_video: state.follow_video,
     })
@@ -7148,9 +7150,10 @@ mod tests {
         VideoDimensions,
     };
     use fm_model::{
-        Input, InputAudioStripState, InputDelaySamples, InputGainMilliDb, Layer, LayerGeometry,
-        Output, ProjectSettings, Rgba8 as ModelRgba8, Scene as ModelScene, SimulatedAudio,
-        SimulatedInput, SimulatedVideo, StartupPolicy, StingerConfig, StingerSlotNumber,
+        Input, InputAudioStripState, InputBalanceBasisPoints, InputDelaySamples, InputGainMilliDb,
+        Layer, LayerGeometry, Output, ProjectSettings, Rgba8 as ModelRgba8, Scene as ModelScene,
+        SimulatedAudio, SimulatedInput, SimulatedVideo, StartupPolicy, StingerConfig,
+        StingerSlotNumber,
     };
     use fm_persistence::{ProjectPosition, ProjectStore, RuntimeRouting, StoredProject};
     use fm_scheduler::FrameNumber;
@@ -8225,6 +8228,7 @@ mod tests {
             inactive,
             InputAudioStripState {
                 gain: InputGainMilliDb::new(-6_021).unwrap(),
+                balance: InputBalanceBasisPoints::CENTER,
                 delay_samples: Default::default(),
                 muted: false,
                 follow_video: false,
@@ -8280,6 +8284,7 @@ mod tests {
             primary,
             InputAudioStripState {
                 gain: InputGainMilliDb::new(-6_021).unwrap(),
+                balance: InputBalanceBasisPoints::CENTER,
                 delay_samples: Default::default(),
                 muted: false,
                 follow_video: true,
@@ -8289,6 +8294,7 @@ mod tests {
             secondary,
             InputAudioStripState {
                 gain: InputGainMilliDb::UNITY,
+                balance: InputBalanceBasisPoints::CENTER,
                 delay_samples: Default::default(),
                 muted: false,
                 follow_video: true,
@@ -8314,6 +8320,7 @@ mod tests {
             secondary,
             InputAudioStripState {
                 gain: InputGainMilliDb::UNITY,
+                balance: InputBalanceBasisPoints::CENTER,
                 delay_samples: Default::default(),
                 muted: true,
                 follow_video: true,
@@ -8340,6 +8347,7 @@ mod tests {
         add_scene(&mut project, scene(10), Vec::new());
         let persisted = InputAudioStripState {
             gain: InputGainMilliDb::new(-12_000).unwrap(),
+            balance: InputBalanceBasisPoints::new(-2_500).unwrap(),
             delay_samples: InputDelaySamples::new(17).unwrap(),
             muted: true,
             follow_video: false,
@@ -8347,6 +8355,7 @@ mod tests {
         assert!(project.set_input_audio_strip(input(1), persisted));
         let alias_persisted = InputAudioStripState {
             gain: InputGainMilliDb::new(-6_000).unwrap(),
+            balance: InputBalanceBasisPoints::new(2_500).unwrap(),
             delay_samples: InputDelaySamples::new(23).unwrap(),
             muted: false,
             follow_video: true,
@@ -8401,6 +8410,7 @@ mod tests {
             input(1),
             InputAudioStripState {
                 gain: InputGainMilliDb::new(-6_021).unwrap(),
+                balance: InputBalanceBasisPoints::CENTER,
                 delay_samples: Default::default(),
                 muted: false,
                 follow_video: true,
@@ -8478,12 +8488,14 @@ mod tests {
 
         let updated = InputAudioStripState {
             gain: InputGainMilliDb::new(-6_000).unwrap(),
+            balance: InputBalanceBasisPoints::new(2_500).unwrap(),
             muted: false,
             follow_video: false,
             delay_samples: InputDelaySamples::new(2).unwrap(),
         };
         let target = native_audio_input_state(updated).unwrap();
         assert_eq!(master.mixer.current_linear_gain(source), Some(1.0));
+        assert_eq!(master.mixer.current_normalized_balance(source), Some(0.0));
         master.set_input_audio_strip(source, updated).unwrap();
         plan.set_input_audio_strip(source, updated).unwrap();
         assert_eq!(master.mixer.input_delay_samples(source), Some(2));
@@ -8492,6 +8504,11 @@ mod tests {
         assert_eq!(master.pending_mixer.input_state(source), Some(target));
         assert_eq!(master.mixer.current_linear_gain(source), Some(1.0));
         assert_eq!(master.pending_mixer.current_linear_gain(source), Some(1.0));
+        assert_eq!(master.mixer.current_normalized_balance(source), Some(0.0));
+        assert_eq!(
+            master.pending_mixer.current_normalized_balance(source),
+            Some(0.0)
+        );
         let stinger = &master.stinger_audio.as_ref().unwrap().masters[&source];
         assert_eq!(stinger.mixer.input_delay_samples(source), Some(2));
         assert_eq!(stinger.pending_mixer.input_delay_samples(source), Some(2));
@@ -8499,6 +8516,11 @@ mod tests {
         assert_eq!(stinger.pending_mixer.input_state(source), Some(target));
         assert_eq!(stinger.mixer.current_linear_gain(source), Some(1.0));
         assert_eq!(stinger.pending_mixer.current_linear_gain(source), Some(1.0));
+        assert_eq!(stinger.mixer.current_normalized_balance(source), Some(0.0));
+        assert_eq!(
+            stinger.pending_mixer.current_normalized_balance(source),
+            Some(0.0)
+        );
         assert_eq!(plan.audio_strip(source), Some(updated));
 
         assert!(master.service_next_frame().unwrap());
@@ -8509,6 +8531,7 @@ mod tests {
             (master.mixer.current_linear_gain(source).unwrap() - target.gain.linear()).abs()
                 < 1.0e-6
         );
+        assert_eq!(master.mixer.current_normalized_balance(source), Some(0.25));
 
         let before = master.mixer.input_delay_samples(source);
         assert!(matches!(

@@ -1,11 +1,11 @@
 use std::{collections::BTreeMap, num::NonZeroU128};
 
 use fm_model::{
-    AudioBus, BusSend, CropRect, Input, InputAudioStrip, InputAudioStripState, InputDelaySamples,
-    InputGainMilliDb, InputKind, Layer, LayerGeometry, MainMix, Output, Project, ProjectSettings,
-    RectMask, RestartPolicy, Rgba8, Rotation, Scene, SimulatedAudio, SimulatedInput,
-    SimulatedVideo, SolidColor, SourceRef, StartupPolicy, StingerAudioPolicy, StingerConfig,
-    StingerMissingMediaFallback, StingerSlotNumber,
+    AudioBus, BusSend, CropRect, Input, InputAudioStrip, InputAudioStripState,
+    InputBalanceBasisPoints, InputDelaySamples, InputGainMilliDb, InputKind, Layer, LayerGeometry,
+    MainMix, Output, Project, ProjectSettings, RectMask, RestartPolicy, Rgba8, Rotation, Scene,
+    SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef, StartupPolicy,
+    StingerAudioPolicy, StingerConfig, StingerMissingMediaFallback, StingerSlotNumber,
 };
 use fm_types::{
     AudioFormat, BusId, Channel, ChannelLayout, ChromaLocation, ColorMetadata, ColorPrimaries,
@@ -189,6 +189,15 @@ fn parse_input_audio_strip(value: Value) -> Result<InputAudioStrip, DecodeError>
         input,
         state: InputAudioStripState {
             gain,
+            balance: InputBalanceBasisPoints::new(object.i32("balance_basis_points")?).ok_or_else(
+                || {
+                    syntax(format!(
+                        "input balance_basis_points must be between {} and {}",
+                        InputBalanceBasisPoints::MIN,
+                        InputBalanceBasisPoints::MAX
+                    ))
+                },
+            )?,
             delay_samples: InputDelaySamples::new(object.u32("delay_samples")?).ok_or_else(
                 || {
                     syntax(format!(

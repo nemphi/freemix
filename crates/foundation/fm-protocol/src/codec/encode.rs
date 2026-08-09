@@ -142,6 +142,7 @@ fn encode_command(record: &mut Record, message: &CommandMessage) -> Result<(), C
         CommandPayload::SetInputAudioStrip {
             input,
             gain_millidb,
+            balance_basis_points,
             muted,
             follow_video,
             delay_samples,
@@ -149,6 +150,7 @@ fn encode_command(record: &mut Record, message: &CommandMessage) -> Result<(), C
             record.field("payload", "input_audio_strip")?;
             record.field("input", input)?;
             record.field("gain_millidb", gain_millidb)?;
+            record.field("balance_basis_points", balance_basis_points)?;
             record.field("muted", u8::from(muted))?;
             record.field("follow_video", u8::from(follow_video))?;
             record.field("delay_samples", delay_samples)?;
@@ -477,15 +479,17 @@ fn encode_input_audio_strips(
     let mut inputs = BTreeSet::new();
     for status in strips {
         if !(-96_000..=24_000).contains(&status.gain_millidb)
+            || !(-10_000..=10_000).contains(&status.balance_basis_points)
             || status.delay_samples > 48_000
             || !inputs.insert(status.input.get())
         {
             return Err(CodecError::InvalidField {
                 field: "input_audio_strips",
                 value: format!(
-                    "{}:{}:{}:{}:{}",
+                    "{}:{}:{}:{}:{}:{}",
                     status.input,
                     status.gain_millidb,
+                    status.balance_basis_points,
                     u8::from(status.muted),
                     u8::from(status.follow_video),
                     status.delay_samples
@@ -499,9 +503,10 @@ fn encode_input_audio_strips(
             .iter()
             .map(|status| {
                 format!(
-                    "{}:{}:{}:{}:{}",
+                    "{}:{}:{}:{}:{}:{}",
                     status.input,
                     status.gain_millidb,
+                    status.balance_basis_points,
                     u8::from(status.muted),
                     u8::from(status.follow_video),
                     status.delay_samples

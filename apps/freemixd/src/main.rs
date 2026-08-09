@@ -41,7 +41,7 @@ use fm_engine::{
     ShowState,
 };
 use fm_model::{
-    InputAudioStripState, InputDelaySamples, InputGainMilliDb, MainMix,
+    InputAudioStripState, InputBalanceBasisPoints, InputDelaySamples, InputGainMilliDb, MainMix,
     StingerAudioPolicy as ModelStingerAudioPolicy, StingerConfig, StingerMissingMediaFallback,
     StingerSlotNumber,
 };
@@ -3647,6 +3647,7 @@ fn restore_input_audio_strips(show: &mut ShowState, project: &fm_model::Project)
             strip.input,
             EngineInputAudioStripState {
                 gain_millidb: strip.state.gain.get(),
+                balance_basis_points: strip.state.balance.get(),
                 muted: strip.state.muted,
                 follow_video: strip.state.follow_video,
                 delay_samples: strip.state.delay_samples.get(),
@@ -3660,6 +3661,8 @@ fn model_audio_strip_state(state: EngineInputAudioStripState) -> InputAudioStrip
     InputAudioStripState {
         gain: InputGainMilliDb::new(state.gain_millidb)
             .expect("engine input audio gain is bounded by the model contract"),
+        balance: InputBalanceBasisPoints::new(state.balance_basis_points)
+            .expect("engine input audio balance is bounded by the model contract"),
         muted: state.muted,
         follow_video: state.follow_video,
         delay_samples: InputDelaySamples::new(state.delay_samples)
@@ -5002,8 +5005,8 @@ mod tests {
     #[cfg(all(feature = "native-media", target_os = "macos"))]
     use fm_io_macos::{CameraIdKind, deterministic_camera_id};
     use fm_model::{
-        Input, InputAudioStripState, InputGainMilliDb, InputKind, Project, ProjectSettings,
-        SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, StingerConfig,
+        Input, InputAudioStripState, InputBalanceBasisPoints, InputGainMilliDb, InputKind, Project,
+        ProjectSettings, SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, StingerConfig,
         StingerSlotNumber,
     };
     #[cfg(feature = "native-media")]
@@ -7557,6 +7560,7 @@ mod tests {
                 CommandPayload::SetInputAudioStrip {
                     input: fm_protocol::WireInputId::from_domain(test_input_id(1)),
                     gain_millidb: -9_000,
+                    balance_basis_points: 2_500,
                     muted: true,
                     follow_video: false,
                     delay_samples: 1_200,
@@ -7573,6 +7577,7 @@ mod tests {
             checkpoint.project().input_audio_strip(test_input_id(1)),
             Some(InputAudioStripState {
                 gain: InputGainMilliDb::new(-9_000).unwrap(),
+                balance: InputBalanceBasisPoints::new(2_500).unwrap(),
                 muted: true,
                 follow_video: false,
                 delay_samples: InputDelaySamples::new(1_200).unwrap(),
@@ -7742,6 +7747,7 @@ mod tests {
             test_input_id(1),
             InputAudioStripState {
                 gain: InputGainMilliDb::new(-3_000).unwrap(),
+                balance: InputBalanceBasisPoints::CENTER,
                 delay_samples: Default::default(),
                 muted: false,
                 follow_video: true,

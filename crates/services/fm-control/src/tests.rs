@@ -1215,6 +1215,7 @@ fn command_result_is_represented_before_its_events() {
                 .map(|input| fm_protocol::InputAudioStripStatus {
                     input: WireInputId::from_domain(input),
                     gain_millidb: 0,
+                    balance_basis_points: 0,
                     muted: false,
                     follow_video: true,
                     delay_samples: 0,
@@ -1237,6 +1238,7 @@ fn input_audio_strip_flows_through_authorization_snapshot_event_and_frame() {
                 CommandPayload::SetInputAudioStrip {
                     input: WireInputId::from_domain(input(2)),
                     gain_millidb: -6_000,
+                    balance_basis_points: 2_500,
                     muted: true,
                     follow_video: false,
                     delay_samples: 2_400,
@@ -1258,6 +1260,7 @@ fn input_audio_strip_flows_through_authorization_snapshot_event_and_frame() {
     assert!(input_audio_strips.iter().any(|status| {
         status.input == WireInputId::from_domain(input(2))
             && status.gain_millidb == -6_000
+            && status.balance_basis_points == 2_500
             && status.muted
             && !status.follow_video
             && status.delay_samples == 2_400
@@ -1279,6 +1282,7 @@ fn input_audio_strip_flows_through_authorization_snapshot_event_and_frame() {
             input(2),
             EngineInputAudioStripState {
                 gain_millidb: -6_000,
+                balance_basis_points: 2_500,
                 muted: true,
                 follow_video: false,
                 delay_samples: 2_400,

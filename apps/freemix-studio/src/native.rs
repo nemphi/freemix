@@ -1156,12 +1156,14 @@ const fn intent_payload(intent: StudioIntent) -> CommandPayload {
         StudioIntent::SetInputAudioStrip {
             input,
             gain_millidb,
+            balance_basis_points,
             muted,
             follow_video,
             delay_samples,
         } => CommandPayload::SetInputAudioStrip {
             input: WireInputId::from_domain(input),
             gain_millidb,
+            balance_basis_points,
             muted,
             follow_video,
             delay_samples,
@@ -1333,6 +1335,7 @@ mod tests {
             intent_payload(StudioIntent::SetInputAudioStrip {
                 input,
                 gain_millidb: -6_000,
+                balance_basis_points: 2_500,
                 muted: true,
                 follow_video: false,
                 delay_samples: 2_400,
@@ -1340,6 +1343,7 @@ mod tests {
             CommandPayload::SetInputAudioStrip {
                 input: WireInputId::from_domain(input),
                 gain_millidb: -6_000,
+                balance_basis_points: 2_500,
                 muted: true,
                 follow_video: false,
                 delay_samples: 2_400,

@@ -288,9 +288,10 @@ fn format_input_audio_strips(strips: &[fm_ui_model::InputAudioStripStatus]) -> S
             .iter()
             .map(|status| {
                 format!(
-                    "{}:{}:{}:{}:{}",
+                    "{}:{}:{}:{}:{}:{}",
                     status.input,
                     status.gain_millidb,
+                    status.balance_basis_points,
                     status.muted,
                     status.follow_video,
                     status.delay_samples

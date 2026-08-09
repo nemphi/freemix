@@ -77,6 +77,7 @@ pub enum Command {
         path: PathBuf,
         input: u128,
         gain_millidb: i32,
+        balance_basis_points: i32,
         muted: bool,
         follow_video: bool,
         delay_samples: u32,
@@ -219,6 +220,7 @@ pub enum Command {
         address: SocketAddr,
         input: u128,
         gain_millidb: i32,
+        balance_basis_points: i32,
         muted: bool,
         follow_video: bool,
         delay_samples: u32,
@@ -515,6 +517,10 @@ fn parse_audio_strip(mut arguments: impl Iterator<Item = String>) -> Result<Comm
     let path = required_path(&mut arguments, "project path")?;
     let input = number(&required(&mut arguments, "input")?, "input")?;
     let gain_millidb = number(&required(&mut arguments, "gain millidB")?, "gain millidB")?;
+    let balance_basis_points = number(
+        &required(&mut arguments, "balance basis points")?,
+        "balance basis points",
+    )?;
     let muted = boolean_choice(&required(&mut arguments, "muted")?, "muted")?;
     let follow_video = boolean_choice(&required(&mut arguments, "follow video")?, "follow video")?;
     let delay_samples = number(&required(&mut arguments, "delay samples")?, "delay samples")?;
@@ -523,6 +529,7 @@ fn parse_audio_strip(mut arguments: impl Iterator<Item = String>) -> Result<Comm
         path,
         input,
         gain_millidb,
+        balance_basis_points,
         muted,
         follow_video,
         delay_samples,
@@ -947,6 +954,10 @@ fn parse_remote_audio_strip(
     let address = socket_address(&required(&mut arguments, "address")?)?;
     let input = number(&required(&mut arguments, "input")?, "input")?;
     let gain_millidb = number(&required(&mut arguments, "gain millidB")?, "gain millidB")?;
+    let balance_basis_points = number(
+        &required(&mut arguments, "balance basis points")?,
+        "balance basis points",
+    )?;
     let muted = boolean_choice(&required(&mut arguments, "muted")?, "muted")?;
     let follow_video = boolean_choice(&required(&mut arguments, "follow video")?, "follow video")?;
     let delay_samples = number(&required(&mut arguments, "delay samples")?, "delay samples")?;
@@ -955,6 +966,7 @@ fn parse_remote_audio_strip(
         address,
         input,
         gain_millidb,
+        balance_basis_points,
         muted,
         follow_video,
         delay_samples,
@@ -1743,6 +1755,7 @@ mod tests {
                 "show.freemix",
                 "7",
                 "-6000",
+                "2500",
                 "on",
                 "off",
                 "48000",
@@ -1751,6 +1764,7 @@ mod tests {
                 path: PathBuf::from("show.freemix"),
                 input: 7,
                 gain_millidb: -6_000,
+                balance_basis_points: 2_500,
                 muted: true,
                 follow_video: false,
                 delay_samples: 48_000,
@@ -1766,6 +1780,7 @@ mod tests {
                 "127.0.0.1:9123",
                 "7",
                 "-6000",
+                "-2500",
                 "off",
                 "on",
                 "2400",
@@ -1778,6 +1793,7 @@ mod tests {
                 address: "127.0.0.1:9123".parse().unwrap(),
                 input: 7,
                 gain_millidb: -6_000,
+                balance_basis_points: -2_500,
                 muted: false,
                 follow_video: true,
                 delay_samples: 2_400,

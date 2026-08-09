@@ -22,6 +22,8 @@ const MAX_TRANSITION_DURATION_FRAMES: u32 = 3_600;
 pub const MAX_INPUT_AUDIO_DELAY_SAMPLES: u32 = 48_000;
 pub const MIN_INPUT_AUDIO_GAIN_MILLIDB: i32 = -96_000;
 pub const MAX_INPUT_AUDIO_GAIN_MILLIDB: i32 = 24_000;
+pub const MIN_INPUT_AUDIO_BALANCE_BASIS_POINTS: i32 = -10_000;
+pub const MAX_INPUT_AUDIO_BALANCE_BASIS_POINTS: i32 = 10_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EngineManualTransitionKind {
@@ -921,6 +923,18 @@ impl Mutation<ShowState, EngineEvent, EngineAcceptance> for EngineMutation {
                     format!(
                         "input audio gain must be between {MIN_INPUT_AUDIO_GAIN_MILLIDB} and \
                          {MAX_INPUT_AUDIO_GAIN_MILLIDB} millidB"
+                    ),
+                ));
+            }
+            if !(MIN_INPUT_AUDIO_BALANCE_BASIS_POINTS..=MAX_INPUT_AUDIO_BALANCE_BASIS_POINTS)
+                .contains(&strip_state.balance_basis_points)
+            {
+                return Err(Rejection::new(
+                    RejectionCode::InvalidCommand,
+                    format!(
+                        "input audio balance must be between \
+                         {MIN_INPUT_AUDIO_BALANCE_BASIS_POINTS} and \
+                         {MAX_INPUT_AUDIO_BALANCE_BASIS_POINTS} basis points"
                     ),
                 ));
             }

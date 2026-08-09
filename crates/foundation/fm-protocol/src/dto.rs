@@ -444,6 +444,7 @@ pub enum CommandPayload {
     SetInputAudioStrip {
         input: WireInputId,
         gain_millidb: i32,
+        balance_basis_points: i32,
         muted: bool,
         follow_video: bool,
         delay_samples: u32,
@@ -599,6 +600,7 @@ pub enum CommandResult {
 pub struct InputAudioStripStatus {
     pub input: WireInputId,
     pub gain_millidb: i32,
+    pub balance_basis_points: i32,
     pub muted: bool,
     pub follow_video: bool,
     pub delay_samples: u32,

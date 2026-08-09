@@ -115,6 +115,7 @@ fn input_audio_strips() -> Vec<fm_protocol::InputAudioStripStatus> {
         .map(|input| fm_protocol::InputAudioStripStatus {
             input,
             gain_millidb: 0,
+            balance_basis_points: 0,
             muted: false,
             follow_video: true,
             delay_samples: 0,

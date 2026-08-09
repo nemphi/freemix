@@ -252,6 +252,7 @@ fn decode_command_payload(
         "input_audio_strip" => CommandPayload::SetInputAudioStrip {
             input: fields.input("input")?,
             gain_millidb: fields.parse_required("gain_millidb")?,
+            balance_basis_points: fields.parse_required("balance_basis_points")?,
             muted: fields.boolean("muted")?,
             follow_video: fields.boolean("follow_video")?,
             delay_samples: fields.parse_required("delay_samples")?,
@@ -559,6 +560,7 @@ fn decode_input_audio_strips(
             let mut parts = entry.split(':');
             let input = parts.next().ok_or_else(invalid)?;
             let gain_millidb = parts.next().ok_or_else(invalid)?;
+            let balance_basis_points = parts.next().ok_or_else(invalid)?;
             let muted = parts.next().ok_or_else(invalid)?;
             let follow_video = parts.next().ok_or_else(invalid)?;
             let delay_samples = parts.next().ok_or_else(invalid)?;
@@ -568,6 +570,7 @@ fn decode_input_audio_strips(
             let status = InputAudioStripStatus {
                 input: parse_input(input).ok_or_else(invalid)?,
                 gain_millidb: gain_millidb.parse().map_err(|_| invalid())?,
+                balance_basis_points: balance_basis_points.parse().map_err(|_| invalid())?,
                 muted: match muted {
                     "0" => false,
                     "1" => true,
@@ -581,6 +584,7 @@ fn decode_input_audio_strips(
                 delay_samples: delay_samples.parse().map_err(|_| invalid())?,
             };
             if !(-96_000..=24_000).contains(&status.gain_millidb)
+                || !(-10_000..=10_000).contains(&status.balance_basis_points)
                 || status.delay_samples > 48_000
                 || !inputs.insert(status.input.get())
             {

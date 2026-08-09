@@ -8,7 +8,8 @@ use fm_command::{
 use fm_engine::{
     Engine, EngineCommand, EngineError, EngineInputAudioStripState, EngineManualTransitionKind,
     EngineManualTransitionPosition, EnginePrepareOutcome, EngineRestoreState, EngineSnapshot,
-    MAX_INPUT_AUDIO_DELAY_SAMPLES, MAX_INPUT_AUDIO_GAIN_MILLIDB, ShowState, SnapshotError,
+    MAX_INPUT_AUDIO_BALANCE_BASIS_POINTS, MAX_INPUT_AUDIO_DELAY_SAMPLES,
+    MAX_INPUT_AUDIO_GAIN_MILLIDB, ShowState, SnapshotError,
 };
 use fm_scheduler::FrameNumber;
 use fm_switcher::{
@@ -108,6 +109,7 @@ fn input_audio_strip_is_durable_and_realized_on_its_scheduled_frame() {
     let mut engine = engine();
     let state = EngineInputAudioStripState {
         gain_millidb: -6_000,
+        balance_basis_points: 2_500,
         muted: true,
         follow_video: false,
         delay_samples: 2_400,
@@ -146,15 +148,29 @@ fn input_audio_strip_is_durable_and_realized_on_its_scheduled_frame() {
 
 #[test]
 fn input_audio_strip_rejects_unknown_inputs_and_out_of_range_values() {
-    for (key, input, gain_millidb, delay_samples) in [
-        ("unknown-strip", input(99), 0, 1),
+    for (key, input, gain_millidb, balance_basis_points, delay_samples) in [
+        ("unknown-strip", input(99), 0, 0, 1),
         (
             "large-delay",
             input(1),
             0,
+            0,
             MAX_INPUT_AUDIO_DELAY_SAMPLES + 1,
         ),
-        ("large-gain", input(1), MAX_INPUT_AUDIO_GAIN_MILLIDB + 1, 0),
+        (
+            "large-gain",
+            input(1),
+            MAX_INPUT_AUDIO_GAIN_MILLIDB + 1,
+            0,
+            0,
+        ),
+        (
+            "large-balance",
+            input(1),
+            0,
+            MAX_INPUT_AUDIO_BALANCE_BASIS_POINTS + 1,
+            0,
+        ),
     ] {
         let mut engine = engine();
         let outcome = engine
@@ -165,6 +181,7 @@ fn input_audio_strip_rejects_unknown_inputs_and_out_of_range_values() {
                         input,
                         state: EngineInputAudioStripState {
                             gain_millidb,
+                            balance_basis_points,
                             muted: false,
                             follow_video: true,
                             delay_samples,

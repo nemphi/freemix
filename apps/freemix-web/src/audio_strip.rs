@@ -12,6 +12,8 @@ pub struct AudioStripControls;
 impl AudioStripControls {
     pub const MIN_GAIN_MILLIDB: i32 = -96_000;
     pub const MAX_GAIN_MILLIDB: i32 = 24_000;
+    pub const MIN_BALANCE_BASIS_POINTS: i32 = -10_000;
+    pub const MAX_BALANCE_BASIS_POINTS: i32 = 10_000;
     pub const MAX_DELAY_SAMPLES: u32 = 48_000;
 
     #[must_use]
@@ -54,6 +56,7 @@ impl AudioStripControls {
         self,
         input: InputId,
         gain_millidb: i32,
+        balance_basis_points: i32,
         muted: bool,
         follow_video: bool,
         delay_samples: u32,
@@ -61,11 +64,14 @@ impl AudioStripControls {
         session: Option<&Session>,
     ) -> Option<CommandPayload> {
         ((Self::MIN_GAIN_MILLIDB..=Self::MAX_GAIN_MILLIDB).contains(&gain_millidb)
+            && (Self::MIN_BALANCE_BASIS_POINTS..=Self::MAX_BALANCE_BASIS_POINTS)
+                .contains(&balance_basis_points)
             && delay_samples <= Self::MAX_DELAY_SAMPLES
             && self.control_state(connection_state, session).is_enabled())
         .then_some(CommandPayload::SetInputAudioStrip {
             input: WireInputId::from_domain(input),
             gain_millidb,
+            balance_basis_points,
             muted,
             follow_video,
             delay_samples,
@@ -105,13 +111,14 @@ mod tests {
 
     #[test]
     fn audio_strip_requires_current_session_permission_and_bounds() {
-        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(2, 5));
+        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(2, 6));
         let controls = AudioStripControls;
         let ready = session(&["control_audio"]);
         assert_eq!(
             controls.command_payload(
                 input(7),
                 -6_000,
+                2_500,
                 true,
                 false,
                 2_400,
@@ -121,6 +128,7 @@ mod tests {
             Some(CommandPayload::SetInputAudioStrip {
                 input: WireInputId::from_domain(input(7)),
                 gain_millidb: -6_000,
+                balance_basis_points: 2_500,
                 muted: true,
                 follow_video: false,
                 delay_samples: 2_400,
@@ -130,6 +138,7 @@ mod tests {
             controls.command_payload(
                 input(7),
                 24_001,
+                0,
                 false,
                 true,
                 0,
@@ -142,9 +151,23 @@ mod tests {
             controls.command_payload(
                 input(7),
                 0,
+                0,
                 false,
                 true,
                 48_001,
+                &ConnectionState::Ready,
+                Some(&ready)
+            ),
+            None
+        );
+        assert_eq!(
+            controls.command_payload(
+                input(7),
+                0,
+                10_001,
+                false,
+                true,
+                0,
                 &ConnectionState::Ready,
                 Some(&ready)
             ),

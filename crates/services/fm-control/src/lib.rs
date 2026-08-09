@@ -1100,6 +1100,7 @@ fn engine_command(payload: CommandPayload) -> EngineCommand {
         CommandPayload::SetInputAudioStrip {
             input,
             gain_millidb,
+            balance_basis_points,
             muted,
             follow_video,
             delay_samples,
@@ -1107,6 +1108,7 @@ fn engine_command(payload: CommandPayload) -> EngineCommand {
             input: input.to_domain(),
             state: EngineInputAudioStripState {
                 gain_millidb,
+                balance_basis_points,
                 muted,
                 follow_video,
                 delay_samples,
@@ -1429,6 +1431,7 @@ fn protocol_input_audio_strips(engine: &Engine) -> Vec<InputAudioStripStatus> {
         .map(|(&input, &state)| InputAudioStripStatus {
             input: WireInputId::from_domain(input),
             gain_millidb: state.gain_millidb,
+            balance_basis_points: state.balance_basis_points,
             muted: state.muted,
             follow_video: state.follow_video,
             delay_samples: state.delay_samples,

@@ -70,8 +70,11 @@ Rules:
   commit does.
 - Command permissions are checked before validation reveals sensitive details.
 - The current input-audio mutation replaces one complete Master strip
-  atomically: gain in `-96000..=24000` milli-dB, mute, follow-video, and delay
-  in `0..=48000` samples. Snapshots and durable events always carry one complete
+  atomically: gain in `-96000..=24000` milli-dB, stereo balance in
+  `-10000..=10000` basis points, mute, follow-video, and delay in
+  `0..=48000` samples. Negative balance attenuates the right destination,
+  positive balance attenuates the left destination, and non-stereo destination
+  labels remain at unity. Snapshots and durable events always carry one complete
   strip for every show input; partial audio-strip patches are not accepted.
 
 Command results are ordered before any event bearing the same accepted revision

@@ -6,11 +6,11 @@ use std::{
 };
 
 use fm_model::{
-    AudioBus, BusSend, CropRect, Input, InputAudioStripState, InputDelaySamples, InputGainMilliDb,
-    InputKind, Layer, LayerGeometry, MainMix, Output, Project, ProjectSettings, RectMask,
-    RestartPolicy, Rgba8, Rotation, Scene, SimulatedAudio, SimulatedInput, SimulatedVideo,
-    SolidColor, SourceRef, StartupPolicy, StingerAudioPolicy, StingerConfig,
-    StingerMissingMediaFallback, StingerSlotNumber,
+    AudioBus, BusSend, CropRect, Input, InputAudioStripState, InputBalanceBasisPoints,
+    InputDelaySamples, InputGainMilliDb, InputKind, Layer, LayerGeometry, MainMix, Output, Project,
+    ProjectSettings, RectMask, RestartPolicy, Rgba8, Rotation, Scene, SimulatedAudio,
+    SimulatedInput, SimulatedVideo, SolidColor, SourceRef, StartupPolicy, StingerAudioPolicy,
+    StingerConfig, StingerMissingMediaFallback, StingerSlotNumber,
 };
 use fm_persistence::{ProjectPosition, ProjectStore, RuntimeRouting, StoreError, StoredProject};
 use fm_types::{
@@ -285,6 +285,7 @@ fn input_audio_strips_round_trip_exactly_and_reject_malformed_values() {
     let input = project.inputs()[1].id;
     let state = InputAudioStripState {
         gain: InputGainMilliDb::new(-12_345).unwrap(),
+        balance: InputBalanceBasisPoints::new(2_500).unwrap(),
         delay_samples: InputDelaySamples::new(1_200).unwrap(),
         muted: true,
         follow_video: false,
@@ -304,7 +305,7 @@ fn input_audio_strips_round_trip_exactly_and_reject_malformed_values() {
     let encoded = fs::read_to_string(store.manifest_path()).unwrap();
     assert!(
         encoded.contains(
-            "\"gain_milli_db\": -12345, \"delay_samples\": 1200, \"muted\": true, \"follow_video\": false"
+            "\"gain_milli_db\": -12345, \"balance_basis_points\": 2500, \"delay_samples\": 1200, \"muted\": true, \"follow_video\": false"
         )
     );
 
@@ -317,6 +318,16 @@ fn input_audio_strips_round_trip_exactly_and_reject_malformed_values() {
         encoded.replacen(
             "\"gain_milli_db\": -12345",
             "\"gain_milli_db\": \"-12345\"",
+            1,
+        ),
+        encoded.replacen(
+            "\"balance_basis_points\": 2500",
+            "\"balance_basis_points\": 10001",
+            1,
+        ),
+        encoded.replacen(
+            "\"balance_basis_points\": 2500",
+            "\"balance_basis_points\": \"2500\"",
             1,
         ),
         encoded.replacen("\"delay_samples\": 1200", "\"delay_samples\": 48001", 1),

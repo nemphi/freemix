@@ -2,10 +2,10 @@ use std::num::NonZeroU128;
 
 use fm_model::{
     AudioBus, BusSend, CURRENT_SCHEMA_VERSION, CropRect, EntityRef, Input, InputAudioStripState,
-    InputDelaySamples, InputGainMilliDb, InputKind, Layer, LayerGeometry, MainMix, Output,
-    OutputFormat, Project, ProjectSettings, RectMask, RestartPolicy, Rgba8, Rotation, Scene,
-    SchemaVersion, SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef,
-    StartupPolicy, StingerAudioPolicy, StingerConfig, StingerMissingMediaFallback,
+    InputBalanceBasisPoints, InputDelaySamples, InputGainMilliDb, InputKind, Layer, LayerGeometry,
+    MainMix, Output, OutputFormat, Project, ProjectSettings, RectMask, RestartPolicy, Rgba8,
+    Rotation, Scene, SchemaVersion, SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor,
+    SourceRef, StartupPolicy, StingerAudioPolicy, StingerConfig, StingerMissingMediaFallback,
     StingerSlotNumber, ValidationErrorKind,
 };
 use fm_types::{
@@ -246,7 +246,7 @@ fn duplicate_routes_are_rejected() {
 
 #[test]
 fn project_uses_the_current_schema_contract() {
-    assert_eq!(CURRENT_SCHEMA_VERSION, SchemaVersion::new(14));
+    assert_eq!(CURRENT_SCHEMA_VERSION, SchemaVersion::new(15));
     assert_eq!(valid_project().schema_version(), CURRENT_SCHEMA_VERSION);
 }
 
@@ -322,6 +322,26 @@ fn persisted_input_gain_is_exact_and_bounded() {
     );
     assert_eq!(InputGainMilliDb::new(InputGainMilliDb::MIN - 1), None);
     assert_eq!(InputGainMilliDb::new(InputGainMilliDb::MAX + 1), None);
+    assert_eq!(
+        InputBalanceBasisPoints::new(InputBalanceBasisPoints::MIN)
+            .unwrap()
+            .get(),
+        -10_000
+    );
+    assert_eq!(
+        InputBalanceBasisPoints::new(InputBalanceBasisPoints::MAX)
+            .unwrap()
+            .get(),
+        10_000
+    );
+    assert_eq!(
+        InputBalanceBasisPoints::new(InputBalanceBasisPoints::MIN - 1),
+        None
+    );
+    assert_eq!(
+        InputBalanceBasisPoints::new(InputBalanceBasisPoints::MAX + 1),
+        None
+    );
     assert_eq!(InputDelaySamples::new(0), Some(InputDelaySamples::ZERO));
     assert_eq!(
         InputDelaySamples::new(InputDelaySamples::MAX)
@@ -334,6 +354,7 @@ fn persisted_input_gain_is_exact_and_bounded() {
         InputAudioStripState::default(),
         InputAudioStripState {
             gain: InputGainMilliDb::UNITY,
+            balance: InputBalanceBasisPoints::CENTER,
             delay_samples: InputDelaySamples::ZERO,
             muted: false,
             follow_video: true,

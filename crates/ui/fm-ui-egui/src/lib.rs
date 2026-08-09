@@ -36,6 +36,7 @@ pub enum StudioIntent {
     SetInputAudioStrip {
         input: InputId,
         gain_millidb: i32,
+        balance_basis_points: i32,
         muted: bool,
         follow_video: bool,
         delay_samples: u32,
@@ -519,6 +520,7 @@ fn draw_input_audio_strips(ui: &mut Ui, state: &StudioUiState, intents: &mut Vec
                 for status in &view.input_audio_strips {
                     ui.label(RichText::new(label_for_input(view, status.input)).small());
                     let mut gain_millidb = status.gain_millidb;
+                    let mut balance_basis_points = status.balance_basis_points;
                     let mut muted = status.muted;
                     let mut follow_video = status.follow_video;
                     let mut delay_samples = status.delay_samples;
@@ -531,6 +533,16 @@ fn draw_input_audio_strips(ui: &mut Ui, state: &StudioUiState, intents: &mut Vec
                                 .speed(100.0),
                         )
                         .on_hover_text("Input gain in one-thousandth of a decibel")
+                        .changed();
+                    let balance_changed = ui
+                        .add_enabled(
+                            enabled,
+                            DragValue::new(&mut balance_basis_points)
+                                .range(-10_000..=10_000)
+                                .suffix(" BAL")
+                                .speed(100.0),
+                        )
+                        .on_hover_text("Stereo balance: -10000 full left, 10000 full right")
                         .changed();
                     let mute_changed = ui
                         .add_enabled(enabled, egui::Checkbox::new(&mut muted, "MUTE"))
@@ -551,10 +563,16 @@ fn draw_input_audio_strips(ui: &mut Ui, state: &StudioUiState, intents: &mut Vec
                         )
                         .on_hover_text("Input delay at the 48 kHz Master sample rate")
                         .changed();
-                    if gain_changed || mute_changed || follow_changed || delay_changed {
+                    if gain_changed
+                        || balance_changed
+                        || mute_changed
+                        || follow_changed
+                        || delay_changed
+                    {
                         intents.push(StudioIntent::SetInputAudioStrip {
                             input: status.input,
                             gain_millidb,
+                            balance_basis_points,
                             muted,
                             follow_video,
                             delay_samples,
@@ -1538,6 +1556,7 @@ mod tests {
             StudioIntent::SetInputAudioStrip {
                 input: input(9),
                 gain_millidb: -6_000,
+                balance_basis_points: 2_500,
                 muted: true,
                 follow_video: false,
                 delay_samples: 2_400,
@@ -1545,6 +1564,7 @@ mod tests {
             StudioIntent::SetInputAudioStrip {
                 input: input(9),
                 gain_millidb: -6_000,
+                balance_basis_points: 2_500,
                 muted: true,
                 follow_video: false,
                 delay_samples: 2_400,

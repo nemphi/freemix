@@ -135,6 +135,7 @@ pub struct OverlayStatus {
 pub struct InputAudioStripStatus {
     pub input: InputId,
     pub gain_millidb: i32,
+    pub balance_basis_points: i32,
     pub muted: bool,
     pub follow_video: bool,
     pub delay_samples: u32,
@@ -1403,6 +1404,7 @@ fn validate_input_audio_strips(
     let mut seen = HashSet::with_capacity(strips.len());
     if strips.iter().any(|status| {
         !(-96_000..=24_000).contains(&status.gain_millidb)
+            || !(-10_000..=10_000).contains(&status.balance_basis_points)
             || status.delay_samples > 48_000
             || !inputs.contains(&status.input)
             || !seen.insert(status.input)
@@ -1522,6 +1524,7 @@ fn protocol_input_audio_strips(
         .map(|status| InputAudioStripStatus {
             input: status.input.to_domain(),
             gain_millidb: status.gain_millidb,
+            balance_basis_points: status.balance_basis_points,
             muted: status.muted,
             follow_video: status.follow_video,
             delay_samples: status.delay_samples,
