@@ -2,26 +2,24 @@ use core::{fmt::Write, num::NonZeroU128};
 
 use fm_command::{Deadline, Revision, StateEpoch};
 use fm_protocol::{
-    ALPHA_FADE_PROTOCOL_VERSION, BASE_PROTOCOL_VERSION, CURRENT_PROTOCOL_VERSION,
-    CapabilityReportMessage, CapabilityReportSummary, ClientHello, ClientType, CodecError,
-    CommandMessage, CommandPayload, CommandResult, DurableEvent, DurableEventBatch, DurableGap,
-    EngineIdentity, ErrorMessage, EventCursor, EventMessage, EventPayload,
-    FADE_TO_BLACK_PROTOCOL_VERSION, FadeToBlackPosition, FadeToBlackState, FieldIssue,
-    HandshakeOutcome, HandshakeRequest, HandshakeResponse, HeartbeatMessage, LineDecoder,
-    MANUAL_ALPHA_FADE_PROTOCOL_VERSION, MANUAL_TRANSITION_PROTOCOL_VERSION, MAX_FIELD_VALUE_BYTES,
+    CURRENT_PROTOCOL_VERSION, CodecError, CommandMessage, CommandPayload, CommandResult,
+    EngineIdentity, ErrorMessage, EventCursor, EventMessage, EventPayload, FadeToBlackPosition,
+    FadeToBlackState, FieldIssue, HandshakeOutcome, LineDecoder, MAX_FIELD_VALUE_BYTES,
     MAX_FIELDS_PER_MESSAGE, MAX_LINE_BYTES, MAX_LIST_ITEMS, MAX_MESSAGES_PER_PUSH,
-    ManualTransitionKind, ManualTransitionPosition, ManualTransitionState, ManualTransitionStatus,
-    ProtocolVersion, ResumeCursor, Role, RuntimeDomainBoundary, RuntimeEventMessage,
-    RuntimeFailureDisposition, RuntimeLifecycleEvent, SLIDE_PROTOCOL_VERSION,
-    STINGER_CONFIGURATION_PROTOCOL_VERSION, STINGER_PROTOCOL_VERSION,
-    STINGER_STATUS_PROTOCOL_VERSION, ServerHello, ServerIdentity, SnapshotMessage, SnapshotReason,
-    StingerAudioPolicy, StingerMissingMediaFallback, StingerReadiness, StingerStatus,
-    StructuredError, WIPE_PROTOCOL_VERSION, WireInputId, WireMessage, WireStingerSlotId,
-    ZOOM_PROTOCOL_VERSION, choose_handshake_outcome, decode_line, encode_line, negotiate_version,
+    ManualTransitionStatus, OverlayStatus, OverlayTransitionKind, ProtocolVersion, ResumeCursor,
+    RuntimeDomainBoundary, RuntimeEventMessage, RuntimeFailureDisposition, RuntimeLifecycleEvent,
+    ServerIdentity, SnapshotMessage, SnapshotReason, StingerAudioPolicy,
+    StingerMissingMediaFallback, StingerReadiness, StingerStatus, StructuredError, WireInputId,
+    WireMessage, WireOutputId, WireOverlayChannelId, WireStingerSlotId, choose_handshake_outcome,
+    decode_line, encode_line, negotiate_version,
 };
 
 fn input(value: u128) -> WireInputId {
     WireInputId::new(NonZeroU128::new(value).unwrap())
+}
+
+fn output(value: u128) -> WireOutputId {
+    WireOutputId::new(NonZeroU128::new(value).unwrap())
 }
 
 fn identity() -> EngineIdentity {
@@ -55,16 +53,6 @@ fn resume_cursor() -> ResumeCursor {
     }
 }
 
-fn capabilities() -> CapabilityReportSummary {
-    CapabilityReportSummary {
-        digest: "sha256:abc".to_owned(),
-        total: 4,
-        available: 3,
-        degraded: 1,
-        unavailable: 0,
-    }
-}
-
 fn structured_error() -> StructuredError {
     StructuredError {
         code: "invalid_command".to_owned(),
@@ -80,7 +68,7 @@ fn structured_error() -> StructuredError {
 
 fn command() -> CommandMessage {
     CommandMessage {
-        protocol: ProtocolVersion::new(1, 2),
+        protocol: CURRENT_PROTOCOL_VERSION,
         id: "01K:test".to_owned(),
         idempotency_key: "operator-7:01K".to_owned(),
         expected_revision: Some(1_842),
@@ -90,125 +78,9 @@ fn command() -> CommandMessage {
 }
 
 #[test]
-fn golden_command_fixture_is_stable() {
-    let fixture = include_str!("fixtures/command_select.wire");
-    let message = WireMessage::Command(command());
-    assert_eq!(encode_line(&message).unwrap(), fixture);
-    assert_eq!(decode_line(fixture).unwrap(), message);
-}
-
-#[test]
-fn additive_wipe_command_has_a_stable_wire_form_without_changing_existing_bytes() {
-    let existing_fixture = include_str!("fixtures/command_select.wire");
-    assert_eq!(
-        encode_line(&WireMessage::Command(command())).unwrap(),
-        existing_fixture
-    );
-
-    let fixture = include_str!("fixtures/command_wipe.wire");
-    let message = WireMessage::Command(CommandMessage {
-        protocol: WIPE_PROTOCOL_VERSION,
-        payload: CommandPayload::Wipe {
-            duration_frames: 45,
-        },
-        ..command()
-    });
-    assert_eq!(encode_line(&message).unwrap(), fixture);
-    assert_eq!(decode_line(fixture).unwrap(), message);
-}
-
-#[test]
-fn additive_alpha_fade_command_has_a_stable_wire_form() {
-    let fixture = include_str!("fixtures/command_alpha_fade.wire");
-    let message = WireMessage::Command(CommandMessage {
-        protocol: ALPHA_FADE_PROTOCOL_VERSION,
-        payload: CommandPayload::AlphaFade {
-            duration_frames: 45,
-        },
-        ..command()
-    });
-    assert_eq!(encode_line(&message).unwrap(), fixture);
-    assert_eq!(decode_line(fixture).unwrap(), message);
-}
-
-#[test]
-fn additive_slide_command_has_a_stable_wire_form() {
-    let fixture = include_str!("fixtures/command_slide.wire");
-    let message = WireMessage::Command(CommandMessage {
-        protocol: SLIDE_PROTOCOL_VERSION,
-        payload: CommandPayload::Slide {
-            duration_frames: 45,
-        },
-        ..command()
-    });
-    assert_eq!(encode_line(&message).unwrap(), fixture);
-    assert_eq!(decode_line(fixture).unwrap(), message);
-}
-
-#[test]
-fn additive_zoom_command_has_a_stable_wire_form() {
-    let fixture = include_str!("fixtures/command_zoom.wire");
-    let message = WireMessage::Command(CommandMessage {
-        protocol: ZOOM_PROTOCOL_VERSION,
-        payload: CommandPayload::Zoom {
-            duration_frames: 45,
-        },
-        ..command()
-    });
-    assert_eq!(encode_line(&message).unwrap(), fixture);
-    assert_eq!(decode_line(fixture).unwrap(), message);
-}
-
-#[test]
-fn additive_stinger_command_has_a_stable_wire_form_and_bounded_slot() {
-    let fixture = include_str!("fixtures/command_stinger.wire");
-    let message = WireMessage::Command(CommandMessage {
-        protocol: STINGER_PROTOCOL_VERSION,
-        payload: CommandPayload::Stinger {
-            slot: WireStingerSlotId::new(3).unwrap(),
-            duration_frames: 45,
-        },
-        ..command()
-    });
-    assert_eq!(encode_line(&message).unwrap(), fixture);
-    assert_eq!(decode_line(fixture).unwrap(), message);
-
-    let invalid = fixture.replace("slot=3", "slot=9");
-    assert_eq!(
-        decode_line(&invalid),
-        Err(CodecError::InvalidField {
-            field: "slot",
-            value: "9".to_owned(),
-        })
-    );
-}
-
-#[test]
-fn golden_client_hello_fixture_is_stable() {
-    let fixture = include_str!("fixtures/client_hello.wire");
-    let message = WireMessage::ClientHello(ClientHello {
-        versions: vec![ProtocolVersion::new(1, 0), ProtocolVersion::new(1, 2)],
-        build: "studio 0.1".to_owned(),
-        client_type: ClientType::Studio,
-        desired_role: Role::Operator,
-        cached_cursor: Some(cursor()),
-    });
-    assert_eq!(encode_line(&message).unwrap(), fixture);
-    assert_eq!(decode_line(fixture).unwrap(), message);
-}
-
-#[test]
+#[allow(clippy::too_many_lines)]
 fn every_message_variant_round_trips() {
     let messages = vec![
-        WireMessage::ServerHello(ServerHello {
-            negotiated: ProtocolVersion::new(1, 2),
-            granted_role: Role::Operator,
-            permissions: vec!["switcher.take".to_owned(), "preview:view".to_owned()],
-            capabilities_digest: "sha256:a b".to_owned(),
-            engine: identity(),
-            current_revision: 1_842,
-            resume: true,
-        }),
         WireMessage::Command(CommandMessage {
             payload: CommandPayload::Cut,
             expected_revision: None,
@@ -239,6 +111,63 @@ fn every_message_variant_round_trips() {
             payload: CommandPayload::Wipe { duration_frames: 9 },
             ..command()
         }),
+        WireMessage::Command(CommandMessage {
+            payload: CommandPayload::TakeOverlay {
+                channel: WireOverlayChannelId::new(1).unwrap(),
+                source: input(42),
+            },
+            ..command()
+        }),
+        WireMessage::Command(CommandMessage {
+            payload: CommandPayload::UpdateOverlay {
+                channel: WireOverlayChannelId::new(8).unwrap(),
+                source: input(7),
+            },
+            ..command()
+        }),
+        WireMessage::Command(CommandMessage {
+            payload: CommandPayload::OverlayOff {
+                channel: WireOverlayChannelId::new(2).unwrap(),
+            },
+            ..command()
+        }),
+        WireMessage::Command(CommandMessage {
+            payload: CommandPayload::SetOverlayOutputInclusion {
+                channel: WireOverlayChannelId::new(3).unwrap(),
+                output: output(9),
+                included: true,
+            },
+            ..command()
+        }),
+        WireMessage::Command(CommandMessage {
+            payload: CommandPayload::ConfigureOverlayTransition {
+                channel: WireOverlayChannelId::new(4).unwrap(),
+                transition: OverlayTransitionKind::Fade,
+                duration_frames: 24,
+            },
+            ..command()
+        }),
+        WireMessage::Command(CommandMessage {
+            payload: CommandPayload::ConfigureOverlayAppearance {
+                channel: WireOverlayChannelId::new(5).unwrap(),
+                position: fm_protocol::OverlayPositionPreset::BottomRight,
+                border: fm_protocol::OverlayBorderPreset::ThickWhite,
+            },
+            ..command()
+        }),
+        WireMessage::Command(CommandMessage {
+            payload: CommandPayload::QueueOverlay {
+                channel: WireOverlayChannelId::new(6).unwrap(),
+                source: input(3),
+            },
+            ..command()
+        }),
+        WireMessage::Command(CommandMessage {
+            payload: CommandPayload::TakeNextOverlay {
+                channel: WireOverlayChannelId::new(6).unwrap(),
+            },
+            ..command()
+        }),
         WireMessage::CommandResult(CommandResult::Accepted {
             id: "accepted".to_owned(),
             revision: 9,
@@ -265,19 +194,31 @@ fn every_message_variant_round_trips() {
             desired_preview: input(1),
             realized_program: input(1),
             realized_preview: input(2),
-            desired_manual_transition: None,
-            realized_manual_transition: None,
-            desired_fade_to_black: None,
-            realized_fade_to_black: None,
-            stingers: None,
+            desired_manual_transition: ManualTransitionStatus::Inactive,
+            realized_manual_transition: ManualTransitionStatus::Inactive,
+            desired_fade_to_black: FadeToBlackState {
+                target_active: false,
+                position: FadeToBlackPosition::LIVE,
+            },
+            realized_fade_to_black: FadeToBlackState {
+                target_active: false,
+                position: FadeToBlackPosition::LIVE,
+            },
+            stingers: Vec::new(),
+            desired_overlays: OverlayStatus::empty_channels(),
+            realized_overlays: OverlayStatus::empty_channels(),
         }),
         WireMessage::Event(EventMessage {
             cursor: cursor(),
             payload: EventPayload::DesiredSwitcher {
                 program: input(2),
                 preview: input(1),
-                manual_transition: None,
-                fade_to_black: None,
+                manual_transition: ManualTransitionStatus::Inactive,
+                fade_to_black: FadeToBlackState {
+                    target_active: false,
+                    position: FadeToBlackPosition::LIVE,
+                },
+                overlays: OverlayStatus::empty_channels(),
             },
         }),
     ];
@@ -288,440 +229,27 @@ fn every_message_variant_round_trips() {
 }
 
 #[test]
-fn manual_transition_commands_have_stable_exact_wire_forms() {
-    let cases = [
-        (
-            include_str!("fixtures/command_manual_start.wire"),
-            CommandPayload::StartManualTransition {
-                kind: ManualTransitionKind::Wipe,
-            },
-        ),
-        (
-            include_str!("fixtures/command_manual_position.wire"),
-            CommandPayload::SetManualTransitionPosition {
-                position: ManualTransitionPosition::new(6_250).unwrap(),
-            },
-        ),
-        (
-            include_str!("fixtures/command_manual_commit.wire"),
-            CommandPayload::CommitManualTransition,
-        ),
-        (
-            include_str!("fixtures/command_manual_cancel.wire"),
-            CommandPayload::CancelManualTransition,
-        ),
-    ];
-    for (fixture, payload) in cases {
-        let message = WireMessage::Command(CommandMessage {
-            protocol: MANUAL_TRANSITION_PROTOCOL_VERSION,
-            payload,
-            ..command()
-        });
-        assert_eq!(encode_line(&message).unwrap(), fixture);
-        assert_eq!(decode_line(fixture).unwrap(), message);
-    }
-}
-
-#[test]
-fn manual_alpha_fade_start_has_a_stable_versioned_wire_form() {
-    let fixture = include_str!("fixtures/command_manual_alpha_fade.wire");
-    let message = WireMessage::Command(CommandMessage {
-        protocol: MANUAL_ALPHA_FADE_PROTOCOL_VERSION,
-        payload: CommandPayload::StartManualTransition {
-            kind: ManualTransitionKind::AlphaFade,
-        },
-        ..command()
-    });
-    assert_eq!(encode_line(&message).unwrap(), fixture);
-    assert_eq!(decode_line(fixture).unwrap(), message);
-}
-
-#[test]
-fn manual_transition_snapshot_and_events_have_stable_exact_wire_forms() {
-    let desired = ManualTransitionStatus::Active(ManualTransitionState {
-        kind: ManualTransitionKind::Wipe,
-        from: input(1),
-        to: input(2),
-        interval_start: ManualTransitionPosition::START,
-        position: ManualTransitionPosition::new(6_250).unwrap(),
-    });
-    let realized = ManualTransitionStatus::Active(ManualTransitionState {
-        kind: ManualTransitionKind::Wipe,
-        from: input(1),
-        to: input(2),
-        interval_start: ManualTransitionPosition::new(6_250).unwrap(),
-        position: ManualTransitionPosition::new(6_250).unwrap(),
-    });
-    let messages = [
-        (
-            include_str!("fixtures/snapshot_manual.wire"),
-            WireMessage::Snapshot(SnapshotMessage {
-                engine: identity(),
-                revision: 1_842,
-                show_name: "Manual".into(),
-                inputs: vec![input(1), input(2)],
-                desired_program: input(1),
-                desired_preview: input(2),
-                realized_program: input(1),
-                realized_preview: input(2),
-                desired_manual_transition: Some(desired),
-                realized_manual_transition: Some(realized),
-                desired_fade_to_black: None,
-                realized_fade_to_black: None,
-                stingers: None,
-            }),
-        ),
-        (
-            include_str!("fixtures/event_manual.wire"),
-            WireMessage::Event(EventMessage {
-                cursor: cursor(),
-                payload: EventPayload::DesiredSwitcher {
-                    program: input(1),
-                    preview: input(2),
-                    manual_transition: Some(desired),
-                    fade_to_black: None,
-                },
-            }),
-        ),
-        (
-            include_str!("fixtures/runtime_event_manual.wire"),
-            WireMessage::RuntimeEvent(RuntimeEventMessage {
-                server: server_identity(),
-                revision: 1_842,
-                generation: 12,
-                sequence: 1,
-                event: RuntimeLifecycleEvent::Realized {
-                    domain: "switcher".into(),
-                    manual_transition: Some(realized),
-                    fade_to_black: None,
-                },
-            }),
-        ),
-    ];
-    for (fixture, message) in messages {
-        assert_eq!(encode_line(&message).unwrap(), fixture);
-        assert_eq!(decode_line(fixture).unwrap(), message);
-    }
-}
-
-#[test]
-fn fade_to_black_command_and_state_have_exact_versioned_wire_forms() {
-    let command = WireMessage::Command(CommandMessage {
-        protocol: FADE_TO_BLACK_PROTOCOL_VERSION,
-        payload: CommandPayload::FadeToBlack {
-            active: true,
-            duration_frames: 25,
-        },
-        ..command()
-    });
-    let command_wire = "command\tprotocol=1.5\tid=01K%3Atest\tidempotency_key=operator-7%3A01K\texpected_revision=1842\tdeadline_ms=500\tpayload=fade_to_black\tactive=1\tduration_frames=25\n";
-    assert_eq!(encode_line(&command).unwrap(), command_wire);
-    assert_eq!(decode_line(command_wire).unwrap(), command);
-
-    let desired = FadeToBlackState {
-        target_active: true,
-        position: FadeToBlackPosition::BLACK,
-    };
-    let realized = FadeToBlackState {
-        target_active: true,
-        position: FadeToBlackPosition::new(32_767),
-    };
-    let snapshot = WireMessage::Snapshot(SnapshotMessage {
-        engine: identity(),
-        revision: 1_842,
-        show_name: "FTB".into(),
-        inputs: vec![input(1), input(2)],
-        desired_program: input(1),
-        desired_preview: input(2),
-        realized_program: input(1),
-        realized_preview: input(2),
-        desired_manual_transition: Some(ManualTransitionStatus::Inactive),
-        realized_manual_transition: Some(ManualTransitionStatus::Inactive),
-        desired_fade_to_black: Some(desired),
-        realized_fade_to_black: Some(realized),
-        stingers: None,
-    });
-    let encoded = encode_line(&snapshot).unwrap();
-    assert!(encoded.contains("?desired_ftb_target_active=1"));
-    assert!(encoded.contains("?desired_ftb_position_numerator=65535"));
-    assert!(encoded.contains("?realized_ftb_position_numerator=32767"));
-    assert_eq!(decode_line(&encoded).unwrap(), snapshot);
-    assert_eq!(
-        decode_line(&encoded.replace("\t?desired_ftb_position_numerator=65535", "")),
-        Err(CodecError::MissingField("?desired_ftb_position_numerator"))
-    );
-    assert_eq!(
-        decode_line(&encoded.replace("\t?desired_ftb_target_active=1", "")),
-        Err(CodecError::MissingField("?desired_ftb_target_active"))
-    );
-
-    let projected = snapshot.compatible_with(MANUAL_TRANSITION_PROTOCOL_VERSION);
-    assert!(matches!(
-        projected,
-        WireMessage::Snapshot(SnapshotMessage {
-            desired_manual_transition: Some(ManualTransitionStatus::Inactive),
-            desired_fade_to_black: None,
-            realized_fade_to_black: None,
-            ..
-        })
-    ));
-}
-
-#[test]
-fn stinger_configuration_and_readiness_have_an_additive_snapshot_wire_form() {
-    let message = WireMessage::Snapshot(SnapshotMessage {
-        engine: identity(),
-        revision: 9,
-        show_name: "Stingers".into(),
-        inputs: vec![input(1), input(2)],
-        desired_program: input(1),
-        desired_preview: input(2),
-        realized_program: input(1),
-        realized_preview: input(2),
-        desired_manual_transition: Some(ManualTransitionStatus::Inactive),
-        realized_manual_transition: Some(ManualTransitionStatus::Inactive),
-        desired_fade_to_black: Some(FadeToBlackState {
-            target_active: false,
-            position: FadeToBlackPosition::LIVE,
-        }),
-        realized_fade_to_black: Some(FadeToBlackState {
-            target_active: false,
-            position: FadeToBlackPosition::LIVE,
-        }),
-        stingers: Some(vec![
-            StingerStatus {
-                slot: WireStingerSlotId::new(1).unwrap(),
-                media_input: input(2),
-                preload: true,
-                cut_point_frames: 12,
-                audio_policy: StingerAudioPolicy::MixWithProgram,
-                missing_media_fallback: StingerMissingMediaFallback::Fade,
-                readiness: StingerReadiness::Ready,
-            },
-            StingerStatus {
-                slot: WireStingerSlotId::new(8).unwrap(),
-                media_input: input(1),
-                preload: false,
-                cut_point_frames: 0,
-                audio_policy: StingerAudioPolicy::Muted,
-                missing_media_fallback: StingerMissingMediaFallback::KeepProgram,
-                readiness: StingerReadiness::NotRequested,
-            },
-        ]),
-    });
-    let encoded = encode_line(&message).unwrap();
-    assert!(encoded.contains(
-        "?stingers=1%3A2%3A1%3A12%3Amix_with_program%3Afade%3Aready%2C8%3A1%3A0%3A0%3Amuted%3Akeep_program%3Anot_requested"
-    ));
-    assert_eq!(decode_line(&encoded), Ok(message.clone()));
-    assert!(matches!(
-        message.compatible_with(STINGER_PROTOCOL_VERSION),
-        WireMessage::Snapshot(SnapshotMessage { stingers: None, .. })
-    ));
-}
-
-#[test]
-fn protocol_1_3_projection_omits_manual_transition_extensions() {
-    let message = WireMessage::Event(EventMessage {
-        cursor: cursor(),
-        payload: EventPayload::DesiredSwitcher {
-            program: input(1),
-            preview: input(2),
-            manual_transition: Some(ManualTransitionStatus::Inactive),
-            fade_to_black: None,
-        },
-    });
-
-    let compatible = message.compatible_with(WIPE_PROTOCOL_VERSION);
-    let encoded = encode_line(&compatible).unwrap();
-
-    assert!(!encoded.contains("manual_"));
-    assert!(matches!(
-        compatible,
-        WireMessage::Event(EventMessage {
-            payload: EventPayload::DesiredSwitcher {
-                manual_transition: None,
-                ..
-            },
-            ..
-        })
-    ));
-}
-
-#[test]
-fn protocol_1_6_projects_active_manual_alpha_fade_as_inactive() {
-    let active = ManualTransitionStatus::Active(ManualTransitionState {
-        kind: ManualTransitionKind::AlphaFade,
-        from: input(1),
-        to: input(2),
-        interval_start: ManualTransitionPosition::new(2_500).unwrap(),
-        position: ManualTransitionPosition::new(6_250).unwrap(),
-    });
-    let message = WireMessage::Event(EventMessage {
-        cursor: cursor(),
-        payload: EventPayload::DesiredSwitcher {
-            program: input(1),
-            preview: input(2),
-            manual_transition: Some(active),
-            fade_to_black: None,
-        },
-    });
-
-    let old = message.compatible_with(ALPHA_FADE_PROTOCOL_VERSION);
-    assert!(matches!(
-        old,
-        WireMessage::Event(EventMessage {
-            payload: EventPayload::DesiredSwitcher {
-                manual_transition: Some(ManualTransitionStatus::Inactive),
-                ..
-            },
-            ..
-        })
-    ));
-    assert_eq!(
-        message.compatible_with(MANUAL_ALPHA_FADE_PROTOCOL_VERSION),
-        message
-    );
-}
-
-#[test]
-fn command_minimum_versions_gate_additive_transitions() {
-    for payload in [
-        CommandPayload::SelectPreview { input: input(1) },
-        CommandPayload::Cut,
-        CommandPayload::Fade { duration_frames: 1 },
-    ] {
-        assert_eq!(payload.minimum_protocol_version(), BASE_PROTOCOL_VERSION);
-        assert!(payload.is_supported_by(BASE_PROTOCOL_VERSION));
-    }
-
-    let wipe = CommandPayload::Wipe { duration_frames: 1 };
-    assert_eq!(WIPE_PROTOCOL_VERSION, ProtocolVersion::new(1, 3));
-    assert_eq!(wipe.minimum_protocol_version(), WIPE_PROTOCOL_VERSION);
-    assert!(!wipe.is_supported_by(ProtocolVersion::new(1, 2)));
-    assert!(wipe.is_supported_by(CURRENT_PROTOCOL_VERSION));
-
-    let manual = CommandPayload::SetManualTransitionPosition {
-        position: ManualTransitionPosition::new(5_000).unwrap(),
-    };
-    assert_eq!(
-        MANUAL_TRANSITION_PROTOCOL_VERSION,
-        ProtocolVersion::new(1, 4)
-    );
-    assert_eq!(
-        manual.minimum_protocol_version(),
-        MANUAL_TRANSITION_PROTOCOL_VERSION
-    );
-    assert!(!manual.is_supported_by(WIPE_PROTOCOL_VERSION));
-    assert!(manual.is_supported_by(CURRENT_PROTOCOL_VERSION));
-
-    let fade_to_black = CommandPayload::FadeToBlack {
-        active: true,
-        duration_frames: 25,
-    };
-    assert_eq!(FADE_TO_BLACK_PROTOCOL_VERSION, ProtocolVersion::new(1, 5));
-    assert_eq!(
-        fade_to_black.minimum_protocol_version(),
-        FADE_TO_BLACK_PROTOCOL_VERSION
-    );
-    assert!(!fade_to_black.is_supported_by(MANUAL_TRANSITION_PROTOCOL_VERSION));
-    assert!(fade_to_black.is_supported_by(CURRENT_PROTOCOL_VERSION));
-
-    let alpha_fade = CommandPayload::AlphaFade {
-        duration_frames: 25,
-    };
-    assert_eq!(ALPHA_FADE_PROTOCOL_VERSION, ProtocolVersion::new(1, 6));
-    assert_eq!(
-        alpha_fade.minimum_protocol_version(),
-        ALPHA_FADE_PROTOCOL_VERSION
-    );
-    assert!(!alpha_fade.is_supported_by(FADE_TO_BLACK_PROTOCOL_VERSION));
-    assert!(alpha_fade.is_supported_by(CURRENT_PROTOCOL_VERSION));
-
-    let manual_alpha_fade = CommandPayload::StartManualTransition {
-        kind: ManualTransitionKind::AlphaFade,
-    };
-    assert_eq!(
-        MANUAL_ALPHA_FADE_PROTOCOL_VERSION,
-        ProtocolVersion::new(1, 7)
-    );
-    assert_eq!(
-        manual_alpha_fade.minimum_protocol_version(),
-        MANUAL_ALPHA_FADE_PROTOCOL_VERSION
-    );
-    assert!(!manual_alpha_fade.is_supported_by(ALPHA_FADE_PROTOCOL_VERSION));
-    assert!(manual_alpha_fade.is_supported_by(CURRENT_PROTOCOL_VERSION));
-
-    let slide = CommandPayload::Slide {
-        duration_frames: 25,
-    };
-    assert_eq!(SLIDE_PROTOCOL_VERSION, ProtocolVersion::new(1, 8));
-    assert_eq!(slide.minimum_protocol_version(), SLIDE_PROTOCOL_VERSION);
-    assert!(!slide.is_supported_by(MANUAL_ALPHA_FADE_PROTOCOL_VERSION));
-    assert!(slide.is_supported_by(CURRENT_PROTOCOL_VERSION));
-
-    let zoom = CommandPayload::Zoom {
-        duration_frames: 25,
-    };
-    assert_eq!(ZOOM_PROTOCOL_VERSION, ProtocolVersion::new(1, 9));
-    assert_eq!(zoom.minimum_protocol_version(), ZOOM_PROTOCOL_VERSION);
-    assert!(!zoom.is_supported_by(SLIDE_PROTOCOL_VERSION));
-    assert!(zoom.is_supported_by(CURRENT_PROTOCOL_VERSION));
-
-    let stinger = CommandPayload::Stinger {
-        slot: WireStingerSlotId::new(1).unwrap(),
-        duration_frames: 25,
-    };
-    assert_eq!(STINGER_PROTOCOL_VERSION, ProtocolVersion::new(1, 10));
-    assert_eq!(stinger.minimum_protocol_version(), STINGER_PROTOCOL_VERSION);
-    assert!(!stinger.is_supported_by(ZOOM_PROTOCOL_VERSION));
-    assert!(stinger.is_supported_by(CURRENT_PROTOCOL_VERSION));
-    assert_eq!(STINGER_STATUS_PROTOCOL_VERSION, ProtocolVersion::new(1, 11));
-    assert_eq!(
-        STINGER_CONFIGURATION_PROTOCOL_VERSION,
-        ProtocolVersion::new(1, 12)
-    );
-    assert_eq!(
-        CommandPayload::RemoveStinger {
-            slot: WireStingerSlotId::new(8).unwrap()
-        }
-        .minimum_protocol_version(),
-        STINGER_CONFIGURATION_PROTOCOL_VERSION
-    );
-    assert_eq!(
-        CURRENT_PROTOCOL_VERSION,
-        STINGER_CONFIGURATION_PROTOCOL_VERSION
-    );
-}
-
-#[test]
 fn stinger_slot_mutations_round_trip_exact_configuration() {
-    for (fixture, payload) in [
-        (
-            include_str!("fixtures/command_configure_stinger.wire"),
-            CommandPayload::ConfigureStinger {
-                slot: WireStingerSlotId::new(8).unwrap(),
-                media_input: input(42),
-                preload: true,
-                cut_point_frames: 17,
-                audio_policy: StingerAudioPolicy::MixWithProgram,
-                missing_media_fallback: StingerMissingMediaFallback::KeepProgram,
-            },
-        ),
-        (
-            include_str!("fixtures/command_remove_stinger.wire"),
-            CommandPayload::RemoveStinger {
-                slot: WireStingerSlotId::new(8).unwrap(),
-            },
-        ),
+    for payload in [
+        CommandPayload::ConfigureStinger {
+            slot: WireStingerSlotId::new(8).unwrap(),
+            media_input: input(42),
+            preload: true,
+            cut_point_frames: 17,
+            audio_policy: StingerAudioPolicy::MixWithProgram,
+            missing_media_fallback: StingerMissingMediaFallback::KeepProgram,
+        },
+        CommandPayload::RemoveStinger {
+            slot: WireStingerSlotId::new(8).unwrap(),
+        },
     ] {
         let message = WireMessage::Command(CommandMessage {
-            protocol: STINGER_CONFIGURATION_PROTOCOL_VERSION,
+            protocol: CURRENT_PROTOCOL_VERSION,
             payload,
             ..command()
         });
-        assert_eq!(encode_line(&message).unwrap(), fixture);
-        assert_eq!(decode_line(fixture).unwrap(), message);
+        let encoded = encode_line(&message).unwrap();
+        assert_eq!(decode_line(&encoded).unwrap(), message);
     }
 
     let event = WireMessage::Event(EventMessage {
@@ -729,11 +257,11 @@ fn stinger_slot_mutations_round_trip_exact_configuration() {
         payload: EventPayload::StingerSlotsChanged {
             program: input(1),
             preview: input(2),
-            manual_transition: Some(ManualTransitionStatus::Inactive),
-            fade_to_black: Some(FadeToBlackState {
+            manual_transition: ManualTransitionStatus::Inactive,
+            fade_to_black: FadeToBlackState {
                 target_active: false,
                 position: FadeToBlackPosition::LIVE,
-            }),
+            },
             stingers: vec![StingerStatus {
                 slot: WireStingerSlotId::new(8).unwrap(),
                 media_input: input(42),
@@ -743,16 +271,15 @@ fn stinger_slot_mutations_round_trip_exact_configuration() {
                 missing_media_fallback: StingerMissingMediaFallback::KeepProgram,
                 readiness: StingerReadiness::Ready,
             }],
+            overlays: OverlayStatus::empty_channels(),
         },
     });
     let encoded = encode_line(&event).unwrap();
     assert_eq!(decode_line(&encoded).unwrap(), event);
-    assert!(!event.is_compatible_with(STINGER_STATUS_PROTOCOL_VERSION));
-    assert!(event.is_compatible_with(STINGER_CONFIGURATION_PROTOCOL_VERSION));
 }
 
 #[test]
-fn stinger_projection_encoder_rejects_too_many_or_duplicate_slots() {
+fn stinger_encoder_rejects_too_many_or_duplicate_slots() {
     let status = StingerStatus {
         slot: WireStingerSlotId::new(1).unwrap(),
         media_input: input(42),
@@ -768,9 +295,13 @@ fn stinger_projection_encoder_rejects_too_many_or_duplicate_slots() {
             payload: EventPayload::StingerSlotsChanged {
                 program: input(1),
                 preview: input(2),
-                manual_transition: Some(ManualTransitionStatus::Inactive),
-                fade_to_black: None,
+                manual_transition: ManualTransitionStatus::Inactive,
+                fade_to_black: FadeToBlackState {
+                    target_active: false,
+                    position: FadeToBlackPosition::LIVE,
+                },
                 stingers,
+                overlays: OverlayStatus::empty_channels(),
             },
         })
     };
@@ -801,12 +332,12 @@ fn decoder_rejects_out_of_range_manual_position() {
 }
 
 #[test]
-fn unknown_optional_fields_are_ignored_but_required_fields_are_strict() {
+fn exact_contract_rejects_every_unknown_field() {
     let fixture = include_str!("fixtures/command_select.wire");
     let optional = fixture.replace('\n', "\t?future=value\n");
     assert_eq!(
-        decode_line(&optional).unwrap(),
-        WireMessage::Command(command())
+        decode_line(&optional),
+        Err(CodecError::UnknownField("?future".to_owned()))
     );
 
     let required = fixture.replace('\n', "\tfuture=value\n");
@@ -836,25 +367,10 @@ fn decoder_rejects_truncation_duplicates_and_invalid_values() {
 }
 
 #[test]
-fn durable_event_rejects_legacy_runtime_realized_payload() {
-    let legacy = concat!(
-        "event\tengine_id=engine-a\tstate_epoch=7\tlog_id=log-a\trevision=1842",
-        "\tevent=runtime_realized\tgeneration=4\tprogram=2\n"
-    );
-    assert_eq!(
-        decode_line(legacy),
-        Err(CodecError::InvalidField {
-            field: "event",
-            value: "runtime_realized".to_owned(),
-        })
-    );
-}
-
-#[test]
 fn streaming_decoder_handles_split_and_multiple_records() {
     let command = include_str!("fixtures/command_select.wire");
-    let hello = include_str!("fixtures/client_hello.wire");
-    let bytes = format!("{command}{hello}");
+    let second_command = include_str!("fixtures/command_select.wire");
+    let bytes = format!("{command}{second_command}");
     let split = bytes.len() / 3;
     let mut decoder = LineDecoder::new();
     assert!(decoder.push(&bytes.as_bytes()[..split]).unwrap().is_empty());
@@ -868,18 +384,16 @@ fn streaming_decoder_handles_split_and_multiple_records() {
 }
 
 #[test]
-fn version_negotiation_uses_newest_compatible_major_and_minor() {
+fn version_negotiation_accepts_only_the_exact_current_contract() {
     assert_eq!(
         negotiate_version(
-            &[ProtocolVersion::new(1, 4), ProtocolVersion::new(2, 1)],
-            &[ProtocolVersion::new(1, 6), ProtocolVersion::new(2, 0)]
+            &[ProtocolVersion::new(2, 3), CURRENT_PROTOCOL_VERSION],
+            &[CURRENT_PROTOCOL_VERSION]
         )
         .unwrap(),
-        ProtocolVersion::new(2, 0)
+        CURRENT_PROTOCOL_VERSION
     );
-    assert!(
-        negotiate_version(&[ProtocolVersion::new(3, 0)], &[ProtocolVersion::new(2, 9)]).is_err()
-    );
+    assert!(negotiate_version(&[ProtocolVersion::new(2, 3)], &[CURRENT_PROTOCOL_VERSION]).is_err());
 }
 
 #[test]
@@ -894,145 +408,6 @@ fn domain_conversion_helpers_are_explicit() {
     assert_eq!(input(42).to_domain().get(), NonZeroU128::new(42).unwrap());
     assert_eq!(resume_cursor().domain_revision(), Revision::new(1_842));
     assert_eq!(server_identity().domain_state_epoch(), StateEpoch::new(7));
-}
-
-#[test]
-fn phase_one_golden_messages_are_stable() {
-    let messages = [
-        (
-            include_str!("fixtures/handshake_request.wire"),
-            WireMessage::HandshakeRequest(HandshakeRequest {
-                versions: vec![ProtocolVersion::new(1, 0), ProtocolVersion::new(1, 2)],
-                build: "studio 0.2".to_owned(),
-                client_type: ClientType::Studio,
-                desired_role: Role::Operator,
-                resume_cursor: Some(resume_cursor()),
-            }),
-        ),
-        (
-            include_str!("fixtures/handshake_resume.wire"),
-            WireMessage::HandshakeResponse(HandshakeResponse {
-                negotiated: ProtocolVersion::new(1, 2),
-                granted_role: Role::Operator,
-                permissions: vec!["switcher.take".to_owned()],
-                capabilities: capabilities(),
-                server: server_identity(),
-                current_revision: 1_845,
-                outcome: HandshakeOutcome::Resume {
-                    cursor: resume_cursor(),
-                },
-            }),
-        ),
-        (
-            include_str!("fixtures/durable_event_batch.wire"),
-            WireMessage::DurableEventBatch(DurableEventBatch {
-                cursor: ResumeCursor {
-                    server: server_identity(),
-                    revision: 1_843,
-                },
-                events: vec![DurableEvent {
-                    sequence: 0,
-                    event_type: "switcher.desired".to_owned(),
-                    payload: "program=2&preview=1".to_owned(),
-                }],
-            }),
-        ),
-        (
-            include_str!("fixtures/durable_gap.wire"),
-            WireMessage::DurableGap(DurableGap {
-                server: server_identity(),
-                requested_after_revision: 1_800,
-                available_from_revision: 1_820,
-                current_revision: 1_845,
-            }),
-        ),
-        (
-            include_str!("fixtures/runtime_event.wire"),
-            WireMessage::RuntimeEvent(RuntimeEventMessage {
-                server: server_identity(),
-                revision: 1_843,
-                generation: 12,
-                sequence: 3,
-                event: RuntimeLifecycleEvent::Scheduled {
-                    domains: vec![
-                        RuntimeDomainBoundary {
-                            domain: "video".to_owned(),
-                            boundary: 900,
-                        },
-                        RuntimeDomainBoundary {
-                            domain: "audio".to_owned(),
-                            boundary: 48_000,
-                        },
-                    ],
-                },
-            }),
-        ),
-        (
-            include_str!("fixtures/heartbeat.wire"),
-            WireMessage::Heartbeat(HeartbeatMessage {
-                server: server_identity(),
-                sequence: 88,
-                sent_at_ms: 1_720_000_000_000,
-                last_applied: Some(resume_cursor()),
-            }),
-        ),
-        (
-            include_str!("fixtures/capability_report.wire"),
-            WireMessage::CapabilityReport(CapabilityReportMessage {
-                server: server_identity(),
-                revision: 1_845,
-                summary: capabilities(),
-            }),
-        ),
-        (
-            include_str!("fixtures/error.wire"),
-            WireMessage::Error(ErrorMessage {
-                request_id: Some("01K:test".to_owned()),
-                current_revision: Some(1_845),
-                error: structured_error(),
-            }),
-        ),
-    ];
-    for (fixture, message) in messages {
-        assert_eq!(encode_line(&message).unwrap(), fixture);
-        assert_eq!(decode_line(fixture).unwrap(), message);
-    }
-}
-
-#[test]
-fn all_handshake_outcomes_have_stable_wire_forms() {
-    let base = HandshakeResponse {
-        negotiated: ProtocolVersion::new(1, 2),
-        granted_role: Role::Operator,
-        permissions: vec!["switcher.take".to_owned()],
-        capabilities: capabilities(),
-        server: server_identity(),
-        current_revision: 1_845,
-        outcome: HandshakeOutcome::Snapshot {
-            reason: SnapshotReason::HistoryUnavailable,
-        },
-    };
-    let snapshot = WireMessage::HandshakeResponse(base.clone());
-    let snapshot_fixture = include_str!("fixtures/handshake_snapshot.wire");
-    assert_eq!(encode_line(&snapshot).unwrap(), snapshot_fixture);
-    assert_eq!(decode_line(snapshot_fixture).unwrap(), snapshot);
-
-    let rejected = WireMessage::HandshakeResponse(HandshakeResponse {
-        granted_role: Role::Viewer,
-        permissions: Vec::new(),
-        outcome: HandshakeOutcome::Rejected {
-            error: StructuredError {
-                code: "permission_denied".to_owned(),
-                message: "role is not allowed".to_owned(),
-                fields: Vec::new(),
-                retryable: false,
-            },
-        },
-        ..base
-    });
-    let rejected_fixture = include_str!("fixtures/handshake_rejected.wire");
-    assert_eq!(encode_line(&rejected).unwrap(), rejected_fixture);
-    assert_eq!(decode_line(rejected_fixture).unwrap(), rejected);
 }
 
 #[test]
@@ -1092,8 +467,11 @@ fn runtime_lifecycle_variants_use_the_independent_runtime_sequence() {
         },
         RuntimeLifecycleEvent::Realized {
             domain: "video".to_owned(),
-            manual_transition: None,
-            fade_to_black: None,
+            manual_transition: ManualTransitionStatus::Inactive,
+            fade_to_black: FadeToBlackState {
+                target_active: false,
+                position: FadeToBlackPosition::LIVE,
+            },
         },
         RuntimeLifecycleEvent::Failed {
             error: structured_error(),

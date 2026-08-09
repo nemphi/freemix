@@ -20,9 +20,11 @@ use fm_persistence::{
     ProjectPosition, ProjectStore, ReceiptOutcome, RuntimeRouting, StoredProject,
 };
 use fm_protocol::{
-    ClientHello, ClientType, CommandMessage, CommandPayload, CommandResult, EngineIdentity,
-    EventMessage, EventPayload, ProtocolVersion, Role, RuntimeEventMessage, RuntimeLifecycleEvent,
-    ServerIdentity, SnapshotMessage, WireInputId, WireMessage, decode_line, encode_line,
+    CURRENT_PROTOCOL_VERSION, ClientType, CommandMessage, CommandPayload, CommandResult,
+    EngineIdentity, EventMessage, EventPayload, FadeToBlackPosition, FadeToBlackState,
+    HandshakeOutcome, HandshakeRequest, ManualTransitionStatus, OverlayStatus, Role,
+    RuntimeEventMessage, RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage, WireInputId,
+    WireMessage, decode_line, encode_line,
 };
 use fm_types::{
     AudioFormat, ChannelLayout, ColorMetadata, FrameRate, InputId, PixelFormat, ProjectId,
@@ -270,39 +272,41 @@ impl SoakClient {
     }
 
     fn handshake(&mut self) -> Result<HandshakeState, String> {
-        self.send(&WireMessage::ClientHello(ClientHello {
-            versions: vec![ProtocolVersion::new(1, 0)],
+        self.send(&WireMessage::HandshakeRequest(HandshakeRequest {
+            versions: vec![CURRENT_PROTOCOL_VERSION],
             build: "phase2-native-soak-v1".into(),
             client_type: ClientType::Integration,
             desired_role: Role::Operator,
-            cached_cursor: None,
+            resume_cursor: None,
         }))?;
         let deadline = Instant::now() + COMMAND_TIMEOUT;
-        let hello = self.receive_before(deadline, "ServerHello")?;
-        let WireMessage::ServerHello(hello) = hello else {
-            return Err("expected ServerHello after legacy ClientHello".into());
+        let response = self.receive_before(deadline, "HandshakeResponse")?;
+        let WireMessage::HandshakeResponse(response) = response else {
+            return Err("expected HandshakeResponse after HandshakeRequest".into());
         };
-        if hello.negotiated != ProtocolVersion::new(1, 0) || hello.granted_role != Role::Operator {
+        if response.negotiated != CURRENT_PROTOCOL_VERSION
+            || response.granted_role != Role::Operator
+            || !matches!(response.outcome, HandshakeOutcome::Snapshot { .. })
+        {
             return Err(format!(
                 "unexpected handshake negotiation: version={:?}, role={:?}",
-                hello.negotiated, hello.granted_role
+                response.negotiated, response.granted_role
             ));
         }
         let snapshot = self.receive_before(deadline, "Snapshot")?;
         let WireMessage::Snapshot(snapshot) = snapshot else {
             return Err("expected Snapshot after ServerHello".into());
         };
-        if hello.engine != snapshot.engine || hello.current_revision != snapshot.revision {
+        if response.server.engine_id != snapshot.engine.engine_id
+            || response.server.state_epoch != snapshot.engine.state_epoch
+            || response.server.log_id != snapshot.engine.log_id
+            || response.current_revision != snapshot.revision
+        {
             return Err(format!(
-                "handshake identity/revision disagrees with snapshot: hello={hello:?}, snapshot={snapshot:?}"
+                "handshake identity/revision disagrees with snapshot: response={response:?}, snapshot={snapshot:?}"
             ));
         }
-        let server = ServerIdentity {
-            engine_id: hello.engine.engine_id.clone(),
-            project_id: project_id().to_string(),
-            state_epoch: hello.engine.state_epoch,
-            log_id: hello.engine.log_id.clone(),
-        };
+        let server = response.server;
         Ok(HandshakeState { snapshot, server })
     }
 
@@ -317,7 +321,7 @@ impl SoakClient {
         let id = format!("phase2-native-soak-command-{sequence}");
         let key = format!("phase2-native-soak-key-{sequence}");
         self.send(&WireMessage::Command(CommandMessage {
-            protocol: ProtocolVersion::new(1, 0),
+            protocol: CURRENT_PROTOCOL_VERSION,
             id: id.clone(),
             idempotency_key: key,
             expected_revision: None,
@@ -443,8 +447,12 @@ fn validate_durable_event(
             != (EventPayload::DesiredSwitcher {
                 program: WireInputId::from_domain(expected_program),
                 preview: WireInputId::from_domain(expected_preview),
-                manual_transition: None,
-                fade_to_black: None,
+                manual_transition: ManualTransitionStatus::Inactive,
+                fade_to_black: FadeToBlackState {
+                    target_active: false,
+                    position: FadeToBlackPosition::LIVE,
+                },
+                overlays: OverlayStatus::empty_channels(),
             })
     {
         return Err(format!(
@@ -468,8 +476,11 @@ fn validate_runtime_event(
             event.event,
             RuntimeLifecycleEvent::Realized {
                 ref domain,
-                manual_transition: None,
-                fade_to_black: None,
+                manual_transition: ManualTransitionStatus::Inactive,
+                fade_to_black: FadeToBlackState {
+                    target_active: false,
+                    position: FadeToBlackPosition::LIVE,
+                },
             } if domain == "switcher"
         )
     {

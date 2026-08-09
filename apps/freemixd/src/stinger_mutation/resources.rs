@@ -8,21 +8,18 @@ use std::{
     thread,
 };
 
-use fm_codec_ffmpeg::{
-    Adapter, Config as FfmpegConfig, StreamSelector, ToolAvailability,
-};
-use fm_command::RuntimeEventMessage;
+use fm_codec_ffmpeg::{Adapter, Config as FfmpegConfig, ToolAvailability};
 use fm_control::ControlService;
-use fm_protocol::ServerIdentity;
+use fm_protocol::{RuntimeEventMessage, ServerIdentity};
 use freemixd::native_media::{
     NativeAudioLimits, NativeMediaRuntime, NativeProjectLimits, NativeProjectPlan,
     NativeResolvedSource, NativeSourcePlayback, NativeStingerAudioRuntime,
 };
 
 use super::super::{
-    AppFailure, AppResult, NativeDaemon, NATIVE_IO_POLL_INTERVAL, Policy, ProcessShutdown,
-    native_clock_domain, partition_native_source_limits, preflight_native_stinger_video,
-    requested_daemon_shutdown, validate_native_stinger_sources,
+    AppFailure, AppResult, NATIVE_IO_POLL_INTERVAL, NativeDaemon, Policy, ProcessShutdown,
+    native_clock_domain, preflight_native_stinger_video, requested_daemon_shutdown,
+    validate_native_stinger_sources,
 };
 use fm_persistence::StoredProject;
 
@@ -30,11 +27,11 @@ const RETIREMENT_WORKERS: usize = 2;
 const RETIREMENT_QUEUE: usize = 2;
 const RETIREMENT_LIMIT: usize = RETIREMENT_WORKERS + RETIREMENT_QUEUE;
 
-pub(super) struct NativeStingerMutation {
-    pub(super) project_plan: NativeProjectPlan,
-    pub(super) stingers: NativeSourcePlayback,
-    pub(super) audio: NativeStingerAudioRuntime,
-    pub(super) ordinary_video_limit: u64,
+pub(crate) struct NativeStingerMutation {
+    pub(crate) project_plan: NativeProjectPlan,
+    pub(crate) stingers: NativeSourcePlayback,
+    pub(crate) audio: NativeStingerAudioRuntime,
+    pub(crate) ordinary_video_limit: u64,
 }
 
 struct RetiredResources {
@@ -42,7 +39,7 @@ struct RetiredResources {
     audio: NativeStingerAudioRuntime,
 }
 
-pub(super) struct NativeStingerRetirements {
+pub(crate) struct NativeStingerRetirements {
     sender: Option<SyncSender<Box<RetiredResources>>>,
     workers: Vec<thread::JoinHandle<()>>,
     pending: Arc<AtomicUsize>,
@@ -53,15 +50,9 @@ struct NativeStingerPreflight {
     worker: thread::JoinHandle<()>,
 }
 
-pub(super) struct PreflightOutcome {
-    pub(super) mutation: Result<NativeStingerMutation, ()>,
-    pub(super) runtime_events: Vec<RuntimeEventMessage>,
-}
-
 impl NativeStingerRetirements {
-    pub(super) fn start() -> AppResult<Self> {
-        let (sender, receiver) =
-            mpsc::sync_channel::<Box<RetiredResources>>(RETIREMENT_QUEUE);
+    pub(crate) fn start() -> AppResult<Self> {
+        let (sender, receiver) = mpsc::sync_channel::<Box<RetiredResources>>(RETIREMENT_QUEUE);
         let receiver = Arc::new(Mutex::new(receiver));
         let pending = Arc::new(AtomicUsize::new(0));
         let mut workers = Vec::with_capacity(RETIREMENT_WORKERS);
@@ -93,7 +84,7 @@ impl NativeStingerRetirements {
         })
     }
 
-    pub(super) fn can_accept(&self) -> bool {
+    pub(crate) fn can_accept(&self) -> bool {
         self.pending.load(Ordering::Acquire) < RETIREMENT_LIMIT
     }
 
@@ -112,7 +103,7 @@ impl NativeStingerRetirements {
         }
     }
 
-    pub(super) fn discard(&self, mutation: NativeStingerMutation) -> AppResult<()> {
+    pub(crate) fn discard(&self, mutation: NativeStingerMutation) -> AppResult<()> {
         let NativeStingerMutation {
             project_plan,
             stingers,
@@ -129,16 +120,16 @@ impl NativeStingerRetirements {
                     audio,
                     ordinary_video_limit,
                 });
-                Err(AppFailure(
-                    "native Stinger retirement capacity changed after preflight".into(),
+                Err(
+                    AppFailure("native Stinger retirement capacity changed after preflight".into())
+                        .into(),
                 )
-                .into())
             }
         }
     }
 
     #[cfg(test)]
-    pub(super) fn set_pending_for_test(&self, pending: usize) {
+    pub(crate) fn set_pending_for_test(&self, pending: usize) {
         self.pending.store(pending, Ordering::Release);
     }
 }
@@ -153,18 +144,15 @@ impl Drop for NativeStingerRetirements {
 }
 
 impl NativeDaemon {
-    pub(super) fn preflight_stinger_mutation_with_ticks(
+    pub(crate) fn preflight_stinger_mutation_with_ticks(
         &mut self,
         candidate: StoredProject,
         control: &mut ControlService<Policy>,
         server: &ServerIdentity,
         process_shutdown: Option<&ProcessShutdown>,
-    ) -> AppResult<Option<PreflightOutcome>> {
+    ) -> AppResult<Option<(Result<NativeStingerMutation, ()>, Vec<RuntimeEventMessage>)>> {
         if !self.stinger_retirements.can_accept() {
-            return Ok(Some(PreflightOutcome {
-                mutation: Err(()),
-                runtime_events: Vec::new(),
-            }));
+            return Ok(Some((Err(()), Vec::new())));
         }
         let runtime = Arc::clone(&self.runtime);
         let sources = Arc::clone(&self.resolved_sources);
@@ -190,22 +178,13 @@ impl NativeDaemon {
                         .is_err()
                     {
                         self.stinger_retirements.discard(mutation)?;
-                        return Ok(Some(PreflightOutcome {
-                            mutation: Err(()),
-                            runtime_events,
-                        }));
+                        return Ok(Some((Err(()), runtime_events)));
                     }
-                    return Ok(Some(PreflightOutcome {
-                        mutation: Ok(mutation),
-                        runtime_events,
-                    }));
+                    return Ok(Some((Ok(mutation), runtime_events)));
                 }
                 Ok(Err(())) | Err(TryRecvError::Disconnected) => {
                     let _ = preflight.worker.join();
-                    return Ok(Some(PreflightOutcome {
-                        mutation: Err(()),
-                        runtime_events,
-                    }));
+                    return Ok(Some((Err(()), runtime_events)));
                 }
                 Err(TryRecvError::Empty) => {}
             }
@@ -219,12 +198,12 @@ impl NativeDaemon {
         }
     }
 
-    pub(super) fn stage_stinger_mutation(&mut self, mutation: NativeStingerMutation) {
+    pub(crate) fn stage_stinger_mutation(&mut self, mutation: NativeStingerMutation) {
         debug_assert!(self.pending_stinger_mutation.is_none());
         self.pending_stinger_mutation = Some(mutation);
     }
 
-    pub(super) fn install_stinger_mutation(&mut self) -> AppResult<()> {
+    pub(crate) fn install_stinger_mutation(&mut self) -> AppResult<()> {
         let Some(mutation) = self.pending_stinger_mutation.take() else {
             return Ok(());
         };
@@ -233,12 +212,10 @@ impl NativeDaemon {
         let old_stingers = core::mem::replace(&mut self.stingers, mutation.stingers);
         let old_audio = self.master.replace_stinger_audio(mutation.audio);
         self.project_plan = mutation.project_plan;
-        match self
-            .stinger_retirements
-            .retire(Box::new(RetiredResources {
-                stingers: old_stingers,
-                audio: old_audio,
-            })) {
+        match self.stinger_retirements.retire(Box::new(RetiredResources {
+            stingers: old_stingers,
+            audio: old_audio,
+        })) {
             Ok(()) => Ok(()),
             Err(retired) => {
                 drop(retired);
@@ -300,7 +277,7 @@ fn preflight_native_stinger_mutation(
     })
 }
 
-pub(super) fn native_stinger_requires_ffmpeg(
+pub(crate) fn native_stinger_requires_ffmpeg(
     stored: &StoredProject,
     sources: &[NativeResolvedSource],
 ) -> bool {
@@ -317,6 +294,6 @@ pub(super) fn native_stinger_requires_ffmpeg(
 }
 
 #[cfg(test)]
-pub(super) const fn retirement_limit_for_test() -> usize {
+pub(crate) const fn retirement_limit_for_test() -> usize {
     RETIREMENT_LIMIT
 }

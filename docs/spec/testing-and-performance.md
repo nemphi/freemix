@@ -6,7 +6,7 @@
 
 Testing is layered:
 
-1. Pure domain tests for commands, revisions, migrations, routing, and graph
+1. Pure domain tests for commands, revisions, routing, and graph
    validation.
 2. Deterministic simulated-clock tests for scheduling, transitions, playback,
    drift, and replay.
@@ -170,7 +170,7 @@ blocking work on media threads.
 - Native GPU/backend matrix nightly.
 - Vendor hardware lab before release.
 - Feature-powerset and minimal-build checks weekly.
-- Project/protocol migration fixtures across supported versions.
+- Exact-current project/protocol contract coverage.
 - Installer, update, rollback, signing, and SBOM checks.
 - No known P0/P1 parity regression, unexplained performance regression over 5%,
   or untriaged soak failure at release.

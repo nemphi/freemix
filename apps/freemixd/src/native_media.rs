@@ -62,8 +62,13 @@ use fm_model::{
     StingerAudioPolicy as ModelStingerAudioPolicy,
 };
 use fm_sim::{CollectingAudioSink, OverflowPolicy, SinkConfigError, SinkTelemetry};
-use fm_switcher::{FadeToBlackFrame, ProgramFrame, TransitionKind as SwitcherTransitionKind};
-use fm_types::{AudioFormat, FrameRate, InputId, SampleFormat, SceneId, TimeBase};
+use fm_switcher::{
+    FadeToBlackFrame, OverlayBorderPreset, OverlayPositionPreset, ProgramFrame,
+    TransitionKind as SwitcherTransitionKind,
+};
+use fm_types::{
+    AudioFormat, FrameRate, InputId, OutputId, SampleFormat, SceneId, TimeBase, VideoDimensions,
+};
 
 const RGBA16_FLOAT_BYTES_PER_PIXEL: u64 = 8;
 const NATIVE_PROJECT_IN_FLIGHT_SLOTS: usize = 1;
@@ -265,6 +270,8 @@ pub struct NativeProjectPlan {
     audio_strips: BTreeMap<InputId, InputAudioStripState>,
     stingers: BTreeMap<fm_switcher::StingerSlotId, NativeStingerConfig>,
     frame_rate: FrameRate,
+    dimensions: VideoDimensions,
+    program_output: Option<OutputId>,
     scenes: Vec<NativeScenePlan>,
     peak_rgba16f_targets: usize,
     transient_rgba16f_bytes: u64,
@@ -533,6 +540,8 @@ impl NativeProjectPlan {
                 .collect(),
             stingers,
             frame_rate: project.settings().frame_rate,
+            dimensions,
+            program_output: project.outputs().first().map(|output| output.id),
             scenes,
             peak_rgba16f_targets,
             transient_rgba16f_bytes,
@@ -610,6 +619,86 @@ impl NativeProjectPlan {
             &self.scenes,
         )
     }
+
+    fn program_overlays(&self, frame: &FrameResult) -> Vec<NativeProgramOverlay> {
+        let Some(output) = self.program_output else {
+            return Vec::new();
+        };
+        frame
+            .overlays
+            .iter()
+            .filter(|overlay| overlay.is_active() && overlay.is_included_in(output))
+            .filter_map(|overlay| {
+                overlay.source().map(|input| NativeProgramOverlay {
+                    input,
+                    opacity: overlay.opacity(),
+                    position: overlay.position(),
+                    border: overlay.border(),
+                })
+            })
+            .collect()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeProgramOverlay {
+    input: InputId,
+    opacity: u8,
+    position: OverlayPositionPreset,
+    border: OverlayBorderPreset,
+}
+
+fn overlay_transform(
+    dimensions: VideoDimensions,
+    position: OverlayPositionPreset,
+) -> Result<Transform, NativeSourceRenderError> {
+    let width = dimensions.width();
+    let height = dimensions.height();
+    let (x, y, scale_width, scale_height) = if position == OverlayPositionPreset::FullFrame {
+        (0, 0, width, height)
+    } else {
+        let scale_width = (width / 3).max(1);
+        let scale_height = (height / 3).max(1);
+        let margin = (width.min(height) / 32).max(1);
+        let left = margin.min(width.saturating_sub(scale_width));
+        let top = margin.min(height.saturating_sub(scale_height));
+        let right = width.saturating_sub(scale_width).saturating_sub(margin);
+        let bottom = height.saturating_sub(scale_height).saturating_sub(margin);
+        let (x, y) = match position {
+            OverlayPositionPreset::FullFrame => unreachable!(),
+            OverlayPositionPreset::TopLeft => (left, top),
+            OverlayPositionPreset::TopRight => (right, top),
+            OverlayPositionPreset::BottomLeft => (left, bottom),
+            OverlayPositionPreset::BottomRight => (right, bottom),
+        };
+        (x, y, scale_width, scale_height)
+    };
+    Ok(Transform::new(
+        i32::try_from(x).map_err(|_| NativeSourceRenderError::ResourceBounds)?,
+        i32::try_from(y).map_err(|_| NativeSourceRenderError::ResourceBounds)?,
+        scale_width,
+        scale_height,
+        CompositorRotation::Deg0,
+    ))
+}
+
+const fn overlay_border_width(border: OverlayBorderPreset, transform: Transform) -> u32 {
+    let minimum_dimension = if transform.scale_width < transform.scale_height {
+        transform.scale_width
+    } else {
+        transform.scale_height
+    };
+    match border {
+        OverlayBorderPreset::None => 0,
+        OverlayBorderPreset::ThinWhite => {
+            let scaled = minimum_dimension / 360;
+            if scaled < 1 { 1 } else { scaled }
+        }
+        OverlayBorderPreset::ThickWhite => {
+            let scaled = minimum_dimension / 120;
+            if scaled < 2 { 2 } else { scaled }
+        }
+    }
 }
 
 fn maximum_native_execution_peak(
@@ -618,7 +707,10 @@ fn maximum_native_execution_peak(
     scenes: &[NativeScenePlan],
 ) -> Result<usize, NativeProjectPlanError> {
     let routes = routes.values().copied().collect::<Vec<_>>();
-    let mut maximum = 3_usize;
+    let mut maximum = 4_usize;
+    let overlay_execution = scene_execution_for_routes(routes.iter().copied().map(Some), scenes)
+        .ok_or(NativeProjectPlanError::TransientTargetCountOverflow)?;
+    maximum = maximum.max(native_execution_peak(&overlay_execution)?);
     for primary in &routes {
         for secondary in &routes {
             let execution = scene_execution_for_routes([Some(*primary), Some(*secondary)], scenes)
@@ -679,12 +771,13 @@ fn native_execution_peak(
     execution: &NativeSceneExecution,
 ) -> Result<usize, NativeProjectPlanError> {
     // One fenced slot retains the full closure, its transition target, and the
-    // post-Program FTB target. The daemon also owns the previous Program target
-    // until the new frame returns.
+    // overlay and post-Program FTB targets. The daemon also owns the previous
+    // Program target until the new frame returns.
     execution
         .required
         .len()
         .checked_add(NATIVE_PROJECT_IN_FLIGHT_SLOTS)
+        .and_then(|targets| targets.checked_add(1))
         .and_then(|targets| targets.checked_add(1))
         .and_then(|targets| targets.checked_add(1))
         .ok_or(NativeProjectPlanError::TransientTargetCountOverflow)
@@ -6447,10 +6540,14 @@ impl NativeMediaRuntime {
     ) -> Result<NativeTexture, NativeSourceRenderError> {
         let plan = native_project_mix_plan(project, frame.program)?;
         let fade_to_black = native_fade_to_black_plan(frame.fade_to_black)?;
-        let inputs = match plan {
-            NativeProjectMixPlan::Transition(plan) => [plan.primary, plan.secondary, plan.primary],
-            NativeProjectMixPlan::Stinger(plan) => [plan.program, plan.preview, plan.media],
+        let overlays = project.program_overlays(frame);
+        let mut inputs = match plan {
+            NativeProjectMixPlan::Transition(plan) => {
+                vec![plan.primary, plan.secondary, plan.primary]
+            }
+            NativeProjectMixPlan::Stinger(plan) => vec![plan.program, plan.preview, plan.media],
         };
+        inputs.extend(overlays.iter().map(|overlay| overlay.input));
         let mut execution = project
             .scene_execution(&inputs)
             .ok_or(NativeSourceRenderError::ResourceBounds)?;
@@ -6514,6 +6611,16 @@ impl NativeMediaRuntime {
                     .map_err(NativeSourceRenderError::Stinger)?
             }
         };
+        let program = self
+            .render_project_overlays(
+                registry,
+                project,
+                &scene_outputs,
+                frame.deadline,
+                program,
+                &overlays,
+            )
+            .await?;
         let output = self
             .fade_to_black_renderer
             .render(&self.context, fade_to_black, &program)
@@ -6521,6 +6628,65 @@ impl NativeMediaRuntime {
             .map_err(NativeSourceRenderError::FadeToBlack)?;
         self.finish_project_frame()?;
         Ok(output)
+    }
+
+    async fn render_project_overlays(
+        &self,
+        registry: &NativeSourceRegistry,
+        project: &NativeProjectPlan,
+        scene_outputs: &BTreeMap<SceneId, (SourceId, NativeTexture)>,
+        deadline: ClockTime,
+        program: NativeTexture,
+        overlays: &[NativeProgramOverlay],
+    ) -> Result<NativeTexture, NativeSourceRenderError> {
+        if overlays.is_empty() {
+            return Ok(program);
+        }
+
+        let mut scene = CompositorScene::new(
+            project.dimensions.width(),
+            project.dimensions.height(),
+            CompositorRgba8::new(0, 0, 0, u8::MAX),
+        )
+        .map_err(|_| NativeSourceRenderError::ResourceBounds)?;
+        let full_frame = Transform::new(
+            0,
+            0,
+            project.dimensions.width(),
+            project.dimensions.height(),
+            CompositorRotation::Deg0,
+        );
+        scene.push_layer(SourceLayer::new(SourceId::new(0), 0, full_frame));
+        for (index, overlay) in overlays.iter().enumerate() {
+            let source = SourceId::new(
+                u64::try_from(index + 1).map_err(|_| NativeSourceRenderError::ResourceBounds)?,
+            );
+            let z =
+                i32::try_from(index + 1).map_err(|_| NativeSourceRenderError::ResourceBounds)?;
+            let transform = overlay_transform(project.dimensions, overlay.position)?;
+            let border_width = overlay_border_width(overlay.border, transform);
+            scene.push_layer(
+                SourceLayer::new(source, z, transform)
+                    .with_opacity(overlay.opacity)
+                    .with_inset_border(border_width),
+            );
+        }
+        let (composition, _) = compile_scene(&scene, OutputTarget::Program)
+            .map_err(|_| NativeSourceRenderError::ResourceBounds)?;
+        let mut sources = Vec::with_capacity(overlays.len() + 1);
+        sources.push(NativeSourceFrame::new(SourceId::new(0), &program));
+        for (index, overlay) in overlays.iter().enumerate() {
+            let source = SourceId::new(
+                u64::try_from(index + 1).map_err(|_| NativeSourceRenderError::ResourceBounds)?,
+            );
+            let texture =
+                project_texture(registry, project, scene_outputs, overlay.input, deadline)?;
+            sources.push(NativeSourceFrame::new(source, texture));
+        }
+        self.composition_renderer
+            .render(&self.context, &composition, &sources)
+            .await
+            .map_err(NativeSourceRenderError::SceneCompositor)
     }
 
     /// Synchronous daemon wrapper for one authoritative program render.
@@ -6725,6 +6891,33 @@ mod tests {
 
     fn input(value: u128) -> InputId {
         InputId::new(NonZeroU128::new(value).unwrap())
+    }
+
+    #[test]
+    fn overlay_position_and_border_presets_have_deterministic_geometry() {
+        let dimensions = VideoDimensions::new(1_920, 1_080).unwrap();
+        assert_eq!(
+            overlay_transform(dimensions, OverlayPositionPreset::FullFrame).unwrap(),
+            Transform::new(0, 0, 1_920, 1_080, CompositorRotation::Deg0)
+        );
+        let top_left = overlay_transform(dimensions, OverlayPositionPreset::TopLeft).unwrap();
+        assert_eq!(
+            top_left,
+            Transform::new(33, 33, 640, 360, CompositorRotation::Deg0)
+        );
+        assert_eq!(
+            overlay_transform(dimensions, OverlayPositionPreset::BottomRight).unwrap(),
+            Transform::new(1_247, 687, 640, 360, CompositorRotation::Deg0)
+        );
+        assert_eq!(overlay_border_width(OverlayBorderPreset::None, top_left), 0);
+        assert_eq!(
+            overlay_border_width(OverlayBorderPreset::ThinWhite, top_left),
+            1
+        );
+        assert_eq!(
+            overlay_border_width(OverlayBorderPreset::ThickWhite, top_left),
+            3
+        );
     }
 
     fn scene(value: u128) -> SceneId {
@@ -7129,6 +7322,7 @@ mod tests {
     ) -> FrameResult {
         FrameResult {
             fade_to_black: fm_switcher::FadeToBlackFrame::LIVE,
+            overlays: std::array::from_fn(|_| fm_switcher::OverlayChannelState::empty()),
             frame: FrameNumber::new(frame),
             deadline: ClockTime::ZERO,
             program: ProgramFrame {
@@ -9710,7 +9904,7 @@ mod tests {
             }
         );
 
-        assert_eq!(switcher.advance_frame(), None);
+        assert!(switcher.advance_frame_events().is_empty());
         assert_eq!(
             native_audio_mix_plan(switcher.program_frame()).unwrap(),
             NativeAudioMixPlan {
@@ -9734,7 +9928,7 @@ mod tests {
             }
         );
 
-        assert_eq!(switcher.advance_frame(), None);
+        assert!(switcher.advance_frame_events().is_empty());
         switcher
             .apply(SwitcherCommand::SetTBarPosition(TBarPosition::END))
             .unwrap();

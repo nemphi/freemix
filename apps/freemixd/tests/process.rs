@@ -21,11 +21,12 @@ use fm_persistence::{
     RuntimeRouting, StoredProject,
 };
 use fm_protocol::{
-    CURRENT_PROTOCOL_VERSION, ClientHello, ClientType, CommandMessage, CommandPayload,
-    CommandResult, EventCursor, HandshakeOutcome, ManualTransitionKind, ManualTransitionPosition,
-    ManualTransitionStatus, ProtocolVersion, Role, RuntimeLifecycleEvent, ServerHello,
-    SnapshotReason, StingerAudioPolicy, StingerMissingMediaFallback, WireInputId, WireMessage,
-    WireStingerSlotId, decode_line, encode_line,
+    CURRENT_PROTOCOL_VERSION, ClientType, CommandMessage, CommandPayload, CommandResult,
+    EngineIdentity, EventCursor, HandshakeOutcome, HandshakeRequest, ManualTransitionKind,
+    ManualTransitionPosition, ManualTransitionStatus, ProtocolVersion, ResumeCursor, Role,
+    RuntimeLifecycleEvent, ServerIdentity, SnapshotReason, StingerAudioPolicy,
+    StingerMissingMediaFallback, WireInputId, WireMessage, WireStingerSlotId, decode_line,
+    encode_line,
 };
 use fm_types::{
     AudioFormat, BusId, ChannelLayout, ColorMetadata, FrameRate, InputId, OutputId, PixelFormat,
@@ -34,9 +35,9 @@ use fm_types::{
 use freemixd::ReadinessRecord;
 
 static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-const LEGACY_MAX_ID: u128 = 18_446_744_073_709_551_615;
-const PROJECT_ID: u128 = LEGACY_MAX_ID + 42;
-const INPUT_ID_BASE: u128 = LEGACY_MAX_ID + 100;
+const U64_MAX_ID: u128 = 18_446_744_073_709_551_615;
+const PROJECT_ID: u128 = U64_MAX_ID + 42;
+const INPUT_ID_BASE: u128 = U64_MAX_ID + 100;
 
 struct TestDirectory(PathBuf);
 
@@ -133,6 +134,13 @@ struct Client {
     writer: TcpStream,
 }
 
+struct TestHandshake {
+    negotiated: ProtocolVersion,
+    engine: EngineIdentity,
+    current_revision: u64,
+    resume: bool,
+}
+
 impl Client {
     fn connect(address: SocketAddr) -> Self {
         let stream = TcpStream::connect(address).unwrap();
@@ -159,26 +167,45 @@ impl Client {
         decode_line(&line).unwrap()
     }
 
-    fn handshake(&mut self, cursor: Option<EventCursor>) -> ServerHello {
-        self.handshake_version(ProtocolVersion::new(1, 0), cursor)
+    fn handshake(&mut self, cursor: Option<EventCursor>) -> TestHandshake {
+        self.handshake_version(CURRENT_PROTOCOL_VERSION, cursor)
     }
 
     fn handshake_version(
         &mut self,
         version: ProtocolVersion,
         cursor: Option<EventCursor>,
-    ) -> ServerHello {
-        self.send(&WireMessage::ClientHello(ClientHello {
+    ) -> TestHandshake {
+        let resume_cursor = cursor.map(|cursor| ResumeCursor {
+            server: ServerIdentity {
+                engine_id: cursor.engine.engine_id,
+                project_id: PROJECT_ID.to_string(),
+                state_epoch: cursor.engine.state_epoch,
+                log_id: cursor.engine.log_id,
+            },
+            revision: cursor.revision,
+        });
+        self.send(&WireMessage::HandshakeRequest(HandshakeRequest {
             versions: vec![version],
             build: "process-test".into(),
             client_type: ClientType::Integration,
             desired_role: Role::Operator,
-            cached_cursor: cursor,
+            resume_cursor,
         }));
-        let WireMessage::ServerHello(hello) = self.receive() else {
-            panic!("expected server hello");
+        let WireMessage::HandshakeResponse(response) = self.receive() else {
+            panic!("expected handshake response");
         };
-        hello
+        let resume = matches!(response.outcome, HandshakeOutcome::Resume { .. });
+        TestHandshake {
+            negotiated: response.negotiated,
+            engine: EngineIdentity {
+                engine_id: response.server.engine_id,
+                state_epoch: response.server.state_epoch,
+                log_id: response.server.log_id,
+            },
+            current_revision: response.current_revision,
+            resume,
+        }
     }
 
     fn next_result(&mut self) -> CommandResult {
@@ -252,7 +279,7 @@ fn current_client_handshake_heartbeat_and_resume_use_ordered_wire_records() {
     create_project(&project_path);
 
     let mut protocol_client = ProtocolClient::new(ClientConfig::new(
-        vec![ProtocolVersion::new(1, 0)],
+        vec![CURRENT_PROTOCOL_VERSION],
         "process-test",
         ClientType::Integration,
         Role::Operator,
@@ -338,7 +365,7 @@ fn current_client_receives_structured_handshake_rejection() {
     let project_path = directory.project_path();
     create_project(&project_path);
     let mut protocol_client = ProtocolClient::new(ClientConfig::new(
-        vec![ProtocolVersion::new(1, 0)],
+        vec![CURRENT_PROTOCOL_VERSION],
         "process-test",
         ClientType::Integration,
         Role::Replay,
@@ -370,81 +397,6 @@ fn current_client_receives_structured_handshake_rejection() {
 
     drop(transport);
     daemon.wait_success();
-}
-
-#[test]
-fn old_client_wipe_is_rejected_before_durable_acceptance() {
-    let directory = TestDirectory::new("old-client-wipe");
-    let project_path = directory.project_path();
-    create_project(&project_path);
-
-    let daemon = Daemon::start(&project_path);
-    let mut client = daemon.connect();
-    let hello = client.handshake(None);
-    assert_eq!(hello.negotiated, ProtocolVersion::new(1, 0));
-    assert!(matches!(
-        client.receive(),
-        WireMessage::Snapshot(snapshot)
-            if snapshot.desired_manual_transition.is_none()
-                && snapshot.realized_manual_transition.is_none()
-    ));
-
-    client.send(&command(
-        "unsupported-wipe",
-        "unsupported-wipe-key",
-        CommandPayload::Wipe { duration_frames: 3 },
-    ));
-    assert!(matches!(
-        client.next_result(),
-        CommandResult::Rejected {
-            code,
-            current_revision: 0,
-            retryable: false,
-            ..
-        } if code == "protocol_mismatch"
-    ));
-
-    drop(client);
-    daemon.wait_success();
-    let persisted = ProjectStore::new(&project_path).unwrap().load().unwrap();
-    assert_eq!(persisted.position().revision, 0);
-    assert!(persisted.idempotency_receipts().is_empty());
-}
-
-#[test]
-fn protocol_1_8_zoom_is_rejected_before_durable_acceptance() {
-    let directory = TestDirectory::new("old-client-zoom");
-    let project_path = directory.project_path();
-    create_project(&project_path);
-
-    let daemon = Daemon::start(&project_path);
-    let mut client = daemon.connect();
-    let old_version = ProtocolVersion::new(1, 8);
-    let hello = client.handshake_version(old_version, None);
-    assert_eq!(hello.negotiated, old_version);
-    assert!(matches!(client.receive(), WireMessage::Snapshot(_)));
-
-    client.send(&command_version(
-        old_version,
-        "unsupported-zoom",
-        "unsupported-zoom-key",
-        CommandPayload::Zoom { duration_frames: 3 },
-    ));
-    assert!(matches!(
-        client.next_result(),
-        CommandResult::Rejected {
-            code,
-            current_revision: 0,
-            retryable: false,
-            ..
-        } if code == "protocol_mismatch"
-    ));
-
-    drop(client);
-    daemon.wait_success();
-    let persisted = ProjectStore::new(&project_path).unwrap().load().unwrap();
-    assert_eq!(persisted.position().revision, 0);
-    assert!(persisted.idempotency_receipts().is_empty());
 }
 
 #[test]
@@ -613,7 +565,7 @@ fn live_stinger_slot_mutations_fire_immediately_and_survive_restart() {
     let WireMessage::Snapshot(snapshot) = client.receive() else {
         panic!("expected restarted snapshot");
     };
-    let restarted = &snapshot.stingers.as_ref().unwrap()[0];
+    let restarted = &snapshot.stingers[0];
     assert_eq!(restarted.slot.number(), 8);
     assert_eq!(restarted.media_input, input(2));
     assert!(!restarted.preload);
@@ -648,7 +600,7 @@ fn live_stinger_slot_mutations_fire_immediately_and_survive_restart() {
     let WireMessage::Snapshot(snapshot) = client.receive() else {
         panic!("expected second restarted snapshot");
     };
-    assert_eq!(snapshot.stingers, Some(Vec::new()));
+    assert!(snapshot.stingers.is_empty());
     drop(client);
     daemon.wait_success();
 }
@@ -921,14 +873,14 @@ fn manual_alpha_fade_state_and_receipts_survive_restart_through_commit_and_cance
         };
         assert!(matches!(
             snapshot.desired_manual_transition,
-            Some(ManualTransitionStatus::Active(state))
+            ManualTransitionStatus::Active(state)
                 if state.kind == ManualTransitionKind::AlphaFade
                     && state.interval_start == ManualTransitionPosition::START
                     && state.position.basis_points() == 6_250
         ));
         assert!(matches!(
             snapshot.realized_manual_transition,
-            Some(ManualTransitionStatus::Active(state))
+            ManualTransitionStatus::Active(state)
                 if state.interval_start.basis_points() == 6_250
                     && state.position.basis_points() == 6_250
         ));
@@ -983,178 +935,23 @@ fn manual_alpha_fade_state_and_receipts_survive_restart_through_commit_and_cance
 }
 
 #[test]
-fn v2_project_migrates_and_serves() {
-    let directory = TestDirectory::new("v2-migration");
-    let project_path = directory.project_path();
-    fs::create_dir(&project_path).unwrap();
-    fs::write(
-        project_path.join("project.json"),
-        r#"{
-  "schema_version": 2,
-  "project_id": 9002,
-  "show_name": "Legacy V2",
-  "input_ids": [1, 2],
-  "desired_program_id": 1,
-  "realized_program_id": 1,
-  "desired_preview_id": 2,
-  "realized_preview_id": 2,
-  "revision": 0,
-  "state_epoch": 1,
-  "event_sequence": 0,
-  "frames_rendered": 0,
-  "runtime_generation": 0,
-  "clock_time_nanos": 0,
-  "idempotency_receipts": []
-}"#,
-    )
-    .unwrap();
-
-    let daemon = Daemon::start(&project_path);
-    let mut client = daemon.connect();
-    assert_eq!(client.handshake(None).current_revision, 0);
-    assert!(matches!(client.receive(), WireMessage::Snapshot(_)));
-    drop(client);
-    daemon.wait_success();
-
-    let migrated = ProjectStore::new(project_path).unwrap().load().unwrap();
-    assert_eq!(migrated.schema_version(), 10);
-    assert_eq!(migrated.project().name(), "Legacy V2");
-}
-
-#[test]
-fn v3_project_migrates_and_serves() {
-    let directory = TestDirectory::new("v3-migration");
-    let project_path = directory.project_path();
-    fs::create_dir(&project_path).unwrap();
-    fs::write(
-        project_path.join("project.json"),
-        include_str!("../../../crates/services/fm-persistence/tests/fixtures/schema-v3.json")
-            .replace("\"revision\": 7", "\"revision\": 0")
-            .replace("\"event_sequence\": 9", "\"event_sequence\": 0")
-            .replace("\"frames_rendered\": 240", "\"frames_rendered\": 0")
-            .replace("\"runtime_generation\": 3", "\"runtime_generation\": 0")
-            .replace("\"clock_time_nanos\": 10000000", "\"clock_time_nanos\": 0"),
-    )
-    .unwrap();
-
-    let daemon = Daemon::start(&project_path);
-    let mut client = daemon.connect();
-    assert_eq!(client.handshake(None).current_revision, 0);
-    assert!(matches!(client.receive(), WireMessage::Snapshot(_)));
-    drop(client);
-    daemon.wait_success();
-
-    let migrated = ProjectStore::new(project_path).unwrap().load().unwrap();
-    assert_eq!(migrated.schema_version(), 10);
-    assert_eq!(migrated.project().name(), "Frozen V3 Scene");
-    let scene = &migrated.project().scenes()[0];
-    assert_eq!(scene.background, Rgba8::OPAQUE_BLACK);
-    assert_eq!(
-        scene.layers[0].geometry,
-        LayerGeometry::new(0, 0, 3_840, 2_160, Rotation::Deg0)
-    );
-}
-
-#[test]
-fn v5_project_migrates_without_losing_manual_transition_state() {
-    let directory = TestDirectory::new("v5-migration");
-    let project_path = directory.project_path();
-    fs::create_dir(&project_path).unwrap();
-    fs::write(
-        project_path.join("project.json"),
-        include_str!("../../../crates/services/fm-persistence/tests/fixtures/schema-v5.json"),
-    )
-    .unwrap();
-
-    let daemon = Daemon::start(&project_path);
-    let mut client = daemon.connect();
-    assert_eq!(client.handshake(None).current_revision, 0);
-    assert!(matches!(client.receive(), WireMessage::Snapshot(_)));
-    drop(client);
-    daemon.wait_success();
-
-    let migrated = ProjectStore::new(project_path).unwrap().load().unwrap();
-    assert_eq!(migrated.schema_version(), 10);
-    assert_eq!(migrated.project().scenes()[0].layers[0].mask, None);
-    let transitions = migrated.runtime_manual_transitions();
-    let desired = transitions.desired.unwrap();
-    let realized = transitions.realized.unwrap();
-    assert_eq!(desired.kind, PersistedManualTransitionKind::Fade);
-    assert_eq!(desired.interval_start_basis_points, 0);
-    assert_eq!(desired.position_basis_points, 6_250);
-    assert_eq!(realized.kind, PersistedManualTransitionKind::Fade);
-    assert_eq!(realized.interval_start_basis_points, 6_250);
-    assert_eq!(realized.position_basis_points, 6_250);
-}
-
-#[test]
-fn v8_project_migrates_losslessly_before_daemon_start() {
-    let directory = TestDirectory::new("v8-migration");
-    let project_path = directory.project_path();
-    create_project(&project_path);
-    let manifest_path = project_path.join("project.json");
-    let source = fs::read_to_string(&manifest_path)
-        .unwrap()
-        .replacen("\"schema_version\": 10", "\"schema_version\": 8", 1)
-        .replace(",\n    \"stingers\": []", "");
-    fs::write(&manifest_path, source).unwrap();
-
-    let daemon = Daemon::start(&project_path);
-    let mut client = daemon.connect();
-    assert_eq!(client.handshake(None).current_revision, 0);
-    assert!(matches!(client.receive(), WireMessage::Snapshot(_)));
-    drop(client);
-    daemon.wait_success();
-
-    let migrated = ProjectStore::new(project_path).unwrap().load().unwrap();
-    assert_eq!(migrated.schema_version(), 10);
-    assert_eq!(migrated.project().name(), "Process Test");
-}
-
-#[test]
-fn v1_project_is_rejected_as_unsupported() {
-    let directory = TestDirectory::new("v1-unsupported");
-    let project_path = directory.project_path();
-    fs::create_dir(&project_path).unwrap();
-    fs::write(
-        project_path.join("project.json"),
-        include_str!("../../../crates/services/fm-persistence/tests/fixtures/schema-v1.json"),
-    )
-    .unwrap();
-
-    let output = ProcessCommand::new(env!("CARGO_BIN_EXE_freemixd"))
-        .arg("serve")
-        .arg(&project_path)
-        .arg("--once")
-        .output()
-        .unwrap();
-
-    assert!(!output.status.success());
-    assert!(String::from_utf8(output.stdout).unwrap().is_empty());
-    assert!(
-        String::from_utf8(output.stderr)
-            .unwrap()
-            .contains("unsupported schema 1; expected 10")
-    );
-}
-
-#[test]
 fn incompatible_handshake_returns_protocol_error() {
     let directory = TestDirectory::new("incompatible");
     let project_path = directory.project_path();
     create_project(&project_path);
     let daemon = Daemon::start(&project_path);
     let mut client = daemon.connect();
-    client.send(&WireMessage::ClientHello(ClientHello {
-        versions: vec![ProtocolVersion::new(2, 0)],
+    client.send(&WireMessage::HandshakeRequest(HandshakeRequest {
+        versions: vec![ProtocolVersion::new(99, 0)],
         build: "future".into(),
         client_type: ClientType::Integration,
         desired_role: Role::Operator,
-        cached_cursor: None,
+        resume_cursor: None,
     }));
     assert!(matches!(
         client.receive(),
-        WireMessage::Error(error) if error.error.code == "incompatible_version"
+        WireMessage::HandshakeResponse(response)
+            if matches!(&response.outcome, HandshakeOutcome::Rejected { error } if error.code == "incompatible_version")
     ));
     drop(client);
     daemon.wait_success();
@@ -1325,7 +1122,7 @@ fn canonical_project() -> Project {
 }
 
 fn command(id: &str, key: &str, payload: CommandPayload) -> WireMessage {
-    command_version(ProtocolVersion::new(1, 0), id, key, payload)
+    command_version(CURRENT_PROTOCOL_VERSION, id, key, payload)
 }
 
 fn command_version(

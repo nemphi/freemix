@@ -13,7 +13,11 @@ pub use fade_to_black::{
     FadeToBlackError, FadeToBlackFrame, FadeToBlackPosition, FadeToBlackRequest,
     FadeToBlackStarted, FadeToBlackTarget, MAX_FADE_TO_BLACK_DURATION_FRAMES,
 };
-pub use overlay::{OVERLAY_CHANNEL_COUNT, OverlayChannelId, OverlayChannelState};
+pub use overlay::{
+    MAX_OVERLAY_QUEUE_DEPTH, MAX_OVERLAY_TRANSITION_DURATION_FRAMES, OVERLAY_CHANNEL_COUNT,
+    OverlayBorderPreset, OverlayChannelId, OverlayChannelState, OverlayPositionPreset,
+    OverlayTransitionAdvance, OverlayTransitionKind,
+};
 pub use state::{ProgramFrame, SwitcherState};
 pub use stinger::{
     MissingMediaFallback, STINGER_SLOT_COUNT, StingerAudioPolicy, StingerDescriptor,

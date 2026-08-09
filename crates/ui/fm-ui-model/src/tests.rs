@@ -1,6 +1,6 @@
 use core::num::NonZeroU128;
 
-use fm_protocol::{CommandResult, EngineIdentity};
+use fm_protocol::{CommandResult, EngineIdentity, FadeToBlackPosition};
 
 use super::*;
 
@@ -20,6 +20,23 @@ fn engine(id: &str, epoch: u64, log: &str) -> EngineIdentity {
     }
 }
 
+fn overlays() -> Vec<OverlayStatus> {
+    (1..=8)
+        .map(|channel| OverlayStatus {
+            channel,
+            source: None,
+            active: false,
+            opacity: 0,
+            transition: fm_protocol::OverlayTransitionKind::Cut,
+            duration_frames: 1,
+            position: fm_protocol::OverlayPositionPreset::FullFrame,
+            border: fm_protocol::OverlayBorderPreset::None,
+            queued_sources: Vec::new(),
+            included_outputs: Vec::new(),
+        })
+        .collect()
+}
+
 fn snapshot(project_id: ProjectId, revision: u64) -> ProjectSnapshot {
     ProjectSnapshot {
         cursor: ProjectCursor {
@@ -30,6 +47,8 @@ fn snapshot(project_id: ProjectId, revision: u64) -> ProjectSnapshot {
         show_name: "Show".into(),
         inputs: vec![input(1), input(2), input(3)],
         stingers: Vec::new(),
+        desired_overlays: overlays(),
+        realized_overlays: overlays(),
         switcher: SwitcherState {
             desired: BusSelection::new(input(1), input(2)),
             realized: BusSelection::new(input(1), input(2)),
@@ -77,8 +96,8 @@ fn realization(
         revision: Revision::new(revision),
         generation,
         sequence,
-        manual_transition: None,
-        fade_to_black: None,
+        manual_transition: ManualTransitionStatus::Inactive,
+        fade_to_black: fade_to_black(false, 0),
     }
 }
 
@@ -90,6 +109,7 @@ fn desired(selection: BusSelection) -> DurableChange {
             target_active: false,
             position: FadeToBlackPosition::LIVE,
         },
+        overlays: overlays(),
     }
 }
 
@@ -156,6 +176,7 @@ fn reduces_exact_desired_and_realized_fade_to_black_state() {
                 selection: BusSelection::new(input(1), input(2)),
                 manual_transition: ManualTransitionStatus::Inactive,
                 fade_to_black: fade_to_black(false, 12_345),
+                overlays: overlays(),
             },
         ))
         .unwrap();
@@ -169,7 +190,7 @@ fn reduces_exact_desired_and_realized_fade_to_black_state() {
     );
 
     let mut realized = realization(project_id, identity, 5, 9, 1);
-    realized.fade_to_black = Some(fade_to_black(false, 12_345));
+    realized.fade_to_black = fade_to_black(false, 12_345);
     model.apply_runtime_realization(realized).unwrap();
     assert_eq!(
         model.state().unwrap().switcher().realized_fade_to_black,
@@ -543,13 +564,13 @@ fn runtime_realization_rejects_invalid_manual_endpoints_transactionally() {
     let before = model.state().unwrap().clone();
 
     let mut unknown = realization(project_id, identity.clone(), 7, 5, 1);
-    unknown.manual_transition = Some(ManualTransitionStatus::Active(ActiveManualTransition {
+    unknown.manual_transition = ManualTransitionStatus::Active(ActiveManualTransition {
         kind: ManualTransitionKind::Fade,
         from: input(1),
         to: input(99),
         interval_start: ManualTransitionPosition::START,
         position: ManualTransitionPosition::new(2_500).unwrap(),
-    }));
+    });
     assert_eq!(
         model.apply_runtime_realization(unknown),
         Err(ModelError::UnknownInput(input(99)))
@@ -557,13 +578,13 @@ fn runtime_realization_rejects_invalid_manual_endpoints_transactionally() {
     assert_eq!(model.state(), Some(&before));
 
     let mut mismatched = realization(project_id, identity.clone(), 7, 5, 1);
-    mismatched.manual_transition = Some(ManualTransitionStatus::Active(ActiveManualTransition {
+    mismatched.manual_transition = ManualTransitionStatus::Active(ActiveManualTransition {
         kind: ManualTransitionKind::Fade,
         from: input(1),
         to: input(3),
         interval_start: ManualTransitionPosition::START,
         position: ManualTransitionPosition::new(2_500).unwrap(),
-    }));
+    });
     assert_eq!(
         model.apply_runtime_realization(mismatched),
         Err(ModelError::InvalidManualTransitionRouting)

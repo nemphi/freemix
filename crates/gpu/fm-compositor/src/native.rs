@@ -20,7 +20,7 @@ use crate::{
 /// arithmetic when combined with device-bounded source dimensions.
 pub const MAX_NATIVE_TRANSFORM_DIMENSION: u32 = 16_384;
 
-const COMPOSITION_UNIFORM_SIZE: usize = 80;
+const COMPOSITION_UNIFORM_SIZE: usize = 96;
 const TRANSITION_UNIFORM_SIZE: usize = 32;
 
 const COMPOSITION_FRAGMENT_SHADER: &str = r"
@@ -44,7 +44,11 @@ struct LayerUniform {
     mask_bottom: u32,
     mask_enabled: u32,
     mask_invert: u32,
-    padding: u32,
+    border_width: u32,
+    padding_0: u32,
+    padding_1: u32,
+    padding_2: u32,
+    padding_3: u32,
 };
 
 @group(0) @binding(0) var source_texture: texture_2d<f32>;
@@ -67,6 +71,15 @@ fn composition_fragment(@builtin(position) position: vec4<f32>) -> @location(0) 
     let rotated = vec2<u32>(translated);
     if rotated.x >= layer.rotated_width || rotated.y >= layer.rotated_height {
         return vec4<f32>(0.0);
+    }
+    if layer.border_width != 0u && (
+        rotated.x < layer.border_width ||
+        rotated.y < layer.border_width ||
+        layer.rotated_width - rotated.x <= layer.border_width ||
+        layer.rotated_height - rotated.y <= layer.border_width
+    ) {
+        let opacity = f32(layer.opacity) / 255.0;
+        return vec4<f32>(opacity);
     }
 
     var scaled: vec2<u32>;
@@ -518,6 +531,7 @@ fn validate_composition<'a>(
                 layer.mask(),
                 layer.opacity(),
                 visible,
+                layer.inset_border_width(),
             ),
         });
     }
@@ -628,6 +642,7 @@ fn encode_composition_uniform(
     mask: Option<RectMask>,
     opacity: u8,
     visible: bool,
+    border_width: u32,
 ) -> [u8; COMPOSITION_UNIFORM_SIZE] {
     let (rotated_width, rotated_height) = rotated_dimensions(transform);
     let rotation = match transform.rotation {
@@ -673,6 +688,10 @@ fn encode_composition_uniform(
         mask_bottom,
         mask_enabled,
         mask_invert,
+        border_width,
+        0,
+        0,
+        0,
         0,
     ];
     let mut bytes = [0; COMPOSITION_UNIFORM_SIZE];
@@ -1188,8 +1207,8 @@ mod tests {
         Transform::new(x, y, width, height, rotation)
     }
 
-    fn uniform_words(uniform: [u8; COMPOSITION_UNIFORM_SIZE]) -> [u32; 20] {
-        let mut words = [0; 20];
+    fn uniform_words(uniform: [u8; COMPOSITION_UNIFORM_SIZE]) -> [u32; 24] {
+        let mut words = [0; 24];
         for (word, bytes) in words.iter_mut().zip(uniform.chunks_exact(4)) {
             *word = u32::from_le_bytes(bytes.try_into().unwrap());
         }
@@ -1197,12 +1216,18 @@ mod tests {
     }
 
     #[test]
-    fn composition_uniform_is_twenty_little_endian_words_with_explicit_mask_bounds() {
+    fn composition_uniform_is_twenty_four_little_endian_words_with_border_and_mask() {
         let transform = transform(-7, 9, 12, 5, Rotation::Deg90);
         let mask = RectMask::new(5, 6, 7, 8).inverted(true);
-        let uniform =
-            encode_composition_uniform(transform, CropRect::new(2, 3, 4, 6), Some(mask), 128, true);
-        assert_eq!(uniform.len(), 80);
+        let uniform = encode_composition_uniform(
+            transform,
+            CropRect::new(2, 3, 4, 6),
+            Some(mask),
+            128,
+            true,
+            3,
+        );
+        assert_eq!(uniform.len(), 96);
         assert_eq!(
             uniform_words(uniform),
             [
@@ -1225,6 +1250,10 @@ mod tests {
                 14,
                 1,
                 1,
+                3,
+                0,
+                0,
+                0,
                 0,
             ]
         );
@@ -1280,6 +1309,7 @@ mod tests {
                 None,
                 255,
                 false,
+                0,
             ));
             assert_eq!(words[0], translation.cast_unsigned());
             assert_eq!(words[1], translation.cast_unsigned());

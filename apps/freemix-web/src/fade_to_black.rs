@@ -1,7 +1,5 @@
 use fm_client::{ConnectionState, Session};
-use fm_protocol::{
-    CommandPayload, FADE_TO_BLACK_PROTOCOL_VERSION, FadeToBlackPosition, FadeToBlackState,
-};
+use fm_protocol::{CommandPayload, FadeToBlackPosition, FadeToBlackState};
 use fm_ui_model::SwitcherState;
 
 use crate::TransitionControlState;
@@ -126,9 +124,6 @@ impl FadeToBlackModel {
         connection_state: &ConnectionState,
         session: Option<&Session>,
     ) -> TransitionControlState {
-        if !session.is_some_and(session_supports_fade_to_black) {
-            return TransitionControlState::Hidden;
-        }
         if !matches!(connection_state, ConnectionState::Ready)
             || !session.is_some_and(session_can_transition)
         {
@@ -184,14 +179,9 @@ fn session_can_transition(session: &Session) -> bool {
         .any(|permission| permission == "transition")
 }
 
-fn session_supports_fade_to_black(session: &Session) -> bool {
-    session.protocol.major == FADE_TO_BLACK_PROTOCOL_VERSION.major
-        && session.protocol.minor >= FADE_TO_BLACK_PROTOCOL_VERSION.minor
-}
-
 #[cfg(test)]
 mod tests {
-    use fm_protocol::{ProtocolVersion, Role, ServerIdentity};
+    use fm_protocol::{CURRENT_PROTOCOL_VERSION, ProtocolVersion, Role, ServerIdentity};
 
     use super::*;
 
@@ -254,7 +244,7 @@ mod tests {
     #[test]
     fn opposite_target_remains_enabled_for_reversal() {
         let model = FadeToBlackModel::new(Some(state(true, 40_000)), Some(state(true, 20_000)));
-        let session = session(FADE_TO_BLACK_PROTOCOL_VERSION, &["transition"]);
+        let session = session(CURRENT_PROTOCOL_VERSION, &["transition"]);
 
         assert_eq!(
             model.control_state(
@@ -280,18 +270,9 @@ mod tests {
     #[test]
     fn protocol_permission_readiness_and_complete_state_gate_commands() {
         let model = FadeToBlackModel::new(Some(state(false, 0)), Some(state(false, 0)));
-        let current = session(FADE_TO_BLACK_PROTOCOL_VERSION, &["transition"]);
-        let old = session(ProtocolVersion::new(1, 4), &["transition"]);
-        let viewer = session(FADE_TO_BLACK_PROTOCOL_VERSION, &["view_status"]);
+        let current = session(CURRENT_PROTOCOL_VERSION, &["transition"]);
+        let viewer = session(CURRENT_PROTOCOL_VERSION, &["view_status"]);
 
-        assert_eq!(
-            model.control_state(
-                FadeToBlackControl::ToBlack,
-                &ConnectionState::Ready,
-                Some(&old),
-            ),
-            TransitionControlState::Hidden
-        );
         assert_eq!(
             model.control_state(
                 FadeToBlackControl::ToBlack,
@@ -321,7 +302,7 @@ mod tests {
     #[test]
     fn duration_is_bounded_and_does_not_emit_a_command() {
         let mut model = FadeToBlackModel::new(Some(state(false, 0)), Some(state(false, 0)));
-        let session = session(FADE_TO_BLACK_PROTOCOL_VERSION, &["transition"]);
+        let session = session(CURRENT_PROTOCOL_VERSION, &["transition"]);
         model.set_duration_frames(0);
         assert_eq!(
             model.duration_frames(),

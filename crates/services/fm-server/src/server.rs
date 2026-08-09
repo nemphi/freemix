@@ -2,7 +2,8 @@ use std::{error::Error, fmt};
 
 use fm_auth::{Permission, Policy, Principal, PrincipalKind, Role as AuthRole};
 use fm_protocol::{
-    ClientHello, EventCursor, Role as ProtocolRole, ServerHello, WireMessage, negotiate_version,
+    EngineIdentity, EventCursor, HandshakeRequest, Role as ProtocolRole, ServerHello,
+    negotiate_version,
 };
 
 use crate::{
@@ -97,7 +98,7 @@ impl<C: ControlPlane> Server<C> {
     /// control-plane error when a session cannot be established.
     pub fn handshake(
         &self,
-        hello: &ClientHello,
+        hello: &HandshakeRequest,
         principal: &Principal,
         now_ms: u64,
     ) -> Result<HandshakeOutcome, HandshakeError<C::Error>> {
@@ -121,18 +122,19 @@ impl<C: ControlPlane> Server<C> {
         }
 
         let scoped_principal = scoped_principal(principal, requested_role);
-        let mut initial = self
+        let cached_cursor = hello.resume_cursor.as_ref().map(|cursor| EventCursor {
+            engine: EngineIdentity {
+                engine_id: cursor.server.engine_id.clone(),
+                state_epoch: cursor.server.state_epoch,
+                log_id: cursor.server.log_id.clone(),
+            },
+            revision: cursor.revision,
+        });
+        let initial = self
             .control
-            .initial_sync(hello.cached_cursor.as_ref())
+            .initial_sync(cached_cursor.as_ref())
             .map_err(HandshakeError::Control)?;
-        validate_initial_sync(&initial, hello.cached_cursor.as_ref())?;
-        if !sync_is_compatible(&initial.payload, negotiated) {
-            initial = self
-                .control
-                .initial_sync(None)
-                .map_err(HandshakeError::Control)?;
-            validate_initial_sync(&initial, None)?;
-        }
+        validate_initial_sync(&initial, cached_cursor.as_ref())?;
 
         let permissions = self
             .policy
@@ -141,7 +143,7 @@ impl<C: ControlPlane> Server<C> {
             .flatten()
             .map(|permission| permission_name(*permission).to_owned())
             .collect();
-        let sync = compatible_sync(initial.payload, negotiated);
+        let sync = initial.payload;
         let server_hello = ServerHello {
             negotiated,
             granted_role: hello.desired_role,
@@ -165,44 +167,6 @@ impl<C: ControlPlane> Server<C> {
             sync,
             session,
         })
-    }
-}
-
-fn sync_is_compatible(payload: &SyncPayload, negotiated: fm_protocol::ProtocolVersion) -> bool {
-    match payload {
-        SyncPayload::Snapshot(snapshot) => {
-            WireMessage::Snapshot(snapshot.as_ref().clone()).is_compatible_with(negotiated)
-        }
-        SyncPayload::Resume(events) => events
-            .iter()
-            .all(|event| WireMessage::Event(event.clone()).is_compatible_with(negotiated)),
-    }
-}
-
-fn compatible_sync(payload: SyncPayload, negotiated: fm_protocol::ProtocolVersion) -> SyncPayload {
-    debug_assert!(sync_is_compatible(&payload, negotiated));
-    match payload {
-        SyncPayload::Snapshot(snapshot) => {
-            let WireMessage::Snapshot(snapshot) =
-                WireMessage::Snapshot(*snapshot).compatible_with(negotiated)
-            else {
-                unreachable!("snapshot compatibility preserves message type");
-            };
-            SyncPayload::Snapshot(Box::new(snapshot))
-        }
-        SyncPayload::Resume(events) => SyncPayload::Resume(
-            events
-                .into_iter()
-                .map(|event| {
-                    let WireMessage::Event(event) =
-                        WireMessage::Event(event).compatible_with(negotiated)
-                    else {
-                        unreachable!("event compatibility preserves message type");
-                    };
-                    event
-                })
-                .collect(),
-        ),
     }
 }
 

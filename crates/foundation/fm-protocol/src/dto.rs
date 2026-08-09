@@ -1,14 +1,9 @@
 use core::{fmt, num::NonZeroU128};
 
 use fm_command::{CommandEnvelope, Deadline, Revision, StateEpoch};
-use fm_types::InputId;
+use fm_types::{InputId, OutputId};
 
-use crate::{
-    ALPHA_FADE_PROTOCOL_VERSION, BASE_PROTOCOL_VERSION, FADE_TO_BLACK_PROTOCOL_VERSION,
-    MANUAL_ALPHA_FADE_PROTOCOL_VERSION, MANUAL_TRANSITION_PROTOCOL_VERSION, ProtocolVersion,
-    SLIDE_PROTOCOL_VERSION, STINGER_CONFIGURATION_PROTOCOL_VERSION, STINGER_PROTOCOL_VERSION,
-    WIPE_PROTOCOL_VERSION, ZOOM_PROTOCOL_VERSION,
-};
+use crate::ProtocolVersion;
 
 /// Stable identity of one project's durable state on one server.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -83,15 +78,6 @@ pub enum Role {
     Replay,
     Operator,
     Admin,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ClientHello {
-    pub versions: Vec<ProtocolVersion>,
-    pub build: String,
-    pub client_type: ClientType,
-    pub desired_role: Role,
-    pub cached_cursor: Option<EventCursor>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -197,6 +183,58 @@ impl WireInputId {
     #[must_use]
     pub const fn to_domain(self) -> InputId {
         InputId::new(self.0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct WireOutputId(NonZeroU128);
+
+impl WireOutputId {
+    #[must_use]
+    pub const fn new(value: NonZeroU128) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn from_domain(value: OutputId) -> Self {
+        Self(value.get())
+    }
+
+    #[must_use]
+    pub const fn to_domain(self) -> OutputId {
+        OutputId::new(self.0)
+    }
+}
+
+impl fmt::Display for WireOutputId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+/// Stable one-based downstream overlay channel number carried on the wire.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct WireOverlayChannelId(u8);
+
+impl WireOverlayChannelId {
+    #[must_use]
+    pub const fn new(number: u8) -> Option<Self> {
+        if number >= 1 && number <= 8 {
+            Some(Self(number))
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub const fn number(self) -> u8 {
+        self.0
+    }
+}
+
+impl fmt::Display for WireOverlayChannelId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
     }
 }
 
@@ -339,6 +377,68 @@ pub struct StingerStatus {
     pub readiness: StingerReadiness,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OverlayStatus {
+    pub channel: WireOverlayChannelId,
+    pub source: Option<WireInputId>,
+    pub active: bool,
+    pub opacity: u8,
+    pub transition: OverlayTransitionKind,
+    pub duration_frames: u32,
+    pub position: OverlayPositionPreset,
+    pub border: OverlayBorderPreset,
+    pub queued_sources: Vec<WireInputId>,
+    pub included_outputs: Vec<WireOutputId>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum OverlayTransitionKind {
+    #[default]
+    Cut,
+    Fade,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum OverlayPositionPreset {
+    #[default]
+    FullFrame,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum OverlayBorderPreset {
+    #[default]
+    None,
+    ThinWhite,
+    ThickWhite,
+}
+
+impl OverlayStatus {
+    /// Builds the complete empty state required by the current eight-channel contract.
+    #[must_use]
+    pub fn empty_channels() -> Vec<Self> {
+        (1..=8)
+            .filter_map(|channel| {
+                WireOverlayChannelId::new(channel).map(|channel| Self {
+                    channel,
+                    source: None,
+                    active: false,
+                    opacity: 0,
+                    transition: OverlayTransitionKind::Cut,
+                    duration_frames: 1,
+                    position: OverlayPositionPreset::FullFrame,
+                    border: OverlayBorderPreset::None,
+                    queued_sources: Vec::new(),
+                    included_outputs: Vec::new(),
+                })
+            })
+            .collect()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CommandPayload {
     SelectPreview {
@@ -372,6 +472,39 @@ pub enum CommandPayload {
     RemoveStinger {
         slot: WireStingerSlotId,
     },
+    TakeOverlay {
+        channel: WireOverlayChannelId,
+        source: WireInputId,
+    },
+    UpdateOverlay {
+        channel: WireOverlayChannelId,
+        source: WireInputId,
+    },
+    OverlayOff {
+        channel: WireOverlayChannelId,
+    },
+    SetOverlayOutputInclusion {
+        channel: WireOverlayChannelId,
+        output: WireOutputId,
+        included: bool,
+    },
+    ConfigureOverlayTransition {
+        channel: WireOverlayChannelId,
+        transition: OverlayTransitionKind,
+        duration_frames: u32,
+    },
+    ConfigureOverlayAppearance {
+        channel: WireOverlayChannelId,
+        position: OverlayPositionPreset,
+        border: OverlayBorderPreset,
+    },
+    QueueOverlay {
+        channel: WireOverlayChannelId,
+        source: WireInputId,
+    },
+    TakeNextOverlay {
+        channel: WireOverlayChannelId,
+    },
     Wipe {
         duration_frames: u32,
     },
@@ -387,37 +520,6 @@ pub enum CommandPayload {
     },
     CommitManualTransition,
     CancelManualTransition,
-}
-
-impl CommandPayload {
-    #[must_use]
-    pub const fn minimum_protocol_version(self) -> ProtocolVersion {
-        match self {
-            Self::SelectPreview { .. } | Self::Cut | Self::Fade { .. } => BASE_PROTOCOL_VERSION,
-            Self::AlphaFade { .. } => ALPHA_FADE_PROTOCOL_VERSION,
-            Self::Slide { .. } => SLIDE_PROTOCOL_VERSION,
-            Self::Zoom { .. } => ZOOM_PROTOCOL_VERSION,
-            Self::Stinger { .. } => STINGER_PROTOCOL_VERSION,
-            Self::ConfigureStinger { .. } | Self::RemoveStinger { .. } => {
-                STINGER_CONFIGURATION_PROTOCOL_VERSION
-            }
-            Self::Wipe { .. } => WIPE_PROTOCOL_VERSION,
-            Self::FadeToBlack { .. } => FADE_TO_BLACK_PROTOCOL_VERSION,
-            Self::StartManualTransition {
-                kind: ManualTransitionKind::AlphaFade,
-            } => MANUAL_ALPHA_FADE_PROTOCOL_VERSION,
-            Self::StartManualTransition { .. }
-            | Self::SetManualTransitionPosition { .. }
-            | Self::CommitManualTransition
-            | Self::CancelManualTransition => MANUAL_TRANSITION_PROTOCOL_VERSION,
-        }
-    }
-
-    #[must_use]
-    pub const fn is_supported_by(self, version: ProtocolVersion) -> bool {
-        let required = self.minimum_protocol_version();
-        version.major == required.major && version.minor >= required.minor
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -496,16 +598,13 @@ pub struct SnapshotMessage {
     pub desired_preview: WireInputId,
     pub realized_program: WireInputId,
     pub realized_preview: WireInputId,
-    /// `None` means the protocol extension was omitted for an older peer.
-    pub desired_manual_transition: Option<ManualTransitionStatus>,
-    /// `None` means the protocol extension was omitted for an older peer.
-    pub realized_manual_transition: Option<ManualTransitionStatus>,
-    /// `None` means the protocol extension was omitted for an older peer.
-    pub desired_fade_to_black: Option<FadeToBlackState>,
-    /// `None` means the protocol extension was omitted for an older peer.
-    pub realized_fade_to_black: Option<FadeToBlackState>,
-    /// `None` means the protocol extension was omitted for a pre-1.11 peer.
-    pub stingers: Option<Vec<StingerStatus>>,
+    pub desired_manual_transition: ManualTransitionStatus,
+    pub realized_manual_transition: ManualTransitionStatus,
+    pub desired_fade_to_black: FadeToBlackState,
+    pub realized_fade_to_black: FadeToBlackState,
+    pub stingers: Vec<StingerStatus>,
+    pub desired_overlays: Vec<OverlayStatus>,
+    pub realized_overlays: Vec<OverlayStatus>,
 }
 
 /// A durable state change. Runtime progress uses [`RuntimeEventMessage`].
@@ -514,17 +613,17 @@ pub enum EventPayload {
     DesiredSwitcher {
         program: WireInputId,
         preview: WireInputId,
-        /// `None` means the protocol extension was omitted for an older peer.
-        manual_transition: Option<ManualTransitionStatus>,
-        /// `None` means the protocol extension was omitted for an older peer.
-        fade_to_black: Option<FadeToBlackState>,
+        manual_transition: ManualTransitionStatus,
+        fade_to_black: FadeToBlackState,
+        overlays: Vec<OverlayStatus>,
     },
     StingerSlotsChanged {
         program: WireInputId,
         preview: WireInputId,
-        manual_transition: Option<ManualTransitionStatus>,
-        fade_to_black: Option<FadeToBlackState>,
+        manual_transition: ManualTransitionStatus,
+        fade_to_black: FadeToBlackState,
         stingers: Vec<StingerStatus>,
+        overlays: Vec<OverlayStatus>,
     },
 }
 
@@ -580,10 +679,8 @@ pub enum RuntimeLifecycleEvent {
     },
     Realized {
         domain: String,
-        /// `None` means the protocol extension was omitted for an older peer.
-        manual_transition: Option<ManualTransitionStatus>,
-        /// `None` means the protocol extension was omitted for an older peer.
-        fade_to_black: Option<FadeToBlackState>,
+        manual_transition: ManualTransitionStatus,
+        fade_to_black: FadeToBlackState,
     },
     Failed {
         error: StructuredError,
@@ -630,8 +727,6 @@ pub struct CapabilityReportMessage {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WireMessage {
-    ClientHello(ClientHello),
-    ServerHello(ServerHello),
     Command(CommandMessage),
     CommandResult(CommandResult),
     Snapshot(SnapshotMessage),
@@ -644,121 +739,4 @@ pub enum WireMessage {
     Heartbeat(HeartbeatMessage),
     CapabilityReport(CapabilityReportMessage),
     Error(ErrorMessage),
-}
-
-impl WireMessage {
-    /// Reports whether this message can be represented without losing state for
-    /// one negotiated peer.
-    #[must_use]
-    pub const fn is_compatible_with(&self, version: ProtocolVersion) -> bool {
-        !matches!(
-            self,
-            Self::Event(EventMessage {
-                payload: EventPayload::StingerSlotsChanged { .. },
-                ..
-            }) if version.major != crate::STINGER_CONFIGURATION_PROTOCOL_VERSION.major
-                || version.minor < crate::STINGER_CONFIGURATION_PROTOCOL_VERSION.minor
-        )
-    }
-
-    /// Returns the projection safe to send to one negotiated peer.
-    ///
-    /// Callers must first verify [`Self::is_compatible_with`]. This projection
-    /// only removes optional fields; it never advances an older peer across a
-    /// state change that peer cannot represent.
-    #[must_use]
-    pub fn compatible_with(&self, version: ProtocolVersion) -> Self {
-        let mut message = self.clone();
-        if (version.major != crate::STINGER_STATUS_PROTOCOL_VERSION.major
-            || version.minor < crate::STINGER_STATUS_PROTOCOL_VERSION.minor)
-            && let Self::Snapshot(snapshot) = &mut message
-        {
-            snapshot.stingers = None;
-        }
-        if version.major != FADE_TO_BLACK_PROTOCOL_VERSION.major
-            || version.minor < FADE_TO_BLACK_PROTOCOL_VERSION.minor
-        {
-            match &mut message {
-                Self::Snapshot(snapshot) => {
-                    snapshot.desired_fade_to_black = None;
-                    snapshot.realized_fade_to_black = None;
-                }
-                Self::Event(EventMessage {
-                    payload: EventPayload::DesiredSwitcher { fade_to_black, .. },
-                    ..
-                })
-                | Self::RuntimeEvent(RuntimeEventMessage {
-                    event: RuntimeLifecycleEvent::Realized { fade_to_black, .. },
-                    ..
-                }) => *fade_to_black = None,
-                _ => {}
-            }
-        }
-        if version.major == MANUAL_TRANSITION_PROTOCOL_VERSION.major
-            && version.minor >= MANUAL_TRANSITION_PROTOCOL_VERSION.minor
-        {
-            if version.minor < MANUAL_ALPHA_FADE_PROTOCOL_VERSION.minor {
-                project_manual_alpha_fade(&mut message);
-            }
-            return message;
-        }
-        match &mut message {
-            Self::Snapshot(snapshot) => {
-                snapshot.desired_manual_transition = None;
-                snapshot.realized_manual_transition = None;
-            }
-            Self::Event(EventMessage {
-                payload:
-                    EventPayload::DesiredSwitcher {
-                        manual_transition, ..
-                    },
-                ..
-            })
-            | Self::RuntimeEvent(RuntimeEventMessage {
-                event:
-                    RuntimeLifecycleEvent::Realized {
-                        manual_transition, ..
-                    },
-                ..
-            }) => *manual_transition = None,
-            _ => {}
-        }
-        message
-    }
-}
-
-fn project_manual_alpha_fade(message: &mut WireMessage) {
-    match message {
-        WireMessage::Snapshot(snapshot) => {
-            project_manual_alpha_fade_status(&mut snapshot.desired_manual_transition);
-            project_manual_alpha_fade_status(&mut snapshot.realized_manual_transition);
-        }
-        WireMessage::Event(EventMessage {
-            payload:
-                EventPayload::DesiredSwitcher {
-                    manual_transition, ..
-                },
-            ..
-        })
-        | WireMessage::RuntimeEvent(RuntimeEventMessage {
-            event:
-                RuntimeLifecycleEvent::Realized {
-                    manual_transition, ..
-                },
-            ..
-        }) => project_manual_alpha_fade_status(manual_transition),
-        _ => {}
-    }
-}
-
-fn project_manual_alpha_fade_status(status: &mut Option<ManualTransitionStatus>) {
-    if matches!(
-        status,
-        Some(ManualTransitionStatus::Active(ManualTransitionState {
-            kind: ManualTransitionKind::AlphaFade,
-            ..
-        }))
-    ) {
-        *status = Some(ManualTransitionStatus::Inactive);
-    }
 }

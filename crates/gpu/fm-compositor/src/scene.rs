@@ -215,6 +215,7 @@ pub struct SourceLayer {
     key: Option<Key>,
     effects: Vec<Effect>,
     overlay_inclusion: Option<OutputInclusion>,
+    inset_border_width: u32,
 }
 
 impl SourceLayer {
@@ -232,6 +233,7 @@ impl SourceLayer {
             key: None,
             effects: Vec::new(),
             overlay_inclusion: None,
+            inset_border_width: 0,
         }
     }
 
@@ -280,6 +282,13 @@ impl SourceLayer {
     #[must_use]
     pub const fn as_overlay(mut self, inclusion: OutputInclusion) -> Self {
         self.overlay_inclusion = Some(inclusion);
+        self
+    }
+
+    /// Draws an opaque white border inside the transformed layer bounds.
+    #[must_use]
+    pub const fn with_inset_border(mut self, width: u32) -> Self {
+        self.inset_border_width = width;
         self
     }
 
@@ -336,6 +345,11 @@ impl SourceLayer {
     #[must_use]
     pub const fn overlay_inclusion(&self) -> Option<OutputInclusion> {
         self.overlay_inclusion
+    }
+
+    #[must_use]
+    pub const fn inset_border_width(&self) -> u32 {
+        self.inset_border_width
     }
 }
 

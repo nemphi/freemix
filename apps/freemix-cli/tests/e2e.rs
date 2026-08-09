@@ -11,10 +11,11 @@ use std::{
 };
 
 use fm_protocol::{
-    CURRENT_PROTOCOL_VERSION, ClientType, CommandMessage, CommandPayload, CommandResult,
-    EngineIdentity, EventCursor, EventMessage, EventPayload, ProtocolVersion, Role,
-    RuntimeDomainBoundary, RuntimeEventMessage, RuntimeLifecycleEvent, ServerHello, ServerIdentity,
-    SnapshotMessage, WireInputId, WireMessage, decode_line, encode_line,
+    CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, ClientType, CommandMessage, CommandPayload,
+    CommandResult, EngineIdentity, EventCursor, EventMessage, EventPayload, HandshakeOutcome,
+    HandshakeResponse, OverlayStatus, ProtocolVersion, Role, RuntimeDomainBoundary,
+    RuntimeEventMessage, RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage, SnapshotReason,
+    WireInputId, WireMessage, decode_line, encode_line,
 };
 
 static TEST_ROOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -39,45 +40,10 @@ impl FakeRemoteServer {
         Self { address, worker }
     }
 
-    fn start_old_without_wipe() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let worker = thread::spawn(move || serve_old_daemon_without_wipe(&listener));
-        Self { address, worker }
-    }
-
-    fn start_old_without_manual_t_bar() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let worker = thread::spawn(move || serve_old_daemon_without_manual_t_bar(&listener));
-        Self { address, worker }
-    }
-
-    fn start_old_without_fade_to_black() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let worker = thread::spawn(move || serve_old_daemon_without_fade_to_black(&listener));
-        Self { address, worker }
-    }
-
-    fn start_old_without_alpha_fade() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let worker = thread::spawn(move || serve_old_daemon_without_alpha_fade(&listener));
-        Self { address, worker }
-    }
-
     fn start_alpha_fade() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let worker = thread::spawn(move || serve_alpha_fade(&listener));
-        Self { address, worker }
-    }
-
-    fn start_old_without_slide() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let worker = thread::spawn(move || serve_old_daemon_without_slide(&listener));
         Self { address, worker }
     }
 
@@ -88,24 +54,10 @@ impl FakeRemoteServer {
         Self { address, worker }
     }
 
-    fn start_old_without_zoom() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let worker = thread::spawn(move || serve_old_daemon_without_zoom(&listener));
-        Self { address, worker }
-    }
-
     fn start_zoom() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let worker = thread::spawn(move || serve_zoom(&listener));
-        Self { address, worker }
-    }
-
-    fn start_old_without_stinger() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let worker = thread::spawn(move || serve_old_daemon_without_stinger(&listener));
         Self { address, worker }
     }
 
@@ -127,13 +79,6 @@ impl FakeRemoteServer {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let worker = thread::spawn(move || serve_manual_position(&listener));
-        Self { address, worker }
-    }
-
-    fn start_old_without_manual_alpha_fade() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let worker = thread::spawn(move || serve_old_daemon_without_manual_alpha_fade(&listener));
         Self { address, worker }
     }
 
@@ -172,7 +117,7 @@ fn serve_remote_sessions(listener: &TcpListener) {
         let (stream, _) = listener.accept().unwrap();
         let mut writer = stream.try_clone().unwrap();
         let mut reader = BufReader::new(stream);
-        assert_client_hello(read_message(&mut reader));
+        assert_handshake_request(read_message(&mut reader));
         write_handshake(&mut writer, &engine, revision);
 
         if matches!(session, 0 | 4) {
@@ -234,7 +179,7 @@ fn serve_premature_event(listener: &TcpListener, kind: PrematureEvent) {
     let (stream, _) = listener.accept().unwrap();
     let mut writer = stream.try_clone().unwrap();
     let mut reader = BufReader::new(stream);
-    assert_client_hello(read_message(&mut reader));
+    assert_handshake_request(read_message(&mut reader));
     write_handshake(&mut writer, &engine, 0);
     let WireMessage::Command(_) = read_message(&mut reader) else {
         panic!("expected remote command");
@@ -248,8 +193,9 @@ fn serve_premature_event(listener: &TcpListener, kind: PrematureEvent) {
             payload: EventPayload::DesiredSwitcher {
                 program: input(2),
                 preview: input(1),
-                manual_transition: None,
-                fade_to_black: None,
+                manual_transition: fm_protocol::ManualTransitionStatus::Inactive,
+                fade_to_black: live_fade_to_black(),
+                overlays: OverlayStatus::empty_channels(),
             },
         }),
         PrematureEvent::Runtime => WireMessage::RuntimeEvent(RuntimeEventMessage {
@@ -259,69 +205,12 @@ fn serve_premature_event(listener: &TcpListener, kind: PrematureEvent) {
             sequence: 1,
             event: RuntimeLifecycleEvent::Realized {
                 domain: "switcher".into(),
-                manual_transition: None,
-                fade_to_black: None,
+                manual_transition: fm_protocol::ManualTransitionStatus::Inactive,
+                fade_to_black: live_fade_to_black(),
             },
         }),
     };
     write_message(&mut writer, &message);
-}
-
-fn serve_old_daemon_without_wipe(listener: &TcpListener) {
-    let engine = EngineIdentity {
-        engine_id: "project-42".into(),
-        state_epoch: 1,
-        log_id: "fake-remote-log".into(),
-    };
-    let (stream, _) = listener.accept().unwrap();
-    let mut writer = stream.try_clone().unwrap();
-    let mut reader = BufReader::new(stream);
-    assert_client_hello(read_message(&mut reader));
-    write_handshake(&mut writer, &engine, 0);
-
-    let mut unexpected = String::new();
-    assert_eq!(reader.read_line(&mut unexpected).unwrap(), 0);
-    assert!(unexpected.is_empty());
-}
-
-fn serve_old_daemon_without_manual_t_bar(listener: &TcpListener) {
-    let engine = EngineIdentity {
-        engine_id: "project-42".into(),
-        state_epoch: 1,
-        log_id: "fake-remote-log".into(),
-    };
-    let (stream, _) = listener.accept().unwrap();
-    let mut writer = stream.try_clone().unwrap();
-    let mut reader = BufReader::new(stream);
-    assert_client_hello(read_message(&mut reader));
-    write_handshake_version(&mut writer, &engine, 0, ProtocolVersion::new(1, 3));
-
-    let mut unexpected = String::new();
-    assert_eq!(reader.read_line(&mut unexpected).unwrap(), 0);
-    assert!(
-        unexpected.is_empty(),
-        "protocol 1.4 command reached a 1.3 daemon"
-    );
-}
-
-fn serve_old_daemon_without_fade_to_black(listener: &TcpListener) {
-    let engine = EngineIdentity {
-        engine_id: "project-42".into(),
-        state_epoch: 1,
-        log_id: "fake-remote-log".into(),
-    };
-    let (stream, _) = listener.accept().unwrap();
-    let mut writer = stream.try_clone().unwrap();
-    let mut reader = BufReader::new(stream);
-    assert_client_hello(read_message(&mut reader));
-    write_handshake_version(&mut writer, &engine, 0, ProtocolVersion::new(1, 4));
-
-    let mut unexpected = String::new();
-    assert_eq!(reader.read_line(&mut unexpected).unwrap(), 0);
-    assert!(
-        unexpected.is_empty(),
-        "protocol 1.5 command reached a 1.4 daemon"
-    );
 }
 
 fn serve_fade_to_black(listener: &TcpListener) {
@@ -333,22 +222,19 @@ fn serve_fade_to_black(listener: &TcpListener) {
     let (stream, _) = listener.accept().unwrap();
     let mut writer = stream.try_clone().unwrap();
     let mut reader = BufReader::new(stream);
-    assert_client_hello(read_message(&mut reader));
+    assert_handshake_request(read_message(&mut reader));
     write_handshake_version_with_fade_to_black(
         &mut writer,
         &engine,
         0,
-        fm_protocol::FADE_TO_BLACK_PROTOCOL_VERSION,
+        fm_protocol::CURRENT_PROTOCOL_VERSION,
         live_fade_to_black(),
     );
 
     let WireMessage::Command(command) = read_message(&mut reader) else {
         panic!("expected remote FTB command");
     };
-    assert_eq!(
-        command.protocol,
-        fm_protocol::FADE_TO_BLACK_PROTOCOL_VERSION
-    );
+    assert_eq!(command.protocol, fm_protocol::CURRENT_PROTOCOL_VERSION);
     assert_eq!(
         command.payload,
         CommandPayload::FadeToBlack {
@@ -376,11 +262,12 @@ fn serve_fade_to_black(listener: &TcpListener) {
             payload: EventPayload::DesiredSwitcher {
                 program: input(1),
                 preview: input(2),
-                manual_transition: Some(fm_protocol::ManualTransitionStatus::Inactive),
-                fade_to_black: Some(fm_protocol::FadeToBlackState {
+                manual_transition: fm_protocol::ManualTransitionStatus::Inactive,
+                fade_to_black: fm_protocol::FadeToBlackState {
                     target_active: true,
                     position: fm_protocol::FadeToBlackPosition::LIVE,
-                }),
+                },
+                overlays: OverlayStatus::empty_channels(),
             },
         }),
     );
@@ -393,124 +280,20 @@ fn serve_fade_to_black(listener: &TcpListener) {
             sequence: 1,
             event: RuntimeLifecycleEvent::Realized {
                 domain: "switcher".into(),
-                manual_transition: Some(fm_protocol::ManualTransitionStatus::Inactive),
-                fade_to_black: Some(fm_protocol::FadeToBlackState {
+                manual_transition: fm_protocol::ManualTransitionStatus::Inactive,
+                fade_to_black: fm_protocol::FadeToBlackState {
                     target_active: true,
                     position: fm_protocol::FadeToBlackPosition::BLACK,
-                }),
+                },
             },
         }),
-    );
-}
-
-fn serve_old_daemon_without_alpha_fade(listener: &TcpListener) {
-    let engine = EngineIdentity {
-        engine_id: "project-42".into(),
-        state_epoch: 1,
-        log_id: "fake-remote-log".into(),
-    };
-    let (stream, _) = listener.accept().unwrap();
-    let mut writer = stream.try_clone().unwrap();
-    let mut reader = BufReader::new(stream);
-    assert_client_hello(read_message(&mut reader));
-    write_handshake_version_with_fade_to_black(
-        &mut writer,
-        &engine,
-        0,
-        fm_protocol::FADE_TO_BLACK_PROTOCOL_VERSION,
-        live_fade_to_black(),
-    );
-
-    let mut unexpected = String::new();
-    assert_eq!(reader.read_line(&mut unexpected).unwrap(), 0);
-    assert!(
-        unexpected.is_empty(),
-        "protocol 1.6 command reached a 1.5 daemon"
-    );
-}
-
-fn serve_old_daemon_without_slide(listener: &TcpListener) {
-    let engine = EngineIdentity {
-        engine_id: "project-42".into(),
-        state_epoch: 1,
-        log_id: "fake-remote-log".into(),
-    };
-    let (stream, _) = listener.accept().unwrap();
-    let mut writer = stream.try_clone().unwrap();
-    let mut reader = BufReader::new(stream);
-    assert_client_hello(read_message(&mut reader));
-    write_handshake_version_with_fade_to_black(
-        &mut writer,
-        &engine,
-        0,
-        fm_protocol::MANUAL_ALPHA_FADE_PROTOCOL_VERSION,
-        live_fade_to_black(),
-    );
-
-    let mut unexpected = String::new();
-    assert_eq!(reader.read_line(&mut unexpected).unwrap(), 0);
-    assert!(
-        unexpected.is_empty(),
-        "protocol 1.8 command reached a 1.7 daemon"
-    );
-}
-
-fn serve_old_daemon_without_zoom(listener: &TcpListener) {
-    let engine = EngineIdentity {
-        engine_id: "project-42".into(),
-        state_epoch: 1,
-        log_id: "fake-remote-log".into(),
-    };
-    let (stream, _) = listener.accept().unwrap();
-    let mut writer = stream.try_clone().unwrap();
-    let mut reader = BufReader::new(stream);
-    assert_client_hello(read_message(&mut reader));
-    write_handshake_version_with_fade_to_black(
-        &mut writer,
-        &engine,
-        0,
-        fm_protocol::SLIDE_PROTOCOL_VERSION,
-        live_fade_to_black(),
-    );
-
-    let mut unexpected = String::new();
-    assert_eq!(reader.read_line(&mut unexpected).unwrap(), 0);
-    assert!(
-        unexpected.is_empty(),
-        "protocol 1.9 command reached a 1.8 daemon"
-    );
-}
-
-fn serve_old_daemon_without_stinger(listener: &TcpListener) {
-    let engine = EngineIdentity {
-        engine_id: "project-42".into(),
-        state_epoch: 1,
-        log_id: "fake-remote-log".into(),
-    };
-    let (stream, _) = listener.accept().unwrap();
-    let mut writer = stream.try_clone().unwrap();
-    let mut reader = BufReader::new(stream);
-    assert_client_hello(read_message(&mut reader));
-    write_handshake_version_with_fade_to_black(
-        &mut writer,
-        &engine,
-        0,
-        fm_protocol::ZOOM_PROTOCOL_VERSION,
-        live_fade_to_black(),
-    );
-
-    let mut unexpected = String::new();
-    assert_eq!(reader.read_line(&mut unexpected).unwrap(), 0);
-    assert!(
-        unexpected.is_empty(),
-        "protocol 1.10 command reached a 1.9 daemon"
     );
 }
 
 fn serve_alpha_fade(listener: &TcpListener) {
     serve_automatic_transition(
         listener,
-        fm_protocol::ALPHA_FADE_PROTOCOL_VERSION,
+        fm_protocol::CURRENT_PROTOCOL_VERSION,
         CommandPayload::AlphaFade { duration_frames: 3 },
         "remote-alpha-fade",
     );
@@ -519,7 +302,7 @@ fn serve_alpha_fade(listener: &TcpListener) {
 fn serve_slide(listener: &TcpListener) {
     serve_automatic_transition(
         listener,
-        fm_protocol::SLIDE_PROTOCOL_VERSION,
+        fm_protocol::CURRENT_PROTOCOL_VERSION,
         CommandPayload::Slide { duration_frames: 3 },
         "remote-slide",
     );
@@ -528,7 +311,7 @@ fn serve_slide(listener: &TcpListener) {
 fn serve_zoom(listener: &TcpListener) {
     serve_automatic_transition(
         listener,
-        fm_protocol::ZOOM_PROTOCOL_VERSION,
+        fm_protocol::CURRENT_PROTOCOL_VERSION,
         CommandPayload::Zoom { duration_frames: 3 },
         "remote-zoom",
     );
@@ -537,7 +320,7 @@ fn serve_zoom(listener: &TcpListener) {
 fn serve_stinger(listener: &TcpListener) {
     serve_automatic_transition(
         listener,
-        fm_protocol::STINGER_PROTOCOL_VERSION,
+        fm_protocol::CURRENT_PROTOCOL_VERSION,
         CommandPayload::Stinger {
             slot: fm_protocol::WireStingerSlotId::new(8).unwrap(),
             duration_frames: 3,
@@ -560,7 +343,7 @@ fn serve_automatic_transition(
     let (stream, _) = listener.accept().unwrap();
     let mut writer = stream.try_clone().unwrap();
     let mut reader = BufReader::new(stream);
-    assert_client_hello(read_message(&mut reader));
+    assert_handshake_request(read_message(&mut reader));
     write_handshake_version_with_fade_to_black(
         &mut writer,
         &engine,
@@ -594,8 +377,9 @@ fn serve_automatic_transition(
             payload: EventPayload::DesiredSwitcher {
                 program: input(2),
                 preview: input(1),
-                manual_transition: Some(fm_protocol::ManualTransitionStatus::Inactive),
-                fade_to_black: Some(live_fade_to_black()),
+                manual_transition: fm_protocol::ManualTransitionStatus::Inactive,
+                fade_to_black: live_fade_to_black(),
+                overlays: OverlayStatus::empty_channels(),
             },
         }),
     );
@@ -623,36 +407,10 @@ fn serve_automatic_transition(
             sequence: 2,
             event: RuntimeLifecycleEvent::Realized {
                 domain: "switcher".into(),
-                manual_transition: Some(fm_protocol::ManualTransitionStatus::Inactive),
-                fade_to_black: Some(live_fade_to_black()),
+                manual_transition: fm_protocol::ManualTransitionStatus::Inactive,
+                fade_to_black: live_fade_to_black(),
             },
         }),
-    );
-}
-
-fn serve_old_daemon_without_manual_alpha_fade(listener: &TcpListener) {
-    let engine = EngineIdentity {
-        engine_id: "project-42".into(),
-        state_epoch: 1,
-        log_id: "fake-remote-log".into(),
-    };
-    let (stream, _) = listener.accept().unwrap();
-    let mut writer = stream.try_clone().unwrap();
-    let mut reader = BufReader::new(stream);
-    assert_client_hello(read_message(&mut reader));
-    write_handshake_version_with_fade_to_black(
-        &mut writer,
-        &engine,
-        0,
-        fm_protocol::ALPHA_FADE_PROTOCOL_VERSION,
-        live_fade_to_black(),
-    );
-
-    let mut unexpected = String::new();
-    assert_eq!(reader.read_line(&mut unexpected).unwrap(), 0);
-    assert!(
-        unexpected.is_empty(),
-        "protocol 1.7 command reached a 1.6 daemon"
     );
 }
 
@@ -665,22 +423,19 @@ fn serve_manual_alpha_fade(listener: &TcpListener) {
     let (stream, _) = listener.accept().unwrap();
     let mut writer = stream.try_clone().unwrap();
     let mut reader = BufReader::new(stream);
-    assert_client_hello(read_message(&mut reader));
+    assert_handshake_request(read_message(&mut reader));
     write_handshake_version_with_fade_to_black(
         &mut writer,
         &engine,
         0,
-        fm_protocol::MANUAL_ALPHA_FADE_PROTOCOL_VERSION,
+        fm_protocol::CURRENT_PROTOCOL_VERSION,
         live_fade_to_black(),
     );
 
     let WireMessage::Command(command) = read_message(&mut reader) else {
         panic!("expected remote manual AlphaFade command");
     };
-    assert_eq!(
-        command.protocol,
-        fm_protocol::MANUAL_ALPHA_FADE_PROTOCOL_VERSION
-    );
+    assert_eq!(command.protocol, fm_protocol::CURRENT_PROTOCOL_VERSION);
     assert_eq!(
         command.payload,
         CommandPayload::StartManualTransition {
@@ -715,8 +470,9 @@ fn serve_manual_alpha_fade(listener: &TcpListener) {
             payload: EventPayload::DesiredSwitcher {
                 program: input(1),
                 preview: input(2),
-                manual_transition: Some(manual_transition),
-                fade_to_black: Some(live_fade_to_black()),
+                manual_transition,
+                fade_to_black: live_fade_to_black(),
+                overlays: OverlayStatus::empty_channels(),
             },
         }),
     );
@@ -729,8 +485,8 @@ fn serve_manual_alpha_fade(listener: &TcpListener) {
             sequence: 1,
             event: RuntimeLifecycleEvent::Realized {
                 domain: "switcher".into(),
-                manual_transition: Some(manual_transition),
-                fade_to_black: Some(live_fade_to_black()),
+                manual_transition,
+                fade_to_black: live_fade_to_black(),
             },
         }),
     );
@@ -745,7 +501,7 @@ fn serve_manual_position(listener: &TcpListener) {
     let (stream, _) = listener.accept().unwrap();
     let mut writer = stream.try_clone().unwrap();
     let mut reader = BufReader::new(stream);
-    assert_client_hello(read_message(&mut reader));
+    assert_handshake_request(read_message(&mut reader));
     let initial_manual =
         fm_protocol::ManualTransitionStatus::Active(fm_protocol::ManualTransitionState {
             kind: fm_protocol::ManualTransitionKind::Fade,
@@ -758,17 +514,14 @@ fn serve_manual_position(listener: &TcpListener) {
         &mut writer,
         &engine,
         0,
-        fm_protocol::MANUAL_TRANSITION_PROTOCOL_VERSION,
+        fm_protocol::CURRENT_PROTOCOL_VERSION,
         initial_manual,
     );
 
     let WireMessage::Command(command) = read_message(&mut reader) else {
         panic!("expected remote manual-position command");
     };
-    assert_eq!(
-        command.protocol,
-        fm_protocol::MANUAL_TRANSITION_PROTOCOL_VERSION
-    );
+    assert_eq!(command.protocol, fm_protocol::CURRENT_PROTOCOL_VERSION);
     assert_eq!(
         command.payload,
         CommandPayload::SetManualTransitionPosition {
@@ -802,8 +555,9 @@ fn serve_manual_position(listener: &TcpListener) {
             payload: EventPayload::DesiredSwitcher {
                 program: input(1),
                 preview: input(2),
-                manual_transition: Some(fm_protocol::ManualTransitionStatus::Active(desired_state)),
-                fade_to_black: None,
+                manual_transition: fm_protocol::ManualTransitionStatus::Active(desired_state),
+                fade_to_black: live_fade_to_black(),
+                overlays: OverlayStatus::empty_channels(),
             },
         }),
     );
@@ -821,25 +575,25 @@ fn serve_manual_position(listener: &TcpListener) {
             sequence: 1,
             event: RuntimeLifecycleEvent::Realized {
                 domain: "switcher".into(),
-                manual_transition: Some(realized),
-                fade_to_black: None,
+                manual_transition: realized,
+                fade_to_black: live_fade_to_black(),
             },
         }),
     );
 }
 
-fn assert_client_hello(message: WireMessage) {
-    let WireMessage::ClientHello(hello) = message else {
-        panic!("expected client hello");
+fn assert_handshake_request(message: WireMessage) {
+    let WireMessage::HandshakeRequest(hello) = message else {
+        panic!("expected handshake request");
     };
     assert_eq!(hello.versions, vec![CURRENT_PROTOCOL_VERSION]);
     assert_eq!(hello.client_type, ClientType::Cli);
     assert_eq!(hello.desired_role, Role::Operator);
-    assert_eq!(hello.cached_cursor, None);
+    assert_eq!(hello.resume_cursor, None);
 }
 
 fn write_handshake(writer: &mut TcpStream, engine: &EngineIdentity, revision: u64) {
-    write_handshake_version(writer, engine, revision, ProtocolVersion::new(1, 0));
+    write_handshake_version(writer, engine, revision, CURRENT_PROTOCOL_VERSION);
 }
 
 fn write_handshake_version(
@@ -866,14 +620,22 @@ fn write_handshake_version_with_manual(
 ) {
     write_message(
         writer,
-        &WireMessage::ServerHello(ServerHello {
+        &WireMessage::HandshakeResponse(HandshakeResponse {
             negotiated,
             granted_role: Role::Operator,
             permissions: vec!["switcher.write".into()],
-            capabilities_digest: "fake-capabilities".into(),
-            engine: engine.clone(),
+            capabilities: CapabilityReportSummary {
+                digest: "fake-capabilities".into(),
+                total: 0,
+                available: 0,
+                degraded: 0,
+                unavailable: 0,
+            },
+            server: server_identity(engine),
             current_revision: revision,
-            resume: false,
+            outcome: HandshakeOutcome::Snapshot {
+                reason: SnapshotReason::NoCursor,
+            },
         }),
     );
     let preview = if revision == 0 { input(2) } else { input(1) };
@@ -888,11 +650,13 @@ fn write_handshake_version_with_manual(
             desired_preview: preview,
             realized_program: input(1),
             realized_preview: preview,
-            desired_manual_transition: (negotiated.minor >= 4).then_some(manual_transition),
-            realized_manual_transition: (negotiated.minor >= 4).then_some(manual_transition),
-            desired_fade_to_black: None,
-            realized_fade_to_black: None,
-            stingers: None,
+            desired_manual_transition: manual_transition,
+            realized_manual_transition: manual_transition,
+            desired_fade_to_black: live_fade_to_black(),
+            realized_fade_to_black: live_fade_to_black(),
+            stingers: Vec::new(),
+            desired_overlays: OverlayStatus::empty_channels(),
+            realized_overlays: OverlayStatus::empty_channels(),
         }),
     );
 }
@@ -906,14 +670,22 @@ fn write_handshake_version_with_fade_to_black(
 ) {
     write_message(
         writer,
-        &WireMessage::ServerHello(ServerHello {
+        &WireMessage::HandshakeResponse(HandshakeResponse {
             negotiated,
             granted_role: Role::Operator,
             permissions: vec!["switcher.write".into()],
-            capabilities_digest: "fake-capabilities".into(),
-            engine: engine.clone(),
+            capabilities: CapabilityReportSummary {
+                digest: "fake-capabilities".into(),
+                total: 0,
+                available: 0,
+                degraded: 0,
+                unavailable: 0,
+            },
+            server: server_identity(engine),
             current_revision: revision,
-            resume: false,
+            outcome: HandshakeOutcome::Snapshot {
+                reason: SnapshotReason::NoCursor,
+            },
         }),
     );
     write_message(
@@ -927,11 +699,13 @@ fn write_handshake_version_with_fade_to_black(
             desired_preview: input(2),
             realized_program: input(1),
             realized_preview: input(2),
-            desired_manual_transition: Some(fm_protocol::ManualTransitionStatus::Inactive),
-            realized_manual_transition: Some(fm_protocol::ManualTransitionStatus::Inactive),
-            desired_fade_to_black: Some(fade_to_black),
-            realized_fade_to_black: Some(fade_to_black),
-            stingers: Some(Vec::new()),
+            desired_manual_transition: fm_protocol::ManualTransitionStatus::Inactive,
+            realized_manual_transition: fm_protocol::ManualTransitionStatus::Inactive,
+            desired_fade_to_black: fade_to_black,
+            realized_fade_to_black: fade_to_black,
+            desired_overlays: OverlayStatus::empty_channels(),
+            realized_overlays: OverlayStatus::empty_channels(),
+            stingers: Vec::new(),
         }),
     );
 }
@@ -949,7 +723,7 @@ fn assert_command(
     key: &str,
     expected_revision: u64,
 ) {
-    assert_eq!(command.protocol, ProtocolVersion::new(1, 0));
+    assert_eq!(command.protocol, CURRENT_PROTOCOL_VERSION);
     assert_eq!(command.idempotency_key, key);
     assert_eq!(command.expected_revision, Some(expected_revision));
     assert_eq!(command.deadline_ms, None);
@@ -973,8 +747,9 @@ fn write_command_events(
             payload: EventPayload::DesiredSwitcher {
                 program: input(1),
                 preview: input(1),
-                manual_transition: None,
-                fade_to_black: None,
+                manual_transition: fm_protocol::ManualTransitionStatus::Inactive,
+                fade_to_black: live_fade_to_black(),
+                overlays: OverlayStatus::empty_channels(),
             },
         }),
     );
@@ -1010,8 +785,8 @@ fn write_command_events(
             sequence,
             event: RuntimeLifecycleEvent::Realized {
                 domain: "switcher".into(),
-                manual_transition: None,
-                fade_to_black: None,
+                manual_transition: fm_protocol::ManualTransitionStatus::Inactive,
+                fade_to_black: live_fade_to_black(),
             },
         }),
     );
@@ -1108,144 +883,6 @@ fn remote_commands_use_protocol_server_and_replay_duplicate_keys() {
 fn remote_commands_reject_non_loopback_addresses_before_connecting() {
     let output = invoke(&["remote-status", "192.0.2.1:9123"]);
     assert_failure_contains(&output, "requires a loopback address");
-}
-
-#[test]
-fn new_cli_does_not_send_wipe_to_an_old_daemon() {
-    let server = FakeRemoteServer::start_old_without_wipe();
-    let output = invoke(&[
-        "remote-wipe",
-        &server.address(),
-        "3",
-        "--key",
-        "unsupported-wipe",
-    ]);
-    assert_failure_contains(
-        &output,
-        "command requires protocol 1.3, but the session negotiated 1.0",
-    );
-    server.finish();
-}
-
-#[test]
-fn cli_does_not_send_manual_t_bar_commands_to_a_protocol_1_3_daemon() {
-    let server = FakeRemoteServer::start_old_without_manual_t_bar();
-    let output = invoke(&[
-        "remote-tbar-start",
-        &server.address(),
-        "fade",
-        "--key",
-        "unsupported-manual",
-    ]);
-    assert_failure_contains(
-        &output,
-        "command requires protocol 1.4, but the session negotiated 1.3",
-    );
-    server.finish();
-}
-
-#[test]
-fn cli_does_not_send_fade_to_black_to_a_protocol_1_4_daemon() {
-    let server = FakeRemoteServer::start_old_without_fade_to_black();
-    let output = invoke(&[
-        "remote-ftb",
-        &server.address(),
-        "black",
-        "3",
-        "--key",
-        "unsupported-ftb",
-    ]);
-    assert_failure_contains(
-        &output,
-        "command requires protocol 1.5, but the session negotiated 1.4",
-    );
-    server.finish();
-}
-
-#[test]
-fn cli_does_not_send_alpha_fade_to_a_protocol_1_5_daemon() {
-    let server = FakeRemoteServer::start_old_without_alpha_fade();
-    let output = invoke(&[
-        "remote-alpha-fade",
-        &server.address(),
-        "3",
-        "--key",
-        "unsupported-alpha-fade",
-    ]);
-    assert_failure_contains(
-        &output,
-        "command requires protocol 1.6, but the session negotiated 1.5",
-    );
-    server.finish();
-}
-
-#[test]
-fn cli_does_not_send_slide_to_a_protocol_1_7_daemon() {
-    let server = FakeRemoteServer::start_old_without_slide();
-    let output = invoke(&[
-        "remote-slide",
-        &server.address(),
-        "3",
-        "--key",
-        "unsupported-slide",
-    ]);
-    assert_failure_contains(
-        &output,
-        "command requires protocol 1.8, but the session negotiated 1.7",
-    );
-    server.finish();
-}
-
-#[test]
-fn cli_does_not_send_zoom_to_a_protocol_1_8_daemon() {
-    let server = FakeRemoteServer::start_old_without_zoom();
-    let output = invoke(&[
-        "remote-zoom",
-        &server.address(),
-        "3",
-        "--key",
-        "unsupported-zoom",
-    ]);
-    assert_failure_contains(
-        &output,
-        "command requires protocol 1.9, but the session negotiated 1.8",
-    );
-    server.finish();
-}
-
-#[test]
-fn cli_does_not_send_stinger_to_a_protocol_1_9_daemon() {
-    let server = FakeRemoteServer::start_old_without_stinger();
-    let output = invoke(&[
-        "remote-stinger",
-        &server.address(),
-        "8",
-        "3",
-        "--key",
-        "unsupported-stinger",
-    ]);
-    assert_failure_contains(
-        &output,
-        "command requires protocol 1.10, but the session negotiated 1.9",
-    );
-    server.finish();
-}
-
-#[test]
-fn cli_does_not_send_manual_alpha_fade_to_a_protocol_1_6_daemon() {
-    let server = FakeRemoteServer::start_old_without_manual_alpha_fade();
-    let output = invoke(&[
-        "remote-tbar-start",
-        &server.address(),
-        "alpha-fade",
-        "--key",
-        "unsupported-manual-alpha",
-    ]);
-    assert_failure_contains(
-        &output,
-        "command requires protocol 1.7, but the session negotiated 1.6",
-    );
-    server.finish();
 }
 
 #[test]
@@ -2172,7 +1809,7 @@ fn status_escapes_show_names_onto_one_line() {
 }
 
 #[test]
-fn edited_schema_v4_configuration_survives_commands_restart_and_render() {
+fn edited_current_configuration_survives_commands_restart_and_render() {
     let root = unique_test_root();
     let project = root.join("edited.freemix");
     let solid_image = root.join("solid.ppm");
@@ -2181,7 +1818,7 @@ fn edited_schema_v4_configuration_survives_commands_restart_and_render() {
     let project_path = project.to_str().unwrap();
     assert_success(&invoke(&["new", project_path, "--name", "Edited V3"]));
 
-    edit_schema_v4_configuration(&project);
+    edit_current_configuration(&project);
 
     let before = status(&project);
     assert_status(&before, 0, 0, 1, 1, 2, 2);
@@ -2230,7 +1867,7 @@ fn edited_schema_v4_configuration_survives_commands_restart_and_render() {
     fs::remove_dir_all(root).unwrap();
 }
 
-fn edit_schema_v4_configuration(project: &Path) {
+fn edit_current_configuration(project: &Path) {
     let mut source = manifest(project);
     let default_rate = r#"{"numerator": 60000, "denominator": 1001}"#;
     assert_eq!(source.matches(default_rate).count(), 2);
@@ -2341,164 +1978,6 @@ fn render_rejects_non_simulated_inputs_clearly() {
     );
     assert!(!image.exists());
 
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn supported_legacy_manifest_is_migrated_before_cli_load() {
-    let root = unique_test_root();
-    let project = root.join("legacy.freemix");
-    let image = root.join("legacy.ppm");
-    fs::create_dir_all(&project).unwrap();
-    fs::write(
-        project.join("project.json"),
-        r#"{
-  "schema_version": 2,
-  "project_id": 42,
-  "show_name": "Legacy CLI",
-  "input_ids": [1, 2],
-  "desired_program_id": 1,
-  "realized_program_id": 1,
-  "desired_preview_id": 2,
-  "realized_preview_id": 2,
-  "revision": 0,
-  "state_epoch": 1,
-  "event_sequence": 0,
-  "frames_rendered": 0,
-  "runtime_generation": 0,
-  "clock_time_nanos": 0,
-  "idempotency_receipts": []
-}
-"#,
-    )
-    .unwrap();
-
-    let migrated_status = status(&project);
-    assert!(migrated_status.contains("project_id=42 show=\"Legacy CLI\""));
-    assert_status(&migrated_status, 0, 0, 1, 1, 2, 2);
-    let migrated = manifest(&project);
-    assert!(migrated.starts_with("{\n  \"schema_version\": 10,"));
-    assert!(migrated.contains(r#""type": "simulated""#));
-
-    assert_success(&invoke(&[
-        "render",
-        project.to_str().unwrap(),
-        image.to_str().unwrap(),
-        "--width",
-        "2",
-        "--height",
-        "1",
-    ]));
-    assert_solid_ppm(&image, 2, 1, [73, 151, 199]);
-
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn schema_v8_manifest_is_migrated_before_cli_load() {
-    let root = unique_test_root();
-    let project = root.join("v8.freemix");
-    fs::create_dir_all(&root).unwrap();
-    assert_success(&invoke(&["new", project.to_str().unwrap()]));
-    let legacy = manifest(&project)
-        .replacen("\"schema_version\": 10", "\"schema_version\": 8", 1)
-        .replace(",\n    \"stingers\": []", "");
-    fs::write(project.join("project.json"), legacy).unwrap();
-
-    assert!(status(&project).contains("show=\"FreeMix Show\""));
-    assert!(manifest(&project).starts_with("{\n  \"schema_version\": 10,"));
-
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn schema_v5_manual_state_migrates_then_mutates_and_restarts_exactly() {
-    let root = unique_test_root();
-    let project = root.join("manual-v5.freemix");
-    fs::create_dir_all(&project).unwrap();
-    fs::write(
-        project.join("project.json"),
-        include_str!("../../../crates/services/fm-persistence/tests/fixtures/schema-v5.json"),
-    )
-    .unwrap();
-
-    let migrated = status(&project);
-    assert!(migrated.contains("TBar(desired=fade:1->2@6250, realized=fade:1->2@6250)"));
-    let migrated_manifest = manifest(&project);
-    assert!(migrated_manifest.starts_with("{\n  \"schema_version\": 10,"));
-    assert!(migrated_manifest.contains(r#""mask": null"#));
-    assert!(migrated_manifest.contains(
-        r#""desired": {"kind": "fade", "from_id": 1, "to_id": 2, "interval_start_basis_points": 0, "position_basis_points": 6250}"#
-    ));
-    assert!(migrated_manifest.contains(
-        r#""realized": {"kind": "fade", "from_id": 1, "to_id": 2, "interval_start_basis_points": 6250, "position_basis_points": 6250}"#
-    ));
-
-    let reversed = invoke(&[
-        "tbar-position",
-        project.to_str().unwrap(),
-        "2500",
-        "--key",
-        "migrated-manual-reverse",
-        "--expect",
-        "0",
-    ]);
-    assert_success(&reversed);
-    assert_status(&stdout(&reversed), 1, 121, 1, 1, 2, 2);
-    assert!(stdout(&reversed).contains("TBar(desired=fade:1->2@2500, realized=fade:1->2@2500)"));
-    assert_eq!(status(&project), stdout(&reversed));
-    let saved = manifest(&project);
-    assert!(saved.contains(
-        r#""desired": {"kind": "fade", "from_id": 1, "to_id": 2, "interval_start_basis_points": 0, "position_basis_points": 2500}"#
-    ));
-    assert!(saved.contains(
-        r#""realized": {"kind": "fade", "from_id": 1, "to_id": 2, "interval_start_basis_points": 2500, "position_basis_points": 2500}"#
-    ));
-
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn schema_v3_manifest_is_migrated_before_cli_load() {
-    let root = unique_test_root();
-    let project = root.join("v3.freemix");
-    fs::create_dir_all(&project).unwrap();
-    fs::write(
-        project.join("project.json"),
-        include_str!("../../../crates/services/fm-persistence/tests/fixtures/schema-v3.json")
-            .replace("\"revision\": 7", "\"revision\": 0")
-            .replace("\"event_sequence\": 9", "\"event_sequence\": 0")
-            .replace("\"frames_rendered\": 240", "\"frames_rendered\": 0")
-            .replace("\"runtime_generation\": 3", "\"runtime_generation\": 0")
-            .replace("\"clock_time_nanos\": 10000000", "\"clock_time_nanos\": 0"),
-    )
-    .unwrap();
-
-    let migrated_status = status(&project);
-    assert!(migrated_status.contains("show=\"Frozen V3 Scene\""));
-    let migrated = manifest(&project);
-    assert!(migrated.starts_with("{\n  \"schema_version\": 10,"));
-    assert!(migrated.contains(r#""background": {"red": 0, "green": 0, "blue": 0, "alpha": 255}"#));
-    assert!(migrated.contains(
-        r#""geometry": {"translation_x": 0, "translation_y": 0, "width": 3840, "height": 2160, "rotation": "deg0"}"#
-    ));
-
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn schema_v1_manifest_is_rejected_without_mutation() {
-    let root = unique_test_root();
-    let project = root.join("v1.freemix");
-    fs::create_dir_all(&project).unwrap();
-    let original =
-        include_str!("../../../crates/services/fm-persistence/tests/fixtures/schema-v1.json");
-    fs::write(project.join("project.json"), original).unwrap();
-
-    let result = invoke(&["status", project.to_str().unwrap()]);
-
-    assert_failure_contains(&result, "unsupported schema 1; expected 10");
-    assert_eq!(manifest(&project), original);
     fs::remove_dir_all(root).unwrap();
 }
 

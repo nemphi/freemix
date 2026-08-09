@@ -2,15 +2,15 @@ use core::{num::NonZeroU128, str::FromStr};
 use std::collections::BTreeMap;
 
 use crate::{
-    CapabilityReportMessage, CapabilityReportSummary, ClientHello, CodecError, CommandMessage,
-    CommandPayload, CommandResult, DurableEventBatch, DurableGap, EngineIdentity, ErrorMessage,
-    EventCursor, EventMessage, EventPayload, FadeToBlackPosition, FadeToBlackState,
-    HandshakeOutcome, HandshakeRequest, HandshakeResponse, HeartbeatMessage, ManualTransitionKind,
-    ManualTransitionPosition, ManualTransitionState, ManualTransitionStatus, ResumeCursor,
-    RuntimeEventMessage, RuntimeFailureDisposition, RuntimeLifecycleEvent, ServerHello,
+    CapabilityReportMessage, CapabilityReportSummary, CodecError, CommandMessage, CommandPayload,
+    CommandResult, DurableEventBatch, DurableGap, EngineIdentity, ErrorMessage, EventCursor,
+    EventMessage, EventPayload, FadeToBlackPosition, FadeToBlackState, HandshakeOutcome,
+    HandshakeRequest, HandshakeResponse, HeartbeatMessage, ManualTransitionKind,
+    ManualTransitionPosition, ManualTransitionState, ManualTransitionStatus, OverlayStatus,
+    ResumeCursor, RuntimeEventMessage, RuntimeFailureDisposition, RuntimeLifecycleEvent,
     ServerIdentity, SnapshotMessage, SnapshotReason, StingerAudioPolicy,
     StingerMissingMediaFallback, StingerReadiness, StingerStatus, StructuredError, WireInputId,
-    WireMessage, WireStingerSlotId,
+    WireMessage, WireOutputId, WireOverlayChannelId, WireStingerSlotId,
 };
 
 use super::value::{
@@ -48,8 +48,6 @@ pub fn decode_line(line: &str) -> Result<WireMessage, CodecError> {
         .ok_or(CodecError::InvalidRecord)?;
     let mut fields = Fields::parse(parts)?;
     let message = match kind {
-        "client_hello" => WireMessage::ClientHello(decode_client_hello(&mut fields)?),
-        "server_hello" => WireMessage::ServerHello(decode_server_hello(&mut fields)?),
         "command" => WireMessage::Command(decode_command(&mut fields)?),
         "command_result" => WireMessage::CommandResult(decode_result(&mut fields)?),
         "snapshot" => WireMessage::Snapshot(decode_snapshot(&mut fields)?),
@@ -197,16 +195,6 @@ impl Fields {
         }
     }
 
-    fn boolean_optional(&mut self, name: &'static str) -> Result<Option<bool>, CodecError> {
-        self.optional(name)
-            .map(|value| match value.as_str() {
-                "0" => Ok(false),
-                "1" => Ok(true),
-                _ => Err(CodecError::InvalidField { field: name, value }),
-            })
-            .transpose()
-    }
-
     fn input(&mut self, name: &'static str) -> Result<WireInputId, CodecError> {
         let value = self.required(name)?;
         parse_input(&value).ok_or(CodecError::InvalidField { field: name, value })
@@ -215,7 +203,7 @@ impl Fields {
     fn finish(self) -> Result<(), CodecError> {
         self.0
             .into_keys()
-            .find(|name| !name.starts_with('?'))
+            .next()
             .map_or(Ok(()), |name| Err(CodecError::UnknownField(name)))
     }
 }
@@ -239,63 +227,6 @@ fn decode_cursor(fields: &mut Fields) -> Result<EventCursor, CodecError> {
     })
 }
 
-fn decode_client_hello(fields: &mut Fields) -> Result<ClientHello, CodecError> {
-    let value = fields.required("versions")?;
-    let versions = parse_versions(&value)?;
-    let value = fields.required("client_type")?;
-    let client_type = parse_client_type(&value).ok_or(CodecError::InvalidField {
-        field: "client_type",
-        value,
-    })?;
-    let value = fields.required("desired_role")?;
-    let desired_role = parse_role(&value).ok_or(CodecError::InvalidField {
-        field: "desired_role",
-        value,
-    })?;
-    let cached_cursor = if fields.boolean("cached")? {
-        Some(EventCursor {
-            engine: EngineIdentity {
-                engine_id: fields.required("cached_engine_id")?,
-                state_epoch: fields.parse_required("cached_state_epoch")?,
-                log_id: fields.required("cached_log_id")?,
-            },
-            revision: fields.parse_required("cached_revision")?,
-        })
-    } else {
-        None
-    };
-    Ok(ClientHello {
-        versions,
-        build: fields.required("build")?,
-        client_type,
-        desired_role,
-        cached_cursor,
-    })
-}
-
-fn decode_server_hello(fields: &mut Fields) -> Result<ServerHello, CodecError> {
-    let value = fields.required("protocol")?;
-    let negotiated = parse_version(&value).ok_or(CodecError::InvalidField {
-        field: "protocol",
-        value,
-    })?;
-    let value = fields.required("granted_role")?;
-    let granted_role = parse_role(&value).ok_or(CodecError::InvalidField {
-        field: "granted_role",
-        value,
-    })?;
-    let permissions = parse_string_list(&fields.required("permissions")?)?;
-    Ok(ServerHello {
-        negotiated,
-        granted_role,
-        permissions,
-        capabilities_digest: fields.required("capabilities")?,
-        engine: decode_identity(fields)?,
-        current_revision: fields.parse_required("current_revision")?,
-        resume: fields.boolean("resume")?,
-    })
-}
-
 fn decode_command(fields: &mut Fields) -> Result<CommandMessage, CodecError> {
     let value = fields.required("protocol")?;
     let protocol = parse_version(&value).ok_or(CodecError::InvalidField {
@@ -303,7 +234,22 @@ fn decode_command(fields: &mut Fields) -> Result<CommandMessage, CodecError> {
         value,
     })?;
     let payload_name = fields.required("payload")?;
-    let payload = match payload_name.as_str() {
+    let payload = decode_command_payload(fields, payload_name)?;
+    Ok(CommandMessage {
+        protocol,
+        id: fields.required("id")?,
+        idempotency_key: fields.required("idempotency_key")?,
+        expected_revision: fields.parse_optional("expected_revision")?,
+        deadline_ms: fields.parse_optional("deadline_ms")?,
+        payload,
+    })
+}
+
+fn decode_command_payload(
+    fields: &mut Fields,
+    payload_name: String,
+) -> Result<CommandPayload, CodecError> {
+    Ok(match payload_name.as_str() {
         "select_preview" => CommandPayload::SelectPreview {
             input: fields.input("input")?,
         },
@@ -335,6 +281,9 @@ fn decode_command(fields: &mut Fields) -> Result<CommandMessage, CodecError> {
         "remove_stinger" => CommandPayload::RemoveStinger {
             slot: decode_stinger_slot(fields)?,
         },
+        overlay @ ("overlay_take" | "overlay_update" | "overlay_off" | "overlay_output"
+        | "overlay_transition" | "overlay_appearance" | "overlay_queue"
+        | "overlay_next") => decode_overlay_command(fields, overlay)?,
         "wipe" => CommandPayload::Wipe {
             duration_frames: fields.parse_required("duration_frames")?,
         },
@@ -379,15 +328,115 @@ fn decode_command(fields: &mut Fields) -> Result<CommandMessage, CodecError> {
                 value: payload_name,
             });
         }
-    };
-    Ok(CommandMessage {
-        protocol,
-        id: fields.required("id")?,
-        idempotency_key: fields.required("idempotency_key")?,
-        expected_revision: fields.parse_optional("expected_revision")?,
-        deadline_ms: fields.parse_optional("deadline_ms")?,
-        payload,
     })
+}
+
+fn decode_overlay_command(fields: &mut Fields, name: &str) -> Result<CommandPayload, CodecError> {
+    let channel = decode_overlay_channel(fields)?;
+    Ok(match name {
+        "overlay_take" => CommandPayload::TakeOverlay {
+            channel,
+            source: fields.input("source")?,
+        },
+        "overlay_update" => CommandPayload::UpdateOverlay {
+            channel,
+            source: fields.input("source")?,
+        },
+        "overlay_off" => CommandPayload::OverlayOff { channel },
+        "overlay_output" => CommandPayload::SetOverlayOutputInclusion {
+            channel,
+            output: decode_output(fields, "output")?,
+            included: fields.boolean("included")?,
+        },
+        "overlay_transition" => {
+            let transition =
+                decode_overlay_transition(fields.required("transition")?, "transition")?;
+            let duration_frames = fields.parse_required("duration_frames")?;
+            validate_overlay_duration(duration_frames, "duration_frames")?;
+            CommandPayload::ConfigureOverlayTransition {
+                channel,
+                transition,
+                duration_frames,
+            }
+        }
+        "overlay_appearance" => CommandPayload::ConfigureOverlayAppearance {
+            channel,
+            position: decode_overlay_position(fields.required("position")?, "position")?,
+            border: decode_overlay_border(fields.required("border")?, "border")?,
+        },
+        "overlay_queue" => CommandPayload::QueueOverlay {
+            channel,
+            source: fields.input("source")?,
+        },
+        "overlay_next" => CommandPayload::TakeNextOverlay { channel },
+        _ => unreachable!("only overlay command names are delegated"),
+    })
+}
+
+fn decode_overlay_channel(fields: &mut Fields) -> Result<WireOverlayChannelId, CodecError> {
+    let number: u8 = fields.parse_required("channel")?;
+    WireOverlayChannelId::new(number).ok_or(CodecError::InvalidField {
+        field: "channel",
+        value: number.to_string(),
+    })
+}
+
+fn decode_overlay_transition(
+    value: String,
+    field: &'static str,
+) -> Result<crate::OverlayTransitionKind, CodecError> {
+    match value.as_str() {
+        "cut" => Ok(crate::OverlayTransitionKind::Cut),
+        "fade" => Ok(crate::OverlayTransitionKind::Fade),
+        _ => Err(CodecError::InvalidField { field, value }),
+    }
+}
+
+fn decode_overlay_position(
+    value: String,
+    field: &'static str,
+) -> Result<crate::OverlayPositionPreset, CodecError> {
+    match value.as_str() {
+        "full_frame" => Ok(crate::OverlayPositionPreset::FullFrame),
+        "top_left" => Ok(crate::OverlayPositionPreset::TopLeft),
+        "top_right" => Ok(crate::OverlayPositionPreset::TopRight),
+        "bottom_left" => Ok(crate::OverlayPositionPreset::BottomLeft),
+        "bottom_right" => Ok(crate::OverlayPositionPreset::BottomRight),
+        _ => Err(CodecError::InvalidField { field, value }),
+    }
+}
+
+fn decode_overlay_border(
+    value: String,
+    field: &'static str,
+) -> Result<crate::OverlayBorderPreset, CodecError> {
+    match value.as_str() {
+        "none" => Ok(crate::OverlayBorderPreset::None),
+        "thin_white" => Ok(crate::OverlayBorderPreset::ThinWhite),
+        "thick_white" => Ok(crate::OverlayBorderPreset::ThickWhite),
+        _ => Err(CodecError::InvalidField { field, value }),
+    }
+}
+
+fn validate_overlay_duration(duration_frames: u32, field: &'static str) -> Result<(), CodecError> {
+    if (1..=3_600).contains(&duration_frames) {
+        Ok(())
+    } else {
+        Err(CodecError::InvalidField {
+            field,
+            value: duration_frames.to_string(),
+        })
+    }
+}
+
+fn decode_output(fields: &mut Fields, field: &'static str) -> Result<WireOutputId, CodecError> {
+    let value = fields.required(field)?;
+    let id = NonZeroU128::new(value.parse().map_err(|_| CodecError::InvalidField {
+        field,
+        value: value.clone(),
+    })?)
+    .ok_or(CodecError::InvalidField { field, value })?;
+    Ok(WireOutputId::new(id))
 }
 
 fn decode_configure_stinger(fields: &mut Fields) -> Result<CommandPayload, CodecError> {
@@ -477,15 +526,157 @@ fn decode_snapshot(fields: &mut Fields) -> Result<SnapshotMessage, CodecError> {
             FadeToBlackStateFields::Realized,
         )?,
         stingers: decode_stingers(fields)?,
+        desired_overlays: decode_overlays(fields, "desired_overlays")?,
+        realized_overlays: decode_overlays(fields, "realized_overlays")?,
     })
 }
 
-fn decode_stingers(fields: &mut Fields) -> Result<Option<Vec<StingerStatus>>, CodecError> {
-    let Some(value) = fields.optional("?stingers") else {
-        return Ok(None);
+fn decode_overlays(
+    fields: &mut Fields,
+    field: &'static str,
+) -> Result<Vec<OverlayStatus>, CodecError> {
+    let value = fields.required(field)?;
+    let entries = value.split(';').collect::<Vec<_>>();
+    if entries.len() != 8 {
+        return Err(CodecError::InvalidField { field, value });
+    }
+    let mut seen = [false; 8];
+    entries
+        .into_iter()
+        .map(|entry| decode_overlay_status(entry, field, &mut seen))
+        .collect()
+}
+
+fn decode_overlay_status(
+    entry: &str,
+    field: &'static str,
+    seen: &mut [bool; 8],
+) -> Result<OverlayStatus, CodecError> {
+    let parts = entry.split(':').collect::<Vec<_>>();
+    let [
+        channel,
+        source,
+        active,
+        opacity,
+        transition,
+        duration_frames,
+        position,
+        border,
+        queue,
+        outputs,
+    ] = parts.as_slice()
+    else {
+        return Err(CodecError::InvalidField {
+            field,
+            value: entry.to_owned(),
+        });
     };
+    let channel_number: u8 = channel.parse().map_err(|_| CodecError::InvalidField {
+        field,
+        value: entry.to_owned(),
+    })?;
+    let channel =
+        WireOverlayChannelId::new(channel_number).ok_or_else(|| CodecError::InvalidField {
+            field,
+            value: entry.to_owned(),
+        })?;
+    let index = usize::from(channel_number - 1);
+    if seen[index] {
+        return Err(CodecError::InvalidField {
+            field,
+            value: entry.to_owned(),
+        });
+    }
+    seen[index] = true;
+    let has_source = *source != "0";
+    let source = if has_source {
+        parse_input(source)
+    } else {
+        None
+    };
+    if has_source && source.is_none() {
+        return Err(CodecError::InvalidField {
+            field,
+            value: entry.to_owned(),
+        });
+    }
+    let active = match *active {
+        "0" => false,
+        "1" => true,
+        _ => {
+            return Err(CodecError::InvalidField {
+                field,
+                value: entry.to_owned(),
+            });
+        }
+    };
+    let opacity = opacity.parse().map_err(|_| CodecError::InvalidField {
+        field,
+        value: entry.to_owned(),
+    })?;
+    let transition = decode_overlay_transition((*transition).to_owned(), field)?;
+    let duration_frames = duration_frames
+        .parse()
+        .map_err(|_| CodecError::InvalidField {
+            field,
+            value: entry.to_owned(),
+        })?;
+    validate_overlay_duration(duration_frames, field)?;
+    let position = decode_overlay_position((*position).to_owned(), field)?;
+    let border = decode_overlay_border((*border).to_owned(), field)?;
+    let queued_sources = decode_overlay_queue(queue, entry, field)?;
+    let included_outputs = if outputs.is_empty() {
+        Vec::new()
+    } else {
+        outputs
+            .split(',')
+            .map(|output| NonZeroU128::new(output.parse().ok()?).map(WireOutputId::new))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| CodecError::InvalidField {
+                field,
+                value: entry.to_owned(),
+            })?
+    };
+    Ok(OverlayStatus {
+        channel,
+        source,
+        active,
+        opacity,
+        transition,
+        duration_frames,
+        position,
+        border,
+        queued_sources,
+        included_outputs,
+    })
+}
+
+fn decode_overlay_queue(
+    value: &str,
+    entry: &str,
+    field: &'static str,
+) -> Result<Vec<WireInputId>, CodecError> {
     if value.is_empty() {
-        return Ok(Some(Vec::new()));
+        return Ok(Vec::new());
+    }
+    let values = value
+        .split(',')
+        .map(parse_input)
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| CodecError::InvalidField {
+            field,
+            value: entry.to_owned(),
+        })?;
+    if values.len() > 64 {
+        return Err(CodecError::TooManyItems("overlay queue"));
+    }
+    Ok(values)
+}
+
+fn decode_stingers(fields: &mut Fields) -> Result<Vec<StingerStatus>, CodecError> {
+    let value = fields.required("?stingers")?;
+    if value.is_empty() {
+        return Ok(Vec::new());
     }
     let entries: Vec<_> = value.split(',').collect();
     if entries.len() > 8 {
@@ -502,7 +693,7 @@ fn decode_stingers(fields: &mut Fields) -> Result<Option<Vec<StingerStatus>>, Co
         seen[slot_index] = true;
         stingers.push(status);
     }
-    Ok(Some(stingers))
+    Ok(stingers)
 }
 
 fn decode_stinger_status(entry: &str) -> Option<StingerStatus> {
@@ -564,13 +755,15 @@ fn decode_event(fields: &mut Fields) -> Result<EventMessage, CodecError> {
             preview: fields.input("preview")?,
             manual_transition: decode_manual_status(fields, ManualStatusFields::Unqualified)?,
             fade_to_black: decode_fade_to_black_state(fields, FadeToBlackStateFields::Unqualified)?,
+            overlays: decode_overlays(fields, "overlays")?,
         },
         "stinger_slots_changed" => EventPayload::StingerSlotsChanged {
             program: fields.input("program")?,
             preview: fields.input("preview")?,
             manual_transition: decode_manual_status(fields, ManualStatusFields::Unqualified)?,
             fade_to_black: decode_fade_to_black_state(fields, FadeToBlackStateFields::Unqualified)?,
-            stingers: decode_stingers(fields)?.ok_or(CodecError::MissingField("?stingers"))?,
+            stingers: decode_stingers(fields)?,
+            overlays: decode_overlays(fields, "overlays")?,
         },
         _ => {
             return Err(CodecError::InvalidField {
@@ -817,7 +1010,7 @@ enum ManualStatusFields {
 fn decode_manual_status(
     fields: &mut Fields,
     names: ManualStatusFields,
-) -> Result<Option<ManualTransitionStatus>, CodecError> {
+) -> Result<ManualTransitionStatus, CodecError> {
     let (active, kind, from, to, interval_start, position) = match names {
         ManualStatusFields::Desired => (
             "?desired_manual_active",
@@ -844,11 +1037,9 @@ fn decode_manual_status(
             "?manual_position_basis_points",
         ),
     };
-    let Some(active_value) = fields.boolean_optional(active)? else {
-        return Ok(None);
-    };
+    let active_value = fields.boolean(active)?;
     if !active_value {
-        return Ok(Some(ManualTransitionStatus::Inactive));
+        return Ok(ManualTransitionStatus::Inactive);
     }
     let kind_value = fields.required(kind)?;
     let kind = match kind_value.as_str() {
@@ -884,15 +1075,13 @@ fn decode_manual_status(
             field: position,
             value: position_value.to_string(),
         })?;
-    Ok(Some(ManualTransitionStatus::Active(
-        ManualTransitionState {
-            kind,
-            from: from_input,
-            to: to_input,
-            interval_start: interval_start_position,
-            position: exact_position,
-        },
-    )))
+    Ok(ManualTransitionStatus::Active(ManualTransitionState {
+        kind,
+        from: from_input,
+        to: to_input,
+        interval_start: interval_start_position,
+        position: exact_position,
+    }))
 }
 
 #[derive(Clone, Copy)]
@@ -905,7 +1094,7 @@ enum FadeToBlackStateFields {
 fn decode_fade_to_black_state(
     fields: &mut Fields,
     names: FadeToBlackStateFields,
-) -> Result<Option<FadeToBlackState>, CodecError> {
+) -> Result<FadeToBlackState, CodecError> {
     let (target_active, position) = match names {
         FadeToBlackStateFields::Desired => (
             "?desired_ftb_target_active",
@@ -917,17 +1106,10 @@ fn decode_fade_to_black_state(
         ),
         FadeToBlackStateFields::Unqualified => ("?ftb_target_active", "?ftb_position_numerator"),
     };
-    let target = fields.boolean_optional(target_active)?;
-    let numerator = fields.parse_optional(position)?;
-    match (target, numerator) {
-        (None, None) => Ok(None),
-        (Some(target_active), Some(numerator)) => Ok(Some(FadeToBlackState {
-            target_active,
-            position: FadeToBlackPosition::new(numerator),
-        })),
-        (Some(_), None) => Err(CodecError::MissingField(position)),
-        (None, Some(_)) => Err(CodecError::MissingField(target_active)),
-    }
+    Ok(FadeToBlackState {
+        target_active: fields.boolean(target_active)?,
+        position: FadeToBlackPosition::new(fields.parse_required(position)?),
+    })
 }
 
 fn decode_heartbeat(fields: &mut Fields) -> Result<HeartbeatMessage, CodecError> {

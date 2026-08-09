@@ -5,8 +5,8 @@ use fm_clock::ClockDomainId;
 use fm_engine::{Engine, EngineManualTransitionKind, ShowState};
 use fm_protocol::{
     CommandMessage, CommandPayload, CommandResult, EngineIdentity, EventCursor,
-    ManualTransitionKind, ManualTransitionPosition, ManualTransitionStatus, ProtocolVersion,
-    RuntimeLifecycleEvent, ServerIdentity, StingerAudioPolicy as ProtocolStingerAudioPolicy,
+    ManualTransitionKind, ManualTransitionPosition, ManualTransitionStatus, RuntimeLifecycleEvent,
+    ServerIdentity, StingerAudioPolicy as ProtocolStingerAudioPolicy,
     StingerMissingMediaFallback as ProtocolStingerFallback, StingerReadiness, StingerStatus,
     WireInputId, WireMessage, WireStingerSlotId,
 };
@@ -96,7 +96,7 @@ fn snapshot_projects_exact_stinger_configuration_and_realized_readiness() {
     let control = stinger_service();
     assert_eq!(
         control.snapshot().snapshot.stingers,
-        Some(vec![StingerStatus {
+        vec![StingerStatus {
             slot: WireStingerSlotId::new(1).unwrap(),
             media_input: WireInputId::from_domain(input(3)),
             preload: true,
@@ -104,7 +104,7 @@ fn snapshot_projects_exact_stinger_configuration_and_realized_readiness() {
             audio_policy: ProtocolStingerAudioPolicy::Muted,
             missing_media_fallback: ProtocolStingerFallback::KeepProgram,
             readiness: StingerReadiness::Ready,
-        }])
+        }]
     );
 }
 
@@ -147,7 +147,7 @@ fn stinger_slot_mutation_is_transition_authorized_and_projects_durable_state() {
     ));
     control.tick(&server_identity()).unwrap();
     assert_eq!(
-        control.snapshot().snapshot.stingers.as_ref().unwrap()[0].readiness,
+        control.snapshot().snapshot.stingers[0].readiness,
         StingerReadiness::Ready
     );
 
@@ -165,12 +165,12 @@ fn stinger_slot_mutation_is_transition_authorized_and_projects_durable_state() {
         )
         .unwrap();
     control.tick(&server_identity()).unwrap();
-    assert_eq!(control.snapshot().snapshot.stingers, Some(Vec::new()));
+    assert!(control.snapshot().snapshot.stingers.is_empty());
 }
 
 fn command(id: &str, key: &str, payload: CommandPayload) -> CommandMessage {
     CommandMessage {
-        protocol: ProtocolVersion::new(1, 0),
+        protocol: fm_protocol::CURRENT_PROTOCOL_VERSION,
         id: id.to_owned(),
         idempotency_key: key.to_owned(),
         expected_revision: None,
@@ -317,11 +317,11 @@ fn manual_transition_is_authorized_durable_reversible_and_replay_safe() {
     assert!(control.engine.realized_switcher().t_bar().is_none());
     assert_eq!(
         control.snapshot().snapshot.desired_manual_transition,
-        Some(ManualTransitionStatus::Inactive)
+        ManualTransitionStatus::Inactive
     );
     assert_eq!(
         control.snapshot().snapshot.realized_manual_transition,
-        Some(ManualTransitionStatus::Inactive)
+        ManualTransitionStatus::Inactive
     );
     assert_eq!(control.engine.realized_switcher().program(), input(1));
     assert_eq!(control.diagnostics().current_revision, 4);
@@ -360,7 +360,7 @@ fn manual_alpha_fade_projects_exact_authoritative_state() {
     ] {
         assert!(matches!(
             status,
-            Some(ManualTransitionStatus::Active(state))
+            ManualTransitionStatus::Active(state)
                 if state.kind == ManualTransitionKind::AlphaFade
                     && state.position.basis_points() == 6_250
         ));
@@ -372,16 +372,8 @@ fn manual_alpha_fade_projects_exact_authoritative_state() {
 }
 
 fn assert_manual_snapshot(control: &ControlService<Policy>, position: u16) {
-    let desired = control
-        .snapshot()
-        .snapshot
-        .desired_manual_transition
-        .expect("protocol 1.4 snapshot must carry desired manual state");
-    let realized = control
-        .snapshot()
-        .snapshot
-        .realized_manual_transition
-        .expect("protocol 1.4 snapshot must carry realized manual state");
+    let desired = control.snapshot().snapshot.desired_manual_transition;
+    let realized = control.snapshot().snapshot.realized_manual_transition;
     assert!(matches!(
         desired,
         ManualTransitionStatus::Active(state)
@@ -718,20 +710,15 @@ fn fade_to_black_is_authorized_reversible_and_runtime_ordered_with_program() {
     assert!(matches!(
         accepted.output.events[0].payload,
         EventPayload::DesiredSwitcher {
-            fade_to_black: Some(FadeToBlackState {
+            fade_to_black: FadeToBlackState {
                 target_active: true,
                 position: FadeToBlackPosition::BLACK,
-            }),
+            },
             ..
         }
     ));
     assert_eq!(
-        control
-            .snapshot()
-            .snapshot
-            .realized_fade_to_black
-            .unwrap()
-            .position,
+        control.snapshot().snapshot.realized_fade_to_black.position,
         FadeToBlackPosition::LIVE
     );
 
@@ -761,10 +748,10 @@ fn fade_to_black_is_authorized_reversible_and_runtime_ordered_with_program() {
     assert!(matches!(
         completed.runtime_events[0].event,
         RuntimeLifecycleEvent::Realized {
-            fade_to_black: Some(FadeToBlackState {
+            fade_to_black: FadeToBlackState {
                 target_active: true,
                 position: FadeToBlackPosition::BLACK,
-            }),
+            },
             ..
         }
     ));
@@ -840,10 +827,10 @@ fn reversing_fade_to_black_supersedes_only_the_displaced_intent() {
             generation: 3,
             sequence: 2,
             event: RuntimeLifecycleEvent::Realized {
-                fade_to_black: Some(FadeToBlackState {
+                fade_to_black: FadeToBlackState {
                     target_active: true,
                     position: FadeToBlackPosition::BLACK,
-                }),
+                },
                 ..
             },
             ..
@@ -1217,11 +1204,12 @@ fn command_result_is_represented_before_its_events() {
         EventPayload::DesiredSwitcher {
             program: WireInputId::from_domain(input(2)),
             preview: WireInputId::from_domain(input(1)),
-            manual_transition: Some(fm_protocol::ManualTransitionStatus::Inactive),
-            fade_to_black: Some(fm_protocol::FadeToBlackState {
+            manual_transition: fm_protocol::ManualTransitionStatus::Inactive,
+            fade_to_black: fm_protocol::FadeToBlackState {
                 target_active: false,
                 position: fm_protocol::FadeToBlackPosition::LIVE,
-            }),
+            },
+            overlays: fm_protocol::OverlayStatus::empty_channels(),
         }
     );
 }

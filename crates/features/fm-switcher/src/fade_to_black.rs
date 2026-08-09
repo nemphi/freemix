@@ -185,6 +185,15 @@ impl Default for FadeToBlackController {
 
 impl FadeToBlackController {
     #[must_use]
+    pub const fn settled(target: FadeToBlackTarget) -> Self {
+        Self {
+            position: target.position(),
+            target,
+            automatic: None,
+        }
+    }
+
+    #[must_use]
     pub const fn position(self) -> FadeToBlackPosition {
         self.position
     }
@@ -281,13 +290,6 @@ impl FadeToBlackController {
                 None
             },
         }
-    }
-
-    /// Applies the legacy immediate endpoint and cancels any automatic move.
-    pub const fn set_immediate(&mut self, target: FadeToBlackTarget) {
-        self.position = target.position();
-        self.target = target;
-        self.automatic = None;
     }
 }
 

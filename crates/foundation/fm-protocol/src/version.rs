@@ -1,17 +1,7 @@
 use core::fmt;
 
-pub const BASE_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 0);
-pub const WIPE_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 3);
-pub const MANUAL_TRANSITION_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 4);
-pub const FADE_TO_BLACK_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 5);
-pub const ALPHA_FADE_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 6);
-pub const MANUAL_ALPHA_FADE_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 7);
-pub const SLIDE_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 8);
-pub const ZOOM_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 9);
-pub const STINGER_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 10);
-pub const STINGER_STATUS_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 11);
-pub const STINGER_CONFIGURATION_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 12);
-pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = STINGER_CONFIGURATION_PROTOCOL_VERSION;
+/// The only protocol accepted by a current-development client or server.
+pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(2, 2);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ProtocolVersion {
@@ -37,32 +27,26 @@ pub struct NegotiationError;
 
 impl fmt::Display for NegotiationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("client and server have no compatible protocol major")
+        formatter.write_str("client and server do not share the current protocol contract")
     }
 }
 
 impl std::error::Error for NegotiationError {}
 
-/// Selects the newest shared major and the lower minor implemented by both
-/// peers for that major.
+/// Accepts only the exact current-development protocol contract.
 ///
 /// # Errors
 ///
-/// Returns [`NegotiationError`] when no major appears in both sets.
+/// Returns [`NegotiationError`] unless both peers advertise the exact current version.
 pub fn negotiate_version(
     client: &[ProtocolVersion],
     server: &[ProtocolVersion],
 ) -> Result<ProtocolVersion, NegotiationError> {
     client
         .iter()
-        .flat_map(|client| {
-            server
-                .iter()
-                .filter(move |server| server.major == client.major)
-                .map(move |server| {
-                    ProtocolVersion::new(client.major, client.minor.min(server.minor))
-                })
-        })
+        .copied()
+        .filter(|version| *version == CURRENT_PROTOCOL_VERSION)
+        .filter(|version| server.contains(version))
         .max()
         .ok_or(NegotiationError)
 }

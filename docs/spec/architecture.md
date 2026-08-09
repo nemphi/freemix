@@ -125,9 +125,9 @@ running” are separate fields with explicit restart policy. Recovery restores
 configuration, reconciles safe desired states, and never repeats an irreversible
 action merely because its acknowledgement was lost.
 
-Migrations are explicit `N -> N+1` transforms with fixtures. The latest version
-can read the preceding two schema versions. Downgrade export is best-effort and
-reports lost features.
+During current development, loading accepts the exact current schema only.
+Breaking schema changes replace the contract and its current-state coverage in
+place; version migration policy begins when the 1.0 contract is frozen.
 
 ## 5. Graph model
 

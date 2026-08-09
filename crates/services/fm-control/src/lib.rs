@@ -26,14 +26,19 @@ use fm_engine::{
 use fm_protocol::{
     CommandMessage, CommandPayload, CommandResult, EngineIdentity, EventCursor, EventMessage,
     EventPayload, FadeToBlackPosition, FadeToBlackState, FieldIssue, ManualTransitionKind,
-    ManualTransitionPosition, ManualTransitionState, ManualTransitionStatus, RuntimeEventMessage,
+    ManualTransitionPosition, ManualTransitionState, ManualTransitionStatus,
+    OverlayBorderPreset as ProtocolOverlayBorder, OverlayPositionPreset as ProtocolOverlayPosition,
+    OverlayStatus, OverlayTransitionKind as ProtocolOverlayTransition, RuntimeEventMessage,
     RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage,
     StingerAudioPolicy as ProtocolStingerAudioPolicy,
     StingerMissingMediaFallback as ProtocolStingerFallback, StingerReadiness, StingerStatus,
-    WireInputId, WireMessage, WireStingerSlotId,
+    WireInputId, WireMessage, WireOutputId, WireOverlayChannelId, WireStingerSlotId,
 };
 use fm_switcher::{
-    MissingMediaFallback, StingerAudioPolicy, StingerDescriptor, StingerPreloadState, StingerSlotId,
+    MissingMediaFallback, OverlayBorderPreset as SwitcherOverlayBorder, OverlayChannelId,
+    OverlayChannelState, OverlayPositionPreset as SwitcherOverlayPosition,
+    OverlayTransitionKind as SwitcherOverlayTransition, StingerAudioPolicy, StingerDescriptor,
+    StingerPreloadState, StingerSlotId,
 };
 
 /// Target-free authorization called before an engine command is constructed or validated.
@@ -214,6 +219,21 @@ impl<A: AuthorizationHook> PreparedSubmission<'_, A> {
             PreparedSubmissionKind::AuthorizationDenial => {
                 project_engine(&self.control.engine, ticks).map_err(ControlError::from)
             }
+        }
+    }
+
+    /// Returns the number of frames needed for the staged overlay channel to
+    /// reach its configured take/off target.
+    #[must_use]
+    pub fn overlay_transition_ticks(&self, channel: OverlayChannelId) -> u32 {
+        let engine = match &self.kind {
+            PreparedSubmissionKind::Engine { execution, .. } => execution.staged_engine(),
+            PreparedSubmissionKind::AuthorizationDenial => &self.control.engine,
+        };
+        let overlay = engine.show().desired_switcher().overlay(channel);
+        match overlay.transition() {
+            SwitcherOverlayTransition::Cut => 1,
+            SwitcherOverlayTransition::Fade => overlay.duration_frames(),
         }
     }
 
@@ -952,12 +972,8 @@ impl<A: AuthorizationHook> ControlService<A> {
     ) -> Result<RuntimeEventMessage, ControlError> {
         let event = RuntimeLifecycleEvent::Realized {
             domain: "switcher".to_owned(),
-            manual_transition: Some(protocol_manual_status(
-                self.engine.realized_manual_transition(),
-            )),
-            fade_to_black: Some(protocol_fade_to_black_state(
-                self.engine.realized_fade_to_black(),
-            )),
+            manual_transition: protocol_manual_status(self.engine.realized_manual_transition()),
+            fade_to_black: protocol_fade_to_black_state(self.engine.realized_fade_to_black()),
         };
         self.runtime_event(server, revision, generation, event)
     }
@@ -1039,6 +1055,14 @@ const fn command_class(payload: CommandPayload) -> CommandClass {
         | CommandPayload::Stinger { .. }
         | CommandPayload::ConfigureStinger { .. }
         | CommandPayload::RemoveStinger { .. }
+        | CommandPayload::TakeOverlay { .. }
+        | CommandPayload::UpdateOverlay { .. }
+        | CommandPayload::OverlayOff { .. }
+        | CommandPayload::SetOverlayOutputInclusion { .. }
+        | CommandPayload::ConfigureOverlayTransition { .. }
+        | CommandPayload::ConfigureOverlayAppearance { .. }
+        | CommandPayload::QueueOverlay { .. }
+        | CommandPayload::TakeNextOverlay { .. }
         | CommandPayload::Wipe { .. }
         | CommandPayload::FadeToBlack { .. }
         | CommandPayload::StartManualTransition { .. }
@@ -1096,6 +1120,14 @@ fn engine_command(payload: CommandPayload) -> EngineCommand {
         CommandPayload::RemoveStinger { slot } => EngineCommand::RemoveStinger {
             slot: StingerSlotId::new(slot.number()).expect("wire Stinger slots are bounded"),
         },
+        payload @ (CommandPayload::TakeOverlay { .. }
+        | CommandPayload::UpdateOverlay { .. }
+        | CommandPayload::OverlayOff { .. }
+        | CommandPayload::SetOverlayOutputInclusion { .. }
+        | CommandPayload::ConfigureOverlayTransition { .. }
+        | CommandPayload::ConfigureOverlayAppearance { .. }
+        | CommandPayload::QueueOverlay { .. }
+        | CommandPayload::TakeNextOverlay { .. }) => overlay_engine_command(payload),
         CommandPayload::Wipe { duration_frames } => EngineCommand::Wipe { duration_frames },
         CommandPayload::FadeToBlack {
             active,
@@ -1119,6 +1151,74 @@ fn engine_command(payload: CommandPayload) -> EngineCommand {
         CommandPayload::CommitManualTransition => EngineCommand::CommitManualTransition,
         CommandPayload::CancelManualTransition => EngineCommand::CancelManualTransition,
     }
+}
+
+fn overlay_engine_command(payload: CommandPayload) -> EngineCommand {
+    match payload {
+        CommandPayload::TakeOverlay { channel, source } => EngineCommand::TakeOverlay {
+            channel: domain_overlay_channel(channel),
+            source: source.to_domain(),
+        },
+        CommandPayload::UpdateOverlay { channel, source } => EngineCommand::UpdateOverlay {
+            channel: domain_overlay_channel(channel),
+            source: source.to_domain(),
+        },
+        CommandPayload::OverlayOff { channel } => EngineCommand::OverlayOff {
+            channel: domain_overlay_channel(channel),
+        },
+        CommandPayload::SetOverlayOutputInclusion {
+            channel,
+            output,
+            included,
+        } => EngineCommand::SetOverlayOutputInclusion {
+            channel: domain_overlay_channel(channel),
+            output: output.to_domain(),
+            included,
+        },
+        CommandPayload::ConfigureOverlayTransition {
+            channel,
+            transition,
+            duration_frames,
+        } => EngineCommand::ConfigureOverlayTransition {
+            channel: domain_overlay_channel(channel),
+            transition: match transition {
+                ProtocolOverlayTransition::Cut => SwitcherOverlayTransition::Cut,
+                ProtocolOverlayTransition::Fade => SwitcherOverlayTransition::Fade,
+            },
+            duration_frames,
+        },
+        CommandPayload::ConfigureOverlayAppearance {
+            channel,
+            position,
+            border,
+        } => EngineCommand::ConfigureOverlayAppearance {
+            channel: domain_overlay_channel(channel),
+            position: match position {
+                ProtocolOverlayPosition::FullFrame => SwitcherOverlayPosition::FullFrame,
+                ProtocolOverlayPosition::TopLeft => SwitcherOverlayPosition::TopLeft,
+                ProtocolOverlayPosition::TopRight => SwitcherOverlayPosition::TopRight,
+                ProtocolOverlayPosition::BottomLeft => SwitcherOverlayPosition::BottomLeft,
+                ProtocolOverlayPosition::BottomRight => SwitcherOverlayPosition::BottomRight,
+            },
+            border: match border {
+                ProtocolOverlayBorder::None => SwitcherOverlayBorder::None,
+                ProtocolOverlayBorder::ThinWhite => SwitcherOverlayBorder::ThinWhite,
+                ProtocolOverlayBorder::ThickWhite => SwitcherOverlayBorder::ThickWhite,
+            },
+        },
+        CommandPayload::QueueOverlay { channel, source } => EngineCommand::QueueOverlay {
+            channel: domain_overlay_channel(channel),
+            source: source.to_domain(),
+        },
+        CommandPayload::TakeNextOverlay { channel } => EngineCommand::TakeNextOverlay {
+            channel: domain_overlay_channel(channel),
+        },
+        _ => unreachable!("only overlay commands are delegated"),
+    }
+}
+
+fn domain_overlay_channel(channel: WireOverlayChannelId) -> OverlayChannelId {
+    OverlayChannelId::new(channel.number()).expect("wire overlay channels are bounded")
 }
 
 const fn is_program_transition(command: EngineCommand) -> bool {
@@ -1191,8 +1291,9 @@ fn engine_submission(
         });
         let program = WireInputId::from_domain(engine.show().desired_switcher().program());
         let preview = WireInputId::from_domain(engine.show().desired_switcher().preview());
-        let manual_transition = Some(protocol_manual_status(engine.desired_manual_transition()));
-        let fade_to_black = Some(protocol_fade_to_black_state(engine.desired_fade_to_black()));
+        let manual_transition = protocol_manual_status(engine.desired_manual_transition());
+        let fade_to_black = protocol_fade_to_black_state(engine.desired_fade_to_black());
+        let overlays = protocol_overlays(engine.show().desired_switcher().overlays());
         vec![EventMessage {
             cursor: EventCursor {
                 engine: identity.clone(),
@@ -1205,6 +1306,7 @@ fn engine_submission(
                     manual_transition,
                     fade_to_black,
                     stingers: protocol_desired_stingers(engine),
+                    overlays,
                 }
             } else {
                 EventPayload::DesiredSwitcher {
@@ -1212,6 +1314,7 @@ fn engine_submission(
                     preview,
                     manual_transition,
                     fade_to_black,
+                    overlays,
                 }
             },
         }]
@@ -1259,15 +1362,13 @@ fn snapshot_record(engine: &Engine, identity: &EngineIdentity) -> SnapshotRecord
         desired_preview: WireInputId::from_domain(engine.show().desired_switcher().preview()),
         realized_program: WireInputId::from_domain(engine.realized_switcher().program()),
         realized_preview: WireInputId::from_domain(engine.realized_switcher().preview()),
-        desired_manual_transition: Some(protocol_manual_status(engine.desired_manual_transition())),
-        realized_manual_transition: Some(protocol_manual_status(
-            engine.realized_manual_transition(),
-        )),
-        desired_fade_to_black: Some(protocol_fade_to_black_state(engine.desired_fade_to_black())),
-        realized_fade_to_black: Some(protocol_fade_to_black_state(
-            engine.realized_fade_to_black(),
-        )),
-        stingers: Some(protocol_stingers(engine)),
+        desired_manual_transition: protocol_manual_status(engine.desired_manual_transition()),
+        realized_manual_transition: protocol_manual_status(engine.realized_manual_transition()),
+        desired_fade_to_black: protocol_fade_to_black_state(engine.desired_fade_to_black()),
+        realized_fade_to_black: protocol_fade_to_black_state(engine.realized_fade_to_black()),
+        stingers: protocol_stingers(engine),
+        desired_overlays: protocol_overlays(engine.show().desired_switcher().overlays()),
+        realized_overlays: protocol_overlays(engine.realized_switcher().overlays()),
     };
     SnapshotRecord {
         cursor: EventCursor {
@@ -1276,6 +1377,51 @@ fn snapshot_record(engine: &Engine, identity: &EngineIdentity) -> SnapshotRecord
         },
         snapshot,
     }
+}
+
+fn protocol_overlays(overlays: &[OverlayChannelState; 8]) -> Vec<OverlayStatus> {
+    overlays
+        .iter()
+        .enumerate()
+        .map(|(index, overlay)| OverlayStatus {
+            channel: WireOverlayChannelId::new(
+                u8::try_from(index + 1).expect("overlay channel index fits u8"),
+            )
+            .expect("overlay channel index is bounded"),
+            source: overlay.source().map(WireInputId::from_domain),
+            active: overlay.is_active(),
+            opacity: overlay.opacity(),
+            transition: match overlay.transition() {
+                SwitcherOverlayTransition::Cut => ProtocolOverlayTransition::Cut,
+                SwitcherOverlayTransition::Fade => ProtocolOverlayTransition::Fade,
+            },
+            duration_frames: overlay.duration_frames(),
+            position: match overlay.position() {
+                SwitcherOverlayPosition::FullFrame => ProtocolOverlayPosition::FullFrame,
+                SwitcherOverlayPosition::TopLeft => ProtocolOverlayPosition::TopLeft,
+                SwitcherOverlayPosition::TopRight => ProtocolOverlayPosition::TopRight,
+                SwitcherOverlayPosition::BottomLeft => ProtocolOverlayPosition::BottomLeft,
+                SwitcherOverlayPosition::BottomRight => ProtocolOverlayPosition::BottomRight,
+            },
+            border: match overlay.border() {
+                SwitcherOverlayBorder::None => ProtocolOverlayBorder::None,
+                SwitcherOverlayBorder::ThinWhite => ProtocolOverlayBorder::ThinWhite,
+                SwitcherOverlayBorder::ThickWhite => ProtocolOverlayBorder::ThickWhite,
+            },
+            queued_sources: overlay
+                .queued_sources()
+                .iter()
+                .copied()
+                .map(WireInputId::from_domain)
+                .collect(),
+            included_outputs: overlay
+                .included_outputs()
+                .iter()
+                .copied()
+                .map(WireOutputId::from_domain)
+                .collect(),
+        })
+        .collect()
 }
 
 fn protocol_stingers(engine: &Engine) -> Vec<StingerStatus> {

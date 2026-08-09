@@ -21,23 +21,28 @@ use std::{
 
 #[cfg(target_os = "macos")]
 use fm_io_macos::{CameraIdKind, deterministic_camera_id};
+use fm_model::{Input, InputKind, MainMix, Project, ProjectSettings};
+#[cfg(target_os = "macos")]
 use fm_model::{
-    Input, InputKind, Layer, LayerGeometry, MainMix, Project, ProjectSettings, RectMask, Rgba8,
-    Rotation, Scene, SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef,
-    StingerAudioPolicy, StingerConfig, StingerMissingMediaFallback, StingerSlotNumber,
+    Layer, LayerGeometry, RectMask, Rgba8, Rotation, Scene, SimulatedAudio, SimulatedInput,
+    SimulatedVideo, SolidColor, SourceRef, StingerAudioPolicy, StingerConfig,
+    StingerMissingMediaFallback, StingerSlotNumber,
 };
 use fm_persistence::{ProjectPosition, ProjectStore, RuntimeRouting, StoredProject};
 #[cfg(target_os = "macos")]
 use fm_protocol::{
-    CURRENT_PROTOCOL_VERSION, ClientHello, ClientType, CommandMessage, CommandPayload,
-    CommandResult, ManualTransitionKind, ManualTransitionPosition, Role, RuntimeLifecycleEvent,
+    CURRENT_PROTOCOL_VERSION, ClientType, CommandMessage, CommandPayload, CommandResult,
+    HandshakeRequest, ManualTransitionKind, ManualTransitionPosition, Role, RuntimeLifecycleEvent,
     SnapshotMessage, StingerStatus, WireInputId, WireMessage, WireStingerSlotId, decode_line,
     encode_line,
 };
+#[cfg(target_os = "macos")]
+use fm_types::SceneId;
 use fm_types::{
     AudioFormat, ChannelLayout, ColorMetadata, FrameRate, InputId, PixelFormat, ProjectId,
-    SampleFormat, SampleRate, ScanMode, SceneId, VideoDimensions, VideoFormat,
+    SampleFormat, SampleRate, ScanMode, VideoDimensions, VideoFormat,
 };
+#[cfg(target_os = "macos")]
 use freemixd::ReadinessRecord;
 
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(20);
@@ -106,6 +111,7 @@ impl CapturedChild {
         )
     }
 
+    #[cfg(target_os = "macos")]
     fn is_alive(&mut self) -> bool {
         self.child
             .as_mut()
@@ -123,6 +129,7 @@ impl CapturedChild {
         self.collect(status, timeout)
     }
 
+    #[cfg(target_os = "macos")]
     fn kill_and_reap(mut self) -> BoundedOutput {
         let status = self.kill_and_poll();
         self.collect(status, PROCESS_TIMEOUT)
@@ -511,7 +518,7 @@ fn native_daemon_hot_configures_fires_replaces_removes_and_restarts_stinger() {
     let mut restarted_client = StudioClient::connect(restarted.address);
     let snapshot = restarted_client.handshake();
     assert_eq!(snapshot.revision, 5);
-    assert_eq!(snapshot.stingers, Some(Vec::new()));
+    assert!(snapshot.stingers.is_empty());
     drop(restarted_client);
     let output = restarted.wait();
     assert!(
@@ -720,7 +727,7 @@ fn native_stinger_preflight_failure_rolls_back_and_keeps_show_cursor_live() {
     let mut resumed = StudioClient::connect(daemon.address);
     let snapshot = resumed.handshake();
     assert_eq!(snapshot.revision, 0);
-    assert_eq!(snapshot.stingers, Some(Vec::new()));
+    assert!(snapshot.stingers.is_empty());
     let cut = resumed.command(
         "post-rollback-cut",
         "post-rollback-cut-key",
@@ -3863,16 +3870,16 @@ impl StudioClient {
     }
 
     fn handshake_with_digest(&mut self) -> (String, SnapshotMessage) {
-        self.send(&WireMessage::ClientHello(ClientHello {
+        self.send(&WireMessage::HandshakeRequest(HandshakeRequest {
             versions: vec![CURRENT_PROTOCOL_VERSION],
             build: "native-daemon-process-test".into(),
             client_type: ClientType::Studio,
             desired_role: Role::Operator,
-            cached_cursor: None,
+            resume_cursor: None,
         }));
-        let digest = self.receive_until("server hello", |message| {
-            if let WireMessage::ServerHello(hello) = message {
-                Some(hello.capabilities_digest.clone())
+        let digest = self.receive_until("handshake response", |message| {
+            if let WireMessage::HandshakeResponse(response) = message {
+                Some(response.capabilities.digest.clone())
             } else {
                 None
             }
@@ -4284,6 +4291,7 @@ fn save_media_project(path: &Path, first_uri: &str, second_uri: &str) {
     ProjectStore::new(path).unwrap().save(&stored).unwrap();
 }
 
+#[cfg(target_os = "macos")]
 fn save_generator_project(path: &Path) {
     save_generator_project_with_position(path, FrameRate::new(25, 1).unwrap(), 0);
 }
@@ -4323,6 +4331,7 @@ fn save_white_black_generator_project(path: &Path) {
     );
 }
 
+#[cfg(target_os = "macos")]
 fn save_restored_generator_project(path: &Path, frames_rendered: u64) {
     save_generator_project_with_position(
         path,
@@ -4331,6 +4340,7 @@ fn save_restored_generator_project(path: &Path, frames_rendered: u64) {
     );
 }
 
+#[cfg(target_os = "macos")]
 fn save_generator_project_with_position(path: &Path, rate: FrameRate, frames_rendered: u64) {
     save_generator_project_with_sources(
         path,
@@ -4346,6 +4356,7 @@ fn save_generator_project_with_position(path: &Path, rate: FrameRate, frames_ren
     );
 }
 
+#[cfg(target_os = "macos")]
 fn save_generator_project_with_sources(
     path: &Path,
     rate: FrameRate,
@@ -4361,6 +4372,7 @@ fn save_generator_project_with_sources(
     );
 }
 
+#[cfg(target_os = "macos")]
 fn save_generator_project_with_sources_and_dimensions(
     path: &Path,
     rate: FrameRate,
@@ -4420,6 +4432,7 @@ fn save_generator_project_with_sources_and_dimensions(
     ProjectStore::new(path).unwrap().save(&stored).unwrap();
 }
 
+#[cfg(target_os = "macos")]
 fn save_scene_generator_project(path: &Path) {
     let rate = FrameRate::new(25, 1).unwrap();
     let mut project = Project::new(
@@ -4513,6 +4526,7 @@ fn save_scene_generator_project(path: &Path) {
     ProjectStore::new(path).unwrap().save(&stored).unwrap();
 }
 
+#[cfg(target_os = "macos")]
 fn scene_layer(source: SourceRef, z_order: i32) -> Layer {
     Layer {
         name: "layer".into(),
@@ -4526,6 +4540,7 @@ fn scene_layer(source: SourceRef, z_order: i32) -> Layer {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn scene_id(value: u128) -> SceneId {
     SceneId::new(NonZeroU128::new(value).unwrap())
 }

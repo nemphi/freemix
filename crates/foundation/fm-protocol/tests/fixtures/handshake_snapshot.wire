@@ -1,1 +1,0 @@
-handshake_response	protocol=1.2	granted_role=operator	permissions=switcher.take	capability_digest=sha256%3Aabc	capability_total=4	capability_available=3	capability_degraded=1	capability_unavailable=0	engine_id=engine-a	project_id=project-9	state_epoch=7	log_id=log-a	current_revision=1845	outcome=snapshot	snapshot_reason=history_unavailable

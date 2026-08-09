@@ -1,5 +1,5 @@
 use fm_client::{ConnectionState, Session};
-use fm_protocol::{CommandPayload, STINGER_PROTOCOL_VERSION, StingerReadiness, WireStingerSlotId};
+use fm_protocol::{CommandPayload, StingerReadiness, WireStingerSlotId};
 use fm_ui_model::StingerStatus;
 
 use crate::TransitionControlState;
@@ -61,9 +61,6 @@ impl StingerControls {
         session: Option<&Session>,
         stingers: &[StingerStatus],
     ) -> TransitionControlState {
-        if !session.is_some_and(session_supports_stinger) {
-            return TransitionControlState::Hidden;
-        }
         if matches!(connection_state, ConnectionState::Ready)
             && session.is_some_and(session_can_transition)
             && stingers.iter().any(|status| {
@@ -109,17 +106,13 @@ fn session_can_transition(session: &Session) -> bool {
         .any(|permission| permission == "transition")
 }
 
-fn session_supports_stinger(session: &Session) -> bool {
-    session.protocol.major == STINGER_PROTOCOL_VERSION.major
-        && session.protocol.minor >= STINGER_PROTOCOL_VERSION.minor
-}
-
 #[cfg(test)]
 mod tests {
     use core::num::NonZeroU128;
 
     use fm_protocol::{
-        ProtocolVersion, Role, ServerIdentity, StingerAudioPolicy, StingerMissingMediaFallback,
+        CURRENT_PROTOCOL_VERSION, ProtocolVersion, Role, ServerIdentity, StingerAudioPolicy,
+        StingerMissingMediaFallback,
     };
     use fm_types::InputId;
 
@@ -170,8 +163,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_1_10_preserves_slot_and_bounded_duration() {
-        let session = session(STINGER_PROTOCOL_VERSION, &["transition"]);
+    fn current_contract_preserves_slot_and_bounded_duration() {
+        let session = session(CURRENT_PROTOCOL_VERSION, &["transition"]);
         let mut controls = StingerControls::default();
         controls.set_duration_frames(91);
         let projected = [ready_stinger(8)];
@@ -195,9 +188,8 @@ mod tests {
 
     #[test]
     fn protocol_permission_and_readiness_gate_every_slot() {
-        let current = session(STINGER_PROTOCOL_VERSION, &["transition"]);
-        let old = session(ProtocolVersion::new(1, 9), &["transition"]);
-        let denied = session(STINGER_PROTOCOL_VERSION, &[]);
+        let current = session(CURRENT_PROTOCOL_VERSION, &["transition"]);
+        let denied = session(CURRENT_PROTOCOL_VERSION, &[]);
         let controls = StingerControls::default();
         let control = StingerControl::new(1).unwrap();
         let projected = [ready_stinger(1)];
@@ -205,10 +197,6 @@ mod tests {
         assert_eq!(
             controls.control_state(control, &ConnectionState::Ready, Some(&current), &projected),
             TransitionControlState::Enabled
-        );
-        assert_eq!(
-            controls.control_state(control, &ConnectionState::Ready, Some(&old), &projected),
-            TransitionControlState::Hidden
         );
         assert_eq!(
             controls.control_state(control, &ConnectionState::Ready, Some(&denied), &projected),

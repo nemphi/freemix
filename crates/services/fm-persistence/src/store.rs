@@ -189,17 +189,6 @@ pub enum StoreError {
     Journal(crate::JournalError),
 }
 
-impl StoreError {
-    pub(crate) fn from_decode(error: json::DecodeError) -> Self {
-        match error {
-            json::DecodeError::Syntax { offset, message } => {
-                Self::MalformedManifest { offset, message }
-            }
-            json::DecodeError::Validation(error) => Self::Validation(error),
-        }
-    }
-}
-
 impl fmt::Display for StoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

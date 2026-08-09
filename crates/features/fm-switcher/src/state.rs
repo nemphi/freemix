@@ -2,11 +2,12 @@ use fm_types::{InputId, OutputId};
 
 use crate::{
     FadeToBlackAdvance, FadeToBlackController, FadeToBlackError, FadeToBlackFrame,
-    FadeToBlackPosition, FadeToBlackRequest, FadeToBlackTarget, MissingMediaFallback,
-    OVERLAY_CHANNEL_COUNT, OverlayChannelId, OverlayChannelState, STINGER_SLOT_COUNT,
-    StingerDescriptor, StingerPlaybackDecision, StingerPreloadState, StingerSlotId,
-    StingerSlotState, SwitcherCommand, SwitcherError, SwitcherEvent, TBarPosition, TBarState,
-    TransitionKind, TransitionState,
+    FadeToBlackPosition, FadeToBlackRequest, FadeToBlackTarget,
+    MAX_OVERLAY_TRANSITION_DURATION_FRAMES, MissingMediaFallback, OVERLAY_CHANNEL_COUNT,
+    OverlayBorderPreset, OverlayChannelId, OverlayChannelState, OverlayPositionPreset,
+    OverlayTransitionKind, STINGER_SLOT_COUNT, StingerDescriptor, StingerPlaybackDecision,
+    StingerPreloadState, StingerSlotId, StingerSlotState, SwitcherCommand, SwitcherError,
+    SwitcherEvent, TBarPosition, TBarState, TransitionKind, TransitionState,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -117,6 +118,11 @@ impl SwitcherState {
         self.fade_to_black.position()
     }
 
+    /// Replaces Fade-to-Black state with a settled current-contract endpoint.
+    pub fn restore_settled_fade_to_black(&mut self, active: bool) {
+        self.fade_to_black = FadeToBlackController::settled(FadeToBlackTarget::from_active(active));
+    }
+
     #[must_use]
     pub const fn fade_to_black_is_automatic(&self) -> bool {
         self.fade_to_black.is_automatic()
@@ -185,12 +191,25 @@ impl SwitcherState {
             SwitcherCommand::SetTBarPosition(position) => self.set_t_bar_position(position),
             SwitcherCommand::CommitTBar => self.commit_t_bar(),
             SwitcherCommand::CancelTBar => self.cancel_t_bar(),
-            SwitcherCommand::SetFadeToBlack(active) => Ok(self.set_fade_to_black(active)),
             SwitcherCommand::TakeOverlay { channel, source } => self.take_overlay(channel, source),
             SwitcherCommand::UpdateOverlay { channel, source } => {
                 self.update_overlay(channel, source)
             }
             SwitcherCommand::OverlayOff(channel) => self.overlay_off(channel),
+            SwitcherCommand::ConfigureOverlayTransition {
+                channel,
+                transition,
+                duration_frames,
+            } => self.configure_overlay_transition(channel, transition, duration_frames),
+            SwitcherCommand::ConfigureOverlayAppearance {
+                channel,
+                position,
+                border,
+            } => Ok(self.configure_overlay_appearance(channel, position, border)),
+            SwitcherCommand::QueueOverlay { channel, source } => {
+                self.queue_overlay(channel, source)
+            }
+            SwitcherCommand::TakeNextOverlay(channel) => self.take_next_overlay(channel),
             SwitcherCommand::SetOverlayOutputInclusion {
                 channel,
                 output,
@@ -234,22 +253,6 @@ impl SwitcherState {
         }
     }
 
-    pub fn advance_frame(&mut self) -> Option<SwitcherEvent> {
-        let fade_to_black = self.advance_fade_to_black();
-        if let Some(t_bar) = &mut self.t_bar {
-            t_bar.settle_frame();
-        }
-        if let Some(mut transition) = self.transition {
-            if transition.advance() {
-                let kind = transition.kind();
-                self.transition = None;
-                return Some(self.complete_take(kind));
-            }
-            self.transition = Some(transition);
-        }
-        legacy_fade_to_black_event(fade_to_black)
-    }
-
     /// Advances one frame and reports all Program/Preview and FTB control events.
     #[must_use]
     pub fn advance_frame_events(&mut self) -> Vec<SwitcherEvent> {
@@ -272,6 +275,18 @@ impl SwitcherState {
             }
         }
         append_fade_to_black_events(&mut events, fade_to_black);
+        for (channel, overlay) in OverlayChannelId::ALL
+            .into_iter()
+            .zip(self.overlays.iter_mut())
+        {
+            let advance = overlay.advance();
+            if let Some(opacity) = advance.opacity_changed {
+                events.push(SwitcherEvent::OverlayOpacityChanged { channel, opacity });
+            }
+            if let Some(active) = advance.completed {
+                events.push(SwitcherEvent::OverlayTransitionCompleted { channel, active });
+            }
+        }
         events
     }
 
@@ -404,13 +419,6 @@ impl SwitcherState {
         Ok(vec![SwitcherEvent::TBarCancelled])
     }
 
-    #[must_use]
-    pub fn set_fade_to_black(&mut self, active: bool) -> Vec<SwitcherEvent> {
-        self.fade_to_black
-            .set_immediate(FadeToBlackTarget::from_active(active));
-        vec![SwitcherEvent::FadeToBlackChanged { active }]
-    }
-
     /// Starts or reverses an automatic FTB move independently of Program/Preview.
     ///
     /// Repeating the current target is idempotent and does not restart progress.
@@ -482,6 +490,139 @@ impl SwitcherState {
     ) -> Result<Vec<SwitcherEvent>, SwitcherError> {
         self.overlays[channel.index()].off();
         Ok(vec![SwitcherEvent::OverlayTurnedOff { channel }])
+    }
+
+    /// Configures the transition used by subsequent Take and Off operations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-duration error unless `duration_frames` is in the
+    /// inclusive supported range.
+    pub fn configure_overlay_transition(
+        &mut self,
+        channel: OverlayChannelId,
+        transition: OverlayTransitionKind,
+        duration_frames: u32,
+    ) -> Result<Vec<SwitcherEvent>, SwitcherError> {
+        if duration_frames == 0 || duration_frames > MAX_OVERLAY_TRANSITION_DURATION_FRAMES {
+            return Err(SwitcherError::InvalidOverlayTransitionDuration {
+                duration_frames,
+                maximum: MAX_OVERLAY_TRANSITION_DURATION_FRAMES,
+            });
+        }
+        self.overlays[channel.index()].configure_transition(transition, duration_frames);
+        Ok(vec![SwitcherEvent::OverlayTransitionConfigured {
+            channel,
+            transition,
+            duration_frames,
+        }])
+    }
+
+    /// Starts the configured realized Take motion for one overlay channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns an unknown-input error when `source` is not part of this show.
+    pub fn request_overlay_take(
+        &mut self,
+        channel: OverlayChannelId,
+        source: InputId,
+    ) -> Result<Vec<SwitcherEvent>, SwitcherError> {
+        self.require_input(source)?;
+        self.overlays[channel.index()].request_take(source);
+        Ok(vec![SwitcherEvent::OverlayTaken { channel, source }])
+    }
+
+    /// Configures the downstream layout presets for one overlay channel.
+    #[must_use]
+    pub fn configure_overlay_appearance(
+        &mut self,
+        channel: OverlayChannelId,
+        position: OverlayPositionPreset,
+        border: OverlayBorderPreset,
+    ) -> Vec<SwitcherEvent> {
+        self.overlays[channel.index()].configure_appearance(position, border);
+        vec![SwitcherEvent::OverlayAppearanceConfigured {
+            channel,
+            position,
+            border,
+        }]
+    }
+
+    /// Appends a source to one bounded overlay queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns an unknown-input error or a queue-full error.
+    pub fn queue_overlay(
+        &mut self,
+        channel: OverlayChannelId,
+        source: InputId,
+    ) -> Result<Vec<SwitcherEvent>, SwitcherError> {
+        self.require_input(source)?;
+        if !self.overlays[channel.index()].enqueue(source) {
+            return Err(SwitcherError::OverlayQueueFull {
+                channel,
+                maximum: crate::MAX_OVERLAY_QUEUE_DEPTH,
+            });
+        }
+        Ok(vec![SwitcherEvent::OverlayQueued {
+            channel,
+            source,
+            depth: self.overlays[channel.index()].queued_sources().len(),
+        }])
+    }
+
+    /// Pops and immediately takes the next queued source in desired state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an empty-queue error when no source is queued.
+    pub fn take_next_overlay(
+        &mut self,
+        channel: OverlayChannelId,
+    ) -> Result<Vec<SwitcherEvent>, SwitcherError> {
+        let source = self.overlays[channel.index()]
+            .take_next()
+            .ok_or(SwitcherError::OverlayQueueEmpty(channel))?;
+        Ok(vec![SwitcherEvent::OverlayQueueAdvanced {
+            channel,
+            source,
+            remaining: self.overlays[channel.index()].queued_sources().len(),
+        }])
+    }
+
+    /// Pops and takes the next source using the configured realized transition.
+    ///
+    /// # Errors
+    ///
+    /// Returns an empty-queue error when no source is queued.
+    pub fn request_overlay_take_next(
+        &mut self,
+        channel: OverlayChannelId,
+    ) -> Result<Vec<SwitcherEvent>, SwitcherError> {
+        let source = self.overlays[channel.index()]
+            .request_take_next()
+            .ok_or(SwitcherError::OverlayQueueEmpty(channel))?;
+        Ok(vec![SwitcherEvent::OverlayQueueAdvanced {
+            channel,
+            source,
+            remaining: self.overlays[channel.index()].queued_sources().len(),
+        }])
+    }
+
+    /// Starts the configured realized Off motion for one overlay channel.
+    #[must_use]
+    pub fn request_overlay_off(&mut self, channel: OverlayChannelId) -> Vec<SwitcherEvent> {
+        self.overlays[channel.index()].request_off();
+        vec![SwitcherEvent::OverlayTurnedOff { channel }]
+    }
+
+    #[must_use]
+    pub fn overlays_in_motion(&self) -> bool {
+        self.overlays
+            .iter()
+            .any(OverlayChannelState::is_transitioning)
     }
 
     #[must_use]
@@ -598,18 +739,6 @@ const fn manual_transition_supported(kind: TransitionKind) -> bool {
         kind,
         TransitionKind::Fade | TransitionKind::Wipe | TransitionKind::AlphaFade
     )
-}
-
-fn legacy_fade_to_black_event(advance: FadeToBlackAdvance) -> Option<SwitcherEvent> {
-    if let Some(target) = advance.completed {
-        Some(SwitcherEvent::FadeToBlackCompleted {
-            active: target.active(),
-        })
-    } else {
-        advance
-            .position_changed
-            .map(|position| SwitcherEvent::FadeToBlackPositionChanged { position })
-    }
 }
 
 fn append_fade_to_black_events(events: &mut Vec<SwitcherEvent>, advance: FadeToBlackAdvance) {

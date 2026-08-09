@@ -11,14 +11,19 @@ use fm_engine::{
 };
 use fm_scheduler::FrameNumber;
 use fm_switcher::{
-    FadeToBlackPosition, FadeToBlackTarget, MissingMediaFallback, StingerAudioPolicy,
+    FadeToBlackPosition, FadeToBlackTarget, MissingMediaFallback, OverlayBorderPreset,
+    OverlayChannelId, OverlayPositionPreset, OverlayTransitionKind, StingerAudioPolicy,
     StingerDescriptor, StingerSlotId, SwitcherEvent, SwitcherState, TBarPosition, TBarState,
     TransitionKind,
 };
-use fm_types::{FrameRate, InputId};
+use fm_types::{FrameRate, InputId, OutputId};
 
 fn input(value: u128) -> InputId {
     InputId::new(NonZeroU128::new(value).unwrap())
+}
+
+fn output(value: u128) -> OutputId {
+    OutputId::new(NonZeroU128::new(value).unwrap())
 }
 
 fn domain() -> ClockDomainId {
@@ -116,6 +121,162 @@ fn stale_revision_is_rejected_without_mutating_desired_state() {
     assert_eq!(rejection.rejection.code, RejectionCode::RevisionConflict);
     assert_eq!(rejection.current_revision, Revision::new(1));
     assert_eq!(engine.show().desired_switcher().preview(), input(1));
+}
+
+#[test]
+fn overlay_commands_realize_independently_on_the_next_frame_boundary() {
+    let mut engine = engine();
+    let channel = OverlayChannelId::new(3).unwrap();
+    let output = output(9);
+
+    engine
+        .execute(
+            envelope(
+                "overlay-output",
+                EngineCommand::SetOverlayOutputInclusion {
+                    channel,
+                    output,
+                    included: true,
+                },
+            ),
+            0,
+        )
+        .unwrap();
+    engine
+        .execute(
+            envelope(
+                "overlay-take",
+                EngineCommand::TakeOverlay {
+                    channel,
+                    source: input(3),
+                },
+            ),
+            0,
+        )
+        .unwrap();
+
+    let desired = engine.show().desired_switcher().overlay(channel);
+    assert_eq!(desired.source(), Some(input(3)));
+    assert!(desired.is_active());
+    assert!(desired.is_included_in(output));
+    assert!(!engine.realized_switcher().overlay(channel).is_active());
+
+    let frame = engine.tick().unwrap();
+    let realized = &frame.overlays[channel.index()];
+    assert_eq!(realized.source(), Some(input(3)));
+    assert!(realized.is_active());
+    assert!(realized.is_included_in(output));
+    assert_eq!(engine.realized_switcher().overlay(channel), realized);
+}
+
+#[test]
+fn overlay_fade_realizes_opacity_over_the_configured_frames() {
+    let mut engine = engine();
+    let channel = OverlayChannelId::new(6).unwrap();
+    engine
+        .execute(
+            envelope(
+                "overlay-transition",
+                EngineCommand::ConfigureOverlayTransition {
+                    channel,
+                    transition: OverlayTransitionKind::Fade,
+                    duration_frames: 4,
+                },
+            ),
+            0,
+        )
+        .unwrap();
+    engine.tick().unwrap();
+    engine
+        .execute(
+            envelope(
+                "overlay-fade-take",
+                EngineCommand::TakeOverlay {
+                    channel,
+                    source: input(3),
+                },
+            ),
+            0,
+        )
+        .unwrap();
+
+    for opacity in [0, 63, 127, 191] {
+        assert_eq!(
+            engine.tick().unwrap().overlays[channel.index()].opacity(),
+            opacity
+        );
+    }
+    assert_eq!(engine.realized_switcher().overlay(channel).opacity(), 255);
+    assert!(engine.snapshot().is_ok());
+}
+
+#[test]
+fn overlay_appearance_realizes_at_the_next_frame_boundary() {
+    let mut engine = engine();
+    let channel = OverlayChannelId::new(3).unwrap();
+    engine
+        .execute(
+            envelope(
+                "overlay-appearance",
+                EngineCommand::ConfigureOverlayAppearance {
+                    channel,
+                    position: OverlayPositionPreset::TopRight,
+                    border: OverlayBorderPreset::ThinWhite,
+                },
+            ),
+            0,
+        )
+        .unwrap();
+
+    assert_eq!(
+        engine.show().desired_switcher().overlay(channel).position(),
+        OverlayPositionPreset::TopRight
+    );
+    assert_eq!(
+        engine.realized_switcher().overlay(channel).position(),
+        OverlayPositionPreset::FullFrame
+    );
+    let frame = engine.tick().unwrap();
+    assert_eq!(
+        frame.overlays[channel.index()].position(),
+        OverlayPositionPreset::TopRight
+    );
+    assert_eq!(
+        frame.overlays[channel.index()].border(),
+        OverlayBorderPreset::ThinWhite
+    );
+}
+
+#[test]
+fn overlay_queue_and_take_next_realize_fifo_at_frame_boundaries() {
+    let mut engine = engine();
+    let channel = OverlayChannelId::new(4).unwrap();
+    for (key, source) in [("queue-1", input(2)), ("queue-2", input(3))] {
+        engine
+            .execute(
+                envelope(key, EngineCommand::QueueOverlay { channel, source }),
+                0,
+            )
+            .unwrap();
+        engine.tick().unwrap();
+    }
+    assert_eq!(
+        engine.realized_switcher().overlay(channel).queued_sources(),
+        &[input(2), input(3)]
+    );
+
+    engine
+        .execute(
+            envelope("next", EngineCommand::TakeNextOverlay { channel }),
+            0,
+        )
+        .unwrap();
+    let frame = engine.tick().unwrap();
+    assert_eq!(frame.overlays[channel.index()].source(), Some(input(2)));
+    assert_eq!(
+        frame.overlays[channel.index()].queued_sources(),
+        &[input(3)]
+    );
 }
 
 #[test]

@@ -3,9 +3,10 @@ use std::num::NonZeroU128;
 use fm_switcher::{
     FADE_TO_BLACK_POSITION_DENOMINATOR, FadeToBlackError, FadeToBlackPosition, FadeToBlackTarget,
     MAX_FADE_TO_BLACK_DURATION_FRAMES, MissingMediaFallback, OVERLAY_CHANNEL_COUNT,
-    OverlayChannelId, STINGER_SLOT_COUNT, StingerAudioPolicy, StingerDescriptor,
-    StingerPlaybackDecision, StingerPreloadState, StingerSlotId, SwitcherCommand, SwitcherError,
-    SwitcherEvent, SwitcherState, TBarPosition, TBarState, TransitionKind,
+    OverlayBorderPreset, OverlayChannelId, OverlayPositionPreset, OverlayTransitionKind,
+    STINGER_SLOT_COUNT, StingerAudioPolicy, StingerDescriptor, StingerPlaybackDecision,
+    StingerPreloadState, StingerSlotId, SwitcherCommand, SwitcherError, SwitcherEvent,
+    SwitcherState, TBarPosition, TBarState, TransitionKind,
 };
 use fm_types::{InputId, OutputId};
 
@@ -67,20 +68,23 @@ fn fade_realizes_on_exact_frame_boundary() {
         (initial.mix_start_numerator, initial.mix_end_numerator),
         (0, 1)
     );
-    assert_eq!(switcher.advance_frame(), None);
+    assert!(switcher.advance_frame_events().is_empty());
     let second = switcher.program_frame();
     assert_eq!(second.mix_numerator, 1);
     assert_eq!(
         (second.mix_start_numerator, second.mix_end_numerator),
         (1, 2)
     );
-    assert_eq!(switcher.advance_frame(), None);
+    assert!(switcher.advance_frame_events().is_empty());
     let third = switcher.program_frame();
     assert_eq!(third.mix_numerator, 2);
     assert_eq!((third.mix_start_numerator, third.mix_end_numerator), (2, 3));
     assert!(matches!(
-        switcher.advance_frame(),
-        Some(SwitcherEvent::ProgramChanged { .. })
+        switcher.advance_frame_events().as_slice(),
+        [
+            SwitcherEvent::ProgramChanged { .. },
+            SwitcherEvent::TransitionCompleted { .. }
+        ]
     ));
     assert_eq!(switcher.program(), input(2));
     assert_eq!(switcher.program_frame().secondary, None);
@@ -184,7 +188,7 @@ fn t_bar_can_reverse_then_commit_or_cancel() {
         (forward.mix_start_numerator, forward.mix_end_numerator),
         (0, 8_000)
     );
-    assert_eq!(switcher.advance_frame(), None);
+    assert!(switcher.advance_frame_events().is_empty());
     let held = switcher.program_frame();
     assert_eq!(
         (held.mix_start_numerator, held.mix_end_numerator),
@@ -201,7 +205,7 @@ fn t_bar_can_reverse_then_commit_or_cancel() {
         (reverse.mix_start_numerator, reverse.mix_end_numerator),
         (8_000, 2_500)
     );
-    assert_eq!(switcher.advance_frame(), None);
+    assert!(switcher.advance_frame_events().is_empty());
     switcher
         .apply(SwitcherCommand::SetTBarPosition(
             TBarPosition::new(7_333).unwrap(),
@@ -260,7 +264,7 @@ fn alpha_fade_t_bar_preserves_kind_through_hold_restore_and_commit() {
         (moving.mix_start_numerator, moving.mix_end_numerator),
         (0, 6_250)
     );
-    assert_eq!(switcher.advance_frame(), None);
+    assert!(switcher.advance_frame_events().is_empty());
 
     let mut restored = state();
     restored.restore_t_bar(switcher.t_bar().unwrap()).unwrap();
@@ -314,14 +318,11 @@ fn manual_transition_rejects_every_unsupported_kind_without_mutation() {
 fn fade_to_black_tracks_explicit_on_and_off_state() {
     let mut switcher = state();
     assert!(!switcher.fade_to_black());
-    assert_eq!(
-        switcher.apply(SwitcherCommand::SetFadeToBlack(true)),
-        Ok(vec![SwitcherEvent::FadeToBlackChanged { active: true }])
-    );
+    switcher.request_fade_to_black(true, 1).unwrap();
+    let _ = switcher.advance_frame_events();
     assert!(switcher.fade_to_black());
-    switcher
-        .apply(SwitcherCommand::SetFadeToBlack(false))
-        .unwrap();
+    switcher.request_fade_to_black(false, 1).unwrap();
+    let _ = switcher.advance_frame_events();
     assert!(!switcher.fade_to_black());
 }
 
@@ -461,20 +462,6 @@ fn automatic_fade_to_black_rejects_invalid_durations_transactionally() {
 }
 
 #[test]
-fn immediate_fade_to_black_cancels_automatic_motion_compatibly() {
-    let mut switcher = state();
-    switcher.request_fade_to_black(true, 10).unwrap();
-    let _ = switcher.advance_frame_events();
-
-    assert_eq!(
-        switcher.apply(SwitcherCommand::SetFadeToBlack(false)),
-        Ok(vec![SwitcherEvent::FadeToBlackChanged { active: false }])
-    );
-    assert_eq!(switcher.fade_to_black_position(), FadeToBlackPosition::LIVE);
-    assert!(switcher.advance_frame_events().is_empty());
-}
-
-#[test]
 fn fade_to_black_advances_orthogonally_to_automatic_and_manual_transitions() {
     let mut automatic = state();
     automatic
@@ -524,8 +511,8 @@ fn fade_to_black_advances_orthogonally_to_automatic_and_manual_transitions() {
         .unwrap();
     manual.request_fade_to_black(true, 2).unwrap();
     assert!(matches!(
-        manual.advance_frame(),
-        Some(SwitcherEvent::FadeToBlackPositionChanged { .. })
+        manual.advance_frame_events().as_slice(),
+        [SwitcherEvent::FadeToBlackPositionChanged { .. }]
     ));
     assert_eq!(
         manual.program_frame().mix_start_numerator,
@@ -605,6 +592,105 @@ fn overlay_inclusion_is_routed_per_output_without_duplicates() {
 
     let _ = switcher.set_overlay_output_inclusion(channel, dirty, false);
     assert!(switcher.overlay(channel).included_outputs().is_empty());
+}
+
+#[test]
+fn overlay_appearance_is_independent_per_channel() {
+    let mut switcher = state();
+    let channel = OverlayChannelId::new(7).unwrap();
+    let events = switcher.configure_overlay_appearance(
+        channel,
+        OverlayPositionPreset::BottomRight,
+        OverlayBorderPreset::ThickWhite,
+    );
+
+    assert_eq!(
+        events,
+        vec![SwitcherEvent::OverlayAppearanceConfigured {
+            channel,
+            position: OverlayPositionPreset::BottomRight,
+            border: OverlayBorderPreset::ThickWhite,
+        }]
+    );
+    assert_eq!(
+        switcher.overlay(channel).position(),
+        OverlayPositionPreset::BottomRight
+    );
+    assert_eq!(
+        switcher.overlay(channel).border(),
+        OverlayBorderPreset::ThickWhite
+    );
+    assert_eq!(
+        switcher
+            .overlay(OverlayChannelId::new(6).unwrap())
+            .position(),
+        OverlayPositionPreset::FullFrame
+    );
+}
+
+#[test]
+fn overlay_queue_is_bounded_fifo_and_take_next_uses_the_configured_transition() {
+    let mut switcher = state();
+    let channel = OverlayChannelId::new(2).unwrap();
+    switcher.queue_overlay(channel, input(2)).unwrap();
+    switcher.queue_overlay(channel, input(3)).unwrap();
+    assert_eq!(
+        switcher.overlay(channel).queued_sources(),
+        &[input(2), input(3)]
+    );
+
+    assert_eq!(
+        switcher.take_next_overlay(channel).unwrap(),
+        vec![SwitcherEvent::OverlayQueueAdvanced {
+            channel,
+            source: input(2),
+            remaining: 1,
+        }]
+    );
+    assert_eq!(switcher.overlay(channel).source(), Some(input(2)));
+    assert_eq!(switcher.overlay(channel).queued_sources(), &[input(3)]);
+    switcher.take_next_overlay(channel).unwrap();
+    assert_eq!(
+        switcher.take_next_overlay(channel),
+        Err(SwitcherError::OverlayQueueEmpty(channel))
+    );
+
+    for _ in 0..fm_switcher::MAX_OVERLAY_QUEUE_DEPTH {
+        switcher.queue_overlay(channel, input(1)).unwrap();
+    }
+    assert_eq!(
+        switcher.queue_overlay(channel, input(1)),
+        Err(SwitcherError::OverlayQueueFull {
+            channel,
+            maximum: fm_switcher::MAX_OVERLAY_QUEUE_DEPTH,
+        })
+    );
+}
+
+#[test]
+fn overlay_fade_take_and_off_advance_to_exact_opacity_endpoints() {
+    let mut switcher = state();
+    let channel = OverlayChannelId::new(5).unwrap();
+    switcher
+        .configure_overlay_transition(channel, OverlayTransitionKind::Fade, 4)
+        .unwrap();
+    switcher.request_overlay_take(channel, input(3)).unwrap();
+
+    assert!(switcher.overlay(channel).is_active());
+    assert_eq!(switcher.overlay(channel).opacity(), 0);
+    for opacity in [63, 127, 191, 255] {
+        let _ = switcher.advance_frame_events();
+        assert_eq!(switcher.overlay(channel).opacity(), opacity);
+    }
+    assert!(!switcher.overlay(channel).is_transitioning());
+
+    let _ = switcher.request_overlay_off(channel);
+    for opacity in [192, 128, 64, 0] {
+        let _ = switcher.advance_frame_events();
+        assert_eq!(switcher.overlay(channel).opacity(), opacity);
+    }
+    assert!(!switcher.overlay(channel).is_active());
+    assert!(!switcher.overlay(channel).is_transitioning());
 }
 
 #[test]
@@ -758,7 +844,7 @@ fn stinger_configuration_and_playback_validate_media_and_timing() {
 }
 
 #[test]
-fn timed_transition_reports_completion_without_changing_legacy_api() {
+fn timed_transition_reports_completion() {
     let mut switcher = state();
     switcher
         .apply(SwitcherCommand::Transition {
@@ -780,20 +866,5 @@ fn timed_transition_reports_completion_without_changing_legacy_api() {
                 program: input(2),
             },
         ]
-    );
-
-    let mut legacy = state();
-    legacy
-        .apply(SwitcherCommand::Transition {
-            kind: TransitionKind::Fade,
-            duration_frames: 1,
-        })
-        .unwrap();
-    assert_eq!(
-        legacy.advance_frame(),
-        Some(SwitcherEvent::ProgramChanged {
-            previous: input(1),
-            program: input(2),
-        })
     );
 }

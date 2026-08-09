@@ -64,6 +64,23 @@ fn ten_layers_compile_and_execute_in_stable_z_order() {
 }
 
 #[test]
+fn inset_border_is_drawn_inside_transformed_bounds_before_layer_opacity() {
+    let source = frame(1, 1, &[Rgba8::new(20, 40, 60, 255)]);
+    let mut scene = Scene::new(6, 5, Rgba8::new(0, 0, 0, 255)).unwrap();
+    scene.push_layer(
+        SourceLayer::new(SourceId::new(1), 0, transform(1, 1, 4, 3)).with_inset_border(1),
+    );
+    let (plan, _) = compile_scene(&scene, OutputTarget::Program).unwrap();
+    assert_eq!(plan.layers()[0].inset_border_width(), 1);
+    let output = execute_cpu(&plan, &[CpuSourceFrame::new(SourceId::new(1), &source)]).unwrap();
+
+    assert_eq!(output.pixel(1, 1), Some(Rgba8::new(255, 255, 255, 255)));
+    assert_eq!(output.pixel(4, 3), Some(Rgba8::new(255, 255, 255, 255)));
+    assert_eq!(output.pixel(2, 2), Some(Rgba8::new(20, 40, 60, 255)));
+    assert_eq!(output.pixel(0, 0), Some(Rgba8::new(0, 0, 0, 255)));
+}
+
+#[test]
 fn crop_transform_mask_chroma_luma_order_and_opacity_have_exact_pixels() {
     let blue = Rgba8::new(0, 0, 255, 255);
     let mut scene = Scene::new(4, 1, blue).unwrap();

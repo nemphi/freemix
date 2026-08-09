@@ -1,8 +1,5 @@
 use fm_client::{ConnectionState, Session};
-use fm_protocol::{
-    CommandPayload, MANUAL_ALPHA_FADE_PROTOCOL_VERSION, MANUAL_TRANSITION_PROTOCOL_VERSION,
-    ManualTransitionKind, ManualTransitionPosition,
-};
+use fm_protocol::{CommandPayload, ManualTransitionKind, ManualTransitionPosition};
 use fm_types::InputId;
 use fm_ui_model::{ManualTransitionStatus, SwitcherState};
 
@@ -150,13 +147,6 @@ impl ManualTransitionModel {
         let Some(session) = session else {
             return TransitionControlState::Hidden;
         };
-        if !session_supports_manual_transition(session)
-            || matches!(control, ManualTransitionControl::StartAlphaFade)
-                && !session_supports_manual_alpha_fade(session)
-        {
-            return TransitionControlState::Hidden;
-        }
-
         if !matches!(connection_state, ConnectionState::Ready)
             || !session_can_transition(session)
             || matches!(self.desired, ManualTransitionProjection::Missing)
@@ -229,14 +219,4 @@ fn session_can_transition(session: &Session) -> bool {
         .permissions
         .iter()
         .any(|permission| permission == "transition")
-}
-
-fn session_supports_manual_transition(session: &Session) -> bool {
-    session.protocol.major == MANUAL_TRANSITION_PROTOCOL_VERSION.major
-        && session.protocol.minor >= MANUAL_TRANSITION_PROTOCOL_VERSION.minor
-}
-
-fn session_supports_manual_alpha_fade(session: &Session) -> bool {
-    session.protocol.major == MANUAL_ALPHA_FADE_PROTOCOL_VERSION.major
-        && session.protocol.minor >= MANUAL_ALPHA_FADE_PROTOCOL_VERSION.minor
 }

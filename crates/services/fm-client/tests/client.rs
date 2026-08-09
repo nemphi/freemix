@@ -5,16 +5,13 @@ use fm_client::{
     DEFAULT_COMPLETED_COMMAND_CAPACITY, Intake, MAX_COMPLETED_COMMAND_CAPACITY, Outbound, SyncMode,
 };
 use fm_protocol::{
-    ALPHA_FADE_PROTOCOL_VERSION, CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, ClientType,
-    CommandPayload, CommandResult, EngineIdentity, EventCursor, EventMessage, EventPayload,
-    FADE_TO_BLACK_PROTOCOL_VERSION, FadeToBlackPosition, FadeToBlackState, HandshakeOutcome,
-    HandshakeResponse, MANUAL_ALPHA_FADE_PROTOCOL_VERSION, MANUAL_TRANSITION_PROTOCOL_VERSION,
-    ManualTransitionKind, ManualTransitionPosition, ManualTransitionState, ManualTransitionStatus,
-    ProtocolVersion, ResumeCursor, Role, RuntimeEventMessage, RuntimeLifecycleEvent,
-    SLIDE_PROTOCOL_VERSION, STINGER_CONFIGURATION_PROTOCOL_VERSION, STINGER_PROTOCOL_VERSION,
-    STINGER_STATUS_PROTOCOL_VERSION, ServerIdentity, SnapshotMessage, SnapshotReason,
-    StingerAudioPolicy, StingerMissingMediaFallback, StingerReadiness, StingerStatus,
-    WIPE_PROTOCOL_VERSION, WireInputId, WireMessage, WireStingerSlotId, ZOOM_PROTOCOL_VERSION,
+    CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, ClientType, CommandPayload, CommandResult,
+    EngineIdentity, EventCursor, EventMessage, EventPayload, FadeToBlackPosition, FadeToBlackState,
+    HandshakeOutcome, HandshakeResponse, ManualTransitionKind, ManualTransitionPosition,
+    ManualTransitionState, ManualTransitionStatus, ProtocolVersion, ResumeCursor, Role,
+    RuntimeEventMessage, RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage, SnapshotReason,
+    StingerAudioPolicy, StingerMissingMediaFallback, StingerReadiness, StingerStatus, WireInputId,
+    WireMessage, WireStingerSlotId,
 };
 use fm_types::ProjectId;
 use fm_ui_model::ManualTransitionStatus as ModelManualTransitionStatus;
@@ -100,11 +97,13 @@ fn snapshot(revision: u64) -> SnapshotMessage {
         desired_preview: input(2),
         realized_program: input(1),
         realized_preview: input(2),
-        desired_manual_transition: Some(ManualTransitionStatus::Inactive),
-        realized_manual_transition: Some(ManualTransitionStatus::Inactive),
-        desired_fade_to_black: Some(live_fade_to_black()),
-        realized_fade_to_black: Some(live_fade_to_black()),
-        stingers: Some(Vec::new()),
+        desired_manual_transition: ManualTransitionStatus::Inactive,
+        realized_manual_transition: ManualTransitionStatus::Inactive,
+        desired_fade_to_black: live_fade_to_black(),
+        realized_fade_to_black: live_fade_to_black(),
+        stingers: Vec::new(),
+        desired_overlays: fm_protocol::OverlayStatus::empty_channels(),
+        realized_overlays: fm_protocol::OverlayStatus::empty_channels(),
     }
 }
 
@@ -209,8 +208,9 @@ fn connect_snapshot_resume_and_reconnect_are_deterministic() {
             payload: EventPayload::DesiredSwitcher {
                 program: input(2),
                 preview: input(1),
-                manual_transition: Some(ManualTransitionStatus::Inactive),
-                fade_to_black: Some(live_fade_to_black()),
+                manual_transition: ManualTransitionStatus::Inactive,
+                fade_to_black: live_fade_to_black(),
+                overlays: fm_protocol::OverlayStatus::empty_channels(),
             },
         })
         .unwrap();
@@ -226,47 +226,20 @@ fn connect_snapshot_resume_and_reconnect_are_deterministic() {
 }
 
 #[test]
-fn protocol_1_5_requires_and_reduces_exact_fade_to_black_state() {
+fn current_contract_reduces_exact_fade_to_black_state() {
     let mut client = Client::new(config(4)).unwrap();
     client.start_connect().unwrap();
     client.transport_connected().unwrap();
     client.accept_handshake(handshake(4, None)).unwrap();
 
-    let mut incomplete = snapshot(4);
-    incomplete.desired_fade_to_black = None;
-    assert!(matches!(
-        client.apply_snapshot(incomplete),
-        Err(ClientError::InvalidSnapshot(
-            "protocol 1.5 snapshot omitted fade-to-black state"
-        ))
-    ));
-
     let mut initial = snapshot(4);
-    initial.desired_fade_to_black = Some(fade_to_black(true, 40_000));
-    initial.realized_fade_to_black = Some(fade_to_black(true, 20_000));
+    initial.desired_fade_to_black = fade_to_black(true, 40_000);
+    initial.realized_fade_to_black = fade_to_black(true, 20_000);
     client.apply_snapshot(initial).unwrap();
     let switcher = client.model().state().unwrap().switcher();
     assert_eq!(switcher.desired_fade_to_black, fade_to_black(true, 40_000));
     assert_eq!(switcher.realized_fade_to_black, fade_to_black(true, 20_000));
 
-    let incomplete_event = EventMessage {
-        cursor: EventCursor {
-            engine: engine(),
-            revision: 5,
-        },
-        payload: EventPayload::DesiredSwitcher {
-            program: input(1),
-            preview: input(2),
-            manual_transition: Some(ManualTransitionStatus::Inactive),
-            fade_to_black: None,
-        },
-    };
-    assert!(matches!(
-        client.apply_event(incomplete_event),
-        Err(ClientError::InvalidSnapshot(
-            "protocol 1.5 event omitted fade-to-black state"
-        ))
-    ));
     client
         .apply_event(EventMessage {
             cursor: EventCursor {
@@ -276,8 +249,9 @@ fn protocol_1_5_requires_and_reduces_exact_fade_to_black_state() {
             payload: EventPayload::DesiredSwitcher {
                 program: input(1),
                 preview: input(2),
-                manual_transition: Some(ManualTransitionStatus::Inactive),
-                fade_to_black: Some(fade_to_black(false, 12_345)),
+                manual_transition: ManualTransitionStatus::Inactive,
+                fade_to_black: fade_to_black(false, 12_345),
+                overlays: fm_protocol::OverlayStatus::empty_channels(),
             },
         })
         .unwrap();
@@ -291,22 +265,6 @@ fn protocol_1_5_requires_and_reduces_exact_fade_to_black_state() {
         fade_to_black(false, 12_345)
     );
 
-    let incomplete_runtime = runtime_event(
-        5,
-        7,
-        1,
-        RuntimeLifecycleEvent::Realized {
-            domain: "switcher".into(),
-            manual_transition: Some(ManualTransitionStatus::Inactive),
-            fade_to_black: None,
-        },
-    );
-    assert!(matches!(
-        client.apply_runtime_event(incomplete_runtime),
-        Err(ClientError::InvalidSnapshot(
-            "protocol 1.5 runtime event omitted fade-to-black state"
-        ))
-    ));
     client
         .apply_runtime_event(runtime_event(
             5,
@@ -314,8 +272,8 @@ fn protocol_1_5_requires_and_reduces_exact_fade_to_black_state() {
             1,
             RuntimeLifecycleEvent::Realized {
                 domain: "switcher".into(),
-                manual_transition: Some(ManualTransitionStatus::Inactive),
-                fade_to_black: Some(fade_to_black(false, 12_345)),
+                manual_transition: ManualTransitionStatus::Inactive,
+                fade_to_black: fade_to_black(false, 12_345),
             },
         ))
         .unwrap();
@@ -331,20 +289,11 @@ fn protocol_1_5_requires_and_reduces_exact_fade_to_black_state() {
 }
 
 #[test]
-fn protocol_1_11_requires_and_reduces_exact_stinger_status() {
+fn current_contract_reduces_exact_stinger_status() {
     let mut client = Client::new(config(4)).unwrap();
     client.start_connect().unwrap();
     client.transport_connected().unwrap();
     client.accept_handshake(handshake(4, None)).unwrap();
-
-    let mut incomplete = snapshot(4);
-    incomplete.stingers = None;
-    assert!(matches!(
-        client.apply_snapshot(incomplete),
-        Err(ClientError::InvalidSnapshot(
-            "protocol 1.11 snapshot omitted Stinger status"
-        ))
-    ));
 
     let status = StingerStatus {
         slot: WireStingerSlotId::new(8).unwrap(),
@@ -356,7 +305,7 @@ fn protocol_1_11_requires_and_reduces_exact_stinger_status() {
         readiness: StingerReadiness::Missing,
     };
     let mut complete = snapshot(4);
-    complete.stingers = Some(vec![status]);
+    complete.stingers = vec![status];
     client.apply_snapshot(complete).unwrap();
     let projected = &client.model().view().unwrap().stingers;
     assert_eq!(projected.len(), 1);
@@ -371,17 +320,17 @@ fn incompatible_handshake_is_terminal_until_configuration_changes() {
     client.start_connect().unwrap();
     client.transport_connected().unwrap();
     let mut incompatible = handshake(0, None);
-    incompatible.negotiated = ProtocolVersion::new(2, 0);
+    incompatible.negotiated = ProtocolVersion::new(99, 0);
     assert_eq!(
         client.accept_handshake(incompatible),
         Err(ClientError::IncompatibleProtocol(ProtocolVersion::new(
-            2, 0
+            99, 0
         )))
     );
     assert_eq!(
         client.state(),
         &ConnectionState::Incompatible {
-            negotiated: ProtocolVersion::new(2, 0)
+            negotiated: ProtocolVersion::new(99, 0)
         }
     );
 }
@@ -442,11 +391,7 @@ fn completed_history_stays_constant_and_reconnect_scan_is_bounded() {
     client.start_connect().unwrap();
     let cursor = client.transport_connected().unwrap().resume_cursor.unwrap();
     client
-        .accept_handshake(handshake_version(
-            ProtocolVersion::new(1, 2),
-            4,
-            Some(cursor),
-        ))
+        .accept_handshake(handshake_version(CURRENT_PROTOCOL_VERSION, 4, Some(cursor)))
         .unwrap();
     assert_eq!(client.state(), &ConnectionState::Ready);
     assert_eq!(client.retained_command_count(), RETAINED);
@@ -512,17 +457,13 @@ fn completed_eviction_preserves_all_unresolved_state_and_uncertainty() {
     client.start_connect().unwrap();
     let cursor = client.transport_connected().unwrap().resume_cursor.unwrap();
     client
-        .accept_handshake(handshake_version(
-            ProtocolVersion::new(1, 2),
-            4,
-            Some(cursor),
-        ))
+        .accept_handshake(handshake_version(CURRENT_PROTOCOL_VERSION, 4, Some(cursor)))
         .unwrap();
     assert_eq!(client.retained_command_count(), 4);
     assert_eq!(client.command(&wipe.id).unwrap().command, wipe);
     assert_eq!(
         client.command(&preview.id).unwrap().command.protocol,
-        ProtocolVersion::new(1, 2)
+        CURRENT_PROTOCOL_VERSION
     );
     assert_eq!(client.model().pending_commands().len(), 2);
     assert_eq!(
@@ -737,393 +678,6 @@ fn wipe_command_is_queued_with_its_exact_duration() {
 }
 
 #[test]
-fn alpha_fade_command_is_queued_only_on_protocol_1_6() {
-    let mut current = ready_client(1);
-    let command = current
-        .queue_command(
-            CommandPayload::AlphaFade {
-                duration_frames: 45,
-            },
-            "alpha-fade-45",
-            Some(4),
-            None,
-        )
-        .unwrap();
-    assert_eq!(command.protocol, CURRENT_PROTOCOL_VERSION);
-    assert_eq!(
-        command.payload,
-        CommandPayload::AlphaFade {
-            duration_frames: 45,
-        }
-    );
-
-    let mut old = Client::new(config(2)).unwrap();
-    old.start_connect().unwrap();
-    old.transport_connected().unwrap();
-    let mut old_handshake = handshake(4, None);
-    old_handshake.negotiated = FADE_TO_BLACK_PROTOCOL_VERSION;
-    old.accept_handshake(old_handshake).unwrap();
-    old.apply_snapshot(snapshot(4)).unwrap();
-    assert_eq!(
-        old.queue_command(
-            CommandPayload::AlphaFade { duration_frames: 3 },
-            "unsupported-alpha-fade",
-            Some(4),
-            None,
-        ),
-        Err(ClientError::UnsupportedCommandVersion {
-            negotiated: FADE_TO_BLACK_PROTOCOL_VERSION,
-            required: ALPHA_FADE_PROTOCOL_VERSION,
-        })
-    );
-    assert_eq!(old.outbound_len(), 0);
-}
-
-#[test]
-fn manual_alpha_fade_start_requires_protocol_1_7() {
-    let mut current = ready_client(1);
-    let command = current
-        .queue_command(
-            CommandPayload::StartManualTransition {
-                kind: ManualTransitionKind::AlphaFade,
-            },
-            "manual-alpha-fade",
-            Some(4),
-            None,
-        )
-        .unwrap();
-    assert_eq!(command.protocol, CURRENT_PROTOCOL_VERSION);
-
-    let mut old = Client::new(config(2)).unwrap();
-    old.start_connect().unwrap();
-    old.transport_connected().unwrap();
-    old.accept_handshake(handshake_version(ALPHA_FADE_PROTOCOL_VERSION, 4, None))
-        .unwrap();
-    old.apply_snapshot(snapshot(4)).unwrap();
-    assert_eq!(
-        old.queue_command(
-            CommandPayload::StartManualTransition {
-                kind: ManualTransitionKind::AlphaFade,
-            },
-            "unsupported-manual-alpha-fade",
-            Some(4),
-            None,
-        ),
-        Err(ClientError::UnsupportedCommandVersion {
-            negotiated: ALPHA_FADE_PROTOCOL_VERSION,
-            required: MANUAL_ALPHA_FADE_PROTOCOL_VERSION,
-        })
-    );
-    assert_eq!(old.outbound_len(), 0);
-}
-
-#[test]
-fn slide_is_queued_only_on_protocol_1_8() {
-    let mut current = ready_client(1);
-    let command = current
-        .queue_command(
-            CommandPayload::Slide {
-                duration_frames: 45,
-            },
-            "slide-45",
-            Some(4),
-            None,
-        )
-        .unwrap();
-    assert_eq!(command.protocol, CURRENT_PROTOCOL_VERSION);
-
-    let mut old = Client::new(config(2)).unwrap();
-    old.start_connect().unwrap();
-    old.transport_connected().unwrap();
-    old.accept_handshake(handshake_version(
-        MANUAL_ALPHA_FADE_PROTOCOL_VERSION,
-        4,
-        None,
-    ))
-    .unwrap();
-    old.apply_snapshot(snapshot(4)).unwrap();
-    assert_eq!(
-        old.queue_command(
-            CommandPayload::Slide { duration_frames: 3 },
-            "unsupported-slide",
-            Some(4),
-            None,
-        ),
-        Err(ClientError::UnsupportedCommandVersion {
-            negotiated: MANUAL_ALPHA_FADE_PROTOCOL_VERSION,
-            required: SLIDE_PROTOCOL_VERSION,
-        })
-    );
-    assert_eq!(old.outbound_len(), 0);
-}
-
-#[test]
-fn zoom_is_queued_only_on_protocol_1_9() {
-    let mut current = ready_client(1);
-    let command = current
-        .queue_command(
-            CommandPayload::Zoom {
-                duration_frames: 45,
-            },
-            "zoom-45",
-            Some(4),
-            None,
-        )
-        .unwrap();
-    assert_eq!(command.protocol, CURRENT_PROTOCOL_VERSION);
-
-    let mut old = Client::new(config(2)).unwrap();
-    old.start_connect().unwrap();
-    old.transport_connected().unwrap();
-    old.accept_handshake(handshake_version(SLIDE_PROTOCOL_VERSION, 4, None))
-        .unwrap();
-    old.apply_snapshot(snapshot(4)).unwrap();
-    assert_eq!(
-        old.queue_command(
-            CommandPayload::Zoom { duration_frames: 3 },
-            "unsupported-zoom",
-            Some(4),
-            None,
-        ),
-        Err(ClientError::UnsupportedCommandVersion {
-            negotiated: SLIDE_PROTOCOL_VERSION,
-            required: ZOOM_PROTOCOL_VERSION,
-        })
-    );
-    assert_eq!(old.outbound_len(), 0);
-}
-
-#[test]
-fn stinger_is_queued_only_on_protocol_1_10() {
-    let mut current = ready_client(1);
-    let command = current
-        .queue_command(
-            CommandPayload::Stinger {
-                slot: WireStingerSlotId::new(2).unwrap(),
-                duration_frames: 45,
-            },
-            "stinger-2",
-            Some(4),
-            None,
-        )
-        .unwrap();
-    assert_eq!(command.protocol, CURRENT_PROTOCOL_VERSION);
-
-    let mut old = Client::new(config(2)).unwrap();
-    old.start_connect().unwrap();
-    old.transport_connected().unwrap();
-    old.accept_handshake(handshake_version(ZOOM_PROTOCOL_VERSION, 4, None))
-        .unwrap();
-    old.apply_snapshot(snapshot(4)).unwrap();
-    assert_eq!(
-        old.queue_command(
-            CommandPayload::Stinger {
-                slot: WireStingerSlotId::new(2).unwrap(),
-                duration_frames: 3,
-            },
-            "unsupported-stinger",
-            Some(4),
-            None,
-        ),
-        Err(ClientError::UnsupportedCommandVersion {
-            negotiated: ZOOM_PROTOCOL_VERSION,
-            required: STINGER_PROTOCOL_VERSION,
-        })
-    );
-    assert_eq!(old.outbound_len(), 0);
-}
-
-#[test]
-fn stinger_slot_mutation_requires_1_12_and_event_updates_authoritative_slots() {
-    let payload = CommandPayload::ConfigureStinger {
-        slot: WireStingerSlotId::new(8).unwrap(),
-        media_input: input(2),
-        preload: true,
-        cut_point_frames: 9,
-        audio_policy: StingerAudioPolicy::MixWithProgram,
-        missing_media_fallback: StingerMissingMediaFallback::KeepProgram,
-    };
-    let mut current = ready_client(1);
-    assert_eq!(
-        current
-            .queue_command(payload, "configure-stinger-8", Some(4), None)
-            .unwrap()
-            .protocol,
-        STINGER_CONFIGURATION_PROTOCOL_VERSION
-    );
-
-    let mut old = Client::new(config(2)).unwrap();
-    old.start_connect().unwrap();
-    old.transport_connected().unwrap();
-    old.accept_handshake(handshake_version(STINGER_STATUS_PROTOCOL_VERSION, 4, None))
-        .unwrap();
-    old.apply_snapshot(snapshot(4)).unwrap();
-    assert_eq!(
-        old.queue_command(payload, "unsupported-configure", Some(4), None),
-        Err(ClientError::UnsupportedCommandVersion {
-            negotiated: STINGER_STATUS_PROTOCOL_VERSION,
-            required: STINGER_CONFIGURATION_PROTOCOL_VERSION,
-        })
-    );
-
-    let mut receiving = ready_client(3);
-    receiving
-        .apply_event(EventMessage {
-            cursor: EventCursor {
-                engine: engine(),
-                revision: 5,
-            },
-            payload: EventPayload::StingerSlotsChanged {
-                program: input(1),
-                preview: input(2),
-                manual_transition: Some(ManualTransitionStatus::Inactive),
-                fade_to_black: Some(live_fade_to_black()),
-                stingers: vec![StingerStatus {
-                    slot: WireStingerSlotId::new(8).unwrap(),
-                    media_input: input(2),
-                    preload: true,
-                    cut_point_frames: 9,
-                    audio_policy: StingerAudioPolicy::MixWithProgram,
-                    missing_media_fallback: StingerMissingMediaFallback::KeepProgram,
-                    readiness: StingerReadiness::Ready,
-                }],
-            },
-        })
-        .unwrap();
-    let view = receiving.model().view().unwrap();
-    assert_eq!(view.stingers.len(), 1);
-    assert_eq!(view.stingers[0].slot, 8);
-}
-
-#[test]
-fn protocol_1_11_client_resyncs_without_applying_stinger_slot_mutation() {
-    let mut client = Client::new(config(2)).unwrap();
-    client.start_connect().unwrap();
-    client.transport_connected().unwrap();
-    client
-        .accept_handshake(handshake_version(STINGER_STATUS_PROTOCOL_VERSION, 4, None))
-        .unwrap();
-    client.apply_snapshot(snapshot(4)).unwrap();
-
-    assert_eq!(
-        client.apply_event(EventMessage {
-            cursor: EventCursor {
-                engine: engine(),
-                revision: 5,
-            },
-            payload: EventPayload::StingerSlotsChanged {
-                program: input(1),
-                preview: input(2),
-                manual_transition: Some(ManualTransitionStatus::Inactive),
-                fade_to_black: Some(live_fade_to_black()),
-                stingers: vec![StingerStatus {
-                    slot: WireStingerSlotId::new(8).unwrap(),
-                    media_input: input(2),
-                    preload: true,
-                    cut_point_frames: 9,
-                    audio_policy: StingerAudioPolicy::MixWithProgram,
-                    missing_media_fallback: StingerMissingMediaFallback::KeepProgram,
-                    readiness: StingerReadiness::Ready,
-                }],
-            },
-        }),
-        Err(ClientError::ResyncRequired {
-            expected_revision: 5,
-            received_revision: 5,
-        })
-    );
-    assert_eq!(
-        client.state(),
-        &ConnectionState::ResyncRequired {
-            expected_revision: 5,
-            received_revision: 5,
-        }
-    );
-    assert_eq!(client.last_applied_cursor().unwrap().revision, 4);
-    assert!(client.model().view().unwrap().stingers.is_empty());
-}
-
-#[test]
-fn new_client_does_not_send_wipe_after_negotiating_with_an_old_daemon() {
-    let mut client = Client::new(config(1)).unwrap();
-    client.start_connect().unwrap();
-    client.transport_connected().unwrap();
-    let mut old_handshake = handshake(4, None);
-    old_handshake.negotiated = ProtocolVersion::new(1, 0);
-    client.accept_handshake(old_handshake).unwrap();
-    client.apply_snapshot(snapshot(4)).unwrap();
-
-    assert_eq!(
-        client.queue_command(
-            CommandPayload::Wipe { duration_frames: 3 },
-            "unsupported-wipe",
-            Some(4),
-            None,
-        ),
-        Err(ClientError::UnsupportedCommandVersion {
-            negotiated: ProtocolVersion::new(1, 0),
-            required: WIPE_PROTOCOL_VERSION,
-        })
-    );
-    assert_eq!(client.outbound_len(), 0);
-    assert!(client.command("diagnostic-a:1").is_none());
-
-    let cut = client
-        .queue_command(CommandPayload::Cut, "supported-cut", Some(4), None)
-        .unwrap();
-    assert_eq!(cut.id, "diagnostic-a:1");
-    assert_eq!(cut.protocol, ProtocolVersion::new(1, 0));
-}
-
-#[test]
-fn unresolved_manual_intent_blocks_fifo_after_reconnect_downgrade() {
-    let mut client = ready_client(3);
-    let manual = client
-        .queue_command(
-            CommandPayload::StartManualTransition {
-                kind: ManualTransitionKind::Fade,
-            },
-            "manual-start",
-            Some(4),
-            None,
-        )
-        .unwrap();
-    assert!(matches!(
-        client.pop_outbound(),
-        Some(Outbound::Command(ref queued)) if queued == &manual
-    ));
-    client
-        .queue_command(CommandPayload::Cut, "later-cut", Some(4), None)
-        .unwrap();
-
-    let _ = client.transport_disconnected();
-    client.start_connect().unwrap();
-    let cursor = client.transport_connected().unwrap().resume_cursor.unwrap();
-    client
-        .accept_handshake(handshake_version(WIPE_PROTOCOL_VERSION, 4, Some(cursor)))
-        .unwrap();
-    assert_eq!(client.state(), &ConnectionState::Ready);
-    assert_eq!(
-        manual.payload.minimum_protocol_version(),
-        MANUAL_TRANSITION_PROTOCOL_VERSION
-    );
-    assert_eq!(
-        client.command(&manual.id).unwrap().command.protocol,
-        CURRENT_PROTOCOL_VERSION
-    );
-    assert_eq!(
-        client.outbound_len(),
-        1,
-        "the later cut must remain queued behind the sent manual intent"
-    );
-    assert_eq!(
-        client.pop_outbound(),
-        None,
-        "unsupported manual head must block the later cut"
-    );
-}
-
-#[test]
 fn event_gap_requests_snapshot_resync() {
     let mut client = ready_client(2);
     let error = client
@@ -1135,8 +689,9 @@ fn event_gap_requests_snapshot_resync() {
             payload: EventPayload::DesiredSwitcher {
                 program: input(2),
                 preview: input(1),
-                manual_transition: Some(ManualTransitionStatus::Inactive),
-                fade_to_black: Some(live_fade_to_black()),
+                manual_transition: ManualTransitionStatus::Inactive,
+                fade_to_black: live_fade_to_black(),
+                overlays: fm_protocol::OverlayStatus::empty_channels(),
             },
         })
         .unwrap_err();
@@ -1168,8 +723,8 @@ fn same_revision_runtime_realization_does_not_move_durable_cursor() {
                 1,
                 RuntimeLifecycleEvent::Realized {
                     domain: "switcher".to_owned(),
-                    manual_transition: Some(ManualTransitionStatus::Inactive),
-                    fade_to_black: Some(live_fade_to_black()),
+                    manual_transition: ManualTransitionStatus::Inactive,
+                    fade_to_black: live_fade_to_black(),
                 },
             )))
             .unwrap(),
@@ -1195,8 +750,8 @@ fn reconnecting_second_client_reduces_exact_desired_and_realized_manual_state() 
     first.transport_connected().unwrap();
     first.accept_handshake(handshake(4, None)).unwrap();
     let mut initial = snapshot(4);
-    initial.desired_manual_transition = Some(active_manual(0, 6_250));
-    initial.realized_manual_transition = Some(active_manual(6_250, 6_250));
+    initial.desired_manual_transition = active_manual(0, 6_250);
+    initial.realized_manual_transition = active_manual(6_250, 6_250);
     first.apply_snapshot(initial.clone()).unwrap();
 
     let mut second = Client::new(config(4)).unwrap();
@@ -1227,8 +782,9 @@ fn reconnecting_second_client_reduces_exact_desired_and_realized_manual_state() 
             payload: EventPayload::DesiredSwitcher {
                 program: input(1),
                 preview: input(2),
-                manual_transition: Some(active_manual(0, 2_500)),
-                fade_to_black: Some(live_fade_to_black()),
+                manual_transition: active_manual(0, 2_500),
+                fade_to_black: live_fade_to_black(),
+                overlays: fm_protocol::OverlayStatus::empty_channels(),
             },
         })
         .unwrap();
@@ -1239,8 +795,8 @@ fn reconnecting_second_client_reduces_exact_desired_and_realized_manual_state() 
             1,
             RuntimeLifecycleEvent::Realized {
                 domain: "switcher".into(),
-                manual_transition: Some(active_manual(2_500, 2_500)),
-                fade_to_black: Some(live_fade_to_black()),
+                manual_transition: active_manual(2_500, 2_500),
+                fade_to_black: live_fade_to_black(),
             },
         ))
         .unwrap();
@@ -1271,8 +827,8 @@ fn runtime_lifecycle_sequence_is_recorded_without_durable_reduction() {
             2,
             RuntimeLifecycleEvent::Realized {
                 domain: "audio".to_owned(),
-                manual_transition: Some(ManualTransitionStatus::Inactive),
-                fade_to_black: None,
+                manual_transition: ManualTransitionStatus::Inactive,
+                fade_to_black: live_fade_to_black(),
             },
         ))
         .unwrap();
@@ -1338,8 +894,9 @@ fn runtime_sequence_gap_does_not_request_durable_resync() {
             payload: EventPayload::DesiredSwitcher {
                 program: input(2),
                 preview: input(1),
-                manual_transition: Some(ManualTransitionStatus::Inactive),
-                fade_to_black: Some(live_fade_to_black()),
+                manual_transition: ManualTransitionStatus::Inactive,
+                fade_to_black: live_fade_to_black(),
+                overlays: fm_protocol::OverlayStatus::empty_channels(),
             },
         })
         .unwrap();

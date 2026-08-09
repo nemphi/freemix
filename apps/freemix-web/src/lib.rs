@@ -9,6 +9,7 @@ use fm_types::ProjectId;
 
 mod fade_to_black;
 mod manual_transition;
+mod overlay;
 mod stinger;
 mod transition;
 
@@ -19,6 +20,7 @@ pub use manual_transition::{
     ManualTransitionControl, ManualTransitionModel, ManualTransitionMotion,
     ManualTransitionPresentation, ManualTransitionProjection,
 };
+pub use overlay::{OverlayControl, OverlayControls};
 pub use stinger::{StingerControl, StingerControls};
 pub use transition::{TransitionControl, TransitionControlState, TransitionControls};
 
