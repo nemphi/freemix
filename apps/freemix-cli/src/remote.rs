@@ -290,6 +290,7 @@ impl Remote {
                     {
                         return Err(RemoteFailure("daemon response timed out".into()).into());
                     }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(error) => return Err(error.into()),
                 };
                 if buffer.is_empty() {

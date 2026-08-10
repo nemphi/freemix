@@ -4,7 +4,7 @@ use std::{
     net::{SocketAddr, TcpListener, TcpStream},
     num::NonZeroU128,
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
     sync::atomic::{AtomicU64, Ordering},
     thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -21,6 +21,7 @@ use fm_protocol::{
 static TEST_ROOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 const TEST_PEER_TIMEOUT: Duration = Duration::from_secs(4);
+const TEST_CLI_TIMEOUT: Duration = Duration::from_secs(4);
 
 struct FakeRemoteServer {
     address: SocketAddr,
@@ -59,7 +60,15 @@ impl FakeRemoteServer {
             let mut writer = stream.try_clone().unwrap();
             let mut reader = BufReader::new(stream);
             assert_handshake_request(read_message(&mut reader));
-            writer.write_all(&vec![b'x'; MAX_LINE_BYTES + 1]).unwrap();
+            if let Err(error) = writer.write_all(&vec![b'x'; MAX_LINE_BYTES + 1]) {
+                assert!(matches!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::WouldBlock
+                ));
+            }
             let mut byte = [0];
             let _ = reader.get_mut().read(&mut byte);
         })
@@ -1084,7 +1093,7 @@ fn remote_commands_reject_non_loopback_addresses_before_connecting() {
 #[test]
 fn remote_status_times_out_when_peer_sends_no_response() {
     let server = FakeRemoteServer::start_silent_response();
-    let output = invoke(&["remote-status", &server.address()]);
+    let output = invoke_bounded(&["remote-status", &server.address()]);
     assert_failure_contains(&output, "daemon response timed out");
     server.finish();
 }
@@ -1092,7 +1101,7 @@ fn remote_status_times_out_when_peer_sends_no_response() {
 #[test]
 fn remote_status_rejects_an_unterminated_oversized_record() {
     let server = FakeRemoteServer::start_unterminated_response();
-    let output = invoke(&["remote-status", &server.address()]);
+    let output = invoke_bounded(&["remote-status", &server.address()]);
     assert_failure_contains(&output, "protocol line exceeds maximum length");
     server.finish();
 }
@@ -2282,6 +2291,32 @@ fn invoke(arguments: &[&str]) -> Output {
         .args(arguments)
         .output()
         .unwrap()
+}
+
+fn invoke_bounded(arguments: &[&str]) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_freemix-cli"))
+        .args(arguments)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + TEST_CLI_TIMEOUT;
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return child.wait_with_output().unwrap();
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "CLI process did not exit before {TEST_CLI_TIMEOUT:?}: status={} stdout={} stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn replace_once(source: &mut String, from: &str, to: &str) {
