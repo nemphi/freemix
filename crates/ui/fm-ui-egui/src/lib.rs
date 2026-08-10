@@ -1083,8 +1083,7 @@ fn draw_monitor(ui: &mut Ui, bus_label: &str, color: Color32, routing: Option<Mo
                                 .color(routing_text_color),
                         )
                         .truncate(),
-                    )
-                    .on_hover_text(&routing.desired.1);
+                    );
                     ui.add_sized(
                         [ui.available_width(), 0.0],
                         Label::new(
@@ -1094,8 +1093,7 @@ fn draw_monitor(ui: &mut Ui, bus_label: &str, color: Color32, routing: Option<Mo
                                 .color(routing_text_color),
                         )
                         .truncate(),
-                    )
-                    .on_hover_text(&routing.realized.1);
+                    );
                 } else {
                     ui.label(
                         RichText::new("ROUTING STATE UNAVAILABLE")
