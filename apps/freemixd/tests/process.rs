@@ -131,21 +131,29 @@ impl Daemon {
     }
 
     fn stop(mut self) {
-        let mut child = self.child.take().unwrap();
-        child.kill().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while child.try_wait().unwrap().is_none() {
-            assert!(Instant::now() < deadline, "daemon did not stop within one second");
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        let stopped = terminate_child(self.child.as_mut().unwrap());
+        assert!(stopped, "daemon did not stop within one second");
     }
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         if let Some(child) = &mut self.child {
-            let _ = child.kill();
-            let _ = child.wait();
+            let _ = terminate_child(child);
+        }
+    }
+}
+
+fn terminate_child(child: &mut Child) -> bool {
+    let _ = child.kill();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) | Err(_) => return false,
         }
     }
 }
