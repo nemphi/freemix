@@ -17,7 +17,7 @@ use fm_protocol::{
     ServerIdentity, SnapshotMessage, StingerAudioPolicy, StingerMissingMediaFallback,
     StingerReadiness,
 };
-use fm_types::{InputId, OutputId, ProjectId};
+use fm_types::{InputId, MAX_INPUT_NAME_BYTES, OutputId, ProjectId};
 
 /// A project-aware cursor used at the UI/protocol boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -239,6 +239,10 @@ impl ProjectSnapshot {
 /// A UI-owned durable desired-state change.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DurableChange {
+    InputRenamed {
+        input: InputId,
+        name: String,
+    },
     DesiredSwitcher {
         selection: BusSelection,
         manual_transition: ManualTransitionStatus,
@@ -268,6 +272,10 @@ impl DurableProjectEvent {
     #[must_use]
     pub fn from_protocol(project_id: ProjectId, message: EventMessage) -> Self {
         let change = match message.payload {
+            EventPayload::InputRenamed { input, name } => DurableChange::InputRenamed {
+                input: input.to_domain(),
+                name,
+            },
             EventPayload::DesiredSwitcher {
                 program,
                 preview,
@@ -1028,7 +1036,7 @@ impl ClientModel {
         }
 
         let state = self.state.as_ref().ok_or(ModelError::StateUnavailable)?;
-        validate_change(&event.change, &state.inputs)?;
+        validate_change(&event.change, state)?;
         let state = self.state.as_mut().ok_or(ModelError::StateUnavailable)?;
         apply_change(state, event.change.clone());
 
@@ -1441,8 +1449,26 @@ fn validate_input_audio_strips(
     Ok(())
 }
 
-fn validate_change(change: &DurableChange, inputs: &[InputId]) -> Result<(), ModelError> {
+fn validate_change(change: &DurableChange, state: &ProjectState) -> Result<(), ModelError> {
     let (selection, manual_transition, stingers, overlays, input_audio_strips) = match change {
+        DurableChange::InputRenamed { input, name } => {
+            let index = state
+                .inputs
+                .iter()
+                .position(|candidate| candidate == input)
+                .ok_or(ModelError::UnknownInput(*input))?;
+            if name.trim().is_empty()
+                || name.len() > MAX_INPUT_NAME_BYTES
+                || state
+                    .input_names
+                    .iter()
+                    .enumerate()
+                    .any(|(other, current)| other != index && current == name)
+            {
+                return Err(ModelError::InvalidInputNames);
+            }
+            return Ok(());
+        }
         DurableChange::DesiredSwitcher {
             selection,
             manual_transition,
@@ -1471,6 +1497,7 @@ fn validate_change(change: &DurableChange, inputs: &[InputId]) -> Result<(), Mod
             input_audio_strips,
         ),
     };
+    let inputs = &state.inputs;
     for input in [selection.program, selection.preview] {
         if !inputs.contains(&input) {
             return Err(ModelError::UnknownInput(input));
@@ -1497,6 +1524,14 @@ fn validate_optimistic(change: OptimisticChange, inputs: &[InputId]) -> Result<(
 
 fn apply_change(state: &mut ProjectState, change: DurableChange) {
     match change {
+        DurableChange::InputRenamed { input, name } => {
+            let index = state
+                .inputs
+                .iter()
+                .position(|candidate| *candidate == input)
+                .expect("validated rename input must exist");
+            state.input_names[index] = name;
+        }
         DurableChange::DesiredSwitcher {
             selection,
             manual_transition,

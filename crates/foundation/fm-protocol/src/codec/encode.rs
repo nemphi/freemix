@@ -143,7 +143,12 @@ fn encode_command(record: &mut Record, message: &CommandMessage) -> Result<(), C
     record.field_str("idempotency_key", &message.idempotency_key)?;
     record.optional("expected_revision", message.expected_revision)?;
     record.optional("deadline_ms", message.deadline_ms)?;
-    match message.payload {
+    match &message.payload {
+        CommandPayload::RenameInput { input, name } => {
+            record.field("payload", "input_rename")?;
+            record.field("input", input)?;
+            record.field_str("name", name)?;
+        }
         payload @ CommandPayload::SetInputAudioStrip { .. } => {
             encode_input_audio_strip_command(record, payload)?;
         }
@@ -197,7 +202,7 @@ fn encode_command(record: &mut Record, message: &CommandMessage) -> Result<(), C
             duration_frames,
         } => {
             record.field("payload", "fade_to_black")?;
-            record.field("active", u8::from(active))?;
+            record.field("active", u8::from(*active))?;
             record.field("duration_frames", duration_frames)?;
         }
         CommandPayload::StartManualTransition { kind } => {
@@ -228,7 +233,7 @@ fn encode_command(record: &mut Record, message: &CommandMessage) -> Result<(), C
 
 fn encode_input_audio_strip_command(
     record: &mut Record,
-    payload: CommandPayload,
+    payload: &CommandPayload,
 ) -> Result<(), CodecError> {
     let CommandPayload::SetInputAudioStrip {
         input,
@@ -246,13 +251,13 @@ fn encode_input_audio_strip_command(
     record.field("input", input)?;
     record.field("gain_millidb", gain_millidb)?;
     record.field("balance_basis_points", balance_basis_points)?;
-    record.field("muted", u8::from(muted))?;
-    record.field("soloed", u8::from(soloed))?;
-    record.field("follow_video", u8::from(follow_video))?;
+    record.field("muted", u8::from(*muted))?;
+    record.field("soloed", u8::from(*soloed))?;
+    record.field("follow_video", u8::from(*follow_video))?;
     record.field("delay_samples", delay_samples)
 }
 
-fn encode_overlay_command(record: &mut Record, payload: CommandPayload) -> Result<(), CodecError> {
+fn encode_overlay_command(record: &mut Record, payload: &CommandPayload) -> Result<(), CodecError> {
     match payload {
         CommandPayload::TakeOverlay { channel, source }
         | CommandPayload::UpdateOverlay { channel, source } => {
@@ -279,7 +284,7 @@ fn encode_overlay_command(record: &mut Record, payload: CommandPayload) -> Resul
             record.field("payload", "overlay_output")?;
             record.field("channel", channel)?;
             record.field("output", output)?;
-            record.field("included", u8::from(included))
+            record.field("included", u8::from(*included))
         }
         CommandPayload::ConfigureOverlayTransition {
             channel,
@@ -304,8 +309,8 @@ fn encode_overlay_command(record: &mut Record, payload: CommandPayload) -> Resul
         } => {
             record.field("payload", "overlay_appearance")?;
             record.field("channel", channel)?;
-            record.field("position", overlay_position(position))?;
-            record.field("border", overlay_border(border))
+            record.field("position", overlay_position(*position))?;
+            record.field("border", overlay_border(*border))
         }
         CommandPayload::QueueOverlay { channel, source } => {
             record.field("payload", "overlay_queue")?;
@@ -320,7 +325,10 @@ fn encode_overlay_command(record: &mut Record, payload: CommandPayload) -> Resul
     }
 }
 
-fn encode_stinger_mutation(record: &mut Record, payload: CommandPayload) -> Result<(), CodecError> {
+fn encode_stinger_mutation(
+    record: &mut Record,
+    payload: &CommandPayload,
+) -> Result<(), CodecError> {
     let CommandPayload::ConfigureStinger {
         slot,
         media_input,
@@ -339,7 +347,7 @@ fn encode_stinger_mutation(record: &mut Record, payload: CommandPayload) -> Resu
     record.field("payload", "configure_stinger")?;
     record.field("slot", slot)?;
     record.field("media_input", media_input)?;
-    record.field("preload", u8::from(preload))?;
+    record.field("preload", u8::from(*preload))?;
     record.field("cut_point_frames", cut_point_frames)?;
     record.field(
         "audio_policy",
@@ -606,6 +614,11 @@ fn encode_event(record: &mut Record, message: &EventMessage) -> Result<(), Codec
     record.kind("event");
     encode_cursor(record, &message.cursor)?;
     match &message.payload {
+        EventPayload::InputRenamed { input, name } => {
+            record.field("event", "input_renamed")?;
+            record.field("input", input)?;
+            record.field_str("name", name)?;
+        }
         EventPayload::DesiredSwitcher {
             program,
             preview,

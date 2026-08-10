@@ -852,11 +852,12 @@ impl Client {
             deadline_ms,
             payload,
         };
-        let optimistic = match payload {
+        let optimistic = match &command.payload {
             CommandPayload::SelectPreview { input } => {
                 Some(OptimisticChange::DesiredPreview(input.to_domain()))
             }
-            CommandPayload::SetInputAudioStrip { .. }
+            CommandPayload::RenameInput { .. }
+            | CommandPayload::SetInputAudioStrip { .. }
             | CommandPayload::Cut
             | CommandPayload::Fade { .. }
             | CommandPayload::AlphaFade { .. }

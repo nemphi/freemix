@@ -253,6 +253,10 @@ fn decode_command_payload(
     payload_name: String,
 ) -> Result<CommandPayload, CodecError> {
     Ok(match payload_name.as_str() {
+        "input_rename" => CommandPayload::RenameInput {
+            input: fields.input("input")?,
+            name: fields.required("name")?,
+        },
         "input_audio_strip" => CommandPayload::SetInputAudioStrip {
             input: fields.input("input")?,
             gain_millidb: fields.parse_required("gain_millidb")?,
@@ -835,6 +839,10 @@ fn invalid_stingers(value: &str) -> CodecError {
 fn decode_event(fields: &mut Fields) -> Result<EventMessage, CodecError> {
     let event = fields.required("event")?;
     let payload = match event.as_str() {
+        "input_renamed" => EventPayload::InputRenamed {
+            input: fields.input("input")?,
+            name: fields.required("name")?,
+        },
         "desired_switcher" => EventPayload::DesiredSwitcher {
             program: fields.input("program")?,
             preview: fields.input("preview")?,

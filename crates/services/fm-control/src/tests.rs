@@ -148,7 +148,11 @@ fn stinger_slot_mutation_is_transition_authorized_and_projects_durable_state() {
     let denied = control
         .submit(
             &principal(Role::Graphics),
-            command("configure-denied", "configure-denied-key", configure),
+            command(
+                "configure-denied",
+                "configure-denied-key",
+                configure.clone(),
+            ),
             0,
         )
         .unwrap();

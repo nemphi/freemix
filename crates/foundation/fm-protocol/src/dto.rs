@@ -440,8 +440,12 @@ impl OverlayStatus {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CommandPayload {
+    RenameInput {
+        input: WireInputId,
+        name: String,
+    },
     SetInputAudioStrip {
         input: WireInputId,
         gain_millidb: i32,
@@ -639,6 +643,10 @@ pub struct SnapshotMessage {
 /// A durable state change. Runtime progress uses [`RuntimeEventMessage`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EventPayload {
+    InputRenamed {
+        input: WireInputId,
+        name: String,
+    },
     DesiredSwitcher {
         program: WireInputId,
         preview: WireInputId,

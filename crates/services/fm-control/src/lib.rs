@@ -495,7 +495,7 @@ struct Subscriber {
     failure: Arc<Mutex<Option<SubscriberFailureReason>>>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct PendingRuntimeAction {
     revision: u64,
     command: EngineCommand,
@@ -720,7 +720,7 @@ impl<A: AuthorizationHook> ControlService<A> {
 
         if let Err(denial) = self
             .authorizer
-            .authorize(principal, command_class(message.payload))
+            .authorize(principal, command_class(&message.payload))
         {
             let result = CommandResult::Rejected {
                 id: message.id,
@@ -746,10 +746,10 @@ impl<A: AuthorizationHook> ControlService<A> {
             }));
         }
 
-        let command = engine_command(message.payload);
+        let command = engine_command(&message.payload);
         match self
             .engine
-            .prepare_execute(message.domain_envelope(command), now_millis)?
+            .prepare_execute(message.domain_envelope(command.clone()), now_millis)?
         {
             EnginePrepareOutcome::Replayed(outcome) => Ok(PrepareSubmitOutcome::Replayed(
                 engine_submission(&self.identity, idempotency_key, &self.engine, &outcome),
@@ -900,12 +900,12 @@ impl<A: AuthorizationHook> ControlService<A> {
                 .checked_add(offset)
                 .ok_or(ControlError::RuntimeGenerationOutOfOrder)
                 .map_err(TickWithRealizerError::Tick)?;
-            if is_program_transition(pending.command) {
+            if is_program_transition(&pending.command) {
                 self.active_transition = Some(ActiveTransition {
                     revision: pending.revision,
                     generation,
                 });
-            } else if matches!(pending.command, EngineCommand::FadeToBlack { .. }) {
+            } else if matches!(&pending.command, EngineCommand::FadeToBlack { .. }) {
                 if let Some(superseded) = self.active_fade_to_black.replace(ActiveTransition {
                     revision: pending.revision,
                     generation,
@@ -927,7 +927,7 @@ impl<A: AuthorizationHook> ControlService<A> {
                         server,
                         pending.revision,
                         generation,
-                        runtime_domain(pending.command),
+                        runtime_domain(&pending.command),
                     )
                     .map_err(TickWithRealizerError::Tick)?,
                 );
@@ -1064,15 +1064,17 @@ impl<A: AuthorizationHook> ControlService<A> {
     }
 }
 
-const fn runtime_domain(command: EngineCommand) -> &'static str {
+const fn runtime_domain(command: &EngineCommand) -> &'static str {
     match command {
+        EngineCommand::RenameInput { .. } => "project",
         EngineCommand::SetInputAudioStrip { .. } => "audio",
         _ => "switcher",
     }
 }
 
-const fn command_class(payload: CommandPayload) -> CommandClass {
+const fn command_class(payload: &CommandPayload) -> CommandClass {
     match payload {
+        CommandPayload::RenameInput { .. } => CommandClass::EditProject,
         CommandPayload::SetInputAudioStrip { .. } => CommandClass::ControlAudio,
         CommandPayload::SelectPreview { .. } => CommandClass::SelectPreview,
         CommandPayload::Cut
@@ -1100,8 +1102,12 @@ const fn command_class(payload: CommandPayload) -> CommandClass {
     }
 }
 
-fn engine_command(payload: CommandPayload) -> EngineCommand {
+fn engine_command(payload: &CommandPayload) -> EngineCommand {
     match payload {
+        CommandPayload::RenameInput { input, name } => EngineCommand::RenameInput {
+            input: input.to_domain(),
+            name: name.clone(),
+        },
         CommandPayload::SetInputAudioStrip {
             input,
             gain_millidb,
@@ -1113,29 +1119,35 @@ fn engine_command(payload: CommandPayload) -> EngineCommand {
         } => EngineCommand::SetInputAudioStrip {
             input: input.to_domain(),
             state: EngineInputAudioStripState {
-                gain_millidb,
-                balance_basis_points,
-                muted,
-                soloed,
-                follow_video,
-                delay_samples,
+                gain_millidb: *gain_millidb,
+                balance_basis_points: *balance_basis_points,
+                muted: *muted,
+                soloed: *soloed,
+                follow_video: *follow_video,
+                delay_samples: *delay_samples,
             },
         },
         CommandPayload::SelectPreview { input } => EngineCommand::SelectPreview(input.to_domain()),
         CommandPayload::Cut => EngineCommand::Cut,
-        CommandPayload::Fade { duration_frames } => EngineCommand::Fade { duration_frames },
-        CommandPayload::AlphaFade { duration_frames } => {
-            EngineCommand::AlphaFade { duration_frames }
-        }
-        CommandPayload::Slide { duration_frames } => EngineCommand::Slide { duration_frames },
-        CommandPayload::Zoom { duration_frames } => EngineCommand::Zoom { duration_frames },
+        CommandPayload::Fade { duration_frames } => EngineCommand::Fade {
+            duration_frames: *duration_frames,
+        },
+        CommandPayload::AlphaFade { duration_frames } => EngineCommand::AlphaFade {
+            duration_frames: *duration_frames,
+        },
+        CommandPayload::Slide { duration_frames } => EngineCommand::Slide {
+            duration_frames: *duration_frames,
+        },
+        CommandPayload::Zoom { duration_frames } => EngineCommand::Zoom {
+            duration_frames: *duration_frames,
+        },
         CommandPayload::Stinger {
             slot,
             duration_frames,
         } => EngineCommand::Stinger {
             slot: fm_switcher::StingerSlotId::new(slot.number())
                 .expect("wire Stinger slots are bounded"),
-            duration_frames,
+            duration_frames: *duration_frames,
         },
         CommandPayload::ConfigureStinger {
             slot,
@@ -1148,8 +1160,8 @@ fn engine_command(payload: CommandPayload) -> EngineCommand {
             slot: StingerSlotId::new(slot.number()).expect("wire Stinger slots are bounded"),
             descriptor: StingerDescriptor::new(
                 media_input.to_domain(),
-                preload,
-                cut_point_frames,
+                *preload,
+                *cut_point_frames,
                 match audio_policy {
                     ProtocolStingerAudioPolicy::Muted => StingerAudioPolicy::Muted,
                     ProtocolStingerAudioPolicy::StingerOnly => StingerAudioPolicy::StingerOnly,
@@ -1175,13 +1187,15 @@ fn engine_command(payload: CommandPayload) -> EngineCommand {
         | CommandPayload::ConfigureOverlayAppearance { .. }
         | CommandPayload::QueueOverlay { .. }
         | CommandPayload::TakeNextOverlay { .. }) => overlay_engine_command(payload),
-        CommandPayload::Wipe { duration_frames } => EngineCommand::Wipe { duration_frames },
+        CommandPayload::Wipe { duration_frames } => EngineCommand::Wipe {
+            duration_frames: *duration_frames,
+        },
         CommandPayload::FadeToBlack {
             active,
             duration_frames,
         } => EngineCommand::FadeToBlack {
-            active,
-            duration_frames,
+            active: *active,
+            duration_frames: *duration_frames,
         },
         CommandPayload::StartManualTransition { kind } => EngineCommand::StartManualTransition {
             kind: match kind {
@@ -1193,7 +1207,7 @@ fn engine_command(payload: CommandPayload) -> EngineCommand {
         },
         CommandPayload::SetManualTransitionPosition { position } => {
             EngineCommand::SetManualTransitionPosition {
-                position: engine_manual_position(position),
+                position: engine_manual_position(*position),
             }
         }
         CommandPayload::CommitManualTransition => EngineCommand::CommitManualTransition,
@@ -1201,46 +1215,46 @@ fn engine_command(payload: CommandPayload) -> EngineCommand {
     }
 }
 
-fn overlay_engine_command(payload: CommandPayload) -> EngineCommand {
+fn overlay_engine_command(payload: &CommandPayload) -> EngineCommand {
     match payload {
         CommandPayload::TakeOverlay { channel, source } => EngineCommand::TakeOverlay {
-            channel: domain_overlay_channel(channel),
+            channel: domain_overlay_channel(*channel),
             source: source.to_domain(),
         },
         CommandPayload::UpdateOverlay { channel, source } => EngineCommand::UpdateOverlay {
-            channel: domain_overlay_channel(channel),
+            channel: domain_overlay_channel(*channel),
             source: source.to_domain(),
         },
         CommandPayload::OverlayOff { channel } => EngineCommand::OverlayOff {
-            channel: domain_overlay_channel(channel),
+            channel: domain_overlay_channel(*channel),
         },
         CommandPayload::SetOverlayOutputInclusion {
             channel,
             output,
             included,
         } => EngineCommand::SetOverlayOutputInclusion {
-            channel: domain_overlay_channel(channel),
+            channel: domain_overlay_channel(*channel),
             output: output.to_domain(),
-            included,
+            included: *included,
         },
         CommandPayload::ConfigureOverlayTransition {
             channel,
             transition,
             duration_frames,
         } => EngineCommand::ConfigureOverlayTransition {
-            channel: domain_overlay_channel(channel),
+            channel: domain_overlay_channel(*channel),
             transition: match transition {
                 ProtocolOverlayTransition::Cut => SwitcherOverlayTransition::Cut,
                 ProtocolOverlayTransition::Fade => SwitcherOverlayTransition::Fade,
             },
-            duration_frames,
+            duration_frames: *duration_frames,
         },
         CommandPayload::ConfigureOverlayAppearance {
             channel,
             position,
             border,
         } => EngineCommand::ConfigureOverlayAppearance {
-            channel: domain_overlay_channel(channel),
+            channel: domain_overlay_channel(*channel),
             position: match position {
                 ProtocolOverlayPosition::FullFrame => SwitcherOverlayPosition::FullFrame,
                 ProtocolOverlayPosition::TopLeft => SwitcherOverlayPosition::TopLeft,
@@ -1255,11 +1269,11 @@ fn overlay_engine_command(payload: CommandPayload) -> EngineCommand {
             },
         },
         CommandPayload::QueueOverlay { channel, source } => EngineCommand::QueueOverlay {
-            channel: domain_overlay_channel(channel),
+            channel: domain_overlay_channel(*channel),
             source: source.to_domain(),
         },
         CommandPayload::TakeNextOverlay { channel } => EngineCommand::TakeNextOverlay {
-            channel: domain_overlay_channel(channel),
+            channel: domain_overlay_channel(*channel),
         },
         _ => unreachable!("only overlay commands are delegated"),
     }
@@ -1269,7 +1283,7 @@ fn domain_overlay_channel(channel: WireOverlayChannelId) -> OverlayChannelId {
     OverlayChannelId::new(channel.number()).expect("wire overlay channels are bounded")
 }
 
-const fn is_program_transition(command: EngineCommand) -> bool {
+const fn is_program_transition(command: &EngineCommand) -> bool {
     matches!(
         command,
         EngineCommand::Fade { .. }
@@ -1329,26 +1343,33 @@ fn engine_submission(
 ) -> CommandSubmission {
     let result = command_result(&outcome.receipt);
     let events = if !outcome.replayed && outcome.receipt.accepted().is_some() {
-        let stinger_slots_changed = outcome.events.iter().any(|event| {
-            matches!(
-                event.payload,
-                EngineEvent::DesiredSwitcherChanged(
-                    EngineCommand::ConfigureStinger { .. } | EngineCommand::RemoveStinger { .. }
+        let payload = if let Some((input, name)) = outcome.events.iter().find_map(|event| {
+            let EngineEvent::InputRenamed { input, name } = &event.payload else {
+                return None;
+            };
+            Some((*input, name))
+        }) {
+            EventPayload::InputRenamed {
+                input: WireInputId::from_domain(input),
+                name: name.clone(),
+            }
+        } else {
+            let stinger_slots_changed = outcome.events.iter().any(|event| {
+                matches!(
+                    &event.payload,
+                    EngineEvent::DesiredSwitcherChanged(
+                        EngineCommand::ConfigureStinger { .. }
+                            | EngineCommand::RemoveStinger { .. }
+                    )
                 )
-            )
-        });
-        let program = WireInputId::from_domain(engine.show().desired_switcher().program());
-        let preview = WireInputId::from_domain(engine.show().desired_switcher().preview());
-        let manual_transition = protocol_manual_status(engine.desired_manual_transition());
-        let fade_to_black = protocol_fade_to_black_state(engine.desired_fade_to_black());
-        let overlays = protocol_overlays(engine.show().desired_switcher().overlays());
-        let input_audio_strips = protocol_input_audio_strips(engine);
-        vec![EventMessage {
-            cursor: EventCursor {
-                engine: identity.clone(),
-                revision: engine.revision().get(),
-            },
-            payload: if stinger_slots_changed {
+            });
+            let program = WireInputId::from_domain(engine.show().desired_switcher().program());
+            let preview = WireInputId::from_domain(engine.show().desired_switcher().preview());
+            let manual_transition = protocol_manual_status(engine.desired_manual_transition());
+            let fade_to_black = protocol_fade_to_black_state(engine.desired_fade_to_black());
+            let overlays = protocol_overlays(engine.show().desired_switcher().overlays());
+            let input_audio_strips = protocol_input_audio_strips(engine);
+            if stinger_slots_changed {
                 EventPayload::StingerSlotsChanged {
                     program,
                     preview,
@@ -1367,7 +1388,14 @@ fn engine_submission(
                     overlays,
                     input_audio_strips,
                 }
+            }
+        };
+        vec![EventMessage {
+            cursor: EventCursor {
+                engine: identity.clone(),
+                revision: engine.revision().get(),
             },
+            payload,
         }]
     } else {
         Vec::new()
