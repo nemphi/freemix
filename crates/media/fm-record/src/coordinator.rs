@@ -252,9 +252,11 @@ impl RecorderCoordinator {
             .factory
             .open_append(&manifest_path)
             .map_err(|error| RecorderError::io(&manifest_path, error))?;
-        manifest
-            .sync_all()
-            .map_err(|error| RecorderError::io(&manifest_path, error))?;
+        if let Err(error) = manifest.sync_all() {
+            let error = RecorderError::io(&manifest_path, error);
+            self.mark_or_insert_failed(id, directory, &error);
+            return Err(error);
+        }
         format::sync_directory(&directory)?;
         let index = self
             .recorders
@@ -279,18 +281,15 @@ impl RecorderCoordinator {
             self.mark_or_insert_failed(id, directory, &error);
             return Err(error);
         }
-        let (kind, payload) = encode_manifest(ManifestEntry::Start {
-            receipt,
-            config,
-            index,
-        });
-        if let Err(error) = write_frame(
+        if let Err(error) = write_manifest_frame(
             manifest.as_mut(),
-            kind,
-            &payload,
-            format::MAX_MANIFEST_PAYLOAD,
+            &manifest_path,
+            ManifestEntry::Start {
+                receipt,
+                config,
+                index,
+            },
         ) {
-            let error = RecorderError::io(&manifest_path, error);
             self.mark_or_insert_failed(id, directory, &error);
             return Err(error);
         }
@@ -386,39 +385,66 @@ impl RecorderCoordinator {
         }
         let mut written = 0;
         loop {
-            let encoded = {
+            let (batch, batch_frames, batch_bytes, queue_bytes, path) = {
                 let recorder = self
                     .recorders
                     .get(&id)
                     .ok_or(RecorderError::UnknownRecorder(id))?;
-                let Some(event) = recorder.queue.front() else {
+                if recorder.queue.is_empty() {
                     break;
-                };
-                let (kind, payload) = encoded_event(event)?;
-                let record_bytes = framed_len(payload.len())?;
-                (kind, payload, record_bytes, event.counts_as_frame())
-            };
-            if self.should_rotate(id, encoded.2, encoded.3)
-                && let Err(error) = self.rotate_inner(id)
-            {
-                self.mark_failed(id, &error);
-                return Err(error);
-            }
-            let path = {
-                let recorder = self
-                    .recorders
-                    .get(&id)
-                    .ok_or(RecorderError::UnknownRecorder(id))?;
-                segment_path(
-                    &recorder.directory,
-                    recorder.segment_index.ok_or(RecorderError::InvalidState {
-                        id,
-                        state: recorder.state,
-                        operation: "append",
-                    })?,
+                }
+                let config = recorder.config.ok_or(RecorderError::InvalidState {
+                    id,
+                    state: recorder.state,
+                    operation: "flush",
+                })?;
+                let mut batch = Vec::new();
+                let mut frames = recorder.segment_frames;
+                let mut bytes = recorder.segment_bytes;
+                let mut batch_frames = 0;
+                let mut batch_bytes = 0;
+                let mut queue_bytes = 0;
+                for event in &recorder.queue {
+                    let (kind, payload) = encoded_event(event)?;
+                    let record_bytes = framed_len(payload.len())?;
+                    let counts_as_frame = event.counts_as_frame();
+                    if should_rotate(
+                        config.segments,
+                        frames,
+                        bytes,
+                        record_bytes,
+                        counts_as_frame,
+                    ) {
+                        break;
+                    }
+                    frames = frames.saturating_add(u64::from(counts_as_frame));
+                    bytes = bytes.saturating_add(record_bytes);
+                    batch_frames += u64::from(counts_as_frame);
+                    batch_bytes += record_bytes;
+                    queue_bytes += event.queue_bytes();
+                    batch.push((kind, payload));
+                }
+                let index = recorder.segment_index.ok_or(RecorderError::InvalidState {
+                    id,
+                    state: recorder.state,
+                    operation: "flush",
+                })?;
+                (
+                    batch,
+                    batch_frames,
+                    batch_bytes,
+                    queue_bytes,
+                    segment_path(&recorder.directory, index),
                 )
             };
-            let write_result = {
+            if batch.is_empty() {
+                if let Err(error) = self.rotate_inner(id) {
+                    self.mark_failed(id, &error);
+                    return Err(error);
+                }
+                continue;
+            }
+            let commit_result = {
                 let recorder = self
                     .recorders
                     .get_mut(&id)
@@ -429,41 +455,37 @@ impl RecorderCoordinator {
                     .ok_or(RecorderError::InvalidState {
                         id,
                         state: recorder.state,
-                        operation: "append",
+                        operation: "flush",
                     })?;
-                write_frame(
-                    segment.as_mut(),
-                    encoded.0,
-                    &encoded.1,
-                    format::MAX_ENCODED_FRAME_PAYLOAD,
-                )
+                batch
+                    .iter()
+                    .try_for_each(|(kind, payload)| {
+                        write_frame(
+                            segment.as_mut(),
+                            *kind,
+                            payload,
+                            format::MAX_ENCODED_FRAME_PAYLOAD,
+                        )
+                        .map(drop)
+                    })
+                    .and_then(|()| segment.sync_all())
             };
-            let actual_bytes = match write_result {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    let error = RecorderError::io(path, error);
-                    self.mark_failed(id, &error);
-                    return Err(error);
-                }
-            };
+            if let Err(error) = commit_result {
+                let error = RecorderError::io(path, error);
+                self.mark_failed(id, &error);
+                return Err(error);
+            }
             let recorder = self
                 .recorders
                 .get_mut(&id)
                 .ok_or(RecorderError::UnknownRecorder(id))?;
-            let event = recorder
-                .queue
-                .pop_front()
-                .ok_or(RecorderError::InvalidState {
-                    id,
-                    state: recorder.state,
-                    operation: "drain queue",
-                })?;
-            recorder.queue_bytes = recorder.queue_bytes.saturating_sub(event.queue_bytes());
-            recorder.segment_bytes = recorder.segment_bytes.saturating_add(actual_bytes);
-            if encoded.3 {
-                recorder.segment_frames = recorder.segment_frames.saturating_add(1);
+            for _ in 0..batch.len() {
+                recorder.queue.pop_front();
             }
-            written += 1;
+            recorder.queue_bytes = recorder.queue_bytes.saturating_sub(queue_bytes);
+            recorder.segment_bytes = recorder.segment_bytes.saturating_add(batch_bytes);
+            recorder.segment_frames = recorder.segment_frames.saturating_add(batch_frames);
+            written += batch.len();
         }
         Ok(written)
     }
@@ -533,14 +555,11 @@ impl RecorderCoordinator {
             };
             (path, writer)
         };
-        let (kind, payload) = encode_manifest(ManifestEntry::Stop { receipt });
-        if let Err(error) = write_frame(
+        if let Err(error) = write_manifest_frame(
             manifest.as_mut(),
-            kind,
-            &payload,
-            format::MAX_MANIFEST_PAYLOAD,
+            &manifest_path,
+            ManifestEntry::Stop { receipt },
         ) {
-            let error = RecorderError::io(manifest_path, error);
             self.mark_failed(id, &error);
             return Err(error);
         }
@@ -628,16 +647,13 @@ impl RecorderCoordinator {
                 .open_append(&manifest_path)
                 .map_err(|error| RecorderError::io(&manifest_path, error))?;
             if latest_open != Some(active_index) || closed.contains_key(&active_index) {
-                let (kind, payload) = encode_manifest(ManifestEntry::SegmentOpen {
-                    index: active_index,
-                });
-                write_frame(
+                write_manifest_frame(
                     manifest_writer.as_mut(),
-                    kind,
-                    &payload,
-                    format::MAX_MANIFEST_PAYLOAD,
-                )
-                .map_err(|error| RecorderError::io(&manifest_path, error))?;
+                    &manifest_path,
+                    ManifestEntry::SegmentOpen {
+                        index: active_index,
+                    },
+                )?;
             }
             segment = Some(segment_writer);
             manifest = Some(manifest_writer);
@@ -698,25 +714,6 @@ impl RecorderCoordinator {
         Ok(())
     }
 
-    fn should_rotate(&self, id: RecorderId, next_bytes: u64, counts_as_frame: bool) -> bool {
-        let Some(recorder) = self.recorders.get(&id) else {
-            return false;
-        };
-        let Some(config) = recorder.config else {
-            return false;
-        };
-        let policy = config.segments;
-        let frame_limit = counts_as_frame
-            && policy
-                .max_frames
-                .is_some_and(|limit| recorder.segment_frames >= limit);
-        let byte_limit = recorder.segment_bytes > 0
-            && policy
-                .max_bytes
-                .is_some_and(|limit| recorder.segment_bytes.saturating_add(next_bytes) > limit);
-        frame_limit || byte_limit
-    }
-
     fn rotate_inner(&mut self, id: RecorderId) -> Result<(), RecorderError> {
         self.close_segment(id)?;
         let (directory, next_index, manifest_path) = {
@@ -762,14 +759,11 @@ impl RecorderCoordinator {
                 state: recorder.state,
                 operation: "rotate",
             })?;
-        let (kind, payload) = encode_manifest(ManifestEntry::SegmentOpen { index: next_index });
-        write_frame(
+        write_manifest_frame(
             manifest.as_mut(),
-            kind,
-            &payload,
-            format::MAX_MANIFEST_PAYLOAD,
-        )
-        .map_err(|error| RecorderError::io(manifest_path, error))?;
+            &manifest_path,
+            ManifestEntry::SegmentOpen { index: next_index },
+        )?;
         recorder.segment = Some(segment);
         recorder.segment_index = Some(next_index);
         recorder.segment_frames = 0;
@@ -801,18 +795,15 @@ impl RecorderCoordinator {
                 state: recorder.state,
                 operation: "close segment",
             })?;
-        let (kind, payload) = encode_manifest(ManifestEntry::SegmentClose {
-            index,
-            frames: recorder.segment_frames,
-            bytes: recorder.segment_bytes,
-        });
-        write_frame(
+        write_manifest_frame(
             manifest.as_mut(),
-            kind,
-            &payload,
-            format::MAX_MANIFEST_PAYLOAD,
-        )
-        .map_err(|error| RecorderError::io(manifest_path, error))?;
+            &manifest_path,
+            ManifestEntry::SegmentClose {
+                index,
+                frames: recorder.segment_frames,
+                bytes: recorder.segment_bytes,
+            },
+        )?;
         recorder.segment = None;
         Ok(())
     }
@@ -837,6 +828,32 @@ impl RecorderCoordinator {
             self.mark_failed(id, error);
         }
     }
+}
+
+fn should_rotate(
+    policy: crate::SegmentPolicy,
+    frames: u64,
+    bytes: u64,
+    next_bytes: u64,
+    counts_as_frame: bool,
+) -> bool {
+    let frame_limit = counts_as_frame && policy.max_frames.is_some_and(|limit| frames >= limit);
+    let byte_limit = bytes > 0
+        && policy
+            .max_bytes
+            .is_some_and(|limit| bytes.saturating_add(next_bytes) > limit);
+    frame_limit || byte_limit
+}
+
+fn write_manifest_frame(
+    writer: &mut dyn DurableWriter,
+    path: &Path,
+    entry: ManifestEntry,
+) -> Result<(), RecorderError> {
+    let (kind, payload) = encode_manifest(entry);
+    write_frame(writer, kind, &payload, format::MAX_MANIFEST_PAYLOAD)
+        .and_then(|_| writer.sync_all())
+        .map_err(|error| RecorderError::io(path, error))
 }
 
 /// Repairs a recording directory by truncating only incomplete final records.

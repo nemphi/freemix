@@ -214,7 +214,6 @@ pub(crate) fn write_frame(
 
     writer.write_all(&header)?;
     writer.write_all(payload)?;
-    writer.sync_all()?;
     Ok(u64::try_from(HEADER_LEN).unwrap_or(24) + payload_len)
 }
 

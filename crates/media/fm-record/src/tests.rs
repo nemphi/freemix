@@ -19,8 +19,8 @@ use fm_types::{ChannelLayout, MediaTimestamp, PixelFormat, SampleRate, TimeBase,
 
 use crate::{
     ActionOutcome, ActionReceiptId, AppendError, Discontinuity, DurableWriter, EnqueueError,
-    QueueLimits, RecordEvent, RecorderConfig, RecorderCoordinator, RecorderId, RecorderState,
-    SegmentPolicy, WriterFactory, format, repair_recording,
+    QueueLimits, RecordEvent, RecorderConfig, RecorderCoordinator, RecorderError, RecorderId,
+    RecorderState, SegmentPolicy, WriterFactory, format, repair_recording,
 };
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -516,8 +516,14 @@ impl WriterFactory for SegmentOpenFailingFactory {
     }
 }
 
+#[derive(Clone, Copy)]
+enum ManifestFailure {
+    Write(usize),
+    Sync(usize),
+}
+
 struct ManifestFrameFailingFactory {
-    fail_frame: usize,
+    failure: ManifestFailure,
 }
 
 impl WriterFactory for ManifestFrameFailingFactory {
@@ -527,7 +533,7 @@ impl WriterFactory for ManifestFrameFailingFactory {
             file,
             manifest: path.file_name().is_some_and(|name| name == "manifest.fmr"),
             frame: 0,
-            fail_frame: self.fail_frame,
+            failure: self.failure,
         }))
     }
 }
@@ -536,14 +542,14 @@ struct ManifestFrameFailingWriter {
     file: File,
     manifest: bool,
     frame: usize,
-    fail_frame: usize,
+    failure: ManifestFailure,
 }
 
 impl Write for ManifestFrameFailingWriter {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
         if self.manifest && buffer.len() == 24 && buffer.starts_with(b"FMRC") {
             self.frame = self.frame.saturating_add(1);
-            if self.frame == self.fail_frame {
+            if matches!(self.failure, ManifestFailure::Write(frame) if self.frame == frame) {
                 return Err(io::Error::new(
                     io::ErrorKind::StorageFull,
                     "injected manifest frame failure",
@@ -560,6 +566,14 @@ impl Write for ManifestFrameFailingWriter {
 
 impl DurableWriter for ManifestFrameFailingWriter {
     fn sync_all(&mut self) -> io::Result<()> {
+        if self.manifest
+            && matches!(self.failure, ManifestFailure::Sync(frame) if self.frame == frame)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                "injected manifest sync failure",
+            ));
+        }
         self.file.sync_all()
     }
 }
@@ -614,7 +628,9 @@ fn segment_open_failure_does_not_commit_start_receipt() {
 fn manifest_boundary_failure_does_not_commit_start_receipt() {
     assert_start_setup_failure_does_not_commit_receipt(
         "start-manifest-boundary-failure",
-        Arc::new(ManifestFrameFailingFactory { fail_frame: 1 }),
+        Arc::new(ManifestFrameFailingFactory {
+            failure: ManifestFailure::Write(1),
+        }),
     );
 }
 
@@ -802,9 +818,100 @@ fn recorder_directory_sync_is_supported() {
     format::sync_directory(temp.path()).expect("sync test directory");
 }
 
+#[test]
+fn flush_sync_failure_retains_uncommitted_batch() {
+    let temp = TempDirectory::new("flush-sync-failure");
+    let recorder = id(46);
+    let armed = Arc::new(AtomicBool::new(false));
+    let factory = Arc::new(FailingFactory {
+        target: format::segment_name(0),
+        armed: Arc::clone(&armed),
+        fail_sync: true,
+    });
+    let (mut coordinator, _) = RecorderCoordinator::open_with_writer_factory(temp.path(), factory)
+        .expect("open coordinator");
+    coordinator
+        .start(recorder, receipt(46), config(SegmentPolicy::default()))
+        .expect("start recorder");
+    coordinator
+        .enqueue(recorder, video(0, 8))
+        .expect("enqueue first event");
+    coordinator
+        .enqueue(recorder, video(1, 8))
+        .expect("enqueue second event");
+    let before = coordinator
+        .snapshot(recorder)
+        .expect("snapshot before flush");
+    armed.store(true, Ordering::SeqCst);
+
+    coordinator
+        .flush(recorder)
+        .expect_err("segment batch sync must fail");
+
+    let after = coordinator
+        .snapshot(recorder)
+        .expect("snapshot after flush");
+    assert_eq!(after.state, RecorderState::Failed);
+    assert_eq!(
+        (
+            after.queued_events,
+            after.queued_bytes,
+            after.written_frames,
+            after.written_bytes,
+        ),
+        (
+            before.queued_events,
+            before.queued_bytes,
+            before.written_frames,
+            before.written_bytes,
+        )
+    );
+}
+
+#[test]
+fn manifest_sync_failure_does_not_publish_action() {
+    #[derive(Clone, Copy)]
+    enum Action {
+        Start,
+        Stop,
+    }
+
+    for (name, action, fail_frame) in [("start", Action::Start, 1), ("stop", Action::Stop, 3)] {
+        let temp = TempDirectory::new(name);
+        let recorder = id(47);
+        let action_receipt = receipt(48);
+        let factory = Arc::new(ManifestFrameFailingFactory {
+            failure: ManifestFailure::Sync(fail_frame),
+        });
+        let (mut coordinator, _) =
+            RecorderCoordinator::open_with_writer_factory(temp.path(), factory)
+                .expect("open coordinator");
+        if matches!(action, Action::Stop) {
+            coordinator
+                .start(recorder, receipt(47), config(SegmentPolicy::default()))
+                .expect("start recorder before stop");
+        }
+        let mut apply = |action| match action {
+            Action::Start => {
+                coordinator.start(recorder, action_receipt, config(SegmentPolicy::default()))
+            }
+            Action::Stop => coordinator.stop(recorder, action_receipt),
+        };
+        apply(action).expect_err("manifest sync must fail");
+        assert!(matches!(
+            apply(action),
+            Err(RecorderError::InvalidState {
+                state: RecorderState::Failed,
+                ..
+            })
+        ));
+    }
+}
+
 struct FailingFactory {
     target: String,
     armed: Arc<AtomicBool>,
+    fail_sync: bool,
 }
 
 impl WriterFactory for FailingFactory {
@@ -814,6 +921,7 @@ impl WriterFactory for FailingFactory {
             file,
             fail: path.to_string_lossy().contains(&self.target),
             armed: Arc::clone(&self.armed),
+            fail_sync: self.fail_sync,
         }))
     }
 }
@@ -822,11 +930,12 @@ struct FailingWriter {
     file: File,
     fail: bool,
     armed: Arc<AtomicBool>,
+    fail_sync: bool,
 }
 
 impl Write for FailingWriter {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        if self.fail && self.armed.load(Ordering::SeqCst) {
+        if self.fail && self.armed.load(Ordering::SeqCst) && !self.fail_sync {
             Err(io::Error::new(
                 io::ErrorKind::StorageFull,
                 "injected full disk",
@@ -843,6 +952,12 @@ impl Write for FailingWriter {
 
 impl DurableWriter for FailingWriter {
     fn sync_all(&mut self) -> io::Result<()> {
+        if self.fail && self.armed.load(Ordering::SeqCst) && self.fail_sync {
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                "injected sync failure",
+            ));
+        }
         self.file.sync_all()
     }
 }
@@ -856,6 +971,7 @@ fn writer_failure_is_isolated_between_recorders() {
     let factory = Arc::new(FailingFactory {
         target: format!("recorder-{:032x}", failed.get().get()),
         armed: Arc::clone(&armed),
+        fail_sync: false,
     });
     let (mut coordinator, _) = RecorderCoordinator::open_with_writer_factory(temp.path(), factory)
         .expect("open coordinator");
