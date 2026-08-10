@@ -36,10 +36,10 @@ impl FakeRemoteServer {
         Self { address, worker }
     }
 
-    fn start_premature(kind: PrematureEvent) -> Self {
+    fn start_peer_event_interleave() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
-        let worker = thread::spawn(move || serve_premature_event(&listener, kind));
+        let worker = thread::spawn(move || serve_peer_event_interleave(&listener));
         Self { address, worker }
     }
 
@@ -179,12 +179,6 @@ fn accept_test_peer(listener: &TcpListener) -> TcpStream {
     }
 }
 
-#[derive(Clone, Copy)]
-enum PrematureEvent {
-    Durable,
-    Runtime,
-}
-
 fn serve_remote_sessions(listener: &TcpListener) {
     let engine = EngineIdentity {
         engine_id: "project-42".into(),
@@ -192,9 +186,8 @@ fn serve_remote_sessions(listener: &TcpListener) {
         log_id: "fake-remote-log".into(),
     };
     let mut revision = 0;
-    let mut fade_result_id = None;
 
-    for session in 0..6 {
+    for session in 0..5 {
         let (stream, _) = listener.accept().unwrap();
         let mut writer = stream.try_clone().unwrap();
         let mut reader = BufReader::new(stream);
@@ -222,18 +215,6 @@ fn serve_remote_sessions(listener: &TcpListener) {
                 "remote-fade",
                 2,
             ),
-            5 => {
-                assert_command(&command, CommandPayload::Cut, "remote-fade", 0);
-                write_message(
-                    &mut writer,
-                    &WireMessage::CommandResult(CommandResult::Accepted {
-                        id: fade_result_id.clone().unwrap(),
-                        revision,
-                        scheduled_frame: Some(3),
-                    }),
-                );
-                continue;
-            }
             _ => unreachable!(),
         }
 
@@ -243,15 +224,19 @@ fn serve_remote_sessions(listener: &TcpListener) {
             revision,
             scheduled_frame: Some(revision),
         };
-        if session == 3 {
-            fade_result_id = Some(command.id.clone());
-        }
         write_message(&mut writer, &WireMessage::CommandResult(result));
-        write_command_events(&mut writer, &engine, revision, command.payload);
+        write_command_events(
+            &mut writer,
+            &engine,
+            revision,
+            command.payload,
+            input(1),
+            input(1),
+        );
     }
 }
 
-fn serve_premature_event(listener: &TcpListener, kind: PrematureEvent) {
+fn serve_peer_event_interleave(listener: &TcpListener) {
     let engine = EngineIdentity {
         engine_id: "project-42".into(),
         state_epoch: 1,
@@ -262,37 +247,39 @@ fn serve_premature_event(listener: &TcpListener, kind: PrematureEvent) {
     let mut reader = BufReader::new(stream);
     assert_handshake_request(read_message(&mut reader));
     write_handshake(&mut writer, &engine, 0);
-    let WireMessage::Command(_) = read_message(&mut reader) else {
+    let WireMessage::Command(command) = read_message(&mut reader) else {
         panic!("expected remote command");
     };
-    let message = match kind {
-        PrematureEvent::Durable => WireMessage::Event(EventMessage {
-            cursor: EventCursor {
-                engine: engine.clone(),
-                revision: 1,
-            },
-            payload: EventPayload::DesiredSwitcher {
-                program: input(2),
-                preview: input(1),
-                manual_transition: fm_protocol::ManualTransitionStatus::Inactive,
-                fade_to_black: live_fade_to_black(),
-                overlays: OverlayStatus::empty_channels(),
-                input_audio_strips: input_audio_strips(),
-            },
+    assert_eq!(
+        command.payload,
+        CommandPayload::SelectPreview { input: input(2) }
+    );
+    assert_eq!(command.idempotency_key, "peer-event-interleave");
+    assert_eq!(command.expected_revision, None);
+    write_command_events(
+        &mut writer,
+        &engine,
+        1,
+        CommandPayload::Cut,
+        input(2),
+        input(1),
+    );
+    write_message(
+        &mut writer,
+        &WireMessage::CommandResult(CommandResult::Accepted {
+            id: command.id,
+            revision: 2,
+            scheduled_frame: Some(2),
         }),
-        PrematureEvent::Runtime => WireMessage::RuntimeEvent(RuntimeEventMessage {
-            server: server_identity(&engine),
-            revision: 0,
-            generation: 1,
-            sequence: 1,
-            event: RuntimeLifecycleEvent::Realized {
-                domain: "switcher".into(),
-                manual_transition: fm_protocol::ManualTransitionStatus::Inactive,
-                fade_to_black: live_fade_to_black(),
-            },
-        }),
-    };
-    write_message(&mut writer, &message);
+    );
+    write_command_events(
+        &mut writer,
+        &engine,
+        2,
+        CommandPayload::SelectPreview { input: input(2) },
+        input(2),
+        input(2),
+    );
 }
 
 fn serve_fade_to_black(listener: &TcpListener) {
@@ -914,6 +901,8 @@ fn write_command_events(
     engine: &EngineIdentity,
     revision: u64,
     payload: CommandPayload,
+    program: WireInputId,
+    preview: WireInputId,
 ) {
     let cursor = EventCursor {
         engine: engine.clone(),
@@ -924,8 +913,8 @@ fn write_command_events(
         &WireMessage::Event(EventMessage {
             cursor,
             payload: EventPayload::DesiredSwitcher {
-                program: input(1),
-                preview: input(1),
+                program,
+                preview,
                 manual_transition: fm_protocol::ManualTransitionStatus::Inactive,
                 fade_to_black: live_fade_to_black(),
                 overlays: OverlayStatus::empty_channels(),
@@ -1024,7 +1013,7 @@ fn input_audio_strips() -> Vec<fm_protocol::InputAudioStripStatus> {
 }
 
 #[test]
-fn remote_commands_use_protocol_server_and_replay_duplicate_keys() {
+fn remote_commands_use_protocol_server() {
     let server = FakeRemoteServer::start();
     let address = server.address();
     let initial = invoke(&["remote-status", &address]);
@@ -1071,16 +1060,6 @@ fn remote_commands_use_protocol_server_and_replay_duplicate_keys() {
     assert_success(&current);
     assert_eq!(stdout(&current), final_status);
 
-    let duplicate = invoke(&[
-        "remote-cut",
-        &address,
-        "--key",
-        "remote-fade",
-        "--expect",
-        "0",
-    ]);
-    assert_success(&duplicate);
-    assert_eq!(stdout(&duplicate), final_status);
     server.finish();
 }
 
@@ -1268,26 +1247,17 @@ fn remote_t_bar_position_preserves_the_exact_endpoint_and_replicated_status() {
 }
 
 #[test]
-fn remote_commands_reject_durable_events_before_command_results() {
-    assert_premature_event_rejected(PrematureEvent::Durable);
-}
-
-#[test]
-fn remote_commands_reject_runtime_events_before_command_results() {
-    assert_premature_event_rejected(PrematureEvent::Runtime);
-}
-
-fn assert_premature_event_rejected(kind: PrematureEvent) {
-    let server = FakeRemoteServer::start_premature(kind);
+fn remote_commands_accept_peer_events_while_waiting() {
+    let server = FakeRemoteServer::start_peer_event_interleave();
     let output = invoke(&[
-        "remote-cut",
+        "remote-preview",
         &server.address(),
+        "2",
         "--key",
-        "premature-event",
-        "--expect",
-        "0",
+        "peer-event-interleave",
     ]);
-    assert_failure_contains(&output, "durable/runtime event before the command result");
+    assert_success(&output);
+    assert_remote_status(&stdout(&output), 2, 2, 2, 2, 2);
     server.finish();
 }
 

@@ -153,27 +153,26 @@ impl Remote {
         debug_assert_eq!(command, queued);
         self.write(&WireMessage::Command(command.clone()))?;
 
-        let result = match self.read()? {
-            WireMessage::CommandResult(result) => result,
-            WireMessage::Error(error) => return Err(protocol_error(&error.error).into()),
-            WireMessage::Event(_) | WireMessage::RuntimeEvent(_) => {
-                return Err(RemoteFailure(
-                    "daemon sent a durable/runtime event before the command result".into(),
-                )
-                .into());
+        let result = loop {
+            match self.read()? {
+                WireMessage::CommandResult(result) => break result,
+                message @ (WireMessage::Event(_) | WireMessage::RuntimeEvent(_)) => {
+                    self.client.intake(message)?;
+                }
+                WireMessage::Error(error) => return Err(protocol_error(&error.error).into()),
+                _ => return Err(RemoteFailure("expected command_result from daemon".into()).into()),
             }
-            _ => return Err(RemoteFailure("expected command_result from daemon".into()).into()),
         };
-        let replayed = result_id(&result) != command.id;
-        if !replayed {
-            let intake = self
-                .client
-                .intake(WireMessage::CommandResult(result.clone()))?;
-            if intake != Intake::ResultReconciled {
-                return Err(
-                    RemoteFailure("client did not reconcile the command result".into()).into(),
-                );
-            }
+        if result_id(&result) != command.id {
+            return Err(
+                RemoteFailure("command result does not match the sent command".into()).into(),
+            );
+        }
+        let intake = self
+            .client
+            .intake(WireMessage::CommandResult(result.clone()))?;
+        if intake != Intake::ResultReconciled {
+            return Err(RemoteFailure("client did not reconcile the command result".into()).into());
         }
 
         match result {
@@ -181,57 +180,42 @@ impl Remote {
                 Err(RemoteFailure(format!("{code}: {message}")).into())
             }
             CommandResult::Accepted { revision, .. } => {
-                if !replayed {
-                    self.read_command_events(revision)?;
-                }
+                self.read_command_events(revision)?;
                 self.print_status()
             }
         }
     }
 
     fn read_command_events(&mut self, revision: u64) -> RemoteResult<()> {
-        let event = match self.read()? {
-            WireMessage::Event(event) => event,
-            WireMessage::Error(error) => return Err(protocol_error(&error.error).into()),
-            _ => {
-                return Err(
-                    RemoteFailure("expected durable command event from daemon".into()).into(),
-                );
-            }
-        };
-        if event.cursor.revision != revision {
-            return Err(RemoteFailure(format!(
-                "command event revision {} does not match result revision {revision}",
-                event.cursor.revision
-            ))
-            .into());
-        }
-        if !matches!(event.payload, EventPayload::DesiredSwitcher { .. }) {
-            return Err(RemoteFailure("command event was not desired_switcher".into()).into());
-        }
-        self.client.intake(WireMessage::Event(event))?;
-
-        loop {
-            let runtime = match self.read()? {
-                WireMessage::RuntimeEvent(event) => event,
+        let mut durable = false;
+        let mut realized = false;
+        while !durable || !realized {
+            match self.read()? {
+                WireMessage::Event(event) => {
+                    let matches_revision = event.cursor.revision == revision;
+                    if matches_revision
+                        && !matches!(event.payload, EventPayload::DesiredSwitcher { .. })
+                    {
+                        return Err(
+                            RemoteFailure("command event was not desired_switcher".into()).into(),
+                        );
+                    }
+                    self.client.intake(WireMessage::Event(event))?;
+                    durable |= matches_revision;
+                }
+                WireMessage::RuntimeEvent(runtime) => {
+                    let matches_realization = runtime.revision == revision
+                        && matches!(&runtime.event, RuntimeLifecycleEvent::Realized { .. });
+                    self.client.intake(WireMessage::RuntimeEvent(runtime))?;
+                    realized |= matches_realization;
+                }
                 WireMessage::Error(error) => return Err(protocol_error(&error.error).into()),
                 _ => {
-                    return Err(
-                        RemoteFailure("expected runtime command event from daemon".into()).into(),
-                    );
+                    return Err(RemoteFailure(
+                        "expected durable/runtime command event from daemon".into(),
+                    )
+                    .into());
                 }
-            };
-            if runtime.revision != revision {
-                return Err(RemoteFailure(format!(
-                    "runtime event revision {} does not match result revision {revision}",
-                    runtime.revision
-                ))
-                .into());
-            }
-            let realized = matches!(&runtime.event, RuntimeLifecycleEvent::Realized { .. });
-            self.client.intake(WireMessage::RuntimeEvent(runtime))?;
-            if realized {
-                break;
             }
         }
         Ok(())

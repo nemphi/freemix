@@ -75,6 +75,8 @@ sequence and uses its bounded peer wait before the existing reconnect backoff.
 Incomplete pre-handshake peers expire on the same absolute heartbeat deadline.
 The one-shot CLI has finite connect/read/write deadlines and accepts only exact
 newline-terminated records up to 64 KiB.
+While the CLI waits for a command, it applies valid peer events but still
+requires the accepted revision's durable event and realized runtime event.
 Studio diagnose checks one bounded raw-TCP heartbeat acknowledgement and keeps
 waiting when validated durable or runtime state arrives first.
 The default simulated daemon cooperatively stops after Unix SIGINT/SIGTERM or Windows Ctrl-C through bounded listener polling.
