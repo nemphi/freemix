@@ -259,6 +259,27 @@ fn handshake_delegates_snapshot_and_resume_selection() {
 }
 
 #[test]
+fn non_contiguous_resume_is_rejected_before_session_exposure() {
+    let mut control = control();
+    control.events.retain(|event| event.cursor.revision == 4);
+    let mut server = Server::new(config(), control).unwrap();
+    server.mark_ready().unwrap();
+    let cursor = EventCursor {
+        engine: engine(),
+        revision: 2,
+    };
+
+    assert!(matches!(
+        server.handshake(
+            &hello(Role::Viewer, Some(cursor)),
+            &principal(AuthRole::Viewer),
+            0,
+        ),
+        Err(HandshakeError::InvalidControlSync)
+    ));
+}
+
+#[test]
 fn desired_role_and_commands_are_authorized_to_the_granted_scope() {
     let server = ready_server(config());
     assert!(matches!(

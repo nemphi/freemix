@@ -225,15 +225,18 @@ fn validate_initial_sync<E>(
             if requested.engine != initial.engine || requested.revision > initial.current_revision {
                 return Err(HandshakeError::InvalidControlSync);
             }
-            let mut previous_revision = requested.revision;
+            let mut expected = requested.revision;
             for event in events {
-                if event.cursor.engine != initial.engine
-                    || event.cursor.revision <= previous_revision
-                    || event.cursor.revision > initial.current_revision
-                {
+                let Some(next_revision) = expected.checked_add(1) else {
+                    return Err(HandshakeError::InvalidControlSync);
+                };
+                if event.cursor.engine != initial.engine || event.cursor.revision != next_revision {
                     return Err(HandshakeError::InvalidControlSync);
                 }
-                previous_revision = event.cursor.revision;
+                expected = next_revision;
+            }
+            if expected != initial.current_revision {
+                return Err(HandshakeError::InvalidControlSync);
             }
         }
     }
