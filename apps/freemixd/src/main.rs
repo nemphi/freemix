@@ -3395,10 +3395,7 @@ fn serve_inner(
             )?)
         }
     };
-    let mut process_shutdown = native
-        .as_ref()
-        .map(|_| register_process_shutdown())
-        .transpose()?;
+    let mut process_shutdown = Some(register_process_shutdown()?);
     let authority = control_server_identity(&control.borrow(), project_id);
     let mut durable = project;
     if let Some(path) = record_program {
@@ -3455,7 +3452,7 @@ fn serve_inner(
 
     let principal = development_principal()?;
     let listener = TcpListener::bind(listen)?;
-    listener.set_nonblocking(native.is_some())?;
+    listener.set_nonblocking(true)?;
     let readiness = ReadinessRecord {
         address: listener.local_addr()?,
         project_id,
@@ -3478,16 +3475,14 @@ fn serve_inner(
         let stream = match listener.accept() {
             Ok((stream, _)) => stream,
             Err(error)
-                if native.is_some()
-                    && matches!(
-                        error.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) =>
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
             {
-                native
-                    .as_mut()
-                    .expect("native state was checked")
-                    .tick_if_due(&mut control.borrow_mut(), &authority)?;
+                if let Some(native) = &mut native {
+                    native.tick_if_due(&mut control.borrow_mut(), &authority)?;
+                }
                 thread::sleep(NATIVE_IO_POLL_INTERVAL);
                 continue;
             }

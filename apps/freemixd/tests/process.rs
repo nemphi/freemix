@@ -1271,6 +1271,22 @@ fn non_loopback_bind_is_rejected_before_listening() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn default_daemon_sigterm_exits_cleanly() {
+    let directory = TestDirectory::new("default-daemon-sigterm");
+    let project_path = directory.project_path();
+    create_project(&project_path);
+
+    let daemon = Daemon::start_without_once(&project_path);
+    let status = ProcessCommand::new("/bin/kill")
+        .args(["-TERM", &daemon.child.as_ref().unwrap().id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success(), "SIGTERM command failed: {status}");
+    daemon.wait_success();
+}
+
 #[test]
 fn help_documents_program_output_and_fullscreen_selection() {
     let output = ProcessCommand::new(env!("CARGO_BIN_EXE_freemixd"))
