@@ -182,7 +182,13 @@ or restore transactionally.
 
 `fm-audio` provides a deterministic reference Master with planar F32 mapping,
 gain/stereo-balance/mute/solo/follow-video, meters, timed canonical blocks,
-sample-count timing validation, and transactional gain and balance ramps. Its bounded
+sample-count timing validation, and transactional gain and balance ramps.
+Allocating reference outputs include deterministic per-input post-strip peak
+and RMS readings in `InputId` order after delay, channel mapping, operator
+gates, gain, balance, and transition gain. Silent configured strips remain
+visible with zero readings. The allocation-free native render path does not
+collect these per-input readings, and no protocol or UI meter transport exists.
+Its bounded
 `ClockMappedAudioSynchronizer` is now connected to native `freemixd` local-file
 audio. The daemon accepts source rates such as 44.1 kHz and linearly resamples
 them to the 48 kHz project Master while preserving absolute source and Master
