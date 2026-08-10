@@ -55,10 +55,11 @@ use fm_persistence::{
 };
 use fm_protocol::{
     CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, CodecError, CommandMessage, CommandPayload,
-    CommandResult, ErrorMessage, EventCursor, HandshakeOutcome as ProtocolHandshakeOutcome,
-    HandshakeRequest, HandshakeResponse, HeartbeatAcknowledgementMessage, HeartbeatMessage,
-    LineDecoder, ProtocolVersion, ResumeCursor, RuntimeEventMessage, ServerHello, ServerIdentity,
-    StructuredError, WireMessage, choose_handshake_outcome, encode_line,
+    CommandResult, ErrorMessage, EventCursor, EventMessage,
+    HandshakeOutcome as ProtocolHandshakeOutcome, HandshakeRequest, HandshakeResponse,
+    HeartbeatAcknowledgementMessage, HeartbeatMessage, LineDecoder, ProtocolVersion, ResumeCursor,
+    RuntimeEventMessage, ServerHello, ServerIdentity, StructuredError, WireMessage,
+    choose_handshake_outcome, encode_line,
 };
 use fm_server::{
     AuthenticationMode, ControlPlane, DisconnectReason, HandshakeError, Heartbeat, InitialSync,
@@ -4070,6 +4071,49 @@ fn process_command(
     native: Option<&mut NativeDaemon>,
     process_shutdown: Option<&ProcessShutdown>,
 ) -> AppResult<()> {
+    let delivery = execute_session_command(
+        session,
+        control,
+        store,
+        durable,
+        principal,
+        server,
+        command,
+        native,
+        process_shutdown,
+    )?;
+    write_session_message(
+        writer,
+        session,
+        &WireMessage::CommandResult(delivery.result),
+    )?;
+    for event in delivery.events {
+        write_session_message(writer, session, &WireMessage::Event(event))?;
+    }
+    for event in delivery.runtime_events {
+        write_session_message(writer, session, &WireMessage::RuntimeEvent(event))?;
+    }
+    Ok(())
+}
+
+struct CommandDelivery {
+    result: CommandResult,
+    events: Vec<EventMessage>,
+    runtime_events: Vec<RuntimeEventMessage>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_session_command(
+    session: &mut Session,
+    control: &SharedControl,
+    store: &ProjectStore,
+    durable: &mut StoredProject,
+    principal: &Principal,
+    server: &ServerIdentity,
+    command: &CommandMessage,
+    native: Option<&mut NativeDaemon>,
+    process_shutdown: Option<&ProcessShutdown>,
+) -> AppResult<CommandDelivery> {
     let encoded_bytes = encode_line(&WireMessage::Command(command.clone()))?.len();
     let now = now_millis()?;
     if let Err(error) = session.admit_command(command, encoded_bytes, now) {
@@ -4078,8 +4122,11 @@ fn process_command(
             &error,
             control.borrow().diagnostics().current_revision,
         );
-        write_session_message(writer, session, &WireMessage::CommandResult(result))?;
-        return Ok(());
+        return Ok(CommandDelivery {
+            result,
+            events: Vec::new(),
+            runtime_events: Vec::new(),
+        });
     }
     let execution = {
         let mut control = control.borrow_mut();
@@ -4101,19 +4148,11 @@ fn process_command(
                     Err(failure) => {
                         drop(control);
                         session.command_completed()?;
-                        write_session_message(
-                            writer,
-                            session,
-                            &WireMessage::CommandResult(failure.result),
-                        )?;
-                        for event in failure.runtime_events {
-                            write_session_message(
-                                writer,
-                                session,
-                                &WireMessage::RuntimeEvent(event),
-                            )?;
-                        }
-                        return Ok(());
+                        return Ok(CommandDelivery {
+                            result: failure.result,
+                            events: Vec::new(),
+                            runtime_events: failure.runtime_events,
+                        });
                     }
                 }
             } else {
@@ -4153,18 +4192,11 @@ fn process_command(
         runtime_events,
     } = execution;
 
-    write_session_message(
-        writer,
-        session,
-        &WireMessage::CommandResult(submission.output.result),
-    )?;
-    for event in submission.output.events {
-        write_session_message(writer, session, &WireMessage::Event(event))?;
-    }
-    for event in runtime_events {
-        write_session_message(writer, session, &WireMessage::RuntimeEvent(event))?;
-    }
-    Ok(())
+    Ok(CommandDelivery {
+        result: submission.output.result,
+        events: submission.output.events,
+        runtime_events,
+    })
 }
 
 fn is_stinger_mutation(command: &CommandMessage) -> bool {
