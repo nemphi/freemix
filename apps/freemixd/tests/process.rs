@@ -279,6 +279,50 @@ impl Client {
     }
 }
 
+fn connect_current_client(daemon: &Daemon, client: &mut ProtocolClient) -> Client {
+    let mut transport = daemon.connect();
+    transport
+        .reader
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    transport.send(&WireMessage::HandshakeRequest(
+        client.transport_connected().unwrap(),
+    ));
+    assert_eq!(
+        client.intake(transport.receive()).unwrap(),
+        Intake::Handshake
+    );
+    assert_eq!(
+        client.intake(transport.receive()).unwrap(),
+        Intake::SnapshotApplied
+    );
+    assert_eq!(client.state(), &ConnectionState::Ready);
+    transport
+}
+
+fn assert_heartbeat(client: &mut ProtocolClient, transport: &mut Client, sent_at_ms: u64) {
+    let cursor = client.last_applied_cursor();
+    let heartbeat = client.queue_heartbeat(sent_at_ms).unwrap();
+    assert_eq!(heartbeat.last_applied, cursor);
+    assert_eq!(
+        client.pop_outbound(),
+        Some(Outbound::Heartbeat(heartbeat.clone()))
+    );
+    transport.send(&WireMessage::Heartbeat(heartbeat.clone()));
+    let WireMessage::HeartbeatAcknowledgement(acknowledgement) = transport.receive() else {
+        panic!("expected heartbeat acknowledgement");
+    };
+    assert_eq!(acknowledgement.server, heartbeat.server);
+    assert_eq!(acknowledgement.heartbeat_sequence, heartbeat.sequence);
+    assert_eq!(
+        client
+            .intake(WireMessage::HeartbeatAcknowledgement(acknowledgement))
+            .unwrap(),
+        Intake::HeartbeatAcknowledged
+    );
+}
+
 fn assert_fade_runtime_round_trip(protocol_client: &mut ProtocolClient, transport: &mut Client) {
     let command = protocol_client
         .queue_command(
@@ -437,6 +481,117 @@ fn malformed_post_handshake_record_does_not_stop_daemon() {
 
     drop(next_client);
     drop(malformed_client);
+    daemon.stop();
+}
+
+#[test]
+fn idle_viewer_receives_operator_events_without_blocking() {
+    let directory = TestDirectory::new("idle-viewer-live-events");
+    let project_path = directory.project_path();
+    create_project(&project_path);
+
+    let viewer_id = "idle-viewer";
+    let operator_id = "show-operator";
+    assert_ne!(viewer_id, operator_id);
+    let mut viewer_client = ProtocolClient::new(ClientConfig::new(
+        "process-test",
+        ClientType::Integration,
+        Role::Viewer,
+        viewer_id,
+        project_id(),
+    ))
+    .unwrap();
+    let mut operator_client = ProtocolClient::new(ClientConfig::new(
+        "process-test",
+        ClientType::Integration,
+        Role::Operator,
+        operator_id,
+        project_id(),
+    ))
+    .unwrap();
+    viewer_client.start_connect().unwrap();
+
+    let daemon = Daemon::start_without_once(&project_path);
+    let mut viewer = connect_current_client(&daemon, &mut viewer_client);
+    assert_eq!(viewer_client.session().unwrap().granted_role, Role::Viewer);
+
+    operator_client.start_connect().unwrap();
+    let mut operator = connect_current_client(&daemon, &mut operator_client);
+    assert_eq!(
+        operator_client.session().unwrap().granted_role,
+        Role::Operator
+    );
+
+    let command = operator_client
+        .queue_command(CommandPayload::Cut, "two-peer-cut", Some(0), None)
+        .unwrap();
+    assert_eq!(command.id, "show-operator:1");
+    assert_eq!(
+        operator_client.pop_outbound(),
+        Some(Outbound::Command(command.clone()))
+    );
+    operator.send(&WireMessage::Command(command.clone()));
+
+    let result = operator.receive();
+    let WireMessage::CommandResult(CommandResult::Accepted { id, revision, .. }) = &result else {
+        panic!("expected accepted command result");
+    };
+    assert_eq!(id, &command.id);
+    assert_eq!(*revision, 1);
+    assert_eq!(
+        operator_client.intake(result).unwrap(),
+        Intake::ResultReconciled
+    );
+
+    let operator_event = operator.receive();
+    let WireMessage::Event(event) = &operator_event else {
+        panic!("expected durable event after command result");
+    };
+    assert_eq!(event.cursor.revision, 1);
+    assert!(matches!(
+        &event.payload,
+        fm_protocol::EventPayload::DesiredSwitcher {
+            program,
+            preview,
+            ..
+        } if *program == input(2) && *preview == input(1)
+    ));
+    assert_eq!(
+        operator_client.intake(operator_event.clone()).unwrap(),
+        Intake::EventApplied
+    );
+    let operator_runtime = operator.receive();
+    let WireMessage::RuntimeEvent(runtime) = &operator_runtime else {
+        panic!("expected runtime event after durable event");
+    };
+    assert_eq!(runtime.revision, 1);
+    assert!(matches!(
+        &runtime.event,
+        RuntimeLifecycleEvent::Realized { domain, .. } if domain == "switcher"
+    ));
+    assert_eq!(
+        operator_client.intake(operator_runtime.clone()).unwrap(),
+        Intake::RuntimeEventObserved
+    );
+
+    let viewer_event = viewer.receive();
+    assert_eq!(viewer_event, operator_event);
+    assert_eq!(
+        viewer_client.intake(viewer_event).unwrap(),
+        Intake::EventApplied
+    );
+    let viewer_runtime = viewer.receive();
+    assert_eq!(viewer_runtime, operator_runtime);
+    assert_eq!(
+        viewer_client.intake(viewer_runtime).unwrap(),
+        Intake::RuntimeEventObserved
+    );
+
+    assert_heartbeat(&mut viewer_client, &mut viewer, 1_234);
+    assert_heartbeat(&mut operator_client, &mut operator, 1_235);
+
+    drop(operator);
+    drop(viewer);
     daemon.stop();
 }
 

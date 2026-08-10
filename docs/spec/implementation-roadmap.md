@@ -80,9 +80,11 @@ The default simulated daemon cooperatively stops after Unix SIGINT/SIGTERM or Wi
 Simulated CLI PPM output uses same-directory write/sync/replace, not broader media or disk certification.
 This is control-plane peer liveness. It is not service readiness, production
 authentication, media health, HTTP resources, WebSocket event subscriptions,
-or transport-level production rate limits. Expired raw TCP sessions are
-reclaimed; this does not add concurrent sessions, HTTP/WebSocket transport,
-production authentication, or RC-008 completion.
+or transport-level production rate limits. The simulated non-native raw-TCP
+daemon has a bounded single-thread two-peer scheduler: an idle Viewer can
+receive live events while an Operator controls the show. Native mode remains
+single-client. This is not HTTP/WebSocket/service/media readiness or RC-008
+completion. Expired raw TCP sessions are reclaimed.
 
 ## 4. Phase 2 — GPU playback switcher (10–14 weeks)
 
