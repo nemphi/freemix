@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+const MAX_CONTROL_LINE_BYTES: usize = 4 * 1024;
 
 pub const HELP: &str = "\
 Restricted child process for FreeMix plugins (Phase 1 skeleton)
@@ -615,10 +616,9 @@ pub fn run_control_loop(
         .transition(LifecycleState::Ready)
         .map_err(RunError::Lifecycle)?;
 
-    let mut line = String::new();
+    let mut line = Vec::with_capacity(MAX_CONTROL_LINE_BYTES);
     loop {
-        line.clear();
-        if input.read_line(&mut line).map_err(RunError::Io)? == 0 {
+        if !read_control_line(&mut input, &mut line)? {
             lifecycle
                 .transition(LifecycleState::ShuttingDown)
                 .map_err(RunError::Lifecycle)?;
@@ -628,7 +628,9 @@ pub fn run_control_loop(
             return Ok(());
         }
 
-        let command_line = line.trim_end_matches(['\r', '\n']);
+        let command_line = std::str::from_utf8(&line)
+            .map_err(|error| RunError::Io(io::Error::new(io::ErrorKind::InvalidData, error)))?
+            .trim_end_matches(['\r', '\n']);
         match command_line.parse::<ControlCommand>() {
             Ok(ControlCommand::Ping) => writeln!(output, "pong").map_err(RunError::Io)?,
             Ok(ControlCommand::Status) => {
@@ -651,10 +653,34 @@ pub fn run_control_loop(
     }
 }
 
+fn read_control_line(input: &mut impl BufRead, line: &mut Vec<u8>) -> Result<bool, RunError> {
+    line.clear();
+    loop {
+        let (length, complete) = {
+            let buffer = input.fill_buf().map_err(RunError::Io)?;
+            if buffer.is_empty() {
+                return Ok(!line.is_empty());
+            }
+            let newline = buffer.iter().position(|&byte| byte == b'\n');
+            let length = newline.map_or(buffer.len(), |index| index + 1);
+            if line.len() + length > MAX_CONTROL_LINE_BYTES {
+                return Err(RunError::ControlLineTooLong);
+            }
+            line.extend_from_slice(&buffer[..length]);
+            (length, newline.is_some())
+        };
+        input.consume(length);
+        if complete {
+            return Ok(true);
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum RunError {
     Io(io::Error),
     Lifecycle(LifecycleError),
+    ControlLineTooLong,
 }
 
 impl fmt::Display for RunError {
@@ -662,6 +688,7 @@ impl fmt::Display for RunError {
         match self {
             Self::Io(error) => error.fmt(formatter),
             Self::Lifecycle(error) => error.fmt(formatter),
+            Self::ControlLineTooLong => formatter.write_str("control line exceeds 4096 bytes"),
         }
     }
 }
@@ -671,6 +698,7 @@ impl std::error::Error for RunError {
         match self {
             Self::Io(error) => Some(error),
             Self::Lifecycle(error) => Some(error),
+            Self::ControlLineTooLong => None,
         }
     }
 }
@@ -881,6 +909,19 @@ mod tests {
             "pong\nstatus ready\nerror unknown control command `nope`\nshutting-down\n"
         );
         assert_eq!(lifecycle.state(), LifecycleState::Stopped);
+    }
+
+    #[test]
+    fn control_loop_rejects_oversized_line() {
+        let input = Cursor::new(vec![b'x'; MAX_CONTROL_LINE_BYTES + 1]);
+        let mut output = Vec::new();
+        let mut lifecycle = Lifecycle::new();
+
+        assert!(matches!(
+            run_control_loop(input, &mut output, &mut lifecycle),
+            Err(RunError::ControlLineTooLong)
+        ));
+        assert!(output.is_empty());
     }
 
     #[test]
