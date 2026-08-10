@@ -11,7 +11,7 @@ use fm_protocol::{
     OverlayTransitionKind, StingerReadiness, WireOverlayChannelId, WireStingerSlotId,
 };
 use fm_types::InputId;
-use fm_ui_model::{BusSelection, ClientView, ManualTransitionStatus, SwitcherState};
+use fm_ui_model::{BusSelection, ClientView, ManualTransitionStatus, StingerStatus, SwitcherState};
 
 mod fade_to_black;
 mod overlay_status;
@@ -322,6 +322,18 @@ const fn stinger_slot_presentation(state: StingerSlotState) -> StingerSlotPresen
             ready: false,
         },
     }
+}
+
+fn stinger_slot_state(stingers: Option<&[StingerStatus]>, slot: u8) -> StingerSlotState {
+    let Some(stingers) = stingers else {
+        return StingerSlotState::Unavailable;
+    };
+    stingers
+        .iter()
+        .find(|status| status.slot == slot)
+        .map_or(StingerSlotState::Unconfigured, |status| {
+            StingerSlotState::Readiness(status.readiness)
+        })
 }
 
 /// Session and replicated-state gates for manual T-bar controls.
@@ -1231,18 +1243,10 @@ fn draw_transition_row(
                     });
                 }
                 for slot in 1..=8 {
-                    let slot_state =
-                        state
-                            .view
-                            .as_ref()
-                            .map_or(StingerSlotState::Unavailable, |view| {
-                                view.stingers
-                                    .iter()
-                                    .find(|status| status.slot == slot)
-                                    .map_or(StingerSlotState::Unconfigured, |status| {
-                                        StingerSlotState::Readiness(status.readiness)
-                                    })
-                            });
+                    let slot_state = stinger_slot_state(
+                        state.view.as_ref().map(|view| view.stingers.as_slice()),
+                        slot,
+                    );
                     let presentation = stinger_slot_presentation(slot_state);
                     if stinger_button(ui, availability.stinger(), slot, presentation) {
                         intents.push(StudioIntent::Stinger {
@@ -1715,6 +1719,11 @@ mod tests {
 
     #[test]
     fn stinger_slot_presentation_uses_replicated_readiness() {
+        assert_eq!(stinger_slot_state(None, 1), StingerSlotState::Unavailable);
+        assert_eq!(
+            stinger_slot_state(Some(&[]), 1),
+            StingerSlotState::Unconfigured
+        );
         for (state, label, color, ready) in [
             (
                 StingerSlotState::Unavailable,
