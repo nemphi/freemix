@@ -93,8 +93,11 @@ impl Daemon {
         let mut line = String::new();
         output.read_line(&mut line).unwrap();
         let readiness = line.parse::<ReadinessRecord>().unwrap_or_else(|error| {
-            let _ = child.kill();
-            let _ = child.wait();
+            if !terminate_child(&mut child) {
+                panic!(
+                    "daemon did not become ready: {error}; stdout={line:?}; cleanup timed out after one second"
+                );
+            }
             let mut stderr = String::new();
             child
                 .stderr
