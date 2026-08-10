@@ -3686,6 +3686,11 @@ fn handle_client(
     native: Option<&mut NativeDaemon>,
     process_shutdown: Option<&ProcessShutdown>,
 ) -> AppResult<()> {
+    let handshake_deadline = Instant::now()
+        .checked_add(Duration::from_millis(
+            server.config().session_limits.heartbeat_timeout_ms,
+        ))
+        .ok_or_else(|| AppFailure("handshake deadline exceeds Instant range".into()))?;
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(CLIENT_READ_POLL_INTERVAL))?;
     if native.is_some() {
@@ -3700,7 +3705,7 @@ fn handle_client(
         authority,
         &mut native,
         process_shutdown,
-        || Ok(true),
+        || Ok(Instant::now() < handshake_deadline),
     )?
     else {
         return Ok(());
@@ -4943,6 +4948,9 @@ impl MessageReader {
             if let Some(message) = self.pending.pop_front() {
                 return Ok(Some(message));
             }
+            if !idle()? {
+                return Ok(None);
+            }
         }
     }
 }
@@ -6161,35 +6169,97 @@ mod tests {
         }
     }
 
+    fn complete_test_handshake(stream: &TcpStream) -> (MessageReader, ServerIdentity) {
+        write_message(
+            &mut stream.try_clone().unwrap(),
+            &WireMessage::HandshakeRequest(HandshakeRequest {
+                protocol: PROTOCOL_VERSION,
+                build: "control-timeout-test".into(),
+                client_type: ClientType::Integration,
+                desired_role: Role::Operator,
+                resume_cursor: None,
+            }),
+        )
+        .unwrap();
+        let mut reader = MessageReader::new(stream.try_clone().unwrap());
+        let Some(WireMessage::HandshakeResponse(response)) =
+            reader.read_message_with_idle(|| Ok(false)).unwrap()
+        else {
+            panic!("expected handshake response");
+        };
+        assert!(matches!(
+            reader.read_message_with_idle(|| Ok(false)).unwrap(),
+            Some(WireMessage::Snapshot(_))
+        ));
+        (reader, response.server)
+    }
+
+    #[test]
+    fn incomplete_pre_handshake_peer_releases_accept_loop() {
+        const HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(100);
+
+        let directory = tempfile::tempdir().unwrap();
+        let project_path = directory.path().join("show.freemix");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (accepted_tx, accepted_rx) = std::sync::mpsc::sync_channel(1);
+        let server_thread = thread::spawn(move || {
+            let store = ProjectStore::new(project_path).unwrap();
+            let mut durable = test_project();
+            let project_id = durable.project().id();
+            let control = Rc::new(RefCell::new(test_control(&durable)));
+            let authority = control_server_identity(&control.borrow(), project_id);
+            let config = ServerConfig::new(
+                ServerMode::Development,
+                AuthenticationMode::Development,
+                address.ip(),
+                CAPABILITIES_DIGEST,
+            )
+            .with_session_limits(fm_server::SessionLimits {
+                heartbeat_timeout_ms: u64::try_from(HANDSHAKE_TIMEOUT.as_millis()).unwrap(),
+                ..fm_server::SessionLimits::default()
+            });
+            let mut server = Server::new(config, ControlHandle(Rc::clone(&control))).unwrap();
+            server.mark_ready().unwrap();
+            let principal = development_principal().unwrap();
+
+            for client_index in 0..2 {
+                let (stream, _) = listener.accept().unwrap();
+                if client_index == 0 {
+                    accepted_tx.send(()).unwrap();
+                }
+                handle_client(
+                    stream,
+                    &server,
+                    &control,
+                    &store,
+                    &mut durable,
+                    &principal,
+                    &authority,
+                    None,
+                    None,
+                )
+                .unwrap();
+            }
+        });
+
+        let incomplete_peer = TcpStream::connect(address).unwrap();
+        accepted_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let next_peer = TcpStream::connect(address).unwrap();
+        next_peer
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        complete_test_handshake(&next_peer);
+
+        drop(incomplete_peer);
+        drop(next_peer);
+        server_thread.join().unwrap();
+    }
+
     #[test]
     fn expired_tcp_session_is_reclaimed_for_next_client() {
         const HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(600);
         const HEARTBEAT_DELAY: Duration = Duration::from_millis(200);
-
-        fn complete_handshake(stream: &TcpStream) -> (MessageReader, ServerIdentity) {
-            write_message(
-                &mut stream.try_clone().unwrap(),
-                &WireMessage::HandshakeRequest(HandshakeRequest {
-                    protocol: PROTOCOL_VERSION,
-                    build: "heartbeat-timeout-test".into(),
-                    client_type: ClientType::Integration,
-                    desired_role: Role::Operator,
-                    resume_cursor: None,
-                }),
-            )
-            .unwrap();
-            let mut reader = MessageReader::new(stream.try_clone().unwrap());
-            let Some(WireMessage::HandshakeResponse(response)) =
-                reader.read_message_with_idle(|| Ok(false)).unwrap()
-            else {
-                panic!("expected handshake response");
-            };
-            assert!(matches!(
-                reader.read_message_with_idle(|| Ok(false)).unwrap(),
-                Some(WireMessage::Snapshot(_))
-            ));
-            (reader, response.server)
-        }
 
         let directory = tempfile::tempdir().unwrap();
         let project_path = directory.path().join("show.freemix");
@@ -6240,7 +6310,7 @@ mod tests {
         client
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
-        let (mut reader, server) = complete_handshake(&client);
+        let (mut reader, server) = complete_test_handshake(&client);
         let original_deadline = Instant::now() + HEARTBEAT_TIMEOUT;
         assert!(matches!(
             expired_rx.recv_timeout(HEARTBEAT_DELAY),
@@ -6278,7 +6348,7 @@ mod tests {
         next_client
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
-        complete_handshake(&next_client);
+        complete_test_handshake(&next_client);
         drop(next_client);
 
         server_thread.join().unwrap();

@@ -72,6 +72,7 @@ and deterministic model tests. Protocol 2.10 makes the daemon acknowledge only
 a validated heartbeat with the session server identity, the exact client
 heartbeat sequence, and the server receive time. Studio accepts one expected
 sequence and uses its bounded peer wait before the existing reconnect backoff.
+Incomplete pre-handshake peers expire on the same absolute heartbeat deadline.
 This is control-plane peer liveness. It is not service readiness, production
 authentication, media health, HTTP resources, WebSocket event subscriptions,
 or transport-level production rate limits. Expired raw TCP sessions are
