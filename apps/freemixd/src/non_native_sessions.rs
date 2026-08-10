@@ -164,7 +164,7 @@ pub(super) fn run(
             return Ok(DaemonShutdownReason::ProcessSignal);
         }
 
-        if once_peer.is_none() && peers.len() < MAX_PEERS {
+        if once_peer.is_none() && (!once || peers.is_empty()) && peers.len() < MAX_PEERS {
             match listener.accept() {
                 Ok((stream, _)) => {
                     if stream.set_nonblocking(true).is_ok() && stream.set_nodelay(true).is_ok() {

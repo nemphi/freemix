@@ -433,20 +433,49 @@ fn daemon_acknowledges_only_valid_heartbeats() {
 }
 
 #[test]
-fn once_daemon_ignores_pre_handshake_disconnect() {
-    let directory = TestDirectory::new("once-pre-handshake-disconnect");
+fn once_daemon_replaces_disconnected_peer_but_admits_one_live_peer() {
+    let directory = TestDirectory::new("once-single-live-peer");
     let project_path = directory.project_path();
     create_project(&project_path);
 
     let daemon = Daemon::start(&project_path);
     drop(TcpStream::connect(daemon.address).unwrap());
 
-    let mut client = daemon.connect();
-    client.handshake(None);
-    assert!(matches!(client.receive(), WireMessage::Snapshot(_)));
-    drop(client);
+    let mut first = daemon.connect();
+    let mut second = daemon.connect();
+    second
+        .reader
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    second.send(&WireMessage::HandshakeRequest(HandshakeRequest {
+        protocol: CURRENT_PROTOCOL_VERSION,
+        build: "process-test".into(),
+        client_type: ClientType::Integration,
+        desired_role: Role::Operator,
+        resume_cursor: None,
+    }));
+
+    first.handshake(None);
+    assert!(matches!(first.receive(), WireMessage::Snapshot(_)));
+    drop(first);
 
     daemon.wait_success();
+
+    let mut line = String::new();
+    match second.reader.read_line(&mut line) {
+        Ok(0) => {}
+        Ok(_) => panic!("second live peer received a daemon response: {line}"),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::WouldBlock
+            ) => {}
+        Err(error) => panic!("could not inspect second live peer: {error}"),
+    }
 }
 
 #[test]
