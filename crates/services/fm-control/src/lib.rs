@@ -651,6 +651,11 @@ impl<A: AuthorizationHook> ControlService<A> {
         })
     }
 
+    /// Removes a live subscription and returns whether it was present.
+    pub fn unsubscribe(&mut self, subscriber: SubscriberId) -> bool {
+        self.subscribers.remove(&subscriber).is_some()
+    }
+
     /// Returns retained events only when identity and every following revision match.
     #[must_use]
     pub fn resume(&self, cursor: &EventCursor) -> ResumeDecision {

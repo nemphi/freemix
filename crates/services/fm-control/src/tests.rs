@@ -1473,6 +1473,24 @@ fn slow_subscriber_is_failed_and_removed() {
 }
 
 #[test]
+fn unsubscribe_releases_idle_subscriber_capacity() {
+    let mut control = service(8, 8);
+    let mut subscriptions: Vec<_> = (0..4).map(|_| control.subscribe().unwrap()).collect();
+    let idle = subscriptions.pop().unwrap();
+
+    assert!(matches!(
+        control.subscribe(),
+        Err(SubscribeError::LimitReached)
+    ));
+    assert!(control.unsubscribe(idle.id()));
+    assert_eq!(idle.try_recv(), Err(TryRecvError::Disconnected));
+    assert_eq!(idle.failure(), None);
+    assert_eq!(control.diagnostics().subscriber_count, 3);
+    control.subscribe().unwrap();
+    assert_eq!(control.diagnostics().subscriber_count, 4);
+}
+
+#[test]
 fn subscription_distinguishes_durable_and_runtime_events() {
     let mut control = service(8, 8);
     let subscription = control.subscribe().unwrap();
