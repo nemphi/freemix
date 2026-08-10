@@ -87,7 +87,7 @@ impl BoundedIpcQueue {
         self.messages.pop_front()
     }
 
-    pub fn front(&self) -> Option<&IpcMessage> {
+    pub(crate) fn front(&self) -> Option<&IpcMessage> {
         self.messages.front()
     }
 
