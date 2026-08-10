@@ -73,6 +73,8 @@ a validated heartbeat with the session server identity, the exact client
 heartbeat sequence, and the server receive time. Studio accepts one expected
 sequence and uses its bounded peer wait before the existing reconnect backoff.
 Incomplete pre-handshake peers expire on the same absolute heartbeat deadline.
+The one-shot CLI has finite connect/read/write deadlines and accepts only exact
+newline-terminated records up to 64 KiB.
 This is control-plane peer liveness. It is not service readiness, production
 authentication, media health, HTTP resources, WebSocket event subscriptions,
 or transport-level production rate limits. Expired raw TCP sessions are

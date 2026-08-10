@@ -3,19 +3,21 @@ use std::{
     io::{BufRead, BufReader, Write},
     net::{SocketAddr, TcpStream},
     num::NonZeroU128,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use fm_client::{Client, ClientConfig, Intake, Outbound};
 use fm_protocol::{
     CURRENT_PROTOCOL_VERSION, ClientType, CommandPayload, CommandResult, EventPayload,
-    FadeToBlackState, HandshakeOutcome, HandshakeRequest, Role, RuntimeLifecycleEvent,
-    ServerIdentity, WireMessage, decode_line, encode_line,
+    FadeToBlackState, HandshakeOutcome, HandshakeRequest, MAX_LINE_BYTES, Role,
+    RuntimeLifecycleEvent, ServerIdentity, WireMessage, decode_line, encode_line,
 };
 use fm_types::ProjectId;
 use fm_ui_model::ManualTransitionStatus;
 
 type RemoteResult<T> = Result<T, Box<dyn Error>>;
+
+const REMOTE_IO_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub fn status(address: SocketAddr) -> RemoteResult<()> {
     let remote = Remote::connect(address)?;
@@ -53,8 +55,10 @@ impl Remote {
             .into());
         }
 
-        let stream = TcpStream::connect(address)?;
+        let stream = TcpStream::connect_timeout(&address, REMOTE_IO_TIMEOUT)?;
         stream.set_nodelay(true)?;
+        stream.set_read_timeout(Some(REMOTE_IO_TIMEOUT))?;
+        stream.set_write_timeout(Some(REMOTE_IO_TIMEOUT))?;
         let mut remote = Self::uninitialized(stream)?;
         remote.write(&WireMessage::HandshakeRequest(HandshakeRequest {
             protocol: CURRENT_PROTOCOL_VERSION,
@@ -273,11 +277,40 @@ impl Remote {
     }
 
     fn read(&mut self) -> RemoteResult<WireMessage> {
-        let mut line = String::new();
-        if self.reader.read_line(&mut line)? == 0 {
-            return Err(RemoteFailure("daemon closed the TCP connection".into()).into());
+        let mut line = Vec::with_capacity(MAX_LINE_BYTES);
+        loop {
+            let (count, complete) = {
+                let buffer = match self.reader.fill_buf() {
+                    Ok(buffer) => buffer,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                        ) =>
+                    {
+                        return Err(RemoteFailure("daemon response timed out".into()).into());
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                if buffer.is_empty() {
+                    return Err(RemoteFailure("daemon closed the TCP connection".into()).into());
+                }
+                let complete = buffer.iter().position(|byte| *byte == b'\n');
+                let count = complete.map_or(buffer.len(), |index| index + 1);
+                if line.len() + count > MAX_LINE_BYTES {
+                    return Err(fm_protocol::CodecError::LineTooLong.into());
+                }
+                line.extend_from_slice(&buffer[..count]);
+                (count, complete.is_some())
+            };
+            self.reader.consume(count);
+            if complete {
+                return Ok(decode_line(core::str::from_utf8(&line)?)?);
+            }
+            if line.len() == MAX_LINE_BYTES {
+                return Err(fm_protocol::CodecError::LineTooLong.into());
+            }
         }
-        Ok(decode_line(&line)?)
     }
 }
 

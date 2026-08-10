@@ -1,24 +1,26 @@
 use std::{
     fs,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     num::NonZeroU128,
     path::{Path, PathBuf},
     process::{Command, Output},
     sync::atomic::{AtomicU64, Ordering},
     thread::{self, JoinHandle},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use fm_protocol::{
     CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, ClientType, CommandMessage, CommandPayload,
     CommandResult, EngineIdentity, EventCursor, EventMessage, EventPayload, HandshakeOutcome,
-    HandshakeResponse, OverlayStatus, ProtocolVersion, Role, RuntimeDomainBoundary,
+    HandshakeResponse, MAX_LINE_BYTES, OverlayStatus, ProtocolVersion, Role, RuntimeDomainBoundary,
     RuntimeEventMessage, RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage, SnapshotReason,
     WireInputId, WireMessage, decode_line, encode_line,
 };
 
 static TEST_ROOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+const TEST_PEER_TIMEOUT: Duration = Duration::from_secs(4);
 
 struct FakeRemoteServer {
     address: SocketAddr,
@@ -37,6 +39,36 @@ impl FakeRemoteServer {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let worker = thread::spawn(move || serve_premature_event(&listener, kind));
+        Self { address, worker }
+    }
+
+    fn start_silent_response() -> Self {
+        Self::start_test_peer(|stream| {
+            stream.set_read_timeout(Some(TEST_PEER_TIMEOUT)).unwrap();
+            let mut reader = BufReader::new(stream);
+            assert_handshake_request(read_message(&mut reader));
+            let mut byte = [0];
+            assert_eq!(reader.get_mut().read(&mut byte).unwrap(), 0);
+        })
+    }
+
+    fn start_unterminated_response() -> Self {
+        Self::start_test_peer(|stream| {
+            stream.set_read_timeout(Some(TEST_PEER_TIMEOUT)).unwrap();
+            stream.set_write_timeout(Some(TEST_PEER_TIMEOUT)).unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+            assert_handshake_request(read_message(&mut reader));
+            writer.write_all(&vec![b'x'; MAX_LINE_BYTES + 1]).unwrap();
+            let mut byte = [0];
+            let _ = reader.get_mut().read(&mut byte);
+        })
+    }
+
+    fn start_test_peer(handler: impl FnOnce(TcpStream) + Send + 'static) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || handler(accept_test_peer(&listener)));
         Self { address, worker }
     }
 
@@ -116,6 +148,25 @@ impl FakeRemoteServer {
 
     fn finish(self) {
         self.worker.join().unwrap();
+    }
+}
+
+fn accept_test_peer(listener: &TcpListener) -> TcpStream {
+    listener.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + TEST_PEER_TIMEOUT;
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream.set_nonblocking(false).unwrap();
+                return stream;
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+            {
+                thread::yield_now();
+            }
+            Err(error) => panic!("test peer did not connect: {error}"),
+        }
     }
 }
 
@@ -1028,6 +1079,22 @@ fn remote_commands_use_protocol_server_and_replay_duplicate_keys() {
 fn remote_commands_reject_non_loopback_addresses_before_connecting() {
     let output = invoke(&["remote-status", "192.0.2.1:9123"]);
     assert_failure_contains(&output, "requires a loopback address");
+}
+
+#[test]
+fn remote_status_times_out_when_peer_sends_no_response() {
+    let server = FakeRemoteServer::start_silent_response();
+    let output = invoke(&["remote-status", &server.address()]);
+    assert_failure_contains(&output, "daemon response timed out");
+    server.finish();
+}
+
+#[test]
+fn remote_status_rejects_an_unterminated_oversized_record() {
+    let server = FakeRemoteServer::start_unterminated_response();
+    let output = invoke(&["remote-status", &server.address()]);
+    assert_failure_contains(&output, "protocol line exceeds maximum length");
+    server.finish();
 }
 
 #[test]
