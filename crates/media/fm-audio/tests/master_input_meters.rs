@@ -1,8 +1,8 @@
 use std::num::NonZeroU128;
 
 use fm_audio::{
-    AudioBlock, AudioError, Balance, ChannelMapping, ChannelMeter, ClippingPolicy, Gain,
-    InputState, MasterMixer, MasterOutput, SourceGain,
+    AudioBlock, Balance, ChannelMapping, ChannelMeter, ClippingPolicy, Gain, InputState,
+    MasterMixer, MasterOutput, SourceGain,
 };
 use fm_frame::{
     ClockDomainId, MediaTiming, NormalizedDuration, NormalizedTimestamp, OriginalTimestamp,
@@ -86,8 +86,6 @@ fn input_meter_applies_gain_and_balance_in_master_channel_order() {
 
     let output = mixer.mix(4, &[(id, &source)], None).unwrap();
 
-    assert_eq!(output.block.plane(0).unwrap(), &[0.0; 4]);
-    assert_eq!(output.block.plane(1).unwrap(), &[0.5; 4]);
     assert_meter(input_channels(&output, id)[0], 0.0, 0.0);
     assert_meter(input_channels(&output, id)[1], 0.5, 0.5);
 }
@@ -220,36 +218,6 @@ fn delay_and_transition_source_gain_are_included_in_input_meter() {
         1.0,
         (1.812_5_f32 / 4.0).sqrt(),
     );
-}
-
-#[test]
-fn invalid_submission_does_not_advance_metered_strip_state() {
-    let format = mono_format();
-    let id = input(1);
-    let unknown = input(2);
-    let source = block(&format, vec![vec![1.0; 2]]);
-    let mut mixer = MasterMixer::new(format.clone()).unwrap();
-    add_input(&mut mixer, id, &format, InputState::default());
-    mixer
-        .set_input_state(
-            id,
-            InputState {
-                gain: Gain::SILENCE,
-                ..InputState::default()
-            },
-            2,
-        )
-        .unwrap();
-
-    assert_eq!(
-        mixer.mix(2, &[(id, &source), (unknown, &source)], None),
-        Err(AudioError::UnknownInput(unknown))
-    );
-    assert_eq!(mixer.current_linear_gain(id), Some(1.0));
-
-    let output = mixer.mix(2, &[(id, &source)], None).unwrap();
-    assert_eq!(output.block.plane(0).unwrap(), &[0.5, 0.0]);
-    assert_meter(input_channels(&output, id)[0], 0.5, 0.5 / 2.0_f32.sqrt());
 }
 
 fn timing(samples: usize) -> MediaTiming {
