@@ -238,7 +238,8 @@ so a muted or video-inactive soloed strip can intentionally produce silence.
 Local and remote CLI commands, Studio controls,
 and the Web semantic control model expose the same bounded mutation. Restart
 restores engine desired state from the canonical strips and checkpoints it back
-to the project. Current-contract persistence, generated-audio, AFV
+to the project. Studio resolves queued field edits against the latest confirmed
+strip before dispatch. Current-contract persistence, generated-audio, AFV
 selected/inactive, mute, solo, immediate startup gain/balance/delay, live full-strip realization,
 and failed-preflight no-partial-state tests cover this slice.
 

@@ -15,7 +15,10 @@ use fm_client::{
     ClientError, CommandStatus, CommandUncertainty, SessionEvent, SyncMode, TcpSessionError,
 };
 use fm_protocol::{CommandPayload, CommandResult, DurableGap, WireInputId, WireMessage};
-use fm_ui_egui::{StudioConnectionStatus, StudioIntent, StudioShell, StudioUiState};
+use fm_ui_egui::{
+    InputAudioStripUpdate, StudioConnectionStatus, StudioIntent, StudioShell, StudioUiState,
+};
+use fm_ui_model::ClientView;
 
 use crate::{LifecycleState, StudioConfig, StudioRuntime};
 
@@ -930,12 +933,10 @@ fn begin_intent(
     publisher: &StatePublisher,
     persistent_error: Option<String>,
 ) -> Result<String, String> {
-    let payload = intent_payload(intent);
-    let expected_revision = runtime
-        .session()
-        .client()
-        .model()
-        .view()
+    let view = runtime.session().client().model().view();
+    let payload = intent_payload(intent, view.as_ref())?;
+    let expected_revision = view
+        .as_ref()
         .map(|view| view.cursor.revision.get())
         .ok_or_else(|| "Cannot send a command before project state is synchronized".to_owned())?;
     let key = keys
@@ -950,6 +951,31 @@ fn begin_intent(
         return Err("Studio UI disconnected".to_owned());
     }
     Ok(command.id)
+}
+
+fn resolve_input_audio_strip(
+    view: Option<&ClientView>,
+    input: fm_types::InputId,
+    update: InputAudioStripUpdate,
+) -> Result<CommandPayload, String> {
+    let view =
+        view.ok_or_else(|| "Cannot edit audio before project state is synchronized".to_owned())?;
+    let strip = view
+        .input_audio_strips
+        .iter()
+        .find(|strip| strip.input == input)
+        .ok_or_else(|| "Cannot edit audio: input is no longer available".to_owned())?;
+    Ok(CommandPayload::SetInputAudioStrip {
+        input: WireInputId::from_domain(input),
+        gain_millidb: update.gain_millidb.unwrap_or(strip.gain_millidb),
+        balance_basis_points: update
+            .balance_basis_points
+            .unwrap_or(strip.balance_basis_points),
+        muted: update.muted.unwrap_or(strip.muted),
+        soloed: update.soloed.unwrap_or(strip.soloed),
+        follow_video: update.follow_video.unwrap_or(strip.follow_video),
+        delay_samples: update.delay_samples.unwrap_or(strip.delay_samples),
+    })
 }
 
 fn consume_command_sequence(
@@ -1222,25 +1248,14 @@ fn result_id(result: &CommandResult) -> &str {
     }
 }
 
-const fn intent_payload(intent: StudioIntent) -> CommandPayload {
-    match intent {
-        StudioIntent::SetInputAudioStrip {
-            input,
-            gain_millidb,
-            balance_basis_points,
-            muted,
-            soloed,
-            follow_video,
-            delay_samples,
-        } => CommandPayload::SetInputAudioStrip {
-            input: WireInputId::from_domain(input),
-            gain_millidb,
-            balance_basis_points,
-            muted,
-            soloed,
-            follow_video,
-            delay_samples,
-        },
+fn intent_payload(
+    intent: StudioIntent,
+    view: Option<&ClientView>,
+) -> Result<CommandPayload, String> {
+    let payload = match intent {
+        StudioIntent::SetInputAudioStrip { input, update } => {
+            return resolve_input_audio_strip(view, input, update);
+        }
         StudioIntent::SelectPreview(input) => CommandPayload::SelectPreview {
             input: WireInputId::from_domain(input),
         },
@@ -1302,7 +1317,8 @@ const fn intent_payload(intent: StudioIntent) -> CommandPayload {
         }
         StudioIntent::CommitManualTransition => CommandPayload::CommitManualTransition,
         StudioIntent::CancelManualTransition => CommandPayload::CancelManualTransition,
-    }
+    };
+    Ok(payload)
 }
 
 const fn lifecycle_status(lifecycle: LifecycleState) -> StudioConnectionStatus {
@@ -1409,11 +1425,12 @@ mod tests {
 
     use fm_protocol::{
         CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, EngineIdentity, FadeToBlackPosition,
-        FadeToBlackState, HandshakeOutcome, HandshakeResponse, InputAudioStripStatus, InputStatus,
-        HeartbeatAcknowledgementMessage, ManualTransitionStatus, OverlayStatus, Role,
+        FadeToBlackState, HandshakeOutcome, HandshakeResponse, HeartbeatAcknowledgementMessage,
+        InputAudioStripStatus, InputStatus, ManualTransitionStatus, OverlayStatus, Role,
         ServerIdentity, SnapshotMessage, SnapshotReason, WireMessage, decode_line, encode_line,
     };
-    use fm_types::InputId;
+    use fm_types::{InputId, ProjectId};
+    use fm_ui_model::{ClientModel, ProjectSnapshot};
 
     #[cfg(unix)]
     use crate::SupervisedConfig;
@@ -1709,27 +1726,53 @@ mod tests {
     }
 
     #[test]
-    fn input_audio_strip_intent_maps_to_the_exact_wire_command() {
-        let input = InputId::new(NonZeroU128::new(7).unwrap());
+    fn queued_audio_edits_merge_with_the_latest_confirmed_strip() {
+        let project = ProjectId::new(NonZeroU128::new(7).unwrap());
+        let snapshot = heartbeat_snapshot();
+        let input = snapshot.inputs[0].input.to_domain();
+        let mut model = ClientModel::new(project);
+        model
+            .install_snapshot(ProjectSnapshot::from_protocol(project, snapshot))
+            .unwrap();
+        let mut confirmed = model.view().unwrap();
         assert_eq!(
-            intent_payload(StudioIntent::SetInputAudioStrip {
+            resolve_input_audio_strip(
+                Some(&confirmed),
                 input,
-                gain_millidb: -6_000,
-                balance_basis_points: 2_500,
-                muted: true,
-                soloed: true,
-                follow_video: false,
-                delay_samples: 2_400,
-            }),
-            CommandPayload::SetInputAudioStrip {
+                InputAudioStripUpdate {
+                    muted: Some(true),
+                    ..InputAudioStripUpdate::default()
+                },
+            ),
+            Ok(CommandPayload::SetInputAudioStrip {
                 input: WireInputId::from_domain(input),
-                gain_millidb: -6_000,
-                balance_basis_points: 2_500,
+                gain_millidb: 0,
+                balance_basis_points: 0,
+                muted: true,
+                soloed: false,
+                follow_video: false,
+                delay_samples: 0,
+            })
+        );
+        confirmed.input_audio_strips[0].muted = true;
+        assert_eq!(
+            resolve_input_audio_strip(
+                Some(&confirmed),
+                input,
+                InputAudioStripUpdate {
+                    soloed: Some(true),
+                    ..InputAudioStripUpdate::default()
+                },
+            ),
+            Ok(CommandPayload::SetInputAudioStrip {
+                input: WireInputId::from_domain(input),
+                gain_millidb: 0,
+                balance_basis_points: 0,
                 muted: true,
                 soloed: true,
                 follow_video: false,
-                delay_samples: 2_400,
-            }
+                delay_samples: 0,
+            })
         );
     }
 }

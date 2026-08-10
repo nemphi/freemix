@@ -31,18 +31,24 @@ const ERROR: Color32 = Color32::from_rgb(255, 100, 91);
 const MIN_TILE_WIDTH: f32 = 156.0;
 const NARROW_MONITOR_WIDTH: f32 = 700.0;
 
+/// Changed controls for one input's Master audio strip.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct InputAudioStripUpdate {
+    pub gain_millidb: Option<i32>,
+    pub balance_basis_points: Option<i32>,
+    pub muted: Option<bool>,
+    pub soloed: Option<bool>,
+    pub follow_video: Option<bool>,
+    pub delay_samples: Option<u32>,
+}
+
 /// Operator actions emitted by [`StudioShell`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StudioIntent {
-    /// Replaces one input's exact Master strip controls atomically.
+    /// Updates changed Master-strip controls on one input.
     SetInputAudioStrip {
         input: InputId,
-        gain_millidb: i32,
-        balance_basis_points: i32,
-        muted: bool,
-        soloed: bool,
-        follow_video: bool,
-        delay_samples: u32,
+        update: InputAudioStripUpdate,
     },
     /// Selects an input on the Preview bus.
     SelectPreview(InputId),
@@ -735,21 +741,18 @@ fn draw_input_audio_strips(ui: &mut Ui, state: &StudioUiState, intents: &mut Vec
                         )
                         .on_hover_text("Input delay at the 48 kHz Master sample rate")
                         .changed();
-                    if gain_changed
-                        || balance_changed
-                        || mute_changed
-                        || solo_changed
-                        || follow_changed
-                        || delay_changed
-                    {
+                    let update = InputAudioStripUpdate {
+                        gain_millidb: gain_changed.then_some(gain_millidb),
+                        balance_basis_points: balance_changed.then_some(balance_basis_points),
+                        muted: mute_changed.then_some(muted),
+                        soloed: solo_changed.then_some(soloed),
+                        follow_video: follow_changed.then_some(follow_video),
+                        delay_samples: delay_changed.then_some(delay_samples),
+                    };
+                    if update != InputAudioStripUpdate::default() {
                         intents.push(StudioIntent::SetInputAudioStrip {
                             input: status.input,
-                            gain_millidb,
-                            balance_basis_points,
-                            muted,
-                            soloed,
-                            follow_video,
-                            delay_samples,
+                            update,
                         });
                     }
                 }
@@ -2061,21 +2064,25 @@ mod tests {
         assert_eq!(
             StudioIntent::SetInputAudioStrip {
                 input: input(9),
-                gain_millidb: -6_000,
-                balance_basis_points: 2_500,
-                muted: true,
-                soloed: true,
-                follow_video: false,
-                delay_samples: 2_400,
+                update: InputAudioStripUpdate {
+                    gain_millidb: Some(-6_000),
+                    balance_basis_points: Some(2_500),
+                    muted: Some(true),
+                    soloed: Some(true),
+                    follow_video: Some(false),
+                    delay_samples: Some(2_400),
+                },
             },
             StudioIntent::SetInputAudioStrip {
                 input: input(9),
-                gain_millidb: -6_000,
-                balance_basis_points: 2_500,
-                muted: true,
-                soloed: true,
-                follow_video: false,
-                delay_samples: 2_400,
+                update: InputAudioStripUpdate {
+                    gain_millidb: Some(-6_000),
+                    balance_basis_points: Some(2_500),
+                    muted: Some(true),
+                    soloed: Some(true),
+                    follow_video: Some(false),
+                    delay_samples: Some(2_400),
+                },
             }
         );
         assert_eq!(
