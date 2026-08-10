@@ -272,14 +272,39 @@ fn serve_peer_event_interleave(listener: &TcpListener) {
             scheduled_frame: Some(2),
         }),
     );
-    write_command_events(
+    write_message(
         &mut writer,
-        &engine,
-        2,
-        CommandPayload::SelectPreview { input: input(2) },
-        input(2),
-        input(2),
+        &WireMessage::Event(EventMessage {
+            cursor: EventCursor {
+                engine: engine.clone(),
+                revision: 2,
+            },
+            payload: EventPayload::DesiredSwitcher {
+                program: input(2),
+                preview: input(2),
+                manual_transition: fm_protocol::ManualTransitionStatus::Inactive,
+                fade_to_black: live_fade_to_black(),
+                overlays: OverlayStatus::empty_channels(),
+                input_audio_strips: input_audio_strips(),
+            },
+        }),
     );
+    for (sequence, domain) in [(1, "audio"), (2, "switcher")] {
+        write_message(
+            &mut writer,
+            &WireMessage::RuntimeEvent(RuntimeEventMessage {
+                server: server_identity(&engine),
+                revision: 2,
+                generation: 2,
+                sequence,
+                event: RuntimeLifecycleEvent::Realized {
+                    domain: domain.into(),
+                    manual_transition: fm_protocol::ManualTransitionStatus::Inactive,
+                    fade_to_black: live_fade_to_black(),
+                },
+            }),
+        );
+    }
 }
 
 fn serve_fade_to_black(listener: &TcpListener) {
@@ -1249,7 +1274,7 @@ fn remote_t_bar_position_preserves_the_exact_endpoint_and_replicated_status() {
 #[test]
 fn remote_commands_accept_peer_events_while_waiting() {
     let server = FakeRemoteServer::start_peer_event_interleave();
-    let output = invoke(&[
+    let output = invoke_bounded(&[
         "remote-preview",
         &server.address(),
         "2",
