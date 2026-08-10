@@ -56,6 +56,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(diagnostic_failure)?
             {
                 SessionEvent::HeartbeatAcknowledged { acknowledgement } => {
+                    if Instant::now() >= deadline {
+                        return Err(diagnostic_failure("deadline exceeded").into());
+                    }
                     println!(
                         "liveness=ok sequence={} received_at_ms={}",
                         acknowledgement.heartbeat_sequence, acknowledgement.received_at_ms

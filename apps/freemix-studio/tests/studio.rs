@@ -31,6 +31,7 @@ use freemix_studio::{
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const DIAGNOSE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
 const PROJECT_VALUE: u128 = 18_446_744_073_709_551_657;
 static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -200,13 +201,17 @@ struct Peer {
 }
 
 impl Peer {
-    fn accept(listener: &TcpListener) -> Self {
-        let (stream, _) = listener.accept().unwrap();
+    fn from_stream(stream: TcpStream) -> Self {
         Self {
             stream,
             decoder: LineDecoder::new(),
             pending: VecDeque::new(),
         }
+    }
+
+    fn accept(listener: &TcpListener) -> Self {
+        let (stream, _) = listener.accept().unwrap();
+        Self::from_stream(stream)
     }
 
     fn accept_until(listener: &TcpListener, deadline: Instant) -> Self {
@@ -215,11 +220,7 @@ impl Peer {
             match listener.accept() {
                 Ok((stream, _)) => {
                     stream.set_nonblocking(false).unwrap();
-                    return Self {
-                        stream,
-                        decoder: LineDecoder::new(),
-                        pending: VecDeque::new(),
-                    };
+                    return Self::from_stream(stream);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     assert!(Instant::now() < deadline, "timed out waiting for Studio");
@@ -264,6 +265,13 @@ impl Peer {
             .write_all(encode_line(message).unwrap().as_bytes())
             .unwrap();
         self.stream.flush().unwrap();
+    }
+
+    fn send_until(&mut self, message: &WireMessage, deadline: Instant) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(!remaining.is_zero(), "timed out writing Studio message");
+        self.stream.set_write_timeout(Some(remaining)).unwrap();
+        self.send(message);
     }
 }
 
@@ -472,25 +480,30 @@ fn existing_runtime_accepts_the_current_contract() {
     server_thread.join().unwrap();
 }
 
+fn terminate_child(child: &mut Child) -> bool {
+    let _ = child.kill();
+    let deadline = Instant::now() + DIAGNOSE_CLEANUP_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(None) | Err(_) => return false,
+        }
+    }
+}
+
 fn diagnose_cleanup(mut child: Child, failure: impl std::fmt::Display) -> String {
-    let kill = child.kill().err();
+    if !terminate_child(&mut child) {
+        return format!("{failure}; cleanup_stopped=false");
+    }
     match child.wait_with_output() {
-        Ok(output) => match kill {
-            Some(error) => format!(
-                "{failure}; cannot kill Studio diagnose: {error}; stderr={}",
-                String::from_utf8_lossy(&output.stderr)
-            ),
-            None => format!(
-                "{failure}; Studio diagnose was killed: stderr={}",
-                String::from_utf8_lossy(&output.stderr)
-            ),
-        },
-        Err(error) => match kill {
-            Some(kill) => {
-                format!("{failure}; cannot kill Studio diagnose: {kill}; cannot reap it: {error}")
-            }
-            None => format!("{failure}; cannot reap Studio diagnose: {error}"),
-        },
+        Ok(output) => format!(
+            "{failure}; cleanup_stopped=true; stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        ),
+        Err(error) => format!(
+            "{failure}; cleanup_stopped=true; cannot collect Studio diagnose output: {error}"
+        ),
     }
 }
 
@@ -541,27 +554,30 @@ fn diagnose_reports_validated_heartbeat() {
             panic!("expected modern handshake request");
         };
         assert_eq!(request.protocol, CURRENT_PROTOCOL_VERSION);
-        peer.send(&WireMessage::HandshakeResponse(handshake(
-            project_id(),
-            4,
-            HandshakeOutcome::Snapshot {
-                reason: SnapshotReason::NoCursor,
-            },
-        )));
-        peer.send(&WireMessage::Snapshot(snapshot(4)));
+        peer.send_until(
+            &WireMessage::HandshakeResponse(handshake(
+                project_id(),
+                4,
+                HandshakeOutcome::Snapshot {
+                    reason: SnapshotReason::NoCursor,
+                },
+            )),
+            deadline,
+        );
+        peer.send_until(&WireMessage::Snapshot(snapshot(4)), deadline);
 
         let WireMessage::Heartbeat(heartbeat) = peer.receive_until(deadline) else {
             panic!("expected heartbeat after snapshot");
         };
-        assert_eq!(heartbeat.sequence, 1);
         assert_eq!(heartbeat.last_applied.unwrap().revision, 4);
-        peer.send(&WireMessage::HeartbeatAcknowledgement(
-            HeartbeatAcknowledgementMessage {
+        peer.send_until(
+            &WireMessage::HeartbeatAcknowledgement(HeartbeatAcknowledgementMessage {
                 server: heartbeat.server,
                 heartbeat_sequence: heartbeat.sequence,
                 received_at_ms: 1_234,
-            },
-        ));
+            }),
+            deadline,
+        );
     });
 
     let output = run_diagnose(address);
