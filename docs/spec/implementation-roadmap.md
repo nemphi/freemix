@@ -67,11 +67,14 @@ saved, restarted, resumed, and tested deterministically.
 
 Current Phase 1 control boundary: the daemon, protocol, and client exercise a
 versioned raw TCP session with handshake, snapshot/resume, commands, events,
-development authentication, and deterministic model tests. This is useful
-partial evidence for the control plane, but it does not implement or verify the
-RC-008 HTTP/WebSocket API contract, including HTTP resources, WebSocket event
-subscriptions, or transport-level production authentication and rate limits.
-RC-008 therefore remains planned.
+development authentication, bounded bidirectional heartbeat acknowledgement,
+and deterministic model tests. Protocol 2.10 makes the daemon acknowledge only
+a validated heartbeat with the session server identity, the exact client
+heartbeat sequence, and the server receive time. Studio accepts one expected
+sequence and uses its bounded peer wait before the existing reconnect backoff.
+This is control-plane peer liveness. It is not service readiness, production
+authentication, media health, HTTP resources, WebSocket event subscriptions,
+or transport-level production rate limits. RC-008 therefore remains planned.
 
 ## 4. Phase 2 — GPU playback switcher (10–14 weeks)
 
@@ -205,7 +208,7 @@ integer milli-dB gain (`-96000..=24000`), stereo balance
 0–48,000-sample delay. Native daemon preflight transactionally maps those
 records to `fm-audio::Gain` and `fm-audio::Balance` and constructs both Master
 mixer copies with the target gain, balance, and delay applied immediately.
-Protocol 2.9 carries authoritative input IDs and canonical names plus full-strip
+Protocol 2.10 carries authoritative input IDs and canonical names plus full-strip
 status in snapshots, and durable events carry full-strip state plus one
 permission-gated atomic live strip command. The engine schedules
 accepted gain, balance, mute, solo, follow-video, and delay changes together at a frame boundary, and
@@ -368,8 +371,9 @@ glass-to-glass latency. GPU duration excludes queue wait, presentation,
 compositor feedback, and physical scanout. There is no live telemetry protocol,
 component-dimensioned metric registry, alerting/UI, CPU/GPU utilization, disk or
 network instrumentation, cross-platform native evidence, or QR/audio-loop
-latency fixture. Item 9 therefore remains incomplete and the broader RC-015
-parity row remains planned.
+latency fixture. The raw TCP heartbeat acknowledgement is not service readiness,
+telemetry, or media health. Item 9 therefore remains incomplete and the broader
+RC-015 parity row remains planned.
 
 Current implementation boundary for item 10: headless native mode accepts a
 bounded `--diagnostic-stop-after` duration after readiness and exits through the
@@ -427,10 +431,10 @@ snapshots while any channel is moving. Every channel also owns a bounded
 bottom-left, and bottom-right position presets plus none/thin-white/thick-white
 inset-border presets. Schema 17 persists the complete desired and realized
 arrays, appearance, queue state, and exact per-input audio strips, and accepts schema
-17 only. Protocol 2.9 carries canonical input names, opacity, transition kind,
+17 only. Protocol 2.10 carries canonical input names, opacity, transition kind,
 duration, Take, Update,
 Off, output inclusion, transition/appearance configuration, Queue, Take Next,
-and atomic per-input audio-strip commands and state, and accepts protocol 2.9 only.
+and atomic per-input audio-strip commands and state, and accepts protocol 2.10 only.
 
 Control authorization treats overlay mutations as transition operations. The
 client/UI reducer validates exactly eight unique channels, active-source
@@ -472,7 +476,7 @@ Native project compilation carries that value into physical and scene-alias
 strips, and native Master/Stinger preflight applies it transactionally to both
 active and pending mixers before gain, balance, mute, solo, follow-video, and source envelopes.
 The engine owns the live desired full-strip map and emits frame-boundary
-realization updates. Protocol 2.9 snapshots pair every input ID with its
+realization updates. Protocol 2.10 snapshots pair every input ID with its
 canonical persisted name and replicate the complete strip map; its
 `SetInputAudioStrip` command atomically carries gain, balance, mute, solo,
 follow-video, and delay and is authorized by the dedicated audio-control

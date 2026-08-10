@@ -741,6 +741,13 @@ pub struct HeartbeatMessage {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HeartbeatAcknowledgementMessage {
+    pub server: ServerIdentity,
+    pub heartbeat_sequence: u64,
+    pub received_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CapabilityReportSummary {
     pub digest: String,
     pub total: u32,
@@ -768,6 +775,7 @@ pub enum WireMessage {
     DurableGap(DurableGap),
     RuntimeEvent(RuntimeEventMessage),
     Heartbeat(HeartbeatMessage),
+    HeartbeatAcknowledgement(HeartbeatAcknowledgementMessage),
     CapabilityReport(CapabilityReportMessage),
     Error(ErrorMessage),
 }

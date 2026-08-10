@@ -5,15 +5,15 @@ use fm_protocol::{
     CURRENT_PROTOCOL_VERSION, CapabilityReportMessage, CapabilityReportSummary, CodecError,
     CommandMessage, CommandPayload, CommandResult, DurableEvent, DurableEventBatch, DurableGap,
     EngineIdentity, ErrorMessage, EventCursor, EventMessage, EventPayload, FadeToBlackPosition,
-    FadeToBlackState, FieldIssue, HandshakeOutcome, HeartbeatMessage, InputAudioStripStatus,
-    InputStatus, LineDecoder, MAX_FIELD_VALUE_BYTES, MAX_FIELDS_PER_MESSAGE, MAX_LINE_BYTES,
-    MAX_LIST_ITEMS, MAX_MESSAGES_PER_PUSH, ManualTransitionKind, ManualTransitionPosition,
-    ManualTransitionState, ManualTransitionStatus, OverlayStatus, OverlayTransitionKind,
-    ResumeCursor, RuntimeDomainBoundary, RuntimeEventMessage, RuntimeFailureDisposition,
-    RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage, SnapshotReason, StingerAudioPolicy,
-    StingerMissingMediaFallback, StingerReadiness, StingerStatus, StructuredError, WireInputId,
-    WireMessage, WireOutputId, WireOverlayChannelId, WireStingerSlotId, choose_handshake_outcome,
-    decode_line, encode_line,
+    FadeToBlackState, FieldIssue, HandshakeOutcome, HeartbeatAcknowledgementMessage,
+    HeartbeatMessage, InputAudioStripStatus, InputStatus, LineDecoder, MAX_FIELD_VALUE_BYTES,
+    MAX_FIELDS_PER_MESSAGE, MAX_LINE_BYTES, MAX_LIST_ITEMS, MAX_MESSAGES_PER_PUSH,
+    ManualTransitionKind, ManualTransitionPosition, ManualTransitionState, ManualTransitionStatus,
+    OverlayStatus, OverlayTransitionKind, ProtocolVersion, ResumeCursor, RuntimeDomainBoundary,
+    RuntimeEventMessage, RuntimeFailureDisposition, RuntimeLifecycleEvent, ServerIdentity,
+    SnapshotMessage, SnapshotReason, StingerAudioPolicy, StingerMissingMediaFallback,
+    StingerReadiness, StingerStatus, StructuredError, WireInputId, WireMessage, WireOutputId,
+    WireOverlayChannelId, WireStingerSlotId, choose_handshake_outcome, decode_line, encode_line,
 };
 
 fn input(value: u128) -> WireInputId {
@@ -102,6 +102,29 @@ fn command() -> CommandMessage {
         deadline_ms: Some(500),
         payload: CommandPayload::SelectPreview { input: input(42) },
     }
+}
+
+#[test]
+fn protocol_2_10_heartbeat_acknowledgement_codec_is_exact() {
+    assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(2, 10));
+    let acknowledgement = WireMessage::HeartbeatAcknowledgement(HeartbeatAcknowledgementMessage {
+        server: server_identity(),
+        heartbeat_sequence: 88,
+        received_at_ms: 1_720_000_000_003,
+    });
+    let encoded = encode_line(&acknowledgement).unwrap();
+    assert_eq!(decode_line(&encoded).unwrap(), acknowledgement);
+    assert_eq!(
+        decode_line(&encoded.replace("\theartbeat_sequence=88", "")),
+        Err(CodecError::MissingField("heartbeat_sequence"))
+    );
+    assert!(matches!(
+        decode_line(&encoded.replace(
+            "\treceived_at_ms=1720000000003",
+            "\treceived_at_ms=1720000000003\textra=1"
+        )),
+        Err(CodecError::UnknownField(field)) if field == "extra"
+    ));
 }
 
 #[test]

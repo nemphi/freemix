@@ -27,10 +27,20 @@ into control messages.
 4. Server sends missing ordered events or a fresh snapshot.
 5. Client builds its read model and subscribes to selected telemetry.
 6. Client requests only visible preview renditions.
-7. Heartbeats carry last applied revision and clock sample.
+7. Heartbeats carry last applied revision and clock sample. After the server
+   validates a heartbeat, it returns the session server identity, the exact
+   client heartbeat sequence, and the server receive time.
 8. Reconnect resumes only when all cursor identity fields match; project
    replacement, restore, log compaction, or engine identity change forces a
    snapshot and a new cursor.
+
+The current Protocol 2.10 implementation uses bounded newline-delimited raw TCP.
+Studio keeps one expected heartbeat sequence and waits for its matching
+acknowledgement within the bounded peer wait. EOF, timeout, wrong server
+identity, or wrong sequence enters the existing reconnect backoff. The server
+does not acknowledge an invalid heartbeat. This exchange gives bidirectional
+control-plane peer liveness only. It is not service readiness, production
+authentication, media health, or the planned HTTP/WebSocket transport.
 
 Snapshots carry the bounded project-order input catalog as exact ID/name pairs.
 The canonical persisted name labels input tiles and mixer strips; clients do not

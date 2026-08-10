@@ -827,7 +827,7 @@ fn handle_heartbeat_timeout(
         let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let wait_started = Instant::now();
         let mut shutdown = false;
-        let result = runtime.send_heartbeat_cancellable(elapsed_ms, IO_POLL_INTERVAL, || {
+        let heartbeat = runtime.send_heartbeat_cancellable(elapsed_ms, IO_POLL_INTERVAL, || {
             shutdown = cancellation_requested(
                 requests,
                 &mut recovery.deferred_intents,
@@ -835,12 +835,34 @@ fn handle_heartbeat_timeout(
             );
             shutdown || wait_started.elapsed() >= PEER_WAIT_TIMEOUT
         });
+        let result = heartbeat
+            .map_err(|error| worker_error("Heartbeat failed", &error))
+            .and_then(|heartbeat| {
+                let event = runtime
+                    .receive_cancellable(IO_POLL_INTERVAL, || {
+                        shutdown = cancellation_requested(
+                            requests,
+                            &mut recovery.deferred_intents,
+                            &mut recovery.deferred_rejections,
+                        );
+                        shutdown || wait_started.elapsed() >= PEER_WAIT_TIMEOUT
+                    })
+                    .map_err(|error| worker_error("Heartbeat acknowledgement failed", &error))?;
+                match event {
+                    SessionEvent::HeartbeatAcknowledged { acknowledgement }
+                        if acknowledgement.heartbeat_sequence == heartbeat.sequence =>
+                    {
+                        Ok(())
+                    }
+                    other => Err(unexpected_failure("heartbeat acknowledgement", &other)),
+                }
+            });
         if shutdown {
             return false;
         }
         if let Err(error) = result {
-            recovery.visible_error = Some(format!("Heartbeat failed: {error}"));
-            if is_recoverable_failure(&error) {
+            recovery.visible_error = Some(error.message().to_owned());
+            if error.is_recoverable() {
                 recovery.realization_uncertain =
                     runtime.session().client().model().view().is_some();
                 recovery.reconnect_wait = ReconnectWait::from_runtime(runtime);
@@ -1104,7 +1126,9 @@ const fn is_transport_failure(error: &crate::StudioError) -> bool {
     matches!(
         error,
         crate::StudioError::Session(
-            TcpSessionError::Disconnected { .. } | TcpSessionError::Cancelled { .. }
+            TcpSessionError::Disconnected { .. }
+                | TcpSessionError::Cancelled { .. }
+                | TcpSessionError::Client(ClientError::InvalidHeartbeatAcknowledgement(_))
         )
     )
 }

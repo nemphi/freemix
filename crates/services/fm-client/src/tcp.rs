@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 
 use fm_protocol::{
     CodecError, CommandPayload, CommandResult, DurableGap, ErrorMessage, EventMessage,
-    HandshakeOutcome, LineDecoder, RuntimeEventMessage, WireMessage, encode_line,
+    HandshakeOutcome, HeartbeatAcknowledgementMessage, LineDecoder, RuntimeEventMessage,
+    WireMessage, encode_line,
 };
 
 use crate::{Client, ClientError, Intake, Outbound, ReconnectBackoff, SyncMode};
@@ -345,6 +346,9 @@ pub enum SessionEvent {
     CommandResult {
         result: CommandResult,
         intake: Intake,
+    },
+    HeartbeatAcknowledged {
+        acknowledgement: HeartbeatAcknowledgementMessage,
     },
     DurableGap {
         gap: DurableGap,
@@ -742,6 +746,15 @@ impl TcpSession {
                 let id = result_id(&result);
                 self.sent_commands.retain(|sent| sent != id);
                 Ok(SessionEvent::CommandResult { result, intake })
+            }
+            WireMessage::HeartbeatAcknowledgement(acknowledgement) => {
+                if let Err(error) = self.client.intake(WireMessage::HeartbeatAcknowledgement(
+                    acknowledgement.clone(),
+                )) {
+                    self.transition_disconnect();
+                    return Err(TcpSessionError::Client(error));
+                }
+                Ok(SessionEvent::HeartbeatAcknowledged { acknowledgement })
             }
             WireMessage::DurableGap(gap) => {
                 let result = self.client.intake(WireMessage::DurableGap(gap.clone()));

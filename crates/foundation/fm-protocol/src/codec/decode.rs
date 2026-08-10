@@ -5,12 +5,13 @@ use crate::{
     CapabilityReportMessage, CapabilityReportSummary, CodecError, CommandMessage, CommandPayload,
     CommandResult, DurableEventBatch, DurableGap, EngineIdentity, ErrorMessage, EventCursor,
     EventMessage, EventPayload, FadeToBlackPosition, FadeToBlackState, HandshakeOutcome,
-    HandshakeRequest, HandshakeResponse, HeartbeatMessage, InputAudioStripStatus,
-    ManualTransitionKind, ManualTransitionPosition, ManualTransitionState, ManualTransitionStatus,
-    OverlayStatus, ResumeCursor, RuntimeEventMessage, RuntimeFailureDisposition,
-    RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage, SnapshotReason, StingerAudioPolicy,
-    StingerMissingMediaFallback, StingerReadiness, StingerStatus, StructuredError, WireInputId,
-    WireMessage, WireOutputId, WireOverlayChannelId, WireStingerSlotId,
+    HandshakeRequest, HandshakeResponse, HeartbeatAcknowledgementMessage, HeartbeatMessage,
+    InputAudioStripStatus, ManualTransitionKind, ManualTransitionPosition, ManualTransitionState,
+    ManualTransitionStatus, OverlayStatus, ResumeCursor, RuntimeEventMessage,
+    RuntimeFailureDisposition, RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage,
+    SnapshotReason, StingerAudioPolicy, StingerMissingMediaFallback, StingerReadiness,
+    StingerStatus, StructuredError, WireInputId, WireMessage, WireOutputId, WireOverlayChannelId,
+    WireStingerSlotId,
 };
 
 use super::value::{
@@ -61,6 +62,9 @@ pub fn decode_line(line: &str) -> Result<WireMessage, CodecError> {
         "durable_gap" => WireMessage::DurableGap(decode_durable_gap(&mut fields)?),
         "runtime_event" => WireMessage::RuntimeEvent(decode_runtime_event(&mut fields)?),
         "heartbeat" => WireMessage::Heartbeat(decode_heartbeat(&mut fields)?),
+        "heartbeat_acknowledgement" => {
+            WireMessage::HeartbeatAcknowledgement(decode_heartbeat_acknowledgement(&mut fields)?)
+        }
         "capability_report" => {
             WireMessage::CapabilityReport(decode_capability_report(&mut fields)?)
         }
@@ -1201,6 +1205,16 @@ fn decode_heartbeat(fields: &mut Fields) -> Result<HeartbeatMessage, CodecError>
         sequence,
         sent_at_ms,
         last_applied,
+    })
+}
+
+fn decode_heartbeat_acknowledgement(
+    fields: &mut Fields,
+) -> Result<HeartbeatAcknowledgementMessage, CodecError> {
+    Ok(HeartbeatAcknowledgementMessage {
+        server: decode_server_identity(fields)?,
+        heartbeat_sequence: fields.parse_required("heartbeat_sequence")?,
+        received_at_ms: fields.parse_required("received_at_ms")?,
     })
 }
 

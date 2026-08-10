@@ -56,9 +56,9 @@ use fm_persistence::{
 use fm_protocol::{
     CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, CommandMessage, CommandPayload,
     CommandResult, ErrorMessage, EventCursor, HandshakeOutcome as ProtocolHandshakeOutcome,
-    HandshakeRequest, HandshakeResponse, HeartbeatMessage, LineDecoder, ProtocolVersion,
-    ResumeCursor, RuntimeEventMessage, ServerHello, ServerIdentity, StructuredError, WireMessage,
-    choose_handshake_outcome, encode_line,
+    HandshakeRequest, HandshakeResponse, HeartbeatAcknowledgementMessage, HeartbeatMessage,
+    LineDecoder, ProtocolVersion, ResumeCursor, RuntimeEventMessage, ServerHello, ServerIdentity,
+    StructuredError, WireMessage, choose_handshake_outcome, encode_line,
 };
 use fm_server::{
     AuthenticationMode, ControlPlane, HandshakeError, Heartbeat, InitialSync, Server, ServerConfig,
@@ -3771,10 +3771,17 @@ fn handle_client(
                 process_shutdown,
             )?,
             WireMessage::Heartbeat(heartbeat) => {
-                if let Err(message) =
-                    record_heartbeat(&mut session, control, &session_identity, &heartbeat)
-                {
-                    write_error(&mut writer, "invalid_heartbeat", &message)?;
+                match record_heartbeat(&mut session, control, &session_identity, &heartbeat) {
+                    Ok(received_at_ms) => write_session_message(
+                        &mut writer,
+                        &mut session,
+                        &WireMessage::HeartbeatAcknowledgement(HeartbeatAcknowledgementMessage {
+                            server: session_identity.clone(),
+                            heartbeat_sequence: heartbeat.sequence,
+                            received_at_ms,
+                        }),
+                    )?,
+                    Err(message) => write_error(&mut writer, "invalid_heartbeat", &message)?,
                 }
             }
             _ => write_error(
@@ -3951,12 +3958,13 @@ fn record_heartbeat(
     control: &SharedControl,
     server: &ServerIdentity,
     heartbeat: &HeartbeatMessage,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     if heartbeat.server != *server {
         return Err("heartbeat server identity does not match the session".into());
     }
+    let received_at_ms = now_millis().map_err(|error| error.to_string())?;
     let Some(cursor) = &heartbeat.last_applied else {
-        return Ok(());
+        return Ok(received_at_ms);
     };
     if cursor.server != *server {
         return Err("heartbeat cursor identity does not match the session".into());
@@ -3970,9 +3978,10 @@ fn record_heartbeat(
                 last_applied: event_cursor(cursor),
                 clock_sample_ms: heartbeat.sent_at_ms,
             },
-            now_millis().map_err(|error| error.to_string())?,
+            received_at_ms,
         )
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    Ok(received_at_ms)
 }
 
 #[allow(clippy::too_many_arguments)]

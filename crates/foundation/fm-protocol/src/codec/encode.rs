@@ -4,8 +4,8 @@ use crate::{
     CapabilityReportMessage, CapabilityReportSummary, CommandMessage, CommandPayload,
     CommandResult, DurableEventBatch, DurableGap, EngineIdentity, ErrorMessage, EventCursor,
     EventMessage, EventPayload, FadeToBlackState, HandshakeOutcome, HandshakeRequest,
-    HandshakeResponse, HeartbeatMessage, InputAudioStripStatus, ManualTransitionKind,
-    ManualTransitionStatus, OverlayStatus, ResumeCursor, RuntimeEventMessage,
+    HandshakeResponse, HeartbeatAcknowledgementMessage, HeartbeatMessage, InputAudioStripStatus,
+    ManualTransitionKind, ManualTransitionStatus, OverlayStatus, ResumeCursor, RuntimeEventMessage,
     RuntimeFailureDisposition, RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage,
     SnapshotReason, StingerAudioPolicy, StingerMissingMediaFallback, StingerReadiness,
     StingerStatus, StructuredError, WireMessage,
@@ -37,6 +37,9 @@ pub fn encode_line(message: &WireMessage) -> Result<String, CodecError> {
         WireMessage::DurableGap(message) => encode_durable_gap(&mut record, message)?,
         WireMessage::RuntimeEvent(message) => encode_runtime_event(&mut record, message)?,
         WireMessage::Heartbeat(message) => encode_heartbeat(&mut record, message)?,
+        WireMessage::HeartbeatAcknowledgement(message) => {
+            encode_heartbeat_acknowledgement(&mut record, message)?;
+        }
         WireMessage::CapabilityReport(message) => encode_capability_report(&mut record, message)?,
         WireMessage::Error(message) => encode_error_message(&mut record, message)?,
     }
@@ -912,6 +915,16 @@ fn encode_heartbeat(record: &mut Record, message: &HeartbeatMessage) -> Result<(
         encode_resume_cursor(record, cursor, "applied")?;
     }
     Ok(())
+}
+
+fn encode_heartbeat_acknowledgement(
+    record: &mut Record,
+    message: &HeartbeatAcknowledgementMessage,
+) -> Result<(), CodecError> {
+    record.kind("heartbeat_acknowledgement");
+    encode_server_identity(record, &message.server)?;
+    record.field("heartbeat_sequence", message.heartbeat_sequence)?;
+    record.field("received_at_ms", message.received_at_ms)
 }
 
 fn encode_capability_report(

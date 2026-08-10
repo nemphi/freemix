@@ -22,9 +22,9 @@ use fm_persistence::{
 };
 use fm_protocol::{
     CURRENT_PROTOCOL_VERSION, ClientType, CommandMessage, CommandPayload, CommandResult,
-    EngineIdentity, EventCursor, HandshakeOutcome, HandshakeRequest, ManualTransitionKind,
-    ManualTransitionPosition, ManualTransitionStatus, ProtocolVersion, ResumeCursor, Role,
-    RuntimeLifecycleEvent, ServerIdentity, SnapshotReason, StingerAudioPolicy,
+    EngineIdentity, EventCursor, HandshakeOutcome, HandshakeRequest, HeartbeatMessage,
+    ManualTransitionKind, ManualTransitionPosition, ManualTransitionStatus, ProtocolVersion,
+    ResumeCursor, Role, RuntimeLifecycleEvent, ServerIdentity, SnapshotReason, StingerAudioPolicy,
     StingerMissingMediaFallback, WireInputId, WireMessage, WireStingerSlotId, decode_line,
     encode_line,
 };
@@ -273,6 +273,60 @@ fn assert_fade_runtime_round_trip(protocol_client: &mut ProtocolClient, transpor
 }
 
 #[test]
+fn daemon_acknowledges_only_valid_heartbeats() {
+    let directory = TestDirectory::new("heartbeat-acknowledgement");
+    let project_path = directory.project_path();
+    create_project(&project_path);
+
+    let daemon = Daemon::start(&project_path);
+    let mut client = daemon.connect();
+    let handshake = client.handshake(None);
+    assert_eq!(handshake.protocol, CURRENT_PROTOCOL_VERSION);
+    assert!(matches!(client.receive(), WireMessage::Snapshot(_)));
+    let server = ServerIdentity {
+        engine_id: handshake.engine.engine_id,
+        project_id: PROJECT_ID.to_string(),
+        state_epoch: handshake.engine.state_epoch,
+        log_id: handshake.engine.log_id,
+    };
+    let heartbeat = |sequence| HeartbeatMessage {
+        server: server.clone(),
+        sequence,
+        sent_at_ms: 1_234,
+        last_applied: Some(ResumeCursor {
+            server: server.clone(),
+            revision: handshake.current_revision,
+        }),
+    };
+
+    client.send(&WireMessage::Heartbeat(heartbeat(1)));
+    let WireMessage::HeartbeatAcknowledgement(acknowledgement) = client.receive() else {
+        panic!("expected heartbeat acknowledgement");
+    };
+    assert_eq!(acknowledgement.server, server);
+    assert_eq!(acknowledgement.heartbeat_sequence, 1);
+    assert!(acknowledgement.received_at_ms > 0);
+
+    let mut invalid = heartbeat(2);
+    invalid.server.engine_id = "wrong-engine".to_owned();
+    invalid.last_applied.as_mut().unwrap().server.engine_id = "wrong-engine".to_owned();
+    client.send(&WireMessage::Heartbeat(invalid));
+    let WireMessage::Error(error) = client.receive() else {
+        panic!("expected invalid heartbeat error");
+    };
+    assert_eq!(error.error.code, "invalid_heartbeat");
+
+    client.send(&WireMessage::Heartbeat(heartbeat(3)));
+    let WireMessage::HeartbeatAcknowledgement(acknowledgement) = client.receive() else {
+        panic!("invalid heartbeat produced an acknowledgement");
+    };
+    assert_eq!(acknowledgement.heartbeat_sequence, 3);
+
+    drop(client);
+    daemon.wait_success();
+}
+
+#[test]
 fn current_client_handshake_heartbeat_and_resume_use_ordered_wire_records() {
     let directory = TestDirectory::new("current-client");
     let project_path = directory.project_path();
@@ -326,6 +380,15 @@ fn current_client_handshake_heartbeat_and_resume_use_ordered_wire_records() {
         Some(Outbound::Heartbeat(heartbeat.clone()))
     );
     transport.send(&WireMessage::Heartbeat(heartbeat));
+    let acknowledgement = transport.receive();
+    assert!(matches!(
+        acknowledgement,
+        WireMessage::HeartbeatAcknowledgement(_)
+    ));
+    assert_eq!(
+        protocol_client.intake(acknowledgement).unwrap(),
+        Intake::HeartbeatAcknowledged
+    );
     assert_fade_runtime_round_trip(&mut protocol_client, &mut transport);
 
     drop(transport);

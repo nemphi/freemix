@@ -15,9 +15,9 @@ use fm_command::{CommandId, Revision};
 use fm_protocol::{
     CURRENT_PROTOCOL_VERSION, ClientType, CommandMessage, CommandPayload, CommandResult,
     DurableGap, EngineIdentity, EventMessage, HandshakeOutcome, HandshakeRequest,
-    HandshakeResponse, HeartbeatMessage, ProtocolVersion, ResumeCursor, Role, RuntimeEventMessage,
-    RuntimeLifecycleEvent, ServerHello, ServerIdentity, SnapshotMessage, StructuredError,
-    WireMessage,
+    HandshakeResponse, HeartbeatAcknowledgementMessage, HeartbeatMessage, ProtocolVersion,
+    ResumeCursor, Role, RuntimeEventMessage, RuntimeLifecycleEvent, ServerHello, ServerIdentity,
+    SnapshotMessage, StructuredError, WireMessage,
 };
 use fm_types::ProjectId;
 use fm_ui_model::{
@@ -159,6 +159,7 @@ pub enum Intake {
     RuntimeEventObserved,
     ResultReconciled,
     DuplicateResult,
+    HeartbeatAcknowledged,
     ResyncRequested,
 }
 
@@ -202,6 +203,8 @@ pub enum ClientError {
     DuplicateIdempotencyKey(String),
     CommandIdExhausted,
     HeartbeatSequenceExhausted,
+    HeartbeatAcknowledgementPending,
+    InvalidHeartbeatAcknowledgement(&'static str),
     UnknownCommand(String),
     CommandAlreadyCompleted(String),
     CommandTerminalUncertain(String),
@@ -276,6 +279,10 @@ impl fmt::Display for ClientError {
             Self::HeartbeatSequenceExhausted => {
                 formatter.write_str("heartbeat sequence space exhausted")
             }
+            Self::HeartbeatAcknowledgementPending => {
+                formatter.write_str("a heartbeat acknowledgement is already pending")
+            }
+            Self::InvalidHeartbeatAcknowledgement(message) => formatter.write_str(message),
             Self::UnknownCommand(id) => write!(formatter, "unknown command result ID {id:?}"),
             Self::CommandAlreadyCompleted(id) => {
                 write!(formatter, "command {id:?} is already complete")
@@ -319,6 +326,7 @@ pub struct Client {
     completed_command_ids: VecDeque<String>,
     next_command_id: u64,
     next_heartbeat_sequence: u64,
+    expected_heartbeat_sequence: Option<u64>,
     reconnect_attempt: u32,
     force_snapshot: bool,
     runtime_server: Option<ServerIdentity>,
@@ -364,6 +372,7 @@ impl Client {
             completed_command_ids: VecDeque::new(),
             next_command_id: 1,
             next_heartbeat_sequence: 1,
+            expected_heartbeat_sequence: None,
             reconnect_attempt: 0,
             force_snapshot: false,
             runtime_server: None,
@@ -467,6 +476,7 @@ impl Client {
     #[must_use]
     pub fn transport_disconnected(&mut self) -> ReconnectBackoff {
         self.session = None;
+        self.expected_heartbeat_sequence = None;
         self.reset_runtime_sequences();
         self.outbound
             .retain(|item| matches!(item, Outbound::Command(_)));
@@ -511,6 +521,10 @@ impl Client {
             WireMessage::RuntimeEvent(event) => {
                 self.apply_runtime_event(event)?;
                 Ok(Intake::RuntimeEventObserved)
+            }
+            WireMessage::HeartbeatAcknowledgement(acknowledgement) => {
+                self.accept_heartbeat_acknowledgement(&acknowledgement)?;
+                Ok(Intake::HeartbeatAcknowledged)
             }
             WireMessage::CommandResult(result) => self.reconcile_result(result),
             WireMessage::DurableGap(gap) => {
@@ -925,6 +939,9 @@ impl Client {
         ) {
             return Err(self.invalid_state("queue a heartbeat"));
         }
+        if self.expected_heartbeat_sequence.is_some() {
+            return Err(ClientError::HeartbeatAcknowledgementPending);
+        }
         self.ensure_queue_space()?;
         let next = self
             .next_heartbeat_sequence
@@ -942,9 +959,40 @@ impl Client {
             last_applied: self.last_applied_cursor(),
         };
         self.next_heartbeat_sequence = next;
+        self.expected_heartbeat_sequence = Some(heartbeat.sequence);
         self.outbound
             .push_back(Outbound::Heartbeat(heartbeat.clone()));
         Ok(heartbeat)
+    }
+
+    /// Validates the server identity and sequence of one heartbeat acknowledgement.
+    ///
+    /// # Errors
+    ///
+    /// Rejects acknowledgements outside an established session, from another server,
+    /// or for an unexpected heartbeat sequence.
+    pub fn accept_heartbeat_acknowledgement(
+        &mut self,
+        acknowledgement: &HeartbeatAcknowledgementMessage,
+    ) -> Result<(), ClientError> {
+        if !matches!(
+            self.state,
+            ConnectionState::Synchronizing { .. } | ConnectionState::Ready
+        ) {
+            return Err(self.invalid_state("accept a heartbeat acknowledgement"));
+        }
+        if self.session.as_ref().map(|session| &session.server) != Some(&acknowledgement.server) {
+            return Err(ClientError::InvalidHeartbeatAcknowledgement(
+                "heartbeat acknowledgement server identity does not match the session",
+            ));
+        }
+        if self.expected_heartbeat_sequence != Some(acknowledgement.heartbeat_sequence) {
+            return Err(ClientError::InvalidHeartbeatAcknowledgement(
+                "heartbeat acknowledgement sequence does not match the pending heartbeat",
+            ));
+        }
+        self.expected_heartbeat_sequence = None;
+        Ok(())
     }
 
     /// Removes the oldest item and marks dequeued commands as sent.

@@ -18,9 +18,10 @@ use fm_client::{ClientError, CommandStatus, Intake, SessionEvent, SyncMode, TcpS
 use fm_protocol::{
     CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, CommandPayload, CommandResult,
     EngineIdentity, EventCursor, EventMessage, EventPayload, FadeToBlackPosition, FadeToBlackState,
-    HandshakeOutcome, HandshakeResponse, LineDecoder, ManualTransitionStatus, OverlayStatus,
-    ProtocolVersion, Role, RuntimeEventMessage, RuntimeLifecycleEvent, ServerIdentity,
-    SnapshotMessage, SnapshotReason, WireInputId, WireMessage, encode_line,
+    HandshakeOutcome, HandshakeResponse, HeartbeatAcknowledgementMessage, LineDecoder,
+    ManualTransitionStatus, OverlayStatus, ProtocolVersion, Role, RuntimeEventMessage,
+    RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage, SnapshotReason, WireInputId,
+    WireMessage, encode_line,
 };
 use fm_types::ProjectId;
 use freemix_studio::{
@@ -249,7 +250,14 @@ fn serve_snapshot_then_resume(listener: &TcpListener) {
         panic!("expected heartbeat");
     };
     assert_eq!(heartbeat.sent_at_ms, 1234);
-    assert_eq!(heartbeat.last_applied.unwrap().revision, 4);
+    assert_eq!(heartbeat.last_applied.as_ref().unwrap().revision, 4);
+    first.send(&WireMessage::HeartbeatAcknowledgement(
+        HeartbeatAcknowledgementMessage {
+            server: heartbeat.server,
+            heartbeat_sequence: heartbeat.sequence,
+            received_at_ms: 1_235,
+        },
+    ));
     let WireMessage::Command(command) = first.receive() else {
         panic!("expected command");
     };
@@ -297,6 +305,10 @@ fn existing_runtime_handles_status_runtime_heartbeat_eof_and_resume() {
     );
 
     runtime.send_heartbeat(1234).unwrap();
+    assert!(matches!(
+        runtime.receive().unwrap(),
+        SessionEvent::HeartbeatAcknowledged { .. }
+    ));
     let command = runtime
         .queue_command(CommandPayload::Cut, "cut-once", Some(4), None)
         .unwrap();
@@ -355,6 +367,83 @@ fn existing_runtime_handles_status_runtime_heartbeat_eof_and_resume() {
             .revision,
         6
     );
+    server_thread.join().unwrap();
+}
+
+fn serve_heartbeat_acknowledgement(listener: TcpListener, sequence_offset: Option<u64>) {
+    let mut peer = Peer::accept(&listener);
+    assert!(matches!(peer.receive(), WireMessage::HandshakeRequest(_)));
+    peer.send(&WireMessage::HandshakeResponse(handshake(
+        project_id(),
+        4,
+        HandshakeOutcome::Snapshot {
+            reason: SnapshotReason::NoCursor,
+        },
+    )));
+    peer.send(&WireMessage::Snapshot(snapshot(4)));
+    let WireMessage::Heartbeat(heartbeat) = peer.receive() else {
+        panic!("expected heartbeat");
+    };
+    if let Some(offset) = sequence_offset {
+        peer.send(&WireMessage::HeartbeatAcknowledgement(
+            HeartbeatAcknowledgementMessage {
+                server: heartbeat.server,
+                heartbeat_sequence: heartbeat.sequence + offset,
+                received_at_ms: 1_235,
+            },
+        ));
+    } else {
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn studio_heartbeat_acknowledgement_controls_reconnect_backoff() {
+    let (address, server_thread) =
+        spawn_server(|listener| serve_heartbeat_acknowledgement(listener, Some(0)));
+    let mut runtime = StudioRuntime::new(existing_config(address, project_id())).unwrap();
+    runtime.connect(CONNECT_TIMEOUT).unwrap();
+    runtime.send_heartbeat(1_234).unwrap();
+    assert!(matches!(
+        runtime.receive().unwrap(),
+        SessionEvent::HeartbeatAcknowledged { .. }
+    ));
+    assert_eq!(runtime.lifecycle().unwrap(), LifecycleState::Ready);
+    server_thread.join().unwrap();
+
+    let (address, server_thread) =
+        spawn_server(|listener| serve_heartbeat_acknowledgement(listener, None));
+    let mut runtime = StudioRuntime::new(existing_config(address, project_id())).unwrap();
+    runtime.connect(CONNECT_TIMEOUT).unwrap();
+    runtime.send_heartbeat(1_234).unwrap();
+    let started = std::time::Instant::now();
+    assert!(matches!(
+        runtime.receive_cancellable(Duration::from_millis(5), || {
+            started.elapsed() >= Duration::from_millis(50)
+        }),
+        Err(StudioError::Session(TcpSessionError::Cancelled { .. }))
+    ));
+    assert!(matches!(
+        runtime.lifecycle().unwrap(),
+        LifecycleState::Backoff(_)
+    ));
+    server_thread.join().unwrap();
+
+    let (address, server_thread) =
+        spawn_server(|listener| serve_heartbeat_acknowledgement(listener, Some(1)));
+    let mut runtime = StudioRuntime::new(existing_config(address, project_id())).unwrap();
+    runtime.connect(CONNECT_TIMEOUT).unwrap();
+    runtime.send_heartbeat(1_234).unwrap();
+    assert!(matches!(
+        runtime.receive(),
+        Err(StudioError::Session(TcpSessionError::Client(
+            ClientError::InvalidHeartbeatAcknowledgement(_)
+        )))
+    ));
+    assert!(matches!(
+        runtime.lifecycle().unwrap(),
+        LifecycleState::Backoff(_)
+    ));
     server_thread.join().unwrap();
 }
 
