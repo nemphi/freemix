@@ -74,7 +74,9 @@ heartbeat sequence, and the server receive time. Studio accepts one expected
 sequence and uses its bounded peer wait before the existing reconnect backoff.
 This is control-plane peer liveness. It is not service readiness, production
 authentication, media health, HTTP resources, WebSocket event subscriptions,
-or transport-level production rate limits. RC-008 therefore remains planned.
+or transport-level production rate limits. Expired raw TCP sessions are
+reclaimed; this does not add concurrent sessions, HTTP/WebSocket transport,
+production authentication, or RC-008 completion.
 
 ## 4. Phase 2 — GPU playback switcher (10–14 weeks)
 

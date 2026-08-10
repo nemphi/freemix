@@ -61,8 +61,8 @@ use fm_protocol::{
     StructuredError, WireMessage, choose_handshake_outcome, encode_line,
 };
 use fm_server::{
-    AuthenticationMode, ControlPlane, HandshakeError, Heartbeat, InitialSync, Server, ServerConfig,
-    ServerMode, Session, SessionError, SyncPayload,
+    AuthenticationMode, ControlPlane, DisconnectReason, HandshakeError, Heartbeat, InitialSync,
+    Server, ServerConfig, ServerMode, Session, SessionError, SyncPayload,
 };
 use fm_switcher::{
     MissingMediaFallback, OverlayBorderPreset, OverlayChannelId, OverlayChannelState,
@@ -138,6 +138,7 @@ type AppResult<T> = Result<T, Box<dyn Error>>;
 type SharedControl = Rc<RefCell<ControlService<Policy>>>;
 
 const NATIVE_IO_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const CLIENT_READ_POLL_INTERVAL: Duration = NATIVE_IO_POLL_INTERVAL;
 #[cfg(all(feature = "native-media", target_os = "macos"))]
 const CAMERA_INITIAL_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(all(feature = "native-media", target_os = "macos"))]
@@ -3686,8 +3687,8 @@ fn handle_client(
     process_shutdown: Option<&ProcessShutdown>,
 ) -> AppResult<()> {
     stream.set_nodelay(true)?;
+    stream.set_read_timeout(Some(CLIENT_READ_POLL_INTERVAL))?;
     if native.is_some() {
-        stream.set_read_timeout(Some(NATIVE_IO_POLL_INTERVAL))?;
         stream.set_write_timeout(Some(NATIVE_CLIENT_WRITE_TIMEOUT))?;
     }
     let mut writer = stream.try_clone()?;
@@ -3699,6 +3700,7 @@ fn handle_client(
         authority,
         &mut native,
         process_shutdown,
+        || Ok(true),
     )?
     else {
         return Ok(());
@@ -3756,6 +3758,7 @@ fn handle_client(
         authority,
         &mut native,
         process_shutdown,
+        || session_heartbeat_active(&mut session),
     )? {
         match message {
             WireMessage::Command(command) => process_command(
@@ -3800,20 +3803,32 @@ fn read_client_message(
     server: &ServerIdentity,
     native: &mut Option<&mut NativeDaemon>,
     process_shutdown: Option<&ProcessShutdown>,
+    mut idle: impl FnMut() -> AppResult<bool>,
 ) -> AppResult<Option<WireMessage>> {
-    if requested_daemon_shutdown(native.as_deref(), process_shutdown).is_some() {
+    if requested_daemon_shutdown(native.as_deref(), process_shutdown).is_some() || !idle()? {
         return Ok(None);
     }
-    if let Some(native) = native.as_deref_mut() {
-        reader.read_message_with_idle(|| {
-            if requested_daemon_shutdown(Some(&*native), process_shutdown).is_some() {
-                return Ok(false);
-            }
+    let message = reader.read_message_with_idle(|| {
+        if requested_daemon_shutdown(native.as_deref(), process_shutdown).is_some() || !idle()? {
+            return Ok(false);
+        }
+        if let Some(native) = native.as_deref_mut() {
             native.tick_if_due(&mut control.borrow_mut(), server)?;
-            Ok(true)
-        })
+        }
+        Ok(true)
+    })?;
+    if message.is_some() && !idle()? {
+        Ok(None)
     } else {
-        reader.read_message()
+        Ok(message)
+    }
+}
+
+fn session_heartbeat_active(session: &mut Session) -> AppResult<bool> {
+    match session.check_heartbeat(now_millis()?) {
+        Ok(()) => Ok(true),
+        Err(SessionError::Disconnected(DisconnectReason::HeartbeatTimeout)) => Ok(false),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -4891,10 +4906,6 @@ impl MessageReader {
         }
     }
 
-    fn read_message(&mut self) -> AppResult<Option<WireMessage>> {
-        self.read_message_with_idle(|| Ok(true))
-    }
-
     fn read_message_with_idle(
         &mut self,
         mut idle: impl FnMut() -> AppResult<bool>,
@@ -4909,7 +4920,9 @@ impl MessageReader {
                 Err(error)
                     if matches!(
                         error.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        std::io::ErrorKind::Interrupted
+                            | std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
                     ) =>
                 {
                     if !idle()? {
@@ -5025,6 +5038,7 @@ mod tests {
     };
     #[cfg(feature = "native-media")]
     use fm_model::{Rgba8 as ModelRgba8, Scene};
+    use fm_protocol::{ClientType, Role};
     #[cfg(feature = "native-media")]
     use fm_types::SceneId;
     use fm_types::{
@@ -6143,6 +6157,86 @@ mod tests {
             let error = client_write_error(std::io::Error::from(kind));
             assert!(is_client_disconnect(error.as_ref()));
         }
+    }
+
+    #[test]
+    fn expired_tcp_session_is_reclaimed_for_next_client() {
+        fn complete_handshake(stream: &TcpStream) {
+            write_message(
+                &mut stream.try_clone().unwrap(),
+                &WireMessage::HandshakeRequest(HandshakeRequest {
+                    protocol: PROTOCOL_VERSION,
+                    build: "heartbeat-timeout-test".into(),
+                    client_type: ClientType::Integration,
+                    desired_role: Role::Operator,
+                    resume_cursor: None,
+                }),
+            )
+            .unwrap();
+            let mut reader = MessageReader::new(stream.try_clone().unwrap());
+            assert!(matches!(
+                reader.read_message_with_idle(|| Ok(false)).unwrap(),
+                Some(WireMessage::HandshakeResponse(_))
+            ));
+            assert!(matches!(
+                reader.read_message_with_idle(|| Ok(false)).unwrap(),
+                Some(WireMessage::Snapshot(_))
+            ));
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let project_path = directory.path().join("show.freemix");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_thread = thread::spawn(move || {
+            let store = ProjectStore::new(project_path).unwrap();
+            let mut durable = test_project();
+            let project_id = durable.project().id();
+            let control = Rc::new(RefCell::new(test_control(&durable)));
+            let authority = control_server_identity(&control.borrow(), project_id);
+            let config = ServerConfig::new(
+                ServerMode::Development,
+                AuthenticationMode::Development,
+                address.ip(),
+                CAPABILITIES_DIGEST,
+            )
+            .with_session_limits(fm_server::SessionLimits {
+                heartbeat_timeout_ms: 50,
+                ..fm_server::SessionLimits::default()
+            });
+            let mut server = Server::new(config, ControlHandle(Rc::clone(&control))).unwrap();
+            server.mark_ready().unwrap();
+            let principal = development_principal().unwrap();
+
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().unwrap();
+                handle_client(
+                    stream,
+                    &server,
+                    &control,
+                    &store,
+                    &mut durable,
+                    &principal,
+                    &authority,
+                    None,
+                    None,
+                )
+                .unwrap();
+            }
+        });
+
+        let mut clients = Vec::new();
+        for _ in 0..2 {
+            let client = TcpStream::connect(address).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            complete_handshake(&client);
+            clients.push(client);
+        }
+        drop(clients.pop());
+
+        server_thread.join().unwrap();
     }
 
     #[cfg(feature = "native-media")]
