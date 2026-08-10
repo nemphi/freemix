@@ -4412,13 +4412,19 @@ fn command_ticks(
         | CommandPayload::AlphaFade { duration_frames }
         | CommandPayload::Slide { duration_frames }
         | CommandPayload::Zoom { duration_frames }
-        | CommandPayload::Stinger {
-            duration_frames, ..
-        }
         | CommandPayload::Wipe { duration_frames }
         | CommandPayload::FadeToBlack {
             duration_frames, ..
         } => duration_frames,
+        CommandPayload::Stinger {
+            duration_frames, ..
+        } => {
+            if prepared.project(1).is_ok() {
+                1
+            } else {
+                duration_frames
+            }
+        }
         CommandPayload::TakeOverlay { channel, .. }
         | CommandPayload::OverlayOff { channel }
         | CommandPayload::TakeNextOverlay { channel } => {
@@ -7657,6 +7663,62 @@ mod tests {
             assert_eq!(
                 state.stinger(preloaded_slot).preload_state(),
                 fm_switcher::StingerPreloadState::Ready
+            );
+        }
+    }
+
+    #[test]
+    fn missing_cut_stinger_uses_one_checkpoint_frame() {
+        let baseline = test_project();
+        let mut project = baseline.project().clone();
+        project.add_stinger(StingerConfig::new(
+            StingerSlotNumber::new(1).unwrap(),
+            test_input_id(2),
+            false,
+            1,
+            ModelStingerAudioPolicy::Muted,
+            StingerMissingMediaFallback::Cut,
+        ));
+        let mut durable = StoredProject::from_project(
+            project,
+            baseline.runtime_routing(),
+            baseline.position(),
+            baseline.idempotency_receipts().to_vec(),
+        )
+        .unwrap();
+        let mut control = test_control(&durable);
+        let server = test_server(&control);
+
+        let execution = execute_durable_command(
+            &mut control,
+            &CountingSaver::default(),
+            &mut durable,
+            &operator(),
+            &server,
+            &test_command(
+                "missing-cut-stinger",
+                "missing-cut-stinger-key",
+                CommandPayload::Stinger {
+                    slot: fm_protocol::WireStingerSlotId::new(1).unwrap(),
+                    duration_frames: 7,
+                },
+            ),
+            0,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            execution.submission.output.result,
+            CommandResult::Accepted { .. }
+        ));
+        assert_eq!(durable.position().frames_rendered, 1);
+        assert_eq!(durable.position().runtime_generation, 1);
+        let restored = restore_engine(&durable).unwrap().snapshot().unwrap();
+        assert_eq!(live_engine_snapshot(&mut control), restored);
+        for state in [restored.show().desired_switcher(), restored.realized_switcher()] {
+            assert_eq!(
+                (state.program(), state.preview()),
+                (test_input_id(2), test_input_id(1))
             );
         }
     }
