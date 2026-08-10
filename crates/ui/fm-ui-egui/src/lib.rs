@@ -4,7 +4,8 @@
 //! and returns intents. It performs no command dispatch, persistence, or I/O.
 
 use egui::{
-    Button, Color32, DragValue, Frame, Grid, Label, Margin, RichText, ScrollArea, Stroke, Ui, Vec2,
+    Button, Color32, DragValue, Event, Frame, Grid, Key, Label, Margin, Modifiers, RichText,
+    ScrollArea, Stroke, Ui, Vec2,
 };
 use fm_protocol::{
     ManualTransitionKind, ManualTransitionPosition, OverlayBorderPreset, OverlayPositionPreset,
@@ -398,6 +399,62 @@ const fn preview_selection_available(gate: TransitionGate, can_select_preview: b
         && !gate.manual_transition_in_flight
 }
 
+const fn numbered_preview_index(key: Key) -> Option<usize> {
+    match key {
+        Key::Num1 => Some(0),
+        Key::Num2 => Some(1),
+        Key::Num3 => Some(2),
+        Key::Num4 => Some(3),
+        Key::Num5 => Some(4),
+        Key::Num6 => Some(5),
+        Key::Num7 => Some(6),
+        Key::Num8 => Some(7),
+        _ => None,
+    }
+}
+
+fn numbered_preview_intent(
+    gate: TransitionGate,
+    can_select_preview: bool,
+    inputs: &[InputId],
+    index: usize,
+) -> Option<StudioIntent> {
+    if !preview_selection_available(gate, can_select_preview) {
+        return None;
+    }
+    inputs.get(index).copied().map(StudioIntent::SelectPreview)
+}
+
+fn numbered_preview_shortcut(ui: &mut Ui, state: &StudioUiState) -> Option<StudioIntent> {
+    if ui.ctx().egui_wants_keyboard_input() {
+        return None;
+    }
+    let view = state.view.as_ref()?;
+    let gate = TransitionGate::from_state(state);
+    if !preview_selection_available(gate, state.can_select_preview) {
+        return None;
+    }
+    let index = ui.input_mut(|input| {
+        let event_index = input.events.iter().position(|event| {
+            matches!(
+                event,
+                Event::Key {
+                    key,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::NONE,
+                    ..
+                } if numbered_preview_index(*key).is_some_and(|index| index < view.inputs.len())
+            )
+        })?;
+        let Event::Key { key, .. } = input.events.remove(event_index) else {
+            unreachable!("matched a key event")
+        };
+        numbered_preview_index(key)
+    })?;
+    numbered_preview_intent(gate, state.can_select_preview, &view.inputs, index)
+}
+
 /// Computes manual T-bar availability without drawing or dispatching intents.
 #[must_use]
 pub fn manual_transition_availability(
@@ -559,6 +616,9 @@ impl StudioShell {
         self.set_fade_to_black_duration_frames(self.fade_to_black_duration_frames);
 
         let mut intents = Vec::new();
+        if let Some(intent) = numbered_preview_shortcut(ui, state) {
+            intents.push(intent);
+        }
         Frame::new()
             .fill(GRAPHITE)
             .inner_margin(Margin::same(12))
@@ -1517,6 +1577,55 @@ mod tests {
             format!("01 | Input {}", u128::MAX)
         );
         assert_eq!(input_label(128, input(7)), "128 | Input 7");
+    }
+
+    #[test]
+    fn numbered_preview_intent_uses_replicated_order_and_current_gate() {
+        let inputs = [
+            input(11),
+            input(12),
+            input(13),
+            input(14),
+            input(15),
+            input(16),
+            input(17),
+            input(18),
+        ];
+        let gate = TransitionGate {
+            connection_status: StudioConnectionStatus::Ready,
+            has_view: true,
+            can_transition: true,
+            manual_transition_in_flight: false,
+        };
+        assert_eq!(numbered_preview_index(Key::Num1), Some(0));
+        assert_eq!(numbered_preview_index(Key::Num8), Some(7));
+        assert_eq!(
+            numbered_preview_intent(gate, true, &inputs, 7),
+            Some(StudioIntent::SelectPreview(input(18)))
+        );
+        assert_eq!(numbered_preview_intent(gate, true, &inputs, 8), None);
+        for (blocked_gate, can_select_preview) in [
+            (
+                TransitionGate {
+                    manual_transition_in_flight: true,
+                    ..gate
+                },
+                true,
+            ),
+            (
+                TransitionGate {
+                    connection_status: StudioConnectionStatus::Connecting,
+                    ..gate
+                },
+                true,
+            ),
+            (gate, false),
+        ] {
+            assert_eq!(
+                numbered_preview_intent(blocked_gate, can_select_preview, &inputs, 0),
+                None
+            );
+        }
     }
 
     #[test]

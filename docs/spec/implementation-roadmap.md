@@ -430,6 +430,12 @@ lifecycle.
 9. Add shortcuts and initial MIDI/OSC/controller support.
 10. Certify Profile A without network contribution.
 
+Current implementation boundary for item 9: native Studio maps unmodified keys
+1–8 to Preview selection for the first eight replicated inputs while its current
+Ready, permission, focus, bounds, and manual-transition gates allow the action.
+This adds no binding editor, chords, scopes, persistence, MIDI/OSC/controller
+runtime, conflict handling, or shortcut acceptance evidence, so RC-004 remains planned.
+
 Current implementation boundary for item 6: the switcher and engine now own
 eight independently addressed overlay channels with a retained source, exact
 on/off state, source update, a deduplicated set of included output IDs, and an
