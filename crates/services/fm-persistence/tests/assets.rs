@@ -51,7 +51,10 @@ fn input_id(value: u128) -> InputId {
     InputId::new(NonZeroU128::new(value).unwrap())
 }
 
-fn stored_project(inputs: impl IntoIterator<Item = (u128, &'static str)>) -> StoredProject {
+fn stored_project(
+    media_inputs: impl IntoIterator<Item = (u128, &'static str)>,
+    non_media_input: (u128, InputKind),
+) -> StoredProject {
     let frame_rate = FrameRate::new(30, 1).unwrap();
     let mut project = Project::new(
         ProjectId::new(NonZeroU128::new(1).unwrap()),
@@ -72,13 +75,22 @@ fn stored_project(inputs: impl IntoIterator<Item = (u128, &'static str)>) -> Sto
             },
         },
     );
-    for (id, asset_uri) in inputs {
+    for (id, kind) in media_inputs
+        .into_iter()
+        .map(|(id, asset_uri)| {
+            (
+                id,
+                InputKind::Media {
+                    asset_uri: asset_uri.into(),
+                },
+            )
+        })
+        .chain([non_media_input])
+    {
         project.add_input(Input {
             id: input_id(id),
             name: format!("Input {id}"),
-            kind: InputKind::Media {
-                asset_uri: asset_uri.into(),
-            },
+            kind,
             required_capabilities: Vec::new(),
         });
     }
@@ -92,30 +104,45 @@ fn project_asset_audit_reports_all_failures_in_stable_order() {
     let store = temp.store();
     create_asset(&store, "valid.mov");
     fs::create_dir_all(store.assets_root().join("directory")).unwrap();
-    let mut inputs = vec![
+    let inputs = vec![
         (50, "asset://missing.mov"),
         (40, "asset://valid.mov"),
         (20, "asset://directory"),
         (10, "asset://../invalid.mov"),
     ];
     #[cfg(unix)]
-    {
+    let inputs = {
         use std::os::unix::fs::symlink;
 
+        let mut inputs = inputs;
         let outside = temp.0.join("outside.mov");
         fs::write(&outside, b"outside").unwrap();
         symlink(&outside, store.assets_root().join("escape.mov")).unwrap();
         inputs.push((30, "asset://escape.mov"));
-    }
-    let project = stored_project(inputs);
+        inputs
+    };
+    let project = stored_project(
+        inputs,
+        (
+            60,
+            InputKind::Network {
+                endpoint: "asset://missing-network.mov".into(),
+            },
+        ),
+    );
 
-    let mut expected = vec![
+    let expected = vec![
         (10, AssetAuditReason::InvalidUri),
         (20, AssetAuditReason::NotRegularFile),
         (50, AssetAuditReason::MissingAsset),
     ];
     #[cfg(unix)]
-    expected.push((30, AssetAuditReason::OutsideProjectRoot));
+    let expected = {
+        let mut expected = expected;
+        expected.push((30, AssetAuditReason::OutsideAssetsRoot));
+        expected
+    };
+    let mut expected = expected;
     expected.sort_unstable_by_key(|(id, _)| *id);
 
     assert_eq!(

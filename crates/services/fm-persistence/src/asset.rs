@@ -74,7 +74,7 @@ impl ProjectStore {
                         | AssetResolveError::AssetUnavailable(_),
                     ) => AssetAuditReason::MissingAsset,
                     Err(AssetResolveError::OutsideAssetsRoot) => {
-                        AssetAuditReason::OutsideProjectRoot
+                        AssetAuditReason::OutsideAssetsRoot
                     }
                     Err(AssetResolveError::NotRegularFile) => AssetAuditReason::NotRegularFile,
                 };
@@ -101,7 +101,7 @@ pub struct AssetAuditIssue {
 pub enum AssetAuditReason {
     InvalidUri,
     MissingAsset,
-    OutsideProjectRoot,
+    OutsideAssetsRoot,
     NotRegularFile,
 }
 
