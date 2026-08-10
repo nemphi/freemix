@@ -73,6 +73,7 @@ use fm_switcher::{
 use fm_types::{InputId, ProjectId};
 use freemixd::ReadinessRecord;
 
+mod non_native_sessions;
 #[cfg(feature = "macos-program-surface")]
 mod program_surface;
 #[cfg(feature = "native-media")]
@@ -3467,59 +3468,76 @@ fn serve_inner(
             .set_diagnostic_deadline(duration)?;
     }
 
-    let mut once_client_outcome = OnceClientOutcome::Unserved;
-    let _shutdown_reason = loop {
-        if let Some(reason) = requested_daemon_shutdown(native.as_ref(), process_shutdown.as_ref())
-        {
-            break reason;
-        }
-        let stream = match listener.accept() {
-            Ok((stream, _)) => stream,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                if let Some(native) = &mut native {
-                    native.tick_if_due(&mut control.borrow_mut(), &authority)?;
-                }
-                thread::sleep(NATIVE_IO_POLL_INTERVAL);
-                continue;
-            }
-            Err(error) => return Err(error.into()),
-        };
-        let result = handle_client(
-            stream,
+    let _shutdown_reason = if native.is_none() {
+        non_native_sessions::run(
+            listener,
             &server,
             &control,
             &store,
             &mut durable,
             &principal,
-            &authority,
-            native.as_mut(),
-            process_shutdown.as_ref(),
-            &mut once_client_outcome,
-        );
-        if let Err(error) = result {
+            process_shutdown
+                .as_ref()
+                .expect("server has a process shutdown signal"),
+            once,
+        )?
+    } else {
+        let mut once_client_outcome = OnceClientOutcome::Unserved;
+        loop {
             if let Some(reason) =
                 requested_daemon_shutdown(native.as_ref(), process_shutdown.as_ref())
             {
                 break reason;
             }
-            if !is_client_disconnect(error.as_ref())
-                && !is_client_protocol_error(error.as_ref())
-                && !is_client_session_termination(error.as_ref())
-            {
-                return Err(error);
+            let stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    if let Some(native) = &mut native {
+                        native.tick_if_due(&mut control.borrow_mut(), &authority)?;
+                    }
+                    thread::sleep(NATIVE_IO_POLL_INTERVAL);
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let result = handle_client(
+                stream,
+                &server,
+                &control,
+                &store,
+                &mut durable,
+                &principal,
+                &authority,
+                native.as_mut(),
+                process_shutdown.as_ref(),
+                &mut once_client_outcome,
+            );
+            if let Err(error) = result {
+                if let Some(reason) =
+                    requested_daemon_shutdown(native.as_ref(), process_shutdown.as_ref())
+                {
+                    break reason;
+                }
+                if !is_client_disconnect(error.as_ref())
+                    && !is_client_protocol_error(error.as_ref())
+                    && !is_client_session_termination(error.as_ref())
+                {
+                    return Err(error);
+                }
             }
-        }
-        if let Some(reason) = requested_daemon_shutdown(native.as_ref(), process_shutdown.as_ref())
-        {
-            break reason;
-        }
-        if once && once_client_outcome == OnceClientOutcome::HandshakeResponseWritten {
-            break DaemonShutdownReason::Once;
+            if let Some(reason) =
+                requested_daemon_shutdown(native.as_ref(), process_shutdown.as_ref())
+            {
+                break reason;
+            }
+            if once && once_client_outcome == OnceClientOutcome::HandshakeResponseWritten {
+                break DaemonShutdownReason::Once;
+            }
         }
     };
     if native.is_some() {
