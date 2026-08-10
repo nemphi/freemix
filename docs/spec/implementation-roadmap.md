@@ -123,11 +123,11 @@ stable-ID input tiles, realized/desired tally, and permission-gated Cut/Fade/Wip
 controls. Manual Fade/Wipe/AlphaFade/Slide T-bar controls require transition permission,
 synchronized state, and Ready lifecycle. The manual panel displays
 replicated desired and realized kind, routing, and exact integer basis-point
-position. Bounded worker channels preserve strict operator FIFO while
-recovering, and later intents cannot overtake unresolved commands. Native Studio
-locally retains bounded unsent intents and coalesces adjacent manual-position values
-and same-input audio-strip field edits; action and input boundaries preserve order.
-This latest-value rule can suppress intermediate unsent manual or audio effects.
+position. Bounded worker channels preserve order across retained non-coalesced action
+and input boundaries while recovering, and later retained intents cannot overtake
+unresolved commands. Native Studio locally retains bounded unsent intents and uses
+latest-value coalescing for adjacent manual-position values and same-input audio-strip
+field edits; this can suppress intermediate unsent manual or audio effects.
 `fm-client` retains a
 bounded terminal command history (256 by default, configurable through 65,536),
 while replay-receipt collisions mark affected sent commands terminal-uncertain,

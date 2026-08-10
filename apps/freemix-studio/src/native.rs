@@ -1840,60 +1840,63 @@ mod tests {
         let input = WireInputId::new(NonZeroU128::new(2).unwrap()).to_domain();
         let other_input = WireInputId::new(NonZeroU128::new(3).unwrap()).to_domain();
         let mut pending = PendingIntents::new();
+        let initial = StudioIntent::SetInputAudioStrip {
+            input,
+            update: InputAudioStripUpdate {
+                muted: Some(false),
+                soloed: Some(false),
+                follow_video: Some(false),
+                ..InputAudioStripUpdate::default()
+            },
+        };
         assert_eq!(
-            pending.push(StudioIntent::SetInputAudioStrip {
-                input,
-                update: InputAudioStripUpdate {
-                    muted: Some(true),
-                    ..InputAudioStripUpdate::default()
-                },
-            }),
+            pending.push(initial),
             Ok(())
         );
-        for value in 0..=REQUEST_CAPACITY {
+        for value in 1..=REQUEST_CAPACITY {
             assert_eq!(
                 pending.push(StudioIntent::SetInputAudioStrip {
                     input,
                     update: InputAudioStripUpdate {
                         gain_millidb: Some(value as i32),
                         balance_basis_points: Some(-(value as i32)),
-                        delay_samples: Some(value as u32),
+                        delay_samples: Some(0),
                         ..InputAudioStripUpdate::default()
                     },
                 }),
                 Ok(())
             );
         }
+        let coalesced = StudioIntent::SetInputAudioStrip {
+            input,
+            update: InputAudioStripUpdate {
+                gain_millidb: Some(REQUEST_CAPACITY as i32),
+                balance_basis_points: Some(-(REQUEST_CAPACITY as i32)),
+                muted: Some(false),
+                soloed: Some(false),
+                follow_video: Some(false),
+                delay_samples: Some(0),
+            },
+        };
         assert_eq!(
             pending.intents,
-            VecDeque::from([StudioIntent::SetInputAudioStrip {
-                input,
-                update: InputAudioStripUpdate {
-                    gain_millidb: Some(REQUEST_CAPACITY as i32),
-                    balance_basis_points: Some(-(REQUEST_CAPACITY as i32)),
-                    muted: Some(true),
-                    delay_samples: Some(REQUEST_CAPACITY as u32),
-                    ..InputAudioStripUpdate::default()
-                },
-            }])
+            VecDeque::from([coalesced])
         );
 
-        assert_eq!(
-            pending.push(StudioIntent::SetInputAudioStrip {
-                input: other_input,
-                update: InputAudioStripUpdate::default(),
-            }),
-            Ok(())
-        );
+        let other = StudioIntent::SetInputAudioStrip {
+            input: other_input,
+            update: InputAudioStripUpdate {
+                muted: Some(true),
+                ..InputAudioStripUpdate::default()
+            },
+        };
+        assert_eq!(pending.push(other), Ok(()));
         assert_eq!(pending.push(StudioIntent::Cut), Ok(()));
+        assert_eq!(pending.push(other), Ok(()));
         assert_eq!(
-            pending.push(StudioIntent::SetInputAudioStrip {
-                input: other_input,
-                update: InputAudioStripUpdate::default(),
-            }),
-            Ok(())
+            pending.intents,
+            VecDeque::from([coalesced, other, StudioIntent::Cut, other])
         );
-        assert_eq!(pending.intents.len(), 4);
     }
 
     #[test]
