@@ -442,6 +442,11 @@ fn once_daemon_replaces_disconnected_peer_but_admits_one_live_peer() {
     drop(TcpStream::connect(daemon.address).unwrap());
 
     let mut first = daemon.connect();
+    first
+        .reader
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
     let mut second = daemon.connect();
     second
         .reader
