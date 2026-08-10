@@ -3,11 +3,15 @@ use std::{
     fmt,
     sync::{
         atomic::{AtomicU64, Ordering},
-        mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError, sync_channel},
+        mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel},
+        Arc, Mutex, PoisonError,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(test)]
+use std::sync::mpsc::RecvTimeoutError;
 
 use eframe::egui;
 use fm_client::{
@@ -30,7 +34,7 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(25);
 const REQUEST_CAPACITY: usize = 16;
 const DEFERRED_INTENT_CAPACITY: usize = 16;
-const STATE_CAPACITY: usize = 16;
+const STATE_NOTIFICATION_CAPACITY: usize = 1;
 const MAX_COMMAND_RECORDS: usize = 8;
 const TERMINAL_UNCERTAINTY_CAPACITY: usize = 8;
 static NEXT_WORKER_NONCE: AtomicU64 = AtomicU64::new(1);
@@ -90,7 +94,7 @@ struct StudioApp {
     shell: StudioShell,
     state: StudioUiState,
     requests: Option<SyncSender<WorkerRequest>>,
-    updates: Option<Receiver<StudioUiState>>,
+    updates: Option<StateUpdates>,
     worker: Option<JoinHandle<()>>,
     shutdown_sent: bool,
 }
@@ -101,22 +105,18 @@ impl StudioApp {
         creation_context: &eframe::CreationContext<'_>,
     ) -> Result<Self, std::io::Error> {
         let (request_sender, request_receiver) = sync_channel(REQUEST_CAPACITY);
-        let (state_sender, state_receiver) = sync_channel(STATE_CAPACITY);
         let repaint_context = creation_context.egui_ctx.clone();
+        let (publisher, updates) = state_mailbox(repaint_context);
         let worker = thread::Builder::new()
             .name("freemix-studio-worker".to_owned())
             .spawn(move || {
-                let publisher = StatePublisher {
-                    sender: state_sender,
-                    repaint_context,
-                };
                 run_worker(config, &request_receiver, &publisher);
             })?;
         Ok(Self {
             shell: StudioShell::default(),
             state: StudioUiState::new(StudioConnectionStatus::Launching),
             requests: Some(request_sender),
-            updates: Some(state_receiver),
+            updates: Some(updates),
             worker: Some(worker),
             shutdown_sent: false,
         })
@@ -139,7 +139,7 @@ impl StudioApp {
 impl eframe::App for StudioApp {
     fn logic(&mut self, _context: &egui::Context, _frame: &mut eframe::Frame) {
         if let Some(updates) = &self.updates {
-            while let Ok(state) = updates.try_recv() {
+            if let Some(state) = updates.try_recv() {
                 self.state = state;
             }
         }
@@ -172,17 +172,65 @@ impl Drop for StudioApp {
 }
 
 struct StatePublisher {
-    sender: SyncSender<StudioUiState>,
+    latest: Arc<Mutex<Option<StudioUiState>>>,
+    sender: SyncSender<()>,
     repaint_context: egui::Context,
+}
+
+struct StateUpdates {
+    latest: Arc<Mutex<Option<StudioUiState>>>,
+    receiver: Receiver<()>,
+}
+
+fn state_mailbox(repaint_context: egui::Context) -> (StatePublisher, StateUpdates) {
+    let latest = Arc::new(Mutex::new(None));
+    let (sender, receiver) = sync_channel(STATE_NOTIFICATION_CAPACITY);
+    (
+        StatePublisher {
+            latest: Arc::clone(&latest),
+            sender,
+            repaint_context,
+        },
+        StateUpdates { latest, receiver },
+    )
 }
 
 impl StatePublisher {
     fn publish(&self, state: StudioUiState) -> bool {
-        if self.sender.send(state).is_err() {
-            return false;
+        *self
+            .latest
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(state);
+        match self.sender.try_send(()) {
+            Ok(()) | Err(TrySendError::Full(())) => {
+                self.repaint_context.request_repaint();
+                true
+            }
+            Err(TrySendError::Disconnected(())) => false,
         }
-        self.repaint_context.request_repaint();
-        true
+    }
+}
+
+impl StateUpdates {
+    fn try_recv(&self) -> Option<StudioUiState> {
+        self.receiver.try_recv().ok()?;
+        self.latest
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+
+    #[cfg(test)]
+    fn recv_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<Option<StudioUiState>, RecvTimeoutError> {
+        self.receiver.recv_timeout(timeout)?;
+        Ok(self
+            .latest
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take())
     }
 }
 
@@ -1366,7 +1414,7 @@ mod tests {
     use std::{
         io::{BufRead, BufReader, Write},
         net::{TcpListener, TcpStream},
-        sync::mpsc::{Receiver, sync_channel},
+        sync::mpsc::sync_channel,
     };
 
     use core::num::NonZeroU128;
@@ -1589,15 +1637,31 @@ mod tests {
     }
 
     fn receive_connection_state(
-        updates: &Receiver<StudioUiState>,
+        updates: &StateUpdates,
         expected: StudioConnectionStatus,
     ) {
         loop {
-            let state = updates.recv_timeout(HEARTBEAT_TEST_TIMEOUT).unwrap();
+            let state = updates
+                .recv_timeout(HEARTBEAT_TEST_TIMEOUT)
+                .unwrap()
+                .expect("notification has a current state");
             if state.connection_status == expected {
                 return;
             }
         }
+    }
+
+    #[test]
+    fn state_mailbox_keeps_latest_state_when_notification_is_full() {
+        let (publisher, updates) = state_mailbox(egui::Context::default());
+        assert!(publisher.publish(StudioUiState::new(StudioConnectionStatus::Launching)));
+        assert!(publisher.publish(StudioUiState::new(StudioConnectionStatus::Ready)));
+        assert_eq!(
+            updates.try_recv().unwrap().connection_status,
+            StudioConnectionStatus::Ready
+        );
+        drop(updates);
+        assert!(!publisher.publish(StudioUiState::new(StudioConnectionStatus::Failed)));
     }
 
     #[cfg(unix)]
@@ -1610,7 +1674,7 @@ mod tests {
         let project_bundle = directory.path("show.freemix");
         let daemon_executable = idle_exit_helper(&directory, address);
         let (request_sender, request_receiver) = sync_channel(REQUEST_CAPACITY);
-        let (state_sender, state_receiver) = sync_channel(STATE_CAPACITY);
+        let (publisher, updates) = state_mailbox(egui::Context::default());
         let worker = thread::spawn(move || {
             run_worker(
                 StudioConfig {
@@ -1626,14 +1690,11 @@ mod tests {
                     },
                 },
                 &request_receiver,
-                &StatePublisher {
-                    sender: state_sender,
-                    repaint_context: egui::Context::default(),
-                },
+                &publisher,
             );
         });
 
-        receive_connection_state(&state_receiver, StudioConnectionStatus::Ready);
+        receive_connection_state(&updates, StudioConnectionStatus::Ready);
         let pid_path = directory.path("show.freemix.pid");
         let pid = fs::read_to_string(pid_path).unwrap();
         assert!(
@@ -1643,8 +1704,8 @@ mod tests {
                 .unwrap()
                 .success()
         );
-        receive_connection_state(&state_receiver, StudioConnectionStatus::Failed);
-        receive_connection_state(&state_receiver, StudioConnectionStatus::Ready);
+        receive_connection_state(&updates, StudioConnectionStatus::Failed);
+        receive_connection_state(&updates, StudioConnectionStatus::Ready);
         assert_eq!(
             fs::read_to_string(directory.path("show.freemix.launches"))
                 .unwrap()
