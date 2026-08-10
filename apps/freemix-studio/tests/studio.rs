@@ -5,10 +5,10 @@ use std::{
     net::{SocketAddr, TcpListener, TcpStream},
     num::NonZeroU128,
     path::{Path, PathBuf},
-    process::{Command as ProcessCommand, Stdio},
+    process::{Command as ProcessCommand, Output, Stdio},
     sync::atomic::{AtomicU64, Ordering},
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[cfg(unix)]
@@ -431,6 +431,88 @@ fn existing_runtime_accepts_the_current_contract() {
     assert_eq!(
         runtime.session().client().session().unwrap().protocol,
         CURRENT_PROTOCOL_VERSION
+    );
+    server_thread.join().unwrap();
+}
+
+fn run_diagnose(address: SocketAddr) -> Output {
+    let mut child = ProcessCommand::new(env!("CARGO_BIN_EXE_freemix-studio"))
+        .args([
+            "--diagnose",
+            "--connect",
+            &address.to_string(),
+            "--project-id",
+            &PROJECT_VALUE.to_string(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + CONNECT_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().unwrap(),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Studio diagnose did not exit before {CONNECT_TIMEOUT:?}: stderr={}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "cannot wait for Studio diagnose: {error}; stderr={}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn diagnose_reports_validated_heartbeat() {
+    let (address, server_thread) = spawn_server(|listener| {
+        let mut peer = Peer::accept(&listener);
+        let WireMessage::HandshakeRequest(request) = peer.receive() else {
+            panic!("expected modern handshake request");
+        };
+        assert_eq!(request.protocol, CURRENT_PROTOCOL_VERSION);
+        peer.send(&WireMessage::HandshakeResponse(handshake(
+            project_id(),
+            4,
+            HandshakeOutcome::Snapshot {
+                reason: SnapshotReason::NoCursor,
+            },
+        )));
+        peer.send(&WireMessage::Snapshot(snapshot(4)));
+
+        let WireMessage::Heartbeat(heartbeat) = peer.receive() else {
+            panic!("expected heartbeat after snapshot");
+        };
+        assert_eq!(heartbeat.sequence, 1);
+        assert_eq!(heartbeat.last_applied.unwrap().revision, 4);
+        peer.send(&WireMessage::HeartbeatAcknowledgement(
+            HeartbeatAcknowledgementMessage {
+                server: heartbeat.server,
+                heartbeat_sequence: heartbeat.sequence,
+                received_at_ms: 1_234,
+            },
+        ));
+    });
+
+    let output = run_diagnose(address);
+    assert!(
+        output.status.success(),
+        "Studio diagnose failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "liveness=ok sequence=1 received_at_ms=1234\n"
     );
     server_thread.join().unwrap();
 }

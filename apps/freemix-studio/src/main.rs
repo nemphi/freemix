@@ -1,8 +1,14 @@
-use std::{env, process::ExitCode, time::Duration};
+use std::{
+    env, io,
+    process::ExitCode,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
+use fm_client::SessionEvent;
 use freemix_studio::{Command, HELP, StudioRuntime, launch_native, parse_args};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const DIAGNOSE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 fn main() -> ExitCode {
     match run() {
@@ -22,14 +28,43 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Open(config) => launch_native(config)?,
         Command::Diagnose(config) => {
             let mut runtime = StudioRuntime::new(config)?;
-            println!(
-                "state={:?} address={}",
-                runtime.lifecycle()?,
-                runtime.address()
-            );
-            let connected = runtime.connect(CONNECT_TIMEOUT)?;
-            println!("event={connected:?} state={:?}", runtime.lifecycle()?);
+            runtime.connect(CONNECT_TIMEOUT)?;
+            let deadline = Instant::now() + CONNECT_TIMEOUT;
+            let sent_at_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)?
+                .as_millis()
+                .try_into()?;
+            let heartbeat = runtime
+                .send_heartbeat_cancellable(sent_at_ms, DIAGNOSE_POLL_INTERVAL, || {
+                    Instant::now() >= deadline
+                })
+                .map_err(diagnostic_failure)?;
+            match runtime
+                .receive_cancellable(DIAGNOSE_POLL_INTERVAL, || Instant::now() >= deadline)
+                .map_err(diagnostic_failure)?
+            {
+                SessionEvent::HeartbeatAcknowledged { acknowledgement }
+                    if acknowledgement.heartbeat_sequence == heartbeat.sequence =>
+                {
+                    println!(
+                        "liveness=ok sequence={} received_at_ms={}",
+                        heartbeat.sequence, acknowledgement.received_at_ms
+                    );
+                }
+                SessionEvent::Disconnected { .. } => return Err(diagnostic_failure("EOF").into()),
+                SessionEvent::ServerError(_) => {
+                    return Err(diagnostic_failure("server error").into());
+                }
+                SessionEvent::HeartbeatAcknowledged { .. } => {
+                    return Err(diagnostic_failure("heartbeat sequence mismatch").into());
+                }
+                _ => return Err(diagnostic_failure("unexpected session event").into()),
+            }
         }
     }
     Ok(())
+}
+
+fn diagnostic_failure(error: impl std::fmt::Display) -> io::Error {
+    io::Error::other(format!("diagnostic heartbeat failed: {error}"))
 }
