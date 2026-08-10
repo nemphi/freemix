@@ -6195,7 +6195,7 @@ mod tests {
         let project_path = directory.path().join("show.freemix");
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
-        let (expired_tx, expired_rx) = std::sync::mpsc::channel();
+        let (expired_tx, expired_rx) = std::sync::mpsc::sync_channel(1);
         let server_thread = thread::spawn(move || {
             let store = ProjectStore::new(project_path).unwrap();
             let mut durable = test_project();
