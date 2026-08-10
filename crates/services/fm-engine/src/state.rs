@@ -2,7 +2,7 @@ use core::fmt;
 use std::collections::{BTreeMap, HashSet};
 
 use fm_switcher::{StingerDescriptor, StingerSlotId, SwitcherEvent, SwitcherState, TBarState};
-use fm_types::InputId;
+use fm_types::{InputId, RenameInputError, validate_input_name};
 
 use crate::ShowError;
 
@@ -103,6 +103,31 @@ impl ShowState {
             .iter()
             .position(|candidate| *candidate == input)
             .map(|index| self.input_names[index].as_str())
+    }
+
+    /// Renames one durable input while preserving the exact supplied text.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`RenameInputError`] when the input is unknown or the name is
+    /// blank, too long, or already used by another input.
+    pub fn rename_input(&mut self, input: InputId, name: String) -> Result<(), RenameInputError> {
+        let index = self
+            .inputs
+            .iter()
+            .position(|candidate| *candidate == input)
+            .ok_or(RenameInputError::UnknownInput(input))?;
+        validate_input_name(&name)?;
+        if self
+            .input_names
+            .iter()
+            .enumerate()
+            .any(|(candidate_index, candidate)| candidate_index != index && candidate == &name)
+        {
+            return Err(RenameInputError::DuplicateName);
+        }
+        self.input_names[index] = name;
+        Ok(())
     }
 
     #[must_use]

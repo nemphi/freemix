@@ -1,4 +1,7 @@
-use fm_types::{AudioFormat, BusId, FrameRate, InputId, OutputId, ProjectId, SceneId, VideoFormat};
+use fm_types::{
+    AudioFormat, BusId, FrameRate, InputId, OutputId, ProjectId, RenameInputError, SceneId,
+    VideoFormat, validate_input_name,
+};
 
 use crate::{ValidationError, validation::validate_project};
 
@@ -128,6 +131,31 @@ impl Project {
             state: InputAudioStripState::default(),
         });
         self.inputs.push(input);
+    }
+
+    /// Renames one input while preserving the exact supplied text.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RenameInputError`] when the input is unknown or the name is
+    /// blank, too long, or already used by another input.
+    pub fn rename_input(&mut self, input: InputId, name: String) -> Result<(), RenameInputError> {
+        let index = self
+            .inputs
+            .iter()
+            .position(|candidate| candidate.id == input)
+            .ok_or(RenameInputError::UnknownInput(input))?;
+        validate_input_name(&name)?;
+        if self
+            .inputs
+            .iter()
+            .enumerate()
+            .any(|(candidate_index, candidate)| candidate_index != index && candidate.name == name)
+        {
+            return Err(RenameInputError::DuplicateName);
+        }
+        self.inputs[index].name = name;
+        Ok(())
     }
 
     /// Replaces the persisted audio strip for an existing input.

@@ -6,10 +6,11 @@ use fm_command::{
     StateEpoch,
 };
 use fm_engine::{
-    Engine, EngineCommand, EngineError, EngineInputAudioStripState, EngineManualTransitionKind,
-    EngineManualTransitionPosition, EnginePrepareOutcome, EngineRestoreState, EngineSnapshot,
-    MAX_INPUT_AUDIO_BALANCE_BASIS_POINTS, MAX_INPUT_AUDIO_DELAY_SAMPLES,
-    MAX_INPUT_AUDIO_GAIN_MILLIDB, ShowError, ShowState, SnapshotError,
+    Engine, EngineCommand, EngineError, EngineEvent, EngineInputAudioStripState,
+    EngineManualTransitionKind, EngineManualTransitionPosition, EnginePrepareOutcome,
+    EngineRestoreState, EngineSnapshot, MAX_INPUT_AUDIO_BALANCE_BASIS_POINTS,
+    MAX_INPUT_AUDIO_DELAY_SAMPLES, MAX_INPUT_AUDIO_GAIN_MILLIDB, ShowError, ShowState,
+    SnapshotError,
 };
 use fm_scheduler::FrameNumber;
 use fm_switcher::{
@@ -18,7 +19,7 @@ use fm_switcher::{
     StingerDescriptor, StingerSlotId, SwitcherEvent, SwitcherState, TBarPosition, TBarState,
     TransitionKind,
 };
-use fm_types::{FrameRate, InputId, OutputId};
+use fm_types::{FrameRate, InputId, MAX_INPUT_NAME_BYTES, OutputId};
 
 fn input(value: u128) -> InputId {
     InputId::new(NonZeroU128::new(value).unwrap())
@@ -132,6 +133,77 @@ fn show_owns_exact_input_names_in_input_order() {
         ),
         Err(ShowError::EmptyInputName)
     );
+}
+
+#[test]
+fn rename_input_is_bounded_unique_and_replay_safe() {
+    let mut engine = engine();
+    let command = envelope(
+        "rename",
+        EngineCommand::RenameInput {
+            input: input(1),
+            name: "  Camera Prime  ".into(),
+        },
+    );
+    let accepted = engine.execute(command.clone(), 0).unwrap();
+    assert_eq!(
+        accepted.events[0].payload,
+        EngineEvent::InputRenamed {
+            input: input(1),
+            name: "  Camera Prime  ".into(),
+        }
+    );
+    assert_eq!(engine.show().input_name(input(1)), Some("  Camera Prime  "));
+    assert_eq!(engine.snapshot(), Err(SnapshotError::WorkInFlight));
+
+    let replay = engine.execute(command, 0).unwrap();
+    assert!(replay.replayed);
+    assert!(replay.events.is_empty());
+    assert_eq!(engine.revision(), Revision::new(1));
+
+    let frame = engine.tick().unwrap();
+    assert!(frame.events.is_empty());
+    assert!(frame.input_audio_strip_updates.is_empty());
+    let snapshot = engine.snapshot().unwrap();
+    assert_eq!(
+        snapshot.show().input_name(input(1)),
+        Some("  Camera Prime  ")
+    );
+    assert_eq!(snapshot.revision(), Revision::new(1));
+    assert_eq!(snapshot.runtime_generation(), RuntimeGeneration::new(1));
+
+    for (key, input, name, code) in [
+        (
+            "unknown-rename",
+            input(99),
+            "Unknown".into(),
+            RejectionCode::NotFound,
+        ),
+        (
+            "blank-rename",
+            input(1),
+            " \t ".into(),
+            RejectionCode::InvalidCommand,
+        ),
+        (
+            "long-rename",
+            input(1),
+            "x".repeat(MAX_INPUT_NAME_BYTES + 1),
+            RejectionCode::InvalidCommand,
+        ),
+        (
+            "duplicate-rename",
+            input(1),
+            "Input 2".into(),
+            RejectionCode::Conflict,
+        ),
+    ] {
+        let rejected = engine
+            .execute(envelope(key, EngineCommand::RenameInput { input, name }), 0)
+            .unwrap();
+        assert_eq!(rejected.receipt.rejected().unwrap().rejection.code, code);
+        assert_eq!(engine.revision(), Revision::new(1));
+    }
 }
 
 #[test]

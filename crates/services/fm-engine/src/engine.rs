@@ -13,7 +13,7 @@ use fm_switcher::{
     ProgramFrame, StingerDescriptor, StingerSlotId, SwitcherCommand, SwitcherError, SwitcherEvent,
     SwitcherState, TBarPosition, TransitionKind,
 };
-use fm_types::{FrameRate, InputId, OutputId};
+use fm_types::{FrameRate, InputId, OutputId, RenameInputError};
 
 use crate::{EngineError, EngineInputAudioStripState, ShowState, SnapshotError};
 
@@ -74,8 +74,12 @@ pub struct EngineFadeToBlackState {
     pub position: FadeToBlackPosition,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EngineCommand {
+    RenameInput {
+        input: InputId,
+        name: String,
+    },
     SetInputAudioStrip {
         input: InputId,
         state: EngineInputAudioStripState,
@@ -160,9 +164,10 @@ pub struct EngineAcceptance {
     pub target_frame: FrameNumber,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EngineEvent {
     DesiredSwitcherChanged(EngineCommand),
+    InputRenamed { input: InputId, name: String },
 }
 
 pub type EngineCommandOutcome = ApplyOutcome<EngineAcceptance, EngineEvent>;
@@ -553,7 +558,7 @@ impl Engine {
         now_millis: u64,
     ) -> Result<EngineCommandOutcome, EngineError> {
         let key = envelope.idempotency_key.clone();
-        let command = envelope.command;
+        let command = envelope.command.clone();
         let target_frame = self.scheduler.pacer().next_frame();
         let already_seen = self.commands.receipt(&key).is_some();
         let scheduled = if already_seen {
@@ -561,7 +566,7 @@ impl Engine {
         } else {
             Some(
                 self.scheduler
-                    .schedule_action(target_frame, command)
+                    .schedule_action(target_frame, command.clone())
                     .map_err(EngineError::Schedule)?,
             )
         };
@@ -570,8 +575,9 @@ impl Engine {
             .commands
             .apply(envelope, now_millis, move |_, command| {
                 if let Some(kind) = runtime_busy
-                    && !matches!(command, EngineCommand::FadeToBlack { .. })
-                    && !is_overlay_command(command)
+                    && !matches!(&command, EngineCommand::FadeToBlack { .. })
+                    && !matches!(&command, EngineCommand::RenameInput { .. })
+                    && !is_overlay_command(&command)
                 {
                     let name = match kind {
                         TransitionKind::Fade => "fade",
@@ -597,18 +603,19 @@ impl Engine {
         }
         if outcome.receipt.accepted().is_some() && !outcome.replayed {
             self.pending_actions += 1;
-            if let Some(kind) = match command {
+            if let Some(kind) = match &command {
                 EngineCommand::Fade { .. } => Some(TransitionKind::Fade),
                 EngineCommand::AlphaFade { .. } => Some(TransitionKind::AlphaFade),
                 EngineCommand::Slide { .. } => Some(TransitionKind::Slide),
                 EngineCommand::Zoom { .. } => Some(TransitionKind::Zoom),
                 EngineCommand::Stinger { slot, .. } => {
-                    stinger_runtime_transition(self.commands.state(), slot)
+                    stinger_runtime_transition(self.commands.state(), *slot)
                 }
                 EngineCommand::ConfigureStinger { .. } | EngineCommand::RemoveStinger { .. } => {
                     None
                 }
-                EngineCommand::SetInputAudioStrip { .. }
+                EngineCommand::RenameInput { .. }
+                | EngineCommand::SetInputAudioStrip { .. }
                 | EngineCommand::TakeOverlay { .. }
                 | EngineCommand::UpdateOverlay { .. }
                 | EngineCommand::OverlayOff { .. }
@@ -892,7 +899,7 @@ fn validate_idle_restore(
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 struct EngineMutation {
     command: EngineCommand,
     target_frame: FrameNumber,
@@ -906,15 +913,27 @@ impl Mutation<ShowState, EngineEvent, EngineAcceptance> for EngineMutation {
         events: &mut Vec<EngineEvent>,
     ) -> Result<EngineAcceptance, Rejection> {
         if matches!(
-            self.command,
+            &self.command,
             EngineCommand::ConfigureStinger { .. } | EngineCommand::RemoveStinger { .. }
         ) {
             return apply_stinger_mutation(state, events, self);
         }
+        if matches!(&self.command, EngineCommand::RenameInput { .. }) {
+            let EngineCommand::RenameInput { input, name } = self.command else {
+                unreachable!("only input renames enter the rename mutation")
+            };
+            state
+                .rename_input(input, name.clone())
+                .map_err(rename_input_rejection)?;
+            events.push(EngineEvent::InputRenamed { input, name });
+            return Ok(EngineAcceptance {
+                target_frame: self.target_frame,
+            });
+        }
         if let EngineCommand::SetInputAudioStrip {
             input,
             state: strip_state,
-        } = self.command
+        } = &self.command
         {
             if !(MIN_INPUT_AUDIO_GAIN_MILLIDB..=MAX_INPUT_AUDIO_GAIN_MILLIDB)
                 .contains(&strip_state.gain_millidb)
@@ -948,7 +967,7 @@ impl Mutation<ShowState, EngineEvent, EngineAcceptance> for EngineMutation {
                 ));
             }
             state
-                .set_input_audio_strip(input, strip_state)
+                .set_input_audio_strip(*input, *strip_state)
                 .map_err(|_| {
                     Rejection::new(
                         RejectionCode::InvalidCommand,
@@ -961,7 +980,7 @@ impl Mutation<ShowState, EngineEvent, EngineAcceptance> for EngineMutation {
             });
         }
         if matches!(
-            self.command,
+            &self.command,
             EngineCommand::TakeOverlay { .. }
                 | EngineCommand::UpdateOverlay { .. }
                 | EngineCommand::OverlayOff { .. }
@@ -973,49 +992,52 @@ impl Mutation<ShowState, EngineEvent, EngineAcceptance> for EngineMutation {
         ) {
             return apply_overlay_mutation(state, events, self);
         }
-        if matches!(self.command, EngineCommand::FadeToBlack { .. }) {
+        if matches!(&self.command, EngineCommand::FadeToBlack { .. }) {
             return apply_fade_to_black_mutation(state, events, self);
         }
-        let switcher_command = match self.command {
+        let switcher_command = match &self.command {
+            EngineCommand::RenameInput { .. } => {
+                unreachable!("input renames return before switcher command mapping")
+            }
             EngineCommand::SetInputAudioStrip { .. } => {
                 unreachable!("audio-strip mutations return before switcher command mapping")
             }
-            EngineCommand::SelectPreview(input) => SwitcherCommand::SelectPreview(input),
+            EngineCommand::SelectPreview(input) => SwitcherCommand::SelectPreview(*input),
             EngineCommand::Cut => SwitcherCommand::Cut,
             EngineCommand::Fade { duration_frames } => {
-                validate_transition_duration("fade", duration_frames)?;
+                validate_transition_duration("fade", *duration_frames)?;
                 SwitcherCommand::Cut
             }
             EngineCommand::AlphaFade { duration_frames } => {
-                validate_transition_duration("alpha fade", duration_frames)?;
+                validate_transition_duration("alpha fade", *duration_frames)?;
                 SwitcherCommand::Cut
             }
             EngineCommand::Slide { duration_frames } => {
-                validate_transition_duration("slide", duration_frames)?;
+                validate_transition_duration("slide", *duration_frames)?;
                 SwitcherCommand::Cut
             }
             EngineCommand::Zoom { duration_frames } => {
-                validate_transition_duration("zoom", duration_frames)?;
+                validate_transition_duration("zoom", *duration_frames)?;
                 SwitcherCommand::Cut
             }
             EngineCommand::Stinger {
                 slot,
                 duration_frames,
             } => {
-                validate_transition_duration("stinger", duration_frames)?;
-                match state.desired_switcher().stinger_playback_decision(slot) {
+                validate_transition_duration("stinger", *duration_frames)?;
+                match state.desired_switcher().stinger_playback_decision(*slot) {
                     fm_switcher::StingerPlaybackDecision::Play => {
                         let descriptor = state
                             .desired_switcher()
-                            .stinger(slot)
+                            .stinger(*slot)
                             .descriptor()
                             .expect("playable stinger has a descriptor");
-                        if descriptor.cut_point_frames > duration_frames {
+                        if descriptor.cut_point_frames > *duration_frames {
                             return Err(switcher_rejection(
                                 SwitcherError::StingerCutPointOutOfRange {
-                                    slot,
+                                    slot: *slot,
                                     cut_point_frames: descriptor.cut_point_frames,
-                                    duration_frames,
+                                    duration_frames: *duration_frames,
                                 },
                             ));
                         }
@@ -1034,7 +1056,9 @@ impl Mutation<ShowState, EngineEvent, EngineAcceptance> for EngineMutation {
                         | fm_switcher::MissingMediaFallback::Fade,
                     ) => SwitcherCommand::Cut,
                     fm_switcher::StingerPlaybackDecision::Unconfigured => {
-                        return Err(switcher_rejection(SwitcherError::UnconfiguredStinger(slot)));
+                        return Err(switcher_rejection(SwitcherError::UnconfiguredStinger(
+                            *slot,
+                        )));
                     }
                 }
             }
@@ -1052,14 +1076,14 @@ impl Mutation<ShowState, EngineEvent, EngineAcceptance> for EngineMutation {
                 unreachable!("overlay mutations return before switcher command mapping")
             }
             EngineCommand::Wipe { duration_frames } => {
-                validate_transition_duration("wipe", duration_frames)?;
+                validate_transition_duration("wipe", *duration_frames)?;
                 SwitcherCommand::Cut
             }
             EngineCommand::FadeToBlack { .. } => {
                 unreachable!("Fade-to-Black mutations return before switcher command mapping")
             }
             EngineCommand::StartManualTransition { kind } => SwitcherCommand::StartTBar {
-                kind: manual_transition_kind(kind),
+                kind: manual_transition_kind(*kind),
             },
             EngineCommand::SetManualTransitionPosition { position } => {
                 SwitcherCommand::SetTBarPosition(position.domain())
@@ -1083,21 +1107,23 @@ fn apply_fade_to_black_mutation(
     events: &mut Vec<EngineEvent>,
     mutation: EngineMutation,
 ) -> Result<EngineAcceptance, Rejection> {
+    let EngineMutation {
+        command,
+        target_frame,
+    } = mutation;
     let EngineCommand::FadeToBlack {
         active,
         duration_frames,
-    } = mutation.command
+    } = &command
     else {
         unreachable!("only Fade-to-Black mutations are delegated")
     };
-    validate_fade_to_black_duration(duration_frames)?;
+    validate_fade_to_black_duration(*duration_frames)?;
     state
         .desired_switcher_mut()
-        .restore_settled_fade_to_black(active);
-    events.push(EngineEvent::DesiredSwitcherChanged(mutation.command));
-    Ok(EngineAcceptance {
-        target_frame: mutation.target_frame,
-    })
+        .restore_settled_fade_to_black(*active);
+    events.push(EngineEvent::DesiredSwitcherChanged(command));
+    Ok(EngineAcceptance { target_frame })
 }
 
 fn apply_overlay_mutation(
@@ -1105,55 +1131,60 @@ fn apply_overlay_mutation(
     events: &mut Vec<EngineEvent>,
     mutation: EngineMutation,
 ) -> Result<EngineAcceptance, Rejection> {
-    let command = match mutation.command {
-        EngineCommand::TakeOverlay { channel, source } => {
-            SwitcherCommand::TakeOverlay { channel, source }
-        }
-        EngineCommand::UpdateOverlay { channel, source } => {
-            SwitcherCommand::UpdateOverlay { channel, source }
-        }
-        EngineCommand::OverlayOff { channel } => SwitcherCommand::OverlayOff(channel),
+    let EngineMutation {
+        command,
+        target_frame,
+    } = mutation;
+    let switcher_command = match &command {
+        EngineCommand::TakeOverlay { channel, source } => SwitcherCommand::TakeOverlay {
+            channel: *channel,
+            source: *source,
+        },
+        EngineCommand::UpdateOverlay { channel, source } => SwitcherCommand::UpdateOverlay {
+            channel: *channel,
+            source: *source,
+        },
+        EngineCommand::OverlayOff { channel } => SwitcherCommand::OverlayOff(*channel),
         EngineCommand::ConfigureOverlayTransition {
             channel,
             transition,
             duration_frames,
         } => SwitcherCommand::ConfigureOverlayTransition {
-            channel,
-            transition,
-            duration_frames,
+            channel: *channel,
+            transition: *transition,
+            duration_frames: *duration_frames,
         },
         EngineCommand::ConfigureOverlayAppearance {
             channel,
             position,
             border,
         } => SwitcherCommand::ConfigureOverlayAppearance {
-            channel,
-            position,
-            border,
+            channel: *channel,
+            position: *position,
+            border: *border,
         },
-        EngineCommand::QueueOverlay { channel, source } => {
-            SwitcherCommand::QueueOverlay { channel, source }
-        }
-        EngineCommand::TakeNextOverlay { channel } => SwitcherCommand::TakeNextOverlay(channel),
+        EngineCommand::QueueOverlay { channel, source } => SwitcherCommand::QueueOverlay {
+            channel: *channel,
+            source: *source,
+        },
+        EngineCommand::TakeNextOverlay { channel } => SwitcherCommand::TakeNextOverlay(*channel),
         EngineCommand::SetOverlayOutputInclusion {
             channel,
             output,
             included,
         } => SwitcherCommand::SetOverlayOutputInclusion {
-            channel,
-            output,
-            included,
+            channel: *channel,
+            output: *output,
+            included: *included,
         },
         _ => unreachable!("only overlay mutation commands are delegated"),
     };
     state
         .desired_switcher_mut()
-        .apply(command)
+        .apply(switcher_command)
         .map_err(switcher_rejection)?;
-    events.push(EngineEvent::DesiredSwitcherChanged(mutation.command));
-    Ok(EngineAcceptance {
-        target_frame: mutation.target_frame,
-    })
+    events.push(EngineEvent::DesiredSwitcherChanged(command));
+    Ok(EngineAcceptance { target_frame })
 }
 
 fn apply_stinger_mutation(
@@ -1161,54 +1192,62 @@ fn apply_stinger_mutation(
     events: &mut Vec<EngineEvent>,
     mutation: EngineMutation,
 ) -> Result<EngineAcceptance, Rejection> {
+    let EngineMutation {
+        command,
+        target_frame,
+    } = mutation;
     if state.desired_switcher().t_bar().is_some() {
         return Err(Rejection::new(
             RejectionCode::Conflict,
             "Stinger slot configuration cannot change during a manual transition",
         ));
     }
-    match mutation.command {
+    match &command {
         EngineCommand::ConfigureStinger { slot, descriptor } => {
             state
                 .desired_switcher_mut()
-                .configure_stinger(slot, descriptor)
+                .configure_stinger(*slot, *descriptor)
                 .map_err(switcher_rejection)?;
             if descriptor.preload {
                 let _ = state
                     .desired_switcher_mut()
-                    .preload_stinger(slot, true)
+                    .preload_stinger(*slot, true)
                     .map_err(switcher_rejection)?;
             }
         }
-        EngineCommand::RemoveStinger { slot } => state.remove_stinger(slot),
+        EngineCommand::RemoveStinger { slot } => state.remove_stinger(*slot),
         _ => unreachable!("only Stinger mutation commands are delegated"),
     }
-    events.push(EngineEvent::DesiredSwitcherChanged(mutation.command));
-    Ok(EngineAcceptance {
-        target_frame: mutation.target_frame,
-    })
+    events.push(EngineEvent::DesiredSwitcherChanged(command));
+    Ok(EngineAcceptance { target_frame })
 }
 
 fn apply_runtime(
     switcher: &mut SwitcherState,
     command: EngineCommand,
 ) -> Result<Vec<SwitcherEvent>, SwitcherError> {
-    if matches!(command, EngineCommand::SetInputAudioStrip { .. }) {
+    if matches!(
+        &command,
+        EngineCommand::RenameInput { .. } | EngineCommand::SetInputAudioStrip { .. }
+    ) {
         return Ok(Vec::new());
     }
     if let EngineCommand::FadeToBlack {
         active,
         duration_frames,
-    } = command
+    } = &command
     {
         return Ok(switcher
-            .request_fade_to_black(active, duration_frames)
+            .request_fade_to_black(*active, *duration_frames)
             .expect("accepted engine FTB durations are validated"));
     }
-    if is_overlay_command(command) {
+    if is_overlay_command(&command) {
         return apply_runtime_overlay(switcher, command);
     }
     switcher.apply(match command {
+        EngineCommand::RenameInput { .. } => {
+            unreachable!("input renames return before switcher command mapping")
+        }
         EngineCommand::SetInputAudioStrip { .. } => {
             unreachable!("audio-strip commands return before switcher command mapping")
         }
@@ -1321,7 +1360,7 @@ fn apply_runtime_overlay(
     }
 }
 
-const fn is_overlay_command(command: EngineCommand) -> bool {
+const fn is_overlay_command(command: &EngineCommand) -> bool {
     matches!(
         command,
         EngineCommand::TakeOverlay { .. }
@@ -1333,6 +1372,17 @@ const fn is_overlay_command(command: EngineCommand) -> bool {
             | EngineCommand::TakeNextOverlay { .. }
             | EngineCommand::SetOverlayOutputInclusion { .. }
     )
+}
+
+fn rename_input_rejection(error: RenameInputError) -> Rejection {
+    let code = match error {
+        RenameInputError::UnknownInput(_) => RejectionCode::NotFound,
+        RenameInputError::EmptyName | RenameInputError::NameTooLong => {
+            RejectionCode::InvalidCommand
+        }
+        RenameInputError::DuplicateName => RejectionCode::Conflict,
+    };
+    Rejection::new(code, error.to_string())
 }
 
 const fn engine_fade_to_black_state(switcher: &SwitcherState) -> EngineFadeToBlackState {
