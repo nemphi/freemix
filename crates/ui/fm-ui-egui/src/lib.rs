@@ -14,6 +14,7 @@ use fm_types::InputId;
 use fm_ui_model::{ClientView, ManualTransitionStatus, SwitcherState};
 
 mod fade_to_black;
+mod overlay_status;
 
 pub use fade_to_black::{FadeToBlackAvailability, FadeToBlackGate, fade_to_black_availability};
 
@@ -629,10 +630,15 @@ fn draw_overlay_channel(
 ) {
     let channel = WireOverlayChannelId::new(channel_number)
         .expect("Studio renders only overlay channels 1 through 8");
-    let status = state.view.as_ref().and_then(|view| {
-        view.desired_overlays
-            .iter()
-            .find(|overlay| overlay.channel == channel_number)
+    let (desired, realized) = state.view.as_ref().map_or((None, None), |view| {
+        (
+            view.desired_overlays
+                .iter()
+                .find(|overlay| overlay.channel == channel_number),
+            view.realized_overlays
+                .iter()
+                .find(|overlay| overlay.channel == channel_number),
+        )
     });
     let source = state
         .view
@@ -654,7 +660,7 @@ fn draw_overlay_channel(
             enabled && source.is_some(),
             Button::new(format!(
                 "Q+{}",
-                status.map_or(0, |value| value.queued_sources.len())
+                desired.map_or(0, |value| value.queued_sources.len())
             )),
         )
         .on_hover_text("Append the current Preview source to this overlay queue")
@@ -665,14 +671,14 @@ fn draw_overlay_channel(
     }
     if ui
         .add_enabled(
-            enabled && status.is_some_and(|value| !value.queued_sources.is_empty()),
+            enabled && desired.is_some_and(|value| !value.queued_sources.is_empty()),
             Button::new("NEXT"),
         )
         .clicked()
     {
         intents.push(StudioIntent::TakeNextOverlay { channel });
     }
-    let transition = status.map_or(OverlayTransitionKind::Cut, |overlay| overlay.transition);
+    let transition = desired.map_or(OverlayTransitionKind::Cut, |overlay| overlay.transition);
     if ui
         .add_enabled(
             enabled,
@@ -693,10 +699,13 @@ fn draw_overlay_channel(
             duration_frames,
         });
     }
-    let position = status.map_or(OverlayPositionPreset::FullFrame, |overlay| overlay.position);
-    let border = status.map_or(OverlayBorderPreset::None, |overlay| overlay.border);
+    let position = desired.map_or(OverlayPositionPreset::FullFrame, |overlay| overlay.position);
+    let border = desired.map_or(OverlayBorderPreset::None, |overlay| overlay.border);
     if ui
-        .add_enabled(enabled, Button::new(overlay_position_label(position)))
+        .add_enabled(
+            enabled,
+            Button::new(overlay_status::position_label(position)),
+        )
         .on_hover_text("Cycle this overlay channel's position preset")
         .clicked()
     {
@@ -707,7 +716,7 @@ fn draw_overlay_channel(
         });
     }
     if ui
-        .add_enabled(enabled, Button::new(overlay_border_label(border)))
+        .add_enabled(enabled, Button::new(overlay_status::border_label(border)))
         .on_hover_text("Cycle this overlay channel's white border preset")
         .clicked()
     {
@@ -719,7 +728,7 @@ fn draw_overlay_channel(
     }
     if ui
         .add_enabled(
-            enabled && status.is_some_and(|overlay| overlay.active),
+            enabled && desired.is_some_and(|overlay| overlay.active),
             Button::new(RichText::new(format!("O{channel_number} OFF")).strong()),
         )
         .on_hover_text("Remove this overlay channel from Program")
@@ -727,16 +736,7 @@ fn draw_overlay_channel(
     {
         intents.push(StudioIntent::OverlayOff { channel });
     }
-}
-
-const fn overlay_position_label(position: OverlayPositionPreset) -> &'static str {
-    match position {
-        OverlayPositionPreset::FullFrame => "FULL",
-        OverlayPositionPreset::TopLeft => "TL",
-        OverlayPositionPreset::TopRight => "TR",
-        OverlayPositionPreset::BottomLeft => "BL",
-        OverlayPositionPreset::BottomRight => "BR",
-    }
+    ui.label(overlay_status::format(desired, realized));
 }
 
 const fn next_overlay_position(position: OverlayPositionPreset) -> OverlayPositionPreset {
@@ -746,14 +746,6 @@ const fn next_overlay_position(position: OverlayPositionPreset) -> OverlayPositi
         OverlayPositionPreset::TopRight => OverlayPositionPreset::BottomLeft,
         OverlayPositionPreset::BottomLeft => OverlayPositionPreset::BottomRight,
         OverlayPositionPreset::BottomRight => OverlayPositionPreset::FullFrame,
-    }
-}
-
-const fn overlay_border_label(border: OverlayBorderPreset) -> &'static str {
-    match border {
-        OverlayBorderPreset::None => "NO BORDER",
-        OverlayBorderPreset::ThinWhite => "THIN",
-        OverlayBorderPreset::ThickWhite => "THICK",
     }
 }
 
