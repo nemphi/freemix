@@ -413,15 +413,19 @@ const fn numbered_preview_index(key: Key) -> Option<usize> {
     }
 }
 
-fn numbered_preview_shortcuts(
+fn studio_shortcuts(
     ui: &mut Ui,
     gate: TransitionGate,
     can_select_preview: bool,
     inputs: &[InputId],
+    transition_duration_frames: u32,
 ) -> Vec<StudioIntent> {
-    if ui.ctx().egui_wants_keyboard_input()
-        || !preview_selection_available(gate, can_select_preview)
-    {
+    if ui.ctx().egui_wants_keyboard_input() {
+        return Vec::new();
+    }
+    let preview_available = preview_selection_available(gate, can_select_preview);
+    let transition_available = transition_availability(gate).basic();
+    if !preview_available && !transition_available {
         return Vec::new();
     }
     ui.input_mut(|input| {
@@ -437,12 +441,28 @@ fn numbered_preview_shortcuts(
             else {
                 return true;
             };
-            let Some(input) = numbered_preview_index(*key).and_then(|index| inputs.get(index))
-            else {
-                return true;
-            };
-            intents.push(StudioIntent::SelectPreview(*input));
-            false
+            match key {
+                Key::C if transition_available => {
+                    intents.push(StudioIntent::Cut);
+                    false
+                }
+                Key::F if transition_available => {
+                    intents.push(StudioIntent::Fade {
+                        duration_frames: transition_duration_frames,
+                    });
+                    false
+                }
+                _ if preview_available => {
+                    let Some(input) =
+                        numbered_preview_index(*key).and_then(|index| inputs.get(index))
+                    else {
+                        return true;
+                    };
+                    intents.push(StudioIntent::SelectPreview(*input));
+                    false
+                }
+                _ => true,
+            }
         });
         intents
     })
@@ -608,14 +628,17 @@ impl StudioShell {
         self.set_transition_duration_frames(self.transition_duration_frames);
         self.set_fade_to_black_duration_frames(self.fade_to_black_duration_frames);
 
-        let mut intents = state.view.as_ref().map_or_else(Vec::new, |view| {
-            numbered_preview_shortcuts(
-                ui,
-                TransitionGate::from_state(state),
-                state.can_select_preview,
-                &view.inputs,
-            )
-        });
+        let inputs = state
+            .view
+            .as_ref()
+            .map_or(&[] as &[InputId], |view| view.inputs.as_slice());
+        let mut intents = studio_shortcuts(
+            ui,
+            TransitionGate::from_state(state),
+            state.can_select_preview,
+            inputs,
+            self.transition_duration_frames,
+        );
         Frame::new()
             .fill(GRAPHITE)
             .inner_margin(Margin::same(12))
@@ -1577,7 +1600,7 @@ mod tests {
     }
 
     #[test]
-    fn numbered_preview_intent_uses_replicated_order_and_current_gate() {
+    fn studio_shortcuts_preserve_order_duration_and_rejected_events() {
         let inputs = [11, 12, 13, 14, 15, 16, 17, 18].map(input);
         let gate = TransitionGate {
             connection_status: StudioConnectionStatus::Ready,
@@ -1593,6 +1616,9 @@ mod tests {
             modifiers,
         };
         let context = egui::Context::default();
+        let mut shell = StudioShell::default();
+        shell.set_transition_duration_frames(42);
+        let duration = shell.transition_duration_frames();
         let run = |events, gate, can_select_preview, focused| {
             context.begin_pass(egui::RawInput {
                 events,
@@ -1603,12 +1629,12 @@ mod tests {
             }
             let mut ui = egui::Ui::new(
                 context.clone(),
-                egui::Id::new("numbered-preview-shortcut"),
+                egui::Id::new("studio-shortcut"),
                 egui::UiBuilder::new()
                     .layer_id(egui::LayerId::background())
                     .max_rect(context.viewport_rect()),
             );
-            let intents = numbered_preview_shortcuts(&mut ui, gate, can_select_preview, &inputs);
+            let intents = studio_shortcuts(&mut ui, gate, can_select_preview, &inputs, duration);
             let remaining = context.input(|input| input.events.clone());
             drop(ui);
             let _ = context.end_pass();
@@ -1620,6 +1646,8 @@ mod tests {
         };
         let (intents, remaining) = run(
             vec![
+                key(Key::C, Modifiers::NONE, false),
+                key(Key::F, Modifiers::NONE, false),
                 key(Key::Num1, Modifiers::NONE, false),
                 key(Key::Num2, shifted, false),
                 key(Key::Num8, Modifiers::NONE, false),
@@ -1632,11 +1660,22 @@ mod tests {
         assert_eq!(
             intents,
             vec![
+                StudioIntent::Cut,
+                StudioIntent::Fade {
+                    duration_frames: duration,
+                },
                 StudioIntent::SelectPreview(input(11)),
                 StudioIntent::SelectPreview(input(18)),
             ]
         );
         assert_eq!(remaining.len(), 2);
+        assert!(matches!(
+            remaining.as_slice(),
+            [
+                Event::Key { key: Key::Num2, .. },
+                Event::Key { key: Key::Num9, .. }
+            ]
+        ));
 
         context.begin_pass(egui::RawInput {
             events: vec![key(Key::Num3, Modifiers::NONE, false)],
@@ -1659,14 +1698,19 @@ mod tests {
             manual_transition_in_flight: true,
             ..gate
         };
-        let (intents, remaining) = run(
-            vec![key(Key::Num1, Modifiers::NONE, false)],
-            blocked,
-            true,
-            false,
-        );
+        let transition_events = vec![
+            key(Key::C, Modifiers::NONE, false),
+            key(Key::F, Modifiers::NONE, false),
+        ];
+        let (intents, remaining) = run(transition_events.clone(), blocked, true, false);
         assert!(intents.is_empty());
-        assert_eq!(remaining.len(), 1);
+        assert!(matches!(
+            remaining.as_slice(),
+            [
+                Event::Key { key: Key::C, .. },
+                Event::Key { key: Key::F, .. }
+            ]
+        ));
 
         let (intents, remaining) = run(
             vec![key(Key::Num1, Modifiers::NONE, false)],
@@ -1677,14 +1721,15 @@ mod tests {
         assert!(intents.is_empty());
         assert_eq!(remaining.len(), 1);
 
-        let (intents, remaining) = run(
-            vec![key(Key::Num1, Modifiers::NONE, false)],
-            gate,
-            true,
-            true,
-        );
+        let (intents, remaining) = run(transition_events.clone(), gate, true, true);
         assert!(intents.is_empty());
-        assert_eq!(remaining.len(), 1);
+        assert!(matches!(
+            remaining.as_slice(),
+            [
+                Event::Key { key: Key::C, .. },
+                Event::Key { key: Key::F, .. }
+            ]
+        ));
     }
 
     #[test]
