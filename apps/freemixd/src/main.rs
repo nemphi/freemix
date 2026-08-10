@@ -6352,6 +6352,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let (terminated_tx, terminated_rx) = std::sync::mpsc::sync_channel(1);
+        let (completed_tx, completed_rx) = std::sync::mpsc::sync_channel(1);
         let server_thread = thread::spawn(move || {
             let store = ProjectStore::new(project_path).unwrap();
             let mut durable = test_project();
@@ -6405,11 +6406,15 @@ mod tests {
                 &mut OnceClientOutcome::Unserved,
             )
             .unwrap();
+            completed_tx.send(()).unwrap();
         });
 
         let client = TcpStream::connect(address).unwrap();
         client
             .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        client
+            .set_write_timeout(Some(Duration::from_secs(1)))
             .unwrap();
         let (_, server) = complete_test_handshake(&client);
         write_message(
@@ -6429,9 +6434,13 @@ mod tests {
         next_client
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
+        next_client
+            .set_write_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
         complete_test_handshake(&next_client);
         drop(next_client);
 
+        completed_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         server_thread.join().unwrap();
     }
 
