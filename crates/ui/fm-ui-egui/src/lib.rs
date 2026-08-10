@@ -640,7 +640,7 @@ impl StudioShell {
             .view
             .as_ref()
             .map_or(&[] as &[InputId], |view| view.inputs.as_slice());
-        let manual_transition_availability = manual_transition_availability(
+        let manual_transition_controls = manual_transition_availability(
             ManualTransitionGate::from_state(state),
             state.view.as_ref().is_some_and(|view| {
                 matches!(
@@ -653,7 +653,7 @@ impl StudioShell {
             ui,
             TransitionGate::from_state(state),
             state.can_select_preview,
-            manual_transition_availability.active_controls,
+            manual_transition_controls.active_controls,
             inputs,
             self.transition_duration_frames,
         );
@@ -678,7 +678,7 @@ impl StudioShell {
                 );
                 self.set_fade_to_black_duration_frames(self.fade_to_black_duration_frames);
                 ui.add_space(8.0);
-                draw_manual_transition(ui, state, manual_transition_availability, &mut intents);
+                draw_manual_transition(ui, state, manual_transition_controls, &mut intents);
                 ui.add_space(8.0);
                 draw_input_audio_strips(ui, state, &mut intents);
                 ui.add_space(8.0);
@@ -1679,8 +1679,16 @@ mod tests {
             ]
         ));
 
+        context.begin_pass(egui::RawInput {
+            events: vec![key(Key::Num3, Modifiers::NONE, false)],
+            ..Default::default()
+        });
+        let _ = context.end_pass();
         let (intents, remaining) = run(
-            vec![key(Key::Escape, Modifiers::NONE, true)],
+            vec![
+                key(Key::Num3, Modifiers::NONE, false),
+                key(Key::Escape, Modifiers::NONE, true),
+            ],
             gate,
             true,
             true,
@@ -1689,7 +1697,18 @@ mod tests {
         assert!(intents.is_empty());
         assert!(matches!(
             remaining.as_slice(),
-            [Event::Key { repeat: true, .. }]
+            [
+                Event::Key {
+                    key: Key::Num3,
+                    repeat: true,
+                    ..
+                },
+                Event::Key {
+                    key: Key::Escape,
+                    repeat: true,
+                    ..
+                }
+            ]
         ));
 
         let blocked = TransitionGate {
