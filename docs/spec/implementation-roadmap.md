@@ -1106,6 +1106,8 @@ Exit: `P0` switcher, composition, audio, display, record, and control rows pass.
    screen/camera/application-audio permission, clock, reconnect, and logout
    behavior.
 7. Implement engine OS service mode, health/readiness, support bundles.
+   The non-native scheduler gives established peers a bounded retryable shutdown
+   notice before it returns an internal command error.
 8. Implement remote browser control, WebRTC multiview preview, roles/pairing.
 9. Add disk/network/GPU preflight and alert policy.
 10. Run process-kill, disk-full, network impairment, and 24-hour soak. (needs to be in a VM or something else, don't kill my pc)

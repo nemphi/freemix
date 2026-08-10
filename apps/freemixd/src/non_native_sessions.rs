@@ -226,7 +226,7 @@ pub(super) fn run(
                 Ok(()) => drain_live(&mut peers, &mut close, &mut live_budget),
                 Err(DispatchError::Peer) => close[index] = true,
                 Err(DispatchError::Daemon(error)) => {
-                    close_all(&mut peers, control);
+                    shutdown_peers(&mut peers, control);
                     return Err(error);
                 }
             }
