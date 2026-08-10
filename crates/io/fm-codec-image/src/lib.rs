@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! Bounded decoding for static PNG, JPEG, and WebP still images.
+//! Bounded decoding for static PNG and JPEG still images.
 //!
 //! Images without an ICC profile are decoded without color conversion and
 //! tagged as full-range, straight-alpha sRGB BT.709 RGB. Embedded ICC profiles
@@ -14,21 +14,18 @@ use fm_frame::{
     CpuVideoPlane, MatrixCoefficients, MediaTiming, PixelFormat, SignalRange, TransferFunction,
     VideoDimensions, VideoFrameMetadata, VideoFrameMetadataError, VideoPayloadError,
 };
-use image::codecs::webp::WebPDecoder;
 use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageError, ImageFormat, ImageReader, Limits};
 
 const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 const JPEG_SIGNATURE: &[u8; 2] = b"\xff\xd8";
 const ICC_JPEG_SIGNATURE: &[u8; 12] = b"ICC_PROFILE\0";
-const WEBP_SIGNATURE_LENGTH: usize = 12;
 
 /// Encoded still-image formats accepted by [`decode_still`].
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum StillFormat {
     Png,
     Jpeg,
-    WebP,
 }
 
 /// Caller-controlled resource bounds for one still-image decode.
@@ -74,7 +71,6 @@ pub enum StillDecodeError {
     EncodedBytesTooLarge { actual: usize, maximum: usize },
     UnsupportedFormat,
     AnimatedPngUnsupported,
-    AnimatedWebpUnsupported,
     CorruptInput { format: StillFormat },
     WidthTooLarge { actual: u32, maximum: u32 },
     HeightTooLarge { actual: u32, maximum: u32 },
@@ -95,12 +91,9 @@ impl fmt::Display for StillDecodeError {
                 "encoded image is {actual} bytes, exceeding the {maximum}-byte limit"
             ),
             Self::UnsupportedFormat => {
-                formatter.write_str("input is not a supported PNG, JPEG, or WebP image")
+                formatter.write_str("input is not a supported PNG or JPEG image")
             }
             Self::AnimatedPngUnsupported => formatter.write_str("animated PNG is not supported"),
-            Self::AnimatedWebpUnsupported => {
-                formatter.write_str("animated WebP is not supported")
-            }
             Self::CorruptInput { format } => write!(formatter, "corrupt {format} image"),
             Self::WidthTooLarge { actual, maximum } => {
                 write!(formatter, "image width {actual} exceeds {maximum}")
@@ -157,12 +150,11 @@ impl fmt::Display for StillFormat {
         formatter.write_str(match self {
             Self::Png => "PNG",
             Self::Jpeg => "JPEG",
-            Self::WebP => "WebP",
         })
     }
 }
 
-/// Decodes static PNG, JPEG, or WebP bytes into straight-alpha RGBA8.
+/// Decodes static PNG or JPEG bytes into straight-alpha RGBA8.
 ///
 /// Format detection uses signatures rather than file names. Every nonempty ICC
 /// profile is rejected because the destination supports only enumerated color
@@ -171,7 +163,7 @@ impl fmt::Display for StillFormat {
 /// # Errors
 ///
 /// Returns a typed format, corruption, metadata, resource-limit, or frame-layout
-/// error. APNG and animated WebP input are always rejected.
+/// error. APNG input is always rejected.
 pub fn decode_still(
     encoded: &[u8],
     timing: MediaTiming,
@@ -193,22 +185,12 @@ pub fn decode_still(
         StillFormat::Jpeg if inspect_jpeg_icc(encoded, limits.max_icc_bytes)? => {
             return Err(StillDecodeError::EmbeddedIccUnsupported);
         }
-        StillFormat::WebP => {
-            let decoder = WebPDecoder::new(Cursor::new(encoded)).map_err(|error| {
-                map_image_error(&error, format, limits.max_image_alloc_bytes, None)
-            })?;
-            if decoder.has_animation() {
-                return Err(StillDecodeError::AnimatedWebpUnsupported);
-            }
-            return decode_with_decoder(decoder, timing, limits, format);
-        }
         StillFormat::Jpeg => {}
     }
 
     let image_format = match format {
         StillFormat::Png => ImageFormat::Png,
         StillFormat::Jpeg => ImageFormat::Jpeg,
-        StillFormat::WebP => unreachable!("WebP uses its concrete decoder"),
     };
     let mut reader = ImageReader::with_format(Cursor::new(encoded), image_format);
     let mut image_limits = Limits::default();
@@ -257,7 +239,7 @@ fn decode_with_decoder(
     let orientation = decoder
         .orientation()
         .map_err(|error| map_image_error(&error, format, limits.max_image_alloc_bytes, None))?;
-    let source_has_alpha = decoder.color_type().has_alpha();
+    let source_has_alpha = format == StillFormat::Png && decoder.color_type().has_alpha();
     let source_dimensions =
         VideoDimensions::new(width, height).ok_or(StillDecodeError::CorruptInput { format })?;
     let (output_width, output_height) = if matches!(
@@ -399,7 +381,7 @@ fn validate_layout(
     })
 }
 
-/// Classifies an encoded prefix as PNG, JPEG, or WebP from its signature bytes.
+/// Classifies an encoded prefix as PNG or JPEG from its signature bytes.
 ///
 /// Only signature bytes are inspected; no image decoding or validation occurs.
 /// File names and extensions are not considered.
@@ -413,11 +395,6 @@ pub fn sniff_still_format(encoded_prefix: &[u8]) -> Result<StillFormat, StillDec
         Ok(StillFormat::Png)
     } else if encoded_prefix.starts_with(JPEG_SIGNATURE) {
         Ok(StillFormat::Jpeg)
-    } else if encoded_prefix.len() >= WEBP_SIGNATURE_LENGTH
-        && &encoded_prefix[..4] == b"RIFF"
-        && &encoded_prefix[8..WEBP_SIGNATURE_LENGTH] == b"WEBP"
-    {
-        Ok(StillFormat::WebP)
     } else {
         Err(StillDecodeError::UnsupportedFormat)
     }

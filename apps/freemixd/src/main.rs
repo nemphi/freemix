@@ -2706,9 +2706,9 @@ fn resolve_native_media_source(
             error.kind()
         ))
     })?;
-    let mut prefix = Vec::with_capacity(12);
+    let mut prefix = Vec::with_capacity(8);
     Read::by_ref(&mut file)
-        .take(12)
+        .take(8)
         .read_to_end(&mut prefix)
         .map_err(|error| {
             AppFailure(format!(
