@@ -3977,20 +3977,22 @@ fn record_heartbeat(
     if heartbeat.server != *server {
         return Err("heartbeat server identity does not match the session".into());
     }
-    let received_at_ms = now_millis().map_err(|error| error.to_string())?;
-    let Some(cursor) = &heartbeat.last_applied else {
-        return Ok(received_at_ms);
+    let last_applied = if let Some(cursor) = &heartbeat.last_applied {
+        if cursor.server != *server {
+            return Err("heartbeat cursor identity does not match the session".into());
+        }
+        if cursor.revision > control.borrow().diagnostics().current_revision {
+            return Err("heartbeat cursor is ahead of the server revision".into());
+        }
+        Some(event_cursor(cursor))
+    } else {
+        None
     };
-    if cursor.server != *server {
-        return Err("heartbeat cursor identity does not match the session".into());
-    }
-    if cursor.revision > control.borrow().diagnostics().current_revision {
-        return Err("heartbeat cursor is ahead of the server revision".into());
-    }
+    let received_at_ms = now_millis().map_err(|error| error.to_string())?;
     session
         .record_heartbeat(
             Heartbeat {
-                last_applied: event_cursor(cursor),
+                last_applied,
                 clock_sample_ms: heartbeat.sent_at_ms,
             },
             received_at_ms,
@@ -6161,7 +6163,10 @@ mod tests {
 
     #[test]
     fn expired_tcp_session_is_reclaimed_for_next_client() {
-        fn complete_handshake(stream: &TcpStream) {
+        const HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(600);
+        const HEARTBEAT_DELAY: Duration = Duration::from_millis(200);
+
+        fn complete_handshake(stream: &TcpStream) -> (MessageReader, ServerIdentity) {
             write_message(
                 &mut stream.try_clone().unwrap(),
                 &WireMessage::HandshakeRequest(HandshakeRequest {
@@ -6174,20 +6179,23 @@ mod tests {
             )
             .unwrap();
             let mut reader = MessageReader::new(stream.try_clone().unwrap());
-            assert!(matches!(
-                reader.read_message_with_idle(|| Ok(false)).unwrap(),
-                Some(WireMessage::HandshakeResponse(_))
-            ));
+            let Some(WireMessage::HandshakeResponse(response)) =
+                reader.read_message_with_idle(|| Ok(false)).unwrap()
+            else {
+                panic!("expected handshake response");
+            };
             assert!(matches!(
                 reader.read_message_with_idle(|| Ok(false)).unwrap(),
                 Some(WireMessage::Snapshot(_))
             ));
+            (reader, response.server)
         }
 
         let directory = tempfile::tempdir().unwrap();
         let project_path = directory.path().join("show.freemix");
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
+        let (expired_tx, expired_rx) = std::sync::mpsc::channel();
         let server_thread = thread::spawn(move || {
             let store = ProjectStore::new(project_path).unwrap();
             let mut durable = test_project();
@@ -6201,14 +6209,14 @@ mod tests {
                 CAPABILITIES_DIGEST,
             )
             .with_session_limits(fm_server::SessionLimits {
-                heartbeat_timeout_ms: 50,
+                heartbeat_timeout_ms: u64::try_from(HEARTBEAT_TIMEOUT.as_millis()).unwrap(),
                 ..fm_server::SessionLimits::default()
             });
             let mut server = Server::new(config, ControlHandle(Rc::clone(&control))).unwrap();
             server.mark_ready().unwrap();
             let principal = development_principal().unwrap();
 
-            for _ in 0..2 {
+            for client_index in 0..2 {
                 let (stream, _) = listener.accept().unwrap();
                 handle_client(
                     stream,
@@ -6222,19 +6230,56 @@ mod tests {
                     None,
                 )
                 .unwrap();
+                if client_index == 0 {
+                    expired_tx.send(()).unwrap();
+                }
             }
         });
 
-        let mut clients = Vec::new();
-        for _ in 0..2 {
-            let client = TcpStream::connect(address).unwrap();
-            client
-                .set_read_timeout(Some(Duration::from_secs(1)))
-                .unwrap();
-            complete_handshake(&client);
-            clients.push(client);
-        }
-        drop(clients.pop());
+        let client = TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let (mut reader, server) = complete_handshake(&client);
+        let original_deadline = Instant::now() + HEARTBEAT_TIMEOUT;
+        assert!(matches!(
+            expired_rx.recv_timeout(HEARTBEAT_DELAY),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        let heartbeat_sent_at = Instant::now();
+        write_message(
+            &mut client.try_clone().unwrap(),
+            &WireMessage::Heartbeat(HeartbeatMessage {
+                server: server.clone(),
+                sequence: 1,
+                sent_at_ms: 1_234,
+                last_applied: None,
+            }),
+        )
+        .unwrap();
+        let Some(WireMessage::HeartbeatAcknowledgement(acknowledgement)) =
+            reader.read_message_with_idle(|| Ok(false)).unwrap()
+        else {
+            panic!("expected heartbeat acknowledgement");
+        };
+        assert_eq!(acknowledgement.server, server);
+        assert_eq!(acknowledgement.heartbeat_sequence, 1);
+
+        assert!(matches!(
+            expired_rx.recv_timeout(original_deadline.saturating_duration_since(Instant::now())),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(Instant::now() >= original_deadline);
+        expired_rx.recv_timeout(HEARTBEAT_TIMEOUT).unwrap();
+        assert!(heartbeat_sent_at.elapsed() >= HEARTBEAT_TIMEOUT);
+
+        let next_client = TcpStream::connect(address).unwrap();
+        next_client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        complete_handshake(&next_client);
+        drop(next_client);
 
         server_thread.join().unwrap();
     }

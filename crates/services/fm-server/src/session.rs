@@ -20,7 +20,7 @@ pub enum SessionState {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Heartbeat {
-    pub last_applied: EventCursor,
+    pub last_applied: Option<EventCursor>,
     pub clock_sample_ms: u64,
 }
 
@@ -299,7 +299,7 @@ impl Session {
         Ok(bytes)
     }
 
-    /// Records the client's latest applied cursor and clock sample.
+    /// Records the client's clock sample and optional latest applied cursor.
     ///
     /// # Errors
     ///
@@ -311,19 +311,21 @@ impl Session {
         received_at_ms: u64,
     ) -> Result<(), SessionError> {
         self.ensure_connected()?;
-        if heartbeat.last_applied.engine != self.engine {
-            return Err(SessionError::CursorIdentityMismatch);
-        }
-        if self
-            .heartbeat
-            .last_applied
-            .as_ref()
-            .is_some_and(|cursor| heartbeat.last_applied.revision < cursor.revision)
-        {
-            return Err(SessionError::CursorRegression);
+        if let Some(cursor) = heartbeat.last_applied {
+            if cursor.engine != self.engine {
+                return Err(SessionError::CursorIdentityMismatch);
+            }
+            if self
+                .heartbeat
+                .last_applied
+                .as_ref()
+                .is_some_and(|previous| cursor.revision < previous.revision)
+            {
+                return Err(SessionError::CursorRegression);
+            }
+            self.heartbeat.last_applied = Some(cursor);
         }
 
-        self.heartbeat.last_applied = Some(heartbeat.last_applied);
         self.heartbeat.client_clock_sample_ms = Some(heartbeat.clock_sample_ms);
         self.heartbeat.last_received_at_ms = received_at_ms;
         self.heartbeat.received_total = self.heartbeat.received_total.saturating_add(1);

@@ -340,7 +340,7 @@ fn heartbeat_tracks_cursor_and_times_out() {
     session
         .record_heartbeat(
             Heartbeat {
-                last_applied: cursor.clone(),
+                last_applied: Some(cursor.clone()),
                 clock_sample_ms: 90,
             },
             200,
