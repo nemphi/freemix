@@ -3511,7 +3511,10 @@ fn serve_inner(
             {
                 break reason;
             }
-            if !is_client_disconnect(error.as_ref()) && !is_client_protocol_error(error.as_ref()) {
+            if !is_client_disconnect(error.as_ref())
+                && !is_client_protocol_error(error.as_ref())
+                && !is_client_session_termination(error.as_ref())
+            {
                 return Err(error);
             }
         }
@@ -5006,6 +5009,17 @@ fn is_client_protocol_error(error: &(dyn Error + 'static)) -> bool {
     error.downcast_ref::<ClientProtocolError>().is_some()
 }
 
+fn is_client_session_termination(error: &(dyn Error + 'static)) -> bool {
+    if let Some(error) = error.downcast_ref::<SessionError>() {
+        return matches!(
+            error,
+            SessionError::OutboundRateLimited
+                | SessionError::Disconnected(DisconnectReason::SlowClient)
+        );
+    }
+    error.source().is_some_and(is_client_session_termination)
+}
+
 fn development_principal() -> AppResult<Principal> {
     Ok(Principal::development(
         UserId::new("local-operator")?,
@@ -6328,6 +6342,96 @@ mod tests {
         complete_test_handshake(&next_peer);
 
         drop(next_peer);
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn outbound_rate_limited_client_releases_accept_loop() {
+        let directory = tempfile::tempdir().unwrap();
+        let project_path = directory.path().join("show.freemix");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (terminated_tx, terminated_rx) = std::sync::mpsc::sync_channel(1);
+        let server_thread = thread::spawn(move || {
+            let store = ProjectStore::new(project_path).unwrap();
+            let mut durable = test_project();
+            let project_id = durable.project().id();
+            let control = Rc::new(RefCell::new(test_control(&durable)));
+            let authority = control_server_identity(&control.borrow(), project_id);
+            let config = ServerConfig::new(
+                ServerMode::Development,
+                AuthenticationMode::Development,
+                address.ip(),
+                CAPABILITIES_DIGEST,
+            )
+            .with_session_limits(fm_server::SessionLimits {
+                outbound_messages: fm_server::RateLimit::new(2, 60_000),
+                ..fm_server::SessionLimits::default()
+            });
+            let mut server = Server::new(config, ControlHandle(Rc::clone(&control))).unwrap();
+            server.mark_ready().unwrap();
+            let principal = development_principal().unwrap();
+
+            let (stream, _) = listener.accept().unwrap();
+            let error = handle_client(
+                stream,
+                &server,
+                &control,
+                &store,
+                &mut durable,
+                &principal,
+                &authority,
+                None,
+                None,
+                &mut OnceClientOutcome::Unserved,
+            )
+            .unwrap_err();
+            assert!(!is_client_disconnect(error.as_ref()));
+            assert!(!is_client_protocol_error(error.as_ref()));
+            assert!(is_client_session_termination(error.as_ref()));
+            terminated_tx.send(()).unwrap();
+
+            let (stream, _) = listener.accept().unwrap();
+            handle_client(
+                stream,
+                &server,
+                &control,
+                &store,
+                &mut durable,
+                &principal,
+                &authority,
+                None,
+                None,
+                &mut OnceClientOutcome::Unserved,
+            )
+            .unwrap();
+        });
+
+        let client = TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let (_, server) = complete_test_handshake(&client);
+        write_message(
+            &mut client.try_clone().unwrap(),
+            &WireMessage::Heartbeat(HeartbeatMessage {
+                server,
+                sequence: 1,
+                sent_at_ms: 1_234,
+                last_applied: None,
+            }),
+        )
+        .unwrap();
+        terminated_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        drop(client);
+
+        let next_client = TcpStream::connect(address).unwrap();
+        next_client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        complete_test_handshake(&next_client);
+        drop(next_client);
+
         server_thread.join().unwrap();
     }
 
