@@ -13,6 +13,14 @@ the same phase order but narrow certified devices and overlap less.
 Phases ship vertical slices. Do not build every input before one end-to-end
 camera-to-display-to-record path is reliable.
 
+During current development, the repository carries one project schema, one wire
+protocol, and one exact plugin ABI/state-snapshot version only. Breaking changes
+replace those contracts in place: do not add schema or snapshot migrations,
+protocol downgrade projections, plugin ABI ranges, legacy API facades,
+compatibility fixtures, or backward-regression gates. Delete superseded paths
+and update current-contract coverage. Version compatibility policy is outside
+this development roadmap.
+
 ## 2. Phase 0 — feasibility and constraints (6–10 weeks)
 
 Build disposable prototypes, not production abstractions.
@@ -25,7 +33,7 @@ Build disposable prototypes, not production abstractions.
 5. Prototype engine/studio process separation and local shared preview.
 6. Validate FFmpeg/GStreamer/vendor SDK redistribution and codec patent posture.
 7. Acquire representative GPU, capture, audio, controller, and storage hardware.
-8. Freeze the vMix 29 compatibility ledger and tag every row with acceptance
+8. Freeze the vMix 29 feature-parity ledger and tag every row with acceptance
    owner and applicable platform.
 
 Exit:
@@ -40,7 +48,7 @@ Exit:
 
 1. Create workspace, dependency policy, CI, `xtask`, and binary skeletons.
 2. Implement `fm-types`, IDs, formats, time/rates, color/audio metadata.
-3. Implement project schema, migration harness, journal, atomic save.
+3. Implement the current project schema, journal, and atomic save.
 4. Implement commands, events, revisions, idempotency, transactions.
 5. Implement capability registry and compatibility report.
 6. Materialize `parity.toml` from the ledger with phase, owning workstream,
@@ -48,9 +56,11 @@ Exit:
    missing or duplicate mappings.
 7. Implement editable graph, validation, plan representation, bounded budgets.
 8. Implement deterministic clock, fake video/audio sources/sinks, and scheduler.
-9. Implement server handshake, snapshot/event resume, auth development mode.
+9. Implement exact-current server handshake, snapshot/event resume, auth
+   development mode.
 10. Implement UI replicated model and a diagnostic client.
-11. Add golden protocol/project fixtures and simulated end-to-end tests.
+11. Add current-contract protocol/project integration and simulated end-to-end
+    tests.
 
 Exit: a headless simulated production can be controlled by CLI and client,
 saved, restarted, resumed, and tested deterministically.
@@ -82,20 +92,16 @@ rotation, translation, opacity, stable z-order, premultiplied source-over, and
 canonical RGBA16F inputs. It also executes hard-edged rectangular masks in
 half-open post-crop source space, with exact CPU-oracle coverage and ignored
 native Metal readback coverage that remains opt-in and is not claimed without
-an adapter. Schema v7 persists each scene background and each layer's explicit
+an adapter. The current schema persists each scene background and each layer's explicit
 input/scene source, geometry, crop, optional hard-edged rectangular mask,
-opacity, and z-order; rectangular masks were introduced in schema v6. Mask
+opacity, and z-order. Mask
 bounds are validated against the effective
 post-crop source dimensions before native planning; inversion does not change
-planner capacity or transient-resource accounting. The explicit v5-to-v6
-migration defaults existing layers to no mask while preserving exact desired
-and realized manual-transition state.
+planner capacity or transient-resource accounting.
 `InputKind::Scene` explicitly routes a `SceneId` plus an optional audio
 `InputId`, while every persisted output explicitly routes a video `SceneId` and
-audio `BusId`. The explicit v3-to-v4 migration supplies opaque-black,
-canvas-identity, no-crop, full-opacity, and zero-z-order defaults while
-preserving legacy sources and layer counts; outputs are preserved as declared
-and are not inferred. Native `freemixd` now consumes this visual model,
+audio `BusId`; outputs are preserved as declared and are not inferred. Native
+`freemixd` now consumes this visual model,
 including the persisted rectangular mask, through the bounded scene planner
 described under Phase 3 item 4 instead of rejecting scene inputs. Feathered or
 non-rectangular masks, keys, effects, per-output realization, live
@@ -105,13 +111,11 @@ this item, so its parity rows remain planned.
 Current implementation boundary for item 5: `freemix-studio` opens a native
 `eframe`/wgpu shell by default with responsive Program/Preview monitor wells,
 stable-ID input tiles, realized/desired tally, and permission-gated Cut/Fade/Wipe
-controls. Studio advertises protocol 1.4; Wipe additionally requires protocol
-1.3, while manual Fade/Wipe T-bar controls require protocol 1.4, transition
-permission, synchronized state, and Ready lifecycle. The manual panel displays
+controls. Manual Fade/Wipe T-bar controls require transition permission,
+synchronized state, and Ready lifecycle. The manual panel displays
 replicated desired and realized kind, routing, and exact integer basis-point
 position. Bounded worker channels preserve strict operator FIFO while
-recovering: unresolved or deferred versioned commands cannot cross a protocol
-downgrade, and later supported intents cannot overtake them. `fm-client` retains a
+recovering, and later intents cannot overtake unresolved commands. `fm-client` retains a
 bounded terminal command history (256 by default, configurable through 65,536),
 while replay-receipt collisions mark affected sent commands terminal-uncertain,
 force authoritative snapshot resynchronization, and remain visibly sticky in
@@ -128,12 +132,11 @@ capped, and supervised daemon shutdown or restart performs bounded
 process-group/job and descendant cleanup. Project input names and video frames
 are not present in the replicated client contract, so tiles use ordinal/ID
 labels and monitor wells state that real preview delivery remains pending.
-`freemix-web` likewise declares protocol 1.5 support in its client configuration.
+`freemix-web` likewise declares only the current protocol in its client configuration.
 Its transport-free semantic presentation model preserves the existing
 permission- and protocol-gated Cut/Fade/Wipe controls and adds manual Fade/Wipe
 Start, exact basis-point Position, Commit, and Cancel controls. Manual controls
-are hidden below protocol 1.4 and otherwise derive availability from Ready
-state, transition permission, and separate authoritative desired and realized
+derive availability from Ready state, transition permission, and separate authoritative desired and realized
 manual projections. It also models protocol-gated FTB actions and exact state.
 Web still has no browser renderer or network runtime, and the remaining
 transition families plus cross-platform output acceptance keep item 5 and
@@ -178,8 +181,8 @@ metadata-output/decode bounds plus subprocess timeouts can reject deep playback
 or restore transactionally.
 
 `fm-audio` provides a deterministic reference Master with planar F32 mapping,
-gain/mute/follow-video, meters, timed canonical blocks, sample-count timing
-validation, and transactional gain ramps. Its bounded
+gain/stereo-balance/mute/solo/follow-video, meters, timed canonical blocks,
+sample-count timing validation, and transactional gain and balance ramps. Its bounded
 `ClockMappedAudioSynchronizer` is now connected to native `freemixd` local-file
 audio. The daemon accepts source rates such as 44.1 kHz and linearly resamples
 them to the 48 kHz project Master while preserving absolute source and Master
@@ -190,20 +193,40 @@ audio is trimmed and delayed audio produces bounded leading silence. Every
 decoded source, including an inactive one, advances on every Master interval so
 later switching does not replay stale audio.
 
-Schema v7 also persists one exact per-input audio strip as bounded integer
-milli-dB gain (`-96000..=24000`), mute, and follow-video. The explicit v6-to-v7
-migration adds unity gain, unmuted, follow-video-enabled records for every
-input kind while preserving v6 masks and exact v5 desired/realized manual
-transition state. Native daemon preflight transactionally maps those records
-to `fm-audio::Gain` and constructs both Master mixer copies with the target
-gain applied immediately rather than as a restart ramp. Checkpoint/restart
-keeps the strips because engine routing projection clones the canonical
-project. Persistence, generated-audio, AFV selected/inactive, mute, immediate
-startup gain, and failed-preflight no-partial-state tests cover this slice.
-There are still no live strip commands or operator controls, meters in the
-studio, pan/solo/PFL, realized strip delay, labels/groups, bus sends,
-microphone automix, device-audio path, or acceptance evidence. Phase 2 item 7
-is partial, Phase 3 item 3 is partial, and `AU-001`/`AU-007` remain planned.
+The current schema also persists one exact per-input audio strip as bounded
+integer milli-dB gain (`-96000..=24000`), stereo balance
+(`-10000..=10000` basis points), mute, solo, follow-video, and a bounded
+0–48,000-sample delay. Native daemon preflight transactionally maps those
+records to `fm-audio::Gain` and `fm-audio::Balance` and constructs both Master
+mixer copies with the target gain, balance, and delay applied immediately.
+Protocol 2.8 carries authoritative input IDs and canonical names plus full-strip
+status in snapshots, and durable events carry full-strip state plus one
+permission-gated atomic live strip command. The engine schedules
+accepted gain, balance, mute, solo, follow-video, and delay changes together at a frame boundary, and
+native realization updates active and pending Master/Stinger mixers and the
+checkpoint project atomically. Live gain and balance changes then ramp linearly
+over 240 samples (5 ms at the 48 kHz project Master rate) while mute,
+solo, follow-video, and delay take effect at the next rendered sample; restored strips
+remain immediate. Balance is linear after channel mapping: negative values
+attenuate the right destination, positive values attenuate the left destination,
+and non-stereo destination labels remain at unity.
+Solo is solo-in-place across the logical Master strips: if any strip is soloed,
+every non-soloed strip is gated. Mute and follow-video remain independent gates,
+so a muted or video-inactive soloed strip can intentionally produce silence.
+Local and remote CLI commands, Studio controls,
+and the Web semantic control model expose the same bounded mutation. Restart
+restores engine desired state from the canonical strips and checkpoints it back
+to the project. Current-contract persistence, generated-audio, AFV
+selected/inactive, mute, solo, immediate startup gain/balance/delay, live full-strip realization,
+and failed-preflight no-partial-state tests cover this slice.
+
+Studio input tiles and mixer strips use exact persisted input names carried by
+the snapshot rather than generated ordinal labels. There are still no audio
+meters in Studio, PFL, strip-name editing/groups, bus
+sends, microphone automix, device-audio path,
+device-clock correction, native EQ/gate/compressor/limiter, or acceptance
+evidence. Phase 2 item 7 is partial, Phase 3 item 3 is partial, and
+`AU-001`/`AU-007` remain planned.
 
 The worker and synchronizer retain bounded blocks, samples, and bytes. Refills
 reserve capacity before nonblocking dispatch, prioritize uncovered sources, and
@@ -222,17 +245,15 @@ physical leaf or explicit silence. Cut keeps one source at unity; Fade and Wipe
 crossfade two sources with sample-linear gains from each interval's explicit
 start/end mix endpoints. Physical terminals render once per interval, but
 distinct logical strips that share one terminal remain independent mixer
-submissions with their own gain/mute/follow-video state and transition
+submissions with their own gain/balance/mute/solo/follow-video state and transition
 coefficients. Truly identical logical Program IDs submit once at unity.
 Automatic Fade and held or reversed Fade and Wipe T-bar movement propagate exact
 endpoints. The manual-transition core is exposed through `EngineCommand` and
-protocol 1.4, and schema v7 preserves exact desired and realized manual state
-across replay-safe daemon restart, including through the explicit v5-to-v6
-no-mask migration. The CLI exposes local and remote manual Start, exact integer
+the current protocol, and the current schema preserves exact desired and realized
+manual state across replay-safe daemon restart. The CLI exposes local and remote manual Start, exact integer
 position, Commit, and Cancel commands; its local path restores and saves the
-schema-v7 engine state and its remote path gates the commands at protocol 1.4.
-Studio negotiates protocol 1.4 and exposes permission-gated manual Fade/Wipe
-controls while Ready. Web now has only a protocol-1.4 transport-free semantic
+current engine state. Studio exposes permission-gated manual Fade/Wipe
+controls while Ready. Web now has only a current-contract transport-free semantic
 manual-control model; it still has no browser renderer or network runtime.
 Missing local audio, stills, scene silence, and
 configured simulated silence produce silence; unsupported simulated sine audio
@@ -386,6 +407,51 @@ lifecycle.
 9. Add shortcuts and initial MIDI/OSC/controller support.
 10. Certify Profile A without network contribution.
 
+Current implementation boundary for item 6: the switcher and engine now own
+eight independently addressed overlay channels with a retained source, exact
+on/off state, source update, a deduplicated set of included output IDs, and an
+independent Cut/Fade transition with a bounded 1–3,600-frame duration.
+Overlay commands are frame-boundary mutations independent of an active Program
+transition, and desired/realized overlay arrays are included in engine frames,
+durable switcher events, snapshots, client projections, and idle checkpoint
+validation. Fade realization advances channel opacity deterministically, keeps
+fade-out channels active until their zero-opacity endpoint, and rejects idle
+snapshots while any channel is moving. Every channel also owns a bounded
+64-source FIFO queue and deterministic full-frame, top-left, top-right,
+bottom-left, and bottom-right position presets plus none/thin-white/thick-white
+inset-border presets. Schema 16 persists the complete desired and realized
+arrays, appearance, queue state, and exact per-input audio strips, and accepts schema
+16 only. Protocol 2.8 carries canonical input names, opacity, transition kind,
+duration, Take, Update,
+Off, output inclusion, transition/appearance configuration, Queue, Take Next,
+and atomic per-input audio-strip commands and state, and accepts protocol 2.8 only.
+
+Control authorization treats overlay mutations as transition operations. The
+client/UI reducer validates exactly eight unique channels, active-source
+references, and output inclusion uniqueness. CLI local and remote commands
+cover Take, Update, Off, inclusion, Queue, Take Next, and Cut/Fade/appearance
+configuration; status prints both desired and realized arrays with opacity,
+transition, appearance, and queue state. Web exposes transport-free semantic
+controls, and Studio exposes Take Preview, Queue Preview, Take Next, Off, and
+per-channel Cut/Fade/position/border controls for all eight channels. The native
+daemon derives a stable realization for every configured project output, unions
+their active overlay sources into one scene-execution closure, renders the
+authoritative Program transition or Stinger base once, and then produces and
+retains one independent GPU texture per output. Each output composites only its
+included channels source-over in channel order before Fade-to-Black, using the
+exact per-frame opacity, deterministic one-third-frame PiP geometry, and
+scale-aware inset white border presets implemented by both the CPU oracle and
+native WGSL compositor. Resource planning charges the shared base, per-output
+composition and final targets, and the prior retained output set. The existing
+fullscreen and recorder consumers select the first configured output
+deterministically; an output-less headless project retains its unbound Program
+path.
+
+This completes the independent source, on/off, per-output-inclusion,
+Cut/Fade-duration, position/border, bounded FIFO queue, and simultaneous native
+output-realization slices. Profile-wide hardware acceptance evidence remains,
+so `SW-005` stays planned.
+
 Current implementation boundary for item 3: `fm-audio` provides a bounded,
 deterministic planar-F32 sample-delay primitive with immutable channel count and
 exact nonnegative sample delay, transactional block validation, caller-owned
@@ -393,11 +459,27 @@ output, allocation-free steady-state processing, and explicit reset. The
 reference `MasterMixer` now gives every logical strip independent raw-planar
 delay history before channel mapping and gains, advances that history with
 submitted PCM or silence on every successful Master interval, and bounds total
-retained history per mixer. Delay configuration is an in-memory mixer API with
-transactional allocation and leading-silence reset; it is not connected to
-device audio, project persistence, daemon/protocol commands, native DSP, or
-operator UI. This remains a partial item 3 slice and does not complete or change
-the status of any `AU-*` parity row.
+retained history per mixer. Schema 16 gives every persisted input strip exact
+bounded gain, stereo balance, mute, solo, follow-video, and 0–48,000-sample delay
+values and rejects missing, wrong-typed, or out-of-range fields.
+Native project compilation carries that value into physical and scene-alias
+strips, and native Master/Stinger preflight applies it transactionally to both
+active and pending mixers before gain, balance, mute, solo, follow-video, and source envelopes.
+The engine owns the live desired full-strip map and emits frame-boundary
+realization updates. Protocol 2.8 snapshots pair every input ID with its
+canonical persisted name and replicate the complete strip map; its
+`SetInputAudioStrip` command atomically carries gain, balance, mute, solo,
+follow-video, and delay and is authorized by the dedicated audio-control
+permission. The daemon applies each update transactionally to every active and
+pending ordinary/Stinger mixer, with 240-sample linear live gain and balance
+ramps and next-sample mute/solo/follow-video/delay changes, before checkpointing the
+canonical project. The local and remote CLI expose the command, exact status,
+and input labels; Studio renders persisted names with Ready- and
+permission-gated per-input controls; Web exposes the equivalent
+transport-free semantic controls. Device audio and clocks, drift correction,
+channel mapping, native EQ/gate/compressor/limiter, meters, and hardware
+acceptance remain. This is still a partial item 3 slice and does not
+complete or change the status of any `AU-*` parity row.
 
 Current implementation boundary for item 1: `fm-io-macos` is the first native
 platform leaf. An isolated Swift helper uses `AVFoundation` to enumerate camera
@@ -530,7 +612,7 @@ camera alongside one uninterrupted camera, aggregate multi-camera startup
 cleanup and shutdown cancellation, frame conservation, and helper reaping. The
 hermetic daemon process exercises generated camera metadata plus selected GPU
 ingest, frame conservation, source timing, checkpointing, and cleanup. Separate
-protocol and capture-node tests cover metadata boundaries, and schema-v7
+protocol and capture-node tests cover metadata boundaries, and the current schema
 persistence round-trips Display-P3/BT.709. Separate native Metal readback tests
 compare color conversions across supported primary/transfer combinations
 against CPU oracles; this does not claim that every combination traverses and
@@ -551,7 +633,7 @@ and screen/window/application-audio capture. Items 1 and 2, plus `IN-001`,
 `IN-005`, and `IN-011`, therefore remain incomplete and planned.
 
 Current implementation boundary for item 4: native `freemixd` now realizes
-schema-v7 scene inputs through an immutable `NativeProjectPlan` compiled before
+current-schema scene inputs through an immutable `NativeProjectPlan` compiled before
 opening media or GPU resources. The planner rejects missing references and
 video/audio cycles, bounds reachable scenes and total enabled layers at 64 each,
 and enforces a default 512 MiB peak transient RGBA16F budget. It maps full-width
@@ -579,48 +661,42 @@ source space. Schema v6 persists an optional mask per layer and native
 `freemixd` maps it into the immutable plan after strict post-crop bounds
 validation. CPU-oracle tests cover crop, half-open edges, inversion, rotation,
 translation, and stable resource accounting; ignored native Metal readback
-coverage remains opt-in and is not claimed without an adapter. The explicit
-v5-to-v6 migration supplies a no-mask default without changing desired or
-realized T-bar runtime state, and daemon checkpoint/restart tests preserve
-masks. Feathered or non-rectangular masks, keys, effect stacks, a ten-layer
+coverage remains opt-in and is not claimed without an adapter. Daemon
+checkpoint/restart tests preserve masks. Feathered or non-rectangular masks,
+keys, effect stacks, a ten-layer
 product limit, per-output scene realization/routing, live scene
 edits/replanning, and cross-platform or hardware certification remain. Item 4
 and its parity rows therefore remain incomplete and planned.
 
 Current implementation boundary for item 5: horizontal Wipe now flows through
 local and remote CLI commands, `fm-control`, `EngineCommand`, the switcher,
-`fm-sim`, the native compositor, and daemon rendering/checkpointing. Protocol
-1.3 gates `CommandPayload::Wipe`; the server rejects Wipe from an older
-negotiated peer before durable acceptance or control/engine mutation. Exact
+`fm-sim`, the native compositor, and daemon rendering/checkpointing. The current
+protocol carries `CommandPayload::Wipe`. Exact
 rational progress selects `floor(width * numerator / denominator)` replacement
 columns and preserves identical start/end frames, with exact CPU and Metal
-coverage of endpoints and pixel boundaries. `freemix-studio` now advertises
-protocol 1.5 and enables its Wipe button only when both transition permission
-and the negotiated protocol allow it; Fade and Wipe share one bounded duration.
-Recovery preserves strict intent FIFO across a tested protocol downgrade, so an
-unresolved Wipe is neither sent to 1.2 nor bypassed by later commands. Bounded
+coverage of endpoints and pixel boundaries. `freemix-studio` enables its Wipe
+button when transition permission allows it; Fade and Wipe share one bounded
+duration. Recovery preserves strict intent FIFO, so an unresolved Wipe is not
+bypassed by later commands. Bounded
 terminal history, collision-triggered authoritative resync, and Studio's sticky
 terminal-uncertainty ledger cover ambiguous replay receipts. `freemix-web`
-declares protocol 1.5 support in its client configuration. Its transport-free
+declares only the current protocol in its client configuration. Its transport-free
 semantic presentation model preserves permission- and protocol-gated
 Cut/Fade/Wipe and adds manual Fade/Wipe Start, exact basis-point Position,
 Commit, and Cancel controls derived from separate authoritative desired and
 realized projections. No browser renderer or network runtime exists.
 
 The T-bar control core supports Fade and Wipe through `fm-switcher`,
-`EngineCommand`, `fm-control`, and protocol 1.4 with exact held, reversed,
-committed, and cancelled progress. Schema v6 persists distinct desired and
-realized manual state, including through v5 migration, and daemon process tests
-cover replay-safe restart through commit and cancel. The CLI exposes local and
+`EngineCommand`, `fm-control`, and the current protocol with exact held,
+reversed, committed, and cancelled progress. The current schema persists
+distinct desired and realized manual state, and daemon process tests cover
+replay-safe restart through commit and cancel. The CLI exposes local and
 remote Start, integer `0..=10_000` basis-point position, Commit, and Cancel
 commands; local command processes restore/mutate/save the engine checkpoint,
-and remote commands cannot cross a protocol 1.3 session. Studio advertises
-protocol 1.5 and presents replicated desired and realized kind, routing, and
+and remote commands use the current contract. Studio presents replicated desired and realized kind, routing, and
 exact position without treating widget state as engine truth. Its manual
-controls require Ready state, transition permission, and negotiated 1.4.
-Reconnect tests preserve strict worker FIFO: an unresolved manual head and
-later commands remain blocked through a 1.3 downgrade and resume unchanged only
-on 1.4. Web now advertises only protocol 1.5. Its transport-free semantic model
+controls require Ready state and transition permission. Reconnect handling
+preserves strict worker FIFO. Web's transport-free semantic model
 retains the manual controls and adds FTB live/black actions, a bounded duration,
 exact separate desired and realized state, reversal through the opposite target,
 and protocol/permission/readiness/completeness gates. It still has no browser
@@ -640,25 +716,19 @@ these primitives do not yet prove a visible product distinction between Fade and
 AlphaFade.
 
 The automatic path now continues through a bounded `EngineCommand`,
-target-free transition authorization, runtime lifecycle tracking, and an
-additive protocol 1.6 `AlphaFade` command. Server admission rejects the command
-from older negotiated peers before control mutation; the client preserves the
-exact duration and applies the same version gate. Daemon durable execution
+target-free transition authorization, runtime lifecycle tracking, and a
+current-contract `AlphaFade` command. The client preserves the exact duration.
+Daemon durable execution
 projects all requested frames before saving, then a focused checkpoint test
 restores the settled Program/Preview routing and engine counters exactly. The
 CLI now exposes matching local and remote `alpha-fade ... <frames>` commands.
 Local execution settles and saves the bundle with replay-safe idempotency;
-remote execution preserves the exact duration and refuses to transmit after a
-protocol 1.5 downgrade. Web now advertises protocol 1.6 and exposes a semantic
-AlphaFade action with the shared bounded duration only when Ready, authorized,
-and negotiated at 1.6; downgrade and reconnect tests hide the action without
-disabling older Fade/Wipe controls. It remains a transport-free model with no
-browser network runtime. Studio now also advertises protocol 1.6 and presents an
+remote execution preserves the exact duration. Web exposes a semantic
+AlphaFade action with the shared bounded duration when Ready and authorized.
+It remains a transport-free model with no browser network runtime. Studio presents an
 AlphaFade action alongside Fade/Wipe using the same bounded duration. Its
-availability requires Ready state, replicated view, transition permission, and
-negotiated 1.6 support. The worker maps the typed intent to the exact command,
-preserves a blocked AlphaFade at the head of its reconnect FIFO through a 1.5
-downgrade, and a loopback worker test observes the duration, envelope, durable
+availability requires Ready state, replicated view, and transition permission.
+The worker maps the typed intent to the exact command, and a loopback worker test observes the duration, envelope, durable
 event, and runtime realization ordering. A hardware-gated macOS/Metal process
 acceptance now sends protocol AlphaFade to a real configured Program recorder
 using static opaque-white and transparent-black generators, observes an ordered
@@ -668,17 +738,14 @@ settled persisted routing.
 The authoritative manual T-bar core now accepts AlphaFade alongside Fade and
 Wipe, preserving exact held and reversed basis-point intervals through engine
 snapshots and feeding the existing AlphaFade native video plus sample-linear
-Master-audio plans. Additive protocol 1.7 carries the new manual kind and
-rejects its Start command before mutation on older sessions; 1.4–1.6 peers
-retain their existing manual fields but see an active AlphaFade projected as
-inactive. Schema v9 persists the kind with lossless schema-v8 migration, and a
+Master-audio plans. The current protocol carries the new manual kind. The
+current schema persists the kind, and a
 daemon restart acceptance verifies replay-safe commit and cancel from the
 restored held state. CLI manual AlphaFade start is available locally and
-remotely, including protocol 1.7 downgrade rejection and local restart-safe
-idempotent replay. The Web semantic control surface advertises protocol 1.7,
-exposes a manual AlphaFade start control only for compatible sessions, and
-preserves authoritative AlphaFade projections. Studio advertises protocol 1.7,
-gates its manual AlphaFade start button independently from the existing manual
+remotely with local restart-safe idempotent replay. The Web semantic control
+surface exposes a manual AlphaFade start control, and
+preserves authoritative AlphaFade projections. Studio gates its manual AlphaFade
+start button independently from the existing manual
 controls, and carries AlphaFade intents through the worker into authoritative
 desired and realized presentation. A hardware-gated macOS/Metal process
 acceptance drives manual AlphaFade to 75%, reverses to 25%, cancels, then fully
@@ -694,23 +761,19 @@ endpoints and odd-width pixels; a required Metal readback matches the CPU
 oracle. Native planning preserves the Slide kind, and Master audio uses the
 existing sample-linear two-source crossfade. Automatic Slide is now
 command-reachable through the engine and target-free transition authorization.
-Additive protocol 1.8 carries its exact duration, and client/server admission
-rejects it before mutation on older negotiated sessions. Daemon durable
+The current protocol carries its exact duration. Daemon durable
 execution settles every requested frame before checkpointing; focused unit and
 process restart acceptances restore exact Program/Preview routing, counters,
 receipt history, and resume position. CLI now exposes matching local and remote
 `slide ... <frames>` commands. Local execution settles and saves the bundle
-with replay-safe idempotency; remote execution preserves the exact duration and
-refuses to transmit after a protocol 1.7 downgrade. Web exposes an accessible
-semantic Slide action with the shared bounded duration only when Ready,
-authorized, and negotiated at protocol 1.8 or newer. Downgrade and reconnect
-tests hide Slide without disabling older transition controls. It remains a
+with replay-safe idempotency; remote execution preserves the exact duration.
+Web exposes an accessible semantic Slide action with the shared bounded
+duration when Ready and authorized. It remains a
 transport-free model with no browser network runtime. Studio presents a Slide
 action alongside the existing automatic transitions using the shared bounded
-duration. Its availability requires Ready state, a replicated view, transition
-permission, and protocol 1.8 support. The worker maps the typed intent to the
-exact command, preserves a blocked Slide at the head of its reconnect FIFO
-through a 1.7 downgrade, and a loopback worker test observes the duration,
+duration. Its availability requires Ready state, a replicated view, and
+transition permission. The worker maps the typed intent to the exact command,
+and a loopback worker test observes the duration,
 envelope, durable event, and runtime realization ordering. A hardware-gated
 macOS/Metal process acceptance now sends
 protocol Slide through a real configured Program recorder, decodes stable
@@ -726,30 +789,24 @@ frame. CPU and simulated paths cover byte-exact endpoints plus odd 5×3
 intermediates. The native wgpu path carries the same explicit geometry in its
 uniform, and a required Metal readback matches the CPU oracle at five progress
 points. Native daemon video planning now preserves Zoom, while Master audio
-uses the existing sample-linear two-source crossfade. The legacy source-only
+uses the existing sample-linear two-source crossfade. The source-only
 audio planner rejects Stinger without project configuration; the project-aware
 Master path applies the configured policies described below. Automatic Zoom is
 now command-reachable through the engine
-and target-free transition authorization. Additive protocol 1.9 carries its
-exact duration through a byte-stable fixture; client and server admission reject
-it before mutation on older negotiated sessions. Daemon durable execution
+and target-free transition authorization. The current protocol carries its
+exact duration. Daemon durable execution
 settles every requested frame before checkpointing. Focused unit and process
 restart acceptances restore exact Program/Preview routing, counters, receipt
-history, and resume position, while a protocol 1.8 process acceptance verifies
-rejection without a durable receipt. CLI now exposes matching local and remote
+history, and resume position. CLI now exposes matching local and remote
 `zoom ... <frames>` commands. Local execution settles and saves the bundle with
-replay-safe idempotency; remote execution preserves the exact duration and
-protocol 1.9 envelope, and refuses to transmit after a protocol 1.8 downgrade.
-Web now advertises protocol 1.9 and exposes an accessible semantic Zoom action
-with the shared bounded duration only when Ready, authorized, and negotiated at
-1.9. Downgrade and reconnect tests hide Zoom without disabling Slide or older
-transition controls. It remains a transport-free model with no browser network
-runtime. Studio now also advertises protocol 1.9 and presents a Zoom action
+replay-safe idempotency; remote execution preserves the exact duration. Web
+exposes an accessible semantic Zoom action with the shared bounded duration
+when Ready and authorized. It remains a transport-free model with no browser
+network runtime. Studio presents a Zoom action
 alongside the existing automatic transitions using the shared bounded duration.
-Its availability requires Ready state, a replicated view, transition
-permission, and negotiated 1.9 support. The worker maps the typed intent to the
-exact command, preserves a blocked Zoom at the head of its reconnect FIFO
-through a 1.8 downgrade, and a loopback worker test observes the duration,
+Its availability requires Ready state, a replicated view, and transition
+permission. The worker maps the typed intent to the exact command, and a
+loopback worker test observes the duration,
 envelope, durable event, and runtime realization ordering. A hardware-gated
 macOS/Metal process acceptance now sends protocol Zoom through a real configured
 Program recorder, decodes stable white, a Zoom-specific white perimeter with a
@@ -764,16 +821,16 @@ playback completes. The CPU oracle source-over composites same-size
 premultiplied RGBA, while a dedicated native wgpu renderer applies the same
 equation without CPU readback or a third shader binding. Required Metal oracles
 match the CPU core and the compiled daemon project path before and at the cut.
-Schema 10 durably stores up to eight unique slots with media input, preload
-intent, cut point, audio policy, and missing-media fallback; schema 2–9
-migrations default an empty slot set. Daemon restore configures identical
+The current schema durably stores up to eight unique slots with media input,
+preload intent, cut point, audio policy, and missing-media fallback. Daemon
+restore configures identical
 desired and realized slot state, and idle restore rejects divergence.
 
 The engine now rejects unconfigured slots and cut points beyond the requested
 duration, applies ready Stingers on exact frame boundaries, and settles
-Cut/Fade/KeepProgram missing-media fallbacks without stale busy state. Additive
-protocol 1.10 carries a one-through-eight slot plus exact duration and rejects
-older peers before mutation. The native compiled project realizes retained
+Cut/Fade/KeepProgram missing-media fallbacks without stale busy state. The
+current protocol carries a one-through-eight slot plus exact duration. The
+native compiled project realizes retained
 single-frame Stinger media through exact video base selection and three explicit
 Master policies: base-only `Muted`, media-only `StingerOnly`, and unity
 media-plus-base `MixWithProgram`. Three independent scene roots are included in
@@ -804,7 +861,7 @@ beyond the initial eight-frame GPU prefix without exceeding it, observes
 Program/media/Preview composition across the configured cut, proves the
 ordinary input ring was not changed, and verifies a byte-identical retrigger.
 A separate native-daemon process acceptance persists the same twelve-frame
-asset, sends two immediately consecutive protocol 1.10 Stingers through durable and runtime
+asset, sends two immediately consecutive current-protocol Stingers through durable and runtime
 realization, records the ordered white/media/black/media/white result, verifies
 the restored routing and revision, then starts a second recording daemon from
 that checkpoint, fires a third Stinger, decodes its recording, and verifies
@@ -813,30 +870,28 @@ remain rejected path-free until deterministic live capture exists.
 
 An additional required native-daemon process acceptance configures three
 preload-disabled slots and sends all three missing-readiness policies over
-protocol 1.10. It verifies two `KeepProgram` commands leave white and black
+the current protocol. It verifies two `KeepProgram` commands leave white and black
 Program routing unchanged, the `Fade` fallback records an intermediate frame
 before settling on black, the `Cut` fallback returns directly to white, and all
 four accepted revisions checkpoint the final routing without requiring the
 deferred media source.
 
 The local and remote CLI now expose an exact `stinger <slot> <frames>` action,
-restore persisted slot state before local mutation, and reject protocol 1.9
-before a remote write. The offline CLI can also atomically configure, replace,
+restore persisted slot state before local mutation, and use the current contract
+for remote writes. The offline CLI can also atomically configure, replace,
 or remove any of the eight slots with full-width media input, preload intent,
 cut point, audio policy, and fallback. It validates the canonical project before
 save, preserves routing, manual-transition, Fade-to-Black, revision, frame,
 runtime-generation, and receipt state, and projects every persisted slot field
-in status output. Web exposes typed one-through-eight slot controls only for
-negotiated 1.10 sessions and preserves the exact requested duration.
-Studio and Web advertise 1.11. Studio exposes eight accessible numbered controls with a
+in status output. Web exposes typed one-through-eight slot controls and preserves
+the exact requested duration. Studio exposes eight accessible numbered controls with a
 Ready replicated transition-capable session, carries typed slots into the wire
-payload, and keeps an unsupported Stinger at the head of its reconnect FIFO
-through a 1.9 downgrade. Loopback worker evidence observes exact slot, duration,
+payload, and keeps unresolved work ordered in its reconnect FIFO. Loopback
+worker evidence observes exact slot, duration,
 pending-command state, durable routing, and runtime realization ordering.
-Additive protocol 1.11 snapshots now project every configured slot field plus
-the realized `NotRequested`, `Ready`, or `Missing` preload state. Protocol 1.10
-peers receive no extension, 1.11 clients reject an omitted or invalid
-projection, and the replicated model validates unique bounded slots and media
+The current protocol snapshots project every configured slot field plus the
+realized `NotRequested`, `Ready`, or `Missing` preload state. Clients reject an
+omitted or invalid projection, and the replicated model validates unique bounded slots and media
 input references. Web and Studio require the selected slot's authoritative
 `Ready` state before enabling its fire action; Studio loopback evidence observes
 the exact projected slot before dispatch. The FFmpeg video and audio cursor
@@ -844,7 +899,7 @@ adapters can restart at clip-local ordinal/sample zero while retaining their
 fixed source identity and bounded audio metadata index; byte/sample oracles
 verify each replay against the original leading decode. The independent native
 Stinger video ring now consumes the video restart primitive for bounded paging
-and retriggering. Additive protocol 1.12 now carries live
+and retriggering. The current protocol carries live
 configure-or-replace and remove mutations for any slot, including the complete
 canonical configuration. The
 transition-authorized authority validates the media input, rejects automatic
@@ -920,8 +975,7 @@ alongside the compositor plan. The controller moves from its current exact
 fixed-rational position to live or black over 1–3,600 frames, supports
 no-jump reversal and idempotent repeated targets, and exposes each interval plus
 exact trajectory progress without cumulative floating-point drift. It advances
-orthogonally to automatic and manual Program/Preview transitions; the existing
-immediate boolean command remains compatible. The engine accepts the same
+orthogonally to automatic and manual Program/Preview transitions. The engine accepts the same
 bounded in-memory intent, commits the desired endpoint immediately, advances a
 separate realized trajectory on frame boundaries, exposes that exact interval
 in each `FrameResult`, and permits Program transitions concurrently. Idle
@@ -932,19 +986,18 @@ oracle and native wgpu path apply the plan after canonical RGBA16F Program
 composition by mixing premultiplied linear RGBA toward opaque black, without
 color conversion, audio work, or production readback.
 
-Protocol 1.5 now carries a bounded `FadeToBlack` command plus exact desired and
+The current protocol carries a bounded `FadeToBlack` command plus exact desired and
 realized target/position state in snapshots, durable switcher events, and
-runtime confirmations. Older negotiated peers receive a projection without the
-additive fields, and the server rejects 1.5 commands before control mutation.
+runtime confirmations.
 `fm-control` authorizes FTB as a transition, tracks it independently from
 Program transitions, preserves monotonic runtime generation/sequence ordering
 through overlap and reversal, and emits deterministic supersession. The client
-and UI reducer require complete state on negotiated 1.5 sessions and retain
+and UI reducer require complete state on the exact current protocol and retain
 exact desired and realized FTB projections by durable revision.
 
-Schema v8 persists only settled live or black checkpoints, rejects partial or
-desired/realized-divergent FTB state, and explicitly migrates v7 projects with a
-live default. Daemon and local CLI checkpoint/restore paths preserve the exact
+The current schema persists only settled live or black checkpoints and rejects
+partial or desired/realized-divergent FTB state. Daemon and local CLI
+checkpoint/restore paths preserve the exact
 endpoint; daemon tests cover live-to-black and black-to-live commands across
 engine reconstruction. The production native realizer now applies each engine
 frame after Program scene/transition composition: video renders the exact FTB
@@ -955,18 +1008,17 @@ in-flight target. Unit coverage exercises forward, reverse, held-black, and
 post-Master behavior, and focused Metal tests validate both the compositor
 oracle and the scene/transition/FTB ordering on a real adapter. The CLI now
 exposes explicit local and remote `ftb ... <live|black> <frames>` commands,
-settles and persists local moves, rejects the remote command below protocol 1.5
-before transmission, and prints separate exact desired and realized target and
-position state. Web has the corresponding protocol-1.5 transport-free semantic
-model, but no renderer or network runtime. Studio now advertises protocol 1.5
-and presents a dedicated native panel with exact separate desired and realized
+settles and persists local moves, and prints separate exact desired and realized
+target and position state. Web has the corresponding transport-free semantic
+model, but no renderer or network runtime. Studio presents a dedicated native
+panel with exact separate desired and realized
 target/position labels, a separately bounded duration, and live/black actions
-gated by Ready state, transition permission, negotiated protocol, and replicated
+gated by Ready state, transition permission, and replicated
 state. The desired target action is disabled while the opposite action remains
-available for reversal. Its worker maps the typed intent to the version-gated
-command, preserves FIFO compatibility behavior, and a loopback protocol test
+available for reversal. Its worker maps the typed intent to the current command,
+preserves FIFO behavior, and a loopback protocol test
 observes exact black then live desired and realized state. A hardware-gated
-macOS daemon acceptance now sends protocol 1.5 live-to-black and black-to-live
+macOS daemon acceptance now sends current-protocol live-to-black and black-to-live
 commands while Program recording is configured, decodes the H.264/AAC result,
 requires ordered live/black/live video plus a sustained Master-audio silence
 interval, and verifies the final live checkpoint. This proves the native FTB
@@ -1064,17 +1116,16 @@ Parallel adapters, each with its own certification:
 
 Exit: each adapter ships only with a platform-specific conformance report.
 
-## 11. Phase 9 — full parity and compatibility (12–20 weeks)
+## 11. Phase 9 — full parity and release certification (12–20 weeks)
 
-1. Close remaining `P2` rows: presentation/DVD/import/legacy surfaces according
+1. Close remaining `P2` rows: presentation/DVD/import surfaces according
    to legal platform scope.
 2. Add vMix HTTP/TCP/tally compatibility adapter.
 3. Complete virtual sets, advanced title import, social moderation adapters.
 4. Complete localization and accessibility audit.
 5. Exercise every universal acceptance scenario on each applicable Tier-1 OS.
 6. Run 72-hour release soak and disaster-recovery drills.
-7. External security, broadcast-operator, and hardware compatibility review.
-8. Freeze 1.0 project/plugin/protocol compatibility policy.
+7. External security, broadcast-operator, and hardware conformance review.
 
 Exit: no unclassified vMix 29 public feature and no incomplete P0/P1/P2 row
 without a documented legal/platform exception.

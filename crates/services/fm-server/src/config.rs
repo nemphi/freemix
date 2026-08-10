@@ -1,7 +1,5 @@
 use std::{error::Error, fmt, net::IpAddr};
 
-use fm_protocol::ProtocolVersion;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ServerMode {
     Development,
@@ -57,7 +55,6 @@ pub struct ServerConfig {
     pub mode: ServerMode,
     pub authentication: AuthenticationMode,
     pub bind_address: IpAddr,
-    pub supported_versions: Vec<ProtocolVersion>,
     pub capabilities_digest: String,
     pub session_limits: SessionLimits,
 }
@@ -68,14 +65,12 @@ impl ServerConfig {
         mode: ServerMode,
         authentication: AuthenticationMode,
         bind_address: IpAddr,
-        supported_versions: Vec<ProtocolVersion>,
         capabilities_digest: impl Into<String>,
     ) -> Self {
         Self {
             mode,
             authentication,
             bind_address,
-            supported_versions,
             capabilities_digest: capabilities_digest.into(),
             session_limits: SessionLimits::default(),
         }
@@ -92,7 +87,7 @@ impl ServerConfig {
     /// # Errors
     ///
     /// Returns a configuration error for unsafe development authentication,
-    /// missing protocol versions, or a zero-valued limit.
+    /// or a zero-valued limit.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.authentication == AuthenticationMode::Development {
             if self.mode == ServerMode::Production {
@@ -102,10 +97,6 @@ impl ServerConfig {
                 return Err(ConfigError::DevelopmentAuthRequiresLoopback);
             }
         }
-        if self.supported_versions.is_empty() {
-            return Err(ConfigError::NoSupportedVersions);
-        }
-
         let limits = &self.session_limits;
         for (name, value) in [
             ("max_command_bytes", limits.max_command_bytes),
@@ -136,7 +127,6 @@ impl ServerConfig {
 pub enum ConfigError {
     DevelopmentAuthInProduction,
     DevelopmentAuthRequiresLoopback,
-    NoSupportedVersions,
     ZeroLimit(&'static str),
 }
 
@@ -149,7 +139,6 @@ impl fmt::Display for ConfigError {
             Self::DevelopmentAuthRequiresLoopback => {
                 formatter.write_str("development authentication requires a loopback bind address")
             }
-            Self::NoSupportedVersions => formatter.write_str("no protocol versions are supported"),
             Self::ZeroLimit(name) => write!(formatter, "session limit `{name}` must be nonzero"),
         }
     }

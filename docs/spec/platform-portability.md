@@ -71,10 +71,10 @@ NDI, Zoom, VST3, AJA, Blackmagic, Bluefish444, and similar integrations ship
 only after legal and redistribution approval. OMT remains an adapter even when
 its implementation is open source, preserving the same dependency direction.
 
-Legacy vMix surfaces such as SWF/Flash, WPF/XAML titles, DirectShow-only devices,
-Windows Media output, and VB.NET scripts are compatibility/import plugins, not
+Archived vMix surfaces such as SWF/Flash, WPF/XAML titles, DirectShow-only devices,
+Windows Media output, and VB.NET scripts are isolated import plugins, not
 portable core requirements. Their parity row can be satisfied by an isolated
-Windows compatibility component plus a documented migration path.
+Windows import component plus a documented conversion report.
 
 ## 5. Codec distribution profiles
 
@@ -111,7 +111,7 @@ and virtual-device permissions vary by OS. The engine:
 - GPU shaders and protocol schemas are reproducible build inputs.
 - Crash symbols are uploaded separately and keyed by build ID.
 - Updates stage next to the active version and support rollback of binaries;
-  project migrations are never silently rolled back.
+  project data always uses the exact current schema.
 
 ## 8. Capability certification
 

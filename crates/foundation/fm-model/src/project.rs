@@ -2,19 +2,7 @@ use fm_types::{AudioFormat, BusId, FrameRate, InputId, OutputId, ProjectId, Scen
 
 use crate::{ValidationError, validation::validate_project};
 
-pub const CURRENT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(10);
-pub const OLDEST_SUPPORTED_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(2);
-pub const SUPPORTED_SCHEMA_VERSIONS: [SchemaVersion; 9] = [
-    CURRENT_SCHEMA_VERSION,
-    SchemaVersion::new(9),
-    SchemaVersion::new(8),
-    SchemaVersion::new(7),
-    SchemaVersion::new(6),
-    SchemaVersion::new(5),
-    SchemaVersion::new(4),
-    SchemaVersion::new(3),
-    OLDEST_SUPPORTED_SCHEMA_VERSION,
-];
+pub const CURRENT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(16);
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct SchemaVersion(u32);
@@ -28,52 +16,6 @@ impl SchemaVersion {
     #[must_use]
     pub const fn get(self) -> u32 {
         self.0
-    }
-
-    #[must_use]
-    pub const fn is_supported(self) -> bool {
-        self.0 >= OLDEST_SUPPORTED_SCHEMA_VERSION.0 && self.0 <= CURRENT_SCHEMA_VERSION.0
-    }
-
-    #[must_use]
-    pub const fn requires_migration(self) -> bool {
-        self.is_supported() && self.0 != CURRENT_SCHEMA_VERSION.0
-    }
-}
-
-/// A decoded project representation together with the schema that describes it.
-///
-/// `T` deliberately has no serialization constraints. Persistence adapters can
-/// use an intermediate representation appropriate to their format and migrate
-/// it into [`Project`] separately.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MigrationInput<T> {
-    schema_version: SchemaVersion,
-    representation: T,
-}
-
-impl<T> MigrationInput<T> {
-    #[must_use]
-    pub const fn new(schema_version: SchemaVersion, representation: T) -> Self {
-        Self {
-            schema_version,
-            representation,
-        }
-    }
-
-    #[must_use]
-    pub const fn schema_version(&self) -> SchemaVersion {
-        self.schema_version
-    }
-
-    #[must_use]
-    pub const fn representation(&self) -> &T {
-        &self.representation
-    }
-
-    #[must_use]
-    pub fn into_representation(self) -> T {
-        self.representation
     }
 }
 
@@ -352,11 +294,63 @@ impl InputGainMilliDb {
     }
 }
 
+/// Exact persisted stereo balance in one-hundredth of a percent.
+///
+/// `-10000` is full left, zero is centered, and `10000` is full right.
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub struct InputBalanceBasisPoints(i32);
+
+impl InputBalanceBasisPoints {
+    pub const MIN: i32 = -10_000;
+    pub const MAX: i32 = 10_000;
+    pub const CENTER: Self = Self(0);
+
+    #[must_use]
+    pub const fn new(value: i32) -> Option<Self> {
+        if value >= Self::MIN && value <= Self::MAX {
+            Some(Self(value))
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub const fn get(self) -> i32 {
+        self.0
+    }
+}
+
+/// Exact nonnegative per-input delay in 48 kHz samples.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct InputDelaySamples(u32);
+
+impl InputDelaySamples {
+    pub const MAX: u32 = 48_000;
+    pub const ZERO: Self = Self(0);
+
+    #[must_use]
+    pub const fn new(value: u32) -> Option<Self> {
+        if value <= Self::MAX {
+            Some(Self(value))
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
 /// Persisted user controls for one input's Master mixer strip.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InputAudioStripState {
     pub gain: InputGainMilliDb,
+    pub balance: InputBalanceBasisPoints,
+    pub delay_samples: InputDelaySamples,
     pub muted: bool,
+    pub soloed: bool,
     pub follow_video: bool,
 }
 
@@ -364,7 +358,10 @@ impl Default for InputAudioStripState {
     fn default() -> Self {
         Self {
             gain: InputGainMilliDb::UNITY,
+            balance: InputBalanceBasisPoints::CENTER,
+            delay_samples: InputDelaySamples::ZERO,
             muted: false,
+            soloed: false,
             follow_video: true,
         }
     }
@@ -557,7 +554,7 @@ impl Scene {
     /// Maximum layers accepted by the compositor for one execution plan.
     ///
     /// Persisted scenes are intentionally not bounded by this value: schema v3
-    /// allowed larger scene lists, so storage and migration must preserve them.
+    /// allowed larger scene lists, so storage must preserve them.
     /// Rendering code must enforce this limit when realizing a scene.
     pub const MAX_RENDERED_LAYERS: usize = 64;
 }

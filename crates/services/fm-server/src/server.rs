@@ -2,7 +2,8 @@ use std::{error::Error, fmt};
 
 use fm_auth::{Permission, Policy, Principal, PrincipalKind, Role as AuthRole};
 use fm_protocol::{
-    ClientHello, EventCursor, Role as ProtocolRole, ServerHello, WireMessage, negotiate_version,
+    CURRENT_PROTOCOL_VERSION, EngineIdentity, EventCursor, HandshakeRequest, Role as ProtocolRole,
+    ServerHello,
 };
 
 use crate::{
@@ -89,7 +90,7 @@ impl<C> Server<C> {
 }
 
 impl<C: ControlPlane> Server<C> {
-    /// Negotiates, authorizes, and obtains initial state from the control plane.
+    /// Accepts the exact current contract, authorizes, and obtains initial state.
     ///
     /// # Errors
     ///
@@ -97,7 +98,7 @@ impl<C: ControlPlane> Server<C> {
     /// control-plane error when a session cannot be established.
     pub fn handshake(
         &self,
-        hello: &ClientHello,
+        hello: &HandshakeRequest,
         principal: &Principal,
         now_ms: u64,
     ) -> Result<HandshakeOutcome, HandshakeError<C::Error>> {
@@ -110,8 +111,9 @@ impl<C: ControlPlane> Server<C> {
             return Err(HandshakeError::DevelopmentPrincipalDenied);
         }
 
-        let negotiated = negotiate_version(&hello.versions, &self.config.supported_versions)
-            .map_err(|_| HandshakeError::IncompatibleVersion)?;
+        if hello.protocol != CURRENT_PROTOCOL_VERSION {
+            return Err(HandshakeError::ProtocolMismatch);
+        }
         let requested_role =
             map_role(hello.desired_role).ok_or(HandshakeError::RoleDenied(hello.desired_role))?;
         if !principal.roles().contains(&requested_role)
@@ -121,18 +123,19 @@ impl<C: ControlPlane> Server<C> {
         }
 
         let scoped_principal = scoped_principal(principal, requested_role);
-        let mut initial = self
+        let cached_cursor = hello.resume_cursor.as_ref().map(|cursor| EventCursor {
+            engine: EngineIdentity {
+                engine_id: cursor.server.engine_id.clone(),
+                state_epoch: cursor.server.state_epoch,
+                log_id: cursor.server.log_id.clone(),
+            },
+            revision: cursor.revision,
+        });
+        let initial = self
             .control
-            .initial_sync(hello.cached_cursor.as_ref())
+            .initial_sync(cached_cursor.as_ref())
             .map_err(HandshakeError::Control)?;
-        validate_initial_sync(&initial, hello.cached_cursor.as_ref())?;
-        if !sync_is_compatible(&initial.payload, negotiated) {
-            initial = self
-                .control
-                .initial_sync(None)
-                .map_err(HandshakeError::Control)?;
-            validate_initial_sync(&initial, None)?;
-        }
+        validate_initial_sync(&initial, cached_cursor.as_ref())?;
 
         let permissions = self
             .policy
@@ -141,9 +144,9 @@ impl<C: ControlPlane> Server<C> {
             .flatten()
             .map(|permission| permission_name(*permission).to_owned())
             .collect();
-        let sync = compatible_sync(initial.payload, negotiated);
+        let sync = initial.payload;
         let server_hello = ServerHello {
-            negotiated,
+            protocol: CURRENT_PROTOCOL_VERSION,
             granted_role: hello.desired_role,
             permissions,
             capabilities_digest: self.config.capabilities_digest.clone(),
@@ -152,7 +155,7 @@ impl<C: ControlPlane> Server<C> {
             resume: sync.is_resume(),
         };
         let session = Session::new(
-            negotiated,
+            CURRENT_PROTOCOL_VERSION,
             initial.engine,
             initial.current_revision,
             scoped_principal,
@@ -165,44 +168,6 @@ impl<C: ControlPlane> Server<C> {
             sync,
             session,
         })
-    }
-}
-
-fn sync_is_compatible(payload: &SyncPayload, negotiated: fm_protocol::ProtocolVersion) -> bool {
-    match payload {
-        SyncPayload::Snapshot(snapshot) => {
-            WireMessage::Snapshot(snapshot.as_ref().clone()).is_compatible_with(negotiated)
-        }
-        SyncPayload::Resume(events) => events
-            .iter()
-            .all(|event| WireMessage::Event(event.clone()).is_compatible_with(negotiated)),
-    }
-}
-
-fn compatible_sync(payload: SyncPayload, negotiated: fm_protocol::ProtocolVersion) -> SyncPayload {
-    debug_assert!(sync_is_compatible(&payload, negotiated));
-    match payload {
-        SyncPayload::Snapshot(snapshot) => {
-            let WireMessage::Snapshot(snapshot) =
-                WireMessage::Snapshot(*snapshot).compatible_with(negotiated)
-            else {
-                unreachable!("snapshot compatibility preserves message type");
-            };
-            SyncPayload::Snapshot(Box::new(snapshot))
-        }
-        SyncPayload::Resume(events) => SyncPayload::Resume(
-            events
-                .into_iter()
-                .map(|event| {
-                    let WireMessage::Event(event) =
-                        WireMessage::Event(event).compatible_with(negotiated)
-                    else {
-                        unreachable!("event compatibility preserves message type");
-                    };
-                    event
-                })
-                .collect(),
-        ),
     }
 }
 
@@ -237,6 +202,7 @@ const fn permission_name(permission: Permission) -> &'static str {
         Permission::ViewStatus => "view_status",
         Permission::SelectPreview => "select_preview",
         Permission::Transition => "transition",
+        Permission::ControlAudio => "control_audio",
         Permission::EditProject => "edit_project",
         Permission::ManageUsers => "manage_users",
     }
@@ -277,7 +243,7 @@ fn validate_initial_sync<E>(
 #[derive(Debug)]
 pub enum HandshakeError<E> {
     NotReady(ReadinessState),
-    IncompatibleVersion,
+    ProtocolMismatch,
     DevelopmentPrincipalDenied,
     RoleDenied(ProtocolRole),
     Control(E),
@@ -288,8 +254,8 @@ impl<E: fmt::Display> fmt::Display for HandshakeError<E> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotReady(state) => write!(formatter, "server is not ready: {}", state.as_str()),
-            Self::IncompatibleVersion => {
-                formatter.write_str("client and server protocol versions are incompatible")
+            Self::ProtocolMismatch => {
+                formatter.write_str("client did not request the exact current protocol")
             }
             Self::DevelopmentPrincipalDenied => {
                 formatter.write_str("development principal is disabled")

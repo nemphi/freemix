@@ -7,7 +7,8 @@ use egui::{
     Button, Color32, DragValue, Frame, Grid, Margin, RichText, ScrollArea, Stroke, Ui, Vec2,
 };
 use fm_protocol::{
-    ManualTransitionKind, ManualTransitionPosition, StingerReadiness, WireStingerSlotId,
+    ManualTransitionKind, ManualTransitionPosition, OverlayBorderPreset, OverlayPositionPreset,
+    OverlayTransitionKind, StingerReadiness, WireOverlayChannelId, WireStingerSlotId,
 };
 use fm_types::InputId;
 use fm_ui_model::{ClientView, ManualTransitionStatus, SwitcherState};
@@ -31,6 +32,16 @@ const NARROW_MONITOR_WIDTH: f32 = 700.0;
 /// Operator actions emitted by [`StudioShell`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StudioIntent {
+    /// Replaces one input's exact Master strip controls atomically.
+    SetInputAudioStrip {
+        input: InputId,
+        gain_millidb: i32,
+        balance_basis_points: i32,
+        muted: bool,
+        soloed: bool,
+        follow_video: bool,
+        delay_samples: u32,
+    },
     /// Selects an input on the Preview bus.
     SelectPreview(InputId),
     /// Performs an immediate Cut transition.
@@ -48,6 +59,32 @@ pub enum StudioIntent {
         slot: WireStingerSlotId,
         duration_frames: u32,
     },
+    /// Takes the current Preview source on one independent overlay channel.
+    TakeOverlay {
+        channel: WireOverlayChannelId,
+        source: InputId,
+    },
+    /// Removes one overlay channel from Program.
+    OverlayOff { channel: WireOverlayChannelId },
+    /// Changes the transition used by one overlay channel.
+    ConfigureOverlayTransition {
+        channel: WireOverlayChannelId,
+        transition: OverlayTransitionKind,
+        duration_frames: u32,
+    },
+    /// Changes the placement and border presets for one overlay channel.
+    ConfigureOverlayAppearance {
+        channel: WireOverlayChannelId,
+        position: OverlayPositionPreset,
+        border: OverlayBorderPreset,
+    },
+    /// Appends the current Preview source to one overlay queue.
+    QueueOverlay {
+        channel: WireOverlayChannelId,
+        source: InputId,
+    },
+    /// Takes and removes the head of one overlay queue.
+    TakeNextOverlay { channel: WireOverlayChannelId },
     /// Performs a Wipe transition with a duration in frames.
     Wipe { duration_frames: u32 },
     /// Fades realized Program video and audio to black or back to live.
@@ -80,10 +117,8 @@ pub enum StudioConnectionStatus {
     Disconnected,
     /// Connection or synchronization failed.
     Failed,
-    /// The peer protocol is incompatible with this studio.
-    Incompatible,
-    /// An unresolved command cannot be retried on the negotiated protocol.
-    PendingIncompatible,
+    /// The peer did not select the exact current protocol.
+    ProtocolMismatch,
 }
 
 impl StudioConnectionStatus {
@@ -98,8 +133,7 @@ impl StudioConnectionStatus {
             Self::Backoff => "RETRY BACKOFF",
             Self::Disconnected => "DISCONNECTED",
             Self::Failed => "FAILED",
-            Self::Incompatible => "INCOMPATIBLE",
-            Self::PendingIncompatible => "PENDING / INCOMPATIBLE",
+            Self::ProtocolMismatch => "PROTOCOL MISMATCH",
         }
     }
 
@@ -117,7 +151,7 @@ pub struct StudioUiState {
     pub view: Option<ClientView>,
     pub can_select_preview: bool,
     pub can_transition: bool,
-    pub transition_protocol: TransitionProtocolSupport,
+    pub can_control_audio: bool,
     pub pending_commands: usize,
     pub notice: Option<String>,
     pub error: Option<String>,
@@ -132,7 +166,7 @@ impl StudioUiState {
             view: None,
             can_select_preview: false,
             can_transition: false,
-            transition_protocol: TransitionProtocolSupport::NONE,
+            can_control_audio: false,
             pending_commands: 0,
             notice: None,
             error: None,
@@ -146,7 +180,7 @@ impl StudioUiState {
         self
     }
 
-    /// Applies the switcher permissions negotiated for the active session.
+    /// Applies the switcher permissions granted for the active session.
     #[must_use]
     pub const fn with_switcher_permissions(
         mut self,
@@ -158,134 +192,12 @@ impl StudioUiState {
         self
     }
 
-    /// Publishes whether the negotiated protocol can carry Wipe commands.
+    /// Applies the granted audio-control permission.
     #[must_use]
-    pub const fn with_wipe_support(mut self, supports_wipe: bool) -> Self {
-        self.transition_protocol.automatic.wipe = supports_wipe;
+    pub const fn with_audio_permission(mut self, can_control_audio: bool) -> Self {
+        self.can_control_audio = can_control_audio;
         self
     }
-
-    /// Publishes whether the negotiated protocol can carry `AlphaFade` commands.
-    #[must_use]
-    pub const fn with_alpha_fade_support(mut self, supported: bool) -> Self {
-        self.transition_protocol.automatic.alpha_fade = supported;
-        self
-    }
-
-    /// Publishes whether the negotiated protocol can carry Slide commands.
-    #[must_use]
-    pub const fn with_slide_support(mut self, supported: bool) -> Self {
-        self.transition_protocol.automatic.slide = supported;
-        self
-    }
-
-    /// Publishes whether the negotiated protocol can carry Zoom commands.
-    #[must_use]
-    pub const fn with_zoom_support(mut self, supported: bool) -> Self {
-        self.transition_protocol.automatic.additive.zoom = supported;
-        self
-    }
-
-    /// Publishes whether the negotiated protocol can carry Stinger commands.
-    #[must_use]
-    pub const fn with_stinger_support(mut self, supported: bool) -> Self {
-        self.transition_protocol.automatic.additive.stinger = supported;
-        self
-    }
-
-    /// Publishes whether the negotiated protocol carries manual T-bar state and commands.
-    #[must_use]
-    pub const fn with_manual_transition_support(mut self, supported: bool) -> Self {
-        self.transition_protocol.manual.base = supported;
-        self
-    }
-
-    /// Publishes whether the negotiated protocol carries manual `AlphaFade` starts.
-    #[must_use]
-    pub const fn with_manual_alpha_fade_support(mut self, supported: bool) -> Self {
-        self.transition_protocol.manual.alpha_fade = supported;
-        self
-    }
-
-    /// Publishes whether the negotiated protocol carries Fade-to-Black state and commands.
-    #[must_use]
-    pub const fn with_fade_to_black_support(mut self, supported: bool) -> Self {
-        self.transition_protocol.fade_to_black = supported;
-        self
-    }
-}
-
-/// Additive transition features carried by the negotiated protocol.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct TransitionProtocolSupport {
-    pub automatic: AutomaticTransitionProtocolSupport,
-    pub manual: ManualTransitionProtocolSupport,
-    pub fade_to_black: bool,
-}
-
-impl TransitionProtocolSupport {
-    pub const NONE: Self = Self {
-        automatic: AutomaticTransitionProtocolSupport::NONE,
-        manual: ManualTransitionProtocolSupport::NONE,
-        fade_to_black: false,
-    };
-}
-
-/// Additive manual-transition features carried by the negotiated protocol.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct ManualTransitionProtocolSupport {
-    pub base: bool,
-    pub alpha_fade: bool,
-}
-
-impl ManualTransitionProtocolSupport {
-    pub const NONE: Self = Self {
-        base: false,
-        alpha_fade: false,
-    };
-}
-
-/// Additive automatic-transition features carried by the negotiated protocol.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct AutomaticTransitionProtocolSupport {
-    pub wipe: bool,
-    pub alpha_fade: bool,
-    pub slide: bool,
-    additive: AdditiveAutomaticTransitionProtocolSupport,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct AdditiveAutomaticTransitionProtocolSupport {
-    zoom: bool,
-    stinger: bool,
-}
-
-impl AutomaticTransitionProtocolSupport {
-    pub const NONE: Self = Self {
-        wipe: false,
-        alpha_fade: false,
-        slide: false,
-        additive: AdditiveAutomaticTransitionProtocolSupport::NONE,
-    };
-
-    /// Returns whether the negotiated protocol can carry Zoom commands.
-    #[must_use]
-    pub const fn zoom(self) -> bool {
-        self.additive.zoom
-    }
-
-    /// Returns whether the negotiated protocol can carry Stinger commands.
-    #[must_use]
-    pub const fn stinger(self) -> bool {
-        self.additive.stinger
-    }
-}
-
-impl AdditiveAutomaticTransitionProtocolSupport {
-    const NONE: Self = Self {
-        zoom: false,
-        stinger: false,
-    };
 }
 
 /// Pure transition-control availability derived from one UI state.
@@ -335,13 +247,12 @@ impl TransitionAvailability {
     }
 }
 
-/// Session and protocol gates for automatic transition controls.
+/// Session gates for automatic transition controls.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransitionGate {
     pub connection_status: StudioConnectionStatus,
     pub has_view: bool,
     pub can_transition: bool,
-    pub protocol_support: AutomaticTransitionProtocolSupport,
 }
 
 impl TransitionGate {
@@ -351,7 +262,6 @@ impl TransitionGate {
             connection_status: state.connection_status,
             has_view: state.view.is_some(),
             can_transition: state.can_transition,
-            protocol_support: state.transition_protocol.automatic,
         }
     }
 }
@@ -370,7 +280,6 @@ pub struct ManualTransitionGate {
     pub connection_status: StudioConnectionStatus,
     pub has_view: bool,
     pub can_transition: bool,
-    pub protocol_support: ManualTransitionProtocolSupport,
 }
 
 impl ManualTransitionGate {
@@ -380,7 +289,6 @@ impl ManualTransitionGate {
             connection_status: state.connection_status,
             has_view: state.view.is_some(),
             can_transition: state.can_transition,
-            protocol_support: state.transition_protocol.manual,
         }
     }
 }
@@ -392,14 +300,14 @@ pub const fn transition_availability(gate: TransitionGate) -> TransitionAvailabi
     TransitionAvailability {
         base: TransitionBaseAvailability {
             basic: base,
-            slide: base && gate.protocol_support.slide,
+            slide: base,
             additive: AdditiveTransitionAvailability {
-                zoom: base && gate.protocol_support.zoom(),
-                stinger: base && gate.protocol_support.stinger(),
+                zoom: base,
+                stinger: base,
             },
         },
-        alpha_fade: base && gate.protocol_support.alpha_fade,
-        wipe: base && gate.protocol_support.wipe,
+        alpha_fade: base,
+        wipe: base,
     }
 }
 
@@ -409,13 +317,10 @@ pub fn manual_transition_availability(
     gate: ManualTransitionGate,
     active: bool,
 ) -> ManualTransitionAvailability {
-    let base = gate.connection_status.controls_enabled()
-        && gate.has_view
-        && gate.can_transition
-        && gate.protocol_support.base;
+    let base = gate.connection_status.controls_enabled() && gate.has_view && gate.can_transition;
     ManualTransitionAvailability {
         start: base && !active,
-        alpha_fade_start_exposed: gate.protocol_support.base && gate.protocol_support.alpha_fade,
+        alpha_fade_start_exposed: true,
         active_controls: base && active,
     }
 }
@@ -578,6 +483,8 @@ impl StudioShell {
                 ui.add_space(8.0);
                 draw_transition_row(ui, self, state, &mut intents);
                 ui.add_space(8.0);
+                draw_overlays(ui, state, self.transition_duration_frames, &mut intents);
+                ui.add_space(8.0);
                 fade_to_black::draw_fade_to_black(
                     ui,
                     &mut self.fade_to_black_duration_frames,
@@ -588,9 +495,273 @@ impl StudioShell {
                 ui.add_space(8.0);
                 draw_manual_transition(ui, state, &mut intents);
                 ui.add_space(8.0);
+                draw_input_audio_strips(ui, state, &mut intents);
+                ui.add_space(8.0);
                 draw_inputs(ui, state, &mut intents);
             });
         intents
+    }
+}
+
+fn draw_input_audio_strips(ui: &mut Ui, state: &StudioUiState, intents: &mut Vec<StudioIntent>) {
+    let enabled = state.connection_status.controls_enabled()
+        && state.can_control_audio
+        && state.view.is_some();
+    Frame::new()
+        .fill(GRAPHITE_RAISED)
+        .stroke(Stroke::new(1.0, Color32::from_rgb(67, 61, 44)))
+        .inner_margin(Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("INPUT AUDIO").small().strong().color(AMBER));
+                let Some(view) = &state.view else {
+                    ui.label(RichText::new("UNAVAILABLE").small().color(MUTED));
+                    return;
+                };
+                for status in &view.input_audio_strips {
+                    ui.label(RichText::new(label_for_input(view, status.input)).small());
+                    let mut gain_millidb = status.gain_millidb;
+                    let mut balance_basis_points = status.balance_basis_points;
+                    let mut muted = status.muted;
+                    let mut soloed = status.soloed;
+                    let mut follow_video = status.follow_video;
+                    let mut delay_samples = status.delay_samples;
+                    let gain_changed = ui
+                        .add_enabled(
+                            enabled,
+                            DragValue::new(&mut gain_millidb)
+                                .range(-96_000..=24_000)
+                                .suffix(" mdB")
+                                .speed(100.0),
+                        )
+                        .on_hover_text("Input gain in one-thousandth of a decibel")
+                        .changed();
+                    let balance_changed = ui
+                        .add_enabled(
+                            enabled,
+                            DragValue::new(&mut balance_basis_points)
+                                .range(-10_000..=10_000)
+                                .suffix(" BAL")
+                                .speed(100.0),
+                        )
+                        .on_hover_text("Stereo balance: -10000 full left, 10000 full right")
+                        .changed();
+                    let mute_changed = ui
+                        .add_enabled(enabled, egui::Checkbox::new(&mut muted, "MUTE"))
+                        .changed();
+                    let solo_changed = ui
+                        .add_enabled(enabled, egui::Checkbox::new(&mut soloed, "SOLO"))
+                        .changed();
+                    let follow_changed = ui
+                        .add_enabled(
+                            enabled,
+                            egui::Checkbox::new(&mut follow_video, "FOLLOW VIDEO"),
+                        )
+                        .changed();
+                    let delay_changed = ui
+                        .add_enabled(
+                            enabled,
+                            DragValue::new(&mut delay_samples)
+                                .range(0..=48_000)
+                                .suffix(" SAMPLES")
+                                .speed(48.0),
+                        )
+                        .on_hover_text("Input delay at the 48 kHz Master sample rate")
+                        .changed();
+                    if gain_changed
+                        || balance_changed
+                        || mute_changed
+                        || solo_changed
+                        || follow_changed
+                        || delay_changed
+                    {
+                        intents.push(StudioIntent::SetInputAudioStrip {
+                            input: status.input,
+                            gain_millidb,
+                            balance_basis_points,
+                            muted,
+                            soloed,
+                            follow_video,
+                            delay_samples,
+                        });
+                    }
+                }
+            });
+        });
+}
+
+fn draw_overlays(
+    ui: &mut Ui,
+    state: &StudioUiState,
+    duration_frames: u32,
+    intents: &mut Vec<StudioIntent>,
+) {
+    let enabled =
+        state.connection_status.controls_enabled() && state.can_transition && state.view.is_some();
+    Frame::new()
+        .fill(GRAPHITE_RAISED)
+        .stroke(Stroke::new(1.0, Color32::from_rgb(67, 61, 44)))
+        .inner_margin(Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("OVERLAYS").small().strong().color(AMBER));
+                for channel_number in 1..=8 {
+                    draw_overlay_channel(
+                        ui,
+                        state,
+                        channel_number,
+                        duration_frames,
+                        enabled,
+                        intents,
+                    );
+                }
+            });
+        });
+}
+
+fn draw_overlay_channel(
+    ui: &mut Ui,
+    state: &StudioUiState,
+    channel_number: u8,
+    duration_frames: u32,
+    enabled: bool,
+    intents: &mut Vec<StudioIntent>,
+) {
+    let channel = WireOverlayChannelId::new(channel_number)
+        .expect("Studio renders only overlay channels 1 through 8");
+    let status = state.view.as_ref().and_then(|view| {
+        view.desired_overlays
+            .iter()
+            .find(|overlay| overlay.channel == channel_number)
+    });
+    let source = state
+        .view
+        .as_ref()
+        .map(|view| view.switcher.desired.preview);
+    if ui
+        .add_enabled(
+            enabled && source.is_some(),
+            Button::new(RichText::new(format!("O{channel_number} TAKE")).strong()),
+        )
+        .on_hover_text("Take the current Preview source on this overlay channel")
+        .clicked()
+        && let Some(source) = source
+    {
+        intents.push(StudioIntent::TakeOverlay { channel, source });
+    }
+    if ui
+        .add_enabled(
+            enabled && source.is_some(),
+            Button::new(format!(
+                "Q+{}",
+                status.map_or(0, |value| value.queued_sources.len())
+            )),
+        )
+        .on_hover_text("Append the current Preview source to this overlay queue")
+        .clicked()
+        && let Some(source) = source
+    {
+        intents.push(StudioIntent::QueueOverlay { channel, source });
+    }
+    if ui
+        .add_enabled(
+            enabled && status.is_some_and(|value| !value.queued_sources.is_empty()),
+            Button::new("NEXT"),
+        )
+        .clicked()
+    {
+        intents.push(StudioIntent::TakeNextOverlay { channel });
+    }
+    let transition = status.map_or(OverlayTransitionKind::Cut, |overlay| overlay.transition);
+    if ui
+        .add_enabled(
+            enabled,
+            Button::new(match transition {
+                OverlayTransitionKind::Cut => "CUT",
+                OverlayTransitionKind::Fade => "FADE",
+            }),
+        )
+        .on_hover_text("Toggle this overlay channel between Cut and Fade")
+        .clicked()
+    {
+        intents.push(StudioIntent::ConfigureOverlayTransition {
+            channel,
+            transition: match transition {
+                OverlayTransitionKind::Cut => OverlayTransitionKind::Fade,
+                OverlayTransitionKind::Fade => OverlayTransitionKind::Cut,
+            },
+            duration_frames,
+        });
+    }
+    let position = status.map_or(OverlayPositionPreset::FullFrame, |overlay| overlay.position);
+    let border = status.map_or(OverlayBorderPreset::None, |overlay| overlay.border);
+    if ui
+        .add_enabled(enabled, Button::new(overlay_position_label(position)))
+        .on_hover_text("Cycle this overlay channel's position preset")
+        .clicked()
+    {
+        intents.push(StudioIntent::ConfigureOverlayAppearance {
+            channel,
+            position: next_overlay_position(position),
+            border,
+        });
+    }
+    if ui
+        .add_enabled(enabled, Button::new(overlay_border_label(border)))
+        .on_hover_text("Cycle this overlay channel's white border preset")
+        .clicked()
+    {
+        intents.push(StudioIntent::ConfigureOverlayAppearance {
+            channel,
+            position,
+            border: next_overlay_border(border),
+        });
+    }
+    if ui
+        .add_enabled(
+            enabled && status.is_some_and(|overlay| overlay.active),
+            Button::new(RichText::new(format!("O{channel_number} OFF")).strong()),
+        )
+        .on_hover_text("Remove this overlay channel from Program")
+        .clicked()
+    {
+        intents.push(StudioIntent::OverlayOff { channel });
+    }
+}
+
+const fn overlay_position_label(position: OverlayPositionPreset) -> &'static str {
+    match position {
+        OverlayPositionPreset::FullFrame => "FULL",
+        OverlayPositionPreset::TopLeft => "TL",
+        OverlayPositionPreset::TopRight => "TR",
+        OverlayPositionPreset::BottomLeft => "BL",
+        OverlayPositionPreset::BottomRight => "BR",
+    }
+}
+
+const fn next_overlay_position(position: OverlayPositionPreset) -> OverlayPositionPreset {
+    match position {
+        OverlayPositionPreset::FullFrame => OverlayPositionPreset::TopLeft,
+        OverlayPositionPreset::TopLeft => OverlayPositionPreset::TopRight,
+        OverlayPositionPreset::TopRight => OverlayPositionPreset::BottomLeft,
+        OverlayPositionPreset::BottomLeft => OverlayPositionPreset::BottomRight,
+        OverlayPositionPreset::BottomRight => OverlayPositionPreset::FullFrame,
+    }
+}
+
+const fn overlay_border_label(border: OverlayBorderPreset) -> &'static str {
+    match border {
+        OverlayBorderPreset::None => "NO BORDER",
+        OverlayBorderPreset::ThinWhite => "THIN",
+        OverlayBorderPreset::ThickWhite => "THICK",
+    }
+}
+
+const fn next_overlay_border(border: OverlayBorderPreset) -> OverlayBorderPreset {
+    match border {
+        OverlayBorderPreset::None => OverlayBorderPreset::ThinWhite,
+        OverlayBorderPreset::ThinWhite => OverlayBorderPreset::ThickWhite,
+        OverlayBorderPreset::ThickWhite => OverlayBorderPreset::None,
     }
 }
 
@@ -1026,11 +1197,8 @@ fn draw_inputs(ui: &mut Ui, state: &StudioUiState, intents: &mut Vec<StudioInten
                 .show(ui, |ui| {
                     for (index, input) in view.inputs.iter().copied().enumerate() {
                         let tally = tally_state(input, view.switcher);
-                        let tile_text = format!(
-                            "{}\n{}",
-                            input_label(index + 1, input),
-                            tally.operator_label()
-                        );
+                        let tile_text =
+                            format!("{}\n{}", view.input_names[index], tally.operator_label());
                         let response = ui.add_enabled(
                             enabled,
                             Button::new(RichText::new(tile_text).color(tally_color(tally)))
@@ -1065,16 +1233,14 @@ fn label_for_input(view: &ClientView, input: InputId) -> String {
         .position(|candidate| *candidate == input)
         .map_or_else(
             || format!("Input {input}"),
-            |index| input_label(index + 1, input),
+            |index| view.input_names[index].clone(),
         )
 }
 
 const fn connection_color(status: StudioConnectionStatus) -> Color32 {
     match status {
         StudioConnectionStatus::Ready => PREVIEW,
-        StudioConnectionStatus::Failed
-        | StudioConnectionStatus::Incompatible
-        | StudioConnectionStatus::PendingIncompatible => ERROR,
+        StudioConnectionStatus::Failed | StudioConnectionStatus::ProtocolMismatch => ERROR,
         StudioConnectionStatus::Disconnected => MUTED,
         StudioConnectionStatus::Launching
         | StudioConnectionStatus::Connecting
@@ -1150,8 +1316,7 @@ mod tests {
             StudioConnectionStatus::Backoff,
             StudioConnectionStatus::Disconnected,
             StudioConnectionStatus::Failed,
-            StudioConnectionStatus::Incompatible,
-            StudioConnectionStatus::PendingIncompatible,
+            StudioConnectionStatus::ProtocolMismatch,
         ];
         assert!(StudioConnectionStatus::Ready.controls_enabled());
         for status in statuses {
@@ -1249,41 +1414,28 @@ mod tests {
     }
 
     #[test]
-    fn additive_transition_availability_requires_protocol_and_base_gates() {
+    fn transition_availability_requires_ready_view_and_permission() {
         let base = TransitionGate {
             connection_status: StudioConnectionStatus::Ready,
             has_view: true,
             can_transition: true,
-            protocol_support: AutomaticTransitionProtocolSupport::NONE,
         };
         assert_eq!(
             transition_availability(base),
             TransitionAvailability {
                 base: TransitionBaseAvailability {
                     basic: true,
-                    slide: false,
+                    slide: true,
                     additive: AdditiveTransitionAvailability {
-                        zoom: false,
-                        stinger: false,
+                        zoom: true,
+                        stinger: true,
                     },
                 },
-                alpha_fade: false,
-                wipe: false,
+                alpha_fade: true,
+                wipe: true,
             }
         );
-        let all_protocols = AutomaticTransitionProtocolSupport {
-            wipe: true,
-            alpha_fade: true,
-            slide: true,
-            additive: AdditiveAutomaticTransitionProtocolSupport {
-                zoom: true,
-                stinger: true,
-            },
-        };
-        let supported = transition_availability(TransitionGate {
-            protocol_support: all_protocols,
-            ..base
-        });
+        let supported = transition_availability(base);
         assert!(supported.wipe);
         assert!(supported.alpha_fade);
         assert!(supported.slide());
@@ -1293,17 +1445,14 @@ mod tests {
         for gate in [
             TransitionGate {
                 connection_status: StudioConnectionStatus::Connecting,
-                protocol_support: all_protocols,
                 ..base
             },
             TransitionGate {
                 has_view: false,
-                protocol_support: all_protocols,
                 ..base
             },
             TransitionGate {
                 can_transition: false,
-                protocol_support: all_protocols,
                 ..base
             },
         ] {
@@ -1326,15 +1475,11 @@ mod tests {
     }
 
     #[test]
-    fn manual_t_bar_availability_requires_ready_view_permission_protocol_and_active_state() {
+    fn manual_t_bar_availability_requires_ready_view_permission_and_active_state() {
         let available = ManualTransitionGate {
             connection_status: StudioConnectionStatus::Ready,
             has_view: true,
             can_transition: true,
-            protocol_support: ManualTransitionProtocolSupport {
-                base: true,
-                alpha_fade: true,
-            },
         };
         assert_eq!(
             manual_transition_availability(available, false),
@@ -1365,36 +1510,16 @@ mod tests {
                 can_transition: false,
                 ..available
             },
-            ManualTransitionGate {
-                protocol_support: ManualTransitionProtocolSupport::NONE,
-                ..available
-            },
         ] {
             assert_eq!(
                 manual_transition_availability(gate, true),
                 ManualTransitionAvailability {
                     start: false,
-                    alpha_fade_start_exposed: gate.protocol_support.base,
+                    alpha_fade_start_exposed: true,
                     active_controls: false,
                 }
             );
         }
-
-        let legacy_manual = ManualTransitionGate {
-            protocol_support: ManualTransitionProtocolSupport {
-                base: true,
-                alpha_fade: false,
-            },
-            ..available
-        };
-        assert_eq!(
-            manual_transition_availability(legacy_manual, false),
-            ManualTransitionAvailability {
-                start: true,
-                alpha_fade_start_exposed: false,
-                active_controls: false,
-            }
-        );
     }
 
     #[test]
@@ -1431,6 +1556,26 @@ mod tests {
 
     #[test]
     fn intents_are_typed_and_comparable() {
+        assert_eq!(
+            StudioIntent::SetInputAudioStrip {
+                input: input(9),
+                gain_millidb: -6_000,
+                balance_basis_points: 2_500,
+                muted: true,
+                soloed: true,
+                follow_video: false,
+                delay_samples: 2_400,
+            },
+            StudioIntent::SetInputAudioStrip {
+                input: input(9),
+                gain_millidb: -6_000,
+                balance_basis_points: 2_500,
+                muted: true,
+                soloed: true,
+                follow_video: false,
+                delay_samples: 2_400,
+            }
+        );
         assert_eq!(
             StudioIntent::SelectPreview(input(9)),
             StudioIntent::SelectPreview(input(9))

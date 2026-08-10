@@ -1,5 +1,6 @@
 use crate::{
-    ClientType, CodecError, DurableEvent, FieldIssue, ProtocolVersion, Role, RuntimeDomainBoundary,
+    ClientType, CodecError, DurableEvent, FieldIssue, InputStatus, ProtocolVersion, Role,
+    RuntimeDomainBoundary,
 };
 
 use super::{MAX_BATCH_EVENTS, MAX_FIELD_VALUE_BYTES, MAX_LIST_ITEMS};
@@ -76,33 +77,6 @@ pub(super) fn parse_role(value: &str) -> Option<Role> {
     }
 }
 
-pub(super) fn versions(values: &[ProtocolVersion]) -> String {
-    values
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-pub(super) fn parse_versions(value: &str) -> Result<Vec<ProtocolVersion>, CodecError> {
-    if value.is_empty() {
-        return Err(CodecError::InvalidField {
-            field: "versions",
-            value: value.to_owned(),
-        });
-    }
-    check_items(value, ',', MAX_LIST_ITEMS, "versions")?;
-    value
-        .split(',')
-        .map(|version| {
-            parse_version(version).ok_or_else(|| CodecError::InvalidField {
-                field: "versions",
-                value: value.to_owned(),
-            })
-        })
-        .collect()
-}
-
 pub(super) fn parse_version(value: &str) -> Option<ProtocolVersion> {
     let (major, minor) = value.split_once('.')?;
     Some(ProtocolVersion::new(
@@ -123,6 +97,52 @@ pub(super) fn parse_string_list(value: &str) -> Result<Vec<String>, CodecError> 
     }
     check_items(value, ',', MAX_LIST_ITEMS, "permissions")?;
     value.split(',').map(unescape).collect()
+}
+
+pub(super) fn input_statuses(values: &[InputStatus]) -> Result<String, CodecError> {
+    bounded_join(values, MAX_LIST_ITEMS, "inputs", |input| {
+        if input.name.trim().is_empty() {
+            return Err(CodecError::InvalidField {
+                field: "inputs",
+                value: input.name.clone(),
+            });
+        }
+        Ok(format!("{}~{}", input.input, escape_bounded(&input.name)?))
+    })
+}
+
+pub(super) fn parse_input_statuses(value: &str) -> Result<Vec<InputStatus>, CodecError> {
+    if value.is_empty() {
+        return Err(CodecError::InvalidField {
+            field: "inputs",
+            value: value.to_owned(),
+        });
+    }
+    check_items(value, ',', MAX_LIST_ITEMS, "inputs")?;
+    value
+        .split(',')
+        .map(|entry| {
+            let (input, name) = entry.split_once('~').ok_or(CodecError::InvalidRecord)?;
+            let input = input
+                .parse::<u128>()
+                .ok()
+                .and_then(core::num::NonZeroU128::new);
+            let name = unescape(name)?;
+            if name.trim().is_empty() {
+                return Err(CodecError::InvalidField {
+                    field: "inputs",
+                    value: value.to_owned(),
+                });
+            }
+            Ok(InputStatus {
+                input: crate::WireInputId::new(input.ok_or_else(|| CodecError::InvalidField {
+                    field: "inputs",
+                    value: value.to_owned(),
+                })?),
+                name,
+            })
+        })
+        .collect()
 }
 
 pub(super) fn field_issues(values: &[FieldIssue]) -> Result<String, CodecError> {

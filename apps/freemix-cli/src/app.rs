@@ -13,36 +13,41 @@ use fm_command::{
     RejectedReceipt, Rejection, RejectionCode, Revision, RuntimeGeneration, StateEpoch,
 };
 use fm_engine::{
-    Engine, EngineAcceptance, EngineCommand, EngineFadeToBlackState, EngineManualTransitionKind,
-    EngineManualTransitionPosition, EngineRestoreState, ShowState,
+    Engine, EngineAcceptance, EngineCommand, EngineFadeToBlackState, EngineInputAudioStripState,
+    EngineManualTransitionKind, EngineManualTransitionPosition, EngineRestoreState, ShowState,
 };
 use fm_model::{
-    Input, InputKind, MainMix, Project, ProjectSettings, SimulatedAudio, SimulatedInput,
-    SimulatedVideo, SolidColor, StingerAudioPolicy as ModelStingerAudioPolicy, StingerConfig,
+    Input, InputAudioStripState, InputBalanceBasisPoints, InputDelaySamples, InputGainMilliDb,
+    InputKind, MainMix, Project, ProjectSettings, SimulatedAudio, SimulatedInput, SimulatedVideo,
+    SolidColor, StingerAudioPolicy as ModelStingerAudioPolicy, StingerConfig,
     StingerMissingMediaFallback, StingerSlotNumber,
 };
 use fm_persistence::{
     FadeToBlackState as PersistedFadeToBlackState, IdempotencyReceipt,
     ManualTransitionKind as PersistedManualTransitionKind,
     ManualTransitionState as PersistedManualTransitionState, ProjectPosition, ProjectStore,
-    ProjectValidationError, ReceiptOutcome, RuntimeFadeToBlack, RuntimeManualTransitions,
-    RuntimeRouting, StoreError, StoredProject,
+    ReceiptOutcome, RuntimeFadeToBlack, RuntimeManualTransitions, RuntimeOverlayBorder,
+    RuntimeOverlayChannel, RuntimeOverlayPosition, RuntimeOverlayTransition, RuntimeOverlays,
+    RuntimeRouting, StoredProject,
 };
 use fm_sim::{Rgba8, SimulatedPipeline, SimulatedSource, SourcePattern};
 use fm_switcher::{
-    MissingMediaFallback, StingerAudioPolicy, StingerDescriptor, StingerSlotId, SwitcherState,
-    TBarPosition, TBarState, TransitionKind,
+    MissingMediaFallback, OverlayBorderPreset, OverlayChannelId, OverlayChannelState,
+    OverlayPositionPreset, OverlayTransitionKind, StingerAudioPolicy, StingerDescriptor,
+    StingerSlotId, SwitcherState, TBarPosition, TBarState, TransitionKind,
 };
 use fm_types::{
-    AudioFormat, ChannelLayout, ColorMetadata, FrameRate, InputId, PixelFormat, ProjectId,
-    SampleFormat, SampleRate, ScanMode, VideoDimensions, VideoFormat,
+    AudioFormat, ChannelLayout, ColorMetadata, FrameRate, InputId, OutputId, PixelFormat,
+    ProjectId, SampleFormat, SampleRate, ScanMode, VideoDimensions, VideoFormat,
 };
 use fm_video::write_ppm;
 
 use crate::{
     args::{
-        Command, ManualTransitionKind, StingerAudioPolicy as CliStingerAudioPolicy,
-        StingerFallback as CliStingerFallback, TBarAction,
+        Command, ManualTransitionKind, OverlayBorder as CliOverlayBorder,
+        OverlayPosition as CliOverlayPosition, OverlayTransition as CliOverlayTransition,
+        StingerAudioPolicy as CliStingerAudioPolicy, StingerFallback as CliStingerFallback,
+        TBarAction,
     },
     remote,
 };
@@ -73,6 +78,32 @@ pub fn run(command: Command) -> AppResult<()> {
             print_status(&project);
         }
         Command::Status { path } => print_status(&load_engine(&path)?),
+        Command::AudioStrip {
+            path,
+            input,
+            gain_millidb,
+            balance_basis_points,
+            muted,
+            soloed,
+            follow_video,
+            delay_samples,
+        } => mutate(
+            &path,
+            EngineCommand::SetInputAudioStrip {
+                input: input_id(input)?,
+                state: engine_audio_strip_state(
+                    gain_millidb,
+                    balance_basis_points,
+                    muted,
+                    soloed,
+                    follow_video,
+                    delay_samples,
+                )?,
+            },
+            1,
+            None,
+            None,
+        )?,
         Command::Preview {
             path,
             input,
@@ -192,6 +223,136 @@ pub fn run(command: Command) -> AppResult<()> {
                 StingerSlotNumber::new(slot).expect("CLI parser validates Stinger slots"),
             )?;
         }
+        Command::OverlayTake {
+            path,
+            channel,
+            source,
+            key,
+            expected_revision,
+        } => mutate(
+            &path,
+            EngineCommand::TakeOverlay {
+                channel: OverlayChannelId::new(channel).expect("CLI parser validates overlays"),
+                source: input_id(source)?,
+            },
+            1,
+            key,
+            expected_revision,
+        )?,
+        Command::OverlayUpdate {
+            path,
+            channel,
+            source,
+            key,
+            expected_revision,
+        } => mutate(
+            &path,
+            EngineCommand::UpdateOverlay {
+                channel: OverlayChannelId::new(channel).expect("CLI parser validates overlays"),
+                source: input_id(source)?,
+            },
+            1,
+            key,
+            expected_revision,
+        )?,
+        Command::OverlayOff {
+            path,
+            channel,
+            key,
+            expected_revision,
+        } => mutate(
+            &path,
+            EngineCommand::OverlayOff {
+                channel: OverlayChannelId::new(channel).expect("CLI parser validates overlays"),
+            },
+            1,
+            key,
+            expected_revision,
+        )?,
+        Command::OverlayOutput {
+            path,
+            channel,
+            output,
+            included,
+            key,
+            expected_revision,
+        } => mutate(
+            &path,
+            EngineCommand::SetOverlayOutputInclusion {
+                channel: OverlayChannelId::new(channel).expect("CLI parser validates overlays"),
+                output: output_id(output)?,
+                included,
+            },
+            1,
+            key,
+            expected_revision,
+        )?,
+        Command::OverlayTransition {
+            path,
+            channel,
+            transition,
+            frames,
+            key,
+            expected_revision,
+        } => mutate(
+            &path,
+            EngineCommand::ConfigureOverlayTransition {
+                channel: OverlayChannelId::new(channel).expect("CLI parser validates overlays"),
+                transition: switcher_overlay_transition(transition),
+                duration_frames: frames,
+            },
+            1,
+            key,
+            expected_revision,
+        )?,
+        Command::OverlayAppearance {
+            path,
+            channel,
+            position,
+            border,
+            key,
+            expected_revision,
+        } => mutate(
+            &path,
+            EngineCommand::ConfigureOverlayAppearance {
+                channel: OverlayChannelId::new(channel).expect("CLI parser validates overlays"),
+                position: switcher_overlay_position(position),
+                border: switcher_overlay_border(border),
+            },
+            1,
+            key,
+            expected_revision,
+        )?,
+        Command::OverlayQueue {
+            path,
+            channel,
+            source,
+            key,
+            expected_revision,
+        } => mutate(
+            &path,
+            EngineCommand::QueueOverlay {
+                channel: OverlayChannelId::new(channel).expect("CLI parser validates overlays"),
+                source: input_id(source)?,
+            },
+            1,
+            key,
+            expected_revision,
+        )?,
+        Command::OverlayNext {
+            path,
+            channel,
+            key,
+            expected_revision,
+        } => mutate(
+            &path,
+            EngineCommand::TakeNextOverlay {
+                channel: OverlayChannelId::new(channel).expect("CLI parser validates overlays"),
+            },
+            1,
+            key,
+            expected_revision,
+        )?,
         Command::Wipe {
             path,
             frames,
@@ -235,6 +396,42 @@ pub fn run(command: Command) -> AppResult<()> {
             expected_revision,
         )?,
         Command::RemoteStatus { address } => remote::status(address)?,
+        Command::RemoteAudioStrip {
+            address,
+            input,
+            gain_millidb,
+            balance_basis_points,
+            muted,
+            soloed,
+            follow_video,
+            delay_samples,
+            key,
+            expected_revision,
+        } => remote::execute(
+            address,
+            fm_protocol::CommandPayload::SetInputAudioStrip {
+                input: fm_protocol::WireInputId::new(
+                    NonZeroU128::new(input)
+                        .ok_or_else(|| AppFailure("input ID must be nonzero".into()))?,
+                ),
+                gain_millidb: InputGainMilliDb::new(gain_millidb)
+                    .ok_or_else(|| AppFailure("gain must be in -96000..=24000 millidB".into()))?
+                    .get(),
+                balance_basis_points: InputBalanceBasisPoints::new(balance_basis_points)
+                    .ok_or_else(|| {
+                        AppFailure("balance must be in -10000..=10000 basis points".into())
+                    })?
+                    .get(),
+                muted,
+                soloed,
+                follow_video,
+                delay_samples: InputDelaySamples::new(delay_samples)
+                    .ok_or_else(|| AppFailure("delay samples must be in 0..=48000".into()))?
+                    .get(),
+            },
+            key,
+            expected_revision,
+        )?,
         Command::RemotePreview {
             address,
             input,
@@ -325,6 +522,148 @@ pub fn run(command: Command) -> AppResult<()> {
                 slot: fm_protocol::WireStingerSlotId::new(slot)
                     .expect("CLI parser validates Stinger slots"),
                 duration_frames: frames,
+            },
+            key,
+            expected_revision,
+        )?,
+        Command::RemoteOverlayTake {
+            address,
+            channel,
+            source,
+            key,
+            expected_revision,
+        } => remote::execute(
+            address,
+            fm_protocol::CommandPayload::TakeOverlay {
+                channel: fm_protocol::WireOverlayChannelId::new(channel)
+                    .expect("CLI parser validates overlays"),
+                source: fm_protocol::WireInputId::new(
+                    NonZeroU128::new(source)
+                        .ok_or_else(|| AppFailure("input ID must be nonzero".into()))?,
+                ),
+            },
+            key,
+            expected_revision,
+        )?,
+        Command::RemoteOverlayUpdate {
+            address,
+            channel,
+            source,
+            key,
+            expected_revision,
+        } => remote::execute(
+            address,
+            fm_protocol::CommandPayload::UpdateOverlay {
+                channel: fm_protocol::WireOverlayChannelId::new(channel)
+                    .expect("CLI parser validates overlays"),
+                source: fm_protocol::WireInputId::new(
+                    NonZeroU128::new(source)
+                        .ok_or_else(|| AppFailure("input ID must be nonzero".into()))?,
+                ),
+            },
+            key,
+            expected_revision,
+        )?,
+        Command::RemoteOverlayOff {
+            address,
+            channel,
+            key,
+            expected_revision,
+        } => remote::execute(
+            address,
+            fm_protocol::CommandPayload::OverlayOff {
+                channel: fm_protocol::WireOverlayChannelId::new(channel)
+                    .expect("CLI parser validates overlays"),
+            },
+            key,
+            expected_revision,
+        )?,
+        Command::RemoteOverlayOutput {
+            address,
+            channel,
+            output,
+            included,
+            key,
+            expected_revision,
+        } => remote::execute(
+            address,
+            fm_protocol::CommandPayload::SetOverlayOutputInclusion {
+                channel: fm_protocol::WireOverlayChannelId::new(channel)
+                    .expect("CLI parser validates overlays"),
+                output: fm_protocol::WireOutputId::new(
+                    NonZeroU128::new(output)
+                        .ok_or_else(|| AppFailure("output ID must be nonzero".into()))?,
+                ),
+                included,
+            },
+            key,
+            expected_revision,
+        )?,
+        Command::RemoteOverlayTransition {
+            address,
+            channel,
+            transition,
+            frames,
+            key,
+            expected_revision,
+        } => remote::execute(
+            address,
+            fm_protocol::CommandPayload::ConfigureOverlayTransition {
+                channel: fm_protocol::WireOverlayChannelId::new(channel)
+                    .expect("CLI parser validates overlays"),
+                transition: protocol_overlay_transition(transition),
+                duration_frames: frames,
+            },
+            key,
+            expected_revision,
+        )?,
+        Command::RemoteOverlayAppearance {
+            address,
+            channel,
+            position,
+            border,
+            key,
+            expected_revision,
+        } => remote::execute(
+            address,
+            fm_protocol::CommandPayload::ConfigureOverlayAppearance {
+                channel: fm_protocol::WireOverlayChannelId::new(channel)
+                    .expect("CLI parser validates overlays"),
+                position: protocol_overlay_position(position),
+                border: protocol_overlay_border(border),
+            },
+            key,
+            expected_revision,
+        )?,
+        Command::RemoteOverlayQueue {
+            address,
+            channel,
+            source,
+            key,
+            expected_revision,
+        } => remote::execute(
+            address,
+            fm_protocol::CommandPayload::QueueOverlay {
+                channel: fm_protocol::WireOverlayChannelId::new(channel)
+                    .expect("CLI parser validates overlays"),
+                source: fm_protocol::WireInputId::new(
+                    NonZeroU128::new(source)
+                        .ok_or_else(|| AppFailure("source input ID must be nonzero".into()))?,
+                ),
+            },
+            key,
+            expected_revision,
+        )?,
+        Command::RemoteOverlayNext {
+            address,
+            channel,
+            key,
+            expected_revision,
+        } => remote::execute(
+            address,
+            fm_protocol::CommandPayload::TakeNextOverlay {
+                channel: fm_protocol::WireOverlayChannelId::new(channel)
+                    .expect("CLI parser validates overlays"),
             },
             key,
             expected_revision,
@@ -431,13 +770,18 @@ fn default_project(name: String) -> AppResult<ProjectEngine> {
 
 fn engine_from_project(project: Project) -> AppResult<ProjectEngine> {
     let main_mix = required_main_mix(&project)?;
-    let inputs = project.inputs().iter().map(|input| input.id).collect();
-    let show = ShowState::new(
+    let inputs = project
+        .inputs()
+        .iter()
+        .map(|input| (input.id, input.name.clone()))
+        .collect();
+    let mut show = ShowState::new(
         project.name(),
         inputs,
         main_mix.desired_program,
         main_mix.desired_preview,
     )?;
+    restore_input_audio_strips(&mut show, &project)?;
     let engine = Engine::new(show, project.settings().frame_rate, clock_domain());
     Ok(ProjectEngine { project, engine })
 }
@@ -455,6 +799,13 @@ fn mutate(
             if project.engine.realized_fade_to_black().active == *active =>
         {
             1
+        }
+        EngineCommand::TakeOverlay { channel, .. } | EngineCommand::OverlayOff { channel } => {
+            let overlay = project.engine.show().desired_switcher().overlay(*channel);
+            match overlay.transition() {
+                OverlayTransitionKind::Cut => 1,
+                OverlayTransitionKind::Fade => overlay.duration_frames(),
+            }
         }
         _ => ticks,
     };
@@ -623,7 +974,8 @@ fn save_engine(path: &Path, project_engine: &ProjectEngine) -> AppResult<()> {
     let realized = snapshot.realized_switcher();
     let mut project = project_engine.project.clone();
     project.set_main_mix(MainMix::new(desired.program(), desired.preview()));
-    let stored = StoredProject::from_project_with_runtime_state(
+    sync_input_audio_strips(&mut project, snapshot.show())?;
+    let stored = StoredProject::from_project_with_complete_runtime_state(
         project,
         RuntimeRouting {
             desired_program_id: Some(desired.program()),
@@ -639,6 +991,7 @@ fn save_engine(path: &Path, project_engine: &ProjectEngine) -> AppResult<()> {
             desired: persisted_fade_to_black(snapshot.desired_fade_to_black()),
             realized: persisted_fade_to_black(snapshot.realized_fade_to_black()),
         },
+        persisted_overlays(desired, realized),
         ProjectPosition {
             revision: snapshot.revision().get(),
             state_epoch: snapshot.state_epoch().get(),
@@ -672,11 +1025,12 @@ fn update_stingers(path: &Path, update: impl FnOnce(&mut Project)) -> AppResult<
     let stored = store.load()?;
     let mut project = stored.project().clone();
     update(&mut project);
-    let configured = StoredProject::from_project_with_runtime_state(
+    let configured = StoredProject::from_project_with_complete_runtime_state(
         project,
         stored.runtime_routing(),
         stored.runtime_manual_transitions(),
         stored.runtime_fade_to_black(),
+        stored.runtime_overlays().clone(),
         stored.position(),
         stored.idempotency_receipts().to_vec(),
     )?;
@@ -691,19 +1045,21 @@ fn load_engine(path: &Path) -> AppResult<ProjectEngine> {
     let inputs = project
         .inputs()
         .iter()
-        .map(|input| input.id)
+        .map(|input| (input.id, input.name.clone()))
         .collect::<Vec<_>>();
+    let input_ids = inputs.iter().map(|(input, _)| *input).collect::<Vec<_>>();
     let main_mix = required_main_mix(&project)?;
     let routing = stored.runtime_routing();
     let realized_program = required_routing(routing.realized_program_id, "realized program")?;
     let realized_preview = required_routing(routing.realized_preview_id, "realized preview")?;
     let mut show = ShowState::new(
         project.name(),
-        inputs.clone(),
+        inputs,
         main_mix.desired_program,
         main_mix.desired_preview,
     )?;
-    let mut realized = SwitcherState::new(inputs, realized_program, realized_preview)?;
+    restore_input_audio_strips(&mut show, &project)?;
+    let mut realized = SwitcherState::new(input_ids, realized_program, realized_preview)?;
     for config in project.stingers() {
         restore_stinger(&mut show, &mut realized, *config)?;
     }
@@ -716,7 +1072,8 @@ fn load_engine(path: &Path) -> AppResult<ProjectEngine> {
     }
     let fade_to_black = stored.runtime_fade_to_black();
     show.restore_fade_to_black(fade_to_black.desired.target_active);
-    let _ = realized.set_fade_to_black(fade_to_black.realized.target_active);
+    realized.restore_settled_fade_to_black(fade_to_black.realized.target_active);
+    restore_overlays(&mut show, &mut realized, stored.runtime_overlays())?;
     let position = stored.position();
     let engine = Engine::restore_persisted(
         show,
@@ -738,6 +1095,178 @@ fn load_engine(path: &Path) -> AppResult<ProjectEngine> {
         },
     )?;
     Ok(ProjectEngine { project, engine })
+}
+
+fn engine_audio_strip_state(
+    gain_millidb: i32,
+    balance_basis_points: i32,
+    muted: bool,
+    soloed: bool,
+    follow_video: bool,
+    delay_samples: u32,
+) -> AppResult<EngineInputAudioStripState> {
+    Ok(EngineInputAudioStripState {
+        gain_millidb: InputGainMilliDb::new(gain_millidb)
+            .ok_or_else(|| AppFailure("gain must be in -96000..=24000 millidB".into()))?
+            .get(),
+        balance_basis_points: InputBalanceBasisPoints::new(balance_basis_points)
+            .ok_or_else(|| AppFailure("balance must be in -10000..=10000 basis points".into()))?
+            .get(),
+        muted,
+        soloed,
+        follow_video,
+        delay_samples: InputDelaySamples::new(delay_samples)
+            .ok_or_else(|| AppFailure("delay samples must be in 0..=48000".into()))?
+            .get(),
+    })
+}
+
+fn restore_input_audio_strips(show: &mut ShowState, project: &Project) -> AppResult<()> {
+    for strip in project.input_audio_strips() {
+        show.set_input_audio_strip(
+            strip.input,
+            EngineInputAudioStripState {
+                gain_millidb: strip.state.gain.get(),
+                balance_basis_points: strip.state.balance.get(),
+                muted: strip.state.muted,
+                soloed: strip.state.soloed,
+                follow_video: strip.state.follow_video,
+                delay_samples: strip.state.delay_samples.get(),
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn sync_input_audio_strips(project: &mut Project, show: &ShowState) -> AppResult<()> {
+    for (&input, &state) in show.input_audio_strips() {
+        project.input_audio_strip(input).ok_or_else(|| {
+            AppFailure(format!("project is missing audio strip for input {input}"))
+        })?;
+        let strip = InputAudioStripState {
+            gain: InputGainMilliDb::new(state.gain_millidb)
+                .expect("engine input audio gain is bounded by the model contract"),
+            balance: InputBalanceBasisPoints::new(state.balance_basis_points)
+                .expect("engine input audio balance is bounded by the model contract"),
+            muted: state.muted,
+            soloed: state.soloed,
+            follow_video: state.follow_video,
+            delay_samples: InputDelaySamples::new(state.delay_samples)
+                .expect("engine input audio delay is bounded by the model contract"),
+        };
+        if !project.set_input_audio_strip(input, strip) {
+            return Err(AppFailure(format!("project is missing input {input}")).into());
+        }
+    }
+    Ok(())
+}
+
+fn persisted_overlays(desired: &SwitcherState, realized: &SwitcherState) -> RuntimeOverlays {
+    RuntimeOverlays {
+        desired: std::array::from_fn(|index| persisted_overlay(&desired.overlays()[index])),
+        realized: std::array::from_fn(|index| persisted_overlay(&realized.overlays()[index])),
+    }
+}
+
+fn persisted_overlay(channel: &OverlayChannelState) -> RuntimeOverlayChannel {
+    RuntimeOverlayChannel {
+        source: channel.source(),
+        active: channel.is_active(),
+        transition: match channel.transition() {
+            OverlayTransitionKind::Cut => RuntimeOverlayTransition::Cut,
+            OverlayTransitionKind::Fade => RuntimeOverlayTransition::Fade,
+        },
+        duration_frames: channel.duration_frames(),
+        position: persisted_overlay_position(channel.position()),
+        border: persisted_overlay_border(channel.border()),
+        queued_sources: channel.queued_sources().to_vec(),
+        included_outputs: channel.included_outputs().to_vec(),
+    }
+}
+
+fn persisted_overlay_position(position: OverlayPositionPreset) -> RuntimeOverlayPosition {
+    match position {
+        OverlayPositionPreset::FullFrame => RuntimeOverlayPosition::FullFrame,
+        OverlayPositionPreset::TopLeft => RuntimeOverlayPosition::TopLeft,
+        OverlayPositionPreset::TopRight => RuntimeOverlayPosition::TopRight,
+        OverlayPositionPreset::BottomLeft => RuntimeOverlayPosition::BottomLeft,
+        OverlayPositionPreset::BottomRight => RuntimeOverlayPosition::BottomRight,
+    }
+}
+
+fn restored_overlay_position(position: RuntimeOverlayPosition) -> OverlayPositionPreset {
+    match position {
+        RuntimeOverlayPosition::FullFrame => OverlayPositionPreset::FullFrame,
+        RuntimeOverlayPosition::TopLeft => OverlayPositionPreset::TopLeft,
+        RuntimeOverlayPosition::TopRight => OverlayPositionPreset::TopRight,
+        RuntimeOverlayPosition::BottomLeft => OverlayPositionPreset::BottomLeft,
+        RuntimeOverlayPosition::BottomRight => OverlayPositionPreset::BottomRight,
+    }
+}
+
+fn persisted_overlay_border(border: OverlayBorderPreset) -> RuntimeOverlayBorder {
+    match border {
+        OverlayBorderPreset::None => RuntimeOverlayBorder::None,
+        OverlayBorderPreset::ThinWhite => RuntimeOverlayBorder::ThinWhite,
+        OverlayBorderPreset::ThickWhite => RuntimeOverlayBorder::ThickWhite,
+    }
+}
+
+fn restored_overlay_border(border: RuntimeOverlayBorder) -> OverlayBorderPreset {
+    match border {
+        RuntimeOverlayBorder::None => OverlayBorderPreset::None,
+        RuntimeOverlayBorder::ThinWhite => OverlayBorderPreset::ThinWhite,
+        RuntimeOverlayBorder::ThickWhite => OverlayBorderPreset::ThickWhite,
+    }
+}
+
+fn restore_overlays(
+    show: &mut ShowState,
+    realized: &mut SwitcherState,
+    overlays: &RuntimeOverlays,
+) -> AppResult<()> {
+    for (index, (desired, realized_state)) in
+        overlays.desired.iter().zip(&overlays.realized).enumerate()
+    {
+        let channel = OverlayChannelId::from_index(index).expect("overlay index is bounded");
+        restore_overlay(show.desired_switcher_mut(), channel, desired)?;
+        restore_overlay(realized, channel, realized_state)?;
+    }
+    Ok(())
+}
+
+fn restore_overlay(
+    switcher: &mut SwitcherState,
+    channel: OverlayChannelId,
+    state: &RuntimeOverlayChannel,
+) -> AppResult<()> {
+    switcher.configure_overlay_transition(
+        channel,
+        match state.transition {
+            RuntimeOverlayTransition::Cut => OverlayTransitionKind::Cut,
+            RuntimeOverlayTransition::Fade => OverlayTransitionKind::Fade,
+        },
+        state.duration_frames,
+    )?;
+    let _ = switcher.configure_overlay_appearance(
+        channel,
+        restored_overlay_position(state.position),
+        restored_overlay_border(state.border),
+    );
+    if let Some(source) = state.source {
+        if state.active {
+            switcher.take_overlay(channel, source)?;
+        } else {
+            switcher.update_overlay(channel, source)?;
+        }
+    }
+    for source in &state.queued_sources {
+        switcher.queue_overlay(channel, *source)?;
+    }
+    for output in &state.included_outputs {
+        let _ = switcher.set_overlay_output_inclusion(channel, *output, true);
+    }
+    Ok(())
 }
 
 fn restore_stinger(
@@ -816,59 +1345,7 @@ fn restored_t_bar(state: PersistedManualTransitionState) -> AppResult<TBarState>
 }
 
 fn load_stored_project(path: &Path) -> AppResult<StoredProject> {
-    let store = ProjectStore::new(path)?;
-    match store.load() {
-        Ok(project) => Ok(project),
-        Err(StoreError::Validation(ProjectValidationError::UnsupportedSchema {
-            found: 2, ..
-        })) => {
-            store.migrate_v2()?;
-            Ok(store.load()?)
-        }
-        Err(StoreError::Validation(ProjectValidationError::UnsupportedSchema {
-            found: 3, ..
-        })) => {
-            store.migrate_v3()?;
-            Ok(store.load()?)
-        }
-        Err(StoreError::Validation(ProjectValidationError::UnsupportedSchema {
-            found: 4, ..
-        })) => {
-            store.migrate_v4()?;
-            Ok(store.load()?)
-        }
-        Err(StoreError::Validation(ProjectValidationError::UnsupportedSchema {
-            found: 5, ..
-        })) => {
-            store.migrate_v5()?;
-            Ok(store.load()?)
-        }
-        Err(StoreError::Validation(ProjectValidationError::UnsupportedSchema {
-            found: 6, ..
-        })) => {
-            store.migrate_v6()?;
-            Ok(store.load()?)
-        }
-        Err(StoreError::Validation(ProjectValidationError::UnsupportedSchema {
-            found: 7, ..
-        })) => {
-            store.migrate_v7()?;
-            Ok(store.load()?)
-        }
-        Err(StoreError::Validation(ProjectValidationError::UnsupportedSchema {
-            found: 8, ..
-        })) => {
-            store.migrate_v8()?;
-            Ok(store.load()?)
-        }
-        Err(StoreError::Validation(ProjectValidationError::UnsupportedSchema {
-            found: 9, ..
-        })) => {
-            store.migrate_v9()?;
-            Ok(store.load()?)
-        }
-        Err(error) => Err(error.into()),
-    }
+    Ok(ProjectStore::new(path)?.load()?)
 }
 
 fn render(path: &Path, output: &Path, width: u32, height: u32) -> AppResult<()> {
@@ -942,7 +1419,7 @@ fn print_status(project: &ProjectEngine) {
     let desired = engine.show().desired_switcher();
     let realized = engine.realized_switcher();
     println!(
-        "project_id={} show={:?} revision={} frame={} Program(desired={}, realized={}) Preview(desired={}, realized={}) TBar(desired={}, realized={}) FTB(desired={}, realized={}) Stingers={}",
+        "project_id={} show={:?} revision={} frame={} Program(desired={}, realized={}) Preview(desired={}, realized={}) TBar(desired={}, realized={}) FTB(desired={}, realized={}) Overlays(desired={}, realized={}) AudioStrips={} Stingers={}",
         project.project.id(),
         engine.show().name(),
         engine.revision(),
@@ -955,8 +1432,81 @@ fn print_status(project: &ProjectEngine) {
         format_t_bar(realized.t_bar()),
         format_fade_to_black(engine.desired_fade_to_black()),
         format_fade_to_black(engine.realized_fade_to_black()),
+        format_overlays(desired.overlays()),
+        format_overlays(realized.overlays()),
+        format_audio_strips(&project.project),
         format_stingers(project.project.stingers()),
     );
+}
+
+fn format_audio_strips(project: &Project) -> String {
+    let strips = project
+        .input_audio_strips()
+        .iter()
+        .map(|strip| {
+            let name = project
+                .inputs()
+                .iter()
+                .find(|input| input.id == strip.input)
+                .map_or("", |input| input.name.as_str());
+            format!(
+                "{}:{name:?}:gain_mdb={}:balance_bp={}:delay_samples={}:{}:{}:{}",
+                strip.input,
+                strip.state.gain.get(),
+                strip.state.balance.get(),
+                strip.state.delay_samples.get(),
+                if strip.state.muted { "muted" } else { "live" },
+                if strip.state.soloed { "solo" } else { "mix" },
+                if strip.state.follow_video {
+                    "afv"
+                } else {
+                    "always"
+                },
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{strips}]")
+}
+
+fn format_overlays(overlays: &[OverlayChannelState; 8]) -> String {
+    let channels = overlays
+        .iter()
+        .enumerate()
+        .map(|(index, overlay)| {
+            let outputs = overlay
+                .included_outputs()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("+");
+            format!(
+                "{}:{}:{}:opacity={}:{}@{}:{}:{}:queue=[{}]:outputs=[{}]",
+                index + 1,
+                overlay
+                    .source()
+                    .map_or_else(|| "none".to_owned(), |source| source.to_string()),
+                if overlay.is_active() { "on" } else { "off" },
+                overlay.opacity(),
+                match overlay.transition() {
+                    OverlayTransitionKind::Cut => "cut",
+                    OverlayTransitionKind::Fade => "fade",
+                },
+                overlay.duration_frames(),
+                overlay_position_name(overlay.position()),
+                overlay_border_name(overlay.border()),
+                overlay
+                    .queued_sources()
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("+"),
+                outputs,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{channels}]")
 }
 
 fn format_stingers(stingers: &[StingerConfig]) -> String {
@@ -1027,6 +1577,7 @@ FreeMix deterministic MVP
 Usage:
   freemix-cli new <show.freemix> [--name <name>]
   freemix-cli status <show.freemix>
+  freemix-cli audio-strip <show.freemix> <input> <gain-millidb:-96000..=24000> <balance-bp:-10000..=10000> <muted:on|off> <soloed:on|off> <follow-video:on|off> <delay-samples:0..=48000>
   freemix-cli preview <show.freemix> <input> [--key <key>] [--expect <revision>]
   freemix-cli cut <show.freemix> [--key <key>] [--expect <revision>]
   freemix-cli fade <show.freemix> <frames> [--key <key>] [--expect <revision>]
@@ -1036,6 +1587,14 @@ Usage:
   freemix-cli stinger <show.freemix> <slot:1..=8> <frames> [--key <key>] [--expect <revision>]
   freemix-cli stinger-configure <show.freemix> <slot:1..=8> <media-input> <true|false> <cut-point-frames> <muted|stinger-only|mix-with-program> <cut|fade|keep-program>
   freemix-cli stinger-remove <show.freemix> <slot:1..=8>
+  freemix-cli overlay-take <show.freemix> <channel:1..=8> <source-input> [--key <key>] [--expect <revision>]
+  freemix-cli overlay-update <show.freemix> <channel:1..=8> <source-input> [--key <key>] [--expect <revision>]
+  freemix-cli overlay-off <show.freemix> <channel:1..=8> [--key <key>] [--expect <revision>]
+  freemix-cli overlay-output <show.freemix> <channel:1..=8> <output> <true|false> [--key <key>] [--expect <revision>]
+  freemix-cli overlay-transition <show.freemix> <channel:1..=8> <cut|fade> <frames> [--key <key>] [--expect <revision>]
+  freemix-cli overlay-appearance <show.freemix> <channel:1..=8> <full-frame|top-left|top-right|bottom-left|bottom-right> <none|thin-white|thick-white> [--key <key>] [--expect <revision>]
+  freemix-cli overlay-queue <show.freemix> <channel:1..=8> <source-input> [--key <key>] [--expect <revision>]
+  freemix-cli overlay-next <show.freemix> <channel:1..=8> [--key <key>] [--expect <revision>]
   freemix-cli wipe <show.freemix> <frames> [--key <key>] [--expect <revision>]
   freemix-cli tbar-start <show.freemix> <fade|wipe|alpha-fade> [--key <key>] [--expect <revision>]
   freemix-cli tbar-position <show.freemix> <basis-points:0..=10000> [--key <key>] [--expect <revision>]
@@ -1043,6 +1602,7 @@ Usage:
   freemix-cli tbar-cancel <show.freemix> [--key <key>] [--expect <revision>]
   freemix-cli ftb <show.freemix> <live|black> <frames> [--key <key>] [--expect <revision>]
   freemix-cli remote-status <127.0.0.1:port>
+  freemix-cli remote-audio-strip <127.0.0.1:port> <input> <gain-millidb:-96000..=24000> <balance-bp:-10000..=10000> <muted:on|off> <soloed:on|off> <follow-video:on|off> <delay-samples:0..=48000> [--key <key>] [--expect <revision>]
   freemix-cli remote-preview <127.0.0.1:port> <input> [--key <key>] [--expect <revision>]
   freemix-cli remote-cut <127.0.0.1:port> [--key <key>] [--expect <revision>]
   freemix-cli remote-fade <127.0.0.1:port> <frames> [--key <key>] [--expect <revision>]
@@ -1050,6 +1610,14 @@ Usage:
   freemix-cli remote-slide <127.0.0.1:port> <frames> [--key <key>] [--expect <revision>]
   freemix-cli remote-zoom <127.0.0.1:port> <frames> [--key <key>] [--expect <revision>]
   freemix-cli remote-stinger <127.0.0.1:port> <slot:1..=8> <frames> [--key <key>] [--expect <revision>]
+  freemix-cli remote-overlay-take <127.0.0.1:port> <channel:1..=8> <source-input> [--key <key>] [--expect <revision>]
+  freemix-cli remote-overlay-update <127.0.0.1:port> <channel:1..=8> <source-input> [--key <key>] [--expect <revision>]
+  freemix-cli remote-overlay-off <127.0.0.1:port> <channel:1..=8> [--key <key>] [--expect <revision>]
+  freemix-cli remote-overlay-output <127.0.0.1:port> <channel:1..=8> <output> <true|false> [--key <key>] [--expect <revision>]
+  freemix-cli remote-overlay-transition <127.0.0.1:port> <channel:1..=8> <cut|fade> <frames> [--key <key>] [--expect <revision>]
+  freemix-cli remote-overlay-appearance <127.0.0.1:port> <channel:1..=8> <full-frame|top-left|top-right|bottom-left|bottom-right> <none|thin-white|thick-white> [--key <key>] [--expect <revision>]
+  freemix-cli remote-overlay-queue <127.0.0.1:port> <channel:1..=8> <source-input> [--key <key>] [--expect <revision>]
+  freemix-cli remote-overlay-next <127.0.0.1:port> <channel:1..=8> [--key <key>] [--expect <revision>]
   freemix-cli remote-wipe <127.0.0.1:port> <frames> [--key <key>] [--expect <revision>]
   freemix-cli remote-tbar-start <127.0.0.1:port> <fade|wipe|alpha-fade> [--key <key>] [--expect <revision>]
   freemix-cli remote-tbar-position <127.0.0.1:port> <basis-points:0..=10000> [--key <key>] [--expect <revision>]
@@ -1066,6 +1634,76 @@ const fn engine_manual_kind(kind: ManualTransitionKind) -> EngineManualTransitio
         ManualTransitionKind::Fade => EngineManualTransitionKind::Fade,
         ManualTransitionKind::Wipe => EngineManualTransitionKind::Wipe,
         ManualTransitionKind::AlphaFade => EngineManualTransitionKind::AlphaFade,
+    }
+}
+
+const fn switcher_overlay_transition(kind: CliOverlayTransition) -> OverlayTransitionKind {
+    match kind {
+        CliOverlayTransition::Cut => OverlayTransitionKind::Cut,
+        CliOverlayTransition::Fade => OverlayTransitionKind::Fade,
+    }
+}
+
+const fn protocol_overlay_transition(
+    kind: CliOverlayTransition,
+) -> fm_protocol::OverlayTransitionKind {
+    match kind {
+        CliOverlayTransition::Cut => fm_protocol::OverlayTransitionKind::Cut,
+        CliOverlayTransition::Fade => fm_protocol::OverlayTransitionKind::Fade,
+    }
+}
+
+const fn switcher_overlay_position(kind: CliOverlayPosition) -> OverlayPositionPreset {
+    match kind {
+        CliOverlayPosition::FullFrame => OverlayPositionPreset::FullFrame,
+        CliOverlayPosition::TopLeft => OverlayPositionPreset::TopLeft,
+        CliOverlayPosition::TopRight => OverlayPositionPreset::TopRight,
+        CliOverlayPosition::BottomLeft => OverlayPositionPreset::BottomLeft,
+        CliOverlayPosition::BottomRight => OverlayPositionPreset::BottomRight,
+    }
+}
+
+const fn switcher_overlay_border(kind: CliOverlayBorder) -> OverlayBorderPreset {
+    match kind {
+        CliOverlayBorder::None => OverlayBorderPreset::None,
+        CliOverlayBorder::ThinWhite => OverlayBorderPreset::ThinWhite,
+        CliOverlayBorder::ThickWhite => OverlayBorderPreset::ThickWhite,
+    }
+}
+
+const fn protocol_overlay_position(kind: CliOverlayPosition) -> fm_protocol::OverlayPositionPreset {
+    match kind {
+        CliOverlayPosition::FullFrame => fm_protocol::OverlayPositionPreset::FullFrame,
+        CliOverlayPosition::TopLeft => fm_protocol::OverlayPositionPreset::TopLeft,
+        CliOverlayPosition::TopRight => fm_protocol::OverlayPositionPreset::TopRight,
+        CliOverlayPosition::BottomLeft => fm_protocol::OverlayPositionPreset::BottomLeft,
+        CliOverlayPosition::BottomRight => fm_protocol::OverlayPositionPreset::BottomRight,
+    }
+}
+
+const fn protocol_overlay_border(kind: CliOverlayBorder) -> fm_protocol::OverlayBorderPreset {
+    match kind {
+        CliOverlayBorder::None => fm_protocol::OverlayBorderPreset::None,
+        CliOverlayBorder::ThinWhite => fm_protocol::OverlayBorderPreset::ThinWhite,
+        CliOverlayBorder::ThickWhite => fm_protocol::OverlayBorderPreset::ThickWhite,
+    }
+}
+
+const fn overlay_position_name(position: OverlayPositionPreset) -> &'static str {
+    match position {
+        OverlayPositionPreset::FullFrame => "full-frame",
+        OverlayPositionPreset::TopLeft => "top-left",
+        OverlayPositionPreset::TopRight => "top-right",
+        OverlayPositionPreset::BottomLeft => "bottom-left",
+        OverlayPositionPreset::BottomRight => "bottom-right",
+    }
+}
+
+const fn overlay_border_name(border: OverlayBorderPreset) -> &'static str {
+    match border {
+        OverlayBorderPreset::None => "none",
+        OverlayBorderPreset::ThinWhite => "thin-white",
+        OverlayBorderPreset::ThickWhite => "thick-white",
     }
 }
 
@@ -1141,6 +1779,12 @@ fn input_id(value: u128) -> AppResult<InputId> {
     NonZeroU128::new(value)
         .map(InputId::new)
         .ok_or_else(|| AppFailure("input ID must be nonzero".into()).into())
+}
+
+fn output_id(value: u128) -> AppResult<OutputId> {
+    NonZeroU128::new(value)
+        .map(OutputId::new)
+        .ok_or_else(|| AppFailure("output ID must be nonzero".into()).into())
 }
 
 fn required_routing(value: Option<InputId>, field: &'static str) -> AppResult<InputId> {
@@ -1221,7 +1865,12 @@ mod tests {
         let program = InputId::new(NonZeroU128::new(1).unwrap());
         let preview = InputId::new(NonZeroU128::new(2).unwrap());
         let inputs = vec![program, preview];
-        let mut show = ShowState::new("restore", inputs.clone(), program, preview).unwrap();
+        let named_inputs = inputs
+            .iter()
+            .copied()
+            .map(|input| (input, format!("Input {input}")))
+            .collect();
+        let mut show = ShowState::new("restore", named_inputs, program, preview).unwrap();
         let mut realized = SwitcherState::new(inputs, program, preview).unwrap();
         let slot = fm_model::StingerSlotNumber::new(1).unwrap();
         let config = |preload| {

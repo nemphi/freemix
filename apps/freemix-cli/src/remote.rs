@@ -8,10 +8,9 @@ use std::{
 
 use fm_client::{Client, ClientConfig, Intake, Outbound};
 use fm_protocol::{
-    CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, ClientHello, ClientType, CommandPayload,
-    CommandResult, EventPayload, FadeToBlackState, HandshakeOutcome, HandshakeResponse, Role,
-    RuntimeLifecycleEvent, ServerHello, ServerIdentity, SnapshotReason, WireMessage, decode_line,
-    encode_line,
+    CURRENT_PROTOCOL_VERSION, ClientType, CommandPayload, CommandResult, EventPayload,
+    FadeToBlackState, HandshakeOutcome, HandshakeRequest, Role, RuntimeLifecycleEvent,
+    ServerIdentity, WireMessage, decode_line, encode_line,
 };
 use fm_types::ProjectId;
 use fm_ui_model::ManualTransitionStatus;
@@ -57,28 +56,35 @@ impl Remote {
         let stream = TcpStream::connect(address)?;
         stream.set_nodelay(true)?;
         let mut remote = Self::uninitialized(stream)?;
-        remote.write(&WireMessage::ClientHello(ClientHello {
-            versions: vec![CURRENT_PROTOCOL_VERSION],
+        remote.write(&WireMessage::HandshakeRequest(HandshakeRequest {
+            protocol: CURRENT_PROTOCOL_VERSION,
             build: format!("freemix-cli-{}", env!("CARGO_PKG_VERSION")),
             client_type: ClientType::Cli,
             desired_role: Role::Operator,
-            cached_cursor: None,
+            resume_cursor: None,
         }))?;
 
-        let hello = match remote.read()? {
-            WireMessage::ServerHello(hello) => hello,
+        let response = match remote.read()? {
+            WireMessage::HandshakeResponse(response) => response,
             WireMessage::Error(error) => return Err(protocol_error(&error.error).into()),
-            _ => return Err(RemoteFailure("expected server_hello during handshake".into()).into()),
+            _ => {
+                return Err(
+                    RemoteFailure("expected handshake_response during handshake".into()).into(),
+                );
+            }
         };
-        if hello.resume {
-            return Err(
-                RemoteFailure("daemon selected resume without a client cursor".into()).into(),
-            );
+        match &response.outcome {
+            HandshakeOutcome::Snapshot { .. } => {}
+            HandshakeOutcome::Resume { .. } => {
+                return Err(
+                    RemoteFailure("daemon selected resume without a client cursor".into()).into(),
+                );
+            }
+            HandshakeOutcome::Rejected { error } => return Err(protocol_error(error).into()),
         }
 
-        let project_id = project_id(&hello)?;
+        let project_id = project_id(&response.server)?;
         let mut client = Client::new(ClientConfig::new(
-            vec![CURRENT_PROTOCOL_VERSION],
             env!("CARGO_PKG_VERSION"),
             ClientType::Cli,
             Role::Operator,
@@ -92,7 +98,7 @@ impl Remote {
                 RemoteFailure("fresh client unexpectedly supplied a resume cursor".into()).into(),
             );
         }
-        client.accept_handshake(adapt_hello(&hello, project_id))?;
+        client.accept_handshake(response)?;
         match remote.read()? {
             WireMessage::Snapshot(snapshot) => {
                 client.intake(WireMessage::Snapshot(snapshot))?;
@@ -116,7 +122,6 @@ impl Remote {
             writer: stream.try_clone()?,
             reader: BufReader::new(stream),
             client: Client::new(ClientConfig::new(
-                vec![CURRENT_PROTOCOL_VERSION],
                 env!("CARGO_PKG_VERSION"),
                 ClientType::Cli,
                 Role::Operator,
@@ -219,10 +224,7 @@ impl Remote {
                 ))
                 .into());
             }
-            let realized = matches!(
-                &runtime.event,
-                RuntimeLifecycleEvent::Realized { domain, .. } if domain == "switcher"
-            );
+            let realized = matches!(&runtime.event, RuntimeLifecycleEvent::Realized { .. });
             self.client.intake(WireMessage::RuntimeEvent(runtime))?;
             if realized {
                 break;
@@ -244,7 +246,7 @@ impl Remote {
             .ok_or_else(|| RemoteFailure("remote project cursor is unavailable".into()))?;
         let switcher = state.switcher();
         println!(
-            "project_id={} show={:?} revision={} frame=unavailable Program(desired={}, realized={}) Preview(desired={}, realized={}) TBar(desired={}, realized={}) FTB(desired={}, realized={})",
+            "project_id={} show={:?} revision={} frame=unavailable Program(desired={}, realized={}) Preview(desired={}, realized={}) TBar(desired={}, realized={}) FTB(desired={}, realized={}) AudioStrips={} Overlays(desired={}, realized={})",
             self.project_id,
             state.show_name(),
             cursor.revision,
@@ -256,6 +258,9 @@ impl Remote {
             format_manual_transition(switcher.realized_manual_transition),
             format_fade_to_black(switcher.desired_fade_to_black),
             format_fade_to_black(switcher.realized_fade_to_black),
+            format_input_audio_strips(state),
+            format_overlays(state.desired_overlays()),
+            format_overlays(state.realized_overlays()),
         );
         Ok(())
     }
@@ -274,6 +279,30 @@ impl Remote {
         }
         Ok(decode_line(&line)?)
     }
+}
+
+fn format_input_audio_strips(state: &fm_ui_model::ProjectState) -> String {
+    format!(
+        "[{}]",
+        state
+            .input_audio_strips()
+            .iter()
+            .map(|status| {
+                format!(
+                    "{}:{:?}:{}:{}:{}:{}:{}:{}",
+                    status.input,
+                    state.input_name(status.input).unwrap_or(""),
+                    status.gain_millidb,
+                    status.balance_basis_points,
+                    status.muted,
+                    status.soloed,
+                    status.follow_video,
+                    status.delay_samples
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    )
 }
 
 fn format_fade_to_black(state: FadeToBlackState) -> String {
@@ -302,38 +331,50 @@ fn format_manual_transition(status: ManualTransitionStatus) -> String {
     }
 }
 
-fn adapt_hello(hello: &ServerHello, project_id: ProjectId) -> HandshakeResponse {
-    HandshakeResponse {
-        negotiated: hello.negotiated,
-        granted_role: hello.granted_role,
-        permissions: hello.permissions.clone(),
-        capabilities: CapabilityReportSummary {
-            digest: hello.capabilities_digest.clone(),
-            total: 0,
-            available: 0,
-            degraded: 0,
-            unavailable: 0,
-        },
-        server: ServerIdentity {
-            engine_id: hello.engine.engine_id.clone(),
-            project_id: project_id.to_string(),
-            state_epoch: hello.engine.state_epoch,
-            log_id: hello.engine.log_id.clone(),
-        },
-        current_revision: hello.current_revision,
-        outcome: HandshakeOutcome::Snapshot {
-            reason: SnapshotReason::NoCursor,
-        },
-    }
+fn format_overlays(overlays: &[fm_ui_model::OverlayStatus]) -> String {
+    format!(
+        "[{}]",
+        overlays
+            .iter()
+            .map(|overlay| format!(
+                "{}:{}:{}:opacity={}:{}@{}:{}:{}:queue=[{}]",
+                overlay.channel,
+                overlay
+                    .source
+                    .map_or_else(|| "none".to_owned(), |source| source.to_string()),
+                if overlay.active { "on" } else { "off" },
+                overlay.opacity,
+                match overlay.transition {
+                    fm_protocol::OverlayTransitionKind::Cut => "cut",
+                    fm_protocol::OverlayTransitionKind::Fade => "fade",
+                },
+                overlay.duration_frames,
+                match overlay.position {
+                    fm_protocol::OverlayPositionPreset::FullFrame => "full-frame",
+                    fm_protocol::OverlayPositionPreset::TopLeft => "top-left",
+                    fm_protocol::OverlayPositionPreset::TopRight => "top-right",
+                    fm_protocol::OverlayPositionPreset::BottomLeft => "bottom-left",
+                    fm_protocol::OverlayPositionPreset::BottomRight => "bottom-right",
+                },
+                match overlay.border {
+                    fm_protocol::OverlayBorderPreset::None => "none",
+                    fm_protocol::OverlayBorderPreset::ThinWhite => "thin-white",
+                    fm_protocol::OverlayBorderPreset::ThickWhite => "thick-white",
+                },
+                overlay
+                    .queued_sources
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("+"),
+            ))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
 }
 
-fn project_id(hello: &ServerHello) -> RemoteResult<ProjectId> {
-    let value = hello
-        .engine
-        .engine_id
-        .strip_prefix("project-")
-        .ok_or_else(|| RemoteFailure("daemon engine identity has no project ID".into()))?
-        .parse::<u128>()?;
+fn project_id(server: &ServerIdentity) -> RemoteResult<ProjectId> {
+    let value = server.project_id.parse::<u128>()?;
     NonZeroU128::new(value)
         .map(ProjectId::new)
         .ok_or_else(|| RemoteFailure("daemon project ID is zero".into()).into())

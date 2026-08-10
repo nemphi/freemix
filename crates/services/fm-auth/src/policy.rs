@@ -20,6 +20,7 @@ pub enum Permission {
     ViewStatus,
     SelectPreview,
     Transition,
+    ControlAudio,
     EditProject,
     ManageUsers,
 }
@@ -30,6 +31,7 @@ pub enum CommandClass {
     ViewStatus,
     SelectPreview,
     Transition,
+    ControlAudio,
     EditProject,
     ManageUsers,
 }
@@ -41,6 +43,7 @@ impl CommandClass {
             Self::ViewStatus => Permission::ViewStatus,
             Self::SelectPreview => Permission::SelectPreview,
             Self::Transition => Permission::Transition,
+            Self::ControlAudio => Permission::ControlAudio,
             Self::EditProject => Permission::EditProject,
             Self::ManageUsers => Permission::ManageUsers,
         }
@@ -133,7 +136,11 @@ impl Policy {
         );
         grants.insert(
             Role::Audio,
-            set([Permission::ViewStatus, Permission::EditProject]),
+            set([
+                Permission::ViewStatus,
+                Permission::ControlAudio,
+                Permission::EditProject,
+            ]),
         );
         grants.insert(
             Role::Operator,
@@ -141,6 +148,7 @@ impl Policy {
                 Permission::ViewStatus,
                 Permission::SelectPreview,
                 Permission::Transition,
+                Permission::ControlAudio,
             ]),
         );
         grants.insert(
@@ -149,6 +157,7 @@ impl Policy {
                 Permission::ViewStatus,
                 Permission::SelectPreview,
                 Permission::Transition,
+                Permission::ControlAudio,
                 Permission::EditProject,
                 Permission::ManageUsers,
             ]),

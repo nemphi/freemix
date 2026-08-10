@@ -2,8 +2,7 @@ use std::{collections::BTreeMap, error::Error, fmt, path::PathBuf};
 
 use fm_capabilities::{Capability, StableId};
 use fm_plugin_api::{
-    AbiVersion, AbiVersionRange, CapabilitySet, PluginId, PluginManifest as ApiPluginManifest,
-    StatusCode, negotiate_abi,
+    AbiVersion, CapabilitySet, PluginId, PluginManifest as ApiPluginManifest, StatusCode,
 };
 
 /// Hard limits assigned to one isolated plugin instance.
@@ -158,7 +157,7 @@ impl Error for SignatureError {}
 /// Host policy applied before an artifact can enter the catalog.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DiscoveryPolicy {
-    pub host_abi: AbiVersionRange,
+    pub host_abi: AbiVersion,
     /// Maximum access the host is willing to grant. This remains default-deny.
     pub granted_capabilities: CapabilitySet,
     pub maximum_budget: ResourceBudget,
@@ -249,14 +248,15 @@ fn validate_artifact(
     if let Err(status) = artifact.manifest.api.validate() {
         return Some(DiscoveryRejectionReason::InvalidManifest(status));
     }
-    let selected_abi = match negotiate_abi(policy.host_abi, artifact.manifest.api.abi) {
-        Ok(version) => version,
-        Err(status) => return Some(DiscoveryRejectionReason::UnsupportedApi(status)),
-    };
+    if artifact.manifest.api.abi_version != policy.host_abi {
+        return Some(DiscoveryRejectionReason::UnsupportedApi(
+            StatusCode::ABI_INCOMPATIBLE,
+        ));
+    }
     if let Err(status) = artifact
         .manifest
         .api
-        .validate_compatible(policy.host_abi, &policy.granted_capabilities)
+        .validate_current(policy.host_abi, &policy.granted_capabilities)
     {
         return Some(DiscoveryRejectionReason::CapabilityDenied(status));
     }
@@ -285,7 +285,7 @@ fn validate_artifact(
         .verify(artifact)
         .err()
         .map(|error| DiscoveryRejectionReason::InvalidSignature {
-            selected_abi,
+            abi_version: policy.host_abi,
             reason: error.reason,
         })
 }
@@ -315,7 +315,7 @@ pub enum DiscoveryRejectionReason {
     DuplicateId,
     InvalidManifest(StatusCode),
     InvalidSignature {
-        selected_abi: AbiVersion,
+        abi_version: AbiVersion,
         reason: String,
     },
     UnsupportedApi(StatusCode),

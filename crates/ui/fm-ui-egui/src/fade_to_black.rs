@@ -19,7 +19,6 @@ pub struct FadeToBlackGate {
     pub connection_status: StudioConnectionStatus,
     pub has_view: bool,
     pub can_transition: bool,
-    pub protocol_supported: bool,
 }
 
 impl FadeToBlackGate {
@@ -29,7 +28,6 @@ impl FadeToBlackGate {
             connection_status: state.connection_status,
             has_view: state.view.is_some(),
             can_transition: state.can_transition,
-            protocol_supported: state.transition_protocol.fade_to_black,
         }
     }
 }
@@ -40,10 +38,7 @@ pub const fn fade_to_black_availability(
     gate: FadeToBlackGate,
     desired: Option<FadeToBlackState>,
 ) -> FadeToBlackAvailability {
-    let base = gate.connection_status.controls_enabled()
-        && gate.has_view
-        && gate.can_transition
-        && gate.protocol_supported;
+    let base = gate.connection_status.controls_enabled() && gate.has_view && gate.can_transition;
     match desired {
         Some(desired) if base => FadeToBlackAvailability {
             to_black: !desired.target_active,
@@ -161,7 +156,6 @@ mod tests {
         connection_status: StudioConnectionStatus::Ready,
         has_view: true,
         can_transition: true,
-        protocol_supported: true,
     };
 
     fn state(target_active: bool, position: u16) -> FadeToBlackState {
@@ -204,10 +198,6 @@ mod tests {
             },
             FadeToBlackGate {
                 can_transition: false,
-                ..AVAILABLE
-            },
-            FadeToBlackGate {
-                protocol_supported: false,
                 ..AVAILABLE
             },
         ] {

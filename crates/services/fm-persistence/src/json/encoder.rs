@@ -10,7 +10,8 @@ use fm_types::{
 
 use crate::{
     CURRENT_SCHEMA_VERSION, FadeToBlackState, IdempotencyReceipt, ManualTransitionKind,
-    ManualTransitionState, ReceiptOutcome, StoredProject,
+    ManualTransitionState, ReceiptOutcome, RuntimeOverlayBorder, RuntimeOverlayChannel,
+    RuntimeOverlayPosition, RuntimeOverlayTransition, StoredProject,
 };
 
 pub(crate) fn encode(stored: &StoredProject) -> String {
@@ -125,6 +126,10 @@ fn write_runtime(output: &mut String, stored: &StoredProject) {
     write_fade_to_black(output, stored.runtime_fade_to_black().desired);
     output.push_str(",\n      \"realized\": ");
     write_fade_to_black(output, stored.runtime_fade_to_black().realized);
+    output.push_str("\n    },\n    \"overlays\": {\n      \"desired\": [");
+    write_overlays(output, &stored.runtime_overlays().desired);
+    output.push_str(",\n      \"realized\": [");
+    write_overlays(output, &stored.runtime_overlays().realized);
     output.push_str("\n    },\n");
     let position = stored.position();
     write!(
@@ -143,6 +148,56 @@ fn write_runtime(output: &mut String, stored: &StoredProject) {
     }
     array_end(output, stored.idempotency_receipts().is_empty(), 4);
     output.push_str("\n  }");
+}
+
+fn write_overlays(output: &mut String, overlays: &[RuntimeOverlayChannel; 8]) {
+    for (index, overlay) in overlays.iter().enumerate() {
+        item_prefix(output, index, 8);
+        output.push_str("{\"source\": ");
+        if let Some(source) = overlay.source {
+            write!(output, "{source}").expect("writing to a string cannot fail");
+        } else {
+            output.push_str("null");
+        }
+        write!(
+            output,
+            ", \"active\": {}, \"transition\": \"{}\", \"duration_frames\": {}, \"position\": \"{}\", \"border\": \"{}\", \"queued_sources\": [",
+            overlay.active,
+            match overlay.transition {
+                RuntimeOverlayTransition::Cut => "cut",
+                RuntimeOverlayTransition::Fade => "fade",
+            },
+            overlay.duration_frames,
+            match overlay.position {
+                RuntimeOverlayPosition::FullFrame => "full_frame",
+                RuntimeOverlayPosition::TopLeft => "top_left",
+                RuntimeOverlayPosition::TopRight => "top_right",
+                RuntimeOverlayPosition::BottomLeft => "bottom_left",
+                RuntimeOverlayPosition::BottomRight => "bottom_right",
+            },
+            match overlay.border {
+                RuntimeOverlayBorder::None => "none",
+                RuntimeOverlayBorder::ThinWhite => "thin_white",
+                RuntimeOverlayBorder::ThickWhite => "thick_white",
+            },
+        )
+        .expect("writing to a string cannot fail");
+        for (queue_index, source) in overlay.queued_sources.iter().enumerate() {
+            if queue_index != 0 {
+                output.push_str(", ");
+            }
+            write!(output, "{source}").expect("writing to a string cannot fail");
+        }
+        output.push_str("], \"included_outputs\": [");
+        for (output_index, output_id) in overlay.included_outputs.iter().enumerate() {
+            if output_index != 0 {
+                output.push_str(", ");
+            }
+            write!(output, "{output_id}").expect("writing to a string cannot fail");
+        }
+        output.push_str("]}");
+    }
+    array_end(output, false, 6);
 }
 
 fn write_fade_to_black(output: &mut String, state: FadeToBlackState) {
@@ -190,20 +245,7 @@ fn write_project_collections(output: &mut String, project: &fm_model::Project) {
         output.push_str("\n      }");
     }
     array_end(output, project.inputs().is_empty(), 4);
-    output.push_str(",\n    \"input_audio_strips\": [");
-    for (index, strip) in project.input_audio_strips().iter().enumerate() {
-        item_prefix(output, index, 6);
-        write!(
-            output,
-            "{{\"input\": {}, \"gain_milli_db\": {}, \"muted\": {}, \"follow_video\": {}}}",
-            strip.input,
-            strip.state.gain.get(),
-            strip.state.muted,
-            strip.state.follow_video,
-        )
-        .expect("writing to a string cannot fail");
-    }
-    array_end(output, project.input_audio_strips().is_empty(), 4);
+    write_input_audio_strips(output, project);
     write_scenes(output, project);
     output.push_str(",\n    \"audio_buses\": [");
     for (index, bus) in project.audio_buses().iter().enumerate() {
@@ -274,6 +316,26 @@ fn write_project_collections(output: &mut String, project: &fm_model::Project) {
     }
     array_end(output, project.stingers().is_empty(), 4);
     output.push(',');
+}
+
+fn write_input_audio_strips(output: &mut String, project: &fm_model::Project) {
+    output.push_str(",\n    \"input_audio_strips\": [");
+    for (index, strip) in project.input_audio_strips().iter().enumerate() {
+        item_prefix(output, index, 6);
+        write!(
+            output,
+            "{{\"input\": {}, \"gain_milli_db\": {}, \"balance_basis_points\": {}, \"delay_samples\": {}, \"muted\": {}, \"soloed\": {}, \"follow_video\": {}}}",
+            strip.input,
+            strip.state.gain.get(),
+            strip.state.balance.get(),
+            strip.state.delay_samples.get(),
+            strip.state.muted,
+            strip.state.soloed,
+            strip.state.follow_video,
+        )
+        .expect("writing to a string cannot fail");
+    }
+    array_end(output, project.input_audio_strips().is_empty(), 4);
 }
 
 fn write_scenes(output: &mut String, project: &fm_model::Project) {

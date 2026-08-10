@@ -47,7 +47,7 @@ impl fmt::Display for CodecError {
             Self::InvalidUtf8 => formatter.write_str("field is not valid UTF-8"),
             Self::DuplicateField(field) => write!(formatter, "duplicate field {field}"),
             Self::MissingField(field) => write!(formatter, "required field {field} is missing"),
-            Self::UnknownField(field) => write!(formatter, "unknown required field {field}"),
+            Self::UnknownField(field) => write!(formatter, "unknown field {field}"),
             Self::InvalidField { field, value } => {
                 write!(formatter, "field {field} has invalid value {value}")
             }

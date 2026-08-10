@@ -1,15 +1,21 @@
 use std::{
     fs,
-    num::NonZeroU64,
+    num::NonZeroU128,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use fm_model::{Input, InputKind, MainMix, Project, ProjectSettings};
 use fm_persistence::{
     CURRENT_SCHEMA_VERSION, FadeToBlackState, IdempotencyReceipt, JournalError, MAX_MANIFEST_BYTES,
-    ManualTransitionKind, ManualTransitionState, MutationBatch, ProjectPosition, ProjectRouting,
-    ProjectStore, ProjectValidationError, ReceiptOutcome, ReferenceField, RuntimeFadeToBlack,
-    RuntimeManualTransitions, StoreError, StoredProject,
+    ManualTransitionKind, ManualTransitionState, MutationBatch, ProjectPosition, ProjectStore,
+    ProjectValidationError, ReceiptOutcome, ReferenceField, RuntimeFadeToBlack,
+    RuntimeManualTransitions, RuntimeOverlayChannel, RuntimeOverlays, RuntimeRouting, StoreError,
+    StoredProject,
+};
+use fm_types::{
+    AudioFormat, ChannelLayout, ColorMetadata, FrameRate, InputId, PixelFormat, ProjectId,
+    SampleFormat, SampleRate, ScanMode, VideoDimensions, VideoFormat,
 };
 
 static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -38,22 +44,13 @@ impl Drop for TestDirectory {
     }
 }
 
-fn id(value: u64) -> NonZeroU64 {
-    NonZeroU64::new(value).unwrap()
+fn input_id(value: u128) -> InputId {
+    InputId::new(NonZeroU128::new(value).unwrap())
 }
 
 fn project(name: &str, revision: u64) -> StoredProject {
-    StoredProject::new(
-        CURRENT_SCHEMA_VERSION,
-        id(9001),
+    project_with_receipts(
         name,
-        vec![id(1), id(2)],
-        ProjectRouting {
-            desired_program_id: Some(id(1)),
-            realized_program_id: Some(id(1)),
-            desired_preview_id: Some(id(2)),
-            realized_preview_id: Some(id(2)),
-        },
         ProjectPosition {
             revision,
             state_epoch: 7,
@@ -74,7 +71,76 @@ fn project(name: &str, revision: u64) -> StoredProject {
             IdempotencyReceipt::accepted("operator:001", "command-001", revision, 241),
         ],
     )
-    .unwrap()
+}
+
+fn project_with_receipts(
+    name: &str,
+    position: ProjectPosition,
+    receipts: Vec<IdempotencyReceipt>,
+) -> StoredProject {
+    try_project_with_receipts(name, position, receipts).unwrap()
+}
+
+fn try_project_with_receipts(
+    name: &str,
+    position: ProjectPosition,
+    receipts: Vec<IdempotencyReceipt>,
+) -> Result<StoredProject, ProjectValidationError> {
+    try_project_with_overlays(name, position, receipts, RuntimeOverlays::default())
+}
+
+fn try_project_with_overlays(
+    name: &str,
+    position: ProjectPosition,
+    receipts: Vec<IdempotencyReceipt>,
+    overlays: RuntimeOverlays,
+) -> Result<StoredProject, ProjectValidationError> {
+    let frame_rate = FrameRate::new(60_000, 1_001).unwrap();
+    let settings = ProjectSettings {
+        frame_rate,
+        video: VideoFormat {
+            dimensions: VideoDimensions::new(1_920, 1_080).unwrap(),
+            frame_rate,
+            pixel_format: PixelFormat::Nv12,
+            scan: ScanMode::Progressive,
+            color: ColorMetadata::default(),
+        },
+        audio: AudioFormat {
+            sample_rate: SampleRate::new(48_000).unwrap(),
+            sample_format: SampleFormat::F32,
+            channels: ChannelLayout::stereo(),
+        },
+    };
+    let program = input_id(1);
+    let preview = input_id(2);
+    let mut domain = Project::new(
+        ProjectId::new(NonZeroU128::new(9_001).unwrap()),
+        name,
+        settings,
+    );
+    for (id, label) in [(program, "Program"), (preview, "Preview")] {
+        domain.add_input(Input {
+            id,
+            name: label.to_owned(),
+            kind: InputKind::Color,
+            required_capabilities: Vec::new(),
+        });
+    }
+    domain.set_main_mix(MainMix::new(program, preview));
+    StoredProject::from_project_with_complete_runtime_state(
+        domain,
+        RuntimeRouting {
+            desired_program_id: Some(program),
+            realized_program_id: Some(program),
+            desired_preview_id: Some(preview),
+            realized_preview_id: Some(preview),
+        },
+        RuntimeManualTransitions::default(),
+        RuntimeFadeToBlack::default(),
+        overlays,
+        position,
+        receipts,
+    )
 }
 
 fn write_manifest(project_root: &Path, source: &str) {
@@ -92,7 +158,7 @@ fn round_trip_preserves_typed_project() {
 
     assert_eq!(store.load().unwrap(), expected);
     assert!(store.root().ends_with("show.freemix"));
-    assert_eq!(expected.project_id(), id(9001));
+    assert_eq!(expected.project().id().get().get(), 9_001);
     assert_eq!(expected.position().frames_rendered, 240);
     assert_eq!(expected.position().runtime_generation, 3);
     assert_eq!(expected.position().clock_time_nanos, 8_008_000_000);
@@ -113,6 +179,35 @@ fn round_trip_preserves_typed_project() {
             retryable: true
         } if code == "revision_conflict" && message == "expected revision changed"
     ));
+}
+
+#[test]
+fn round_trip_preserves_complete_overlay_state() {
+    let temp = TestDirectory::new("overlay-round-trip");
+    let root = temp.project_path("show");
+    let mut overlays = RuntimeOverlays::default();
+    overlays.desired[2] = RuntimeOverlayChannel {
+        source: Some(input_id(2)),
+        active: true,
+        transition: fm_persistence::RuntimeOverlayTransition::Fade,
+        duration_frames: 18,
+        position: fm_persistence::RuntimeOverlayPosition::BottomRight,
+        border: fm_persistence::RuntimeOverlayBorder::ThinWhite,
+        queued_sources: vec![input_id(1), input_id(2)],
+        included_outputs: Vec::new(),
+    };
+    overlays.realized = overlays.desired.clone();
+    let stored = try_project_with_overlays(
+        "Overlay show",
+        ProjectPosition::default(),
+        Vec::new(),
+        overlays.clone(),
+    )
+    .unwrap();
+
+    let store = ProjectStore::new(root).unwrap();
+    store.save(&stored).unwrap();
+    assert_eq!(store.load().unwrap().runtime_overlays(), &overlays);
 }
 
 #[test]
@@ -280,200 +375,6 @@ fn manifests_reject_unsettled_manual_transition_intervals() {
 }
 
 #[test]
-fn schema_v4_migrates_with_inactive_manual_transition_defaults() {
-    let temp = TestDirectory::new("schema-v4");
-    let root = temp.project_path("show");
-    write_manifest(&root, include_str!("fixtures/schema-v4.json"));
-    let store = ProjectStore::new(root).unwrap();
-
-    let report = store.migrate_v4().unwrap();
-    let migrated = store.load().unwrap();
-
-    assert_eq!((report.from_schema(), report.to_schema()), (4, 10));
-    assert_eq!(
-        report.defaulted_fields(),
-        [
-            "runtime.manual_transitions=inactive",
-            "scenes.layers.mask=null",
-            "input_audio_strips=per-input gain_milli_db=0/muted=false/follow_video=true",
-            "runtime.fade_to_black=live",
-            "stingers=[]"
-        ]
-    );
-    assert_eq!(
-        migrated.runtime_manual_transitions(),
-        RuntimeManualTransitions::default()
-    );
-}
-
-#[test]
-fn schema_v5_migration_preserves_manual_state_and_defaults_no_mask() {
-    let temp = TestDirectory::new("schema-v5");
-    let root = temp.project_path("show");
-    write_manifest(&root, include_str!("fixtures/schema-v5.json"));
-    let store = ProjectStore::new(root).unwrap();
-
-    let report = store.migrate_v5().unwrap();
-    let migrated = store.load().unwrap();
-
-    assert_eq!((report.from_schema(), report.to_schema()), (5, 10));
-    assert_eq!(
-        report.defaulted_fields(),
-        [
-            "scenes.layers.mask=null",
-            "input_audio_strips=per-input gain_milli_db=0/muted=false/follow_video=true",
-            "runtime.fade_to_black=live",
-            "stingers=[]"
-        ]
-    );
-    assert_eq!(migrated.project().scenes()[0].layers[0].mask, None);
-    let transitions = migrated.runtime_manual_transitions();
-    assert_eq!(
-        transitions.desired,
-        ManualTransitionState::new(
-            ManualTransitionKind::Fade,
-            migrated.runtime_routing().desired_program_id.unwrap(),
-            migrated.runtime_routing().desired_preview_id.unwrap(),
-            0,
-            6_250,
-        )
-    );
-    assert_eq!(
-        transitions.realized,
-        ManualTransitionState::new(
-            ManualTransitionKind::Fade,
-            migrated.runtime_routing().realized_program_id.unwrap(),
-            migrated.runtime_routing().realized_preview_id.unwrap(),
-            6_250,
-            6_250,
-        )
-    );
-    let encoded = fs::read_to_string(store.manifest_path()).unwrap();
-    assert!(encoded.starts_with("{\n  \"schema_version\": 10,"));
-    assert!(encoded.contains("\"mask\": null"));
-}
-
-#[test]
-fn schema_v6_migration_preserves_masks_and_manual_state_and_defaults_audio_strips() {
-    let temp = TestDirectory::new("schema-v6");
-    let root = temp.project_path("show");
-    write_manifest(&root, include_str!("fixtures/schema-v6.json"));
-    let store = ProjectStore::new(root).unwrap();
-
-    let report = store.migrate_v6().unwrap();
-    let migrated = store.load().unwrap();
-
-    assert_eq!((report.from_schema(), report.to_schema()), (6, 10));
-    assert_eq!(
-        report.defaulted_fields(),
-        [
-            "input_audio_strips=per-input gain_milli_db=0/muted=false/follow_video=true",
-            "runtime.fade_to_black=live",
-            "stingers=[]"
-        ]
-    );
-    assert_eq!(
-        migrated.project().scenes()[0].layers[0].mask,
-        Some(fm_model::RectMask::new(0, 0, 2, 2).inverted(true))
-    );
-    assert!(
-        migrated
-            .project()
-            .input_audio_strips()
-            .iter()
-            .all(|strip| strip.state == fm_model::InputAudioStripState::default())
-    );
-    let transitions = migrated.runtime_manual_transitions();
-    assert_eq!(transitions.desired.unwrap().position_basis_points, 6_250);
-    assert_eq!(
-        transitions.realized.unwrap().interval_start_basis_points,
-        6_250
-    );
-}
-
-#[test]
-fn schema_v7_migration_preserves_project_state_and_defaults_live_fade_to_black() {
-    let temp = TestDirectory::new("schema-v7");
-    let source_store = ProjectStore::new(temp.project_path("source")).unwrap();
-    let expected = project("Schema v7", 11);
-    source_store.save(&expected).unwrap();
-    let source = fs::read_to_string(source_store.manifest_path())
-        .unwrap()
-        .replacen("\"schema_version\": 10", "\"schema_version\": 7", 1)
-        .replacen("    \"stingers\": [],\n", "", 1)
-        .replacen(
-            "    \"fade_to_black\": {\n      \"desired\": {\"target_active\": false, \"position_numerator\": 0},\n      \"realized\": {\"target_active\": false, \"position_numerator\": 0}\n    },\n",
-            "",
-            1,
-        );
-
-    let root = temp.project_path("show");
-    write_manifest(&root, &source);
-    let store = ProjectStore::new(root).unwrap();
-    let report = store.migrate_v7().unwrap();
-    let migrated = store.load().unwrap();
-
-    assert_eq!((report.from_schema(), report.to_schema()), (7, 10));
-    assert_eq!(
-        report.defaulted_fields(),
-        ["runtime.fade_to_black=live", "stingers=[]"]
-    );
-    assert_eq!(
-        migrated.runtime_fade_to_black(),
-        RuntimeFadeToBlack::default()
-    );
-    assert_eq!(migrated.project(), expected.project());
-    assert_eq!(
-        migrated.runtime_manual_transitions(),
-        expected.runtime_manual_transitions()
-    );
-}
-
-#[test]
-fn schema_v8_migration_preserves_complete_runtime_state_without_defaults() {
-    let temp = TestDirectory::new("schema-v8");
-    let source_store = ProjectStore::new(temp.project_path("source")).unwrap();
-    let expected = project("Schema v8", 12);
-    source_store.save(&expected).unwrap();
-    let source = fs::read_to_string(source_store.manifest_path())
-        .unwrap()
-        .replacen("\"schema_version\": 10", "\"schema_version\": 8", 1)
-        .replacen("    \"stingers\": [],\n", "", 1);
-
-    let root = temp.project_path("show");
-    write_manifest(&root, &source);
-    let store = ProjectStore::new(root).unwrap();
-    let report = store.migrate_v8().unwrap();
-    let migrated = store.load().unwrap();
-
-    assert_eq!((report.from_schema(), report.to_schema()), (8, 10));
-    assert_eq!(report.defaulted_fields(), ["stingers=[]"]);
-    assert_eq!(migrated, expected);
-}
-
-#[test]
-fn schema_v9_migration_defaults_empty_stinger_slots() {
-    let temp = TestDirectory::new("schema-v9");
-    let source_store = ProjectStore::new(temp.project_path("source")).unwrap();
-    let expected = project("Schema v9", 13);
-    source_store.save(&expected).unwrap();
-    let source = fs::read_to_string(source_store.manifest_path())
-        .unwrap()
-        .replacen("\"schema_version\": 10", "\"schema_version\": 9", 1)
-        .replacen("    \"stingers\": [],\n", "", 1);
-
-    let root = temp.project_path("show");
-    write_manifest(&root, &source);
-    let store = ProjectStore::new(root).unwrap();
-    let report = store.migrate_v9().unwrap();
-    let migrated = store.load().unwrap();
-
-    assert_eq!((report.from_schema(), report.to_schema()), (9, 10));
-    assert_eq!(report.defaulted_fields(), ["stingers=[]"]);
-    assert_eq!(migrated, expected);
-}
-
-#[test]
 fn json_escaping_round_trips_quotes_slashes_controls_and_unicode() {
     let temp = TestDirectory::new("escaping");
     let store = ProjectStore::new(temp.project_path("escape")).unwrap();
@@ -519,7 +420,7 @@ fn malformed_and_truncated_manifests_never_return_a_project() {
     let truncated_root = temp.project_path("truncated");
     write_manifest(
         &truncated_root,
-        "{\"schema_version\":2,\"show_name\":\"unfinished",
+        &format!("{{\"schema_version\":{CURRENT_SCHEMA_VERSION},\"show_name\":\"unfinished"),
     );
     let truncated = ProjectStore::new(truncated_root)
         .unwrap()
@@ -556,19 +457,20 @@ fn manifest_just_over_size_limit_is_rejected() {
 }
 
 #[test]
-fn explicit_unsupported_schema_is_reported_before_missing_current_fields() {
-    let temp = TestDirectory::new("unsupported-schema");
+fn non_current_schema_is_reported_before_missing_current_fields() {
+    let temp = TestDirectory::new("non-current-schema");
     let root = temp.project_path("show");
-    write_manifest(&root, r#"{"schema_version":1}"#);
+    let non_current = CURRENT_SCHEMA_VERSION.checked_add(1).unwrap();
+    write_manifest(&root, &format!(r#"{{"schema_version":{non_current}}}"#));
 
     assert!(matches!(
         ProjectStore::new(root).unwrap().load(),
         Err(StoreError::Validation(
             ProjectValidationError::UnsupportedSchema {
-                found: 1,
+                found,
                 supported: CURRENT_SCHEMA_VERSION
             }
-        ))
+        )) if found == non_current
     ));
 }
 
@@ -576,14 +478,29 @@ fn explicit_unsupported_schema_is_reported_before_missing_current_fields() {
 fn strict_parser_rejects_unknown_duplicate_and_wrong_typed_fields() {
     let temp = TestDirectory::new("strict");
     for (name, manifest) in [
-        ("unknown", "{\"schema_version\":10,\"unknown\":true}"),
-        ("duplicate", "{\"schema_version\":10,\"schema_version\":10}"),
-        ("wrong-type", "{\"schema_version\":\"1\"}"),
-        ("object-trailing-comma", "{\"schema_version\":2,}"),
+        (
+            "unknown",
+            format!("{{\"schema_version\":{CURRENT_SCHEMA_VERSION},\"unknown\":true}}"),
+        ),
+        (
+            "duplicate",
+            format!(
+                "{{\"schema_version\":{CURRENT_SCHEMA_VERSION},\"schema_version\":{CURRENT_SCHEMA_VERSION}}}"
+            ),
+        ),
+        (
+            "wrong-type",
+            format!("{{\"schema_version\":\"{CURRENT_SCHEMA_VERSION}\"}}"),
+        ),
+        (
+            "object-trailing-comma",
+            format!("{{\"schema_version\":{CURRENT_SCHEMA_VERSION},}}"),
+        ),
         (
             "array-trailing-comma",
-            r#"{
-              "schema_version": 2,
+            format!(
+                r#"{{
+              "schema_version": {CURRENT_SCHEMA_VERSION},
               "project_id": 1,
               "show_name": "Trailing",
               "input_ids": [1,],
@@ -594,11 +511,12 @@ fn strict_parser_rejects_unknown_duplicate_and_wrong_typed_fields() {
               "revision": 0,
               "state_epoch": 0,
               "event_sequence": 0
-            }"#,
+            }}"#
+            ),
         ),
     ] {
         let root = temp.project_path(name);
-        write_manifest(&root, manifest);
+        write_manifest(&root, &manifest);
         assert!(matches!(
             ProjectStore::new(root).unwrap().load(),
             Err(StoreError::MalformedManifest { .. })
@@ -690,12 +608,8 @@ fn invalid_bundle_path_is_rejected_without_creating_it() {
 #[test]
 fn receipt_metadata_and_revision_invariants_are_validated() {
     let base = |receipts| {
-        StoredProject::new(
-            CURRENT_SCHEMA_VERSION,
-            id(1),
+        try_project_with_receipts(
             "Validation",
-            Vec::new(),
-            ProjectRouting::default(),
             ProjectPosition {
                 revision: 4,
                 ..ProjectPosition::default()
@@ -746,19 +660,14 @@ fn strict_parser_rejects_receipt_variant_fields() {
     let temp = TestDirectory::new("receipt-variant");
     let root = temp.project_path("show");
     let store = ProjectStore::new(&root).unwrap();
-    let strict = StoredProject::new(
-        CURRENT_SCHEMA_VERSION,
-        id(1),
+    let strict = project_with_receipts(
         "Strict receipt",
-        Vec::new(),
-        ProjectRouting::default(),
         ProjectPosition {
             revision: 1,
             ..ProjectPosition::default()
         },
         vec![IdempotencyReceipt::accepted("key", "command", 1, 1)],
-    )
-    .unwrap();
+    );
     store.save(&strict).unwrap();
     let manifest = fs::read_to_string(store.manifest_path()).unwrap();
     write_manifest(
@@ -773,24 +682,6 @@ fn strict_parser_rejects_receipt_variant_fields() {
     assert!(matches!(
         ProjectStore::new(root).unwrap().load(),
         Err(StoreError::MalformedManifest { .. })
-    ));
-}
-
-#[test]
-fn schema_v1_is_deliberately_outside_the_supported_window() {
-    let temp = TestDirectory::new("unsupported-v1");
-    let root = temp.project_path("show");
-    write_manifest(&root, include_str!("fixtures/schema-v1.json"));
-    let store = ProjectStore::new(root).unwrap();
-
-    assert!(matches!(
-        store.load(),
-        Err(StoreError::Validation(
-            ProjectValidationError::UnsupportedSchema {
-                found: 1,
-                supported: CURRENT_SCHEMA_VERSION
-            }
-        ))
     ));
 }
 

@@ -1,1 +1,0 @@
-runtime_event	engine_id=engine-a	project_id=project-9	state_epoch=7	log_id=log-a	revision=1842	generation=12	sequence=1	event=realized	domain=switcher	?manual_active=1	?manual_kind=wipe	?manual_from=1	?manual_to=2	?manual_interval_start_basis_points=6250	?manual_position_basis_points=6250

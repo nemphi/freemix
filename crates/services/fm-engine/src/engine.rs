@@ -8,15 +8,22 @@ use fm_command::{
 };
 use fm_scheduler::{FrameNumber, FrameScheduler, PlanGeneration};
 use fm_switcher::{
-    FadeToBlackFrame, FadeToBlackPosition, ProgramFrame, StingerDescriptor, StingerSlotId,
-    SwitcherCommand, SwitcherError, SwitcherEvent, SwitcherState, TBarPosition, TransitionKind,
+    FadeToBlackFrame, FadeToBlackPosition, OVERLAY_CHANNEL_COUNT, OverlayBorderPreset,
+    OverlayChannelId, OverlayChannelState, OverlayPositionPreset, OverlayTransitionKind,
+    ProgramFrame, StingerDescriptor, StingerSlotId, SwitcherCommand, SwitcherError, SwitcherEvent,
+    SwitcherState, TBarPosition, TransitionKind,
 };
-use fm_types::{FrameRate, InputId};
+use fm_types::{FrameRate, InputId, OutputId};
 
-use crate::{EngineError, ShowState, SnapshotError};
+use crate::{EngineError, EngineInputAudioStripState, ShowState, SnapshotError};
 
 type RuntimeScheduler = FrameScheduler<(), (), EngineCommand, ()>;
 const MAX_TRANSITION_DURATION_FRAMES: u32 = 3_600;
+pub const MAX_INPUT_AUDIO_DELAY_SAMPLES: u32 = 48_000;
+pub const MIN_INPUT_AUDIO_GAIN_MILLIDB: i32 = -96_000;
+pub const MAX_INPUT_AUDIO_GAIN_MILLIDB: i32 = 24_000;
+pub const MIN_INPUT_AUDIO_BALANCE_BASIS_POINTS: i32 = -10_000;
+pub const MAX_INPUT_AUDIO_BALANCE_BASIS_POINTS: i32 = 10_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EngineManualTransitionKind {
@@ -68,6 +75,10 @@ pub struct EngineFadeToBlackState {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EngineCommand {
+    SetInputAudioStrip {
+        input: InputId,
+        state: EngineInputAudioStripState,
+    },
     SelectPreview(InputId),
     Cut,
     Fade {
@@ -92,6 +103,39 @@ pub enum EngineCommand {
     },
     RemoveStinger {
         slot: StingerSlotId,
+    },
+    TakeOverlay {
+        channel: OverlayChannelId,
+        source: InputId,
+    },
+    UpdateOverlay {
+        channel: OverlayChannelId,
+        source: InputId,
+    },
+    OverlayOff {
+        channel: OverlayChannelId,
+    },
+    ConfigureOverlayTransition {
+        channel: OverlayChannelId,
+        transition: OverlayTransitionKind,
+        duration_frames: u32,
+    },
+    ConfigureOverlayAppearance {
+        channel: OverlayChannelId,
+        position: OverlayPositionPreset,
+        border: OverlayBorderPreset,
+    },
+    QueueOverlay {
+        channel: OverlayChannelId,
+        source: InputId,
+    },
+    TakeNextOverlay {
+        channel: OverlayChannelId,
+    },
+    SetOverlayOutputInclusion {
+        channel: OverlayChannelId,
+        output: OutputId,
+        included: bool,
     },
     Wipe {
         duration_frames: u32,
@@ -219,7 +263,9 @@ pub struct FrameResult {
     pub deadline: ClockTime,
     pub program: ProgramFrame,
     pub fade_to_black: FadeToBlackFrame,
+    pub overlays: [OverlayChannelState; OVERLAY_CHANNEL_COUNT],
     pub events: Vec<SwitcherEvent>,
+    pub input_audio_strip_updates: Vec<(InputId, EngineInputAudioStripState)>,
     pub revision: Revision,
     pub runtime_generation: RuntimeGeneration,
 }
@@ -524,6 +570,7 @@ impl Engine {
             .apply(envelope, now_millis, move |_, command| {
                 if let Some(kind) = runtime_busy
                     && !matches!(command, EngineCommand::FadeToBlack { .. })
+                    && !is_overlay_command(command)
                 {
                     let name = match kind {
                         TransitionKind::Fade => "fade",
@@ -560,14 +607,23 @@ impl Engine {
                 EngineCommand::ConfigureStinger { .. } | EngineCommand::RemoveStinger { .. } => {
                     None
                 }
-                EngineCommand::Wipe { .. } => Some(TransitionKind::Wipe),
-                EngineCommand::SelectPreview(_)
+                EngineCommand::SetInputAudioStrip { .. }
+                | EngineCommand::TakeOverlay { .. }
+                | EngineCommand::UpdateOverlay { .. }
+                | EngineCommand::OverlayOff { .. }
+                | EngineCommand::ConfigureOverlayTransition { .. }
+                | EngineCommand::ConfigureOverlayAppearance { .. }
+                | EngineCommand::QueueOverlay { .. }
+                | EngineCommand::TakeNextOverlay { .. }
+                | EngineCommand::SetOverlayOutputInclusion { .. }
+                | EngineCommand::SelectPreview(_)
                 | EngineCommand::Cut
                 | EngineCommand::FadeToBlack { .. }
                 | EngineCommand::StartManualTransition { .. }
                 | EngineCommand::SetManualTransitionPosition { .. }
                 | EngineCommand::CommitManualTransition
                 | EngineCommand::CancelManualTransition => None,
+                EngineCommand::Wipe { .. } => Some(TransitionKind::Wipe),
             } {
                 self.transition_in_flight = Some(kind);
             }
@@ -606,7 +662,11 @@ impl Engine {
         self.pending_actions = self.pending_actions.saturating_sub(tick.actions.len());
 
         let mut events = Vec::new();
+        let mut input_audio_strip_updates = Vec::new();
         for scheduled in tick.actions {
+            if let EngineCommand::SetInputAudioStrip { input, state } = scheduled.action {
+                input_audio_strip_updates.push((input, state));
+            }
             let command_events = apply_runtime(&mut self.realized_switcher, scheduled.action)?;
             events.extend(command_events);
             self.runtime_generation = self.runtime_generation.checked_next()?;
@@ -614,7 +674,8 @@ impl Engine {
 
         let program = self.realized_switcher.program_frame();
         let fade_to_black = self.realized_switcher.fade_to_black_frame();
-        if let Some(event) = self.realized_switcher.advance_frame() {
+        let overlays = self.realized_switcher.overlays().clone();
+        for event in self.realized_switcher.advance_frame_events() {
             if matches!(event, SwitcherEvent::ProgramChanged { .. }) {
                 self.transition_in_flight = None;
             }
@@ -626,7 +687,9 @@ impl Engine {
             deadline: ClockTime::from_nanos(tick.deadline.at_ns),
             program,
             fade_to_black,
+            overlays,
             events,
+            input_audio_strip_updates,
             revision: self.commands.revision(),
             runtime_generation: self.runtime_generation,
         })
@@ -648,6 +711,7 @@ impl Engine {
                 .desired_switcher()
                 .fade_to_black_is_automatic()
             || self.realized_switcher.fade_to_black_is_automatic()
+            || self.realized_switcher.overlays_in_motion()
         {
             return Err(SnapshotError::WorkInFlight);
         }
@@ -763,6 +827,7 @@ fn validate_idle_restore(
         || show.desired_switcher().fade_to_black_position()
             != realized_switcher.fade_to_black_position()
         || show.desired_switcher().stingers() != realized_switcher.stingers()
+        || show.desired_switcher().overlays() != realized_switcher.overlays()
     {
         return Err(SnapshotError::MismatchedSwitcherRouting);
     }
@@ -833,6 +898,7 @@ struct EngineMutation {
 }
 
 impl Mutation<ShowState, EngineEvent, EngineAcceptance> for EngineMutation {
+    #[allow(clippy::too_many_lines)]
     fn apply(
         self,
         state: &mut ShowState,
@@ -844,7 +910,75 @@ impl Mutation<ShowState, EngineEvent, EngineAcceptance> for EngineMutation {
         ) {
             return apply_stinger_mutation(state, events, self);
         }
+        if let EngineCommand::SetInputAudioStrip {
+            input,
+            state: strip_state,
+        } = self.command
+        {
+            if !(MIN_INPUT_AUDIO_GAIN_MILLIDB..=MAX_INPUT_AUDIO_GAIN_MILLIDB)
+                .contains(&strip_state.gain_millidb)
+            {
+                return Err(Rejection::new(
+                    RejectionCode::InvalidCommand,
+                    format!(
+                        "input audio gain must be between {MIN_INPUT_AUDIO_GAIN_MILLIDB} and \
+                         {MAX_INPUT_AUDIO_GAIN_MILLIDB} millidB"
+                    ),
+                ));
+            }
+            if !(MIN_INPUT_AUDIO_BALANCE_BASIS_POINTS..=MAX_INPUT_AUDIO_BALANCE_BASIS_POINTS)
+                .contains(&strip_state.balance_basis_points)
+            {
+                return Err(Rejection::new(
+                    RejectionCode::InvalidCommand,
+                    format!(
+                        "input audio balance must be between \
+                         {MIN_INPUT_AUDIO_BALANCE_BASIS_POINTS} and \
+                         {MAX_INPUT_AUDIO_BALANCE_BASIS_POINTS} basis points"
+                    ),
+                ));
+            }
+            if strip_state.delay_samples > MAX_INPUT_AUDIO_DELAY_SAMPLES {
+                return Err(Rejection::new(
+                    RejectionCode::InvalidCommand,
+                    format!(
+                        "input audio delay must not exceed {MAX_INPUT_AUDIO_DELAY_SAMPLES} samples"
+                    ),
+                ));
+            }
+            state
+                .set_input_audio_strip(input, strip_state)
+                .map_err(|_| {
+                    Rejection::new(
+                        RejectionCode::InvalidCommand,
+                        format!("input {input} is not part of this show"),
+                    )
+                })?;
+            events.push(EngineEvent::DesiredSwitcherChanged(self.command));
+            return Ok(EngineAcceptance {
+                target_frame: self.target_frame,
+            });
+        }
+        if matches!(
+            self.command,
+            EngineCommand::TakeOverlay { .. }
+                | EngineCommand::UpdateOverlay { .. }
+                | EngineCommand::OverlayOff { .. }
+                | EngineCommand::ConfigureOverlayTransition { .. }
+                | EngineCommand::ConfigureOverlayAppearance { .. }
+                | EngineCommand::QueueOverlay { .. }
+                | EngineCommand::TakeNextOverlay { .. }
+                | EngineCommand::SetOverlayOutputInclusion { .. }
+        ) {
+            return apply_overlay_mutation(state, events, self);
+        }
+        if matches!(self.command, EngineCommand::FadeToBlack { .. }) {
+            return apply_fade_to_black_mutation(state, events, self);
+        }
         let switcher_command = match self.command {
+            EngineCommand::SetInputAudioStrip { .. } => {
+                unreachable!("audio-strip mutations return before switcher command mapping")
+            }
             EngineCommand::SelectPreview(input) => SwitcherCommand::SelectPreview(input),
             EngineCommand::Cut => SwitcherCommand::Cut,
             EngineCommand::Fade { duration_frames } => {
@@ -906,20 +1040,22 @@ impl Mutation<ShowState, EngineEvent, EngineAcceptance> for EngineMutation {
             EngineCommand::ConfigureStinger { .. } | EngineCommand::RemoveStinger { .. } => {
                 unreachable!("Stinger mutations return before switcher command mapping")
             }
+            EngineCommand::TakeOverlay { .. }
+            | EngineCommand::UpdateOverlay { .. }
+            | EngineCommand::OverlayOff { .. }
+            | EngineCommand::ConfigureOverlayTransition { .. }
+            | EngineCommand::ConfigureOverlayAppearance { .. }
+            | EngineCommand::QueueOverlay { .. }
+            | EngineCommand::TakeNextOverlay { .. }
+            | EngineCommand::SetOverlayOutputInclusion { .. } => {
+                unreachable!("overlay mutations return before switcher command mapping")
+            }
             EngineCommand::Wipe { duration_frames } => {
                 validate_transition_duration("wipe", duration_frames)?;
                 SwitcherCommand::Cut
             }
-            EngineCommand::FadeToBlack {
-                active,
-                duration_frames,
-            } => {
-                validate_fade_to_black_duration(duration_frames)?;
-                let _ = state.desired_switcher_mut().set_fade_to_black(active);
-                events.push(EngineEvent::DesiredSwitcherChanged(self.command));
-                return Ok(EngineAcceptance {
-                    target_frame: self.target_frame,
-                });
+            EngineCommand::FadeToBlack { .. } => {
+                unreachable!("Fade-to-Black mutations return before switcher command mapping")
             }
             EngineCommand::StartManualTransition { kind } => SwitcherCommand::StartTBar {
                 kind: manual_transition_kind(kind),
@@ -939,6 +1075,84 @@ impl Mutation<ShowState, EngineEvent, EngineAcceptance> for EngineMutation {
             target_frame: self.target_frame,
         })
     }
+}
+
+fn apply_fade_to_black_mutation(
+    state: &mut ShowState,
+    events: &mut Vec<EngineEvent>,
+    mutation: EngineMutation,
+) -> Result<EngineAcceptance, Rejection> {
+    let EngineCommand::FadeToBlack {
+        active,
+        duration_frames,
+    } = mutation.command
+    else {
+        unreachable!("only Fade-to-Black mutations are delegated")
+    };
+    validate_fade_to_black_duration(duration_frames)?;
+    state
+        .desired_switcher_mut()
+        .restore_settled_fade_to_black(active);
+    events.push(EngineEvent::DesiredSwitcherChanged(mutation.command));
+    Ok(EngineAcceptance {
+        target_frame: mutation.target_frame,
+    })
+}
+
+fn apply_overlay_mutation(
+    state: &mut ShowState,
+    events: &mut Vec<EngineEvent>,
+    mutation: EngineMutation,
+) -> Result<EngineAcceptance, Rejection> {
+    let command = match mutation.command {
+        EngineCommand::TakeOverlay { channel, source } => {
+            SwitcherCommand::TakeOverlay { channel, source }
+        }
+        EngineCommand::UpdateOverlay { channel, source } => {
+            SwitcherCommand::UpdateOverlay { channel, source }
+        }
+        EngineCommand::OverlayOff { channel } => SwitcherCommand::OverlayOff(channel),
+        EngineCommand::ConfigureOverlayTransition {
+            channel,
+            transition,
+            duration_frames,
+        } => SwitcherCommand::ConfigureOverlayTransition {
+            channel,
+            transition,
+            duration_frames,
+        },
+        EngineCommand::ConfigureOverlayAppearance {
+            channel,
+            position,
+            border,
+        } => SwitcherCommand::ConfigureOverlayAppearance {
+            channel,
+            position,
+            border,
+        },
+        EngineCommand::QueueOverlay { channel, source } => {
+            SwitcherCommand::QueueOverlay { channel, source }
+        }
+        EngineCommand::TakeNextOverlay { channel } => SwitcherCommand::TakeNextOverlay(channel),
+        EngineCommand::SetOverlayOutputInclusion {
+            channel,
+            output,
+            included,
+        } => SwitcherCommand::SetOverlayOutputInclusion {
+            channel,
+            output,
+            included,
+        },
+        _ => unreachable!("only overlay mutation commands are delegated"),
+    };
+    state
+        .desired_switcher_mut()
+        .apply(command)
+        .map_err(switcher_rejection)?;
+    events.push(EngineEvent::DesiredSwitcherChanged(mutation.command));
+    Ok(EngineAcceptance {
+        target_frame: mutation.target_frame,
+    })
 }
 
 fn apply_stinger_mutation(
@@ -978,6 +1192,9 @@ fn apply_runtime(
     switcher: &mut SwitcherState,
     command: EngineCommand,
 ) -> Result<Vec<SwitcherEvent>, SwitcherError> {
+    if matches!(command, EngineCommand::SetInputAudioStrip { .. }) {
+        return Ok(Vec::new());
+    }
     if let EngineCommand::FadeToBlack {
         active,
         duration_frames,
@@ -987,7 +1204,13 @@ fn apply_runtime(
             .request_fade_to_black(active, duration_frames)
             .expect("accepted engine FTB durations are validated"));
     }
+    if is_overlay_command(command) {
+        return apply_runtime_overlay(switcher, command);
+    }
     switcher.apply(match command {
+        EngineCommand::SetInputAudioStrip { .. } => {
+            unreachable!("audio-strip commands return before switcher command mapping")
+        }
         EngineCommand::SelectPreview(input) => SwitcherCommand::SelectPreview(input),
         EngineCommand::Cut => SwitcherCommand::Cut,
         EngineCommand::Fade { duration_frames } => SwitcherCommand::Transition {
@@ -1025,6 +1248,16 @@ fn apply_runtime(
             switcher.remove_stinger(slot);
             return Ok(Vec::new());
         }
+        EngineCommand::TakeOverlay { .. }
+        | EngineCommand::UpdateOverlay { .. }
+        | EngineCommand::OverlayOff { .. }
+        | EngineCommand::ConfigureOverlayTransition { .. }
+        | EngineCommand::ConfigureOverlayAppearance { .. }
+        | EngineCommand::QueueOverlay { .. }
+        | EngineCommand::TakeNextOverlay { .. }
+        | EngineCommand::SetOverlayOutputInclusion { .. } => {
+            unreachable!("overlay commands return before switcher command mapping")
+        }
         EngineCommand::Wipe { duration_frames } => SwitcherCommand::Wipe { duration_frames },
         EngineCommand::FadeToBlack { .. } => {
             unreachable!("Fade-to-Black commands return before switcher command mapping")
@@ -1038,6 +1271,67 @@ fn apply_runtime(
         EngineCommand::CommitManualTransition => SwitcherCommand::CommitTBar,
         EngineCommand::CancelManualTransition => SwitcherCommand::CancelTBar,
     })
+}
+
+fn apply_runtime_overlay(
+    switcher: &mut SwitcherState,
+    command: EngineCommand,
+) -> Result<Vec<SwitcherEvent>, SwitcherError> {
+    match command {
+        EngineCommand::TakeOverlay { channel, source } => {
+            switcher.request_overlay_take(channel, source)
+        }
+        EngineCommand::OverlayOff { channel } => Ok(switcher.request_overlay_off(channel)),
+        EngineCommand::TakeNextOverlay { channel } => switcher.request_overlay_take_next(channel),
+        EngineCommand::UpdateOverlay { channel, source } => {
+            switcher.apply(SwitcherCommand::UpdateOverlay { channel, source })
+        }
+        EngineCommand::ConfigureOverlayTransition {
+            channel,
+            transition,
+            duration_frames,
+        } => switcher.apply(SwitcherCommand::ConfigureOverlayTransition {
+            channel,
+            transition,
+            duration_frames,
+        }),
+        EngineCommand::ConfigureOverlayAppearance {
+            channel,
+            position,
+            border,
+        } => switcher.apply(SwitcherCommand::ConfigureOverlayAppearance {
+            channel,
+            position,
+            border,
+        }),
+        EngineCommand::QueueOverlay { channel, source } => {
+            switcher.apply(SwitcherCommand::QueueOverlay { channel, source })
+        }
+        EngineCommand::SetOverlayOutputInclusion {
+            channel,
+            output,
+            included,
+        } => switcher.apply(SwitcherCommand::SetOverlayOutputInclusion {
+            channel,
+            output,
+            included,
+        }),
+        _ => unreachable!("only overlay commands are delegated"),
+    }
+}
+
+const fn is_overlay_command(command: EngineCommand) -> bool {
+    matches!(
+        command,
+        EngineCommand::TakeOverlay { .. }
+            | EngineCommand::UpdateOverlay { .. }
+            | EngineCommand::OverlayOff { .. }
+            | EngineCommand::ConfigureOverlayTransition { .. }
+            | EngineCommand::ConfigureOverlayAppearance { .. }
+            | EngineCommand::QueueOverlay { .. }
+            | EngineCommand::TakeNextOverlay { .. }
+            | EngineCommand::SetOverlayOutputInclusion { .. }
+    )
 }
 
 const fn engine_fade_to_black_state(switcher: &SwitcherState) -> EngineFadeToBlackState {
@@ -1139,6 +1433,9 @@ fn switcher_rejection(error: SwitcherError) -> Rejection {
         SwitcherError::UnsupportedManualTransitionKind
         | SwitcherError::InvalidManualTransitionRoute
         | SwitcherError::ZeroDuration
+        | SwitcherError::InvalidOverlayTransitionDuration { .. }
+        | SwitcherError::OverlayQueueFull { .. }
+        | SwitcherError::OverlayQueueEmpty(_)
         | SwitcherError::StingerCutPointOutOfRange { .. } => RejectionCode::InvalidCommand,
     };
     Rejection::new(code, error.to_string())

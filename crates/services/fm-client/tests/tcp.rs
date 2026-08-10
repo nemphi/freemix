@@ -13,10 +13,11 @@ use fm_client::{
     SessionEvent, SyncMode, TcpSession, TcpSessionError,
 };
 use fm_protocol::{
-    CapabilityReportSummary, ClientType, CodecError, CommandPayload, CommandResult, EngineIdentity,
-    EventCursor, EventMessage, EventPayload, HandshakeOutcome, HandshakeRequest, HandshakeResponse,
-    LineDecoder, MAX_LINE_BYTES, ProtocolVersion, ResumeCursor, Role, RuntimeEventMessage,
-    RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage, SnapshotReason, WIPE_PROTOCOL_VERSION,
+    CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, ClientType, CodecError, CommandPayload,
+    CommandResult, EngineIdentity, EventCursor, EventMessage, EventPayload, FadeToBlackPosition,
+    FadeToBlackState, HandshakeOutcome, HandshakeRequest, HandshakeResponse, LineDecoder,
+    MAX_LINE_BYTES, ManualTransitionStatus, OverlayStatus, ProtocolVersion, ResumeCursor, Role,
+    RuntimeEventMessage, RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage, SnapshotReason,
     WireInputId, WireMessage, encode_line,
 };
 use fm_types::ProjectId;
@@ -26,6 +27,16 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn input(value: u128) -> WireInputId {
     WireInputId::new(NonZeroU128::new(value).unwrap())
+}
+
+fn input_statuses() -> Vec<fm_protocol::InputStatus> {
+    [(1, "Camera"), (2, "Slides")]
+        .into_iter()
+        .map(|(value, name)| fm_protocol::InputStatus {
+            input: input(value),
+            name: name.into(),
+        })
+        .collect()
 }
 
 fn project_id() -> ProjectId {
@@ -55,7 +66,6 @@ fn client(capacity: usize) -> Client {
 
 fn client_with_completed_history(capacity: usize, completed_command_capacity: usize) -> Client {
     let mut config = ClientConfig::new(
-        vec![WIPE_PROTOCOL_VERSION],
         "tcp-test",
         ClientType::Integration,
         Role::Operator,
@@ -70,16 +80,16 @@ fn client_with_completed_history(capacity: usize, completed_command_capacity: us
 }
 
 fn handshake(revision: u64, outcome: HandshakeOutcome) -> HandshakeResponse {
-    handshake_version(ProtocolVersion::new(1, 1), revision, outcome)
+    handshake_version(CURRENT_PROTOCOL_VERSION, revision, outcome)
 }
 
 fn handshake_version(
-    negotiated: ProtocolVersion,
+    protocol: ProtocolVersion,
     revision: u64,
     outcome: HandshakeOutcome,
 ) -> HandshakeResponse {
     HandshakeResponse {
-        negotiated,
+        protocol,
         granted_role: Role::Operator,
         permissions: vec!["switcher.take".to_owned()],
         capabilities: CapabilityReportSummary {
@@ -100,16 +110,25 @@ fn snapshot(revision: u64) -> SnapshotMessage {
         engine: engine(),
         revision,
         show_name: "Show".to_owned(),
-        inputs: vec![input(1), input(2)],
+        inputs: input_statuses(),
+        input_audio_strips: input_audio_strips(),
         desired_program: input(1),
         desired_preview: input(2),
         realized_program: input(1),
         realized_preview: input(2),
-        desired_manual_transition: None,
-        realized_manual_transition: None,
-        desired_fade_to_black: None,
-        realized_fade_to_black: None,
-        stingers: Some(Vec::new()),
+        desired_manual_transition: ManualTransitionStatus::Inactive,
+        realized_manual_transition: ManualTransitionStatus::Inactive,
+        desired_fade_to_black: FadeToBlackState {
+            target_active: false,
+            position: FadeToBlackPosition::LIVE,
+        },
+        realized_fade_to_black: FadeToBlackState {
+            target_active: false,
+            position: FadeToBlackPosition::LIVE,
+        },
+        stingers: Vec::new(),
+        desired_overlays: OverlayStatus::empty_channels(),
+        realized_overlays: OverlayStatus::empty_channels(),
     }
 }
 
@@ -122,8 +141,13 @@ fn event(revision: u64) -> EventMessage {
         payload: EventPayload::DesiredSwitcher {
             program: input(2),
             preview: input(1),
-            manual_transition: None,
-            fade_to_black: None,
+            manual_transition: ManualTransitionStatus::Inactive,
+            fade_to_black: FadeToBlackState {
+                target_active: false,
+                position: FadeToBlackPosition::LIVE,
+            },
+            overlays: OverlayStatus::empty_channels(),
+            input_audio_strips: input_audio_strips(),
         },
     }
 }
@@ -136,26 +160,29 @@ fn runtime_event(revision: u64) -> RuntimeEventMessage {
         sequence: 1,
         event: RuntimeLifecycleEvent::Realized {
             domain: "switcher".to_owned(),
-            manual_transition: None,
-            fade_to_black: None,
+            manual_transition: ManualTransitionStatus::Inactive,
+            fade_to_black: FadeToBlackState {
+                target_active: false,
+                position: FadeToBlackPosition::LIVE,
+            },
         },
     }
 }
 
 fn accept_snapshot(peer: &mut Peer, revision: u64) -> HandshakeRequest {
-    accept_snapshot_version(peer, ProtocolVersion::new(1, 1), revision)
+    accept_snapshot_version(peer, CURRENT_PROTOCOL_VERSION, revision)
 }
 
 fn accept_snapshot_version(
     peer: &mut Peer,
-    negotiated: ProtocolVersion,
+    protocol: ProtocolVersion,
     revision: u64,
 ) -> HandshakeRequest {
     let WireMessage::HandshakeRequest(request) = peer.receive() else {
-        panic!("adapter emitted a legacy or invalid handshake")
+        panic!("adapter emitted a non-current or invalid handshake")
     };
     peer.send(&WireMessage::HandshakeResponse(handshake_version(
-        negotiated,
+        protocol,
         revision,
         HandshakeOutcome::Snapshot {
             reason: SnapshotReason::NoCursor,
@@ -166,20 +193,20 @@ fn accept_snapshot_version(
 }
 
 fn accept_resume(peer: &mut Peer, revision: u64) -> ResumeCursor {
-    accept_resume_version(peer, ProtocolVersion::new(1, 1), revision)
+    accept_resume_version(peer, CURRENT_PROTOCOL_VERSION, revision)
 }
 
 fn accept_resume_version(
     peer: &mut Peer,
-    negotiated: ProtocolVersion,
+    protocol: ProtocolVersion,
     revision: u64,
 ) -> ResumeCursor {
     let WireMessage::HandshakeRequest(request) = peer.receive() else {
-        panic!("adapter emitted a legacy or invalid handshake")
+        panic!("adapter emitted a non-current or invalid handshake")
     };
     let cursor = request.resume_cursor.expect("resume cursor");
     peer.send(&WireMessage::HandshakeResponse(handshake_version(
-        negotiated,
+        protocol,
         revision,
         HandshakeOutcome::Resume {
             cursor: cursor.clone(),
@@ -400,151 +427,6 @@ fn unresolved_command_retries_original_envelope_but_completed_result_does_not() 
 }
 
 #[test]
-fn unresolved_wipe_backoff_grows_and_caps_until_a_compatible_reconnect() {
-    let (original_tx, original_rx) = mpsc::channel();
-    let (address, server_thread) = spawn_server(move |listener| {
-        let mut first = Peer::accept(&listener);
-        let request = accept_snapshot_version(&mut first, WIPE_PROTOCOL_VERSION, 4);
-        assert_eq!(request.versions, vec![WIPE_PROTOCOL_VERSION]);
-        let WireMessage::Command(original) = first.receive() else {
-            panic!("expected original Wipe command")
-        };
-        original_tx.send(original.clone()).unwrap();
-        drop(first);
-
-        for _ in 0..3 {
-            let mut downgraded = Peer::accept(&listener);
-            accept_resume_version(&mut downgraded, ProtocolVersion::new(1, 2), 4);
-            assert_eq!(
-                downgraded.stream.read(&mut [0_u8; 1]).unwrap(),
-                0,
-                "Wipe was retransmitted to a protocol 1.2 peer"
-            );
-        }
-
-        let mut compatible = Peer::accept(&listener);
-        accept_resume_version(&mut compatible, WIPE_PROTOCOL_VERSION, 4);
-        let WireMessage::Command(retried) = compatible.receive() else {
-            panic!("expected unresolved Wipe retry")
-        };
-        assert_eq!(retried, original);
-        compatible.send(&WireMessage::CommandResult(CommandResult::Accepted {
-            id: retried.id,
-            revision: 4,
-            scheduled_frame: None,
-        }));
-    });
-
-    let mut session = TcpSession::new(client(2));
-    session.connect(address, CONNECT_TIMEOUT).unwrap();
-    let command = session
-        .queue_command(
-            CommandPayload::Wipe {
-                duration_frames: 45,
-            },
-            "uncertain-wipe",
-            Some(4),
-            None,
-        )
-        .unwrap();
-    session.flush().unwrap();
-    assert_eq!(original_rx.recv().unwrap(), command);
-    assert!(matches!(
-        session.receive().unwrap(),
-        SessionEvent::Disconnected { backoff, .. }
-            if backoff == fm_client::ReconnectBackoff { attempt: 1, delay_ms: 10 }
-    ));
-    for (attempt, delay_ms) in [(2, 20), (3, 40), (4, 40)] {
-        assert!(matches!(
-            session.connect(address, CONNECT_TIMEOUT),
-            Err(TcpSessionError::PendingCommandIncompatible {
-                ref command_id,
-                negotiated,
-                required,
-                backoff,
-            }) if command_id == &command.id
-                && negotiated == ProtocolVersion::new(1, 2)
-                && required == WIPE_PROTOCOL_VERSION
-                && backoff == fm_client::ReconnectBackoff { attempt, delay_ms }
-        ));
-    }
-    assert!(matches!(
-        session.client().state(),
-        ConnectionState::PendingIncompatible { command_id, .. } if command_id == &command.id
-    ));
-    assert_eq!(session.in_flight_len(), 1);
-    assert_eq!(
-        session.client().command(&command.id).unwrap().command,
-        command
-    );
-
-    session.connect(address, CONNECT_TIMEOUT).unwrap();
-    assert!(matches!(
-        session.receive().unwrap(),
-        SessionEvent::CommandResult {
-            intake: Intake::ResultReconciled,
-            ..
-        }
-    ));
-    assert_eq!(session.disconnect().unwrap().attempt, 1);
-    server_thread.join().unwrap();
-}
-
-#[test]
-fn explicit_result_terminally_resolves_pending_incompatible_wipe() {
-    let (address, server_thread) = spawn_server(move |listener| {
-        let mut first = Peer::accept(&listener);
-        accept_snapshot_version(&mut first, WIPE_PROTOCOL_VERSION, 4);
-        assert!(matches!(first.receive(), WireMessage::Command(_)));
-        drop(first);
-
-        let mut downgraded = Peer::accept(&listener);
-        accept_resume_version(&mut downgraded, ProtocolVersion::new(1, 2), 4);
-        assert_eq!(downgraded.stream.read(&mut [0_u8; 1]).unwrap(), 0);
-    });
-
-    let mut session = TcpSession::new(client(2));
-    session.connect(address, CONNECT_TIMEOUT).unwrap();
-    let command = session
-        .queue_command(
-            CommandPayload::Wipe { duration_frames: 3 },
-            "terminal-wipe",
-            Some(4),
-            None,
-        )
-        .unwrap();
-    session.flush().unwrap();
-    assert!(matches!(
-        session.receive().unwrap(),
-        SessionEvent::Disconnected { .. }
-    ));
-    assert!(matches!(
-        session.connect(address, CONNECT_TIMEOUT),
-        Err(TcpSessionError::PendingCommandIncompatible { .. })
-    ));
-
-    let terminal = CommandResult::Rejected {
-        id: command.id.clone(),
-        code: "operator_resolved_uncertainty".to_owned(),
-        message: "operator accepted the uncertain outcome".to_owned(),
-        fields: Vec::new(),
-        current_revision: 4,
-        retryable: false,
-    };
-    session
-        .client_mut()
-        .reconcile_result(terminal.clone())
-        .unwrap();
-    assert_eq!(session.client().state(), &ConnectionState::Disconnected);
-    assert_eq!(
-        session.client().command(&command.id).unwrap().status,
-        CommandStatus::Completed(terminal)
-    );
-    assert!(session.client().model().pending_commands().is_empty());
-    server_thread.join().unwrap();
-}
-
-#[test]
 fn replayed_evicted_receipt_forces_snapshot_without_retransmitting_collision() {
     let (address, server_thread) = spawn_server(move |listener| {
         let mut first = Peer::accept(&listener);
@@ -742,7 +624,7 @@ fn wrong_first_record_and_wrong_project_reject_current_handshake() {
 }
 
 #[test]
-fn incompatible_handshake_remains_terminal_after_socket_close() {
+fn protocol_mismatch_remains_terminal_after_socket_close() {
     let (address, server_thread) = spawn_server(|listener| {
         let mut peer = Peer::accept(&listener);
         assert!(matches!(peer.receive(), WireMessage::HandshakeRequest(_)));
@@ -752,7 +634,7 @@ fn incompatible_handshake_remains_terminal_after_socket_close() {
                 reason: SnapshotReason::NoCursor,
             },
         );
-        response.negotiated = ProtocolVersion::new(2, 0);
+        response.protocol = ProtocolVersion::new(99, 0);
         peer.send(&WireMessage::HandshakeResponse(response));
         assert_eq!(peer.stream.read(&mut [0_u8; 1]).unwrap(), 0);
     });
@@ -760,14 +642,17 @@ fn incompatible_handshake_remains_terminal_after_socket_close() {
 
     assert!(matches!(
         session.connect(address, CONNECT_TIMEOUT),
-        Err(TcpSessionError::Client(ClientError::IncompatibleProtocol(
-            ProtocolVersion { major: 2, minor: 0 }
+        Err(TcpSessionError::Client(ClientError::ProtocolMismatch(
+            ProtocolVersion {
+                major: 99,
+                minor: 0
+            }
         )))
     ));
     assert_eq!(
         session.client().state(),
-        &ConnectionState::Incompatible {
-            negotiated: ProtocolVersion::new(2, 0)
+        &ConnectionState::ProtocolMismatch {
+            protocol: ProtocolVersion::new(99, 0)
         }
     );
     assert_eq!(session.reconnect_backoff(), None);
@@ -1010,8 +895,13 @@ fn model_error_forces_snapshot_and_preserves_unresolved_command() {
             payload: EventPayload::DesiredSwitcher {
                 program: input(1),
                 preview: input(99),
-                manual_transition: None,
-                fade_to_black: None,
+                manual_transition: ManualTransitionStatus::Inactive,
+                fade_to_black: FadeToBlackState {
+                    target_active: false,
+                    position: FadeToBlackPosition::LIVE,
+                },
+                overlays: OverlayStatus::empty_channels(),
+                input_audio_strips: input_audio_strips(),
             },
         }));
         assert_eq!(first.stream.read(&mut [0_u8; 1]).unwrap(), 0);
@@ -1053,4 +943,19 @@ fn model_error_forces_snapshot_and_preserves_unresolved_command() {
         }
     ));
     server_thread.join().unwrap();
+}
+
+fn input_audio_strips() -> Vec<fm_protocol::InputAudioStripStatus> {
+    [input(1), input(2)]
+        .into_iter()
+        .map(|input| fm_protocol::InputAudioStripStatus {
+            input,
+            gain_millidb: 0,
+            balance_basis_points: 0,
+            muted: false,
+            soloed: false,
+            follow_video: true,
+            delay_samples: 0,
+        })
+        .collect()
 }

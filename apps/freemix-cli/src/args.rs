@@ -8,6 +8,28 @@ pub enum ManualTransitionKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OverlayTransition {
+    Cut,
+    Fade,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OverlayPosition {
+    FullFrame,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OverlayBorder {
+    None,
+    ThinWhite,
+    ThickWhite,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TBarAction {
     Start(ManualTransitionKind),
     SetPosition(u16),
@@ -50,6 +72,16 @@ pub enum Command {
     },
     Status {
         path: PathBuf,
+    },
+    AudioStrip {
+        path: PathBuf,
+        input: u128,
+        gain_millidb: i32,
+        balance_basis_points: i32,
+        muted: bool,
+        soloed: bool,
+        follow_video: bool,
+        delay_samples: u32,
     },
     Preview {
         path: PathBuf,
@@ -106,6 +138,63 @@ pub enum Command {
         path: PathBuf,
         slot: u8,
     },
+    OverlayTake {
+        path: PathBuf,
+        channel: u8,
+        source: u128,
+        key: Option<String>,
+        expected_revision: Option<u64>,
+    },
+    OverlayUpdate {
+        path: PathBuf,
+        channel: u8,
+        source: u128,
+        key: Option<String>,
+        expected_revision: Option<u64>,
+    },
+    OverlayOff {
+        path: PathBuf,
+        channel: u8,
+        key: Option<String>,
+        expected_revision: Option<u64>,
+    },
+    OverlayOutput {
+        path: PathBuf,
+        channel: u8,
+        output: u128,
+        included: bool,
+        key: Option<String>,
+        expected_revision: Option<u64>,
+    },
+    OverlayTransition {
+        path: PathBuf,
+        channel: u8,
+        transition: OverlayTransition,
+        frames: u32,
+        key: Option<String>,
+        expected_revision: Option<u64>,
+    },
+    OverlayAppearance {
+        path: PathBuf,
+        channel: u8,
+        position: OverlayPosition,
+        border: OverlayBorder,
+        key: Option<String>,
+        expected_revision: Option<u64>,
+    },
+    OverlayQueue {
+        path: PathBuf,
+        channel: u8,
+        source: u128,
+        key: Option<String>,
+        expected_revision: Option<u64>,
+    },
+    OverlayNext {
+        path: PathBuf,
+        channel: u8,
+        key: Option<String>,
+        expected_revision: Option<u64>,
+    },
     Wipe {
         path: PathBuf,
         frames: u32,
@@ -127,6 +216,18 @@ pub enum Command {
     },
     RemoteStatus {
         address: SocketAddr,
+    },
+    RemoteAudioStrip {
+        address: SocketAddr,
+        input: u128,
+        gain_millidb: i32,
+        balance_basis_points: i32,
+        muted: bool,
+        soloed: bool,
+        follow_video: bool,
+        delay_samples: u32,
+        key: Option<String>,
+        expected_revision: Option<u64>,
     },
     RemotePreview {
         address: SocketAddr,
@@ -167,6 +268,63 @@ pub enum Command {
         address: SocketAddr,
         slot: u8,
         frames: u32,
+        key: Option<String>,
+        expected_revision: Option<u64>,
+    },
+    RemoteOverlayTake {
+        address: SocketAddr,
+        channel: u8,
+        source: u128,
+        key: Option<String>,
+        expected_revision: Option<u64>,
+    },
+    RemoteOverlayUpdate {
+        address: SocketAddr,
+        channel: u8,
+        source: u128,
+        key: Option<String>,
+        expected_revision: Option<u64>,
+    },
+    RemoteOverlayOff {
+        address: SocketAddr,
+        channel: u8,
+        key: Option<String>,
+        expected_revision: Option<u64>,
+    },
+    RemoteOverlayOutput {
+        address: SocketAddr,
+        channel: u8,
+        output: u128,
+        included: bool,
+        key: Option<String>,
+        expected_revision: Option<u64>,
+    },
+    RemoteOverlayTransition {
+        address: SocketAddr,
+        channel: u8,
+        transition: OverlayTransition,
+        frames: u32,
+        key: Option<String>,
+        expected_revision: Option<u64>,
+    },
+    RemoteOverlayAppearance {
+        address: SocketAddr,
+        channel: u8,
+        position: OverlayPosition,
+        border: OverlayBorder,
+        key: Option<String>,
+        expected_revision: Option<u64>,
+    },
+    RemoteOverlayQueue {
+        address: SocketAddr,
+        channel: u8,
+        source: u128,
+        key: Option<String>,
+        expected_revision: Option<u64>,
+    },
+    RemoteOverlayNext {
+        address: SocketAddr,
+        channel: u8,
         key: Option<String>,
         expected_revision: Option<u64>,
     },
@@ -267,6 +425,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
             reject_extra(&mut arguments)?;
             Ok(Command::Status { path })
         }
+        "audio-strip" => parse_audio_strip(arguments),
         "preview" => {
             let path = required_path(&mut arguments, "project path")?;
             let input = number(&required(&mut arguments, "input")?, "input")?;
@@ -293,17 +452,30 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
         "stinger" => parse_local_stinger(arguments),
         "stinger-configure" => parse_stinger_configuration(arguments),
         "stinger-remove" => parse_stinger_removal(arguments),
+        "overlay-take" | "overlay-update" | "overlay-off" | "overlay-output"
+        | "overlay-transition" | "overlay-appearance" | "overlay-queue" | "overlay-next" => {
+            parse_local_overlay(&command, arguments)
+        }
         "tbar-start" | "tbar-position" | "tbar-commit" | "tbar-cancel" => {
             parse_local_t_bar(&command, arguments)
         }
         "ftb" => parse_local_fade_to_black(arguments),
         "remote-status" => parse_remote_status(arguments),
+        "remote-audio-strip" => parse_remote_audio_strip(arguments),
         "remote-preview" => parse_remote_preview(arguments),
         "remote-cut" => parse_remote_cut(arguments),
         "remote-fade" | "remote-alpha-fade" | "remote-slide" | "remote-zoom" | "remote-wipe" => {
             parse_remote_timed_transition(&command, arguments)
         }
         "remote-stinger" => parse_remote_stinger(arguments),
+        "remote-overlay-take"
+        | "remote-overlay-update"
+        | "remote-overlay-off"
+        | "remote-overlay-output"
+        | "remote-overlay-transition"
+        | "remote-overlay-appearance"
+        | "remote-overlay-queue"
+        | "remote-overlay-next" => parse_remote_overlay(&command, arguments),
         "remote-tbar-start"
         | "remote-tbar-position"
         | "remote-tbar-commit"
@@ -341,6 +513,227 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
         "help" | "--help" | "-h" => Ok(Command::Help),
         _ => Err(ArgsError::UnknownCommand(command)),
     }
+}
+
+fn parse_audio_strip(mut arguments: impl Iterator<Item = String>) -> Result<Command, ArgsError> {
+    let path = required_path(&mut arguments, "project path")?;
+    let input = number(&required(&mut arguments, "input")?, "input")?;
+    let gain_millidb = number(&required(&mut arguments, "gain millidB")?, "gain millidB")?;
+    let balance_basis_points = number(
+        &required(&mut arguments, "balance basis points")?,
+        "balance basis points",
+    )?;
+    let muted = boolean_choice(&required(&mut arguments, "muted")?, "muted")?;
+    let soloed = boolean_choice(&required(&mut arguments, "soloed")?, "soloed")?;
+    let follow_video = boolean_choice(&required(&mut arguments, "follow video")?, "follow video")?;
+    let delay_samples = number(&required(&mut arguments, "delay samples")?, "delay samples")?;
+    reject_extra(&mut arguments)?;
+    Ok(Command::AudioStrip {
+        path,
+        input,
+        gain_millidb,
+        balance_basis_points,
+        muted,
+        soloed,
+        follow_video,
+        delay_samples,
+    })
+}
+
+fn parse_local_overlay(
+    command: &str,
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Command, ArgsError> {
+    let path = required_path(&mut arguments, "project path")?;
+    let channel = overlay_channel(&required(&mut arguments, "overlay channel")?)?;
+    let result = match command {
+        "overlay-take" | "overlay-update" | "overlay-queue" => {
+            let source = number(&required(&mut arguments, "source input")?, "source input")?;
+            let (key, expected_revision) = command_options(arguments)?;
+            if command == "overlay-take" {
+                Command::OverlayTake {
+                    path,
+                    channel,
+                    source,
+                    key,
+                    expected_revision,
+                }
+            } else if command == "overlay-update" {
+                Command::OverlayUpdate {
+                    path,
+                    channel,
+                    source,
+                    key,
+                    expected_revision,
+                }
+            } else {
+                Command::OverlayQueue {
+                    path,
+                    channel,
+                    source,
+                    key,
+                    expected_revision,
+                }
+            }
+        }
+        "overlay-off" => {
+            let (key, expected_revision) = command_options(arguments)?;
+            Command::OverlayOff {
+                path,
+                channel,
+                key,
+                expected_revision,
+            }
+        }
+        "overlay-output" => {
+            let output = number(&required(&mut arguments, "output")?, "output")?;
+            let included = boolean(&required(&mut arguments, "included")?, "included")?;
+            let (key, expected_revision) = command_options(arguments)?;
+            Command::OverlayOutput {
+                path,
+                channel,
+                output,
+                included,
+                key,
+                expected_revision,
+            }
+        }
+        "overlay-transition" => {
+            let transition = overlay_transition(&required(&mut arguments, "overlay transition")?)?;
+            let frames = number(&required(&mut arguments, "frames")?, "frames")?;
+            let (key, expected_revision) = command_options(arguments)?;
+            Command::OverlayTransition {
+                path,
+                channel,
+                transition,
+                frames,
+                key,
+                expected_revision,
+            }
+        }
+        "overlay-appearance" => {
+            let position = overlay_position(&required(&mut arguments, "overlay position")?)?;
+            let border = overlay_border(&required(&mut arguments, "overlay border")?)?;
+            let (key, expected_revision) = command_options(arguments)?;
+            Command::OverlayAppearance {
+                path,
+                channel,
+                position,
+                border,
+                key,
+                expected_revision,
+            }
+        }
+        "overlay-next" => {
+            let (key, expected_revision) = command_options(arguments)?;
+            Command::OverlayNext {
+                path,
+                channel,
+                key,
+                expected_revision,
+            }
+        }
+        _ => unreachable!("caller dispatches only overlay commands"),
+    };
+    Ok(result)
+}
+
+fn parse_remote_overlay(
+    command: &str,
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Command, ArgsError> {
+    let address = socket_address(&required(&mut arguments, "address")?)?;
+    let channel = overlay_channel(&required(&mut arguments, "overlay channel")?)?;
+    let result = match command {
+        "remote-overlay-take" | "remote-overlay-update" | "remote-overlay-queue" => {
+            let source = number(&required(&mut arguments, "source input")?, "source input")?;
+            let (key, expected_revision) = command_options(arguments)?;
+            if command == "remote-overlay-take" {
+                Command::RemoteOverlayTake {
+                    address,
+                    channel,
+                    source,
+                    key,
+                    expected_revision,
+                }
+            } else if command == "remote-overlay-update" {
+                Command::RemoteOverlayUpdate {
+                    address,
+                    channel,
+                    source,
+                    key,
+                    expected_revision,
+                }
+            } else {
+                Command::RemoteOverlayQueue {
+                    address,
+                    channel,
+                    source,
+                    key,
+                    expected_revision,
+                }
+            }
+        }
+        "remote-overlay-off" => {
+            let (key, expected_revision) = command_options(arguments)?;
+            Command::RemoteOverlayOff {
+                address,
+                channel,
+                key,
+                expected_revision,
+            }
+        }
+        "remote-overlay-output" => {
+            let output = number(&required(&mut arguments, "output")?, "output")?;
+            let included = boolean(&required(&mut arguments, "included")?, "included")?;
+            let (key, expected_revision) = command_options(arguments)?;
+            Command::RemoteOverlayOutput {
+                address,
+                channel,
+                output,
+                included,
+                key,
+                expected_revision,
+            }
+        }
+        "remote-overlay-transition" => {
+            let transition = overlay_transition(&required(&mut arguments, "overlay transition")?)?;
+            let frames = number(&required(&mut arguments, "frames")?, "frames")?;
+            let (key, expected_revision) = command_options(arguments)?;
+            Command::RemoteOverlayTransition {
+                address,
+                channel,
+                transition,
+                frames,
+                key,
+                expected_revision,
+            }
+        }
+        "remote-overlay-appearance" => {
+            let position = overlay_position(&required(&mut arguments, "overlay position")?)?;
+            let border = overlay_border(&required(&mut arguments, "overlay border")?)?;
+            let (key, expected_revision) = command_options(arguments)?;
+            Command::RemoteOverlayAppearance {
+                address,
+                channel,
+                position,
+                border,
+                key,
+                expected_revision,
+            }
+        }
+        "remote-overlay-next" => {
+            let (key, expected_revision) = command_options(arguments)?;
+            Command::RemoteOverlayNext {
+                address,
+                channel,
+                key,
+                expected_revision,
+            }
+        }
+        _ => unreachable!("caller dispatches only remote overlay commands"),
+    };
+    Ok(result)
 }
 
 fn parse_new(mut arguments: impl Iterator<Item = String>) -> Result<Command, ArgsError> {
@@ -559,6 +952,35 @@ fn parse_remote_status(mut arguments: impl Iterator<Item = String>) -> Result<Co
     Ok(Command::RemoteStatus { address })
 }
 
+fn parse_remote_audio_strip(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Command, ArgsError> {
+    let address = socket_address(&required(&mut arguments, "address")?)?;
+    let input = number(&required(&mut arguments, "input")?, "input")?;
+    let gain_millidb = number(&required(&mut arguments, "gain millidB")?, "gain millidB")?;
+    let balance_basis_points = number(
+        &required(&mut arguments, "balance basis points")?,
+        "balance basis points",
+    )?;
+    let muted = boolean_choice(&required(&mut arguments, "muted")?, "muted")?;
+    let soloed = boolean_choice(&required(&mut arguments, "soloed")?, "soloed")?;
+    let follow_video = boolean_choice(&required(&mut arguments, "follow video")?, "follow video")?;
+    let delay_samples = number(&required(&mut arguments, "delay samples")?, "delay samples")?;
+    let (key, expected_revision) = command_options(arguments)?;
+    Ok(Command::RemoteAudioStrip {
+        address,
+        input,
+        gain_millidb,
+        balance_basis_points,
+        muted,
+        soloed,
+        follow_video,
+        delay_samples,
+        key,
+        expected_revision,
+    })
+}
+
 fn parse_remote_preview(mut arguments: impl Iterator<Item = String>) -> Result<Command, ArgsError> {
     let address = socket_address(&required(&mut arguments, "address")?)?;
     let input = number(&required(&mut arguments, "input")?, "input")?;
@@ -694,6 +1116,17 @@ where
     })
 }
 
+fn boolean_choice(value: &str, field: &'static str) -> Result<bool, ArgsError> {
+    match value {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        _ => Err(ArgsError::InvalidChoice {
+            field,
+            value: value.to_owned(),
+        }),
+    }
+}
+
 fn socket_address(value: &str) -> Result<SocketAddr, ArgsError> {
     number(value, "address")
 }
@@ -705,6 +1138,43 @@ fn manual_kind(value: &str) -> Result<ManualTransitionKind, ArgsError> {
         "alpha-fade" => Ok(ManualTransitionKind::AlphaFade),
         _ => Err(ArgsError::InvalidChoice {
             field: "transition kind",
+            value: value.to_owned(),
+        }),
+    }
+}
+
+fn overlay_transition(value: &str) -> Result<OverlayTransition, ArgsError> {
+    match value {
+        "cut" => Ok(OverlayTransition::Cut),
+        "fade" => Ok(OverlayTransition::Fade),
+        _ => Err(ArgsError::InvalidChoice {
+            field: "overlay transition",
+            value: value.to_owned(),
+        }),
+    }
+}
+
+fn overlay_position(value: &str) -> Result<OverlayPosition, ArgsError> {
+    match value {
+        "full-frame" => Ok(OverlayPosition::FullFrame),
+        "top-left" => Ok(OverlayPosition::TopLeft),
+        "top-right" => Ok(OverlayPosition::TopRight),
+        "bottom-left" => Ok(OverlayPosition::BottomLeft),
+        "bottom-right" => Ok(OverlayPosition::BottomRight),
+        _ => Err(ArgsError::InvalidChoice {
+            field: "overlay position",
+            value: value.to_owned(),
+        }),
+    }
+}
+
+fn overlay_border(value: &str) -> Result<OverlayBorder, ArgsError> {
+    match value {
+        "none" => Ok(OverlayBorder::None),
+        "thin-white" => Ok(OverlayBorder::ThinWhite),
+        "thick-white" => Ok(OverlayBorder::ThickWhite),
+        _ => Err(ArgsError::InvalidChoice {
+            field: "overlay border",
             value: value.to_owned(),
         }),
     }
@@ -746,6 +1216,30 @@ fn stinger_slot(value: &str) -> Result<u8, ArgsError> {
         });
     }
     Ok(u8::try_from(slot).expect("validated Stinger slot fits u8"))
+}
+
+fn overlay_channel(value: &str) -> Result<u8, ArgsError> {
+    let channel = number::<u16>(value, "overlay channel")?;
+    if !(1..=8).contains(&channel) {
+        return Err(ArgsError::OutOfRange {
+            field: "overlay channel",
+            minimum: 1,
+            maximum: 8,
+            value: channel,
+        });
+    }
+    Ok(u8::try_from(channel).expect("validated overlay channel fits u8"))
+}
+
+fn boolean(value: &str, field: &'static str) -> Result<bool, ArgsError> {
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(ArgsError::InvalidChoice {
+            field,
+            value: value.to_owned(),
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -980,6 +1474,65 @@ mod tests {
     }
 
     #[test]
+    fn parses_local_and_remote_overlay_appearance() {
+        assert_eq!(
+            parse(strings(&[
+                "overlay-appearance",
+                "show.freemix",
+                "4",
+                "bottom-right",
+                "thick-white",
+                "--expect",
+                "7",
+            ])),
+            Ok(Command::OverlayAppearance {
+                path: "show.freemix".into(),
+                channel: 4,
+                position: OverlayPosition::BottomRight,
+                border: OverlayBorder::ThickWhite,
+                key: None,
+                expected_revision: Some(7),
+            })
+        );
+        assert_eq!(
+            parse(strings(&[
+                "remote-overlay-appearance",
+                "127.0.0.1:9123",
+                "1",
+                "top-left",
+                "thin-white",
+            ])),
+            Ok(Command::RemoteOverlayAppearance {
+                address: "127.0.0.1:9123".parse().unwrap(),
+                channel: 1,
+                position: OverlayPosition::TopLeft,
+                border: OverlayBorder::ThinWhite,
+                key: None,
+                expected_revision: None,
+            })
+        );
+        assert_eq!(
+            parse(strings(&["overlay-queue", "show.freemix", "4", "2",])),
+            Ok(Command::OverlayQueue {
+                path: "show.freemix".into(),
+                channel: 4,
+                source: 2,
+                key: None,
+                expected_revision: None,
+            })
+        );
+        assert_eq!(
+            parse(strings(&["remote-overlay-next", "127.0.0.1:9123", "4"])),
+            Ok(Command::RemoteOverlayNext {
+                address: "127.0.0.1:9123".parse().unwrap(),
+                channel: 4,
+                key: None,
+                expected_revision: None,
+            })
+        );
+    }
+
+    #[test]
     fn parses_complete_stinger_configuration_and_removal() {
         assert_eq!(
             parse(strings(&[
@@ -1197,6 +1750,66 @@ mod tests {
         assert_eq!(
             parse(strings(&["status", "show.freemix", "extra"])),
             Err(ArgsError::UnexpectedArgument("extra".into()))
+        );
+    }
+
+    #[test]
+    fn audio_strip_parses_exact_project_input_and_controls() {
+        assert_eq!(
+            parse(strings(&[
+                "audio-strip",
+                "show.freemix",
+                "7",
+                "-6000",
+                "2500",
+                "on",
+                "on",
+                "off",
+                "48000",
+            ])),
+            Ok(Command::AudioStrip {
+                path: PathBuf::from("show.freemix"),
+                input: 7,
+                gain_millidb: -6_000,
+                balance_basis_points: 2_500,
+                muted: true,
+                soloed: true,
+                follow_video: false,
+                delay_samples: 48_000,
+            })
+        );
+    }
+
+    #[test]
+    fn remote_audio_strip_parses_command_options() {
+        assert_eq!(
+            parse(strings(&[
+                "remote-audio-strip",
+                "127.0.0.1:9123",
+                "7",
+                "-6000",
+                "-2500",
+                "off",
+                "off",
+                "on",
+                "2400",
+                "--key",
+                "delay",
+                "--expect",
+                "3",
+            ])),
+            Ok(Command::RemoteAudioStrip {
+                address: "127.0.0.1:9123".parse().unwrap(),
+                input: 7,
+                gain_millidb: -6_000,
+                balance_basis_points: -2_500,
+                muted: false,
+                soloed: false,
+                follow_video: true,
+                delay_samples: 2_400,
+                key: Some("delay".into()),
+                expected_revision: Some(3),
+            })
         );
     }
 

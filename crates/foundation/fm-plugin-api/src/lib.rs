@@ -26,8 +26,8 @@ pub const MAX_PLUGIN_NAME_BYTES: usize = 128;
 
 /// A stable numeric status code transported across an ABI boundary.
 ///
-/// This is intentionally a newtype rather than a Rust enum. Receivers can
-/// safely preserve status values introduced by a newer contract version.
+/// This is intentionally a newtype rather than a Rust enum so the FFI record
+/// has a fixed integer representation.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct StatusCode(pub u32);
@@ -220,9 +220,9 @@ impl ErrorRecord {
 pub struct AbiVersion {
     /// Breaking-change version.
     pub major: u32,
-    /// Backwards-compatible feature version.
+    /// Feature version component.
     pub minor: u32,
-    /// Backwards-compatible fix version.
+    /// Fix version component.
     pub patch: u32,
 }
 
@@ -235,91 +235,6 @@ impl AbiVersion {
             minor,
             patch,
         }
-    }
-}
-
-/// An inclusive range of compatible ABI versions.
-///
-/// A range is valid only when both endpoints have the same major version. This
-/// prevents an accidental claim of compatibility across a breaking boundary.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct AbiVersionRange {
-    /// Oldest accepted ABI version, inclusive.
-    pub minimum: AbiVersion,
-    /// Newest accepted ABI version, inclusive.
-    pub maximum: AbiVersion,
-}
-
-impl AbiVersionRange {
-    /// Creates and validates an inclusive range.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StatusCode::INVALID_ARGUMENT`] for reversed ranges or ranges
-    /// that cross a major-version boundary.
-    pub const fn new(minimum: AbiVersion, maximum: AbiVersion) -> Result<Self, StatusCode> {
-        if minimum.major != maximum.major
-            || minimum.minor > maximum.minor
-            || (minimum.minor == maximum.minor && minimum.patch > maximum.patch)
-        {
-            return Err(StatusCode::INVALID_ARGUMENT);
-        }
-        Ok(Self { minimum, maximum })
-    }
-
-    /// A range containing exactly one version.
-    #[must_use]
-    pub const fn exact(version: AbiVersion) -> Self {
-        Self {
-            minimum: version,
-            maximum: version,
-        }
-    }
-
-    /// Validates this range, including records decoded from another ABI.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StatusCode::INVALID_ARGUMENT`] when the endpoints are invalid.
-    pub const fn validate(self) -> Result<(), StatusCode> {
-        match Self::new(self.minimum, self.maximum) {
-            Ok(_) => Ok(()),
-            Err(error) => Err(error),
-        }
-    }
-
-    /// Whether this range contains `version`.
-    #[must_use]
-    pub fn contains(self, version: AbiVersion) -> bool {
-        self.validate().is_ok()
-            && version.major == self.minimum.major
-            && version >= self.minimum
-            && version <= self.maximum
-    }
-}
-
-/// Selects the newest ABI version supported by both ranges.
-///
-/// # Errors
-///
-/// Returns [`StatusCode::INVALID_ARGUMENT`] if either range is malformed, or
-/// [`StatusCode::ABI_INCOMPATIBLE`] if the ranges do not overlap.
-pub fn negotiate_abi(
-    host: AbiVersionRange,
-    plugin: AbiVersionRange,
-) -> Result<AbiVersion, StatusCode> {
-    host.validate()?;
-    plugin.validate()?;
-    if host.minimum.major != plugin.minimum.major {
-        return Err(StatusCode::ABI_INCOMPATIBLE);
-    }
-    let minimum = core::cmp::max(host.minimum, plugin.minimum);
-    let maximum = core::cmp::min(host.maximum, plugin.maximum);
-    if minimum > maximum {
-        Err(StatusCode::ABI_INCOMPATIBLE)
-    } else {
-        Ok(maximum)
     }
 }
 
@@ -605,7 +520,7 @@ impl Default for CapabilitySet {
     }
 }
 
-/// A plugin manifest containing identity, ABI support, and requested access.
+/// A plugin manifest containing identity, its exact ABI, and requested access.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PluginManifest {
@@ -615,8 +530,8 @@ pub struct PluginManifest {
     pub plugin_id: PluginId,
     /// Semantic version of the plugin implementation.
     pub plugin_version: AbiVersion,
-    /// ABI versions accepted by the plugin.
-    pub abi: AbiVersionRange,
+    /// Exact current ABI required by the plugin.
+    pub abi_version: AbiVersion,
     /// Human-readable plugin name.
     pub name: PluginName,
     /// Capabilities requested by the plugin. Requests are not grants.
@@ -633,14 +548,14 @@ impl PluginManifest {
     pub fn new(
         plugin_id: PluginId,
         plugin_version: AbiVersion,
-        abi: AbiVersionRange,
+        abi_version: AbiVersion,
         name: &str,
     ) -> Result<Self, StatusCode> {
         Ok(Self {
             schema_version: MANIFEST_SCHEMA_VERSION,
             plugin_id,
             plugin_version,
-            abi,
+            abi_version,
             name: PluginName::from_text(name)?,
             requested_capabilities: CapabilitySet::EMPTY,
         })
@@ -651,12 +566,11 @@ impl PluginManifest {
     /// # Errors
     ///
     /// Returns [`StatusCode::MANIFEST_INVALID`] for an unsupported schema,
-    /// invalid identity, name, ABI range, or capability request.
+    /// invalid identity, name, or capability request.
     pub fn validate(&self) -> Result<(), StatusCode> {
         if self.schema_version != MANIFEST_SCHEMA_VERSION
             || !self.plugin_id.is_valid()
             || self.name.is_empty()
-            || self.abi.validate().is_err()
             || self.requested_capabilities.validate().is_err()
         {
             return Err(StatusCode::MANIFEST_INVALID);
@@ -664,27 +578,29 @@ impl PluginManifest {
         Ok(())
     }
 
-    /// Validates the manifest against a host ABI range and explicit grants,
-    /// returning the negotiated ABI version.
+    /// Validates the manifest against the exact current host ABI and explicit
+    /// grants.
     ///
     /// Capability policy is default-deny: every request must be covered by an
     /// exact resource grant with a superset of permission bits.
     ///
     /// # Errors
     ///
-    /// Returns a manifest, ABI compatibility, or permission status.
-    pub fn validate_compatible(
+    /// Returns a manifest, exact-ABI, or permission status.
+    pub fn validate_current(
         &self,
-        host_abi: AbiVersionRange,
+        host_abi: AbiVersion,
         host_grants: &CapabilitySet,
-    ) -> Result<AbiVersion, StatusCode> {
+    ) -> Result<(), StatusCode> {
         self.validate()?;
         host_grants.validate()?;
-        let selected = negotiate_abi(host_abi, self.abi)?;
+        if self.abi_version != host_abi {
+            return Err(StatusCode::ABI_INCOMPATIBLE);
+        }
         if !host_grants.allows_all(&self.requested_capabilities) {
             return Err(StatusCode::PERMISSION_DENIED);
         }
-        Ok(selected)
+        Ok(())
     }
 }
 
@@ -1088,38 +1004,10 @@ impl CommandRecord {
 mod tests {
     use super::*;
 
-    const ABI_1_0_0: AbiVersion = AbiVersion::new(1, 0, 0);
     const ABI_1_2_0: AbiVersion = AbiVersion::new(1, 2, 0);
     const ABI_1_3_0: AbiVersion = AbiVersion::new(1, 3, 0);
-    const ABI_1_4_0: AbiVersion = AbiVersion::new(1, 4, 0);
-    const ABI_2_0_0: AbiVersion = AbiVersion::new(2, 0, 0);
     const OWNER: PluginId = PluginId::new(1, 10);
     const BORROWER: PluginId = PluginId::new(2, 20);
-
-    #[test]
-    fn negotiation_selects_newest_shared_version() {
-        let host = AbiVersionRange::new(ABI_1_0_0, ABI_1_3_0).unwrap();
-        let plugin = AbiVersionRange::new(ABI_1_2_0, ABI_1_4_0).unwrap();
-        assert_eq!(negotiate_abi(host, plugin), Ok(ABI_1_3_0));
-    }
-
-    #[test]
-    fn negotiation_rejects_disjoint_and_cross_major_ranges() {
-        let older = AbiVersionRange::new(ABI_1_0_0, ABI_1_2_0).unwrap();
-        let newer = AbiVersionRange::exact(ABI_1_3_0);
-        assert_eq!(
-            negotiate_abi(older, newer),
-            Err(StatusCode::ABI_INCOMPATIBLE)
-        );
-        assert_eq!(
-            negotiate_abi(older, AbiVersionRange::exact(ABI_2_0_0)),
-            Err(StatusCode::ABI_INCOMPATIBLE)
-        );
-        assert_eq!(
-            AbiVersionRange::new(ABI_1_3_0, ABI_2_0_0),
-            Err(StatusCode::INVALID_ARGUMENT)
-        );
-    }
 
     #[test]
     fn only_owner_can_release_and_borrowed_handles_cannot_release() {
@@ -1185,8 +1073,8 @@ mod tests {
     }
 
     #[test]
-    fn manifest_requires_compatible_abi_and_explicit_grants() {
-        let abi = AbiVersionRange::new(ABI_1_0_0, ABI_1_3_0).unwrap();
+    fn manifest_requires_exact_current_abi_and_explicit_grants() {
+        let abi = ABI_1_3_0;
         let mut manifest = PluginManifest::new(OWNER, ABI_1_2_0, abi, "mixer").unwrap();
         manifest
             .requested_capabilities
@@ -1201,7 +1089,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            manifest.validate_compatible(abi, &CapabilitySet::default()),
+            manifest.validate_current(abi, &CapabilitySet::default()),
             Err(StatusCode::PERMISSION_DENIED)
         );
         let mut grants = CapabilitySet::default();
@@ -1215,7 +1103,7 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-        assert_eq!(manifest.validate_compatible(abi, &grants), Ok(ABI_1_3_0));
+        assert_eq!(manifest.validate_current(abi, &grants), Ok(()));
 
         manifest.schema_version += 1;
         assert_eq!(manifest.validate(), Err(StatusCode::MANIFEST_INVALID));

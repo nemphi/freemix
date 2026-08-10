@@ -11,13 +11,13 @@ use std::collections::{HashMap, HashSet};
 
 use fm_command::{CommandId, Revision};
 use fm_protocol::{
-    CommandResult, EngineIdentity, EventCursor, EventMessage, EventPayload, FadeToBlackPosition,
-    FadeToBlackState, FieldIssue, ManualTransitionKind, ManualTransitionPosition,
+    CommandResult, EngineIdentity, EventCursor, EventMessage, EventPayload, FadeToBlackState,
+    FieldIssue, ManualTransitionKind, ManualTransitionPosition,
     ManualTransitionStatus as ProtocolManualTransitionStatus, ResumeCursor, ServerHello,
     ServerIdentity, SnapshotMessage, StingerAudioPolicy, StingerMissingMediaFallback,
     StingerReadiness,
 };
-use fm_types::{InputId, ProjectId};
+use fm_types::{InputId, OutputId, ProjectId};
 
 /// A project-aware cursor used at the UI/protocol boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -117,6 +117,31 @@ pub struct StingerStatus {
     pub readiness: StingerReadiness,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OverlayStatus {
+    pub channel: u8,
+    pub source: Option<InputId>,
+    pub active: bool,
+    pub opacity: u8,
+    pub transition: fm_protocol::OverlayTransitionKind,
+    pub duration_frames: u32,
+    pub position: fm_protocol::OverlayPositionPreset,
+    pub border: fm_protocol::OverlayBorderPreset,
+    pub queued_sources: Vec<InputId>,
+    pub included_outputs: Vec<OutputId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InputAudioStripStatus {
+    pub input: InputId,
+    pub gain_millidb: i32,
+    pub balance_basis_points: i32,
+    pub muted: bool,
+    pub soloed: bool,
+    pub follow_video: bool,
+    pub delay_samples: u32,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ActiveManualTransition {
     pub kind: ManualTransitionKind,
@@ -154,7 +179,11 @@ pub struct ProjectSnapshot {
     pub cursor: ProjectCursor,
     pub show_name: String,
     pub inputs: Vec<InputId>,
+    pub input_names: Vec<String>,
+    pub input_audio_strips: Vec<InputAudioStripStatus>,
     pub stingers: Vec<StingerStatus>,
+    pub desired_overlays: Vec<OverlayStatus>,
+    pub realized_overlays: Vec<OverlayStatus>,
     pub switcher: SwitcherState,
 }
 
@@ -162,7 +191,15 @@ impl ProjectSnapshot {
     /// Adds the project identity omitted by the current protocol snapshot DTO.
     #[must_use]
     pub fn from_protocol(project_id: ProjectId, message: SnapshotMessage) -> Self {
-        let stingers = protocol_stingers(message.stingers.unwrap_or_default());
+        let stingers = protocol_stingers(message.stingers);
+        let desired_overlays = protocol_overlays(message.desired_overlays);
+        let realized_overlays = protocol_overlays(message.realized_overlays);
+        let input_audio_strips = protocol_input_audio_strips(message.input_audio_strips);
+        let (inputs, input_names) = message
+            .inputs
+            .into_iter()
+            .map(|input| (input.input.to_domain(), input.name))
+            .unzip();
         Self {
             cursor: ProjectCursor {
                 project_id,
@@ -170,12 +207,12 @@ impl ProjectSnapshot {
                 revision: Revision::new(message.revision),
             },
             show_name: message.show_name,
-            inputs: message
-                .inputs
-                .into_iter()
-                .map(fm_protocol::WireInputId::to_domain)
-                .collect(),
+            inputs,
+            input_names,
+            input_audio_strips,
             stingers,
+            desired_overlays,
+            realized_overlays,
             switcher: SwitcherState {
                 desired: BusSelection::new(
                     message.desired_program.to_domain(),
@@ -206,12 +243,16 @@ pub enum DurableChange {
         selection: BusSelection,
         manual_transition: ManualTransitionStatus,
         fade_to_black: FadeToBlackState,
+        overlays: Vec<OverlayStatus>,
+        input_audio_strips: Vec<InputAudioStripStatus>,
     },
     StingerSlotsChanged {
         selection: BusSelection,
         manual_transition: ManualTransitionStatus,
         fade_to_black: FadeToBlackState,
         stingers: Vec<StingerStatus>,
+        overlays: Vec<OverlayStatus>,
+        input_audio_strips: Vec<InputAudioStripStatus>,
     },
 }
 
@@ -232,10 +273,14 @@ impl DurableProjectEvent {
                 preview,
                 manual_transition,
                 fade_to_black,
+                overlays,
+                input_audio_strips,
             } => DurableChange::DesiredSwitcher {
                 selection: BusSelection::new(program.to_domain(), preview.to_domain()),
                 manual_transition: manual_status_from_protocol(manual_transition),
                 fade_to_black: fade_to_black_from_protocol(fade_to_black),
+                overlays: protocol_overlays(overlays),
+                input_audio_strips: protocol_input_audio_strips(input_audio_strips),
             },
             EventPayload::StingerSlotsChanged {
                 program,
@@ -243,11 +288,15 @@ impl DurableProjectEvent {
                 manual_transition,
                 fade_to_black,
                 stingers,
+                overlays,
+                input_audio_strips,
             } => DurableChange::StingerSlotsChanged {
                 selection: BusSelection::new(program.to_domain(), preview.to_domain()),
                 manual_transition: manual_status_from_protocol(manual_transition),
                 fade_to_black: fade_to_black_from_protocol(fade_to_black),
                 stingers: protocol_stingers(stingers),
+                overlays: protocol_overlays(overlays),
+                input_audio_strips: protocol_input_audio_strips(input_audio_strips),
             },
         };
         Self {
@@ -292,8 +341,8 @@ pub struct RuntimeRealization {
     pub revision: Revision,
     pub generation: u64,
     pub sequence: u64,
-    pub manual_transition: Option<ManualTransitionStatus>,
-    pub fade_to_black: Option<FadeToBlackState>,
+    pub manual_transition: ManualTransitionStatus,
+    pub fade_to_black: FadeToBlackState,
 }
 
 /// Authoritative project data at the last applied cursor.
@@ -301,7 +350,11 @@ pub struct RuntimeRealization {
 pub struct ProjectState {
     show_name: String,
     inputs: Vec<InputId>,
+    input_names: Vec<String>,
+    input_audio_strips: Vec<InputAudioStripStatus>,
     stingers: Vec<StingerStatus>,
+    desired_overlays: Vec<OverlayStatus>,
+    realized_overlays: Vec<OverlayStatus>,
     switcher: SwitcherState,
 }
 
@@ -317,8 +370,31 @@ impl ProjectState {
     }
 
     #[must_use]
+    pub fn input_name(&self, input: InputId) -> Option<&str> {
+        self.inputs
+            .iter()
+            .position(|candidate| *candidate == input)
+            .map(|index| self.input_names[index].as_str())
+    }
+
+    #[must_use]
+    pub fn input_audio_strips(&self) -> &[InputAudioStripStatus] {
+        &self.input_audio_strips
+    }
+
+    #[must_use]
     pub fn stingers(&self) -> &[StingerStatus] {
         &self.stingers
+    }
+
+    #[must_use]
+    pub fn desired_overlays(&self) -> &[OverlayStatus] {
+        &self.desired_overlays
+    }
+
+    #[must_use]
+    pub fn realized_overlays(&self) -> &[OverlayStatus] {
+        &self.realized_overlays
     }
 
     #[must_use]
@@ -333,7 +409,11 @@ pub struct ClientView {
     pub cursor: ProjectCursor,
     pub show_name: String,
     pub inputs: Vec<InputId>,
+    pub input_names: Vec<String>,
+    pub input_audio_strips: Vec<InputAudioStripStatus>,
     pub stingers: Vec<StingerStatus>,
+    pub desired_overlays: Vec<OverlayStatus>,
+    pub realized_overlays: Vec<OverlayStatus>,
     pub switcher: SwitcherState,
 }
 
@@ -441,7 +521,7 @@ pub enum CommandReconciled {
 /// A reducer input for callers that prefer one dispatch surface.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Action {
-    InstallSnapshot(ProjectSnapshot),
+    InstallSnapshot(Box<ProjectSnapshot>),
     ApplyEvent(DurableProjectEvent),
     ApplyRuntimeRealization(RuntimeRealization),
     TrackCommand {
@@ -507,8 +587,22 @@ pub enum ModelError {
     },
     RevisionExhausted,
     DuplicateInput(InputId),
+    InvalidInputNames,
+    InvalidInputAudioStrips,
     DuplicateStingerSlot(u8),
     InvalidStingerSlot(u8),
+    InvalidOverlayCount(usize),
+    InvalidOverlayChannel(u8),
+    InvalidOverlayTransitionDuration {
+        channel: u8,
+        duration_frames: u32,
+    },
+    ActiveOverlayMissingSource(u8),
+    InvalidOverlayQueueDepth {
+        channel: u8,
+        depth: usize,
+    },
+    DuplicateOverlayOutput(u8),
     UnknownInput(InputId),
     InvalidManualTransitionRouting,
     DuplicateCommand(CommandId),
@@ -571,10 +665,41 @@ impl fmt::Display for ModelError {
             ),
             Self::RevisionExhausted => formatter.write_str("revision counter is exhausted"),
             Self::DuplicateInput(input) => write!(formatter, "snapshot repeats input {input}"),
+            Self::InvalidInputNames => formatter
+                .write_str("input names must contain one nonempty label for each show input"),
+            Self::InvalidInputAudioStrips => formatter.write_str(
+                "input audio strips must contain each show input exactly once with gain in -96000..=24000 millidB, balance in -10000..=10000 basis points, and delay in 0..=48000 samples",
+            ),
             Self::DuplicateStingerSlot(slot) => {
                 write!(formatter, "snapshot repeats Stinger slot {slot}")
             }
             Self::InvalidStingerSlot(slot) => write!(formatter, "invalid Stinger slot {slot}"),
+            Self::InvalidOverlayCount(count) => {
+                write!(
+                    formatter,
+                    "snapshot contains {count} overlay channels; expected 8"
+                )
+            }
+            Self::InvalidOverlayChannel(channel) => {
+                write!(formatter, "invalid or duplicate overlay channel {channel}")
+            }
+            Self::InvalidOverlayTransitionDuration {
+                channel,
+                duration_frames,
+            } => write!(
+                formatter,
+                "overlay channel {channel} transition duration {duration_frames} is outside 1..=3600 frames"
+            ),
+            Self::ActiveOverlayMissingSource(channel) => {
+                write!(formatter, "active overlay channel {channel} has no source")
+            }
+            Self::InvalidOverlayQueueDepth { channel, depth } => write!(
+                formatter,
+                "overlay channel {channel} queue depth {depth} exceeds 64"
+            ),
+            Self::DuplicateOverlayOutput(channel) => {
+                write!(formatter, "overlay channel {channel} repeats an output")
+            }
             Self::UnknownInput(input) => write!(formatter, "unknown input {input}"),
             Self::InvalidManualTransitionRouting => formatter
                 .write_str("manual transition endpoints do not match Program and Preview routing"),
@@ -595,8 +720,15 @@ pub struct ClientModel {
     expected_engine: Option<EngineIdentity>,
     state: Option<ProjectState>,
     applied_events: HashMap<Revision, DurableProjectEvent>,
-    desired_by_revision:
-        HashMap<Revision, (BusSelection, ManualTransitionStatus, FadeToBlackState)>,
+    desired_by_revision: HashMap<
+        Revision,
+        (
+            BusSelection,
+            ManualTransitionStatus,
+            FadeToBlackState,
+            Vec<OverlayStatus>,
+        ),
+    >,
     last_runtime_realization: Option<RuntimeRealization>,
     pending: Vec<PendingCommand>,
     last_rejection: Option<RejectedCommand>,
@@ -648,7 +780,11 @@ impl ClientModel {
             cursor,
             show_name: state.show_name.clone(),
             inputs: state.inputs.clone(),
+            input_names: state.input_names.clone(),
+            input_audio_strips: state.input_audio_strips.clone(),
             stingers: state.stingers.clone(),
+            desired_overlays: state.desired_overlays.clone(),
+            realized_overlays: state.realized_overlays.clone(),
             switcher,
         })
     }
@@ -694,7 +830,7 @@ impl ClientModel {
     pub fn reduce(&mut self, action: Action) -> Result<Reduction, ModelError> {
         match action {
             Action::InstallSnapshot(snapshot) => self
-                .install_snapshot(snapshot)
+                .install_snapshot(*snapshot)
                 .map(Reduction::SnapshotInstalled),
             Action::ApplyEvent(event) => self.apply_event(event).map(Reduction::EventApplied),
             Action::ApplyRuntimeRealization(realization) => self
@@ -810,6 +946,7 @@ impl ClientModel {
                 snapshot.switcher.desired,
                 snapshot.switcher.desired_manual_transition,
                 snapshot.switcher.desired_fade_to_black,
+                snapshot.desired_overlays.clone(),
             ),
         );
         self.expected_engine = Some(snapshot.cursor.engine.clone());
@@ -818,7 +955,11 @@ impl ClientModel {
         self.state = Some(ProjectState {
             show_name: snapshot.show_name,
             inputs: snapshot.inputs,
+            input_names: snapshot.input_names,
+            input_audio_strips: snapshot.input_audio_strips,
             stingers: snapshot.stingers,
+            desired_overlays: snapshot.desired_overlays,
+            realized_overlays: snapshot.realized_overlays,
             switcher: snapshot.switcher,
         });
         self.applied_events.clear();
@@ -898,6 +1039,7 @@ impl ClientModel {
                 state.switcher.desired,
                 state.switcher.desired_manual_transition,
                 state.switcher.desired_fade_to_black,
+                state.desired_overlays.clone(),
             ),
         );
         self.cursor = Some(event.cursor.clone());
@@ -970,17 +1112,15 @@ impl ClientModel {
                 },
             }
         }
-        let (desired, desired_manual_transition, desired_fade_to_black) = self
+        let (desired, _, _, desired_overlays) = self
             .desired_by_revision
             .get(&realization.revision)
-            .copied()
+            .cloned()
             .ok_or(ModelError::UnknownDurableRevision {
                 revision: realization.revision,
             })?;
-        let realized_manual_transition = realization
-            .manual_transition
-            .unwrap_or(desired_manual_transition);
-        let realized_fade_to_black = realization.fade_to_black.unwrap_or(desired_fade_to_black);
+        let realized_manual_transition = realization.manual_transition;
+        let realized_fade_to_black = realization.fade_to_black;
         let state = self.state.as_ref().ok_or(ModelError::StateUnavailable)?;
         let inputs = state.inputs.iter().copied().collect();
         validate_manual_transition(realized_manual_transition, desired, &inputs)?;
@@ -988,6 +1128,7 @@ impl ClientModel {
         state.switcher.realized = desired;
         state.switcher.realized_manual_transition = realized_manual_transition;
         state.switcher.realized_fade_to_black = realized_fade_to_black;
+        state.realized_overlays = desired_overlays;
         state.switcher.runtime_generation = Some(realization.generation);
         self.last_runtime_realization = Some(realization);
         Ok(RuntimeRealizationApplied::Applied)
@@ -1171,6 +1312,14 @@ fn validate_engine(engine: &EngineIdentity) -> Result<(), ModelError> {
 }
 
 fn validate_snapshot_inputs(snapshot: &ProjectSnapshot) -> Result<(), ModelError> {
+    if snapshot.input_names.len() != snapshot.inputs.len()
+        || snapshot
+            .input_names
+            .iter()
+            .any(|name| name.trim().is_empty())
+    {
+        return Err(ModelError::InvalidInputNames);
+    }
     let mut inputs = HashSet::with_capacity(snapshot.inputs.len());
     for input in &snapshot.inputs {
         if !inputs.insert(*input) {
@@ -1188,6 +1337,9 @@ fn validate_snapshot_inputs(snapshot: &ProjectSnapshot) -> Result<(), ModelError
         }
     }
     validate_stingers(&snapshot.stingers, &inputs)?;
+    validate_input_audio_strips(&snapshot.input_audio_strips, &inputs)?;
+    validate_overlays(&snapshot.desired_overlays, &inputs)?;
+    validate_overlays(&snapshot.realized_overlays, &inputs)?;
     validate_manual_transition(
         snapshot.switcher.desired_manual_transition,
         snapshot.switcher.desired,
@@ -1198,6 +1350,55 @@ fn validate_snapshot_inputs(snapshot: &ProjectSnapshot) -> Result<(), ModelError
         snapshot.switcher.realized,
         &inputs,
     )?;
+    Ok(())
+}
+
+fn validate_overlays(
+    overlays: &[OverlayStatus],
+    inputs: &HashSet<InputId>,
+) -> Result<(), ModelError> {
+    if overlays.len() != 8 {
+        return Err(ModelError::InvalidOverlayCount(overlays.len()));
+    }
+    let mut channels = HashSet::with_capacity(8);
+    for overlay in overlays {
+        if !(1..=8).contains(&overlay.channel) || !channels.insert(overlay.channel) {
+            return Err(ModelError::InvalidOverlayChannel(overlay.channel));
+        }
+        if overlay.active && overlay.source.is_none() {
+            return Err(ModelError::ActiveOverlayMissingSource(overlay.channel));
+        }
+        if !(1..=3_600).contains(&overlay.duration_frames) {
+            return Err(ModelError::InvalidOverlayTransitionDuration {
+                channel: overlay.channel,
+                duration_frames: overlay.duration_frames,
+            });
+        }
+        if let Some(source) = overlay.source
+            && !inputs.contains(&source)
+        {
+            return Err(ModelError::UnknownInput(source));
+        }
+        if overlay.queued_sources.len() > 64 {
+            return Err(ModelError::InvalidOverlayQueueDepth {
+                channel: overlay.channel,
+                depth: overlay.queued_sources.len(),
+            });
+        }
+        for source in &overlay.queued_sources {
+            if !inputs.contains(source) {
+                return Err(ModelError::UnknownInput(*source));
+            }
+        }
+        let outputs = overlay
+            .included_outputs
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        if outputs.len() != overlay.included_outputs.len() {
+            return Err(ModelError::DuplicateOverlayOutput(overlay.channel));
+        }
+    }
     Ok(())
 }
 
@@ -1220,19 +1421,55 @@ fn validate_stingers(
     Ok(())
 }
 
+fn validate_input_audio_strips(
+    strips: &[InputAudioStripStatus],
+    inputs: &HashSet<InputId>,
+) -> Result<(), ModelError> {
+    if strips.len() != inputs.len() {
+        return Err(ModelError::InvalidInputAudioStrips);
+    }
+    let mut seen = HashSet::with_capacity(strips.len());
+    if strips.iter().any(|status| {
+        !(-96_000..=24_000).contains(&status.gain_millidb)
+            || !(-10_000..=10_000).contains(&status.balance_basis_points)
+            || status.delay_samples > 48_000
+            || !inputs.contains(&status.input)
+            || !seen.insert(status.input)
+    }) {
+        return Err(ModelError::InvalidInputAudioStrips);
+    }
+    Ok(())
+}
+
 fn validate_change(change: &DurableChange, inputs: &[InputId]) -> Result<(), ModelError> {
-    let (selection, manual_transition, stingers) = match change {
+    let (selection, manual_transition, stingers, overlays, input_audio_strips) = match change {
         DurableChange::DesiredSwitcher {
             selection,
             manual_transition,
+            overlays,
+            input_audio_strips,
             ..
-        } => (*selection, *manual_transition, None),
+        } => (
+            *selection,
+            *manual_transition,
+            None,
+            overlays,
+            input_audio_strips,
+        ),
         DurableChange::StingerSlotsChanged {
             selection,
             manual_transition,
             stingers,
+            overlays,
+            input_audio_strips,
             ..
-        } => (*selection, *manual_transition, Some(stingers.as_slice())),
+        } => (
+            *selection,
+            *manual_transition,
+            Some(stingers.as_slice()),
+            overlays,
+            input_audio_strips,
+        ),
     };
     for input in [selection.program, selection.preview] {
         if !inputs.contains(&input) {
@@ -1244,6 +1481,8 @@ fn validate_change(change: &DurableChange, inputs: &[InputId]) -> Result<(), Mod
     if let Some(stingers) = stingers {
         validate_stingers(stingers, &input_set)?;
     }
+    validate_overlays(overlays, &input_set)?;
+    validate_input_audio_strips(input_audio_strips, &input_set)?;
     Ok(())
 }
 
@@ -1262,21 +1501,29 @@ fn apply_change(state: &mut ProjectState, change: DurableChange) {
             selection,
             manual_transition,
             fade_to_black,
+            overlays,
+            input_audio_strips,
         } => {
             state.switcher.desired = selection;
             state.switcher.desired_manual_transition = manual_transition;
             state.switcher.desired_fade_to_black = fade_to_black;
+            state.desired_overlays = overlays;
+            state.input_audio_strips = input_audio_strips;
         }
         DurableChange::StingerSlotsChanged {
             selection,
             manual_transition,
             fade_to_black,
             stingers,
+            overlays,
+            input_audio_strips,
         } => {
             state.switcher.desired = selection;
             state.switcher.desired_manual_transition = manual_transition;
             state.switcher.desired_fade_to_black = fade_to_black;
             state.stingers = stingers;
+            state.desired_overlays = overlays;
+            state.input_audio_strips = input_audio_strips;
         }
     }
 }
@@ -1296,20 +1543,55 @@ fn protocol_stingers(stingers: Vec<fm_protocol::StingerStatus>) -> Vec<StingerSt
         .collect()
 }
 
-fn manual_status_from_protocol(
-    status: Option<ProtocolManualTransitionStatus>,
-) -> ManualTransitionStatus {
-    status.map_or(
-        ManualTransitionStatus::Inactive,
-        ManualTransitionStatus::from_protocol,
-    )
+fn protocol_input_audio_strips(
+    strips: Vec<fm_protocol::InputAudioStripStatus>,
+) -> Vec<InputAudioStripStatus> {
+    strips
+        .into_iter()
+        .map(|status| InputAudioStripStatus {
+            input: status.input.to_domain(),
+            gain_millidb: status.gain_millidb,
+            balance_basis_points: status.balance_basis_points,
+            muted: status.muted,
+            soloed: status.soloed,
+            follow_video: status.follow_video,
+            delay_samples: status.delay_samples,
+        })
+        .collect()
 }
 
-fn fade_to_black_from_protocol(state: Option<FadeToBlackState>) -> FadeToBlackState {
-    state.unwrap_or(FadeToBlackState {
-        target_active: false,
-        position: FadeToBlackPosition::LIVE,
-    })
+fn protocol_overlays(overlays: Vec<fm_protocol::OverlayStatus>) -> Vec<OverlayStatus> {
+    overlays
+        .into_iter()
+        .map(|status| OverlayStatus {
+            channel: status.channel.number(),
+            source: status.source.map(fm_protocol::WireInputId::to_domain),
+            active: status.active,
+            opacity: status.opacity,
+            transition: status.transition,
+            duration_frames: status.duration_frames,
+            position: status.position,
+            border: status.border,
+            queued_sources: status
+                .queued_sources
+                .into_iter()
+                .map(fm_protocol::WireInputId::to_domain)
+                .collect(),
+            included_outputs: status
+                .included_outputs
+                .into_iter()
+                .map(fm_protocol::WireOutputId::to_domain)
+                .collect(),
+        })
+        .collect()
+}
+
+fn manual_status_from_protocol(status: ProtocolManualTransitionStatus) -> ManualTransitionStatus {
+    ManualTransitionStatus::from_protocol(status)
+}
+
+fn fade_to_black_from_protocol(state: FadeToBlackState) -> FadeToBlackState {
+    state
 }
 
 fn validate_manual_transition(

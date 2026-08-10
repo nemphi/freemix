@@ -75,7 +75,7 @@ impl WindowCounter {
 #[derive(Clone, Debug)]
 pub struct Session {
     state: SessionState,
-    negotiated: ProtocolVersion,
+    protocol: ProtocolVersion,
     engine: EngineIdentity,
     current_revision: u64,
     principal: Principal,
@@ -90,7 +90,7 @@ pub struct Session {
 
 impl Session {
     pub(crate) fn new(
-        negotiated: ProtocolVersion,
+        protocol: ProtocolVersion,
         engine: EngineIdentity,
         current_revision: u64,
         principal: Principal,
@@ -100,7 +100,7 @@ impl Session {
     ) -> Self {
         Self {
             state: SessionState::Connected,
-            negotiated,
+            protocol,
             engine,
             current_revision,
             principal,
@@ -125,8 +125,8 @@ impl Session {
     }
 
     #[must_use]
-    pub const fn negotiated_version(&self) -> ProtocolVersion {
-        self.negotiated
+    pub const fn protocol_version(&self) -> ProtocolVersion {
+        self.protocol
     }
 
     #[must_use]
@@ -166,6 +166,7 @@ impl Session {
         self.ensure_connected()?;
 
         let class = match command.payload {
+            CommandPayload::SetInputAudioStrip { .. } => CommandClass::ControlAudio,
             CommandPayload::SelectPreview { .. } => CommandClass::SelectPreview,
             CommandPayload::Cut
             | CommandPayload::Fade { .. }
@@ -175,6 +176,14 @@ impl Session {
             | CommandPayload::Stinger { .. }
             | CommandPayload::ConfigureStinger { .. }
             | CommandPayload::RemoveStinger { .. }
+            | CommandPayload::TakeOverlay { .. }
+            | CommandPayload::UpdateOverlay { .. }
+            | CommandPayload::OverlayOff { .. }
+            | CommandPayload::SetOverlayOutputInclusion { .. }
+            | CommandPayload::ConfigureOverlayTransition { .. }
+            | CommandPayload::ConfigureOverlayAppearance { .. }
+            | CommandPayload::QueueOverlay { .. }
+            | CommandPayload::TakeNextOverlay { .. }
             | CommandPayload::Wipe { .. }
             | CommandPayload::FadeToBlack { .. }
             | CommandPayload::StartManualTransition { .. }
@@ -184,16 +193,10 @@ impl Session {
         };
         self.policy.authorize(&self.principal, class)?;
 
-        if command.protocol != self.negotiated {
+        if command.protocol != self.protocol {
             return Err(SessionError::ProtocolMismatch {
-                expected: self.negotiated,
+                expected: self.protocol,
                 received: command.protocol,
-            });
-        }
-        if !command.payload.is_supported_by(self.negotiated) {
-            return Err(SessionError::UnsupportedCommandVersion {
-                negotiated: self.negotiated,
-                required: command.payload.minimum_protocol_version(),
             });
         }
         if encoded_bytes > self.limits.max_command_bytes {
@@ -368,10 +371,6 @@ pub enum SessionError {
         expected: ProtocolVersion,
         received: ProtocolVersion,
     },
-    UnsupportedCommandVersion {
-        negotiated: ProtocolVersion,
-        required: ProtocolVersion,
-    },
     CommandTooLarge {
         size: usize,
         maximum: usize,
@@ -402,13 +401,6 @@ impl fmt::Display for SessionError {
                     "command protocol {received} does not match session protocol {expected}"
                 )
             }
-            Self::UnsupportedCommandVersion {
-                negotiated,
-                required,
-            } => write!(
-                formatter,
-                "command requires protocol {required}, but the session negotiated {negotiated}"
-            ),
             Self::CommandTooLarge { size, maximum } => {
                 write!(formatter, "command size {size} exceeds maximum {maximum}")
             }

@@ -13,12 +13,11 @@ use std::fmt;
 
 use fm_command::{CommandId, Revision};
 use fm_protocol::{
-    ClientType, CommandMessage, CommandPayload, CommandResult, DurableGap, EngineIdentity,
-    EventMessage, FADE_TO_BLACK_PROTOCOL_VERSION, HandshakeOutcome, HandshakeRequest,
-    HandshakeResponse, HeartbeatMessage, MANUAL_TRANSITION_PROTOCOL_VERSION, ProtocolVersion,
-    ResumeCursor, Role, RuntimeEventMessage, RuntimeLifecycleEvent,
-    STINGER_STATUS_PROTOCOL_VERSION, ServerHello, ServerIdentity, SnapshotMessage, StructuredError,
-    WireMessage, negotiate_version,
+    CURRENT_PROTOCOL_VERSION, ClientType, CommandMessage, CommandPayload, CommandResult,
+    DurableGap, EngineIdentity, EventMessage, HandshakeOutcome, HandshakeRequest,
+    HandshakeResponse, HeartbeatMessage, ProtocolVersion, ResumeCursor, Role, RuntimeEventMessage,
+    RuntimeLifecycleEvent, ServerHello, ServerIdentity, SnapshotMessage, StructuredError,
+    WireMessage,
 };
 use fm_types::ProjectId;
 use fm_ui_model::{
@@ -34,7 +33,6 @@ pub const MAX_COMPLETED_COMMAND_CAPACITY: usize = 65_536;
 /// Static client settings. An external scheduler supplies all clock behavior.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClientConfig {
-    pub supported_versions: Vec<ProtocolVersion>,
     pub build: String,
     pub client_type: ClientType,
     pub desired_role: Role,
@@ -52,7 +50,6 @@ impl ClientConfig {
     /// Creates settings with conservative queue and reconnect defaults.
     #[must_use]
     pub fn new(
-        supported_versions: Vec<ProtocolVersion>,
         build: impl Into<String>,
         client_type: ClientType,
         desired_role: Role,
@@ -60,7 +57,6 @@ impl ClientConfig {
         project_id: ProjectId,
     ) -> Self {
         Self {
-            supported_versions,
             build: build.into(),
             client_type,
             desired_role,
@@ -102,14 +98,8 @@ pub enum ConnectionState {
         expected_revision: u64,
         received_revision: u64,
     },
-    PendingIncompatible {
-        command_id: String,
-        negotiated: ProtocolVersion,
-        required: ProtocolVersion,
-        backoff: ReconnectBackoff,
-    },
-    Incompatible {
-        negotiated: ProtocolVersion,
+    ProtocolMismatch {
+        protocol: ProtocolVersion,
     },
 }
 
@@ -179,7 +169,7 @@ pub enum ClientError {
         operation: &'static str,
         state: ConnectionState,
     },
-    IncompatibleProtocol(ProtocolVersion),
+    ProtocolMismatch(ProtocolVersion),
     HandshakeRejected(StructuredError),
     InvalidHandshake(&'static str),
     InvalidSnapshot(&'static str),
@@ -208,10 +198,6 @@ pub enum ClientError {
     QueueFull {
         capacity: usize,
     },
-    UnsupportedCommandVersion {
-        negotiated: ProtocolVersion,
-        required: ProtocolVersion,
-    },
     EmptyIdempotencyKey,
     DuplicateIdempotencyKey(String),
     CommandIdExhausted,
@@ -236,8 +222,8 @@ impl fmt::Display for ClientError {
             Self::InvalidState { operation, state } => {
                 write!(formatter, "cannot {operation} while client is {state:?}")
             }
-            Self::IncompatibleProtocol(version) => {
-                write!(formatter, "server selected incompatible protocol {version}")
+            Self::ProtocolMismatch(version) => {
+                write!(formatter, "server selected non-current protocol {version}")
             }
             Self::HandshakeRejected(error) => {
                 write!(
@@ -282,13 +268,6 @@ impl fmt::Display for ClientError {
             Self::QueueFull { capacity } => {
                 write!(formatter, "outbound queue reached capacity {capacity}")
             }
-            Self::UnsupportedCommandVersion {
-                negotiated,
-                required,
-            } => write!(
-                formatter,
-                "command requires protocol {required}, but the session negotiated {negotiated}"
-            ),
             Self::EmptyIdempotencyKey => formatter.write_str("idempotency key must not be empty"),
             Self::DuplicateIdempotencyKey(key) => {
                 write!(formatter, "idempotency key {key:?} is already in use")
@@ -351,13 +330,8 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// Rejects settings that cannot provide bounded operation or negotiation.
+    /// Rejects settings that cannot provide bounded operation.
     pub fn new(config: ClientConfig) -> Result<Self, ClientError> {
-        if config.supported_versions.is_empty() {
-            return Err(ClientError::InvalidConfig(
-                "at least one supported protocol version is required",
-            ));
-        }
         if config.client_id.is_empty() {
             return Err(ClientError::InvalidConfig("client ID must not be empty"));
         }
@@ -457,8 +431,7 @@ impl Client {
         match self.state {
             ConnectionState::Disconnected
             | ConnectionState::Backoff(_)
-            | ConnectionState::ResyncRequired { .. }
-            | ConnectionState::PendingIncompatible { .. } => {
+            | ConnectionState::ResyncRequired { .. } => {
                 self.state = ConnectionState::Connecting;
                 Ok(())
             }
@@ -476,7 +449,7 @@ impl Client {
             return Err(self.invalid_state("report transport connected"));
         }
         let request = HandshakeRequest {
-            versions: self.config.supported_versions.clone(),
+            protocol: CURRENT_PROTOCOL_VERSION,
             build: self.config.build.clone(),
             client_type: self.config.client_type,
             desired_role: self.config.desired_role,
@@ -499,27 +472,6 @@ impl Client {
             .retain(|item| matches!(item, Outbound::Command(_)));
         let backoff = self.next_reconnect_backoff();
         self.state = ConnectionState::Backoff(backoff);
-        backoff
-    }
-
-    #[cfg(feature = "std-tcp")]
-    fn command_protocol_incompatible(
-        &mut self,
-        command_id: String,
-        negotiated: ProtocolVersion,
-        required: ProtocolVersion,
-    ) -> ReconnectBackoff {
-        self.session = None;
-        self.reset_runtime_sequences();
-        self.outbound
-            .retain(|item| matches!(item, Outbound::Command(_)));
-        let backoff = self.next_reconnect_backoff();
-        self.state = ConnectionState::PendingIncompatible {
-            command_id,
-            negotiated,
-            required,
-            backoff,
-        };
         backoff
     }
 
@@ -565,9 +517,7 @@ impl Client {
                 self.apply_gap(&gap)?;
                 Ok(Intake::ResyncRequested)
             }
-            WireMessage::ClientHello(_)
-            | WireMessage::ServerHello(_)
-            | WireMessage::Command(_)
+            WireMessage::Command(_)
             | WireMessage::HandshakeRequest(_)
             | WireMessage::DurableEventBatch(_)
             | WireMessage::Heartbeat(_)
@@ -580,19 +530,17 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// Rejects incompatible versions, project identities, resume cursors, and
+    /// Rejects non-current versions, project identities, resume cursors, and
     /// structured handshake failures.
     pub fn accept_handshake(&mut self, response: HandshakeResponse) -> Result<(), ClientError> {
         if self.state != ConnectionState::AwaitingHandshake {
             return Err(self.invalid_state("accept a handshake"));
         }
-        if negotiate_version(&self.config.supported_versions, &[response.negotiated])
-            != Ok(response.negotiated)
-        {
-            self.state = ConnectionState::Incompatible {
-                negotiated: response.negotiated,
+        if response.protocol != CURRENT_PROTOCOL_VERSION {
+            self.state = ConnectionState::ProtocolMismatch {
+                protocol: response.protocol,
             };
-            return Err(ClientError::IncompatibleProtocol(response.negotiated));
+            return Err(ClientError::ProtocolMismatch(response.protocol));
         }
         if response.server.project_id != self.config.project_id.to_string() {
             return Err(ClientError::InvalidHandshake(
@@ -629,7 +577,7 @@ impl Client {
             self.reset_runtime_sequences();
         }
         self.model.observe_server(&ServerHello {
-            negotiated: response.negotiated,
+            protocol: response.protocol,
             granted_role: response.granted_role,
             permissions: response.permissions.clone(),
             capabilities_digest: response.capabilities.digest.clone(),
@@ -638,24 +586,20 @@ impl Client {
             resume,
         })?;
         self.session = Some(Session {
-            protocol: response.negotiated,
+            protocol: response.protocol,
             granted_role: response.granted_role,
             permissions: response.permissions,
             server: response.server,
             capabilities_digest: response.capabilities.digest,
         });
         for record in self.commands.values_mut() {
-            if record.status.is_active()
-                && record.command.payload.is_supported_by(response.negotiated)
-            {
-                record.command.protocol = response.negotiated;
+            if record.status.is_active() {
+                record.command.protocol = response.protocol;
             }
         }
         for item in &mut self.outbound {
-            if let Outbound::Command(command) = item
-                && command.payload.is_supported_by(response.negotiated)
-            {
-                command.protocol = response.negotiated;
+            if let Outbound::Command(command) = item {
+                command.protocol = response.protocol;
             }
         }
         let mode = if resume {
@@ -705,27 +649,6 @@ impl Client {
                 "snapshot revision does not match the handshake",
             ));
         }
-        if supports_manual_state(session.protocol)
-            && (snapshot.desired_manual_transition.is_none()
-                || snapshot.realized_manual_transition.is_none())
-        {
-            return Err(ClientError::InvalidSnapshot(
-                "protocol 1.4 snapshot omitted manual-transition state",
-            ));
-        }
-        if supports_fade_to_black_state(session.protocol)
-            && (snapshot.desired_fade_to_black.is_none()
-                || snapshot.realized_fade_to_black.is_none())
-        {
-            return Err(ClientError::InvalidSnapshot(
-                "protocol 1.5 snapshot omitted fade-to-black state",
-            ));
-        }
-        if supports_stinger_status(session.protocol) && snapshot.stingers.is_none() {
-            return Err(ClientError::InvalidSnapshot(
-                "protocol 1.11 snapshot omitted Stinger status",
-            ));
-        }
         self.model.install_snapshot(ProjectSnapshot::from_protocol(
             self.config.project_id,
             snapshot,
@@ -752,51 +675,14 @@ impl Client {
             .model
             .reconnect_cursor()
             .ok_or(ClientError::InvalidSnapshot("event has no base snapshot"))?;
-        let protocol = self
-            .session
+        self.session
             .as_ref()
-            .ok_or(ClientError::InvalidSnapshot("event has no session"))?
-            .protocol;
+            .ok_or(ClientError::InvalidSnapshot("event has no session"))?;
         let expected_revision = current
             .revision
             .get()
             .checked_add(1)
             .ok_or(ClientError::InvalidSnapshot("event revision overflow"))?;
-        if !WireMessage::Event(event.clone()).is_compatible_with(protocol) {
-            return self.require_resync(expected_revision, event.cursor.revision);
-        }
-        if supports_manual_state(protocol)
-            && matches!(
-                &event.payload,
-                fm_protocol::EventPayload::DesiredSwitcher {
-                    manual_transition: None,
-                    ..
-                } | fm_protocol::EventPayload::StingerSlotsChanged {
-                    manual_transition: None,
-                    ..
-                }
-            )
-        {
-            return Err(ClientError::InvalidSnapshot(
-                "protocol 1.4 event omitted manual-transition state",
-            ));
-        }
-        if supports_fade_to_black_state(protocol)
-            && matches!(
-                &event.payload,
-                fm_protocol::EventPayload::DesiredSwitcher {
-                    fade_to_black: None,
-                    ..
-                } | fm_protocol::EventPayload::StingerSlotsChanged {
-                    fade_to_black: None,
-                    ..
-                }
-            )
-        {
-            return Err(ClientError::InvalidSnapshot(
-                "protocol 1.5 event omitted fade-to-black state",
-            ));
-        }
         if event.cursor.revision < expected_revision {
             return Err(ClientError::StaleEvent {
                 expected_revision,
@@ -882,35 +768,6 @@ impl Client {
                 received_sequence: event.sequence,
             });
         }
-        if supports_manual_state(session.protocol)
-            && matches!(
-                &event.event,
-                RuntimeLifecycleEvent::Realized {
-                    domain,
-                    manual_transition: None,
-                    ..
-                } if domain == "switcher"
-            )
-        {
-            return Err(ClientError::InvalidSnapshot(
-                "protocol 1.4 runtime event omitted manual-transition state",
-            ));
-        }
-        if supports_fade_to_black_state(session.protocol)
-            && matches!(
-                &event.event,
-                RuntimeLifecycleEvent::Realized {
-                    domain,
-                    fade_to_black: None,
-                    ..
-                } if domain == "switcher"
-            )
-        {
-            return Err(ClientError::InvalidSnapshot(
-                "protocol 1.5 runtime event omitted fade-to-black state",
-            ));
-        }
-
         if let RuntimeLifecycleEvent::Realized {
             domain,
             manual_transition,
@@ -924,8 +781,7 @@ impl Client {
                 revision: Revision::new(event.revision),
                 generation: event.generation,
                 sequence: event.sequence,
-                manual_transition: manual_transition
-                    .map(ModelManualTransitionStatus::from_protocol),
+                manual_transition: ModelManualTransitionStatus::from_protocol(*manual_transition),
                 fade_to_black: *fade_to_black,
             })?;
         }
@@ -960,12 +816,6 @@ impl Client {
             .as_ref()
             .ok_or_else(|| self.invalid_state("queue a command"))?
             .protocol;
-        if !payload.is_supported_by(protocol) {
-            return Err(ClientError::UnsupportedCommandVersion {
-                negotiated: protocol,
-                required: payload.minimum_protocol_version(),
-            });
-        }
         self.ensure_queue_space()?;
         let idempotency_key = idempotency_key.into();
         if idempotency_key.is_empty() {
@@ -992,7 +842,8 @@ impl Client {
             CommandPayload::SelectPreview { input } => {
                 Some(OptimisticChange::DesiredPreview(input.to_domain()))
             }
-            CommandPayload::Cut
+            CommandPayload::SetInputAudioStrip { .. }
+            | CommandPayload::Cut
             | CommandPayload::Fade { .. }
             | CommandPayload::AlphaFade { .. }
             | CommandPayload::Slide { .. }
@@ -1000,6 +851,14 @@ impl Client {
             | CommandPayload::Stinger { .. }
             | CommandPayload::ConfigureStinger { .. }
             | CommandPayload::RemoveStinger { .. }
+            | CommandPayload::TakeOverlay { .. }
+            | CommandPayload::UpdateOverlay { .. }
+            | CommandPayload::OverlayOff { .. }
+            | CommandPayload::SetOverlayOutputInclusion { .. }
+            | CommandPayload::ConfigureOverlayTransition { .. }
+            | CommandPayload::ConfigureOverlayAppearance { .. }
+            | CommandPayload::QueueOverlay { .. }
+            | CommandPayload::TakeNextOverlay { .. }
             | CommandPayload::Wipe { .. }
             | CommandPayload::FadeToBlack { .. }
             | CommandPayload::StartManualTransition { .. }
@@ -1058,7 +917,7 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// Requires a negotiated session, queue space, and sequence capacity.
+    /// Requires an established current-protocol session, queue space, and sequence capacity.
     pub fn queue_heartbeat(&mut self, sent_at_ms: u64) -> Result<HeartbeatMessage, ClientError> {
         if !matches!(
             self.state,
@@ -1095,17 +954,6 @@ impl Client {
         {
             return None;
         }
-        if self.unresolved_incompatible_command().is_some() {
-            return None;
-        }
-        if let Some(Outbound::Command(command)) = self.outbound.front()
-            && self
-                .session
-                .as_ref()
-                .is_some_and(|session| !command.payload.is_supported_by(session.protocol))
-        {
-            return None;
-        }
         let item = self.outbound.pop_front()?;
         if let Outbound::Command(command) = &item
             && let Some(record) = self.commands.get_mut(&command.id)
@@ -1137,10 +985,6 @@ impl Client {
             return Err(ClientError::CommandTerminalUncertain(id.to_owned()));
         }
         self.model.reconcile_command(&result)?;
-        let resolves_pending_incompatible = matches!(
-            &self.state,
-            ConnectionState::PendingIncompatible { command_id, .. } if command_id == id
-        );
         let completed_id = id.to_owned();
         if let Some(record) = self.commands.get_mut(id) {
             record.status = CommandStatus::Completed(result);
@@ -1150,27 +994,7 @@ impl Client {
         );
         self.completed_command_ids.push_back(completed_id);
         self.prune_completed_commands();
-        if resolves_pending_incompatible {
-            self.state = ConnectionState::Disconnected;
-        }
         Ok(Intake::ResultReconciled)
-    }
-
-    fn unresolved_incompatible_command(
-        &self,
-    ) -> Option<(String, ProtocolVersion, ProtocolVersion)> {
-        let negotiated = self.session.as_ref()?.protocol;
-        self.commands.values().find_map(|record| {
-            (record.status.is_active() && !record.command.payload.is_supported_by(negotiated)).then(
-                || {
-                    (
-                        record.command.id.clone(),
-                        negotiated,
-                        record.command.payload.minimum_protocol_version(),
-                    )
-                },
-            )
-        })
     }
 
     fn handle_unknown_result_collision<T>(
@@ -1260,10 +1084,7 @@ impl Client {
 
     fn finish_sync(&mut self) {
         self.state = ConnectionState::Ready;
-        // Synchronizing is not recovery while an uncertain command cannot be retried.
-        if self.unresolved_incompatible_command().is_none() {
-            self.reconnect_attempt = 0;
-        }
+        self.reconnect_attempt = 0;
         self.force_snapshot = false;
     }
 
@@ -1304,21 +1125,6 @@ impl Client {
             state: self.state.clone(),
         }
     }
-}
-
-const fn supports_manual_state(version: ProtocolVersion) -> bool {
-    version.major == MANUAL_TRANSITION_PROTOCOL_VERSION.major
-        && version.minor >= MANUAL_TRANSITION_PROTOCOL_VERSION.minor
-}
-
-const fn supports_fade_to_black_state(version: ProtocolVersion) -> bool {
-    version.major == FADE_TO_BLACK_PROTOCOL_VERSION.major
-        && version.minor >= FADE_TO_BLACK_PROTOCOL_VERSION.minor
-}
-
-const fn supports_stinger_status(version: ProtocolVersion) -> bool {
-    version.major == STINGER_STATUS_PROTOCOL_VERSION.major
-        && version.minor >= STINGER_STATUS_PROTOCOL_VERSION.minor
 }
 
 fn engine_identity(server: &ServerIdentity) -> EngineIdentity {

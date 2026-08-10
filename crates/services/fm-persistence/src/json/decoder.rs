@@ -1,14 +1,11 @@
-use std::{
-    collections::BTreeMap,
-    num::{NonZeroU64, NonZeroU128},
-};
+use std::{collections::BTreeMap, num::NonZeroU128};
 
 use fm_model::{
-    AudioBus, BusSend, CropRect, Input, InputAudioStrip, InputAudioStripState, InputGainMilliDb,
-    InputKind, Layer, LayerGeometry, MainMix, Output, Project, ProjectSettings, RectMask,
-    RestartPolicy, Rgba8, Rotation, Scene, SimulatedAudio, SimulatedInput, SimulatedVideo,
-    SolidColor, SourceRef, StartupPolicy, StingerAudioPolicy, StingerConfig,
-    StingerMissingMediaFallback, StingerSlotNumber,
+    AudioBus, BusSend, CropRect, Input, InputAudioStrip, InputAudioStripState,
+    InputBalanceBasisPoints, InputDelaySamples, InputGainMilliDb, InputKind, Layer, LayerGeometry,
+    MainMix, Output, Project, ProjectSettings, RectMask, RestartPolicy, Rgba8, Rotation, Scene,
+    SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef, StartupPolicy,
+    StingerAudioPolicy, StingerConfig, StingerMissingMediaFallback, StingerSlotNumber,
 };
 use fm_types::{
     AudioFormat, BusId, Channel, ChannelLayout, ChromaLocation, ColorMetadata, ColorPrimaries,
@@ -18,23 +15,15 @@ use fm_types::{
 
 use crate::{
     CURRENT_SCHEMA_VERSION, FadeToBlackState, IdempotencyReceipt, ManualTransitionKind,
-    ManualTransitionState, ProjectPosition, ProjectRouting, ProjectValidationError,
-    RuntimeFadeToBlack, RuntimeManualTransitions, RuntimeRouting, StoredProject,
+    ManualTransitionState, ProjectPosition, ProjectValidationError, RuntimeFadeToBlack,
+    RuntimeManualTransitions, RuntimeOverlayBorder, RuntimeOverlayChannel, RuntimeOverlayPosition,
+    RuntimeOverlayTransition, RuntimeOverlays, RuntimeRouting, StoredProject,
 };
 
 use super::{
     DecodeError,
     reader::{Reader, Value},
 };
-
-const V2_SCHEMA_VERSION: u32 = 2;
-const V3_SCHEMA_VERSION: u32 = 3;
-const V4_SCHEMA_VERSION: u32 = 4;
-const V5_SCHEMA_VERSION: u32 = 5;
-const V6_SCHEMA_VERSION: u32 = 6;
-const V7_SCHEMA_VERSION: u32 = 7;
-const V8_SCHEMA_VERSION: u32 = 8;
-const V9_SCHEMA_VERSION: u32 = 9;
 
 pub(crate) fn decode(source: &str) -> Result<StoredProject, DecodeError> {
     let mut root = Object::new(Reader::new(source).document()?, "manifest")?;
@@ -47,182 +36,16 @@ pub(crate) fn decode(source: &str) -> Result<StoredProject, DecodeError> {
             },
         ));
     }
-    let project = ProjectDto::parse(root.take("project")?, ProjectSchema::V10)?.into_domain();
-    let (routing, manual_transitions, fade_to_black, position, receipts) =
-        parse_runtime(root.take("runtime")?, true, true)?;
+    let project = ProjectDto::parse(root.take("project")?)?.into_domain();
+    let (routing, manual_transitions, fade_to_black, overlays, position, receipts) =
+        parse_runtime(root.take("runtime")?)?;
     root.finish()?;
-    StoredProject::from_project_with_runtime_state(
+    StoredProject::from_project_with_complete_runtime_state(
         project,
         routing,
         manual_transitions,
         fade_to_black,
-        position,
-        receipts,
-    )
-    .map_err(DecodeError::Validation)
-}
-
-pub(crate) fn decode_v2(source: &str) -> Result<StoredProject, DecodeError> {
-    LegacyDto::parse(source)?.into_current()
-}
-
-pub(crate) fn decode_v3(source: &str) -> Result<StoredProject, DecodeError> {
-    let mut root = Object::new(Reader::new(source).document()?, "manifest")?;
-    let schema = root.u32("schema_version")?;
-    if schema != V3_SCHEMA_VERSION {
-        return Err(DecodeError::Validation(
-            ProjectValidationError::UnsupportedSchema {
-                found: schema,
-                supported: V3_SCHEMA_VERSION,
-            },
-        ));
-    }
-    let project = ProjectDto::parse(root.take("project")?, ProjectSchema::V3)?.into_domain();
-    let (routing, _, _, position, receipts) = parse_runtime(root.take("runtime")?, false, false)?;
-    root.finish()?;
-    StoredProject::from_project(project, routing, position, receipts)
-        .map_err(DecodeError::Validation)
-}
-
-pub(crate) fn decode_v4(source: &str) -> Result<StoredProject, DecodeError> {
-    let mut root = Object::new(Reader::new(source).document()?, "manifest")?;
-    let schema = root.u32("schema_version")?;
-    if schema != V4_SCHEMA_VERSION {
-        return Err(DecodeError::Validation(
-            ProjectValidationError::UnsupportedSchema {
-                found: schema,
-                supported: V4_SCHEMA_VERSION,
-            },
-        ));
-    }
-    let project = ProjectDto::parse(root.take("project")?, ProjectSchema::V4ToV5)?.into_domain();
-    let (routing, _, _, position, receipts) = parse_runtime(root.take("runtime")?, false, false)?;
-    root.finish()?;
-    StoredProject::from_project(project, routing, position, receipts)
-        .map_err(DecodeError::Validation)
-}
-
-pub(crate) fn decode_v5(source: &str) -> Result<StoredProject, DecodeError> {
-    let mut root = Object::new(Reader::new(source).document()?, "manifest")?;
-    let schema = root.u32("schema_version")?;
-    if schema != V5_SCHEMA_VERSION {
-        return Err(DecodeError::Validation(
-            ProjectValidationError::UnsupportedSchema {
-                found: schema,
-                supported: V5_SCHEMA_VERSION,
-            },
-        ));
-    }
-    let project = ProjectDto::parse(root.take("project")?, ProjectSchema::V4ToV5)?.into_domain();
-    let (routing, manual_transitions, _, position, receipts) =
-        parse_runtime(root.take("runtime")?, true, false)?;
-    root.finish()?;
-    StoredProject::from_project_with_manual_transitions(
-        project,
-        routing,
-        manual_transitions,
-        position,
-        receipts,
-    )
-    .map_err(DecodeError::Validation)
-}
-
-pub(crate) fn decode_v6(source: &str) -> Result<StoredProject, DecodeError> {
-    let mut root = Object::new(Reader::new(source).document()?, "manifest")?;
-    let schema = root.u32("schema_version")?;
-    if schema != V6_SCHEMA_VERSION {
-        return Err(DecodeError::Validation(
-            ProjectValidationError::UnsupportedSchema {
-                found: schema,
-                supported: V6_SCHEMA_VERSION,
-            },
-        ));
-    }
-    let project = ProjectDto::parse(root.take("project")?, ProjectSchema::V6)?.into_domain();
-    let (routing, manual_transitions, _, position, receipts) =
-        parse_runtime(root.take("runtime")?, true, false)?;
-    root.finish()?;
-    StoredProject::from_project_with_manual_transitions(
-        project,
-        routing,
-        manual_transitions,
-        position,
-        receipts,
-    )
-    .map_err(DecodeError::Validation)
-}
-
-pub(crate) fn decode_v7(source: &str) -> Result<StoredProject, DecodeError> {
-    let mut root = Object::new(Reader::new(source).document()?, "manifest")?;
-    let schema = root.u32("schema_version")?;
-    if schema != V7_SCHEMA_VERSION {
-        return Err(DecodeError::Validation(
-            ProjectValidationError::UnsupportedSchema {
-                found: schema,
-                supported: V7_SCHEMA_VERSION,
-            },
-        ));
-    }
-    let project = ProjectDto::parse(root.take("project")?, ProjectSchema::V7ToV9)?.into_domain();
-    let (routing, manual_transitions, _, position, receipts) =
-        parse_runtime(root.take("runtime")?, true, false)?;
-    root.finish()?;
-    StoredProject::from_project_with_manual_transitions(
-        project,
-        routing,
-        manual_transitions,
-        position,
-        receipts,
-    )
-    .map_err(DecodeError::Validation)
-}
-
-pub(crate) fn decode_v8(source: &str) -> Result<StoredProject, DecodeError> {
-    let mut root = Object::new(Reader::new(source).document()?, "manifest")?;
-    let schema = root.u32("schema_version")?;
-    if schema != V8_SCHEMA_VERSION {
-        return Err(DecodeError::Validation(
-            ProjectValidationError::UnsupportedSchema {
-                found: schema,
-                supported: V8_SCHEMA_VERSION,
-            },
-        ));
-    }
-    let project = ProjectDto::parse(root.take("project")?, ProjectSchema::V7ToV9)?.into_domain();
-    let (routing, manual_transitions, fade_to_black, position, receipts) =
-        parse_runtime(root.take("runtime")?, true, true)?;
-    root.finish()?;
-    StoredProject::from_project_with_runtime_state(
-        project,
-        routing,
-        manual_transitions,
-        fade_to_black,
-        position,
-        receipts,
-    )
-    .map_err(DecodeError::Validation)
-}
-
-pub(crate) fn decode_v9(source: &str) -> Result<StoredProject, DecodeError> {
-    let mut root = Object::new(Reader::new(source).document()?, "manifest")?;
-    let schema = root.u32("schema_version")?;
-    if schema != V9_SCHEMA_VERSION {
-        return Err(DecodeError::Validation(
-            ProjectValidationError::UnsupportedSchema {
-                found: schema,
-                supported: V9_SCHEMA_VERSION,
-            },
-        ));
-    }
-    let project = ProjectDto::parse(root.take("project")?, ProjectSchema::V7ToV9)?.into_domain();
-    let (routing, manual_transitions, fade_to_black, position, receipts) =
-        parse_runtime(root.take("runtime")?, true, true)?;
-    root.finish()?;
-    StoredProject::from_project_with_runtime_state(
-        project,
-        routing,
-        manual_transitions,
-        fade_to_black,
+        overlays,
         position,
         receipts,
     )
@@ -234,7 +57,7 @@ struct ProjectDto {
     name: String,
     settings: ProjectSettings,
     inputs: Vec<Input>,
-    input_audio_strips: Option<Vec<InputAudioStrip>>,
+    input_audio_strips: Vec<InputAudioStrip>,
     scenes: Vec<Scene>,
     audio_buses: Vec<AudioBus>,
     outputs: Vec<Output>,
@@ -243,98 +66,52 @@ struct ProjectDto {
     restart_policy: RestartPolicy,
 }
 
-#[derive(Clone, Copy)]
-enum ProjectSchema {
-    V3,
-    V4ToV5,
-    V6,
-    V7ToV9,
-    V10,
-}
-
-impl ProjectSchema {
-    const fn legacy_v3_inputs(self) -> bool {
-        matches!(self, Self::V3)
-    }
-
-    const fn has_masks(self) -> bool {
-        matches!(self, Self::V6 | Self::V7ToV9 | Self::V10)
-    }
-
-    const fn has_audio_strips(self) -> bool {
-        matches!(self, Self::V7ToV9 | Self::V10)
-    }
-
-    const fn has_stingers(self) -> bool {
-        matches!(self, Self::V10)
-    }
-}
-
 impl ProjectDto {
-    fn parse(value: Value, schema: ProjectSchema) -> Result<Self, DecodeError> {
+    fn parse(value: Value) -> Result<Self, DecodeError> {
         let mut object = Object::new(value, "project")?;
         let id = ProjectId::new(object.nonzero_u128("id")?);
         let name = object.string("name")?;
         let settings = parse_settings(object.take("settings")?)?;
-        let inputs = parse_array(object.take("inputs")?, "inputs", |value| {
-            parse_input(value, schema.legacy_v3_inputs())
-        })?;
-        let dimensions = settings.video.dimensions;
+        let inputs = parse_array(object.take("inputs")?, "inputs", parse_input)?;
         let dto = Self {
             id,
             name,
             settings,
             inputs,
-            input_audio_strips: if schema.has_audio_strips() {
-                Some(parse_array(
-                    object.take("input_audio_strips")?,
-                    "input_audio_strips",
-                    parse_input_audio_strip,
-                )?)
-            } else {
-                None
-            },
-            scenes: parse_array(object.take("scenes")?, "scenes", |value| {
-                parse_scene(
-                    value,
-                    schema.legacy_v3_inputs(),
-                    schema.has_masks(),
-                    dimensions.width(),
-                    dimensions.height(),
-                )
-            })?,
+            input_audio_strips: parse_array(
+                object.take("input_audio_strips")?,
+                "input_audio_strips",
+                parse_input_audio_strip,
+            )?,
+            scenes: parse_array(object.take("scenes")?, "scenes", parse_scene)?,
             audio_buses: parse_array(object.take("audio_buses")?, "audio_buses", parse_bus)?,
             outputs: parse_array(object.take("outputs")?, "outputs", parse_output)?,
             main_mix: parse_optional(object.take("main_mix")?, parse_main_mix)?,
-            stingers: if schema.has_stingers() {
-                parse_array(object.take("stingers")?, "stingers", parse_stinger)?
-            } else {
-                Vec::new()
-            },
+            stingers: parse_array(object.take("stingers")?, "stingers", parse_stinger)?,
             restart_policy: parse_restart_policy(object.take("restart_policy")?)?,
         };
         object.finish()?;
-        if let Some(strips) = &dto.input_audio_strips {
-            for input in &dto.inputs {
-                if strips
-                    .iter()
-                    .filter(|strip| strip.input == input.id)
-                    .count()
-                    != 1
-                {
-                    return Err(syntax(
-                        "input_audio_strips must contain exactly one strip for every input",
-                    ));
-                }
-            }
-            if strips
+        for input in &dto.inputs {
+            if dto
+                .input_audio_strips
                 .iter()
-                .any(|strip| !dto.inputs.iter().any(|input| input.id == strip.input))
+                .filter(|strip| strip.input == input.id)
+                .count()
+                != 1
             {
                 return Err(syntax(
-                    "input_audio_strips must not reference an unknown input",
+                    "input_audio_strips must contain exactly one strip for every input",
                 ));
             }
+        }
+        if dto
+            .input_audio_strips
+            .iter()
+            .any(|strip| !dto.inputs.iter().any(|input| input.id == strip.input))
+        {
+            return Err(syntax(
+                "input_audio_strips must not reference an unknown input",
+            ));
         }
         Ok(dto)
     }
@@ -345,13 +122,11 @@ impl ProjectDto {
         for input in self.inputs {
             project.add_input(input);
         }
-        if let Some(strips) = self.input_audio_strips {
-            for strip in strips {
-                assert!(
-                    project.set_input_audio_strip(strip.input, strip.state),
-                    "validated input audio strip must reference an input"
-                );
-            }
+        for strip in self.input_audio_strips {
+            assert!(
+                project.set_input_audio_strip(strip.input, strip.state),
+                "validated input audio strip must reference an input"
+            );
         }
         for scene in self.scenes {
             project.add_scene(scene);
@@ -414,7 +189,25 @@ fn parse_input_audio_strip(value: Value) -> Result<InputAudioStrip, DecodeError>
         input,
         state: InputAudioStripState {
             gain,
+            balance: InputBalanceBasisPoints::new(object.i32("balance_basis_points")?).ok_or_else(
+                || {
+                    syntax(format!(
+                        "input balance_basis_points must be between {} and {}",
+                        InputBalanceBasisPoints::MIN,
+                        InputBalanceBasisPoints::MAX
+                    ))
+                },
+            )?,
+            delay_samples: InputDelaySamples::new(object.u32("delay_samples")?).ok_or_else(
+                || {
+                    syntax(format!(
+                        "input delay_samples must not exceed {}",
+                        InputDelaySamples::MAX
+                    ))
+                },
+            )?,
             muted: object.boolean("muted")?,
+            soloed: object.boolean("soloed")?,
             follow_video: object.boolean("follow_video")?,
         },
     };
@@ -552,12 +345,12 @@ fn parse_audio(value: Value) -> Result<AudioFormat, DecodeError> {
     })
 }
 
-fn parse_input(value: Value, schema_v3: bool) -> Result<Input, DecodeError> {
+fn parse_input(value: Value) -> Result<Input, DecodeError> {
     let mut object = Object::new(value, "input")?;
     let input = Input {
         id: InputId::new(object.nonzero_u128("id")?),
         name: object.string("name")?,
-        kind: parse_input_kind(object.take("kind")?, schema_v3)?,
+        kind: parse_input_kind(object.take("kind")?)?,
         required_capabilities: parse_strings(
             object.take("required_capabilities")?,
             "required_capabilities",
@@ -567,7 +360,7 @@ fn parse_input(value: Value, schema_v3: bool) -> Result<Input, DecodeError> {
     Ok(input)
 }
 
-fn parse_input_kind(value: Value, schema_v3: bool) -> Result<InputKind, DecodeError> {
+fn parse_input_kind(value: Value) -> Result<InputKind, DecodeError> {
     let mut object = Object::new(value, "input kind")?;
     let kind = match object.string("type")?.as_str() {
         "color" => InputKind::Color,
@@ -580,7 +373,7 @@ fn parse_input_kind(value: Value, schema_v3: bool) -> Result<InputKind, DecodeEr
         "network" => InputKind::Network {
             endpoint: object.string("endpoint")?,
         },
-        "scene" if !schema_v3 => InputKind::Scene {
+        "scene" => InputKind::Scene {
             scene_id: SceneId::new(object.nonzero_u128("scene_id")?),
             audio_source: object.optional_input_id("audio_source")?,
         },
@@ -623,65 +416,31 @@ fn parse_simulated_audio(value: Value) -> Result<SimulatedAudio, DecodeError> {
     Ok(audio)
 }
 
-fn parse_scene(
-    value: Value,
-    schema_v3: bool,
-    schema_v6: bool,
-    canvas_width: u32,
-    canvas_height: u32,
-) -> Result<Scene, DecodeError> {
+fn parse_scene(value: Value) -> Result<Scene, DecodeError> {
     let mut object = Object::new(value, "scene")?;
     let id = SceneId::new(object.nonzero_u128("id")?);
     let name = object.string("name")?;
-    let background = if schema_v3 {
-        Rgba8::OPAQUE_BLACK
-    } else {
-        parse_rgba(object.take("background")?)?
-    };
+    let background = parse_rgba(object.take("background")?)?;
     let scene = Scene {
         id,
         name,
         background,
-        layers: parse_array(object.take("layers")?, "layers", |value| {
-            parse_layer(value, schema_v3, schema_v6, canvas_width, canvas_height)
-        })?,
+        layers: parse_array(object.take("layers")?, "layers", parse_layer)?,
     };
     object.finish()?;
     Ok(scene)
 }
 
-fn parse_layer(
-    value: Value,
-    schema_v3: bool,
-    schema_v6: bool,
-    canvas_width: u32,
-    canvas_height: u32,
-) -> Result<Layer, DecodeError> {
+fn parse_layer(value: Value) -> Result<Layer, DecodeError> {
     let mut object = Object::new(value, "layer")?;
     let name = object.string("name")?;
     let source = parse_source(object.take("source")?)?;
     let enabled = object.boolean("enabled")?;
-    let (geometry, crop, mask, opacity, z_order) = if schema_v3 {
-        (
-            LayerGeometry::new(0, 0, canvas_width, canvas_height, Rotation::Deg0),
-            None,
-            None,
-            u8::MAX,
-            0,
-        )
-    } else {
-        (
-            parse_geometry(object.take("geometry")?)?,
-            parse_optional(object.take("crop")?, parse_crop)?,
-            if schema_v6 {
-                parse_optional(object.take("mask")?, parse_mask)?
-            } else {
-                None
-            },
-            object.u8("opacity")?,
-            object.i32("z_order")?,
-        )
-    };
+    let geometry = parse_geometry(object.take("geometry")?)?;
+    let crop = parse_optional(object.take("crop")?, parse_crop)?;
+    let mask = parse_optional(object.take("mask")?, parse_mask)?;
+    let opacity = object.u8("opacity")?;
+    let z_order = object.i32("z_order")?;
     let layer = Layer {
         name,
         source,
@@ -824,32 +583,21 @@ fn parse_restart_policy(value: Value) -> Result<RestartPolicy, DecodeError> {
     Ok(policy)
 }
 
-fn parse_runtime(
-    value: Value,
-    has_manual_transitions: bool,
-    has_fade_to_black: bool,
-) -> Result<
-    (
-        RuntimeRouting,
-        RuntimeManualTransitions,
-        RuntimeFadeToBlack,
-        ProjectPosition,
-        Vec<IdempotencyReceipt>,
-    ),
-    DecodeError,
-> {
+type ParsedRuntime = (
+    RuntimeRouting,
+    RuntimeManualTransitions,
+    RuntimeFadeToBlack,
+    RuntimeOverlays,
+    ProjectPosition,
+    Vec<IdempotencyReceipt>,
+);
+
+fn parse_runtime(value: Value) -> Result<ParsedRuntime, DecodeError> {
     let mut object = Object::new(value, "runtime")?;
     let routing = parse_routing(object.take("routing")?)?;
-    let manual_transitions = if has_manual_transitions {
-        parse_manual_transitions(object.take("manual_transitions")?)?
-    } else {
-        RuntimeManualTransitions::default()
-    };
-    let fade_to_black = if has_fade_to_black {
-        parse_fade_to_black(object.take("fade_to_black")?)?
-    } else {
-        RuntimeFadeToBlack::default()
-    };
+    let manual_transitions = parse_manual_transitions(object.take("manual_transitions")?)?;
+    let fade_to_black = parse_fade_to_black(object.take("fade_to_black")?)?;
+    let overlays = parse_overlays(object.take("overlays")?)?;
     let position = parse_position(object.take("position")?)?;
     let receipts = parse_array(
         object.take("idempotency_receipts")?,
@@ -861,9 +609,73 @@ fn parse_runtime(
         routing,
         manual_transitions,
         fade_to_black,
+        overlays,
         position,
         receipts,
     ))
+}
+
+fn parse_overlays(value: Value) -> Result<RuntimeOverlays, DecodeError> {
+    let mut object = Object::new(value, "overlays")?;
+    let desired = parse_overlay_channels(object.take("desired")?)?;
+    let realized = parse_overlay_channels(object.take("realized")?)?;
+    object.finish()?;
+    Ok(RuntimeOverlays { desired, realized })
+}
+
+fn parse_overlay_channels(value: Value) -> Result<[RuntimeOverlayChannel; 8], DecodeError> {
+    let channels = parse_array(value, "overlay channels", |value| {
+        let mut object = Object::new(value, "overlay channel")?;
+        let source = object.optional_input_id("source")?;
+        let active = object.boolean("active")?;
+        let transition = match object.string("transition")?.as_str() {
+            "cut" => RuntimeOverlayTransition::Cut,
+            "fade" => RuntimeOverlayTransition::Fade,
+            value => return Err(syntax(format!("unknown overlay transition `{value}`"))),
+        };
+        let duration_frames = object.u32("duration_frames")?;
+        let position = match object.string("position")?.as_str() {
+            "full_frame" => RuntimeOverlayPosition::FullFrame,
+            "top_left" => RuntimeOverlayPosition::TopLeft,
+            "top_right" => RuntimeOverlayPosition::TopRight,
+            "bottom_left" => RuntimeOverlayPosition::BottomLeft,
+            "bottom_right" => RuntimeOverlayPosition::BottomRight,
+            value => return Err(syntax(format!("unknown overlay position `{value}`"))),
+        };
+        let border = match object.string("border")?.as_str() {
+            "none" => RuntimeOverlayBorder::None,
+            "thin_white" => RuntimeOverlayBorder::ThinWhite,
+            "thick_white" => RuntimeOverlayBorder::ThickWhite,
+            value => return Err(syntax(format!("unknown overlay border `{value}`"))),
+        };
+        let queued_sources = parse_array(
+            object.take("queued_sources")?,
+            "overlay queued sources",
+            |value| Ok(InputId::new(nonzero_u128(&value, "input ID")?)),
+        )?;
+        let included_outputs = parse_array(
+            object.take("included_outputs")?,
+            "overlay included outputs",
+            |value| Ok(OutputId::new(nonzero_u128(&value, "output ID")?)),
+        )?;
+        object.finish()?;
+        Ok(RuntimeOverlayChannel {
+            source,
+            active,
+            transition,
+            duration_frames,
+            position,
+            border,
+            queued_sources,
+            included_outputs,
+        })
+    })?;
+    channels.try_into().map_err(|channels: Vec<_>| {
+        syntax(format!(
+            "expected 8 overlay channels, found {}",
+            channels.len()
+        ))
+    })
 }
 
 fn parse_fade_to_black(value: Value) -> Result<RuntimeFadeToBlack, DecodeError> {
@@ -970,81 +782,6 @@ fn parse_receipt(value: Value) -> Result<IdempotencyReceipt, DecodeError> {
     Ok(receipt)
 }
 
-struct LegacyDto {
-    project_id: NonZeroU64,
-    show_name: String,
-    input_ids: Vec<NonZeroU64>,
-    routing: ProjectRouting,
-    position: ProjectPosition,
-    receipts: Vec<IdempotencyReceipt>,
-}
-
-impl LegacyDto {
-    fn parse(source: &str) -> Result<Self, DecodeError> {
-        let mut object = Object::new(Reader::new(source).document()?, "legacy manifest")?;
-        let schema = object.u32("schema_version")?;
-        if schema != V2_SCHEMA_VERSION {
-            return Err(DecodeError::Validation(
-                ProjectValidationError::UnsupportedSchema {
-                    found: schema,
-                    supported: V2_SCHEMA_VERSION,
-                },
-            ));
-        }
-        let project_id = object.nonzero_u64("project_id")?;
-        let show_name = object.string("show_name")?;
-        let input_ids = parse_array(object.take("input_ids")?, "input_ids", |value| {
-            nonzero_u64(&value, "input ID")
-        })?;
-        let routing = ProjectRouting {
-            desired_program_id: object.optional_nonzero_u64("desired_program_id")?,
-            realized_program_id: object.optional_nonzero_u64("realized_program_id")?,
-            desired_preview_id: object.optional_nonzero_u64("desired_preview_id")?,
-            realized_preview_id: object.optional_nonzero_u64("realized_preview_id")?,
-        };
-        let revision = object.u64("revision")?;
-        let state_epoch = object.u64("state_epoch")?;
-        let event_sequence = object.u64("event_sequence")?;
-        let frames_rendered = object.u64("frames_rendered")?;
-        let runtime_generation = object.u64("runtime_generation")?;
-        let clock_time_nanos = object.u64("clock_time_nanos")?;
-        let receipts = parse_array(
-            object.take("idempotency_receipts")?,
-            "idempotency_receipts",
-            parse_receipt,
-        )?;
-        object.finish()?;
-        Ok(Self {
-            project_id,
-            show_name,
-            input_ids,
-            routing,
-            position: ProjectPosition {
-                revision,
-                state_epoch,
-                event_sequence,
-                frames_rendered,
-                runtime_generation,
-                clock_time_nanos,
-            },
-            receipts,
-        })
-    }
-
-    fn into_current(self) -> Result<StoredProject, DecodeError> {
-        StoredProject::new(
-            CURRENT_SCHEMA_VERSION,
-            self.project_id,
-            self.show_name,
-            self.input_ids,
-            self.routing,
-            self.position,
-            self.receipts,
-        )
-        .map_err(DecodeError::Validation)
-    }
-}
-
 struct Object {
     context: &'static str,
     values: BTreeMap<String, Value>,
@@ -1126,10 +863,6 @@ impl Object {
             .ok_or_else(|| syntax(format!("field `{field}` must be nonzero")))
     }
 
-    fn nonzero_u64(&mut self, field: &str) -> Result<NonZeroU64, DecodeError> {
-        nonzero_u64(&self.take(field)?, field)
-    }
-
     fn optional_input_id(&mut self, field: &str) -> Result<Option<InputId>, DecodeError> {
         match self.take(field)? {
             Value::Null => Ok(None),
@@ -1140,13 +873,6 @@ impl Object {
             _ => Err(syntax(format!(
                 "field `{field}` must be an unsigned integer or null"
             ))),
-        }
-    }
-
-    fn optional_nonzero_u64(&mut self, field: &str) -> Result<Option<NonZeroU64>, DecodeError> {
-        match self.take(field)? {
-            Value::Null => Ok(None),
-            value => nonzero_u64(&value, field).map(Some),
         }
     }
 
@@ -1193,12 +919,11 @@ fn parse_optional<T>(
     }
 }
 
-fn nonzero_u64(value: &Value, context: &str) -> Result<NonZeroU64, DecodeError> {
+fn nonzero_u128(value: &Value, context: &str) -> Result<NonZeroU128, DecodeError> {
     let Value::Number(value) = value else {
         return Err(syntax(format!("{context} must be an unsigned integer")));
     };
-    let value = u64::try_from(*value).map_err(|_| syntax(format!("{context} exceeds u64")))?;
-    NonZeroU64::new(value).ok_or_else(|| syntax(format!("{context} must be nonzero")))
+    NonZeroU128::new(*value).ok_or_else(|| syntax(format!("{context} must be nonzero")))
 }
 
 fn unknown_enum(field: &str, value: &str) -> DecodeError {

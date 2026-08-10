@@ -20,6 +20,7 @@ pub struct PlanLayer {
     key: Option<Key>,
     effects: Vec<Effect>,
     overlay_inclusion: Option<OutputInclusion>,
+    inset_border_width: u32,
     scene_index: usize,
 }
 
@@ -72,6 +73,11 @@ impl PlanLayer {
     #[must_use]
     pub const fn overlay_inclusion(&self) -> Option<OutputInclusion> {
         self.overlay_inclusion
+    }
+
+    #[must_use]
+    pub const fn inset_border_width(&self) -> u32 {
+        self.inset_border_width
     }
 
     #[must_use]
@@ -349,6 +355,7 @@ pub fn compile_scene(
                 key: layer.key(),
                 effects: layer.effects().to_vec(),
                 overlay_inclusion: layer.overlay_inclusion(),
+                inset_border_width: layer.inset_border_width(),
                 scene_index,
             }
         })

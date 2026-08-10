@@ -8,7 +8,9 @@ pub use engine::{
     Engine, EngineAcceptance, EngineCommand, EngineCommandOutcome, EngineEvent,
     EngineFadeToBlackState, EngineManualTransitionKind, EngineManualTransitionPosition,
     EngineManualTransitionState, EnginePrepareOutcome, EngineRestoreState, EngineSnapshot,
-    FrameResult, PreparedEngineExecution,
+    FrameResult, MAX_INPUT_AUDIO_BALANCE_BASIS_POINTS, MAX_INPUT_AUDIO_DELAY_SAMPLES,
+    MAX_INPUT_AUDIO_GAIN_MILLIDB, MIN_INPUT_AUDIO_BALANCE_BASIS_POINTS,
+    MIN_INPUT_AUDIO_GAIN_MILLIDB, PreparedEngineExecution,
 };
 pub use error::{EngineError, ShowError, SnapshotError};
-pub use state::ShowState;
+pub use state::{EngineInputAudioStripState, ShowState};

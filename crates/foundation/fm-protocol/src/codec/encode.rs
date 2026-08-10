@@ -1,15 +1,18 @@
+use std::collections::BTreeSet;
+
 use crate::{
-    CapabilityReportMessage, CapabilityReportSummary, ClientHello, CommandMessage, CommandPayload,
+    CapabilityReportMessage, CapabilityReportSummary, CommandMessage, CommandPayload,
     CommandResult, DurableEventBatch, DurableGap, EngineIdentity, ErrorMessage, EventCursor,
     EventMessage, EventPayload, FadeToBlackState, HandshakeOutcome, HandshakeRequest,
-    HandshakeResponse, HeartbeatMessage, ManualTransitionKind, ManualTransitionStatus,
-    ResumeCursor, RuntimeEventMessage, RuntimeFailureDisposition, RuntimeLifecycleEvent,
-    ServerHello, ServerIdentity, SnapshotMessage, SnapshotReason, StingerAudioPolicy,
-    StingerMissingMediaFallback, StingerReadiness, StingerStatus, StructuredError, WireMessage,
+    HandshakeResponse, HeartbeatMessage, InputAudioStripStatus, ManualTransitionKind,
+    ManualTransitionStatus, OverlayStatus, ResumeCursor, RuntimeEventMessage,
+    RuntimeFailureDisposition, RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage,
+    SnapshotReason, StingerAudioPolicy, StingerMissingMediaFallback, StingerReadiness,
+    StingerStatus, StructuredError, WireMessage,
 };
 
 use super::value::{
-    client_type, durable_events, field_issues, role, runtime_domains, string_list, versions,
+    client_type, durable_events, field_issues, input_statuses, role, runtime_domains, string_list,
 };
 use super::{CodecError, MAX_FIELD_VALUE_BYTES, MAX_LINE_BYTES, MAX_LIST_ITEMS};
 
@@ -22,8 +25,6 @@ use super::{CodecError, MAX_FIELD_VALUE_BYTES, MAX_LINE_BYTES, MAX_LIST_ITEMS};
 pub fn encode_line(message: &WireMessage) -> Result<String, CodecError> {
     let mut record = Record::default();
     match message {
-        WireMessage::ClientHello(message) => encode_client_hello(&mut record, message)?,
-        WireMessage::ServerHello(message) => encode_server_hello(&mut record, message)?,
         WireMessage::Command(message) => encode_command(&mut record, message)?,
         WireMessage::CommandResult(message) => encode_result(&mut record, message)?,
         WireMessage::Snapshot(message) => encode_snapshot(&mut record, message)?,
@@ -132,34 +133,6 @@ fn encode_cursor(record: &mut Record, cursor: &EventCursor) -> Result<(), CodecE
     record.field("revision", cursor.revision)
 }
 
-fn encode_client_hello(record: &mut Record, message: &ClientHello) -> Result<(), CodecError> {
-    record.kind("client_hello");
-    check_count(message.versions.len(), "versions")?;
-    record.field("versions", versions(&message.versions))?;
-    record.field_str("build", &message.build)?;
-    record.field("client_type", client_type(message.client_type))?;
-    record.field("desired_role", role(message.desired_role))?;
-    record.field("cached", u8::from(message.cached_cursor.is_some()))?;
-    if let Some(cursor) = &message.cached_cursor {
-        record.field_str("cached_engine_id", &cursor.engine.engine_id)?;
-        record.field("cached_state_epoch", cursor.engine.state_epoch)?;
-        record.field_str("cached_log_id", &cursor.engine.log_id)?;
-        record.field("cached_revision", cursor.revision)?;
-    }
-    Ok(())
-}
-
-fn encode_server_hello(record: &mut Record, message: &ServerHello) -> Result<(), CodecError> {
-    record.kind("server_hello");
-    record.field("protocol", message.negotiated)?;
-    record.field("granted_role", role(message.granted_role))?;
-    record.field_string("permissions", string_list(&message.permissions)?)?;
-    record.field_str("capabilities", &message.capabilities_digest)?;
-    encode_identity(record, &message.engine)?;
-    record.field("current_revision", message.current_revision)?;
-    record.field("resume", u8::from(message.resume))
-}
-
 fn encode_command(record: &mut Record, message: &CommandMessage) -> Result<(), CodecError> {
     record.kind("command");
     record.field("protocol", message.protocol)?;
@@ -168,6 +141,9 @@ fn encode_command(record: &mut Record, message: &CommandMessage) -> Result<(), C
     record.optional("expected_revision", message.expected_revision)?;
     record.optional("deadline_ms", message.deadline_ms)?;
     match message.payload {
+        payload @ CommandPayload::SetInputAudioStrip { .. } => {
+            encode_input_audio_strip_command(record, payload)?;
+        }
         CommandPayload::SelectPreview { input } => {
             record.field("payload", "select_preview")?;
             record.field("input", input)?;
@@ -199,6 +175,16 @@ fn encode_command(record: &mut Record, message: &CommandMessage) -> Result<(), C
         }
         payload @ (CommandPayload::ConfigureStinger { .. }
         | CommandPayload::RemoveStinger { .. }) => encode_stinger_mutation(record, payload)?,
+        payload @ (CommandPayload::TakeOverlay { .. }
+        | CommandPayload::UpdateOverlay { .. }
+        | CommandPayload::OverlayOff { .. }
+        | CommandPayload::SetOverlayOutputInclusion { .. }
+        | CommandPayload::ConfigureOverlayTransition { .. }
+        | CommandPayload::ConfigureOverlayAppearance { .. }
+        | CommandPayload::QueueOverlay { .. }
+        | CommandPayload::TakeNextOverlay { .. }) => {
+            encode_overlay_command(record, payload)?;
+        }
         CommandPayload::Wipe { duration_frames } => {
             record.field("payload", "wipe")?;
             record.field("duration_frames", duration_frames)?;
@@ -234,6 +220,100 @@ fn encode_command(record: &mut Record, message: &CommandMessage) -> Result<(), C
         }
     }
     Ok(())
+}
+
+fn encode_input_audio_strip_command(
+    record: &mut Record,
+    payload: CommandPayload,
+) -> Result<(), CodecError> {
+    let CommandPayload::SetInputAudioStrip {
+        input,
+        gain_millidb,
+        balance_basis_points,
+        muted,
+        soloed,
+        follow_video,
+        delay_samples,
+    } = payload
+    else {
+        unreachable!("input audio strip encoder received another command")
+    };
+    record.field("payload", "input_audio_strip")?;
+    record.field("input", input)?;
+    record.field("gain_millidb", gain_millidb)?;
+    record.field("balance_basis_points", balance_basis_points)?;
+    record.field("muted", u8::from(muted))?;
+    record.field("soloed", u8::from(soloed))?;
+    record.field("follow_video", u8::from(follow_video))?;
+    record.field("delay_samples", delay_samples)
+}
+
+fn encode_overlay_command(record: &mut Record, payload: CommandPayload) -> Result<(), CodecError> {
+    match payload {
+        CommandPayload::TakeOverlay { channel, source }
+        | CommandPayload::UpdateOverlay { channel, source } => {
+            record.field(
+                "payload",
+                if matches!(payload, CommandPayload::TakeOverlay { .. }) {
+                    "overlay_take"
+                } else {
+                    "overlay_update"
+                },
+            )?;
+            record.field("channel", channel)?;
+            record.field("source", source)
+        }
+        CommandPayload::OverlayOff { channel } => {
+            record.field("payload", "overlay_off")?;
+            record.field("channel", channel)
+        }
+        CommandPayload::SetOverlayOutputInclusion {
+            channel,
+            output,
+            included,
+        } => {
+            record.field("payload", "overlay_output")?;
+            record.field("channel", channel)?;
+            record.field("output", output)?;
+            record.field("included", u8::from(included))
+        }
+        CommandPayload::ConfigureOverlayTransition {
+            channel,
+            transition,
+            duration_frames,
+        } => {
+            record.field("payload", "overlay_transition")?;
+            record.field("channel", channel)?;
+            record.field(
+                "transition",
+                match transition {
+                    crate::OverlayTransitionKind::Cut => "cut",
+                    crate::OverlayTransitionKind::Fade => "fade",
+                },
+            )?;
+            record.field("duration_frames", duration_frames)
+        }
+        CommandPayload::ConfigureOverlayAppearance {
+            channel,
+            position,
+            border,
+        } => {
+            record.field("payload", "overlay_appearance")?;
+            record.field("channel", channel)?;
+            record.field("position", overlay_position(position))?;
+            record.field("border", overlay_border(border))
+        }
+        CommandPayload::QueueOverlay { channel, source } => {
+            record.field("payload", "overlay_queue")?;
+            record.field("channel", channel)?;
+            record.field("source", source)
+        }
+        CommandPayload::TakeNextOverlay { channel } => {
+            record.field("payload", "overlay_next")?;
+            record.field("channel", channel)
+        }
+        _ => unreachable!("only overlay commands are delegated"),
+    }
 }
 
 fn encode_stinger_mutation(record: &mut Record, payload: CommandPayload) -> Result<(), CodecError> {
@@ -313,16 +393,8 @@ fn encode_snapshot(record: &mut Record, message: &SnapshotMessage) -> Result<(),
     encode_identity(record, &message.engine)?;
     record.field("revision", message.revision)?;
     record.field_str("show_name", &message.show_name)?;
-    check_count(message.inputs.len(), "inputs")?;
-    record.field_string(
-        "inputs",
-        message
-            .inputs
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(","),
-    )?;
+    record.field_string("inputs", input_statuses(&message.inputs)?)?;
+    encode_input_audio_strips(record, &message.input_audio_strips)?;
     record.field("desired_program", message.desired_program)?;
     record.field("desired_preview", message.desired_preview)?;
     record.field("realized_program", message.realized_program)?;
@@ -347,16 +419,131 @@ fn encode_snapshot(record: &mut Record, message: &SnapshotMessage) -> Result<(),
         message.realized_fade_to_black,
         FadeToBlackStateFields::Realized,
     )?;
-    encode_stingers(record, message.stingers.as_deref())
+    encode_stingers(record, &message.stingers)?;
+    encode_overlays(record, "desired_overlays", &message.desired_overlays)?;
+    encode_overlays(record, "realized_overlays", &message.realized_overlays)
 }
 
-fn encode_stingers(
+fn encode_overlays(
     record: &mut Record,
-    stingers: Option<&[StingerStatus]>,
+    field: &'static str,
+    overlays: &[OverlayStatus],
 ) -> Result<(), CodecError> {
-    let Some(stingers) = stingers else {
-        return Ok(());
-    };
+    if overlays.len() != 8 {
+        return Err(CodecError::InvalidField {
+            field,
+            value: format!("expected 8 channels, found {}", overlays.len()),
+        });
+    }
+    let value = overlays
+        .iter()
+        .map(|overlay| {
+            if overlay.queued_sources.len() > 64 {
+                return Err(CodecError::TooManyItems("overlay queue"));
+            }
+            let outputs = overlay
+                .included_outputs
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let queue = overlay
+                .queued_sources
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            Ok(format!(
+                "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+                overlay.channel,
+                overlay
+                    .source
+                    .map_or_else(|| "0".to_owned(), |source| source.to_string()),
+                u8::from(overlay.active),
+                overlay.opacity,
+                match overlay.transition {
+                    crate::OverlayTransitionKind::Cut => "cut",
+                    crate::OverlayTransitionKind::Fade => "fade",
+                },
+                overlay.duration_frames,
+                overlay_position(overlay.position),
+                overlay_border(overlay.border),
+                queue,
+                outputs,
+            ))
+        })
+        .collect::<Result<Vec<_>, CodecError>>()?
+        .join(";");
+    record.field_string(field, value)
+}
+
+fn encode_input_audio_strips(
+    record: &mut Record,
+    strips: &[InputAudioStripStatus],
+) -> Result<(), CodecError> {
+    check_count(strips.len(), "input audio strips")?;
+    let mut inputs = BTreeSet::new();
+    for status in strips {
+        if !(-96_000..=24_000).contains(&status.gain_millidb)
+            || !(-10_000..=10_000).contains(&status.balance_basis_points)
+            || status.delay_samples > 48_000
+            || !inputs.insert(status.input.get())
+        {
+            return Err(CodecError::InvalidField {
+                field: "input_audio_strips",
+                value: format!(
+                    "{}:{}:{}:{}:{}:{}:{}",
+                    status.input,
+                    status.gain_millidb,
+                    status.balance_basis_points,
+                    u8::from(status.muted),
+                    u8::from(status.soloed),
+                    u8::from(status.follow_video),
+                    status.delay_samples
+                ),
+            });
+        }
+    }
+    record.field_string(
+        "input_audio_strips",
+        strips
+            .iter()
+            .map(|status| {
+                format!(
+                    "{}:{}:{}:{}:{}:{}:{}",
+                    status.input,
+                    status.gain_millidb,
+                    status.balance_basis_points,
+                    u8::from(status.muted),
+                    u8::from(status.soloed),
+                    u8::from(status.follow_video),
+                    status.delay_samples
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+    )
+}
+
+const fn overlay_position(position: crate::OverlayPositionPreset) -> &'static str {
+    match position {
+        crate::OverlayPositionPreset::FullFrame => "full_frame",
+        crate::OverlayPositionPreset::TopLeft => "top_left",
+        crate::OverlayPositionPreset::TopRight => "top_right",
+        crate::OverlayPositionPreset::BottomLeft => "bottom_left",
+        crate::OverlayPositionPreset::BottomRight => "bottom_right",
+    }
+}
+
+const fn overlay_border(border: crate::OverlayBorderPreset) -> &'static str {
+    match border {
+        crate::OverlayBorderPreset::None => "none",
+        crate::OverlayBorderPreset::ThinWhite => "thin_white",
+        crate::OverlayBorderPreset::ThickWhite => "thick_white",
+    }
+}
+
+fn encode_stingers(record: &mut Record, stingers: &[StingerStatus]) -> Result<(), CodecError> {
     if stingers.len() > 8 {
         return Err(CodecError::TooManyItems("stingers"));
     }
@@ -365,7 +552,7 @@ fn encode_stingers(
         let index = usize::from(status.slot.number() - 1);
         if seen[index] {
             return Err(CodecError::InvalidField {
-                field: "?stingers",
+                field: "stingers",
                 value: format!("duplicate slot {}", status.slot.number()),
             });
         }
@@ -399,7 +586,7 @@ fn encode_stingers(
         })
         .collect::<Vec<_>>()
         .join(",");
-    record.field_string("?stingers", value)
+    record.field_string("stingers", value)
 }
 
 fn encode_event(record: &mut Record, message: &EventMessage) -> Result<(), CodecError> {
@@ -411,6 +598,8 @@ fn encode_event(record: &mut Record, message: &EventMessage) -> Result<(), Codec
             preview,
             manual_transition,
             fade_to_black,
+            overlays,
+            input_audio_strips,
         } => {
             record.field("event", "desired_switcher")?;
             record.field("program", program)?;
@@ -421,6 +610,8 @@ fn encode_event(record: &mut Record, message: &EventMessage) -> Result<(), Codec
                 *fade_to_black,
                 FadeToBlackStateFields::Unqualified,
             )?;
+            encode_overlays(record, "overlays", overlays)?;
+            encode_input_audio_strips(record, input_audio_strips)?;
         }
         EventPayload::StingerSlotsChanged {
             program,
@@ -428,6 +619,8 @@ fn encode_event(record: &mut Record, message: &EventMessage) -> Result<(), Codec
             manual_transition,
             fade_to_black,
             stingers,
+            overlays,
+            input_audio_strips,
         } => {
             record.field("event", "stinger_slots_changed")?;
             record.field("program", program)?;
@@ -438,7 +631,9 @@ fn encode_event(record: &mut Record, message: &EventMessage) -> Result<(), Codec
                 *fade_to_black,
                 FadeToBlackStateFields::Unqualified,
             )?;
-            encode_stingers(record, Some(stingers))?;
+            encode_stingers(record, stingers)?;
+            encode_overlays(record, "overlays", overlays)?;
+            encode_input_audio_strips(record, input_audio_strips)?;
         }
     }
     Ok(())
@@ -488,8 +683,7 @@ fn encode_handshake_request(
     message: &HandshakeRequest,
 ) -> Result<(), CodecError> {
     record.kind("handshake_request");
-    check_count(message.versions.len(), "versions")?;
-    record.field("versions", versions(&message.versions))?;
+    record.field("protocol", message.protocol)?;
     record.field_str("build", &message.build)?;
     record.field("client_type", client_type(message.client_type))?;
     record.field("desired_role", role(message.desired_role))?;
@@ -505,7 +699,7 @@ fn encode_handshake_response(
     message: &HandshakeResponse,
 ) -> Result<(), CodecError> {
     record.kind("handshake_response");
-    record.field("protocol", message.negotiated)?;
+    record.field("protocol", message.protocol)?;
     record.field("granted_role", role(message.granted_role))?;
     record.field_string("permissions", string_list(&message.permissions)?)?;
     encode_capability_summary(record, &message.capabilities)?;
@@ -624,36 +818,33 @@ enum ManualStatusFields {
 
 fn encode_manual_status(
     record: &mut Record,
-    status: Option<ManualTransitionStatus>,
+    status: ManualTransitionStatus,
     fields: ManualStatusFields,
 ) -> Result<(), CodecError> {
-    let Some(status) = status else {
-        return Ok(());
-    };
     let (active, kind, from, to, interval_start, position) = match fields {
         ManualStatusFields::Desired => (
-            "?desired_manual_active",
-            "?desired_manual_kind",
-            "?desired_manual_from",
-            "?desired_manual_to",
-            "?desired_manual_interval_start_basis_points",
-            "?desired_manual_position_basis_points",
+            "desired_manual_active",
+            "desired_manual_kind",
+            "desired_manual_from",
+            "desired_manual_to",
+            "desired_manual_interval_start_basis_points",
+            "desired_manual_position_basis_points",
         ),
         ManualStatusFields::Realized => (
-            "?realized_manual_active",
-            "?realized_manual_kind",
-            "?realized_manual_from",
-            "?realized_manual_to",
-            "?realized_manual_interval_start_basis_points",
-            "?realized_manual_position_basis_points",
+            "realized_manual_active",
+            "realized_manual_kind",
+            "realized_manual_from",
+            "realized_manual_to",
+            "realized_manual_interval_start_basis_points",
+            "realized_manual_position_basis_points",
         ),
         ManualStatusFields::Unqualified => (
-            "?manual_active",
-            "?manual_kind",
-            "?manual_from",
-            "?manual_to",
-            "?manual_interval_start_basis_points",
-            "?manual_position_basis_points",
+            "manual_active",
+            "manual_kind",
+            "manual_from",
+            "manual_to",
+            "manual_interval_start_basis_points",
+            "manual_position_basis_points",
         ),
     };
     match status {
@@ -685,22 +876,19 @@ enum FadeToBlackStateFields {
 
 fn encode_fade_to_black_state(
     record: &mut Record,
-    state: Option<FadeToBlackState>,
+    state: FadeToBlackState,
     fields: FadeToBlackStateFields,
 ) -> Result<(), CodecError> {
-    let Some(state) = state else {
-        return Ok(());
-    };
     let (target_active, position) = match fields {
         FadeToBlackStateFields::Desired => (
-            "?desired_ftb_target_active",
-            "?desired_ftb_position_numerator",
+            "desired_ftb_target_active",
+            "desired_ftb_position_numerator",
         ),
         FadeToBlackStateFields::Realized => (
-            "?realized_ftb_target_active",
-            "?realized_ftb_position_numerator",
+            "realized_ftb_target_active",
+            "realized_ftb_position_numerator",
         ),
-        FadeToBlackStateFields::Unqualified => ("?ftb_target_active", "?ftb_position_numerator"),
+        FadeToBlackStateFields::Unqualified => ("ftb_target_active", "ftb_position_numerator"),
     };
     record.field(target_active, u8::from(state.target_active))?;
     record.field(position, state.position.numerator())

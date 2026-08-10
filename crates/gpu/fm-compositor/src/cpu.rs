@@ -6,7 +6,7 @@ use fm_frame::{
 };
 use fm_video::{
     CompositeError, CropError, FrameError, ImageFrame, Layer, Rgba8, TransformError,
-    compose_layers, crop, premultiply_alpha, transform_nearest,
+    compose_layers, crop, draw_inset_rect_border, premultiply_alpha, transform_nearest,
 };
 
 use crate::{AlphaMode, CompositionPlan, Effect, Key, RectMask, SourceId};
@@ -166,11 +166,25 @@ pub fn execute_cpu(
         if layer.alpha_mode() == AlphaMode::Straight {
             frame = premultiply_alpha(&frame)?;
         }
-        rendered.push(transform_nearest(
-            &frame,
-            plan.width(),
-            plan.height(),
-            layer.transform(),
+        let transformed =
+            transform_nearest(&frame, plan.width(), plan.height(), layer.transform())?;
+        let transform = layer.transform();
+        let (border_width, border_height) = match transform.rotation {
+            fm_video::Rotation::Deg0 | fm_video::Rotation::Deg180 => {
+                (transform.scale_width, transform.scale_height)
+            }
+            fm_video::Rotation::Deg90 | fm_video::Rotation::Deg270 => {
+                (transform.scale_height, transform.scale_width)
+            }
+        };
+        rendered.push(draw_inset_rect_border(
+            &transformed,
+            transform.translation_x,
+            transform.translation_y,
+            border_width,
+            border_height,
+            layer.inset_border_width(),
+            fm_video::Rgba8::new(255, 255, 255, 255),
         )?);
     }
 

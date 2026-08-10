@@ -1,17 +1,15 @@
 use core::num::NonZeroU128;
 
-use fm_client::{ConnectionState, ReconnectBackoff, Session};
+use fm_client::{ConnectionState, Session};
 use fm_protocol::{
-    ALPHA_FADE_PROTOCOL_VERSION, CommandPayload, FADE_TO_BLACK_PROTOCOL_VERSION,
-    MANUAL_ALPHA_FADE_PROTOCOL_VERSION, MANUAL_TRANSITION_PROTOCOL_VERSION, ManualTransitionKind,
-    ManualTransitionPosition, ProtocolVersion, Role, SLIDE_PROTOCOL_VERSION,
-    STINGER_PROTOCOL_VERSION, ServerIdentity,
+    CURRENT_PROTOCOL_VERSION, CommandPayload, ManualTransitionKind, ManualTransitionPosition,
+    ProtocolVersion, Role, ServerIdentity,
 };
 use fm_types::InputId;
 use fm_ui_model::{ActiveManualTransition, BusSelection, ManualTransitionStatus, SwitcherState};
 use freemix_web::{
     ManualTransitionControl, ManualTransitionModel, ManualTransitionMotion,
-    ManualTransitionProjection, SUPPORTED_PROTOCOL_VERSIONS, TransitionControlState,
+    ManualTransitionProjection, TransitionControlState,
 };
 
 fn input(value: u128) -> InputId {
@@ -53,27 +51,7 @@ fn active(
 }
 
 fn ready_session() -> Session {
-    session(MANUAL_ALPHA_FADE_PROTOCOL_VERSION, &["transition"])
-}
-
-#[test]
-fn web_handshake_advertises_only_current_protocol() {
-    assert_eq!(
-        SUPPORTED_PROTOCOL_VERSIONS,
-        [fm_protocol::CURRENT_PROTOCOL_VERSION]
-    );
-    assert_eq!(STINGER_PROTOCOL_VERSION, ProtocolVersion::new(1, 10));
-    assert_eq!(SLIDE_PROTOCOL_VERSION, ProtocolVersion::new(1, 8));
-    assert_eq!(
-        MANUAL_ALPHA_FADE_PROTOCOL_VERSION,
-        ProtocolVersion::new(1, 7)
-    );
-    assert_eq!(ALPHA_FADE_PROTOCOL_VERSION, ProtocolVersion::new(1, 6));
-    assert_eq!(FADE_TO_BLACK_PROTOCOL_VERSION, ProtocolVersion::new(1, 5));
-    assert_eq!(
-        MANUAL_TRANSITION_PROTOCOL_VERSION,
-        ProtocolVersion::new(1, 4)
-    );
+    session(CURRENT_PROTOCOL_VERSION, &["transition"])
 }
 
 #[test]
@@ -280,50 +258,6 @@ fn terminal_lag_waits_for_realized_inactive_before_enabling_start() {
 }
 
 #[test]
-fn protocol_1_6_hides_manual_alpha_fade_without_hiding_existing_manual_controls() {
-    let model = ManualTransitionModel::new(
-        Some(ManualTransitionStatus::Inactive),
-        Some(ManualTransitionStatus::Inactive),
-    );
-    let session = session(ALPHA_FADE_PROTOCOL_VERSION, &["transition"]);
-
-    assert_eq!(
-        model.control_state(
-            ManualTransitionControl::StartAlphaFade,
-            &ConnectionState::Ready,
-            Some(&session),
-        ),
-        TransitionControlState::Hidden
-    );
-    assert_eq!(
-        model.command_payload(
-            ManualTransitionControl::StartAlphaFade,
-            &ConnectionState::Ready,
-            Some(&session),
-        ),
-        None
-    );
-    assert_eq!(
-        model.control_state(
-            ManualTransitionControl::StartFade,
-            &ConnectionState::Ready,
-            Some(&session),
-        ),
-        TransitionControlState::Enabled
-    );
-    assert_eq!(
-        model.command_payload(
-            ManualTransitionControl::StartWipe,
-            &ConnectionState::Ready,
-            Some(&session),
-        ),
-        Some(CommandPayload::StartManualTransition {
-            kind: ManualTransitionKind::Wipe,
-        })
-    );
-}
-
-#[test]
 fn desired_and_realized_present_routing_intervals_positions_and_motion_separately() {
     let model = ManualTransitionModel::new(
         Some(active(ManualTransitionKind::Wipe, 1, 2, 8_000, 2_500)),
@@ -365,7 +299,7 @@ fn missing_projection_ready_and_permission_gates_disable_without_hiding() {
         Some(active(ManualTransitionKind::Fade, 1, 2, 0, 0)),
     );
     let operator_session = ready_session();
-    let no_permission = session(FADE_TO_BLACK_PROTOCOL_VERSION, &["view_status"]);
+    let no_permission = session(CURRENT_PROTOCOL_VERSION, &["view_status"]);
 
     for model in [missing_desired, missing_realized] {
         assert_eq!(
@@ -390,66 +324,6 @@ fn missing_projection_ready_and_permission_gates_disable_without_hiding() {
             None
         );
     }
-}
-
-#[test]
-fn reconnect_and_protocol_downgrade_hide_every_manual_control_and_emit_nothing() {
-    let model = ManualTransitionModel::new(
-        Some(active(ManualTransitionKind::Wipe, 1, 2, 0, 5_000)),
-        Some(active(ManualTransitionKind::Wipe, 1, 2, 0, 5_000)),
-    );
-    let current = ready_session();
-    let downgraded = session(ProtocolVersion::new(1, 3), &["transition"]);
-    let controls = [
-        ManualTransitionControl::StartFade,
-        ManualTransitionControl::StartWipe,
-        ManualTransitionControl::StartAlphaFade,
-        ManualTransitionControl::Position(ManualTransitionPosition::END),
-        ManualTransitionControl::Commit,
-        ManualTransitionControl::Cancel,
-    ];
-
-    for control in controls {
-        assert_eq!(
-            model.control_state(
-                control,
-                &ConnectionState::Backoff(ReconnectBackoff {
-                    attempt: 1,
-                    delay_ms: 250,
-                }),
-                None,
-            ),
-            TransitionControlState::Hidden
-        );
-        assert_eq!(
-            model.command_payload(
-                control,
-                &ConnectionState::Backoff(ReconnectBackoff {
-                    attempt: 1,
-                    delay_ms: 250,
-                }),
-                None,
-            ),
-            None
-        );
-        assert_eq!(
-            model.control_state(control, &ConnectionState::Ready, Some(&downgraded)),
-            TransitionControlState::Hidden
-        );
-        assert_eq!(
-            model.command_payload(control, &ConnectionState::Ready, Some(&downgraded)),
-            None
-        );
-    }
-
-    assert_eq!(
-        model.control_state(
-            ManualTransitionControl::Commit,
-            &ConnectionState::Ready,
-            Some(&current),
-        ),
-        TransitionControlState::Enabled
-    );
 }
 
 #[test]

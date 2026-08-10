@@ -6,7 +6,6 @@
 
 mod exchange;
 mod host;
-mod snapshot;
 mod types;
 
 pub use exchange::{
@@ -21,11 +20,7 @@ pub use fm_plugin_api as plugin_api;
 pub use host::{
     HostError, PluginCommand, PluginCommandResult, PluginEvent, PluginHost, PluginRecord,
 };
-pub use snapshot::{
-    MigrationError, MigrationRequest, SnapshotMigrator, migrate_snapshot,
-    validate_migration_response,
-};
 pub use types::{
-    ApiCompatibility, ApiVersion, CapabilityDecision, CapabilityId, CrashReport, PluginId,
-    PluginManifest, PluginState, QuarantineReason, StateSnapshot, StateVersion,
+    ApiVersion, CapabilityDecision, CapabilityId, CrashReport, PluginId, PluginManifest,
+    PluginState, QuarantineReason, StateSnapshot, StateVersion,
 };

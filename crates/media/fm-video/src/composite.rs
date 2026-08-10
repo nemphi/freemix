@@ -113,6 +113,67 @@ pub fn apply_opacity_premultiplied(
     Ok(output)
 }
 
+/// Draws a clipped opaque or premultiplied border inside a rectangle.
+///
+/// The rectangle uses output coordinates and may extend outside the frame.
+/// A zero-width border leaves the source unchanged.
+///
+/// # Errors
+///
+/// Returns an error for non-premultiplied input/color or an invalid frame layout.
+pub fn draw_inset_rect_border(
+    source: &ImageFrame,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    border_width: u32,
+    color: Rgba8,
+) -> Result<ImageFrame, CompositeError> {
+    validate_premultiplied(source, None)?;
+    if !is_premultiplied(color) {
+        return Err(CompositeError::NotPremultiplied {
+            layer: None,
+            x: 0,
+            y: 0,
+            pixel: color,
+        });
+    }
+    let mut output = source.clone();
+    if border_width == 0 || width == 0 || height == 0 {
+        return Ok(output);
+    }
+    let left = i64::from(x);
+    let top = i64::from(y);
+    let right = left + i64::from(width);
+    let bottom = top + i64::from(height);
+    let thickness = i64::from(border_width);
+    for output_y in 0..output.height() {
+        let output_y = i64::from(output_y);
+        if output_y < top || output_y >= bottom {
+            continue;
+        }
+        for output_x in 0..output.width() {
+            let output_x = i64::from(output_x);
+            if output_x < left || output_x >= right {
+                continue;
+            }
+            if output_x - left < thickness
+                || right - output_x <= thickness
+                || output_y - top < thickness
+                || bottom - output_y <= thickness
+            {
+                output.set_pixel(
+                    u32::try_from(output_x).map_err(|_| FrameError::LayoutOverflow)?,
+                    u32::try_from(output_y).map_err(|_| FrameError::LayoutOverflow)?,
+                    color,
+                );
+            }
+        }
+    }
+    Ok(output)
+}
+
 /// Composes positioned layers over a premultiplied clear color.
 ///
 /// Layers use premultiplied-alpha source-over blending. Lower `z` values are

@@ -133,7 +133,7 @@ impl TcpConnection {
         Ok(self.reader.peer_addr()?)
     }
 
-    /// Writes one current protocol record. This never emits a legacy hello.
+    /// Writes one current protocol record.
     ///
     /// # Errors
     ///
@@ -373,12 +373,6 @@ pub enum TcpSessionError {
     Cancelled {
         backoff: ReconnectBackoff,
     },
-    PendingCommandIncompatible {
-        command_id: String,
-        negotiated: fm_protocol::ProtocolVersion,
-        required: fm_protocol::ProtocolVersion,
-        backoff: ReconnectBackoff,
-    },
 }
 
 impl fmt::Display for TcpSessionError {
@@ -403,16 +397,6 @@ impl fmt::Display for TcpSessionError {
                 "TCP session wait cancelled; reconnect attempt {} after {} ms",
                 backoff.attempt, backoff.delay_ms
             ),
-            Self::PendingCommandIncompatible {
-                command_id,
-                negotiated,
-                required,
-                backoff,
-            } => write!(
-                formatter,
-                "unresolved command {command_id:?} requires protocol {required}, but reconnect negotiated {negotiated}; reconnect attempt {} after {} ms",
-                backoff.attempt, backoff.delay_ms
-            ),
         }
     }
 }
@@ -428,8 +412,7 @@ impl std::error::Error for TcpSessionError {
             | Self::UnexpectedMessage
             | Self::NotConnected
             | Self::AlreadyConnected
-            | Self::Cancelled { .. }
-            | Self::PendingCommandIncompatible { .. } => None,
+            | Self::Cancelled { .. } => None,
         }
     }
 }
@@ -482,8 +465,7 @@ impl TcpSession {
     #[must_use]
     pub fn reconnect_backoff(&self) -> Option<ReconnectBackoff> {
         match self.client.state() {
-            crate::ConnectionState::Backoff(backoff)
-            | crate::ConnectionState::PendingIncompatible { backoff, .. } => Some(*backoff),
+            crate::ConnectionState::Backoff(backoff) => Some(*backoff),
             _ => None,
         }
     }
@@ -601,22 +583,6 @@ impl TcpSession {
             }
         }
 
-        if let Some((command_id, negotiated, required)) =
-            self.client.unresolved_incompatible_command()
-        {
-            if let Some(connection) = self.connection.take() {
-                connection.shutdown();
-            }
-            let backoff =
-                self.client
-                    .command_protocol_incompatible(command_id.clone(), negotiated, required);
-            return Err(TcpSessionError::PendingCommandIncompatible {
-                command_id,
-                negotiated,
-                required,
-                backoff,
-            });
-        }
         self.retry_unresolved(wait)?;
         Ok(SessionEvent::Connected { mode })
     }
@@ -643,7 +609,7 @@ impl TcpSession {
     ///
     /// # Errors
     ///
-    /// Returns an error when there is no negotiated session, the queue is
+    /// Returns an error when there is no established current-protocol session, the queue is
     /// full, or the heartbeat sequence is exhausted.
     pub fn queue_heartbeat(
         &mut self,
@@ -789,9 +755,7 @@ impl TcpSession {
                 Ok(SessionEvent::DurableGap { gap })
             }
             WireMessage::Error(error) => Ok(SessionEvent::ServerError(error)),
-            WireMessage::ClientHello(_)
-            | WireMessage::ServerHello(_)
-            | WireMessage::Command(_)
+            WireMessage::Command(_)
             | WireMessage::Snapshot(_)
             | WireMessage::HandshakeRequest(_)
             | WireMessage::HandshakeResponse(_)
@@ -949,7 +913,7 @@ impl TcpSession {
     fn connect_client_error(&mut self, error: ClientError) -> TcpSessionError {
         if matches!(
             self.client.state(),
-            crate::ConnectionState::Incompatible { .. }
+            crate::ConnectionState::ProtocolMismatch { .. }
         ) {
             if let Some(connection) = self.connection.take() {
                 connection.shutdown();

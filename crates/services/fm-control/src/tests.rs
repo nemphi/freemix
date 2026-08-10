@@ -2,11 +2,11 @@ use std::{error::Error, fmt, num::NonZeroU128, sync::mpsc::TryRecvError};
 
 use fm_auth::{Policy, Principal, Role, SessionId, UserId};
 use fm_clock::ClockDomainId;
-use fm_engine::{Engine, EngineManualTransitionKind, ShowState};
+use fm_engine::{Engine, EngineInputAudioStripState, EngineManualTransitionKind, ShowState};
 use fm_protocol::{
     CommandMessage, CommandPayload, CommandResult, EngineIdentity, EventCursor,
-    ManualTransitionKind, ManualTransitionPosition, ManualTransitionStatus, ProtocolVersion,
-    RuntimeLifecycleEvent, ServerIdentity, StingerAudioPolicy as ProtocolStingerAudioPolicy,
+    ManualTransitionKind, ManualTransitionPosition, ManualTransitionStatus, RuntimeLifecycleEvent,
+    ServerIdentity, StingerAudioPolicy as ProtocolStingerAudioPolicy,
     StingerMissingMediaFallback as ProtocolStingerFallback, StingerReadiness, StingerStatus,
     WireInputId, WireMessage, WireStingerSlotId,
 };
@@ -17,6 +17,13 @@ use super::*;
 
 fn input(value: u128) -> InputId {
     InputId::new(NonZeroU128::new(value).unwrap())
+}
+
+fn named_inputs(values: impl IntoIterator<Item = InputId>) -> Vec<(InputId, String)> {
+    values
+        .into_iter()
+        .map(|input| (input, format!("Input {input}")))
+        .collect()
 }
 
 fn principal(role: Role) -> Principal {
@@ -30,7 +37,7 @@ fn principal(role: Role) -> Principal {
 fn service(retained_events: usize, subscriber_queue: usize) -> ControlService {
     let show = ShowState::new(
         "show",
-        vec![input(1), input(2), input(3)],
+        named_inputs([input(1), input(2), input(3)]),
         input(1),
         input(2),
     )
@@ -56,7 +63,7 @@ fn service(retained_events: usize, subscriber_queue: usize) -> ControlService {
 fn stinger_service() -> ControlService {
     let mut show = ShowState::new(
         "stinger show",
-        vec![input(1), input(2), input(3)],
+        named_inputs([input(1), input(2), input(3)]),
         input(1),
         input(2),
     )
@@ -92,11 +99,30 @@ fn stinger_service() -> ControlService {
 }
 
 #[test]
+fn snapshot_projects_canonical_input_names_in_engine_order() {
+    let control = service(8, 2);
+    assert_eq!(
+        control
+            .snapshot()
+            .snapshot
+            .inputs
+            .iter()
+            .map(|input| (input.input.to_domain(), input.name.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (input(1), "Input 1"),
+            (input(2), "Input 2"),
+            (input(3), "Input 3"),
+        ]
+    );
+}
+
+#[test]
 fn snapshot_projects_exact_stinger_configuration_and_realized_readiness() {
     let control = stinger_service();
     assert_eq!(
         control.snapshot().snapshot.stingers,
-        Some(vec![StingerStatus {
+        vec![StingerStatus {
             slot: WireStingerSlotId::new(1).unwrap(),
             media_input: WireInputId::from_domain(input(3)),
             preload: true,
@@ -104,7 +130,7 @@ fn snapshot_projects_exact_stinger_configuration_and_realized_readiness() {
             audio_policy: ProtocolStingerAudioPolicy::Muted,
             missing_media_fallback: ProtocolStingerFallback::KeepProgram,
             readiness: StingerReadiness::Ready,
-        }])
+        }]
     );
 }
 
@@ -147,7 +173,7 @@ fn stinger_slot_mutation_is_transition_authorized_and_projects_durable_state() {
     ));
     control.tick(&server_identity()).unwrap();
     assert_eq!(
-        control.snapshot().snapshot.stingers.as_ref().unwrap()[0].readiness,
+        control.snapshot().snapshot.stingers[0].readiness,
         StingerReadiness::Ready
     );
 
@@ -165,12 +191,12 @@ fn stinger_slot_mutation_is_transition_authorized_and_projects_durable_state() {
         )
         .unwrap();
     control.tick(&server_identity()).unwrap();
-    assert_eq!(control.snapshot().snapshot.stingers, Some(Vec::new()));
+    assert!(control.snapshot().snapshot.stingers.is_empty());
 }
 
 fn command(id: &str, key: &str, payload: CommandPayload) -> CommandMessage {
     CommandMessage {
-        protocol: ProtocolVersion::new(1, 0),
+        protocol: fm_protocol::CURRENT_PROTOCOL_VERSION,
         id: id.to_owned(),
         idempotency_key: key.to_owned(),
         expected_revision: None,
@@ -317,11 +343,11 @@ fn manual_transition_is_authorized_durable_reversible_and_replay_safe() {
     assert!(control.engine.realized_switcher().t_bar().is_none());
     assert_eq!(
         control.snapshot().snapshot.desired_manual_transition,
-        Some(ManualTransitionStatus::Inactive)
+        ManualTransitionStatus::Inactive
     );
     assert_eq!(
         control.snapshot().snapshot.realized_manual_transition,
-        Some(ManualTransitionStatus::Inactive)
+        ManualTransitionStatus::Inactive
     );
     assert_eq!(control.engine.realized_switcher().program(), input(1));
     assert_eq!(control.diagnostics().current_revision, 4);
@@ -360,7 +386,7 @@ fn manual_alpha_fade_projects_exact_authoritative_state() {
     ] {
         assert!(matches!(
             status,
-            Some(ManualTransitionStatus::Active(state))
+            ManualTransitionStatus::Active(state)
                 if state.kind == ManualTransitionKind::AlphaFade
                     && state.position.basis_points() == 6_250
         ));
@@ -372,16 +398,8 @@ fn manual_alpha_fade_projects_exact_authoritative_state() {
 }
 
 fn assert_manual_snapshot(control: &ControlService<Policy>, position: u16) {
-    let desired = control
-        .snapshot()
-        .snapshot
-        .desired_manual_transition
-        .expect("protocol 1.4 snapshot must carry desired manual state");
-    let realized = control
-        .snapshot()
-        .snapshot
-        .realized_manual_transition
-        .expect("protocol 1.4 snapshot must carry realized manual state");
+    let desired = control.snapshot().snapshot.desired_manual_transition;
+    let realized = control.snapshot().snapshot.realized_manual_transition;
     assert!(matches!(
         desired,
         ManualTransitionStatus::Active(state)
@@ -718,20 +736,15 @@ fn fade_to_black_is_authorized_reversible_and_runtime_ordered_with_program() {
     assert!(matches!(
         accepted.output.events[0].payload,
         EventPayload::DesiredSwitcher {
-            fade_to_black: Some(FadeToBlackState {
+            fade_to_black: FadeToBlackState {
                 target_active: true,
                 position: FadeToBlackPosition::BLACK,
-            }),
+            },
             ..
         }
     ));
     assert_eq!(
-        control
-            .snapshot()
-            .snapshot
-            .realized_fade_to_black
-            .unwrap()
-            .position,
+        control.snapshot().snapshot.realized_fade_to_black.position,
         FadeToBlackPosition::LIVE
     );
 
@@ -761,10 +774,10 @@ fn fade_to_black_is_authorized_reversible_and_runtime_ordered_with_program() {
     assert!(matches!(
         completed.runtime_events[0].event,
         RuntimeLifecycleEvent::Realized {
-            fade_to_black: Some(FadeToBlackState {
+            fade_to_black: FadeToBlackState {
                 target_active: true,
                 position: FadeToBlackPosition::BLACK,
-            }),
+            },
             ..
         }
     ));
@@ -840,10 +853,10 @@ fn reversing_fade_to_black_supersedes_only_the_displaced_intent() {
             generation: 3,
             sequence: 2,
             event: RuntimeLifecycleEvent::Realized {
-                fade_to_black: Some(FadeToBlackState {
+                fade_to_black: FadeToBlackState {
                     target_active: true,
                     position: FadeToBlackPosition::BLACK,
-                }),
+                },
                 ..
             },
             ..
@@ -1152,7 +1165,7 @@ fn engine_controls_accepted_rejected_and_duplicate_behavior() {
 fn restored_engine_rejection_receipts_still_replay_after_authorization() {
     let show = ShowState::new(
         "show",
-        vec![input(1), input(2), input(3)],
+        named_inputs([input(1), input(2), input(3)]),
         input(1),
         input(2),
     )
@@ -1217,12 +1230,93 @@ fn command_result_is_represented_before_its_events() {
         EventPayload::DesiredSwitcher {
             program: WireInputId::from_domain(input(2)),
             preview: WireInputId::from_domain(input(1)),
-            manual_transition: Some(fm_protocol::ManualTransitionStatus::Inactive),
-            fade_to_black: Some(fm_protocol::FadeToBlackState {
+            manual_transition: fm_protocol::ManualTransitionStatus::Inactive,
+            fade_to_black: fm_protocol::FadeToBlackState {
                 target_active: false,
                 position: fm_protocol::FadeToBlackPosition::LIVE,
-            }),
+            },
+            overlays: fm_protocol::OverlayStatus::empty_channels(),
+            input_audio_strips: [input(1), input(2), input(3)]
+                .into_iter()
+                .map(|input| fm_protocol::InputAudioStripStatus {
+                    input: WireInputId::from_domain(input),
+                    gain_millidb: 0,
+                    balance_basis_points: 0,
+                    muted: false,
+                    soloed: false,
+                    follow_video: true,
+                    delay_samples: 0,
+                })
+                .collect(),
         }
+    );
+}
+
+#[test]
+fn input_audio_strip_flows_through_authorization_snapshot_event_and_frame() {
+    let mut control = service(8, 8);
+    let server = server_identity();
+    let submission = control
+        .submit(
+            &principal(Role::Operator),
+            command(
+                "audio-strip",
+                "audio-strip-key",
+                CommandPayload::SetInputAudioStrip {
+                    input: WireInputId::from_domain(input(2)),
+                    gain_millidb: -6_000,
+                    balance_basis_points: 2_500,
+                    muted: true,
+                    soloed: true,
+                    follow_video: false,
+                    delay_samples: 2_400,
+                },
+            ),
+            0,
+        )
+        .unwrap();
+    assert!(matches!(
+        submission.output.result,
+        CommandResult::Accepted { .. }
+    ));
+    let EventPayload::DesiredSwitcher {
+        input_audio_strips, ..
+    } = &submission.output.events[0].payload
+    else {
+        panic!("expected desired-state event")
+    };
+    assert!(input_audio_strips.iter().any(|status| {
+        status.input == WireInputId::from_domain(input(2))
+            && status.gain_millidb == -6_000
+            && status.balance_basis_points == 2_500
+            && status.muted
+            && !status.follow_video
+            && status.delay_samples == 2_400
+    }));
+    assert!(
+        control
+            .snapshot()
+            .snapshot
+            .input_audio_strips
+            .iter()
+            .any(|status| status.input == WireInputId::from_domain(input(2))
+                && status.delay_samples == 2_400)
+    );
+
+    let tick = control.tick(&server).unwrap();
+    assert_eq!(
+        tick.frame.input_audio_strip_updates,
+        [(
+            input(2),
+            EngineInputAudioStripState {
+                gain_millidb: -6_000,
+                balance_basis_points: 2_500,
+                muted: true,
+                soloed: true,
+                follow_video: false,
+                delay_samples: 2_400,
+            }
+        )]
     );
 }
 

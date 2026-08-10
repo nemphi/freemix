@@ -36,7 +36,7 @@ tools/
 | `fm-types` | IDs, rational frame rates, timecode, timestamps, formats, color/audio metadata, small errors | Tokio, wgpu, GUI, FFmpeg, OS APIs |
 | `fm-model` | Versioned project/domain configuration and validation | Device SDKs, UI, async runtime |
 | `fm-command` | Domain commands, results, events, transactions, inverse intents | Transport and engine runtime |
-| `fm-protocol` | Wire DTOs, version negotiation, serialization fixtures | Domain implementation details |
+| `fm-protocol` | Exact-current wire DTOs, contract validation, and codec | Domain implementation details |
 | `fm-capabilities` | Capability descriptors, matching, limits, compatibility reports | Backend implementations |
 | `fm-plugin-api` | Versioned WIT and C ABI declarations, opaque handles, ownership rules | Plugin host implementation |
 
@@ -136,7 +136,7 @@ do not own devices.
 | `fm-control` | Command validation, authorization hook, revision log, subscriptions |
 | `fm-server` | HTTP/WebSocket/WebRTC signaling, discovery, rate limits |
 | `fm-vmix-compat` | Complete documented vMix 29 HTTP/XML/TCP/tally compatibility surface |
-| `fm-persistence` | Projects, journal, migrations, asset relink/bundle, secrets references |
+| `fm-persistence` | Current-schema projects, journal, asset relink/bundle, secrets references |
 | `fm-auth` | Pairing, users, roles, token/certificate lifecycle |
 | `fm-plugin-host` | Native/Wasm discovery, isolation, IPC, crash handling |
 | `fm-dsp-host` | Shared-memory real-time DSP hosting, one-block latency contract, deadline and bypass ramp |

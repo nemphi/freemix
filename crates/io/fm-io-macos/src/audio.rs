@@ -5,7 +5,7 @@ use std::{
     fmt,
     num::{NonZeroU128, NonZeroUsize},
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 #[cfg(target_os = "macos")]
@@ -19,6 +19,7 @@ use std::{
         mpsc::{Receiver, RecvTimeoutError, sync_channel},
     },
     thread::JoinHandle,
+    time::Duration,
 };
 
 use fm_frame::{AudioBlock, ClockDomainId};
@@ -32,12 +33,12 @@ use fm_types::SampleRate;
 
 use crate::{
     FNV_OFFSET_BASIS_128, FNV_PRIME_128, SIGNAL_LOSS_TIMEOUT, adapter_failure, coremedia_clock,
-    developer_helper_path, escaped_diagnostic, escaped_text, invalid_state, permission_state,
-    protocol::{
-        self, HelperAudioDevice, HelperAudioDiscovery, MAX_AUDIO_BLOCK_BYTES, MAX_DISCOVERY_BYTES,
-    },
-    run_helper, stable_id,
+    escaped_text, invalid_state, permission_state,
+    protocol::{self, HelperAudioDevice, HelperAudioDiscovery, MAX_AUDIO_BLOCK_BYTES},
+    stable_id,
 };
+#[cfg(target_os = "macos")]
+use crate::{developer_helper_path, escaped_diagnostic, protocol::MAX_DISCOVERY_BYTES, run_helper};
 
 const MAX_AUDIO_QUEUE_CAPACITY: usize = 32;
 const AUDIO_STABLE_KEY_PREFIX: &str = "macos.avfoundation.audio.v1.";

@@ -2,14 +2,10 @@ use std::{convert::Infallible, net::IpAddr, num::NonZeroU128};
 
 use fm_auth::{Principal, Role as AuthRole, SessionId, UserId};
 use fm_protocol::{
-    ALPHA_FADE_PROTOCOL_VERSION, CURRENT_PROTOCOL_VERSION, ClientHello, ClientType, CommandMessage,
-    CommandPayload, EngineIdentity, EventCursor, EventMessage, EventPayload,
-    FADE_TO_BLACK_PROTOCOL_VERSION, MANUAL_ALPHA_FADE_PROTOCOL_VERSION,
-    MANUAL_TRANSITION_PROTOCOL_VERSION, ManualTransitionKind, ManualTransitionStatus,
-    ProtocolVersion, Role, SLIDE_PROTOCOL_VERSION, STINGER_PROTOCOL_VERSION,
-    STINGER_STATUS_PROTOCOL_VERSION, SnapshotMessage, StingerAudioPolicy,
-    StingerMissingMediaFallback, StingerReadiness, StingerStatus, WIPE_PROTOCOL_VERSION,
-    WireInputId, WireStingerSlotId, ZOOM_PROTOCOL_VERSION,
+    CURRENT_PROTOCOL_VERSION, ClientType, CommandMessage, CommandPayload, EngineIdentity,
+    EventCursor, EventMessage, EventPayload, FadeToBlackPosition, FadeToBlackState,
+    HandshakeRequest, ManualTransitionStatus, ProtocolVersion, ResumeCursor, Role, ServerIdentity,
+    SnapshotMessage, WireInputId,
 };
 use fm_server::{
     AuthenticationMode, ConfigError, ControlPlane, DisconnectReason, HandshakeError, HealthState,
@@ -61,22 +57,41 @@ fn input(value: u128) -> WireInputId {
     WireInputId::new(NonZeroU128::new(value).unwrap())
 }
 
+fn input_statuses() -> Vec<fm_protocol::InputStatus> {
+    [(1, "Camera"), (2, "Slides")]
+        .into_iter()
+        .map(|(value, name)| fm_protocol::InputStatus {
+            input: input(value),
+            name: name.into(),
+        })
+        .collect()
+}
+
 fn control() -> FakeControl {
     let engine = engine();
     let snapshot = SnapshotMessage {
         engine: engine.clone(),
         revision: 4,
         show_name: "show".into(),
-        inputs: vec![input(1), input(2)],
+        inputs: input_statuses(),
+        input_audio_strips: input_audio_strips(),
         desired_program: input(1),
         desired_preview: input(2),
         realized_program: input(1),
         realized_preview: input(2),
-        desired_manual_transition: Some(ManualTransitionStatus::Inactive),
-        realized_manual_transition: Some(ManualTransitionStatus::Inactive),
-        desired_fade_to_black: None,
-        realized_fade_to_black: None,
-        stingers: None,
+        desired_manual_transition: ManualTransitionStatus::Inactive,
+        realized_manual_transition: ManualTransitionStatus::Inactive,
+        desired_fade_to_black: FadeToBlackState {
+            target_active: false,
+            position: FadeToBlackPosition::LIVE,
+        },
+        realized_fade_to_black: FadeToBlackState {
+            target_active: false,
+            position: FadeToBlackPosition::LIVE,
+        },
+        stingers: Vec::new(),
+        desired_overlays: fm_protocol::OverlayStatus::empty_channels(),
+        realized_overlays: fm_protocol::OverlayStatus::empty_channels(),
     };
     let events = [3, 4]
         .map(|revision| EventMessage {
@@ -87,8 +102,13 @@ fn control() -> FakeControl {
             payload: EventPayload::DesiredSwitcher {
                 program: input(1),
                 preview: input(2),
-                manual_transition: Some(ManualTransitionStatus::Inactive),
-                fade_to_black: None,
+                manual_transition: ManualTransitionStatus::Inactive,
+                fade_to_black: FadeToBlackState {
+                    target_active: false,
+                    position: FadeToBlackPosition::LIVE,
+                },
+                overlays: fm_protocol::OverlayStatus::empty_channels(),
+                input_audio_strips: input_audio_strips(),
             },
         })
         .to_vec();
@@ -99,12 +119,26 @@ fn control() -> FakeControl {
     }
 }
 
+fn input_audio_strips() -> Vec<fm_protocol::InputAudioStripStatus> {
+    [input(1), input(2)]
+        .into_iter()
+        .map(|input| fm_protocol::InputAudioStripStatus {
+            input,
+            gain_millidb: 0,
+            balance_basis_points: 0,
+            muted: false,
+            soloed: false,
+            follow_video: true,
+            delay_samples: 0,
+        })
+        .collect()
+}
+
 fn config() -> ServerConfig {
     ServerConfig::new(
         ServerMode::Production,
         AuthenticationMode::Required,
         IpAddr::from([127, 0, 0, 1]),
-        vec![ProtocolVersion::new(1, 2)],
         "capabilities-v1",
     )
 }
@@ -125,13 +159,21 @@ fn development_principal(role: AuthRole) -> Principal {
     )
 }
 
-fn hello(role: Role, cursor: Option<EventCursor>) -> ClientHello {
-    ClientHello {
-        versions: vec![ProtocolVersion::new(1, 1)],
+fn hello(role: Role, cursor: Option<EventCursor>) -> HandshakeRequest {
+    HandshakeRequest {
+        protocol: CURRENT_PROTOCOL_VERSION,
         build: "test".into(),
         client_type: ClientType::Cli,
         desired_role: role,
-        cached_cursor: cursor,
+        resume_cursor: cursor.map(|cursor| ResumeCursor {
+            server: ServerIdentity {
+                engine_id: cursor.engine.engine_id,
+                project_id: "project-9".into(),
+                state_epoch: cursor.engine.state_epoch,
+                log_id: cursor.engine.log_id,
+            },
+            revision: cursor.revision,
+        }),
     }
 }
 
@@ -142,14 +184,14 @@ fn ready_server(config: ServerConfig) -> Server<FakeControl> {
 }
 
 #[test]
-fn incompatible_versions_are_rejected() {
+fn non_current_versions_are_rejected() {
     let server = ready_server(config());
     let mut hello = hello(Role::Viewer, None);
-    hello.versions = vec![ProtocolVersion::new(2, 0)];
+    hello.protocol = ProtocolVersion::new(99, 0);
 
     assert!(matches!(
         server.handshake(&hello, &principal(AuthRole::Viewer), 0),
-        Err(HandshakeError::IncompatibleVersion)
+        Err(HandshakeError::ProtocolMismatch)
     ));
 }
 
@@ -159,7 +201,6 @@ fn development_auth_requires_development_mode_and_loopback() {
         ServerMode::Production,
         AuthenticationMode::Development,
         IpAddr::from([127, 0, 0, 1]),
-        vec![ProtocolVersion::new(1, 0)],
         "digest",
     );
     assert_eq!(
@@ -171,7 +212,6 @@ fn development_auth_requires_development_mode_and_loopback() {
         ServerMode::Development,
         AuthenticationMode::Development,
         IpAddr::from([0, 0, 0, 0]),
-        vec![ProtocolVersion::new(1, 0)],
         "digest",
     );
     assert_eq!(
@@ -199,7 +239,7 @@ fn handshake_delegates_snapshot_and_resume_selection() {
     let snapshot = server
         .handshake(&hello(Role::Viewer, None), &principal(AuthRole::Viewer), 10)
         .unwrap();
-    assert_eq!(snapshot.server_hello.negotiated, ProtocolVersion::new(1, 1));
+    assert_eq!(snapshot.server_hello.protocol, CURRENT_PROTOCOL_VERSION);
     assert!(!snapshot.server_hello.resume);
     assert!(matches!(snapshot.sync, SyncPayload::Snapshot(_)));
 
@@ -216,61 +256,6 @@ fn handshake_delegates_snapshot_and_resume_selection() {
         .unwrap();
     assert!(resumed.server_hello.resume);
     assert!(matches!(resumed.sync, SyncPayload::Resume(events) if events.len() == 2));
-}
-
-#[test]
-fn protocol_1_11_resume_falls_back_to_snapshot_across_stinger_slot_mutation() {
-    let mut control = control();
-    let stinger = StingerStatus {
-        slot: WireStingerSlotId::new(8).unwrap(),
-        media_input: input(2),
-        preload: false,
-        cut_point_frames: 7,
-        audio_policy: StingerAudioPolicy::Muted,
-        missing_media_fallback: StingerMissingMediaFallback::KeepProgram,
-        readiness: StingerReadiness::NotRequested,
-    };
-    control.snapshot.stingers = Some(vec![stinger]);
-    control.events = vec![EventMessage {
-        cursor: EventCursor {
-            engine: engine(),
-            revision: 4,
-        },
-        payload: EventPayload::StingerSlotsChanged {
-            program: input(1),
-            preview: input(2),
-            manual_transition: Some(ManualTransitionStatus::Inactive),
-            fade_to_black: None,
-            stingers: vec![stinger],
-        },
-    }];
-    let config = ServerConfig::new(
-        ServerMode::Production,
-        AuthenticationMode::Required,
-        IpAddr::from([127, 0, 0, 1]),
-        vec![CURRENT_PROTOCOL_VERSION],
-        "capabilities-v1",
-    );
-    let mut server = Server::new(config, control).unwrap();
-    server.mark_ready().unwrap();
-    let mut request = hello(
-        Role::Viewer,
-        Some(EventCursor {
-            engine: engine(),
-            revision: 3,
-        }),
-    );
-    request.versions = vec![STINGER_STATUS_PROTOCOL_VERSION];
-
-    let outcome = server
-        .handshake(&request, &principal(AuthRole::Viewer), 10)
-        .unwrap();
-    assert!(!outcome.server_hello.resume);
-    let SyncPayload::Snapshot(snapshot) = outcome.sync else {
-        panic!("incompatible resume must fall back to a snapshot");
-    };
-    assert_eq!(snapshot.stingers, Some(vec![stinger]));
-    assert_eq!(snapshot.revision, 4);
 }
 
 #[test]
@@ -316,13 +301,11 @@ fn wipe_uses_transition_authorization_and_fade_rate_accounting() {
         ServerMode::Production,
         AuthenticationMode::Required,
         IpAddr::from([127, 0, 0, 1]),
-        vec![CURRENT_PROTOCOL_VERSION],
         "capabilities-v1",
     )
     .with_session_limits(limits);
     let server = ready_server(current_config);
-    let mut current_hello = hello(Role::Operator, None);
-    current_hello.versions = vec![CURRENT_PROTOCOL_VERSION];
+    let current_hello = hello(Role::Operator, None);
     let mut operator = server
         .handshake(&current_hello, &principal(AuthRole::Operator), 0)
         .unwrap()
@@ -337,298 +320,6 @@ fn wipe_uses_transition_authorization_and_fade_rate_accounting() {
         operator.admit_command(&fade, 10, 0),
         Err(SessionError::InboundRateLimited)
     );
-}
-
-#[test]
-fn old_client_cannot_admit_wipe_to_a_new_server() {
-    let server = ready_server(ServerConfig::new(
-        ServerMode::Production,
-        AuthenticationMode::Required,
-        IpAddr::from([127, 0, 0, 1]),
-        vec![CURRENT_PROTOCOL_VERSION],
-        "capabilities-v1",
-    ));
-    let mut old_hello = hello(Role::Operator, None);
-    old_hello.versions = vec![ProtocolVersion::new(1, 0)];
-    let outcome = server
-        .handshake(&old_hello, &principal(AuthRole::Operator), 0)
-        .unwrap();
-    assert_eq!(outcome.server_hello.negotiated, ProtocolVersion::new(1, 0));
-    let mut session = outcome.session;
-
-    let mut wipe = command(CommandPayload::Wipe { duration_frames: 3 });
-    wipe.protocol = ProtocolVersion::new(1, 0);
-    assert_eq!(
-        session.admit_command(&wipe, 10, 0),
-        Err(SessionError::UnsupportedCommandVersion {
-            negotiated: ProtocolVersion::new(1, 0),
-            required: WIPE_PROTOCOL_VERSION,
-        })
-    );
-    assert_eq!(session.accounting().inbound_commands_admitted_total, 0);
-    assert_eq!(session.accounting().inbound_commands_inflight, 0);
-
-    let mut cut = command(CommandPayload::Cut);
-    cut.protocol = ProtocolVersion::new(1, 0);
-    session.admit_command(&cut, 10, 0).unwrap();
-}
-
-#[test]
-fn protocol_1_3_peer_cannot_admit_manual_transition() {
-    let server = ready_server(ServerConfig::new(
-        ServerMode::Production,
-        AuthenticationMode::Required,
-        IpAddr::from([127, 0, 0, 1]),
-        vec![CURRENT_PROTOCOL_VERSION],
-        "capabilities-v1",
-    ));
-    let mut old_hello = hello(Role::Operator, None);
-    old_hello.versions = vec![WIPE_PROTOCOL_VERSION];
-    let outcome = server
-        .handshake(&old_hello, &principal(AuthRole::Operator), 0)
-        .unwrap();
-    assert_eq!(outcome.server_hello.negotiated, WIPE_PROTOCOL_VERSION);
-    assert!(matches!(
-        &outcome.sync,
-        SyncPayload::Snapshot(snapshot)
-            if matches!(
-                snapshot.as_ref(),
-                SnapshotMessage {
-            desired_manual_transition: None,
-            realized_manual_transition: None,
-            ..
-                }
-            )
-    ));
-    let mut session = outcome.session;
-    let mut manual = command(CommandPayload::StartManualTransition {
-        kind: ManualTransitionKind::Fade,
-    });
-    manual.protocol = WIPE_PROTOCOL_VERSION;
-    assert_eq!(
-        session.admit_command(&manual, 10, 0),
-        Err(SessionError::UnsupportedCommandVersion {
-            negotiated: WIPE_PROTOCOL_VERSION,
-            required: MANUAL_TRANSITION_PROTOCOL_VERSION,
-        })
-    );
-    assert_eq!(session.accounting().inbound_commands_admitted_total, 0);
-    assert_eq!(session.accounting().inbound_commands_inflight, 0);
-}
-
-#[test]
-fn protocol_1_4_peer_cannot_admit_fade_to_black() {
-    let server = ready_server(ServerConfig::new(
-        ServerMode::Production,
-        AuthenticationMode::Required,
-        IpAddr::from([127, 0, 0, 1]),
-        vec![CURRENT_PROTOCOL_VERSION],
-        "capabilities-v1",
-    ));
-    let mut old_hello = hello(Role::Operator, None);
-    old_hello.versions = vec![MANUAL_TRANSITION_PROTOCOL_VERSION];
-    let outcome = server
-        .handshake(&old_hello, &principal(AuthRole::Operator), 0)
-        .unwrap();
-    assert_eq!(
-        outcome.server_hello.negotiated,
-        MANUAL_TRANSITION_PROTOCOL_VERSION
-    );
-    assert!(matches!(
-        &outcome.sync,
-        SyncPayload::Snapshot(snapshot)
-            if matches!(
-                snapshot.as_ref(),
-                SnapshotMessage {
-                    desired_fade_to_black: None,
-                    realized_fade_to_black: None,
-                    ..
-                }
-            )
-    ));
-
-    let mut session = outcome.session;
-    let mut command = command(CommandPayload::FadeToBlack {
-        active: true,
-        duration_frames: 30,
-    });
-    command.protocol = MANUAL_TRANSITION_PROTOCOL_VERSION;
-    assert_eq!(
-        session.admit_command(&command, 10, 0),
-        Err(SessionError::UnsupportedCommandVersion {
-            negotiated: MANUAL_TRANSITION_PROTOCOL_VERSION,
-            required: FADE_TO_BLACK_PROTOCOL_VERSION,
-        })
-    );
-    assert_eq!(session.accounting().inbound_commands_admitted_total, 0);
-    assert_eq!(session.accounting().inbound_commands_inflight, 0);
-}
-
-#[test]
-fn protocol_1_5_peer_cannot_admit_alpha_fade() {
-    let server = ready_server(ServerConfig::new(
-        ServerMode::Production,
-        AuthenticationMode::Required,
-        IpAddr::from([127, 0, 0, 1]),
-        vec![CURRENT_PROTOCOL_VERSION],
-        "capabilities-v1",
-    ));
-    let mut old_hello = hello(Role::Operator, None);
-    old_hello.versions = vec![FADE_TO_BLACK_PROTOCOL_VERSION];
-    let outcome = server
-        .handshake(&old_hello, &principal(AuthRole::Operator), 0)
-        .unwrap();
-    assert_eq!(
-        outcome.server_hello.negotiated,
-        FADE_TO_BLACK_PROTOCOL_VERSION
-    );
-
-    let mut session = outcome.session;
-    let mut command = command(CommandPayload::AlphaFade {
-        duration_frames: 30,
-    });
-    command.protocol = FADE_TO_BLACK_PROTOCOL_VERSION;
-    assert_eq!(
-        session.admit_command(&command, 10, 0),
-        Err(SessionError::UnsupportedCommandVersion {
-            negotiated: FADE_TO_BLACK_PROTOCOL_VERSION,
-            required: ALPHA_FADE_PROTOCOL_VERSION,
-        })
-    );
-    assert_eq!(session.accounting().inbound_commands_admitted_total, 0);
-    assert_eq!(session.accounting().inbound_commands_inflight, 0);
-}
-
-#[test]
-fn protocol_1_6_peer_cannot_admit_manual_alpha_fade() {
-    let server = ready_server(ServerConfig::new(
-        ServerMode::Production,
-        AuthenticationMode::Required,
-        IpAddr::from([127, 0, 0, 1]),
-        vec![CURRENT_PROTOCOL_VERSION],
-        "capabilities-v1",
-    ));
-    let mut old_hello = hello(Role::Operator, None);
-    old_hello.versions = vec![ALPHA_FADE_PROTOCOL_VERSION];
-    let outcome = server
-        .handshake(&old_hello, &principal(AuthRole::Operator), 0)
-        .unwrap();
-    assert_eq!(outcome.server_hello.negotiated, ALPHA_FADE_PROTOCOL_VERSION);
-
-    let mut session = outcome.session;
-    let mut command = command(CommandPayload::StartManualTransition {
-        kind: ManualTransitionKind::AlphaFade,
-    });
-    command.protocol = ALPHA_FADE_PROTOCOL_VERSION;
-    assert_eq!(
-        session.admit_command(&command, 10, 0),
-        Err(SessionError::UnsupportedCommandVersion {
-            negotiated: ALPHA_FADE_PROTOCOL_VERSION,
-            required: MANUAL_ALPHA_FADE_PROTOCOL_VERSION,
-        })
-    );
-    assert_eq!(session.accounting().inbound_commands_admitted_total, 0);
-    assert_eq!(session.accounting().inbound_commands_inflight, 0);
-}
-
-#[test]
-fn slide_requires_protocol_1_8() {
-    let server = ready_server(ServerConfig::new(
-        ServerMode::Production,
-        AuthenticationMode::Required,
-        IpAddr::from([127, 0, 0, 1]),
-        vec![CURRENT_PROTOCOL_VERSION],
-        "capabilities-v1",
-    ));
-    let mut old_hello = hello(Role::Operator, None);
-    old_hello.versions = vec![MANUAL_ALPHA_FADE_PROTOCOL_VERSION];
-    let outcome = server
-        .handshake(&old_hello, &principal(AuthRole::Operator), 0)
-        .unwrap();
-    assert_eq!(
-        outcome.server_hello.negotiated,
-        MANUAL_ALPHA_FADE_PROTOCOL_VERSION
-    );
-
-    let mut session = outcome.session;
-    let mut command = command(CommandPayload::Slide {
-        duration_frames: 30,
-    });
-    command.protocol = MANUAL_ALPHA_FADE_PROTOCOL_VERSION;
-    assert_eq!(
-        session.admit_command(&command, 10, 0),
-        Err(SessionError::UnsupportedCommandVersion {
-            negotiated: MANUAL_ALPHA_FADE_PROTOCOL_VERSION,
-            required: SLIDE_PROTOCOL_VERSION,
-        })
-    );
-    assert_eq!(session.accounting().inbound_commands_admitted_total, 0);
-    assert_eq!(session.accounting().inbound_commands_inflight, 0);
-}
-
-#[test]
-fn zoom_requires_protocol_1_9() {
-    let server = ready_server(ServerConfig::new(
-        ServerMode::Production,
-        AuthenticationMode::Required,
-        IpAddr::from([127, 0, 0, 1]),
-        vec![CURRENT_PROTOCOL_VERSION],
-        "capabilities-v1",
-    ));
-    let mut old_hello = hello(Role::Operator, None);
-    old_hello.versions = vec![SLIDE_PROTOCOL_VERSION];
-    let outcome = server
-        .handshake(&old_hello, &principal(AuthRole::Operator), 0)
-        .unwrap();
-    assert_eq!(outcome.server_hello.negotiated, SLIDE_PROTOCOL_VERSION);
-
-    let mut session = outcome.session;
-    let mut command = command(CommandPayload::Zoom {
-        duration_frames: 30,
-    });
-    command.protocol = SLIDE_PROTOCOL_VERSION;
-    assert_eq!(
-        session.admit_command(&command, 10, 0),
-        Err(SessionError::UnsupportedCommandVersion {
-            negotiated: SLIDE_PROTOCOL_VERSION,
-            required: ZOOM_PROTOCOL_VERSION,
-        })
-    );
-    assert_eq!(session.accounting().inbound_commands_admitted_total, 0);
-    assert_eq!(session.accounting().inbound_commands_inflight, 0);
-}
-
-#[test]
-fn stinger_requires_protocol_1_10() {
-    let server = ready_server(ServerConfig::new(
-        ServerMode::Production,
-        AuthenticationMode::Required,
-        IpAddr::from([127, 0, 0, 1]),
-        vec![CURRENT_PROTOCOL_VERSION],
-        "capabilities-v1",
-    ));
-    let mut old_hello = hello(Role::Operator, None);
-    old_hello.versions = vec![ZOOM_PROTOCOL_VERSION];
-    let outcome = server
-        .handshake(&old_hello, &principal(AuthRole::Operator), 0)
-        .unwrap();
-    assert_eq!(outcome.server_hello.negotiated, ZOOM_PROTOCOL_VERSION);
-
-    let mut session = outcome.session;
-    let mut command = command(CommandPayload::Stinger {
-        slot: WireStingerSlotId::new(1).unwrap(),
-        duration_frames: 30,
-    });
-    command.protocol = ZOOM_PROTOCOL_VERSION;
-    assert_eq!(
-        session.admit_command(&command, 10, 0),
-        Err(SessionError::UnsupportedCommandVersion {
-            negotiated: ZOOM_PROTOCOL_VERSION,
-            required: STINGER_PROTOCOL_VERSION,
-        })
-    );
-    assert_eq!(session.accounting().inbound_commands_admitted_total, 0);
-    assert_eq!(session.accounting().inbound_commands_inflight, 0);
 }
 
 #[test]
@@ -770,7 +461,7 @@ fn health_and_readiness_have_stable_lifecycle_states() {
 
 fn command(payload: CommandPayload) -> CommandMessage {
     CommandMessage {
-        protocol: ProtocolVersion::new(1, 1),
+        protocol: CURRENT_PROTOCOL_VERSION,
         id: "command-1".into(),
         idempotency_key: "alice-1".into(),
         expected_revision: None,

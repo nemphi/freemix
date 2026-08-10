@@ -1,8 +1,9 @@
 use fm_types::{InputId, OutputId};
 
 use crate::{
-    FadeToBlackPosition, FadeToBlackTarget, MissingMediaFallback, OverlayChannelId,
-    StingerPreloadState, StingerSlotId, TBarPosition, TransitionKind,
+    FadeToBlackPosition, FadeToBlackTarget, MissingMediaFallback, OverlayBorderPreset,
+    OverlayChannelId, OverlayPositionPreset, OverlayTransitionKind, StingerPreloadState,
+    StingerSlotId, TBarPosition, TransitionKind,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -22,7 +23,6 @@ pub enum SwitcherCommand {
     SetTBarPosition(TBarPosition),
     CommitTBar,
     CancelTBar,
-    SetFadeToBlack(bool),
     TakeOverlay {
         channel: OverlayChannelId,
         source: InputId,
@@ -32,6 +32,21 @@ pub enum SwitcherCommand {
         source: InputId,
     },
     OverlayOff(OverlayChannelId),
+    ConfigureOverlayTransition {
+        channel: OverlayChannelId,
+        transition: OverlayTransitionKind,
+        duration_frames: u32,
+    },
+    ConfigureOverlayAppearance {
+        channel: OverlayChannelId,
+        position: OverlayPositionPreset,
+        border: OverlayBorderPreset,
+    },
+    QueueOverlay {
+        channel: OverlayChannelId,
+        source: InputId,
+    },
+    TakeNextOverlay(OverlayChannelId),
     SetOverlayOutputInclusion {
         channel: OverlayChannelId,
         output: OutputId,
@@ -67,9 +82,6 @@ pub enum SwitcherEvent {
         position: TBarPosition,
     },
     TBarCancelled,
-    FadeToBlackChanged {
-        active: bool,
-    },
     FadeToBlackStarted {
         from: FadeToBlackPosition,
         target: FadeToBlackTarget,
@@ -91,6 +103,34 @@ pub enum SwitcherEvent {
     },
     OverlayTurnedOff {
         channel: OverlayChannelId,
+    },
+    OverlayTransitionConfigured {
+        channel: OverlayChannelId,
+        transition: OverlayTransitionKind,
+        duration_frames: u32,
+    },
+    OverlayAppearanceConfigured {
+        channel: OverlayChannelId,
+        position: OverlayPositionPreset,
+        border: OverlayBorderPreset,
+    },
+    OverlayQueued {
+        channel: OverlayChannelId,
+        source: InputId,
+        depth: usize,
+    },
+    OverlayQueueAdvanced {
+        channel: OverlayChannelId,
+        source: InputId,
+        remaining: usize,
+    },
+    OverlayOpacityChanged {
+        channel: OverlayChannelId,
+        opacity: u8,
+    },
+    OverlayTransitionCompleted {
+        channel: OverlayChannelId,
+        active: bool,
     },
     OverlayOutputInclusionChanged {
         channel: OverlayChannelId,
@@ -114,6 +154,15 @@ pub enum SwitcherError {
     UnsupportedManualTransitionKind,
     InvalidManualTransitionRoute,
     ZeroDuration,
+    InvalidOverlayTransitionDuration {
+        duration_frames: u32,
+        maximum: u32,
+    },
+    OverlayQueueFull {
+        channel: OverlayChannelId,
+        maximum: usize,
+    },
+    OverlayQueueEmpty(OverlayChannelId),
     UnconfiguredStinger(StingerSlotId),
     StingerCutPointOutOfRange {
         slot: StingerSlotId,
@@ -136,6 +185,25 @@ impl core::fmt::Display for SwitcherError {
                 formatter.write_str("manual transition endpoints must match Program and Preview")
             }
             Self::ZeroDuration => formatter.write_str("transition duration must be nonzero"),
+            Self::InvalidOverlayTransitionDuration {
+                duration_frames,
+                maximum,
+            } => write!(
+                formatter,
+                "overlay transition duration {duration_frames} is outside 1..={maximum}"
+            ),
+            Self::OverlayQueueFull { channel, maximum } => write!(
+                formatter,
+                "overlay channel {} queue is full (maximum {maximum})",
+                channel.number()
+            ),
+            Self::OverlayQueueEmpty(channel) => {
+                write!(
+                    formatter,
+                    "overlay channel {} queue is empty",
+                    channel.number()
+                )
+            }
             Self::UnconfiguredStinger(slot) => {
                 write!(
                     formatter,

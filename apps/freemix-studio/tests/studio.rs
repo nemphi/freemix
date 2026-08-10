@@ -17,10 +17,10 @@ use std::os::unix::fs::PermissionsExt;
 use fm_client::{ClientError, CommandStatus, Intake, SessionEvent, SyncMode, TcpSessionError};
 use fm_protocol::{
     CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, CommandPayload, CommandResult,
-    EngineIdentity, EventCursor, EventMessage, EventPayload, FADE_TO_BLACK_PROTOCOL_VERSION,
-    FadeToBlackPosition, FadeToBlackState, HandshakeOutcome, HandshakeResponse, LineDecoder,
-    ManualTransitionStatus, ProtocolVersion, Role, RuntimeEventMessage, RuntimeLifecycleEvent,
-    ServerIdentity, SnapshotMessage, SnapshotReason, WireInputId, WireMessage, encode_line,
+    EngineIdentity, EventCursor, EventMessage, EventPayload, FadeToBlackPosition, FadeToBlackState,
+    HandshakeOutcome, HandshakeResponse, LineDecoder, ManualTransitionStatus, OverlayStatus,
+    ProtocolVersion, Role, RuntimeEventMessage, RuntimeLifecycleEvent, ServerIdentity,
+    SnapshotMessage, SnapshotReason, WireInputId, WireMessage, encode_line,
 };
 use fm_types::ProjectId;
 use freemix_studio::{
@@ -41,6 +41,16 @@ fn input(value: u128) -> WireInputId {
     WireInputId::new(NonZeroU128::new(value).unwrap())
 }
 
+fn input_statuses() -> Vec<fm_protocol::InputStatus> {
+    [(1, "Camera"), (2, "Slides")]
+        .into_iter()
+        .map(|(value, name)| fm_protocol::InputStatus {
+            input: input(value),
+            name: name.into(),
+        })
+        .collect()
+}
+
 fn engine() -> EngineIdentity {
     EngineIdentity {
         engine_id: "engine-studio".to_owned(),
@@ -59,17 +69,17 @@ fn server(project: ProjectId) -> ServerIdentity {
 }
 
 fn handshake(project: ProjectId, revision: u64, outcome: HandshakeOutcome) -> HandshakeResponse {
-    handshake_version(ProtocolVersion::new(1, 2), project, revision, outcome)
+    handshake_version(CURRENT_PROTOCOL_VERSION, project, revision, outcome)
 }
 
 fn handshake_version(
-    negotiated: ProtocolVersion,
+    protocol: ProtocolVersion,
     project: ProjectId,
     revision: u64,
     outcome: HandshakeOutcome,
 ) -> HandshakeResponse {
     HandshakeResponse {
-        negotiated,
+        protocol,
         granted_role: Role::Operator,
         permissions: vec!["switcher.take".to_owned()],
         capabilities: CapabilityReportSummary {
@@ -90,16 +100,25 @@ fn snapshot(revision: u64) -> SnapshotMessage {
         engine: engine(),
         revision,
         show_name: "Studio test".to_owned(),
-        inputs: vec![input(1), input(2)],
+        inputs: input_statuses(),
+        input_audio_strips: input_audio_strips(),
         desired_program: input(1),
         desired_preview: input(2),
         realized_program: input(1),
         realized_preview: input(2),
-        desired_manual_transition: None,
-        realized_manual_transition: None,
-        desired_fade_to_black: None,
-        realized_fade_to_black: None,
-        stingers: Some(Vec::new()),
+        desired_manual_transition: ManualTransitionStatus::Inactive,
+        realized_manual_transition: ManualTransitionStatus::Inactive,
+        desired_fade_to_black: FadeToBlackState {
+            target_active: false,
+            position: FadeToBlackPosition::LIVE,
+        },
+        realized_fade_to_black: FadeToBlackState {
+            target_active: false,
+            position: FadeToBlackPosition::LIVE,
+        },
+        stingers: Vec::new(),
+        desired_overlays: OverlayStatus::empty_channels(),
+        realized_overlays: OverlayStatus::empty_channels(),
     }
 }
 
@@ -112,10 +131,30 @@ fn event(revision: u64) -> EventMessage {
         payload: EventPayload::DesiredSwitcher {
             program: input(2),
             preview: input(1),
-            manual_transition: None,
-            fade_to_black: None,
+            manual_transition: ManualTransitionStatus::Inactive,
+            fade_to_black: FadeToBlackState {
+                target_active: false,
+                position: FadeToBlackPosition::LIVE,
+            },
+            overlays: OverlayStatus::empty_channels(),
+            input_audio_strips: input_audio_strips(),
         },
     }
+}
+
+fn input_audio_strips() -> Vec<fm_protocol::InputAudioStripStatus> {
+    [input(1), input(2)]
+        .into_iter()
+        .map(|input| fm_protocol::InputAudioStripStatus {
+            input,
+            gain_millidb: 0,
+            balance_basis_points: 0,
+            muted: false,
+            soloed: false,
+            follow_video: true,
+            delay_samples: 0,
+        })
+        .collect()
 }
 
 fn runtime_event(revision: u64) -> RuntimeEventMessage {
@@ -126,8 +165,11 @@ fn runtime_event(revision: u64) -> RuntimeEventMessage {
         sequence: 1,
         event: RuntimeLifecycleEvent::Realized {
             domain: "switcher".to_owned(),
-            manual_transition: None,
-            fade_to_black: None,
+            manual_transition: ManualTransitionStatus::Inactive,
+            fade_to_black: FadeToBlackState {
+                target_active: false,
+                position: FadeToBlackPosition::LIVE,
+            },
         },
     }
 }
@@ -192,7 +234,7 @@ fn serve_snapshot_then_resume(listener: &TcpListener) {
     let WireMessage::HandshakeRequest(request) = first.receive() else {
         panic!("expected modern handshake request");
     };
-    assert_eq!(request.versions, vec![CURRENT_PROTOCOL_VERSION]);
+    assert_eq!(request.protocol, CURRENT_PROTOCOL_VERSION);
     assert_eq!(request.resume_cursor, None);
     first.send(&WireMessage::HandshakeResponse(handshake(
         project_id(),
@@ -251,7 +293,7 @@ fn existing_runtime_handles_status_runtime_heartbeat_eof_and_resume() {
     assert_eq!(runtime.lifecycle().unwrap(), LifecycleState::Ready);
     assert_eq!(
         runtime.session().client().session().unwrap().protocol,
-        ProtocolVersion::new(1, 2)
+        CURRENT_PROTOCOL_VERSION
     );
 
     runtime.send_heartbeat(1234).unwrap();
@@ -341,15 +383,15 @@ fn existing_runtime_rejects_wrong_project_handshake() {
 }
 
 #[test]
-fn existing_runtime_negotiates_fade_to_black_protocol_with_a_1_5_peer() {
+fn existing_runtime_accepts_the_current_contract() {
     let (address, server_thread) = spawn_server(|listener| {
         let mut peer = Peer::accept(&listener);
         let WireMessage::HandshakeRequest(request) = peer.receive() else {
             panic!("expected modern handshake request");
         };
-        assert_eq!(request.versions, vec![CURRENT_PROTOCOL_VERSION]);
+        assert_eq!(request.protocol, CURRENT_PROTOCOL_VERSION);
         peer.send(&WireMessage::HandshakeResponse(handshake_version(
-            FADE_TO_BLACK_PROTOCOL_VERSION,
+            CURRENT_PROTOCOL_VERSION,
             project_id(),
             4,
             HandshakeOutcome::Snapshot {
@@ -357,12 +399,12 @@ fn existing_runtime_negotiates_fade_to_black_protocol_with_a_1_5_peer() {
             },
         )));
         let mut initial = snapshot(4);
-        initial.desired_manual_transition = Some(ManualTransitionStatus::Inactive);
-        initial.realized_manual_transition = Some(ManualTransitionStatus::Inactive);
-        initial.desired_fade_to_black = Some(FadeToBlackState {
+        initial.desired_manual_transition = ManualTransitionStatus::Inactive;
+        initial.realized_manual_transition = ManualTransitionStatus::Inactive;
+        initial.desired_fade_to_black = FadeToBlackState {
             target_active: false,
             position: FadeToBlackPosition::LIVE,
-        });
+        };
         initial.realized_fade_to_black = initial.desired_fade_to_black;
         peer.send(&WireMessage::Snapshot(initial));
     });
@@ -376,7 +418,7 @@ fn existing_runtime_negotiates_fade_to_black_protocol_with_a_1_5_peer() {
     );
     assert_eq!(
         runtime.session().client().session().unwrap().protocol,
-        FADE_TO_BLACK_PROTOCOL_VERSION
+        CURRENT_PROTOCOL_VERSION
     );
     server_thread.join().unwrap();
 }
@@ -413,7 +455,7 @@ fn helper(directory: &TestDirectory, behavior: &str) -> PathBuf {
             "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$2.args\"\nprintf '%s\\n' \"$$\" > \"$2.pid\"\nprintf 'FREEMIXD_READY\\tv=1\\taddress=127.0.0.1:32123\\tproject_id={PROJECT_VALUE}\\n'\nIFS= read -r hold\n"
         ),
         "crash" => format!(
-            "#!/bin/sh\nprintf 'FREEMIXD_READY\\tv=1\\taddress=127.0.0.1:32123\\tproject_id={PROJECT_VALUE}\\n'\nexit 7\n"
+            "#!/bin/sh\nprintf 'FREEMIXD_READY\\tv=1\\taddress=127.0.0.1:32123\\tproject_id={PROJECT_VALUE}\\n'\nsleep 0.1\nexit 7\n"
         ),
         "identity-change" => format!(
             "#!/bin/sh\nif test -e \"$2.count\"; then id=42; else id={PROJECT_VALUE}; : > \"$2.count\"; fi\nprintf 'FREEMIXD_READY\\tv=1\\taddress=127.0.0.1:32123\\tproject_id=%s\\n' \"$id\"\nIFS= read -r hold\n"

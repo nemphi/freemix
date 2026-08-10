@@ -36,20 +36,25 @@ use fm_control::{
 };
 #[cfg(feature = "native-media")]
 use fm_engine::FrameResult;
-use fm_engine::{Engine, EngineAcceptance, EngineRestoreState, EngineSnapshot, ShowState};
+use fm_engine::{
+    Engine, EngineAcceptance, EngineInputAudioStripState, EngineRestoreState, EngineSnapshot,
+    ShowState,
+};
 use fm_model::{
-    MainMix, StingerAudioPolicy as ModelStingerAudioPolicy, StingerConfig,
-    StingerMissingMediaFallback, StingerSlotNumber,
+    InputAudioStripState, InputBalanceBasisPoints, InputDelaySamples, InputGainMilliDb, MainMix,
+    StingerAudioPolicy as ModelStingerAudioPolicy, StingerConfig, StingerMissingMediaFallback,
+    StingerSlotNumber,
 };
 use fm_persistence::{
     FadeToBlackState as PersistedFadeToBlackState, IdempotencyReceipt,
     ManualTransitionKind as PersistedManualTransitionKind,
     ManualTransitionState as PersistedManualTransitionState, ProjectPosition, ProjectStore,
-    ProjectValidationError, ReceiptOutcome, RuntimeFadeToBlack, RuntimeManualTransitions,
-    RuntimeRouting, StoreError, StoredProject,
+    ReceiptOutcome, RuntimeFadeToBlack, RuntimeManualTransitions, RuntimeOverlayBorder,
+    RuntimeOverlayChannel, RuntimeOverlayPosition, RuntimeOverlayTransition, RuntimeOverlays,
+    RuntimeRouting, StoredProject,
 };
 use fm_protocol::{
-    CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, ClientHello, CommandMessage, CommandPayload,
+    CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, CommandMessage, CommandPayload,
     CommandResult, ErrorMessage, EventCursor, HandshakeOutcome as ProtocolHandshakeOutcome,
     HandshakeRequest, HandshakeResponse, HeartbeatMessage, LineDecoder, ProtocolVersion,
     ResumeCursor, RuntimeEventMessage, ServerHello, ServerIdentity, StructuredError, WireMessage,
@@ -60,8 +65,9 @@ use fm_server::{
     ServerMode, Session, SessionError, SyncPayload,
 };
 use fm_switcher::{
-    MissingMediaFallback, StingerAudioPolicy, StingerDescriptor, StingerSlotId, SwitcherState,
-    TBarPosition, TBarState, TransitionKind,
+    MissingMediaFallback, OverlayBorderPreset, OverlayChannelId, OverlayChannelState,
+    OverlayPositionPreset, OverlayTransitionKind, StingerAudioPolicy, StingerDescriptor,
+    StingerSlotId, SwitcherState, TBarPosition, TBarState, TransitionKind,
 };
 use fm_types::{InputId, ProjectId};
 use freemixd::ReadinessRecord;
@@ -81,9 +87,11 @@ use fm_codec_ffmpeg::{
 };
 #[cfg(feature = "native-media")]
 use fm_codec_image::{StillDecodeLimits, decode_still, sniff_still_format};
+#[cfg(all(feature = "native-media", target_os = "macos"))]
+use fm_frame::CpuVideoFrame;
 #[cfg(feature = "native-media")]
 use fm_frame::{
-    AudioBlock, ClockDomainId as MediaClockDomainId, CpuVideoFrame, MediaTimestamp, MediaTiming,
+    AudioBlock, ClockDomainId as MediaClockDomainId, MediaTimestamp, MediaTiming,
     NormalizedDuration, NormalizedTimestamp, OriginalTimestamp, SequenceNumber,
 };
 #[cfg(all(feature = "macos-program-surface", target_os = "macos"))]
@@ -108,13 +116,11 @@ use fm_sim::{Rgba8, SimulatedVideoSource, SourcePattern};
 #[cfg(feature = "native-media")]
 use freemixd::native_media::{
     NativeAudioLimits, NativeMasterError, NativeMasterRuntime, NativeMediaRuntime,
-    NativeProgramReadback, NativeProjectLimits, NativeProjectPlan, NativeResolvedSource,
-    NativeSourceLimits, NativeSourceRenderError,
+    NativeOutputFrame, NativeProgramReadback, NativeProjectLimits, NativeProjectPlan,
+    NativeResolvedSource, NativeSourceLimits, NativeSourceRenderError,
 };
 #[cfg(feature = "native-media")]
-use stinger_mutation::{
-    NativeMutationFailure, NativeStingerMutation, NativeStingerRetirements,
-};
+use stinger_mutation::{NativeStingerMutation, NativeStingerRetirements};
 
 const DEFAULT_LISTEN: &str = "127.0.0.1:0";
 const PROTOCOL_VERSION: ProtocolVersion = CURRENT_PROTOCOL_VERSION;
@@ -149,11 +155,7 @@ const NATIVE_CLIENT_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
 const PROGRAM_RECORDER_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(feature = "native-media")]
 const PROGRAM_RECORDER_KILL_TIMEOUT: Duration = Duration::from_secs(2);
-#[cfg(all(
-    feature = "native-media",
-    feature = "macos-program-surface",
-    target_os = "macos"
-))]
+#[cfg(all(feature = "native-media", feature = "macos-program-surface"))]
 const PROGRAM_CHECKPOINT_MARGIN: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
@@ -248,6 +250,7 @@ struct NativeDaemon {
     pacer_start_offset: Duration,
     origin: Instant,
     latest_output: Option<NativeTexture>,
+    latest_project_outputs: Vec<NativeOutputFrame>,
     master: NativeMasterRuntime,
     project_plan: NativeProjectPlan,
     playback: freemixd::native_media::NativeSourcePlayback,
@@ -1664,7 +1667,10 @@ impl NativeDaemon {
         let project_plan =
             NativeProjectPlan::compile(stored.project(), NativeProjectLimits::default())?;
         validate_native_audio_modes(stored)?;
+        #[cfg(target_os = "macos")]
         let mut resolution = resolve_native_sources(store, stored, camera_helper)?;
+        #[cfg(not(target_os = "macos"))]
+        let resolution = resolve_native_sources(store, stored, camera_helper)?;
         let sources = resolution.sources;
         validate_native_stinger_sources(stored, &sources)?;
         let requires_ffmpeg = sources
@@ -1722,6 +1728,7 @@ impl NativeDaemon {
             pacer_start_offset,
             origin,
             latest_output: None,
+            latest_project_outputs: Vec::new(),
             master,
             project_plan,
             playback,
@@ -1905,38 +1912,67 @@ impl NativeDaemon {
         let registry = self.playback.registry();
         let stinger_registry = self.stingers.registry();
         let master = &mut self.master;
-        let project_plan = &self.project_plan;
+        let project_plan = &mut self.project_plan;
         let projected_frame = self.projected_frame.as_ref();
         let latest_output = &mut self.latest_output;
+        let latest_project_outputs = &mut self.latest_project_outputs;
         let mut audio = None;
         let outcome = control.tick_with_realizer(server, |frame| {
             debug_assert_eq!(projected_frame, Some(frame));
-            let output = runtime
-                .render_project_frame_result_with_stingers_blocking(
-                    registry,
-                    stinger_registry,
-                    project_plan,
-                    frame,
-                )
-                .map_err(NativeRealizationError::Video)?;
+            for &(input, state) in &frame.input_audio_strip_updates {
+                let strip = model_audio_strip_state(state);
+                master
+                    .set_input_audio_strip(input, strip)
+                    .map_err(NativeRealizationError::Audio)?;
+                project_plan
+                    .set_input_audio_strip(input, strip)
+                    .map_err(NativeRealizationError::Audio)?;
+            }
+            if project_plan.output_ids().is_empty() {
+                let output = runtime
+                    .render_project_frame_result_with_stingers_blocking(
+                        registry,
+                        stinger_registry,
+                        project_plan,
+                        frame,
+                    )
+                    .map_err(NativeRealizationError::Video)?;
+                *latest_output = Some(output);
+                latest_project_outputs.clear();
+            } else {
+                let outputs = runtime
+                    .render_project_outputs_with_stingers_blocking(
+                        registry,
+                        stinger_registry,
+                        project_plan,
+                        frame,
+                    )
+                    .map_err(NativeRealizationError::Video)?;
+                *latest_project_outputs = outputs;
+                *latest_output = None;
+            }
             let block = master
                 .render_project_frame_audio(frame, project_plan)
                 .map_err(NativeRealizationError::Audio)?;
-            *latest_output = Some(output);
             audio = Some(block);
             Ok::<(), NativeRealizationError>(())
         })?;
         self.install_stinger_mutation()?;
         self.projected_frame = None;
         self.pacer.advance()?;
+        let latest_program = self
+            .latest_project_outputs
+            .first()
+            .map(NativeOutputFrame::texture)
+            .or(self.latest_output.as_ref());
         #[cfg(all(feature = "macos-program-surface", target_os = "macos"))]
-        if let (Some(program), Some(output)) = (&mut self.program, self.latest_output.as_ref()) {
+        if let (Some(program), Some(output)) = (&mut self.program, latest_program) {
             program
                 .present_latest(self.runtime.context(), output)
                 .map_err(|error| -> Box<dyn Error> { Box::new(AppFailure(error)) })?;
         }
         if let (Some(recorder), Some(output), Some(audio)) =
-            (&mut self.recorder, self.latest_output.as_ref(), audio)
+            (&mut self.recorder, latest_program, audio)
         {
             recorder.capture(&self.runtime, output, audio);
         }
@@ -2177,6 +2213,7 @@ fn preflight_native_stinger_video(
     Ok((stingers, playback_limits.max_retained_rgba16f_bytes))
 }
 
+#[cfg(feature = "native-media")]
 fn validate_native_video_dimensions(
     label: &str,
     registry: &freemixd::native_media::NativeSourceRegistry,
@@ -3299,7 +3336,7 @@ fn serve_inner(
     }
 
     let store = ProjectStore::new(path)?;
-    let project = load_migrate_recover(&store)?;
+    let project = load_and_recover(&store)?;
     let project_id = project.project().id();
     let engine = restore_engine(&project)?;
     let identity = format!("project-{project_id}");
@@ -3390,7 +3427,6 @@ fn serve_inner(
         ServerMode::Development,
         AuthenticationMode::Development,
         listen.ip(),
-        vec![PROTOCOL_VERSION],
         capabilities_digest,
     );
     let mut server = Server::new(config, ControlHandle(Rc::clone(&control)))?;
@@ -3498,35 +3534,8 @@ fn checkpoint_native(
     Ok(())
 }
 
-fn load_migrate_recover(store: &ProjectStore) -> AppResult<StoredProject> {
-    let project = match store.load() {
-        Ok(project) => project,
-        Err(StoreError::Validation(ProjectValidationError::UnsupportedSchema {
-            found, ..
-        })) => {
-            match found {
-                2 => store.migrate_v2()?,
-                3 => store.migrate_v3()?,
-                4 => store.migrate_v4()?,
-                5 => store.migrate_v5()?,
-                6 => store.migrate_v6()?,
-                7 => store.migrate_v7()?,
-                8 => store.migrate_v8()?,
-                9 => store.migrate_v9()?,
-                _ => {
-                    return Err(StoreError::Validation(
-                        ProjectValidationError::UnsupportedSchema {
-                            found,
-                            supported: fm_persistence::CURRENT_SCHEMA_VERSION,
-                        },
-                    )
-                    .into());
-                }
-            };
-            store.load()?
-        }
-        Err(error) => return Err(error.into()),
-    };
+fn load_and_recover(store: &ProjectStore) -> AppResult<StoredProject> {
+    let project = store.load()?;
     if store.journal_path().try_exists()? {
         let scan = store.recover_journal()?;
         if !scan.batches().is_empty() {
@@ -3545,8 +3554,9 @@ fn restore_engine(project: &StoredProject) -> AppResult<Engine> {
     let inputs = canonical
         .inputs()
         .iter()
-        .map(|input| input.id)
+        .map(|input| (input.id, input.name.clone()))
         .collect::<Vec<_>>();
+    let input_ids = inputs.iter().map(|(input, _)| *input).collect::<Vec<_>>();
     let main_mix = canonical
         .main_mix()
         .ok_or_else(|| AppFailure("project is missing desired main mix routing".into()))?;
@@ -3555,11 +3565,12 @@ fn restore_engine(project: &StoredProject) -> AppResult<Engine> {
     let realized_preview = required_routing(routing.realized_preview_id, "realized preview")?;
     let mut show = ShowState::new(
         canonical.name(),
-        inputs.clone(),
+        inputs,
         main_mix.desired_program,
         main_mix.desired_preview,
     )?;
-    let mut realized = SwitcherState::new(inputs, realized_program, realized_preview)?;
+    restore_input_audio_strips(&mut show, canonical)?;
+    let mut realized = SwitcherState::new(input_ids, realized_program, realized_preview)?;
     for config in canonical.stingers() {
         restore_stinger(&mut show, &mut realized, *config)?;
     }
@@ -3572,7 +3583,8 @@ fn restore_engine(project: &StoredProject) -> AppResult<Engine> {
     }
     let fade_to_black = project.runtime_fade_to_black();
     show.restore_fade_to_black(fade_to_black.desired.target_active);
-    let _ = realized.set_fade_to_black(fade_to_black.realized.target_active);
+    realized.restore_settled_fade_to_black(fade_to_black.realized.target_active);
+    restore_overlays(&mut show, &mut realized, project.runtime_overlays())?;
     let position = project.position();
     Ok(Engine::restore_persisted(
         show,
@@ -3630,6 +3642,37 @@ fn restore_stinger(
     Ok(())
 }
 
+fn restore_input_audio_strips(show: &mut ShowState, project: &fm_model::Project) -> AppResult<()> {
+    for strip in project.input_audio_strips() {
+        show.set_input_audio_strip(
+            strip.input,
+            EngineInputAudioStripState {
+                gain_millidb: strip.state.gain.get(),
+                balance_basis_points: strip.state.balance.get(),
+                muted: strip.state.muted,
+                soloed: strip.state.soloed,
+                follow_video: strip.state.follow_video,
+                delay_samples: strip.state.delay_samples.get(),
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn model_audio_strip_state(state: EngineInputAudioStripState) -> InputAudioStripState {
+    InputAudioStripState {
+        gain: InputGainMilliDb::new(state.gain_millidb)
+            .expect("engine input audio gain is bounded by the model contract"),
+        balance: InputBalanceBasisPoints::new(state.balance_basis_points)
+            .expect("engine input audio balance is bounded by the model contract"),
+        muted: state.muted,
+        soloed: state.soloed,
+        follow_video: state.follow_video,
+        delay_samples: InputDelaySamples::new(state.delay_samples)
+            .expect("engine input audio delay is bounded by the model contract"),
+    }
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn handle_client(
     stream: TcpStream,
@@ -3660,53 +3703,41 @@ fn handle_client(
     else {
         return Ok(());
     };
-    let (hello, wire_handshake) = match first {
-        WireMessage::ClientHello(hello) => (hello, WireHandshake::Legacy),
-        WireMessage::HandshakeRequest(request) => {
-            current_handshake(&request, control, durable.project().id())
-        }
-        _ => {
-            write_error(
-                &mut writer,
-                "handshake_required",
-                "first message must be client_hello or handshake_request",
-            )?;
-            return Ok(());
-        }
+    let (hello, handshake_outcome) = if let WireMessage::HandshakeRequest(request) = first {
+        current_handshake(&request, control, durable.project().id())
+    } else {
+        write_error(
+            &mut writer,
+            "handshake_required",
+            "first message must be handshake_request",
+        )?;
+        return Ok(());
     };
 
     let handshake = match server.handshake(&hello, principal, now_millis()?) {
         Ok(handshake) => handshake,
         Err(error) => {
-            match wire_handshake {
-                WireHandshake::Legacy => {
-                    write_error(&mut writer, handshake_code(&error), &error.to_string())?;
-                }
-                WireHandshake::Current(_) => write_message(
-                    &mut writer,
-                    &WireMessage::HandshakeResponse(rejected_handshake_response(
-                        server,
-                        control,
-                        durable.project().id(),
-                        &hello,
-                        handshake_code(&error),
-                        &error.to_string(),
-                    )),
-                )?,
-            }
+            write_message(
+                &mut writer,
+                &WireMessage::HandshakeResponse(rejected_handshake_response(
+                    server,
+                    control,
+                    durable.project().id(),
+                    &hello,
+                    handshake_code(&error),
+                    &error.to_string(),
+                )),
+            )?;
             return Ok(());
         }
     };
     let mut session = handshake.session;
     let session_identity = server_identity(&handshake.server_hello, durable.project().id());
-    let response = match wire_handshake {
-        WireHandshake::Legacy => WireMessage::ServerHello(handshake.server_hello),
-        WireHandshake::Current(outcome) => WireMessage::HandshakeResponse(handshake_response(
-            &handshake.server_hello,
-            session_identity.clone(),
-            reconciled_handshake_outcome(outcome, &handshake.sync),
-        )),
-    };
+    let response = WireMessage::HandshakeResponse(handshake_response(
+        &handshake.server_hello,
+        session_identity.clone(),
+        reconciled_handshake_outcome(handshake_outcome, &handshake.sync),
+    ));
     write_session_message(&mut writer, &mut session, &response)?;
     match handshake.sync {
         SyncPayload::Snapshot(snapshot) => {
@@ -3779,11 +3810,6 @@ fn read_client_message(
     }
 }
 
-enum WireHandshake {
-    Legacy,
-    Current(ProtocolHandshakeOutcome),
-}
-
 fn reconciled_handshake_outcome(
     outcome: ProtocolHandshakeOutcome,
     sync: &SyncPayload,
@@ -3803,7 +3829,7 @@ fn current_handshake(
     request: &HandshakeRequest,
     control: &SharedControl,
     project_id: ProjectId,
-) -> (ClientHello, WireHandshake) {
+) -> (HandshakeRequest, ProtocolHandshakeOutcome) {
     let diagnostics = control.borrow().diagnostics();
     let server = ServerIdentity {
         engine_id: diagnostics.engine.engine_id.clone(),
@@ -3820,22 +3846,11 @@ fn current_handshake(
         available_from_revision,
         request.resume_cursor.as_ref(),
     );
-    let cached_cursor = match &outcome {
-        ProtocolHandshakeOutcome::Resume { cursor } => Some(event_cursor(cursor)),
-        ProtocolHandshakeOutcome::Snapshot { .. } | ProtocolHandshakeOutcome::Rejected { .. } => {
-            None
-        }
-    };
-    (
-        ClientHello {
-            versions: request.versions.clone(),
-            build: request.build.clone(),
-            client_type: request.client_type,
-            desired_role: request.desired_role,
-            cached_cursor,
-        },
-        WireHandshake::Current(outcome),
-    )
+    let mut reconciled = request.clone();
+    if !matches!(outcome, ProtocolHandshakeOutcome::Resume { .. }) {
+        reconciled.resume_cursor = None;
+    }
+    (reconciled, outcome)
 }
 
 fn handshake_response(
@@ -3844,7 +3859,7 @@ fn handshake_response(
     outcome: ProtocolHandshakeOutcome,
 ) -> HandshakeResponse {
     HandshakeResponse {
-        negotiated: hello.negotiated,
+        protocol: hello.protocol,
         granted_role: hello.granted_role,
         permissions: hello.permissions.clone(),
         capabilities: CapabilityReportSummary {
@@ -3864,17 +3879,13 @@ fn rejected_handshake_response(
     server: &Server<ControlHandle>,
     control: &SharedControl,
     project_id: ProjectId,
-    hello: &ClientHello,
+    hello: &HandshakeRequest,
     code: &str,
     message: &str,
 ) -> HandshakeResponse {
     let diagnostics = control.borrow().diagnostics();
     HandshakeResponse {
-        negotiated: fm_protocol::negotiate_version(
-            &hello.versions,
-            &server.config().supported_versions,
-        )
-        .unwrap_or(PROTOCOL_VERSION),
+        protocol: PROTOCOL_VERSION,
         granted_role: hello.desired_role,
         permissions: Vec::new(),
         capabilities: CapabilityReportSummary {
@@ -4309,7 +4320,7 @@ fn execute_durable_command_with_ticks(
     };
 
     let ticks = if prepared.submission().is_accepted() {
-        command_ticks(command)
+        command_ticks(command, &prepared)
     } else {
         0
     };
@@ -4331,7 +4342,10 @@ fn execute_durable_command_with_ticks(
     })
 }
 
-fn command_ticks(command: &CommandMessage) -> u32 {
+fn command_ticks(
+    command: &CommandMessage,
+    prepared: &fm_control::PreparedSubmission<'_, Policy>,
+) -> u32 {
     match command.payload {
         CommandPayload::Fade { duration_frames }
         | CommandPayload::AlphaFade { duration_frames }
@@ -4344,10 +4358,22 @@ fn command_ticks(command: &CommandMessage) -> u32 {
         | CommandPayload::FadeToBlack {
             duration_frames, ..
         } => duration_frames,
-        CommandPayload::SelectPreview { .. }
+        CommandPayload::TakeOverlay { channel, .. } | CommandPayload::OverlayOff { channel } => {
+            let channel =
+                OverlayChannelId::new(channel.number()).expect("wire overlay channels are bounded");
+            prepared.overlay_transition_ticks(channel)
+        }
+        CommandPayload::SetInputAudioStrip { .. }
+        | CommandPayload::SelectPreview { .. }
         | CommandPayload::Cut
         | CommandPayload::ConfigureStinger { .. }
         | CommandPayload::RemoveStinger { .. }
+        | CommandPayload::UpdateOverlay { .. }
+        | CommandPayload::SetOverlayOutputInclusion { .. }
+        | CommandPayload::ConfigureOverlayTransition { .. }
+        | CommandPayload::ConfigureOverlayAppearance { .. }
+        | CommandPayload::QueueOverlay { .. }
+        | CommandPayload::TakeNextOverlay { .. }
         | CommandPayload::StartManualTransition { .. }
         | CommandPayload::SetManualTransitionPosition { .. }
         | CommandPayload::CommitManualTransition
@@ -4408,8 +4434,15 @@ fn stored_project_with_receipts(
     let realized = snapshot.realized_switcher();
     let mut project = durable.project().clone();
     project.set_main_mix(MainMix::new(desired.program(), desired.preview()));
+    for (&input, &state) in show.input_audio_strips() {
+        if !project.set_input_audio_strip(input, model_audio_strip_state(state)) {
+            return Err(
+                AppFailure(format!("project is missing audio strip for input {input}")).into(),
+            );
+        }
+    }
     sync_project_stingers(&mut project, desired, realized)?;
-    StoredProject::from_project_with_runtime_state(
+    StoredProject::from_project_with_complete_runtime_state(
         project,
         RuntimeRouting {
             desired_program_id: Some(desired.program()),
@@ -4425,6 +4458,7 @@ fn stored_project_with_receipts(
             desired: persisted_fade_to_black(snapshot.desired_fade_to_black()),
             realized: persisted_fade_to_black(snapshot.realized_fade_to_black()),
         },
+        persisted_overlays(desired, realized),
         ProjectPosition {
             revision: snapshot.revision().get(),
             state_epoch: snapshot.state_epoch().get(),
@@ -4436,6 +4470,114 @@ fn stored_project_with_receipts(
         receipts,
     )
     .map_err(Into::into)
+}
+
+fn persisted_overlays(desired: &SwitcherState, realized: &SwitcherState) -> RuntimeOverlays {
+    RuntimeOverlays {
+        desired: std::array::from_fn(|index| persisted_overlay(&desired.overlays()[index])),
+        realized: std::array::from_fn(|index| persisted_overlay(&realized.overlays()[index])),
+    }
+}
+
+fn persisted_overlay(channel: &OverlayChannelState) -> RuntimeOverlayChannel {
+    RuntimeOverlayChannel {
+        source: channel.source(),
+        active: channel.is_active(),
+        transition: match channel.transition() {
+            OverlayTransitionKind::Cut => RuntimeOverlayTransition::Cut,
+            OverlayTransitionKind::Fade => RuntimeOverlayTransition::Fade,
+        },
+        duration_frames: channel.duration_frames(),
+        position: persisted_overlay_position(channel.position()),
+        border: persisted_overlay_border(channel.border()),
+        queued_sources: channel.queued_sources().to_vec(),
+        included_outputs: channel.included_outputs().to_vec(),
+    }
+}
+
+fn persisted_overlay_position(position: OverlayPositionPreset) -> RuntimeOverlayPosition {
+    match position {
+        OverlayPositionPreset::FullFrame => RuntimeOverlayPosition::FullFrame,
+        OverlayPositionPreset::TopLeft => RuntimeOverlayPosition::TopLeft,
+        OverlayPositionPreset::TopRight => RuntimeOverlayPosition::TopRight,
+        OverlayPositionPreset::BottomLeft => RuntimeOverlayPosition::BottomLeft,
+        OverlayPositionPreset::BottomRight => RuntimeOverlayPosition::BottomRight,
+    }
+}
+
+fn restored_overlay_position(position: RuntimeOverlayPosition) -> OverlayPositionPreset {
+    match position {
+        RuntimeOverlayPosition::FullFrame => OverlayPositionPreset::FullFrame,
+        RuntimeOverlayPosition::TopLeft => OverlayPositionPreset::TopLeft,
+        RuntimeOverlayPosition::TopRight => OverlayPositionPreset::TopRight,
+        RuntimeOverlayPosition::BottomLeft => OverlayPositionPreset::BottomLeft,
+        RuntimeOverlayPosition::BottomRight => OverlayPositionPreset::BottomRight,
+    }
+}
+
+fn persisted_overlay_border(border: OverlayBorderPreset) -> RuntimeOverlayBorder {
+    match border {
+        OverlayBorderPreset::None => RuntimeOverlayBorder::None,
+        OverlayBorderPreset::ThinWhite => RuntimeOverlayBorder::ThinWhite,
+        OverlayBorderPreset::ThickWhite => RuntimeOverlayBorder::ThickWhite,
+    }
+}
+
+fn restored_overlay_border(border: RuntimeOverlayBorder) -> OverlayBorderPreset {
+    match border {
+        RuntimeOverlayBorder::None => OverlayBorderPreset::None,
+        RuntimeOverlayBorder::ThinWhite => OverlayBorderPreset::ThinWhite,
+        RuntimeOverlayBorder::ThickWhite => OverlayBorderPreset::ThickWhite,
+    }
+}
+
+fn restore_overlays(
+    show: &mut ShowState,
+    realized: &mut SwitcherState,
+    overlays: &RuntimeOverlays,
+) -> AppResult<()> {
+    for (index, (desired, realized_state)) in
+        overlays.desired.iter().zip(&overlays.realized).enumerate()
+    {
+        let channel = OverlayChannelId::from_index(index).expect("overlay index is bounded");
+        restore_overlay(show.desired_switcher_mut(), channel, desired)?;
+        restore_overlay(realized, channel, realized_state)?;
+    }
+    Ok(())
+}
+
+fn restore_overlay(
+    switcher: &mut SwitcherState,
+    channel: OverlayChannelId,
+    state: &RuntimeOverlayChannel,
+) -> AppResult<()> {
+    switcher.configure_overlay_transition(
+        channel,
+        match state.transition {
+            RuntimeOverlayTransition::Cut => OverlayTransitionKind::Cut,
+            RuntimeOverlayTransition::Fade => OverlayTransitionKind::Fade,
+        },
+        state.duration_frames,
+    )?;
+    let _ = switcher.configure_overlay_appearance(
+        channel,
+        restored_overlay_position(state.position),
+        restored_overlay_border(state.border),
+    );
+    if let Some(source) = state.source {
+        if state.active {
+            switcher.take_overlay(channel, source)?;
+        } else {
+            switcher.update_overlay(channel, source)?;
+        }
+    }
+    for source in &state.queued_sources {
+        switcher.queue_overlay(channel, *source)?;
+    }
+    for output in &state.included_outputs {
+        let _ = switcher.set_overlay_output_inclusion(channel, *output, true);
+    }
+    Ok(())
 }
 
 fn sync_project_stingers(
@@ -4643,9 +4785,7 @@ fn session_rejection(
 ) -> CommandResult {
     let (code, retryable) = match error {
         SessionError::Authorization(_) => ("permission_denied", false),
-        SessionError::ProtocolMismatch { .. } | SessionError::UnsupportedCommandVersion { .. } => {
-            ("protocol_mismatch", false)
-        }
+        SessionError::ProtocolMismatch { .. } => ("protocol_mismatch", false),
         SessionError::CommandTooLarge { .. }
         | SessionError::TooManyInflightCommands
         | SessionError::InboundRateLimited
@@ -4667,8 +4807,7 @@ fn write_session_message(
     session: &mut Session,
     message: &WireMessage,
 ) -> AppResult<()> {
-    let compatible = message.compatible_with(session.negotiated_version());
-    let line = encode_line(&compatible)?;
+    let line = encode_line(message)?;
     session.queue_outbound(line.len(), now_millis()?)?;
     write_client_bytes(writer, line.as_bytes())?;
     session.outbound_delivered()?;
@@ -4716,7 +4855,7 @@ fn client_write_error(error: std::io::Error) -> Box<dyn Error> {
 
 fn handshake_code(error: &HandshakeError<Infallible>) -> &'static str {
     match error {
-        HandshakeError::IncompatibleVersion => "incompatible_version",
+        HandshakeError::ProtocolMismatch => "protocol_mismatch",
         HandshakeError::NotReady(_) => "not_ready",
         HandshakeError::DevelopmentPrincipalDenied | HandshakeError::RoleDenied(_) => {
             "permission_denied"
@@ -4869,8 +5008,8 @@ mod tests {
     #[cfg(all(feature = "native-media", target_os = "macos"))]
     use fm_io_macos::{CameraIdKind, deterministic_camera_id};
     use fm_model::{
-        Input, InputAudioStripState, InputGainMilliDb, InputKind, Project, ProjectSettings,
-        SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, StingerConfig,
+        Input, InputAudioStripState, InputBalanceBasisPoints, InputGainMilliDb, InputKind, Project,
+        ProjectSettings, SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, StingerConfig,
         StingerSlotNumber,
     };
     #[cfg(feature = "native-media")]
@@ -7076,13 +7215,10 @@ mod tests {
     #[test]
     fn native_stinger_retirement_preflight_gate_is_bounded() {
         let retirements = NativeStingerRetirements::start().unwrap();
-        retirements
-            .pending
-            .store(NATIVE_STINGER_RETIREMENT_LIMIT - 1, AtomicOrdering::Release);
+        let limit = stinger_mutation::retirement_limit_for_test();
+        retirements.set_pending_for_test(limit - 1);
         assert!(retirements.can_accept());
-        retirements
-            .pending
-            .store(NATIVE_STINGER_RETIREMENT_LIMIT, AtomicOrdering::Release);
+        retirements.set_pending_for_test(limit);
         assert!(!retirements.can_accept());
     }
 
@@ -7125,11 +7261,11 @@ mod tests {
             path: PathBuf::from("/secret/stinger.mov"),
         };
         validate_native_stinger_sources(&durable, std::slice::from_ref(&local)).unwrap();
-        assert!(native_stinger_requires_ffmpeg(
+        assert!(stinger_mutation::native_stinger_requires_ffmpeg(
             &durable,
             std::slice::from_ref(&local)
         ));
-        assert!(!native_stinger_requires_ffmpeg(
+        assert!(!stinger_mutation::native_stinger_requires_ffmpeg(
             &baseline,
             std::slice::from_ref(&local)
         ));
@@ -7187,7 +7323,10 @@ mod tests {
         )
         .unwrap();
         validate_native_stinger_sources(&deferred, std::slice::from_ref(&local)).unwrap();
-        assert!(!native_stinger_requires_ffmpeg(&deferred, &[local]));
+        assert!(!stinger_mutation::native_stinger_requires_ffmpeg(
+            &deferred,
+            &[local]
+        ));
     }
 
     #[test]
@@ -7408,6 +7547,50 @@ mod tests {
     }
 
     #[test]
+    fn audio_strip_command_checkpoints_every_control() {
+        let mut durable = test_project();
+        let mut control = test_control(&durable);
+        let server = test_server(&control);
+        execute_durable_command(
+            &mut control,
+            &CountingSaver::default(),
+            &mut durable,
+            &operator(),
+            &server,
+            &test_command(
+                "audio-strip",
+                "audio-strip-key",
+                CommandPayload::SetInputAudioStrip {
+                    input: fm_protocol::WireInputId::from_domain(test_input_id(1)),
+                    gain_millidb: -9_000,
+                    balance_basis_points: 2_500,
+                    muted: true,
+                    soloed: true,
+                    follow_video: false,
+                    delay_samples: 1_200,
+                },
+            ),
+            0,
+        )
+        .unwrap();
+        control.tick(&server).unwrap();
+
+        let checkpoint =
+            stored_project_checkpoint(&durable, &control.idle_engine_snapshot().unwrap()).unwrap();
+        assert_eq!(
+            checkpoint.project().input_audio_strip(test_input_id(1)),
+            Some(InputAudioStripState {
+                gain: InputGainMilliDb::new(-9_000).unwrap(),
+                balance: InputBalanceBasisPoints::new(2_500).unwrap(),
+                muted: true,
+                soloed: true,
+                follow_video: false,
+                delay_samples: InputDelaySamples::new(1_200).unwrap(),
+            })
+        );
+    }
+
+    #[test]
     fn authorization_denial_is_saved_before_becoming_replayable() {
         let mut durable = test_project();
         let mut control = test_control(&durable);
@@ -7569,7 +7752,10 @@ mod tests {
             test_input_id(1),
             InputAudioStripState {
                 gain: InputGainMilliDb::new(-3_000).unwrap(),
+                balance: InputBalanceBasisPoints::CENTER,
+                delay_samples: Default::default(),
                 muted: false,
+                soloed: false,
                 follow_video: true,
             },
         ));

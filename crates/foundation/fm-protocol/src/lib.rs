@@ -10,21 +10,16 @@ pub use codec::{
     encode_line,
 };
 pub use dto::{
-    CapabilityReportMessage, CapabilityReportSummary, ClientHello, ClientType, CommandMessage,
-    CommandPayload, CommandResult, DurableEvent, DurableEventBatch, DurableGap, EngineIdentity,
-    ErrorMessage, EventCursor, EventMessage, EventPayload, FadeToBlackPosition, FadeToBlackState,
-    FieldIssue, HandshakeOutcome, HandshakeRequest, HandshakeResponse, HeartbeatMessage,
-    ManualTransitionKind, ManualTransitionPosition, ManualTransitionState, ManualTransitionStatus,
-    ResumeCursor, Role, RuntimeDomainBoundary, RuntimeEventMessage, RuntimeFailureDisposition,
-    RuntimeLifecycleEvent, ServerHello, ServerIdentity, SnapshotMessage, SnapshotReason,
-    StingerAudioPolicy, StingerMissingMediaFallback, StingerReadiness, StingerStatus,
-    StructuredError, WireInputId, WireMessage, WireStingerSlotId, choose_handshake_outcome,
+    CapabilityReportMessage, CapabilityReportSummary, ClientType, CommandMessage, CommandPayload,
+    CommandResult, DurableEvent, DurableEventBatch, DurableGap, EngineIdentity, ErrorMessage,
+    EventCursor, EventMessage, EventPayload, FadeToBlackPosition, FadeToBlackState, FieldIssue,
+    HandshakeOutcome, HandshakeRequest, HandshakeResponse, HeartbeatMessage, InputAudioStripStatus,
+    InputStatus, ManualTransitionKind, ManualTransitionPosition, ManualTransitionState,
+    ManualTransitionStatus, OverlayBorderPreset, OverlayPositionPreset, OverlayStatus,
+    OverlayTransitionKind, ResumeCursor, Role, RuntimeDomainBoundary, RuntimeEventMessage,
+    RuntimeFailureDisposition, RuntimeLifecycleEvent, ServerHello, ServerIdentity, SnapshotMessage,
+    SnapshotReason, StingerAudioPolicy, StingerMissingMediaFallback, StingerReadiness,
+    StingerStatus, StructuredError, WireInputId, WireMessage, WireOutputId, WireOverlayChannelId,
+    WireStingerSlotId, choose_handshake_outcome,
 };
-pub use version::{
-    ALPHA_FADE_PROTOCOL_VERSION, BASE_PROTOCOL_VERSION, CURRENT_PROTOCOL_VERSION,
-    FADE_TO_BLACK_PROTOCOL_VERSION, MANUAL_ALPHA_FADE_PROTOCOL_VERSION,
-    MANUAL_TRANSITION_PROTOCOL_VERSION, NegotiationError, ProtocolVersion, SLIDE_PROTOCOL_VERSION,
-    STINGER_CONFIGURATION_PROTOCOL_VERSION, STINGER_PROTOCOL_VERSION,
-    STINGER_STATUS_PROTOCOL_VERSION, WIPE_PROTOCOL_VERSION, ZOOM_PROTOCOL_VERSION,
-    negotiate_version,
-};
+pub use version::{CURRENT_PROTOCOL_VERSION, ProtocolVersion};

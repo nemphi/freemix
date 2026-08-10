@@ -1,18 +1,7 @@
-use std::{
-    collections::BTreeSet,
-    error::Error,
-    fmt,
-    num::{NonZeroU64, NonZeroU128},
-};
+use std::{collections::BTreeSet, error::Error, fmt};
 
-use fm_model::{
-    Input, InputKind, MainMix, Project, ProjectSettings, SimulatedAudio, SimulatedInput,
-    SimulatedVideo, SolidColor, ValidationError,
-};
-use fm_types::{
-    AudioFormat, ChannelLayout, ColorMetadata, FrameRate, InputId, PixelFormat, ProjectId,
-    SampleFormat, SampleRate, ScanMode, VideoDimensions, VideoFormat,
-};
+use fm_model::{Project, ValidationError};
+use fm_types::{InputId, OutputId};
 
 pub const CURRENT_SCHEMA_VERSION: u32 = fm_model::CURRENT_SCHEMA_VERSION.get();
 
@@ -118,22 +107,76 @@ pub struct RuntimeFadeToBlack {
     pub realized: FadeToBlackState,
 }
 
-/// Legacy 64-bit routing view retained while existing applications migrate.
+pub const OVERLAY_CHANNEL_COUNT: usize = 8;
+pub const MAX_OVERLAY_TRANSITION_DURATION_FRAMES: u32 = 3_600;
+pub const MAX_OVERLAY_QUEUE_DEPTH: usize = 64;
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct ProjectRouting {
-    pub desired_program_id: Option<NonZeroU64>,
-    pub realized_program_id: Option<NonZeroU64>,
-    pub desired_preview_id: Option<NonZeroU64>,
-    pub realized_preview_id: Option<NonZeroU64>,
+pub enum RuntimeOverlayTransition {
+    #[default]
+    Cut,
+    Fade,
 }
 
-impl From<ProjectRouting> for RuntimeRouting {
-    fn from(value: ProjectRouting) -> Self {
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RuntimeOverlayPosition {
+    #[default]
+    FullFrame,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RuntimeOverlayBorder {
+    #[default]
+    None,
+    ThinWhite,
+    ThickWhite,
+}
+
+/// Complete desired/realized state for one downstream overlay channel.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeOverlayChannel {
+    pub source: Option<InputId>,
+    pub active: bool,
+    pub transition: RuntimeOverlayTransition,
+    pub duration_frames: u32,
+    pub position: RuntimeOverlayPosition,
+    pub border: RuntimeOverlayBorder,
+    pub queued_sources: Vec<InputId>,
+    pub included_outputs: Vec<OutputId>,
+}
+
+impl RuntimeOverlayChannel {
+    #[must_use]
+    pub const fn empty() -> Self {
         Self {
-            desired_program_id: value.desired_program_id.map(legacy_input_id),
-            realized_program_id: value.realized_program_id.map(legacy_input_id),
-            desired_preview_id: value.desired_preview_id.map(legacy_input_id),
-            realized_preview_id: value.realized_preview_id.map(legacy_input_id),
+            source: None,
+            active: false,
+            transition: RuntimeOverlayTransition::Cut,
+            duration_frames: 1,
+            position: RuntimeOverlayPosition::FullFrame,
+            border: RuntimeOverlayBorder::None,
+            queued_sources: Vec::new(),
+            included_outputs: Vec::new(),
+        }
+    }
+}
+
+/// Exact desired and realized overlay state at an idle checkpoint.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeOverlays {
+    pub desired: [RuntimeOverlayChannel; OVERLAY_CHANNEL_COUNT],
+    pub realized: [RuntimeOverlayChannel; OVERLAY_CHANNEL_COUNT],
+}
+
+impl Default for RuntimeOverlays {
+    fn default() -> Self {
+        Self {
+            desired: std::array::from_fn(|_| RuntimeOverlayChannel::empty()),
+            realized: std::array::from_fn(|_| RuntimeOverlayChannel::empty()),
         }
     }
 }
@@ -234,6 +277,7 @@ pub struct StoredProject {
     routing: RuntimeRouting,
     manual_transitions: RuntimeManualTransitions,
     fade_to_black: RuntimeFadeToBlack,
+    overlays: RuntimeOverlays,
     position: ProjectPosition,
     idempotency_receipts: Vec<IdempotencyReceipt>,
 }
@@ -295,6 +339,32 @@ impl StoredProject {
         manual_transitions: RuntimeManualTransitions,
         fade_to_black: RuntimeFadeToBlack,
         position: ProjectPosition,
+        idempotency_receipts: Vec<IdempotencyReceipt>,
+    ) -> Result<Self, ProjectValidationError> {
+        Self::from_project_with_complete_runtime_state(
+            project,
+            routing,
+            manual_transitions,
+            fade_to_black,
+            RuntimeOverlays::default(),
+            position,
+            idempotency_receipts,
+        )
+    }
+
+    /// Creates a manifest using the complete current runtime contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error when project references or persisted runtime
+    /// state do not satisfy the current schema.
+    pub fn from_project_with_complete_runtime_state(
+        project: Project,
+        routing: RuntimeRouting,
+        manual_transitions: RuntimeManualTransitions,
+        fade_to_black: RuntimeFadeToBlack,
+        overlays: RuntimeOverlays,
+        position: ProjectPosition,
         mut idempotency_receipts: Vec<IdempotencyReceipt>,
     ) -> Result<Self, ProjectValidationError> {
         idempotency_receipts.sort_by(|left, right| left.key.cmp(&right.key));
@@ -303,41 +373,12 @@ impl StoredProject {
             routing,
             manual_transitions,
             fade_to_black,
+            overlays,
             position,
             idempotency_receipts,
         };
         stored.validate()?;
         Ok(stored)
-    }
-
-    /// Legacy constructor that deterministically synthesizes a simulated current project.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProjectValidationError`] for an unsupported schema or invalid state.
-    pub fn new(
-        schema_version: u32,
-        project_id: NonZeroU64,
-        show_name: impl Into<String>,
-        input_ids: Vec<NonZeroU64>,
-        routing: ProjectRouting,
-        position: ProjectPosition,
-        idempotency_receipts: Vec<IdempotencyReceipt>,
-    ) -> Result<Self, ProjectValidationError> {
-        if schema_version != CURRENT_SCHEMA_VERSION {
-            return Err(ProjectValidationError::UnsupportedSchema {
-                found: schema_version,
-                supported: CURRENT_SCHEMA_VERSION,
-            });
-        }
-        let routing = RuntimeRouting::from(routing);
-        let project = synthesize_project(
-            ProjectId::new(NonZeroU128::from(project_id)),
-            show_name.into(),
-            input_ids.into_iter().map(legacy_input_id).collect(),
-            routing,
-        );
-        Self::from_project(project, routing, position, idempotency_receipts)
     }
 
     /// Revalidates all manifest invariants.
@@ -383,6 +424,7 @@ impl StoredProject {
 
         self.validate_manual_transitions()?;
         self.validate_fade_to_black()?;
+        self.validate_overlays()?;
 
         let mut keys = BTreeSet::new();
         for receipt in &self.idempotency_receipts {
@@ -476,6 +518,74 @@ impl StoredProject {
         Ok(())
     }
 
+    fn validate_overlays(&self) -> Result<(), ProjectValidationError> {
+        if self.overlays.desired != self.overlays.realized {
+            return Err(ProjectValidationError::OverlayCheckpointMismatch);
+        }
+        for (index, channel) in self.overlays.desired.iter().enumerate() {
+            if !(1..=MAX_OVERLAY_TRANSITION_DURATION_FRAMES).contains(&channel.duration_frames) {
+                return Err(ProjectValidationError::InvalidOverlayTransitionDuration {
+                    channel: index + 1,
+                    duration_frames: channel.duration_frames,
+                });
+            }
+            if channel.active && channel.source.is_none() {
+                return Err(ProjectValidationError::ActiveOverlayMissingSource {
+                    channel: index + 1,
+                });
+            }
+            if let Some(source) = channel.source
+                && !self.project.inputs().iter().any(|input| input.id == source)
+            {
+                return Err(ProjectValidationError::MissingOverlayInput {
+                    channel: index + 1,
+                    input: source,
+                });
+            }
+            if channel.queued_sources.len() > MAX_OVERLAY_QUEUE_DEPTH {
+                return Err(ProjectValidationError::OverlayQueueTooDeep {
+                    channel: index + 1,
+                    depth: channel.queued_sources.len(),
+                    maximum: MAX_OVERLAY_QUEUE_DEPTH,
+                });
+            }
+            for source in &channel.queued_sources {
+                if !self
+                    .project
+                    .inputs()
+                    .iter()
+                    .any(|input| input.id == *source)
+                {
+                    return Err(ProjectValidationError::MissingOverlayInput {
+                        channel: index + 1,
+                        input: *source,
+                    });
+                }
+            }
+            let mut outputs = BTreeSet::new();
+            for output in &channel.included_outputs {
+                if !self
+                    .project
+                    .outputs()
+                    .iter()
+                    .any(|candidate| candidate.id == *output)
+                {
+                    return Err(ProjectValidationError::MissingOverlayOutput {
+                        channel: index + 1,
+                        output: *output,
+                    });
+                }
+                if !outputs.insert(*output) {
+                    return Err(ProjectValidationError::DuplicateOverlayOutput {
+                        channel: index + 1,
+                        output: *output,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub const fn schema_version(&self) -> u32 {
         CURRENT_SCHEMA_VERSION
@@ -501,60 +611,14 @@ impl StoredProject {
         self.fade_to_black
     }
 
-    /// Returns the legacy project ID view.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the canonical ID does not fit the legacy 64-bit API.
     #[must_use]
-    pub fn project_id(&self) -> NonZeroU64 {
-        legacy_id(self.project.id().get(), "project")
+    pub const fn runtime_overlays(&self) -> &RuntimeOverlays {
+        &self.overlays
     }
 
     #[must_use]
     pub fn show_name(&self) -> &str {
         self.project.name()
-    }
-
-    /// Returns legacy 64-bit input IDs derived from the canonical project.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a canonical input ID does not fit the legacy 64-bit API.
-    #[must_use]
-    pub fn input_ids(&self) -> Vec<NonZeroU64> {
-        self.project
-            .inputs()
-            .iter()
-            .map(|input| legacy_id(input.id.get(), "input"))
-            .collect()
-    }
-
-    /// Returns the legacy 64-bit runtime routing view.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a routed input ID does not fit the legacy 64-bit API.
-    #[must_use]
-    pub fn routing(&self) -> ProjectRouting {
-        ProjectRouting {
-            desired_program_id: self
-                .routing
-                .desired_program_id
-                .map(|id| legacy_id(id.get(), "input")),
-            realized_program_id: self
-                .routing
-                .realized_program_id
-                .map(|id| legacy_id(id.get(), "input")),
-            desired_preview_id: self
-                .routing
-                .desired_preview_id
-                .map(|id| legacy_id(id.get(), "input")),
-            realized_preview_id: self
-                .routing
-                .realized_preview_id
-                .map(|id| legacy_id(id.get(), "input")),
-        }
     }
 
     #[must_use]
@@ -566,64 +630,6 @@ impl StoredProject {
     pub fn idempotency_receipts(&self) -> &[IdempotencyReceipt] {
         &self.idempotency_receipts
     }
-}
-
-fn synthesize_project(
-    id: ProjectId,
-    name: String,
-    input_ids: Vec<InputId>,
-    routing: RuntimeRouting,
-) -> Project {
-    let frame_rate = FrameRate::new(60_000, 1_001).expect("legacy frame rate is valid");
-    let settings = ProjectSettings {
-        frame_rate,
-        video: VideoFormat {
-            dimensions: VideoDimensions::new(1_920, 1_080).expect("legacy dimensions are valid"),
-            frame_rate,
-            pixel_format: PixelFormat::Nv12,
-            scan: ScanMode::Progressive,
-            color: ColorMetadata::default(),
-        },
-        audio: AudioFormat {
-            sample_rate: SampleRate::new(48_000).expect("legacy sample rate is valid"),
-            sample_format: SampleFormat::F32,
-            channels: ChannelLayout::stereo(),
-        },
-    };
-    let mut project = Project::new(id, name, settings);
-    for input_id in input_ids {
-        let value = input_id.get().get();
-        project.add_input(Input {
-            id: input_id,
-            name: format!("Input {value}"),
-            kind: InputKind::Simulated(SimulatedInput::new(
-                SimulatedVideo::Solid(SolidColor::new(
-                    u8::try_from(value.wrapping_mul(73) & 0xff).expect("value is masked to u8"),
-                    u8::try_from(value.wrapping_mul(151) & 0xff).expect("value is masked to u8"),
-                    u8::try_from(value.wrapping_mul(199) & 0xff).expect("value is masked to u8"),
-                    u8::MAX,
-                )),
-                SimulatedAudio::Silence,
-            )),
-            required_capabilities: Vec::new(),
-        });
-    }
-    if let (Some(program), Some(preview)) = (routing.desired_program_id, routing.desired_preview_id)
-        && program != preview
-    {
-        project.set_main_mix(MainMix::new(program, preview));
-    }
-    project
-}
-
-fn legacy_input_id(id: NonZeroU64) -> InputId {
-    InputId::new(NonZeroU128::from(id))
-}
-
-fn legacy_id(id: NonZeroU128, kind: &str) -> NonZeroU64 {
-    let value = u64::try_from(id.get())
-        .unwrap_or_else(|_| panic!("{kind} ID {id} exceeds the legacy 64-bit API"));
-    NonZeroU64::new(value).expect("a nonzero u128 remains nonzero after a successful conversion")
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -662,6 +668,31 @@ pub enum ProjectValidationError {
     InvalidRealizedManualTransitionInterval,
     UnsettledFadeToBlack,
     FadeToBlackCheckpointMismatch,
+    OverlayCheckpointMismatch,
+    InvalidOverlayTransitionDuration {
+        channel: usize,
+        duration_frames: u32,
+    },
+    ActiveOverlayMissingSource {
+        channel: usize,
+    },
+    MissingOverlayInput {
+        channel: usize,
+        input: InputId,
+    },
+    MissingOverlayOutput {
+        channel: usize,
+        output: OutputId,
+    },
+    DuplicateOverlayOutput {
+        channel: usize,
+        output: OutputId,
+    },
+    OverlayQueueTooDeep {
+        channel: usize,
+        depth: usize,
+        maximum: usize,
+    },
     EmptyIdempotencyKey,
     EmptyCommandId {
         key: String,
@@ -711,6 +742,36 @@ impl fmt::Display for ProjectValidationError {
             ),
             Self::FadeToBlackCheckpointMismatch => formatter.write_str(
                 "desired and realized fade-to-black state must match at an idle checkpoint",
+            ),
+            Self::OverlayCheckpointMismatch => formatter.write_str(
+                "desired and realized overlay state must match at an idle checkpoint",
+            ),
+            Self::InvalidOverlayTransitionDuration {
+                channel,
+                duration_frames,
+            } => write!(
+                formatter,
+                "overlay channel {channel} transition duration {duration_frames} is outside 1..={MAX_OVERLAY_TRANSITION_DURATION_FRAMES} frames"
+            ),
+            Self::ActiveOverlayMissingSource { channel } => {
+                write!(formatter, "active overlay channel {channel} has no source")
+            }
+            Self::MissingOverlayInput { channel, input } => {
+                write!(formatter, "overlay channel {channel} references missing input {input}")
+            }
+            Self::MissingOverlayOutput { channel, output } => {
+                write!(formatter, "overlay channel {channel} references missing output {output}")
+            }
+            Self::DuplicateOverlayOutput { channel, output } => {
+                write!(formatter, "overlay channel {channel} repeats output {output}")
+            }
+            Self::OverlayQueueTooDeep {
+                channel,
+                depth,
+                maximum,
+            } => write!(
+                formatter,
+                "overlay channel {channel} queue depth {depth} exceeds maximum {maximum}"
             ),
             Self::EmptyIdempotencyKey => formatter.write_str("idempotency key is blank"),
             Self::EmptyCommandId { key } => {

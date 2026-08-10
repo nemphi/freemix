@@ -22,9 +22,9 @@ use std::{
 };
 
 use fm_audio::{
-    AudioCadenceOrigin, AudioRenderPlan, AudioSilenceSpan, AudioSynchronizerLimits, ChannelMapping,
-    ClippingPolicy, ClockMappedAudioSynchronizer, InputState, MAX_CHANNEL_MAPPING_CHANNELS,
-    MasterAudioInterval, MasterMixer, PlanarAudioSource, SourceGain,
+    AudioCadenceOrigin, AudioRenderPlan, AudioSilenceSpan, AudioSynchronizerLimits, Balance,
+    ChannelMapping, ClippingPolicy, ClockMappedAudioSynchronizer, InputState,
+    MAX_CHANNEL_MAPPING_CHANNELS, MasterAudioInterval, MasterMixer, PlanarAudioSource, SourceGain,
 };
 use fm_clock::{
     ClockDomainId as MappingClockDomainId, ClockMapping, ClockSnapshot, ClockTime, FrameCadence,
@@ -62,8 +62,13 @@ use fm_model::{
     StingerAudioPolicy as ModelStingerAudioPolicy,
 };
 use fm_sim::{CollectingAudioSink, OverflowPolicy, SinkConfigError, SinkTelemetry};
-use fm_switcher::{FadeToBlackFrame, ProgramFrame, TransitionKind as SwitcherTransitionKind};
-use fm_types::{AudioFormat, FrameRate, InputId, SampleFormat, SceneId, TimeBase};
+use fm_switcher::{
+    FadeToBlackFrame, OverlayBorderPreset, OverlayPositionPreset, ProgramFrame,
+    TransitionKind as SwitcherTransitionKind,
+};
+use fm_types::{
+    AudioFormat, FrameRate, InputId, OutputId, SampleFormat, SceneId, TimeBase, VideoDimensions,
+};
 
 const RGBA16_FLOAT_BYTES_PER_PIXEL: u64 = 8;
 const NATIVE_PROJECT_IN_FLIGHT_SLOTS: usize = 1;
@@ -71,6 +76,8 @@ const SOURCE_REFILL_LOW_WATERMARK: usize = 4;
 const SOURCE_REFILL_MAX_PAGE: u32 = 4;
 const AUDIO_REFILL_LOW_WATERMARK: usize = 8;
 const MAX_NATIVE_AUDIO_STRIPS: usize = NativeSourceLimits::DEFAULT_MAX_MEDIA_INPUTS;
+/// Five milliseconds at the fixed 48 kHz project Master rate.
+const LIVE_INPUT_GAIN_RAMP_SAMPLES: usize = 240;
 
 /// Resource bounds applied while compiling native scenes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -265,6 +272,8 @@ pub struct NativeProjectPlan {
     audio_strips: BTreeMap<InputId, InputAudioStripState>,
     stingers: BTreeMap<fm_switcher::StingerSlotId, NativeStingerConfig>,
     frame_rate: FrameRate,
+    dimensions: VideoDimensions,
+    program_outputs: Vec<OutputId>,
     scenes: Vec<NativeScenePlan>,
     peak_rgba16f_targets: usize,
     transient_rgba16f_bytes: u64,
@@ -470,8 +479,17 @@ impl NativeProjectPlan {
             .iter()
             .filter_map(|config| video_routes.get(&config.media_input).copied())
             .collect::<Vec<_>>();
-        let peak_rgba16f_targets =
-            maximum_native_execution_peak(&video_routes, &stinger_routes, &scenes)?;
+        let program_outputs = project
+            .outputs()
+            .iter()
+            .map(|output| output.id)
+            .collect::<Vec<_>>();
+        let peak_rgba16f_targets = maximum_native_execution_peak(
+            &video_routes,
+            &stinger_routes,
+            &scenes,
+            program_outputs.len().max(1),
+        )?;
         let frame_bytes = u64::from(dimensions.width())
             .checked_mul(u64::from(dimensions.height()))
             .and_then(|pixels| pixels.checked_mul(RGBA16_FLOAT_BYTES_PER_PIXEL))
@@ -533,6 +551,8 @@ impl NativeProjectPlan {
                 .collect(),
             stingers,
             frame_rate: project.settings().frame_rate,
+            dimensions,
+            program_outputs,
             scenes,
             peak_rgba16f_targets,
             transient_rgba16f_bytes,
@@ -552,6 +572,24 @@ impl NativeProjectPlan {
     #[must_use]
     pub fn audio_strip(&self, input: InputId) -> Option<InputAudioStripState> {
         self.audio_strips.get(&input).copied()
+    }
+
+    /// Updates the exact-current strip controls used by subsequent native planning.
+    ///
+    /// # Errors
+    ///
+    /// Returns a missing-route error for an invalid input.
+    pub fn set_input_audio_strip(
+        &mut self,
+        input: InputId,
+        state: InputAudioStripState,
+    ) -> Result<(), NativeMasterError> {
+        let strip = self
+            .audio_strips
+            .get_mut(&input)
+            .ok_or(NativeMasterError::MissingAudioRoute { input })?;
+        *strip = state;
+        Ok(())
     }
 
     fn stinger(&self, slot: fm_switcher::StingerSlotId) -> Option<NativeStingerConfig> {
@@ -602,6 +640,12 @@ impl NativeProjectPlan {
         self.transient_rgba16f_bytes
     }
 
+    /// Returns every configured output in stable project order.
+    #[must_use]
+    pub fn output_ids(&self) -> &[OutputId] {
+        &self.program_outputs
+    }
+
     fn scene_execution(&self, inputs: &[InputId]) -> Option<NativeSceneExecution> {
         scene_execution_for_routes(
             inputs
@@ -610,27 +654,131 @@ impl NativeProjectPlan {
             &self.scenes,
         )
     }
+
+    fn program_overlays(frame: &FrameResult, output: OutputId) -> Vec<NativeProgramOverlay> {
+        frame
+            .overlays
+            .iter()
+            .filter(|overlay| overlay.is_active() && overlay.is_included_in(output))
+            .filter_map(|overlay| {
+                overlay.source().map(|input| NativeProgramOverlay {
+                    input,
+                    opacity: overlay.opacity(),
+                    position: overlay.position(),
+                    border: overlay.border(),
+                })
+            })
+            .collect()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeProgramOverlay {
+    input: InputId,
+    opacity: u8,
+    position: OverlayPositionPreset,
+    border: OverlayBorderPreset,
+}
+
+/// One independently realized, GPU-resident project output.
+pub struct NativeOutputFrame {
+    output: OutputId,
+    texture: NativeTexture,
+}
+
+impl NativeOutputFrame {
+    /// Returns the project output owning this realization.
+    #[must_use]
+    pub const fn output(&self) -> OutputId {
+        self.output
+    }
+
+    /// Returns the opaque native texture for presentation or encoding.
+    #[must_use]
+    pub const fn texture(&self) -> &NativeTexture {
+        &self.texture
+    }
+}
+
+fn overlay_transform(
+    dimensions: VideoDimensions,
+    position: OverlayPositionPreset,
+) -> Result<Transform, NativeSourceRenderError> {
+    let width = dimensions.width();
+    let height = dimensions.height();
+    let (x, y, scale_width, scale_height) = if position == OverlayPositionPreset::FullFrame {
+        (0, 0, width, height)
+    } else {
+        let scale_width = (width / 3).max(1);
+        let scale_height = (height / 3).max(1);
+        let margin = (width.min(height) / 32).max(1);
+        let left = margin.min(width.saturating_sub(scale_width));
+        let top = margin.min(height.saturating_sub(scale_height));
+        let right = width.saturating_sub(scale_width).saturating_sub(margin);
+        let bottom = height.saturating_sub(scale_height).saturating_sub(margin);
+        let (x, y) = match position {
+            OverlayPositionPreset::FullFrame => unreachable!(),
+            OverlayPositionPreset::TopLeft => (left, top),
+            OverlayPositionPreset::TopRight => (right, top),
+            OverlayPositionPreset::BottomLeft => (left, bottom),
+            OverlayPositionPreset::BottomRight => (right, bottom),
+        };
+        (x, y, scale_width, scale_height)
+    };
+    Ok(Transform::new(
+        i32::try_from(x).map_err(|_| NativeSourceRenderError::ResourceBounds)?,
+        i32::try_from(y).map_err(|_| NativeSourceRenderError::ResourceBounds)?,
+        scale_width,
+        scale_height,
+        CompositorRotation::Deg0,
+    ))
+}
+
+const fn overlay_border_width(border: OverlayBorderPreset, transform: Transform) -> u32 {
+    let minimum_dimension = if transform.scale_width < transform.scale_height {
+        transform.scale_width
+    } else {
+        transform.scale_height
+    };
+    match border {
+        OverlayBorderPreset::None => 0,
+        OverlayBorderPreset::ThinWhite => {
+            let scaled = minimum_dimension / 360;
+            if scaled < 1 { 1 } else { scaled }
+        }
+        OverlayBorderPreset::ThickWhite => {
+            let scaled = minimum_dimension / 120;
+            if scaled < 2 { 2 } else { scaled }
+        }
+    }
 }
 
 fn maximum_native_execution_peak(
     routes: &BTreeMap<InputId, NativeVideoRoute>,
     stinger_routes: &[NativeVideoRoute],
     scenes: &[NativeScenePlan],
+    output_count: usize,
 ) -> Result<usize, NativeProjectPlanError> {
     let routes = routes.values().copied().collect::<Vec<_>>();
-    let mut maximum = 3_usize;
+    let mut maximum = output_count
+        .checked_mul(2)
+        .and_then(|targets| targets.checked_add(2))
+        .ok_or(NativeProjectPlanError::TransientTargetCountOverflow)?;
+    let overlay_execution = scene_execution_for_routes(routes.iter().copied().map(Some), scenes)
+        .ok_or(NativeProjectPlanError::TransientTargetCountOverflow)?;
+    maximum = maximum.max(native_execution_peak(&overlay_execution, output_count)?);
     for primary in &routes {
         for secondary in &routes {
             let execution = scene_execution_for_routes([Some(*primary), Some(*secondary)], scenes)
                 .ok_or(NativeProjectPlanError::TransientTargetCountOverflow)?;
-            maximum = maximum.max(native_execution_peak(&execution)?);
+            maximum = maximum.max(native_execution_peak(&execution, output_count)?);
             for stinger in stinger_routes {
                 let execution = scene_execution_for_routes(
                     [Some(*primary), Some(*secondary), Some(*stinger)],
                     scenes,
                 )
                 .ok_or(NativeProjectPlanError::TransientTargetCountOverflow)?;
-                maximum = maximum.max(native_execution_peak(&execution)?);
+                maximum = maximum.max(native_execution_peak(&execution, output_count)?);
             }
         }
     }
@@ -677,15 +825,17 @@ fn scene_execution_for_routes(
 
 fn native_execution_peak(
     execution: &NativeSceneExecution,
+    output_count: usize,
 ) -> Result<usize, NativeProjectPlanError> {
-    // One fenced slot retains the full closure, its transition target, and the
-    // post-Program FTB target. The daemon also owns the previous Program target
-    // until the new frame returns.
+    // One fenced slot retains the full scene closure and shared Program base.
+    // Every configured output retains both its previous and newly rendered
+    // texture while the final output also has one composition target in flight.
     execution
         .required
         .len()
         .checked_add(NATIVE_PROJECT_IN_FLIGHT_SLOTS)
-        .and_then(|targets| targets.checked_add(1))
+        .and_then(|targets| targets.checked_add(output_count))
+        .and_then(|targets| targets.checked_add(output_count))
         .and_then(|targets| targets.checked_add(1))
         .ok_or(NativeProjectPlanError::TransientTargetCountOverflow)
 }
@@ -2815,6 +2965,13 @@ impl NativeMasterRuntime {
                     self.sources.insert(input, NativeAudioSource::silence());
                 }
             }
+            let delay = native_input_delay(project, input)?;
+            self.mixer
+                .set_input_delay(input, delay)
+                .map_err(|_| NativeMasterError::BoundsExceeded)?;
+            self.pending_mixer
+                .set_input_delay(input, delay)
+                .map_err(|_| NativeMasterError::BoundsExceeded)?;
         }
         let source_count = self.sources.len();
         if self.scratch.plans.capacity() < source_count {
@@ -2836,16 +2993,96 @@ impl NativeMasterRuntime {
         let states = self
             .sources
             .keys()
-            .map(|input| Ok((*input, native_input_state(project, *input)?)))
+            .map(|input| {
+                Ok((
+                    *input,
+                    native_input_state(project, *input)?,
+                    native_input_delay(project, *input)?,
+                ))
+            })
             .collect::<Result<Vec<_>, NativeMasterError>>()?;
         let mut mixer = self.mixer.clone();
         let mut pending_mixer = self.pending_mixer.clone();
-        for (input, state) in states {
+        for (input, state, delay) in states {
+            mixer
+                .set_input_delay(input, delay)
+                .map_err(|_| NativeMasterError::BoundsExceeded)?;
+            pending_mixer
+                .set_input_delay(input, delay)
+                .map_err(|_| NativeMasterError::BoundsExceeded)?;
             mixer.set_input_state(input, state, 0)?;
             pending_mixer.set_input_state(input, state, 0)?;
         }
         self.mixer = mixer;
         self.pending_mixer = pending_mixer;
+        Ok(())
+    }
+
+    /// Applies one scheduled strip update to the ordinary and clip-local
+    /// mixers as one preflighted transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns a missing-route or mixer resource-bound failure without changing
+    /// any mixer.
+    pub fn set_input_audio_strip(
+        &mut self,
+        input: InputId,
+        strip: InputAudioStripState,
+    ) -> Result<(), NativeMasterError> {
+        let delay = usize::try_from(strip.delay_samples.get())
+            .map_err(|_| NativeMasterError::BoundsExceeded)?;
+        let state = native_audio_input_state(strip)?;
+        if self.mixer.input_state(input).is_none() {
+            return Err(NativeMasterError::MissingAudioRoute { input });
+        }
+
+        let mut mixer = self.mixer.clone();
+        let mut pending_mixer = self.pending_mixer.clone();
+        mixer
+            .set_input_delay(input, delay)
+            .map_err(|_| NativeMasterError::BoundsExceeded)?;
+        pending_mixer
+            .set_input_delay(input, delay)
+            .map_err(|_| NativeMasterError::BoundsExceeded)?;
+        mixer.set_input_state(input, state, LIVE_INPUT_GAIN_RAMP_SAMPLES)?;
+        pending_mixer.set_input_state(input, state, LIVE_INPUT_GAIN_RAMP_SAMPLES)?;
+
+        let mut stinger_mixers = Vec::new();
+        if let Some(playback) = &self.stinger_audio {
+            for (&media, master) in &playback.masters {
+                if master.mixer.input_state(input).is_none() {
+                    continue;
+                }
+                let mut stinger_mixer = master.mixer.clone();
+                let mut stinger_pending_mixer = master.pending_mixer.clone();
+                stinger_mixer
+                    .set_input_delay(input, delay)
+                    .map_err(|_| NativeMasterError::BoundsExceeded)?;
+                stinger_pending_mixer
+                    .set_input_delay(input, delay)
+                    .map_err(|_| NativeMasterError::BoundsExceeded)?;
+                stinger_mixer.set_input_state(input, state, LIVE_INPUT_GAIN_RAMP_SAMPLES)?;
+                stinger_pending_mixer.set_input_state(
+                    input,
+                    state,
+                    LIVE_INPUT_GAIN_RAMP_SAMPLES,
+                )?;
+                stinger_mixers.push((media, stinger_mixer, stinger_pending_mixer));
+            }
+        }
+
+        self.mixer = mixer;
+        self.pending_mixer = pending_mixer;
+        if let Some(playback) = &mut self.stinger_audio {
+            for (media, mixer, pending_mixer) in stinger_mixers {
+                let Some(master) = playback.masters.get_mut(&media) else {
+                    return Err(NativeMasterError::InvalidFormat);
+                };
+                master.mixer = mixer;
+                master.pending_mixer = pending_mixer;
+            }
+        }
         Ok(())
     }
 
@@ -3750,6 +3987,15 @@ impl NativeStingerAudioRuntime {
                     continue;
                 }
                 let state = native_input_state(project, input)?;
+                let delay = native_input_delay(project, input)?;
+                stinger_master
+                    .mixer
+                    .set_input_delay(input, delay)
+                    .map_err(|_| NativeMasterError::BoundsExceeded)?;
+                stinger_master
+                    .pending_mixer
+                    .set_input_delay(input, delay)
+                    .map_err(|_| NativeMasterError::BoundsExceeded)?;
                 stinger_master.mixer.set_input_state(input, state, 0)?;
                 stinger_master
                     .pending_mixer
@@ -4531,6 +4777,10 @@ fn native_input_state(
     let state = project
         .audio_strip(input)
         .ok_or(NativeMasterError::MissingAudioRoute { input })?;
+    native_audio_input_state(state)
+}
+
+fn native_audio_input_state(state: InputAudioStripState) -> Result<InputState, NativeMasterError> {
     let milli_db = state.gain.get();
     let whole_db = i16::try_from(milli_db / 1_000).expect("persisted gain is bounded");
     let fractional_milli_db =
@@ -4539,9 +4789,22 @@ fn native_input_state(
         gain: fm_audio::Gain::from_db(
             f32::from(whole_db) + f32::from(fractional_milli_db) / 1_000.0,
         )?,
+        balance: Balance::from_basis_points(state.balance.get())
+            .ok_or(NativeMasterError::InvalidFormat)?,
         muted: state.muted,
+        soloed: state.soloed,
         follow_video: state.follow_video,
     })
+}
+
+fn native_input_delay(
+    project: &NativeProjectPlan,
+    input: InputId,
+) -> Result<usize, NativeMasterError> {
+    let state = project
+        .audio_strip(input)
+        .ok_or(NativeMasterError::MissingAudioRoute { input })?;
+    usize::try_from(state.delay_samples.get()).map_err(|_| NativeMasterError::BoundsExceeded)
 }
 
 fn native_audio_mix_plan(program: ProgramFrame) -> Result<NativeAudioMixPlan, NativeMasterError> {
@@ -6445,18 +6708,134 @@ impl NativeMediaRuntime {
         project: &NativeProjectPlan,
         frame: &FrameResult,
     ) -> Result<NativeTexture, NativeSourceRenderError> {
+        let output = project.output_ids().first().copied();
+        let mut rendered = self
+            .render_project_output_set_with_stingers(registry, stingers, project, frame, &[output])
+            .await?;
+        rendered
+            .pop()
+            .map(|(_, texture)| texture)
+            .ok_or(NativeSourceRenderError::ResourceBounds)
+    }
+
+    /// Renders and retains one independent GPU texture for every configured
+    /// project output. The Program transition or Stinger is shared, while each
+    /// output receives only its included overlays before the common FTB state.
+    /// Output order is exactly the stable project order.
+    ///
+    /// A project with no configured outputs returns an empty set; the singular
+    /// Program render API remains available for that valid headless project.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed project route, source, scene, Stinger compositor,
+    /// per-output composition, or transition failure.
+    pub async fn render_project_outputs_with_stingers(
+        &self,
+        registry: &NativeSourceRegistry,
+        stingers: &NativeSourceRegistry,
+        project: &NativeProjectPlan,
+        frame: &FrameResult,
+    ) -> Result<Vec<NativeOutputFrame>, NativeSourceRenderError> {
+        let outputs = project
+            .output_ids()
+            .iter()
+            .copied()
+            .map(Some)
+            .collect::<Vec<_>>();
+        if outputs.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.render_project_output_set_with_stingers(registry, stingers, project, frame, &outputs)
+            .await?
+            .into_iter()
+            .map(|(output, texture)| {
+                output
+                    .map(|output| NativeOutputFrame { output, texture })
+                    .ok_or(NativeSourceRenderError::ResourceBounds)
+            })
+            .collect()
+    }
+
+    async fn render_project_output_set_with_stingers(
+        &self,
+        registry: &NativeSourceRegistry,
+        stingers: &NativeSourceRegistry,
+        project: &NativeProjectPlan,
+        frame: &FrameResult,
+        outputs: &[Option<OutputId>],
+    ) -> Result<Vec<(Option<OutputId>, NativeTexture)>, NativeSourceRenderError> {
+        if outputs.is_empty() {
+            return Err(NativeSourceRenderError::ResourceBounds);
+        }
         let plan = native_project_mix_plan(project, frame.program)?;
         let fade_to_black = native_fade_to_black_plan(frame.fade_to_black)?;
-        let inputs = match plan {
-            NativeProjectMixPlan::Transition(plan) => [plan.primary, plan.secondary, plan.primary],
-            NativeProjectMixPlan::Stinger(plan) => [plan.program, plan.preview, plan.media],
+        let overlay_sets = outputs
+            .iter()
+            .map(|output| {
+                output.map_or_else(Vec::new, |output| {
+                    NativeProjectPlan::program_overlays(frame, output)
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut inputs = match plan {
+            NativeProjectMixPlan::Transition(plan) => {
+                vec![plan.primary, plan.secondary, plan.primary]
+            }
+            NativeProjectMixPlan::Stinger(plan) => vec![plan.program, plan.preview, plan.media],
         };
+        inputs.extend(overlay_sets.iter().flatten().map(|overlay| overlay.input));
         let mut execution = project
             .scene_execution(&inputs)
             .ok_or(NativeSourceRenderError::ResourceBounds)?;
         let _frame_slot = self.begin_project_frame()?;
+        let (program, scene_outputs) = self
+            .render_project_base_with_stingers(
+                registry,
+                stingers,
+                project,
+                frame,
+                plan,
+                &mut execution,
+            )
+            .await?;
+        let mut rendered = Vec::with_capacity(outputs.len());
+        for (&output, overlays) in outputs.iter().zip(&overlay_sets) {
+            let composed = self
+                .render_project_overlays(
+                    registry,
+                    project,
+                    &scene_outputs,
+                    frame.deadline,
+                    &program,
+                    overlays,
+                )
+                .await?;
+            let texture = self
+                .fade_to_black_renderer
+                .render(&self.context, fade_to_black, &composed)
+                .await
+                .map_err(NativeSourceRenderError::FadeToBlack)?;
+            rendered.push((output, texture));
+        }
+        self.finish_project_frame()?;
+        Ok(rendered)
+    }
+
+    async fn render_project_base_with_stingers(
+        &self,
+        registry: &NativeSourceRegistry,
+        stingers: &NativeSourceRegistry,
+        project: &NativeProjectPlan,
+        frame: &FrameResult,
+        plan: NativeProjectMixPlan,
+        execution: &mut NativeSceneExecution,
+    ) -> Result<
+        (NativeTexture, BTreeMap<SceneId, (SourceId, NativeTexture)>),
+        NativeSourceRenderError,
+    > {
         let scene_outputs = self
-            .render_project_scenes(registry, project, frame, &mut execution)
+            .render_project_scenes(registry, project, frame, execution)
             .await?;
         let program = match plan {
             NativeProjectMixPlan::Transition(plan) => {
@@ -6514,13 +6893,62 @@ impl NativeMediaRuntime {
                     .map_err(NativeSourceRenderError::Stinger)?
             }
         };
-        let output = self
-            .fade_to_black_renderer
-            .render(&self.context, fade_to_black, &program)
+        Ok((program, scene_outputs))
+    }
+
+    async fn render_project_overlays(
+        &self,
+        registry: &NativeSourceRegistry,
+        project: &NativeProjectPlan,
+        scene_outputs: &BTreeMap<SceneId, (SourceId, NativeTexture)>,
+        deadline: ClockTime,
+        program: &NativeTexture,
+        overlays: &[NativeProgramOverlay],
+    ) -> Result<NativeTexture, NativeSourceRenderError> {
+        let mut scene = CompositorScene::new(
+            project.dimensions.width(),
+            project.dimensions.height(),
+            CompositorRgba8::new(0, 0, 0, u8::MAX),
+        )
+        .map_err(|_| NativeSourceRenderError::ResourceBounds)?;
+        let full_frame = Transform::new(
+            0,
+            0,
+            project.dimensions.width(),
+            project.dimensions.height(),
+            CompositorRotation::Deg0,
+        );
+        scene.push_layer(SourceLayer::new(SourceId::new(0), 0, full_frame));
+        for (index, overlay) in overlays.iter().enumerate() {
+            let source = SourceId::new(
+                u64::try_from(index + 1).map_err(|_| NativeSourceRenderError::ResourceBounds)?,
+            );
+            let z =
+                i32::try_from(index + 1).map_err(|_| NativeSourceRenderError::ResourceBounds)?;
+            let transform = overlay_transform(project.dimensions, overlay.position)?;
+            let border_width = overlay_border_width(overlay.border, transform);
+            scene.push_layer(
+                SourceLayer::new(source, z, transform)
+                    .with_opacity(overlay.opacity)
+                    .with_inset_border(border_width),
+            );
+        }
+        let (composition, _) = compile_scene(&scene, OutputTarget::Program)
+            .map_err(|_| NativeSourceRenderError::ResourceBounds)?;
+        let mut sources = Vec::with_capacity(overlays.len() + 1);
+        sources.push(NativeSourceFrame::new(SourceId::new(0), program));
+        for (index, overlay) in overlays.iter().enumerate() {
+            let source = SourceId::new(
+                u64::try_from(index + 1).map_err(|_| NativeSourceRenderError::ResourceBounds)?,
+            );
+            let texture =
+                project_texture(registry, project, scene_outputs, overlay.input, deadline)?;
+            sources.push(NativeSourceFrame::new(source, texture));
+        }
+        self.composition_renderer
+            .render(&self.context, &composition, &sources)
             .await
-            .map_err(NativeSourceRenderError::FadeToBlack)?;
-        self.finish_project_frame()?;
-        Ok(output)
+            .map_err(NativeSourceRenderError::SceneCompositor)
     }
 
     /// Synchronous daemon wrapper for one authoritative program render.
@@ -6565,6 +6993,21 @@ impl NativeMediaRuntime {
         frame: &FrameResult,
     ) -> Result<NativeTexture, NativeSourceRenderError> {
         block_on(self.render_project_frame_result_with_stingers(registry, stingers, project, frame))
+    }
+
+    /// Synchronous wrapper for [`Self::render_project_outputs_with_stingers`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::render_project_outputs_with_stingers`].
+    pub fn render_project_outputs_with_stingers_blocking(
+        &self,
+        registry: &NativeSourceRegistry,
+        stingers: &NativeSourceRegistry,
+        project: &NativeProjectPlan,
+        frame: &FrameResult,
+    ) -> Result<Vec<NativeOutputFrame>, NativeSourceRenderError> {
+        block_on(self.render_project_outputs_with_stingers(registry, stingers, project, frame))
     }
 
     /// Renders a GPU-resident Cut, Fade, or Wipe between canonical RGBA16-float
@@ -6708,16 +7151,19 @@ mod tests {
         VideoDimensions,
     };
     use fm_model::{
-        Input, InputAudioStripState, InputGainMilliDb, Layer, LayerGeometry, ProjectSettings,
-        Rgba8 as ModelRgba8, Scene as ModelScene, SimulatedAudio, SimulatedInput, SimulatedVideo,
-        StingerConfig, StingerSlotNumber,
+        Input, InputAudioStripState, InputBalanceBasisPoints, InputDelaySamples, InputGainMilliDb,
+        Layer, LayerGeometry, Output, ProjectSettings, Rgba8 as ModelRgba8, Scene as ModelScene,
+        SimulatedAudio, SimulatedInput, SimulatedVideo, StartupPolicy, StingerConfig,
+        StingerSlotNumber,
     };
     use fm_persistence::{ProjectPosition, ProjectStore, RuntimeRouting, StoredProject};
     use fm_scheduler::FrameNumber;
     use fm_switcher::{
         SwitcherCommand, SwitcherState, TBarPosition, TransitionKind as SwitcherTransitionKind,
     };
-    use fm_types::{ColorMetadata as ModelColorMetadata, ProjectId, ScanMode, VideoFormat};
+    use fm_types::{
+        BusId, ColorMetadata as ModelColorMetadata, OutputId, ProjectId, ScanMode, VideoFormat,
+    };
     #[cfg(target_os = "macos")]
     use half::f16;
 
@@ -6727,8 +7173,50 @@ mod tests {
         InputId::new(NonZeroU128::new(value).unwrap())
     }
 
+    #[test]
+    fn overlay_position_and_border_presets_have_deterministic_geometry() {
+        let dimensions = VideoDimensions::new(1_920, 1_080).unwrap();
+        assert_eq!(
+            overlay_transform(dimensions, OverlayPositionPreset::FullFrame).unwrap(),
+            Transform::new(0, 0, 1_920, 1_080, CompositorRotation::Deg0)
+        );
+        let top_left = overlay_transform(dimensions, OverlayPositionPreset::TopLeft).unwrap();
+        assert_eq!(
+            top_left,
+            Transform::new(33, 33, 640, 360, CompositorRotation::Deg0)
+        );
+        assert_eq!(
+            overlay_transform(dimensions, OverlayPositionPreset::BottomRight).unwrap(),
+            Transform::new(1_247, 687, 640, 360, CompositorRotation::Deg0)
+        );
+        assert_eq!(overlay_border_width(OverlayBorderPreset::None, top_left), 0);
+        assert_eq!(
+            overlay_border_width(OverlayBorderPreset::ThinWhite, top_left),
+            1
+        );
+        assert_eq!(
+            overlay_border_width(OverlayBorderPreset::ThickWhite, top_left),
+            3
+        );
+    }
+
     fn scene(value: u128) -> SceneId {
         SceneId::new(NonZeroU128::new(value).unwrap())
+    }
+
+    fn output(value: u128) -> OutputId {
+        OutputId::new(NonZeroU128::new(value).unwrap())
+    }
+
+    fn add_output(project: &mut Project, id: OutputId) {
+        project.add_output(Output {
+            id,
+            name: format!("output {id}"),
+            video_source: scene(99),
+            audio_source: BusId::new(NonZeroU128::new(99).unwrap()),
+            startup: StartupPolicy::Stopped,
+            required_capabilities: Vec::new(),
+        });
     }
 
     fn native_plan_project(width: u32, height: u32) -> Project {
@@ -7129,6 +7617,8 @@ mod tests {
     ) -> FrameResult {
         FrameResult {
             fade_to_black: fm_switcher::FadeToBlackFrame::LIVE,
+            overlays: std::array::from_fn(|_| fm_switcher::OverlayChannelState::empty()),
+            input_audio_strip_updates: Vec::new(),
             frame: FrameNumber::new(frame),
             deadline: ClockTime::ZERO,
             program: ProgramFrame {
@@ -7254,8 +7744,8 @@ mod tests {
         add_leaf(&mut leaf_only, input(9));
         let leaf_plan =
             NativeProjectPlan::compile(&leaf_only, NativeProjectLimits::default()).unwrap();
-        assert_eq!(leaf_plan.peak_rgba16f_targets(), 3);
-        assert_eq!(leaf_plan.transient_rgba16f_bytes(), 3 * 4 * 2 * 8);
+        assert_eq!(leaf_plan.peak_rgba16f_targets(), 4);
+        assert_eq!(leaf_plan.transient_rgba16f_bytes(), 4 * 4 * 2 * 8);
 
         let mut project = native_plan_project(4, 2);
         add_scene_input(&mut project, input(1), scene(10), None);
@@ -7266,13 +7756,65 @@ mod tests {
 
         assert_eq!(plan.scene_order().collect::<Vec<_>>(), vec![scene(10)]);
         assert_eq!(plan.active_layer_count(), 0);
-        assert_eq!(plan.peak_rgba16f_targets(), 4);
-        assert_eq!(plan.transient_rgba16f_bytes(), 4 * 4 * 2 * 8);
+        assert_eq!(plan.peak_rgba16f_targets(), 5);
+        assert_eq!(plan.transient_rgba16f_bytes(), 5 * 4 * 2 * 8);
         assert_eq!(
             plan.video_route(input(1)),
             Some(NativeVideoRoute::Scene(scene(10)))
         );
         assert_eq!(plan.audio_route(input(1)), Some(NativeAudioRoute::Silence));
+    }
+
+    #[test]
+    fn native_project_plan_preserves_output_order_routing_and_exact_target_charge() {
+        let clean = output(10);
+        let dirty = output(11);
+        let overlay_source = input(3);
+        let mut project = native_plan_project(4, 2);
+        for source in [input(1), input(2), overlay_source] {
+            add_leaf(&mut project, source);
+        }
+        add_output(&mut project, clean);
+        add_output(&mut project, dirty);
+
+        let plan = NativeProjectPlan::compile(&project, NativeProjectLimits::default()).unwrap();
+
+        assert_eq!(plan.output_ids(), &[clean, dirty]);
+        assert_eq!(plan.peak_rgba16f_targets(), 6);
+        assert_eq!(plan.transient_rgba16f_bytes(), 6 * 4 * 2 * 8);
+        assert_eq!(
+            NativeProjectPlan::compile(
+                &project,
+                NativeProjectLimits {
+                    max_transient_rgba16f_bytes: 383,
+                    ..NativeProjectLimits::default()
+                },
+            ),
+            Err(NativeProjectPlanError::TransientBytesExceeded {
+                required: 384,
+                maximum: 383,
+            })
+        );
+
+        let channel = fm_switcher::OverlayChannelId::new(1).unwrap();
+        let mut switcher =
+            SwitcherState::new(vec![input(1), input(2), overlay_source], input(1), input(2))
+                .unwrap();
+        switcher.take_overlay(channel, overlay_source).unwrap();
+        let _ = switcher.set_overlay_output_inclusion(channel, dirty, true);
+        let mut frame = frame_result(0, input(1), None);
+        frame.overlays = switcher.overlays().clone();
+
+        assert!(NativeProjectPlan::program_overlays(&frame, clean).is_empty());
+        assert_eq!(
+            NativeProjectPlan::program_overlays(&frame, dirty),
+            vec![NativeProgramOverlay {
+                input: overlay_source,
+                opacity: u8::MAX,
+                position: OverlayPositionPreset::FullFrame,
+                border: OverlayBorderPreset::None,
+            }]
+        );
     }
 
     #[test]
@@ -7307,19 +7849,19 @@ mod tests {
             vec![scene(10), scene(20), scene(30)]
         );
         assert_eq!(plan.active_layer_count(), 4);
-        assert_eq!(plan.peak_rgba16f_targets(), 6);
-        assert_eq!(plan.transient_rgba16f_bytes(), 6 * 4 * 2 * 8);
+        assert_eq!(plan.peak_rgba16f_targets(), 7);
+        assert_eq!(plan.transient_rgba16f_bytes(), 7 * 4 * 2 * 8);
         assert_eq!(
             NativeProjectPlan::compile(
                 &project,
                 NativeProjectLimits {
-                    max_transient_rgba16f_bytes: 383,
+                    max_transient_rgba16f_bytes: 447,
                     ..NativeProjectLimits::default()
                 }
             ),
             Err(NativeProjectPlanError::TransientBytesExceeded {
-                required: 384,
-                maximum: 383,
+                required: 448,
+                maximum: 447,
             })
         );
         let primary_only = plan.scene_execution(&[input(2), input(2)]).unwrap();
@@ -7352,8 +7894,8 @@ mod tests {
 
         let plan = NativeProjectPlan::compile(&project, NativeProjectLimits::default()).unwrap();
 
-        assert_eq!(plan.peak_rgba16f_targets(), 6);
-        assert_eq!(plan.transient_rgba16f_bytes(), 6 * 4 * 2 * 8);
+        assert_eq!(plan.peak_rgba16f_targets(), 7);
+        assert_eq!(plan.transient_rgba16f_bytes(), 7 * 4 * 2 * 8);
         let execution = plan
             .scene_execution(&[input(1), input(2), input(3)])
             .unwrap();
@@ -7687,7 +8229,10 @@ mod tests {
             inactive,
             InputAudioStripState {
                 gain: InputGainMilliDb::new(-6_021).unwrap(),
+                balance: InputBalanceBasisPoints::CENTER,
+                delay_samples: Default::default(),
                 muted: false,
+                soloed: false,
                 follow_video: false,
             },
         ));
@@ -7741,7 +8286,10 @@ mod tests {
             primary,
             InputAudioStripState {
                 gain: InputGainMilliDb::new(-6_021).unwrap(),
+                balance: InputBalanceBasisPoints::CENTER,
+                delay_samples: Default::default(),
                 muted: false,
+                soloed: false,
                 follow_video: true,
             },
         ));
@@ -7749,7 +8297,10 @@ mod tests {
             secondary,
             InputAudioStripState {
                 gain: InputGainMilliDb::UNITY,
+                balance: InputBalanceBasisPoints::CENTER,
+                delay_samples: Default::default(),
                 muted: false,
+                soloed: false,
                 follow_video: true,
             },
         ));
@@ -7773,7 +8324,10 @@ mod tests {
             secondary,
             InputAudioStripState {
                 gain: InputGainMilliDb::UNITY,
+                balance: InputBalanceBasisPoints::CENTER,
+                delay_samples: Default::default(),
                 muted: true,
+                soloed: false,
                 follow_video: true,
             },
         ));
@@ -7798,13 +8352,19 @@ mod tests {
         add_scene(&mut project, scene(10), Vec::new());
         let persisted = InputAudioStripState {
             gain: InputGainMilliDb::new(-12_000).unwrap(),
+            balance: InputBalanceBasisPoints::new(-2_500).unwrap(),
+            delay_samples: InputDelaySamples::new(17).unwrap(),
             muted: true,
+            soloed: true,
             follow_video: false,
         };
         assert!(project.set_input_audio_strip(input(1), persisted));
         let alias_persisted = InputAudioStripState {
             gain: InputGainMilliDb::new(-6_000).unwrap(),
+            balance: InputBalanceBasisPoints::new(2_500).unwrap(),
+            delay_samples: InputDelaySamples::new(23).unwrap(),
             muted: false,
+            soloed: false,
             follow_video: true,
         };
         assert!(project.set_input_audio_strip(input(2), alias_persisted));
@@ -7833,10 +8393,12 @@ mod tests {
             master.mixer.current_linear_gain(input(1)),
             Some(realized.gain.linear())
         );
+        assert_eq!(master.mixer.input_delay_samples(input(1)), Some(17));
         let alias = master.mixer.input_state(input(2)).unwrap();
         assert!((alias.gain.db() + 6.0).abs() < 0.000_1);
         assert!(!alias.muted);
         assert!(alias.follow_video);
+        assert_eq!(master.mixer.input_delay_samples(input(2)), Some(23));
 
         let before = master.mixer.input_state(input(1));
         plan.audio_strips.remove(&input(1));
@@ -7855,7 +8417,10 @@ mod tests {
             input(1),
             InputAudioStripState {
                 gain: InputGainMilliDb::new(-6_021).unwrap(),
+                balance: InputBalanceBasisPoints::CENTER,
+                delay_samples: Default::default(),
                 muted: false,
+                soloed: false,
                 follow_video: true,
             },
         ));
@@ -7911,6 +8476,103 @@ mod tests {
                 .iter()
                 .all(|sample| *sample == 0.0)
         );
+    }
+
+    #[test]
+    fn scheduled_input_strip_updates_native_mixers_and_project_plan_transactionally() {
+        let source = input(1);
+        let mut project = native_plan_project(4, 2);
+        add_leaf(&mut project, source);
+        let mut plan =
+            NativeProjectPlan::compile(&project, NativeProjectLimits::default()).unwrap();
+        let mut master = audio_test_master(&[(source, 1.0)], 2);
+        master.realize_project_audio(&plan).unwrap();
+        master.stinger_audio = Some(NativeStingerAudioPlayback {
+            masters: BTreeMap::from([(source, Box::new(audio_test_master(&[(source, 1.0)], 2)))]),
+            silent_inputs: BTreeSet::new(),
+            active_trigger: None,
+            ready: None,
+        });
+
+        let updated = InputAudioStripState {
+            gain: InputGainMilliDb::new(-6_000).unwrap(),
+            balance: InputBalanceBasisPoints::new(2_500).unwrap(),
+            muted: false,
+            soloed: true,
+            follow_video: false,
+            delay_samples: InputDelaySamples::new(2).unwrap(),
+        };
+        let target = native_audio_input_state(updated).unwrap();
+        assert_eq!(master.mixer.current_linear_gain(source), Some(1.0));
+        assert_eq!(master.mixer.current_normalized_balance(source), Some(0.0));
+        master.set_input_audio_strip(source, updated).unwrap();
+        plan.set_input_audio_strip(source, updated).unwrap();
+        assert_eq!(master.mixer.input_delay_samples(source), Some(2));
+        assert_eq!(master.pending_mixer.input_delay_samples(source), Some(2));
+        assert_eq!(master.mixer.input_state(source), Some(target));
+        assert_eq!(master.pending_mixer.input_state(source), Some(target));
+        assert_eq!(master.mixer.current_linear_gain(source), Some(1.0));
+        assert_eq!(master.pending_mixer.current_linear_gain(source), Some(1.0));
+        assert_eq!(master.mixer.current_normalized_balance(source), Some(0.0));
+        assert_eq!(
+            master.pending_mixer.current_normalized_balance(source),
+            Some(0.0)
+        );
+        let stinger = &master.stinger_audio.as_ref().unwrap().masters[&source];
+        assert_eq!(stinger.mixer.input_delay_samples(source), Some(2));
+        assert_eq!(stinger.pending_mixer.input_delay_samples(source), Some(2));
+        assert_eq!(stinger.mixer.input_state(source), Some(target));
+        assert_eq!(stinger.pending_mixer.input_state(source), Some(target));
+        assert_eq!(stinger.mixer.current_linear_gain(source), Some(1.0));
+        assert_eq!(stinger.pending_mixer.current_linear_gain(source), Some(1.0));
+        assert_eq!(stinger.mixer.current_normalized_balance(source), Some(0.0));
+        assert_eq!(
+            stinger.pending_mixer.current_normalized_balance(source),
+            Some(0.0)
+        );
+        assert_eq!(plan.audio_strip(source), Some(updated));
+
+        assert!(master.service_next_frame().unwrap());
+        master
+            .render_project_frame_audio(&frame_result(0, source, None), &plan)
+            .unwrap();
+        assert!(
+            (master.mixer.current_linear_gain(source).unwrap() - target.gain.linear()).abs()
+                < 1.0e-6
+        );
+        assert_eq!(master.mixer.current_normalized_balance(source), Some(0.25));
+
+        let before = master.mixer.input_delay_samples(source);
+        assert!(matches!(
+            master.set_input_audio_strip(input(99), updated),
+            Err(NativeMasterError::MissingAudioRoute { input: missing }) if missing == input(99)
+        ));
+        assert_eq!(master.mixer.input_delay_samples(source), before);
+    }
+
+    #[test]
+    fn persisted_input_delay_is_applied_before_native_master_gain() {
+        let source = input(1);
+        let mut project = native_plan_project(4, 2);
+        add_leaf(&mut project, source);
+        assert!(project.set_input_audio_strip(
+            source,
+            InputAudioStripState {
+                delay_samples: InputDelaySamples::new(2).unwrap(),
+                ..InputAudioStripState::default()
+            },
+        ));
+        let plan = NativeProjectPlan::compile(&project, NativeProjectLimits::default()).unwrap();
+        let mut master = audio_test_master(&[(source, 1.0)], 1);
+        master.realize_project_audio(&plan).unwrap();
+
+        assert!(master.service_next_frame().unwrap());
+        let output = master
+            .render_project_frame_audio(&frame_result(0, source, None), &plan)
+            .unwrap();
+
+        assert_eq!(master.mixer.input_delay_samples(source), Some(2));
+        assert_eq!(&output.plane(0).unwrap()[..3], &[0.0, 0.0, 1.0]);
     }
 
     #[test]
@@ -7979,7 +8641,7 @@ mod tests {
                 },
             ),
             Err(NativeProjectPlanError::TransientBytesExceeded {
-                required: 256,
+                required: 320,
                 maximum: 191,
             })
         );
@@ -9710,7 +10372,7 @@ mod tests {
             }
         );
 
-        assert_eq!(switcher.advance_frame(), None);
+        assert!(switcher.advance_frame_events().is_empty());
         assert_eq!(
             native_audio_mix_plan(switcher.program_frame()).unwrap(),
             NativeAudioMixPlan {
@@ -9734,7 +10396,7 @@ mod tests {
             }
         );
 
-        assert_eq!(switcher.advance_frame(), None);
+        assert!(switcher.advance_frame_events().is_empty());
         switcher
             .apply(SwitcherCommand::SetTBarPosition(TBarPosition::END))
             .unwrap();
@@ -10338,7 +11000,19 @@ mod tests {
         let inputs = vec![old, new];
         let frame_rate = FrameRate::new(25, 1).unwrap();
         let clock_domain = EngineClockDomainId::new(NonZeroU128::new(99).unwrap());
-        let show = || ShowState::new("interval propagation", inputs.clone(), old, new).unwrap();
+        let show = || {
+            ShowState::new(
+                "interval propagation",
+                inputs
+                    .iter()
+                    .copied()
+                    .map(|input| (input, format!("Input {input}")))
+                    .collect(),
+                old,
+                new,
+            )
+            .unwrap()
+        };
 
         let mut fade = Engine::new(show(), frame_rate, clock_domain);
         fade.execute(
@@ -10442,7 +11116,16 @@ mod tests {
         let new = input(2);
         let frame_rate = FrameRate::new(25, 1).unwrap();
         let clock_domain = EngineClockDomainId::new(NonZeroU128::new(99).unwrap());
-        let show = ShowState::new("manual alpha", vec![old, new], old, new).unwrap();
+        let show = ShowState::new(
+            "manual alpha",
+            [old, new]
+                .into_iter()
+                .map(|input| (input, format!("Input {input}")))
+                .collect(),
+            old,
+            new,
+        )
+        .unwrap();
         let mut engine = Engine::new(show, frame_rate, clock_domain);
         for (key, command) in [
             (
@@ -10849,6 +11532,84 @@ mod tests {
                 .all(|pixel| pixel == [0, 0, 0, 255])
         );
         assert_eq!(second, first);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires a native macOS Metal adapter"]
+    fn native_metal_realizes_per_output_overlay_variants_simultaneously() {
+        let runtime = NativeMediaRuntime::new_blocking([NativeBackend::Metal]).unwrap();
+        let clock_domain = ClockDomainId::new(NonZeroU128::new(76).unwrap());
+        let program = input(1);
+        let preview = input(2);
+        let overlay = input(3);
+        let playback = runtime
+            .preflight_resolved_source_playback_mixed_blocking(
+                None,
+                [
+                    NativeResolvedSource::RetainedFrame {
+                        input: program,
+                        frame: colored_retained_frame(clock_domain, [255, 0, 0, 255]),
+                    },
+                    NativeResolvedSource::RetainedFrame {
+                        input: preview,
+                        frame: colored_retained_frame(clock_domain, [255, 0, 0, 255]),
+                    },
+                    NativeResolvedSource::RetainedFrame {
+                        input: overlay,
+                        frame: colored_retained_frame(clock_domain, [0, 0, 255, 255]),
+                    },
+                ],
+                clock_domain,
+                StreamSelector::Best,
+                NativeSourceLimits::default(),
+            )
+            .unwrap();
+        let clean = output(10);
+        let dirty = output(11);
+        let mut project = native_plan_project(1, 1);
+        for source in [program, preview, overlay] {
+            add_leaf(&mut project, source);
+        }
+        add_output(&mut project, clean);
+        add_output(&mut project, dirty);
+        let project = NativeProjectPlan::compile(&project, NativeProjectLimits::default()).unwrap();
+        let channel = fm_switcher::OverlayChannelId::new(1).unwrap();
+        let mut switcher =
+            SwitcherState::new(vec![program, preview, overlay], program, preview).unwrap();
+        switcher.take_overlay(channel, overlay).unwrap();
+        let _ = switcher.set_overlay_output_inclusion(channel, dirty, true);
+        let mut frame = frame_result(0, program, None);
+        frame.overlays = switcher.overlays().clone();
+
+        let outputs = runtime
+            .render_project_outputs_with_stingers_blocking(
+                playback.registry(),
+                playback.registry(),
+                &project,
+                &frame,
+            )
+            .unwrap();
+
+        assert_eq!(
+            outputs
+                .iter()
+                .map(NativeOutputFrame::output)
+                .collect::<Vec<_>>(),
+            vec![clean, dirty]
+        );
+        let clean = rgba16f_components(
+            &block_on(runtime.diagnostic_readback(outputs[0].texture()))
+                .unwrap()
+                .bytes,
+        );
+        let dirty = rgba16f_components(
+            &block_on(runtime.diagnostic_readback(outputs[1].texture()))
+                .unwrap()
+                .bytes,
+        );
+        assert!(clean[0] > clean[2], "clean output remains Program red");
+        assert!(dirty[2] > dirty[0], "dirty output receives overlay blue");
     }
 
     #[cfg(target_os = "macos")]

@@ -6,7 +6,6 @@ pub const HARD_MAX_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 pub const HARD_MAX_BATCH_ITEMS: usize = 4096;
 pub const HARD_MAX_CAPABILITIES: usize = 4096;
 pub const HARD_MAX_IDENTIFIER_BYTES: usize = 1024;
-pub const HARD_MAX_MIGRATION_STEPS: u32 = 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProtocolLimits {
@@ -18,7 +17,6 @@ pub struct ProtocolLimits {
     pub max_crash_report_bytes: usize,
     pub max_identifier_bytes: usize,
     pub max_capabilities: usize,
-    pub max_migration_steps: u32,
 }
 
 impl Default for ProtocolLimits {
@@ -32,7 +30,6 @@ impl Default for ProtocolLimits {
             max_crash_report_bytes: 256 * 1024,
             max_identifier_bytes: 256,
             max_capabilities: 256,
-            max_migration_steps: 64,
         }
     }
 }
@@ -61,8 +58,6 @@ impl ProtocolLimits {
             || self.max_identifier_bytes > HARD_MAX_IDENTIFIER_BYTES
             || self.max_capabilities == 0
             || self.max_capabilities > HARD_MAX_CAPABILITIES
-            || self.max_migration_steps == 0
-            || self.max_migration_steps > HARD_MAX_MIGRATION_STEPS
         {
             return Err(ExchangeError::InvalidLimits);
         }

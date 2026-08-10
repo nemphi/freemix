@@ -1,12 +1,11 @@
 use super::*;
 use crate::{
-    ApiVersion, CommandReceipt, DataMessage, EventBatch, EventMessage, IdempotencyKey,
-    MigrationError, StateVersion,
+    ApiVersion, CommandReceipt, DataMessage, EventBatch, EventMessage, IdempotencyKey, StateVersion,
 };
 
 fn host() -> PluginHost {
     PluginHost::new(
-        ApiCompatibility::new(1, 0, 2),
+        ApiVersion::new(1, 1),
         ProtocolLimits::default(),
         StateEpoch::new(1),
     )
@@ -169,33 +168,6 @@ fn event_data_and_batch_bounds_are_enforced() {
     let loose_limits = ProtocolLimits::default();
     let loose_item = EventMessage::new("plugin", "topic", vec![0; 4], &loose_limits).unwrap();
     assert!(EventBatch::new([loose_item], &limits).is_err());
-}
-
-#[test]
-fn snapshots_migrate_one_validated_version_at_a_time() {
-    let limits = ProtocolLimits::default();
-    let snapshot =
-        StateSnapshot::new("com.example.test", StateVersion::new(0), [0], &limits).unwrap();
-    let mut visited = Vec::new();
-    let mut migrator = |request: crate::MigrationRequest| {
-        visited.push((request.from_version, request.to_version));
-        let mut data = request.snapshot.data().to_vec();
-        data.push(u8::try_from(request.to_version.get()).unwrap());
-        StateSnapshot::new(request.plugin_id, request.to_version, data, &limits)
-            .map_err(MigrationError::from)
-    };
-    let migrated = crate::migrate_snapshot(
-        snapshot,
-        StateVersion::new(2),
-        Deadline::from_millis(100),
-        100,
-        &limits,
-        &mut migrator,
-    )
-    .unwrap();
-    assert_eq!(migrated.version(), StateVersion::new(2));
-    assert_eq!(migrated.data(), &[0, 1, 2]);
-    assert_eq!(visited.len(), 2);
 }
 
 #[test]

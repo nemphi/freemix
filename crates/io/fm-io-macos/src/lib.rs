@@ -43,7 +43,9 @@ use fm_io_api::{
 };
 use fm_types::FrameRate;
 
-use protocol::{HelperDevice, HelperDiscovery, HelperPermission, MAX_DISCOVERY_BYTES};
+#[cfg(target_os = "macos")]
+use protocol::MAX_DISCOVERY_BYTES;
+use protocol::{HelperDevice, HelperDiscovery, HelperPermission};
 
 const MAX_QUEUE_CAPACITY: usize = 8;
 const MAX_MEDIA_BYTES: usize = 64 * 1024 * 1024;

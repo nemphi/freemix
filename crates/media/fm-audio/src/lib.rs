@@ -318,10 +318,43 @@ impl Gain {
     }
 }
 
-/// An immutable, owned planar `f32` reference/generator audio block.
+/// Exact stereo balance in one-hundredth of a percent.
 ///
-/// Timed media interchange uses [`fm_frame::AudioBlock`]. This legacy block is
-/// retained for reference generators and existing callers.
+/// Balance attenuates the opposite destination channel: full left mutes Right,
+/// full right mutes Left, and Center leaves both at unity. Other destination
+/// channel labels are unchanged.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Balance(i32);
+
+impl Balance {
+    pub const MIN_BASIS_POINTS: i32 = -10_000;
+    pub const MAX_BASIS_POINTS: i32 = 10_000;
+    pub const CENTER: Self = Self(0);
+
+    #[must_use]
+    pub const fn from_basis_points(value: i32) -> Option<Self> {
+        if value >= Self::MIN_BASIS_POINTS && value <= Self::MAX_BASIS_POINTS {
+            Some(Self(value))
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub const fn basis_points(self) -> i32 {
+        self.0
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn normalized(self) -> f32 {
+        self.0 as f32 / Self::MAX_BASIS_POINTS as f32
+    }
+}
+
+/// An immutable, owned planar `f32` DSP/generator block.
+///
+/// Timed media interchange uses [`fm_frame::AudioBlock`]; this type is for
+/// deterministic signal generation and untimed DSP calls.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AudioBlock {
     format: AudioFormat,
@@ -571,7 +604,9 @@ impl AudioGenerator for ImpulseGenerator {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct InputState {
     pub gain: Gain,
+    pub balance: Balance,
     pub muted: bool,
+    pub soloed: bool,
     pub follow_video: bool,
 }
 
@@ -579,7 +614,9 @@ impl Default for InputState {
     fn default() -> Self {
         Self {
             gain: Gain::UNITY,
+            balance: Balance::CENTER,
             muted: false,
+            soloed: false,
             follow_video: false,
         }
     }
@@ -662,6 +699,43 @@ struct GainRamp {
     remaining: u16,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct BalanceRamp {
+    current: f32,
+    target: f32,
+    remaining: u16,
+}
+
+impl BalanceRamp {
+    fn immediate(balance: Balance) -> Self {
+        let value = balance.normalized();
+        Self {
+            current: value,
+            target: value,
+            remaining: 0,
+        }
+    }
+
+    fn set(&mut self, target: Balance, samples: usize) {
+        self.target = target.normalized();
+        self.remaining = u16::try_from(samples).expect("validated ramp length fits in u16");
+        if samples == 0 {
+            self.current = self.target;
+        }
+    }
+
+    fn next(&mut self) -> f32 {
+        if self.remaining != 0 {
+            self.current += (self.target - self.current) / f32::from(self.remaining);
+            self.remaining -= 1;
+            if self.remaining == 0 {
+                self.current = self.target;
+            }
+        }
+        self.current
+    }
+}
+
 impl GainRamp {
     const fn immediate(gain: Gain) -> Self {
         Self {
@@ -697,6 +771,7 @@ struct InputStrip {
     mapping: ChannelMapping,
     state: InputState,
     ramp: GainRamp,
+    balance_ramp: BalanceRamp,
     delay: SampleDelay,
 }
 
@@ -943,6 +1018,7 @@ impl MasterMixer {
         let channels = format.channels.channels().len();
         let delay = SampleDelay::zero(channels);
         let ramp = GainRamp::immediate(state.gain);
+        let balance_ramp = BalanceRamp::immediate(state.balance);
         self.inputs.insert(
             id,
             InputStrip {
@@ -950,6 +1026,7 @@ impl MasterMixer {
                 mapping,
                 state,
                 ramp,
+                balance_ramp,
                 delay,
             },
         );
@@ -1009,6 +1086,11 @@ impl MasterMixer {
     }
 
     #[must_use]
+    pub fn current_normalized_balance(&self, id: InputId) -> Option<f32> {
+        self.inputs.get(&id).map(|strip| strip.balance_ramp.current)
+    }
+
+    #[must_use]
     pub fn input_delay_samples(&self, id: InputId) -> Option<usize> {
         self.inputs
             .get(&id)
@@ -1061,7 +1143,7 @@ impl MasterMixer {
         Ok(())
     }
 
-    /// Replaces input state and schedules a linear gain ramp.
+    /// Replaces input state and schedules linear gain and balance ramps.
     ///
     /// Mute and follow-video changes take effect at the next rendered sample.
     ///
@@ -1083,6 +1165,7 @@ impl MasterMixer {
             .get_mut(&id)
             .ok_or(AudioError::UnknownInput(id))?;
         strip.ramp.set(state.gain, ramp_samples);
+        strip.balance_ramp.set(state.balance, ramp_samples);
         strip.state = state;
         Ok(())
     }
@@ -1116,6 +1199,7 @@ impl MasterMixer {
             };
             strip.state = source.state;
             strip.ramp = source.ramp;
+            strip.balance_ramp = source.balance_ramp;
             strip.delay.copy_runtime_state_from(&source.delay);
         }
         self.retained_delay_bytes = other.retained_delay_bytes;
@@ -1123,11 +1207,12 @@ impl MasterMixer {
         Ok(())
     }
 
-    /// Clears gain-ramp and delay history while preserving configured strip
-    /// state, mappings, delay lengths, and clipping policy.
+    /// Clears gain/balance-ramp and delay history while preserving configured
+    /// strip state, mappings, delay lengths, and clipping policy.
     pub fn reset_runtime_state(&mut self) {
         for strip in self.inputs.values_mut() {
             strip.ramp = GainRamp::immediate(strip.state.gain);
+            strip.balance_ramp = BalanceRamp::immediate(strip.state.balance);
             strip.delay.reset();
         }
     }
@@ -1330,23 +1415,29 @@ impl MasterMixer {
         for plane in output.iter_mut() {
             plane[..samples].fill(0.0);
         }
+        let any_soloed = self.inputs.values().any(|strip| strip.state.soloed);
         for (id, strip) in &self.inputs {
             let block = blocks.iter().find_map(|submission| {
                 (submission.input() == *id).then(|| (submission.block(), submission.source_gain()))
             });
             let audible = !strip.state.muted
+                && (!any_soloed || strip.state.soloed)
                 && (!strip.state.follow_video || active_video_inputs.contains(id));
             let mut ramp = strip.ramp;
+            let mut balance_ramp = strip.balance_ramp;
             if audible {
                 let source_gain = block.map_or(SourceGain::UNITY, |(_, source_gain)| source_gain);
                 for sample in 0..samples {
                     let strip_gain = ramp.next();
+                    let balance = balance_ramp.next();
                     let source_gain = source_gain.at_sample(sample, samples);
                     for (source, destination, coefficient) in strip.mapping.compiled_routes() {
                         let input = block.map(|(block, _)| block.planes()[source].as_slice());
                         let delayed = strip.delay.preview_sample(source, sample, input);
+                        let balance_gain =
+                            balance_gain(balance, self.format.channels.channels()[destination]);
                         let mapped = output[destination][sample]
-                            + delayed * strip_gain * source_gain * coefficient;
+                            + delayed * strip_gain * balance_gain * source_gain * coefficient;
                         if !mapped.is_finite() {
                             return Err(AudioError::NonFiniteSample {
                                 channel: destination,
@@ -1359,6 +1450,7 @@ impl MasterMixer {
             } else {
                 for _ in 0..samples {
                     ramp.next();
+                    balance_ramp.next();
                 }
             }
         }
@@ -1396,8 +1488,17 @@ impl MasterMixer {
             strip.delay.advance(samples);
             for _ in 0..samples {
                 strip.ramp.next();
+                strip.balance_ramp.next();
             }
         }
+    }
+}
+
+fn balance_gain(balance: f32, destination: fm_types::Channel) -> f32 {
+    match destination {
+        fm_types::Channel::Left => 1.0 - balance.max(0.0),
+        fm_types::Channel::Right => 1.0 + balance.min(0.0),
+        _ => 1.0,
     }
 }
 
@@ -2054,6 +2155,7 @@ mod tests {
                     ChannelMapping::identity(mono_format().channels).unwrap(),
                     InputState {
                         muted: is_muted,
+                        soloed: false,
                         follow_video: true,
                         ..InputState::default()
                     },
@@ -2136,95 +2238,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rendered.block.plane(0).unwrap(), &[0.375, 0.5]);
-    }
-
-    #[test]
-    fn timed_gain_mute_afv_ramps_and_meters_match_legacy_mix() {
-        let format = mono_format();
-        let gain_id = input_id(1);
-        let muted_id = input_id(2);
-        let afv_id = input_id(3);
-        let planes = vec![vec![0.5, -0.5, 0.25, -0.25]];
-        let legacy_block = AudioBlock::from_planar(format.clone(), planes.clone()).unwrap();
-        let timed_block = canonical_block(timing(1), &format, planes);
-        let mut legacy_mixer = MasterMixer::new(format.clone()).unwrap();
-        legacy_mixer.set_clipping_policy(ClippingPolicy::Allow);
-        for (id, state) in [
-            (gain_id, InputState::default()),
-            (
-                muted_id,
-                InputState {
-                    muted: true,
-                    ..InputState::default()
-                },
-            ),
-            (
-                afv_id,
-                InputState {
-                    follow_video: true,
-                    ..InputState::default()
-                },
-            ),
-        ] {
-            legacy_mixer
-                .add_input(
-                    id,
-                    format.clone(),
-                    ChannelMapping::identity(mono_format().channels).unwrap(),
-                    state,
-                )
-                .unwrap();
-        }
-        legacy_mixer
-            .set_input_state(
-                gain_id,
-                InputState {
-                    gain: Gain::SILENCE,
-                    ..InputState::default()
-                },
-                4,
-            )
-            .unwrap();
-        let mut timed_mixer = legacy_mixer.clone();
-
-        let legacy = legacy_mixer
-            .mix(
-                4,
-                &[
-                    (gain_id, &legacy_block),
-                    (muted_id, &legacy_block),
-                    (afv_id, &legacy_block),
-                ],
-                Some(afv_id),
-            )
-            .unwrap();
-        let timed = timed_mixer
-            .mix_timed(
-                timing_for_samples(2, 4),
-                4,
-                &[
-                    (gain_id, &timed_block),
-                    (muted_id, &timed_block),
-                    (afv_id, &timed_block),
-                ],
-                Some(afv_id),
-            )
-            .unwrap();
-
-        assert_eq!(timed.block.planes(), legacy.block.planes());
-        assert_eq!(timed.meters, legacy.meters);
-        assert_eq!(
-            timed_mixer.current_linear_gain(gain_id),
-            legacy_mixer.current_linear_gain(gain_id)
-        );
-        assert_eq!(
-            timed_mixer.current_linear_gain(muted_id),
-            legacy_mixer.current_linear_gain(muted_id)
-        );
-        assert_eq!(
-            timed_mixer.current_linear_gain(afv_id),
-            legacy_mixer.current_linear_gain(afv_id)
-        );
     }
 
     #[test]
@@ -2477,7 +2490,9 @@ mod tests {
                 ChannelMapping::identity(mono_format().channels).unwrap(),
                 InputState {
                     gain: Gain::from_db(-6.020_6).unwrap(),
+                    balance: Balance::CENTER,
                     muted: false,
+                    soloed: false,
                     follow_video: false,
                 },
             )
@@ -2489,7 +2504,9 @@ mod tests {
                 ChannelMapping::identity(mono_format().channels).unwrap(),
                 InputState {
                     gain: Gain::UNITY,
+                    balance: Balance::CENTER,
                     muted: false,
+                    soloed: false,
                     follow_video: true,
                 },
             )
@@ -2507,7 +2524,9 @@ mod tests {
         }
         let muted = InputState {
             gain: Gain::UNITY,
+            balance: Balance::CENTER,
             muted: true,
+            soloed: false,
             follow_video: true,
         };
         mixer.set_input_state(second_id, muted, 0).unwrap();
@@ -2522,6 +2541,121 @@ mod tests {
                 .iter()
                 .all(|sample| *sample == 0.0)
         );
+    }
+
+    #[test]
+    fn stereo_balance_is_bounded_and_ramps_the_opposite_channel() {
+        assert_eq!(Balance::from_basis_points(-10_001), None);
+        assert_eq!(Balance::from_basis_points(10_001), None);
+        let format = stereo_format();
+        let id = input_id(1);
+        let block =
+            AudioBlock::from_planar(format.clone(), vec![vec![1.0; 4], vec![1.0; 4]]).unwrap();
+        let mut mixer = MasterMixer::new(format.clone()).unwrap();
+        mixer
+            .add_input(
+                id,
+                format.clone(),
+                ChannelMapping::identity(format.channels).unwrap(),
+                InputState::default(),
+            )
+            .unwrap();
+        mixer
+            .set_input_state(
+                id,
+                InputState {
+                    balance: Balance::from_basis_points(-10_000).unwrap(),
+                    ..InputState::default()
+                },
+                4,
+            )
+            .unwrap();
+
+        let output = mixer.mix(4, &[(id, &block)], Some(id)).unwrap();
+        assert_eq!(output.block.plane(0).unwrap(), &[1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(output.block.plane(1).unwrap(), &[0.75, 0.5, 0.25, 0.0]);
+        assert_eq!(mixer.current_normalized_balance(id), Some(-1.0));
+
+        mixer
+            .set_input_state(
+                id,
+                InputState {
+                    balance: Balance::from_basis_points(10_000).unwrap(),
+                    ..InputState::default()
+                },
+                0,
+            )
+            .unwrap();
+        let output = mixer.mix(4, &[(id, &block)], Some(id)).unwrap();
+        assert_eq!(output.block.plane(0).unwrap(), &[0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(output.block.plane(1).unwrap(), &[1.0, 1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn solo_gates_other_strips_while_mute_and_follow_video_remain_independent() {
+        let format = mono_format();
+        let first = input_id(1);
+        let second = input_id(2);
+        let first_block = AudioBlock::from_planar(format.clone(), vec![vec![0.25; 2]]).unwrap();
+        let second_block = AudioBlock::from_planar(format.clone(), vec![vec![0.5; 2]]).unwrap();
+        let mut mixer = MasterMixer::new(format.clone()).unwrap();
+        for input in [first, second] {
+            mixer
+                .add_input(
+                    input,
+                    format.clone(),
+                    ChannelMapping::identity(format.channels.clone()).unwrap(),
+                    InputState::default(),
+                )
+                .unwrap();
+        }
+
+        mixer
+            .set_input_state(
+                first,
+                InputState {
+                    soloed: true,
+                    ..InputState::default()
+                },
+                0,
+            )
+            .unwrap();
+        let output = mixer
+            .mix(2, &[(first, &first_block), (second, &second_block)], None)
+            .unwrap();
+        assert_eq!(output.block.plane(0).unwrap(), &[0.25, 0.25]);
+
+        mixer
+            .set_input_state(
+                first,
+                InputState {
+                    soloed: true,
+                    follow_video: true,
+                    ..InputState::default()
+                },
+                0,
+            )
+            .unwrap();
+        let output = mixer
+            .mix(2, &[(first, &first_block), (second, &second_block)], None)
+            .unwrap();
+        assert_eq!(output.block.plane(0).unwrap(), &[0.0, 0.0]);
+
+        mixer
+            .set_input_state(
+                first,
+                InputState {
+                    muted: true,
+                    soloed: true,
+                    ..InputState::default()
+                },
+                0,
+            )
+            .unwrap();
+        let output = mixer
+            .mix(2, &[(first, &first_block), (second, &second_block)], None)
+            .unwrap();
+        assert_eq!(output.block.plane(0).unwrap(), &[0.0, 0.0]);
     }
 
     #[test]
@@ -2545,7 +2679,9 @@ mod tests {
                 source,
                 InputState {
                     gain: Gain::from_db(-6.020_6).unwrap(),
+                    balance: Balance::CENTER,
                     muted: false,
+                    soloed: false,
                     follow_video: true,
                 },
             )
