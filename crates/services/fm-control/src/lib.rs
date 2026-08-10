@@ -26,11 +26,11 @@ use fm_engine::{
 use fm_protocol::{
     CommandMessage, CommandPayload, CommandResult, EngineIdentity, EventCursor, EventMessage,
     EventPayload, FadeToBlackPosition, FadeToBlackState, FieldIssue, InputAudioStripStatus,
-    ManualTransitionKind, ManualTransitionPosition, ManualTransitionState, ManualTransitionStatus,
-    OverlayBorderPreset as ProtocolOverlayBorder, OverlayPositionPreset as ProtocolOverlayPosition,
-    OverlayStatus, OverlayTransitionKind as ProtocolOverlayTransition, RuntimeEventMessage,
-    RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage,
-    StingerAudioPolicy as ProtocolStingerAudioPolicy,
+    InputStatus, ManualTransitionKind, ManualTransitionPosition, ManualTransitionState,
+    ManualTransitionStatus, OverlayBorderPreset as ProtocolOverlayBorder,
+    OverlayPositionPreset as ProtocolOverlayPosition, OverlayStatus,
+    OverlayTransitionKind as ProtocolOverlayTransition, RuntimeEventMessage, RuntimeLifecycleEvent,
+    ServerIdentity, SnapshotMessage, StingerAudioPolicy as ProtocolStingerAudioPolicy,
     StingerMissingMediaFallback as ProtocolStingerFallback, StingerReadiness, StingerStatus,
     WireInputId, WireMessage, WireOutputId, WireOverlayChannelId, WireStingerSlotId,
 };
@@ -1399,7 +1399,11 @@ fn snapshot_record(engine: &Engine, identity: &EngineIdentity) -> SnapshotRecord
             .inputs()
             .iter()
             .copied()
-            .map(WireInputId::from_domain)
+            .zip(engine.show().input_names().iter().cloned())
+            .map(|(input, name)| InputStatus {
+                input: WireInputId::from_domain(input),
+                name,
+            })
             .collect(),
         input_audio_strips: protocol_input_audio_strips(engine),
         desired_program: WireInputId::from_domain(engine.show().desired_switcher().program()),

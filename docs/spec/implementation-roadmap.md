@@ -199,8 +199,9 @@ integer milli-dB gain (`-96000..=24000`), stereo balance
 0–48,000-sample delay. Native daemon preflight transactionally maps those
 records to `fm-audio::Gain` and `fm-audio::Balance` and constructs both Master
 mixer copies with the target gain, balance, and delay applied immediately.
-Protocol 2.6 carries authoritative full-strip status in snapshots and durable
-events plus one permission-gated atomic live strip command. The engine schedules
+Protocol 2.7 carries authoritative input IDs and canonical names plus full-strip
+status in snapshots, and durable events carry full-strip state plus one
+permission-gated atomic live strip command. The engine schedules
 accepted gain, balance, mute, follow-video, and delay changes together at a frame boundary, and
 native realization updates active and pending Master/Stinger mixers and the
 checkpoint project atomically. Live gain and balance changes then ramp linearly
@@ -216,7 +217,9 @@ to the project. Current-contract persistence, generated-audio, AFV
 selected/inactive, mute, immediate startup gain/balance/delay, live full-strip realization,
 and failed-preflight no-partial-state tests cover this slice.
 
-There are still no audio meters in Studio, solo/PFL, labels/groups, bus
+Studio input tiles and mixer strips use exact persisted input names carried by
+the snapshot rather than generated ordinal labels. There are still no audio
+meters in Studio, solo/PFL, strip-name editing/groups, bus
 sends, microphone automix, device-audio path,
 device-clock correction, native EQ/gate/compressor/limiter, or acceptance
 evidence. Phase 2 item 7 is partial, Phase 3 item 3 is partial, and
@@ -415,9 +418,10 @@ snapshots while any channel is moving. Every channel also owns a bounded
 bottom-left, and bottom-right position presets plus none/thin-white/thick-white
 inset-border presets. Schema 15 persists the complete desired and realized
 arrays, appearance, queue state, and exact per-input audio strips, and accepts schema
-15 only. Protocol 2.6 carries opacity, transition kind, duration, Take, Update,
+15 only. Protocol 2.7 carries canonical input names, opacity, transition kind,
+duration, Take, Update,
 Off, output inclusion, transition/appearance configuration, Queue, Take Next,
-and atomic per-input audio-strip commands and state, and accepts protocol 2.6 only.
+and atomic per-input audio-strip commands and state, and accepts protocol 2.7 only.
 
 Control authorization treats overlay mutations as transition operations. The
 client/UI reducer validates exactly eight unique channels, active-source
@@ -459,14 +463,16 @@ Native project compilation carries that value into physical and scene-alias
 strips, and native Master/Stinger preflight applies it transactionally to both
 active and pending mixers before gain, balance, mute, follow-video, and source envelopes.
 The engine owns the live desired full-strip map and emits frame-boundary
-realization updates. Protocol 2.6 snapshots and events replicate the complete
-map; its `SetInputAudioStrip` command atomically carries gain, balance, mute,
+realization updates. Protocol 2.7 snapshots pair every input ID with its
+canonical persisted name and replicate the complete strip map; its
+`SetInputAudioStrip` command atomically carries gain, balance, mute,
 follow-video, and delay and is authorized by the dedicated audio-control
 permission. The daemon applies each update transactionally to every active and
 pending ordinary/Stinger mixer, with 240-sample linear live gain and balance
 ramps and next-sample mute/follow-video/delay changes, before checkpointing the
-canonical project. The local and remote CLI expose the command and exact status; Studio
-renders Ready- and permission-gated per-input controls; Web exposes the equivalent
+canonical project. The local and remote CLI expose the command, exact status,
+and input labels; Studio renders persisted names with Ready- and
+permission-gated per-input controls; Web exposes the equivalent
 transport-free semantic controls. Device audio and clocks, drift correction,
 channel mapping, native EQ/gate/compressor/limiter, meters, and hardware
 acceptance remain. This is still a partial item 3 slice and does not

@@ -258,7 +258,7 @@ impl Remote {
             format_manual_transition(switcher.realized_manual_transition),
             format_fade_to_black(switcher.desired_fade_to_black),
             format_fade_to_black(switcher.realized_fade_to_black),
-            format_input_audio_strips(state.input_audio_strips()),
+            format_input_audio_strips(state),
             format_overlays(state.desired_overlays()),
             format_overlays(state.realized_overlays()),
         );
@@ -281,15 +281,17 @@ impl Remote {
     }
 }
 
-fn format_input_audio_strips(strips: &[fm_ui_model::InputAudioStripStatus]) -> String {
+fn format_input_audio_strips(state: &fm_ui_model::ProjectState) -> String {
     format!(
         "[{}]",
-        strips
+        state
+            .input_audio_strips()
             .iter()
             .map(|status| {
                 format!(
-                    "{}:{}:{}:{}:{}:{}",
+                    "{}:{:?}:{}:{}:{}:{}:{}",
                     status.input,
+                    state.input_name(status.input).unwrap_or(""),
                     status.gain_millidb,
                     status.balance_basis_points,
                     status.muted,

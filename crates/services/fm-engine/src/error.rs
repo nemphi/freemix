@@ -9,6 +9,7 @@ use fm_types::InputId;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShowError {
     EmptyName,
+    EmptyInputName,
     NoInputs,
     DuplicateInput,
     UnknownInput(InputId),
@@ -19,6 +20,7 @@ impl fmt::Display for ShowError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyName => formatter.write_str("show name must not be empty"),
+            Self::EmptyInputName => formatter.write_str("show input names must not be empty"),
             Self::NoInputs => formatter.write_str("show must contain at least one input"),
             Self::DuplicateInput => formatter.write_str("show input identifiers must be unique"),
             Self::UnknownInput(input) => write!(formatter, "show does not contain input {input}"),

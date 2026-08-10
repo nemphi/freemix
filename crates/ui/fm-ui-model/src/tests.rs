@@ -60,6 +60,7 @@ fn snapshot(project_id: ProjectId, revision: u64) -> ProjectSnapshot {
         },
         show_name: "Show".into(),
         inputs: vec![input(1), input(2), input(3)],
+        input_names: vec!["Camera".into(), "Slides".into(), "Guest".into()],
         input_audio_strips: input_audio_strips(),
         stingers: Vec::new(),
         desired_overlays: overlays(),
@@ -139,11 +140,21 @@ fn fade_to_black(target_active: bool, numerator: u16) -> FadeToBlackState {
 #[test]
 fn installs_and_validates_snapshot() {
     let project_id = project(10);
+    let mut invalid_names = snapshot(project_id, 1);
+    invalid_names.input_names.pop();
+    assert_eq!(
+        ClientModel::new(project_id)
+            .install_snapshot(invalid_names)
+            .unwrap_err(),
+        ModelError::InvalidInputNames
+    );
     let mut model = ClientModel::new(project_id);
     model.install_snapshot(snapshot(project_id, 7)).unwrap();
 
     let state = model.state().unwrap();
     assert_eq!(state.show_name(), "Show");
+    assert_eq!(state.input_name(input(1)), Some("Camera"));
+    assert_eq!(model.view().unwrap().input_names[1], "Slides");
     assert_eq!(state.switcher().desired.program, input(1));
     assert_eq!(model.sync_status(), &SyncStatus::Current);
 

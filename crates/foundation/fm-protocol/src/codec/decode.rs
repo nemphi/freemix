@@ -14,8 +14,8 @@ use crate::{
 };
 
 use super::value::{
-    parse_client_type, parse_durable_events, parse_field_issues, parse_role, parse_runtime_domains,
-    parse_string_list, parse_version, unescape,
+    parse_client_type, parse_durable_events, parse_field_issues, parse_input_statuses, parse_role,
+    parse_runtime_domains, parse_string_list, parse_version, unescape,
 };
 use super::{
     MAX_FIELD_NAME_BYTES, MAX_FIELD_VALUE_BYTES, MAX_FIELDS_PER_MESSAGE, MAX_LINE_BYTES,
@@ -511,11 +511,7 @@ fn decode_result(fields: &mut Fields) -> Result<CommandResult, CodecError> {
 }
 
 fn decode_snapshot(fields: &mut Fields) -> Result<SnapshotMessage, CodecError> {
-    let inputs_value = fields.required("inputs")?;
-    let inputs = parse_inputs(&inputs_value).ok_or(CodecError::InvalidField {
-        field: "inputs",
-        value: inputs_value,
-    })?;
+    let inputs = parse_input_statuses(&fields.required("inputs")?)?;
     Ok(SnapshotMessage {
         engine: decode_identity(fields)?,
         revision: fields.parse_required("revision")?,
@@ -849,16 +845,6 @@ fn decode_event(fields: &mut Fields) -> Result<EventMessage, CodecError> {
 
 fn parse_input(value: &str) -> Option<WireInputId> {
     Some(WireInputId::new(NonZeroU128::new(value.parse().ok()?)?))
-}
-
-fn parse_inputs(value: &str) -> Option<Vec<WireInputId>> {
-    if value.is_empty() {
-        return None;
-    }
-    if value.split(',').take(MAX_LIST_ITEMS + 1).count() > MAX_LIST_ITEMS {
-        return None;
-    }
-    value.split(',').map(parse_input).collect()
 }
 
 fn decode_server_identity(fields: &mut Fields) -> Result<ServerIdentity, CodecError> {

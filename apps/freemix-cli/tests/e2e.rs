@@ -743,7 +743,7 @@ fn write_handshake_version_with_manual(
             engine: engine.clone(),
             revision,
             show_name: "Remote Contract".into(),
-            inputs: vec![input(1), input(2)],
+            inputs: input_statuses(),
             input_audio_strips: input_audio_strips(),
             desired_program: input(1),
             desired_preview: preview,
@@ -793,7 +793,7 @@ fn write_handshake_version_with_fade_to_black(
             engine: engine.clone(),
             revision,
             show_name: "Remote Contract".into(),
-            inputs: vec![input(1), input(2)],
+            inputs: input_statuses(),
             input_audio_strips: input_audio_strips(),
             desired_program: input(1),
             desired_preview: input(2),
@@ -917,6 +917,16 @@ fn write_message(writer: &mut TcpStream, message: &WireMessage) {
 
 fn input(value: u128) -> WireInputId {
     WireInputId::new(NonZeroU128::new(value).unwrap())
+}
+
+fn input_statuses() -> Vec<fm_protocol::InputStatus> {
+    [(1, "Camera"), (2, "Slides")]
+        .into_iter()
+        .map(|(value, name)| fm_protocol::InputStatus {
+            input: input(value),
+            name: name.into(),
+        })
+        .collect()
 }
 
 fn input_audio_strips() -> Vec<fm_protocol::InputAudioStripStatus> {
@@ -1085,9 +1095,9 @@ fn remote_audio_strip_preserves_controls_and_replicated_state() {
         "0",
     ]);
     assert_success(&output);
-    assert!(
-        stdout(&output).contains("AudioStrips=[1:0:0:false:true:0,2:-6000:2500:true:false:2400]")
-    );
+    assert!(stdout(&output).contains(
+        "AudioStrips=[1:\"Camera\":0:0:false:true:0,2:\"Slides\":-6000:2500:true:false:2400]"
+    ));
     server.finish();
 }
 

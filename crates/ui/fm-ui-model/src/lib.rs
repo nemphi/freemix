@@ -178,6 +178,7 @@ pub struct ProjectSnapshot {
     pub cursor: ProjectCursor,
     pub show_name: String,
     pub inputs: Vec<InputId>,
+    pub input_names: Vec<String>,
     pub input_audio_strips: Vec<InputAudioStripStatus>,
     pub stingers: Vec<StingerStatus>,
     pub desired_overlays: Vec<OverlayStatus>,
@@ -193,6 +194,11 @@ impl ProjectSnapshot {
         let desired_overlays = protocol_overlays(message.desired_overlays);
         let realized_overlays = protocol_overlays(message.realized_overlays);
         let input_audio_strips = protocol_input_audio_strips(message.input_audio_strips);
+        let (inputs, input_names) = message
+            .inputs
+            .into_iter()
+            .map(|input| (input.input.to_domain(), input.name))
+            .unzip();
         Self {
             cursor: ProjectCursor {
                 project_id,
@@ -200,11 +206,8 @@ impl ProjectSnapshot {
                 revision: Revision::new(message.revision),
             },
             show_name: message.show_name,
-            inputs: message
-                .inputs
-                .into_iter()
-                .map(fm_protocol::WireInputId::to_domain)
-                .collect(),
+            inputs,
+            input_names,
             input_audio_strips,
             stingers,
             desired_overlays,
@@ -346,6 +349,7 @@ pub struct RuntimeRealization {
 pub struct ProjectState {
     show_name: String,
     inputs: Vec<InputId>,
+    input_names: Vec<String>,
     input_audio_strips: Vec<InputAudioStripStatus>,
     stingers: Vec<StingerStatus>,
     desired_overlays: Vec<OverlayStatus>,
@@ -362,6 +366,14 @@ impl ProjectState {
     #[must_use]
     pub fn inputs(&self) -> &[InputId] {
         &self.inputs
+    }
+
+    #[must_use]
+    pub fn input_name(&self, input: InputId) -> Option<&str> {
+        self.inputs
+            .iter()
+            .position(|candidate| *candidate == input)
+            .map(|index| self.input_names[index].as_str())
     }
 
     #[must_use]
@@ -396,6 +408,7 @@ pub struct ClientView {
     pub cursor: ProjectCursor,
     pub show_name: String,
     pub inputs: Vec<InputId>,
+    pub input_names: Vec<String>,
     pub input_audio_strips: Vec<InputAudioStripStatus>,
     pub stingers: Vec<StingerStatus>,
     pub desired_overlays: Vec<OverlayStatus>,
@@ -507,7 +520,7 @@ pub enum CommandReconciled {
 /// A reducer input for callers that prefer one dispatch surface.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Action {
-    InstallSnapshot(ProjectSnapshot),
+    InstallSnapshot(Box<ProjectSnapshot>),
     ApplyEvent(DurableProjectEvent),
     ApplyRuntimeRealization(RuntimeRealization),
     TrackCommand {
@@ -573,6 +586,7 @@ pub enum ModelError {
     },
     RevisionExhausted,
     DuplicateInput(InputId),
+    InvalidInputNames,
     InvalidInputAudioStrips,
     DuplicateStingerSlot(u8),
     InvalidStingerSlot(u8),
@@ -650,8 +664,10 @@ impl fmt::Display for ModelError {
             ),
             Self::RevisionExhausted => formatter.write_str("revision counter is exhausted"),
             Self::DuplicateInput(input) => write!(formatter, "snapshot repeats input {input}"),
+            Self::InvalidInputNames => formatter
+                .write_str("input names must contain one nonempty label for each show input"),
             Self::InvalidInputAudioStrips => formatter.write_str(
-                "input audio strips must contain each show input exactly once with gain in -96000..=24000 millidB and delay in 0..=48000 samples",
+                "input audio strips must contain each show input exactly once with gain in -96000..=24000 millidB, balance in -10000..=10000 basis points, and delay in 0..=48000 samples",
             ),
             Self::DuplicateStingerSlot(slot) => {
                 write!(formatter, "snapshot repeats Stinger slot {slot}")
@@ -763,6 +779,7 @@ impl ClientModel {
             cursor,
             show_name: state.show_name.clone(),
             inputs: state.inputs.clone(),
+            input_names: state.input_names.clone(),
             input_audio_strips: state.input_audio_strips.clone(),
             stingers: state.stingers.clone(),
             desired_overlays: state.desired_overlays.clone(),
@@ -812,7 +829,7 @@ impl ClientModel {
     pub fn reduce(&mut self, action: Action) -> Result<Reduction, ModelError> {
         match action {
             Action::InstallSnapshot(snapshot) => self
-                .install_snapshot(snapshot)
+                .install_snapshot(*snapshot)
                 .map(Reduction::SnapshotInstalled),
             Action::ApplyEvent(event) => self.apply_event(event).map(Reduction::EventApplied),
             Action::ApplyRuntimeRealization(realization) => self
@@ -937,6 +954,7 @@ impl ClientModel {
         self.state = Some(ProjectState {
             show_name: snapshot.show_name,
             inputs: snapshot.inputs,
+            input_names: snapshot.input_names,
             input_audio_strips: snapshot.input_audio_strips,
             stingers: snapshot.stingers,
             desired_overlays: snapshot.desired_overlays,
@@ -1293,6 +1311,14 @@ fn validate_engine(engine: &EngineIdentity) -> Result<(), ModelError> {
 }
 
 fn validate_snapshot_inputs(snapshot: &ProjectSnapshot) -> Result<(), ModelError> {
+    if snapshot.input_names.len() != snapshot.inputs.len()
+        || snapshot
+            .input_names
+            .iter()
+            .any(|name| name.trim().is_empty())
+    {
+        return Err(ModelError::InvalidInputNames);
+    }
     let mut inputs = HashSet::with_capacity(snapshot.inputs.len());
     for input in &snapshot.inputs {
         if !inputs.insert(*input) {

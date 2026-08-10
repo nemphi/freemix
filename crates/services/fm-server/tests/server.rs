@@ -57,13 +57,23 @@ fn input(value: u128) -> WireInputId {
     WireInputId::new(NonZeroU128::new(value).unwrap())
 }
 
+fn input_statuses() -> Vec<fm_protocol::InputStatus> {
+    [(1, "Camera"), (2, "Slides")]
+        .into_iter()
+        .map(|(value, name)| fm_protocol::InputStatus {
+            input: input(value),
+            name: name.into(),
+        })
+        .collect()
+}
+
 fn control() -> FakeControl {
     let engine = engine();
     let snapshot = SnapshotMessage {
         engine: engine.clone(),
         revision: 4,
         show_name: "show".into(),
-        inputs: vec![input(1), input(2)],
+        inputs: input_statuses(),
         input_audio_strips: input_audio_strips(),
         desired_program: input(1),
         desired_preview: input(2),

@@ -6,17 +6,27 @@ use fm_protocol::{
     CommandMessage, CommandPayload, CommandResult, DurableEvent, DurableEventBatch, DurableGap,
     EngineIdentity, ErrorMessage, EventCursor, EventMessage, EventPayload, FadeToBlackPosition,
     FadeToBlackState, FieldIssue, HandshakeOutcome, HeartbeatMessage, InputAudioStripStatus,
-    LineDecoder, MAX_FIELD_VALUE_BYTES, MAX_FIELDS_PER_MESSAGE, MAX_LINE_BYTES, MAX_LIST_ITEMS,
-    MAX_MESSAGES_PER_PUSH, ManualTransitionStatus, OverlayStatus, OverlayTransitionKind,
-    ResumeCursor, RuntimeDomainBoundary, RuntimeEventMessage, RuntimeFailureDisposition,
-    RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage, SnapshotReason, StingerAudioPolicy,
-    StingerMissingMediaFallback, StingerReadiness, StingerStatus, StructuredError, WireInputId,
-    WireMessage, WireOutputId, WireOverlayChannelId, WireStingerSlotId, choose_handshake_outcome,
-    decode_line, encode_line,
+    InputStatus, LineDecoder, MAX_FIELD_VALUE_BYTES, MAX_FIELDS_PER_MESSAGE, MAX_LINE_BYTES,
+    MAX_LIST_ITEMS, MAX_MESSAGES_PER_PUSH, ManualTransitionStatus, OverlayStatus,
+    OverlayTransitionKind, ResumeCursor, RuntimeDomainBoundary, RuntimeEventMessage,
+    RuntimeFailureDisposition, RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage,
+    SnapshotReason, StingerAudioPolicy, StingerMissingMediaFallback, StingerReadiness,
+    StingerStatus, StructuredError, WireInputId, WireMessage, WireOutputId, WireOverlayChannelId,
+    WireStingerSlotId, choose_handshake_outcome, decode_line, encode_line,
 };
 
 fn input(value: u128) -> WireInputId {
     WireInputId::new(NonZeroU128::new(value).unwrap())
+}
+
+fn input_statuses(values: &[(u128, &str)]) -> Vec<InputStatus> {
+    values
+        .iter()
+        .map(|&(value, name)| InputStatus {
+            input: input(value),
+            name: name.into(),
+        })
+        .collect()
 }
 
 fn input_audio_strips(values: &[u128]) -> Vec<InputAudioStripStatus> {
@@ -215,7 +225,7 @@ fn every_message_variant_round_trips() {
             engine: identity(),
             revision: 9,
             show_name: "My Show\nA".to_owned(),
-            inputs: vec![input(1), input(2)],
+            inputs: input_statuses(&[(1, "Camera, A"), (2, "Slides ~ Main")]),
             input_audio_strips: input_audio_strips(&[1, 2]),
             desired_program: input(2),
             desired_preview: input(1),

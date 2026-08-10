@@ -19,6 +19,13 @@ fn input(value: u128) -> InputId {
     InputId::new(NonZeroU128::new(value).unwrap())
 }
 
+fn named_inputs(values: impl IntoIterator<Item = InputId>) -> Vec<(InputId, String)> {
+    values
+        .into_iter()
+        .map(|input| (input, format!("Input {input}")))
+        .collect()
+}
+
 fn principal(role: Role) -> Principal {
     Principal::authenticated(
         UserId::new("user").unwrap(),
@@ -30,7 +37,7 @@ fn principal(role: Role) -> Principal {
 fn service(retained_events: usize, subscriber_queue: usize) -> ControlService {
     let show = ShowState::new(
         "show",
-        vec![input(1), input(2), input(3)],
+        named_inputs([input(1), input(2), input(3)]),
         input(1),
         input(2),
     )
@@ -56,7 +63,7 @@ fn service(retained_events: usize, subscriber_queue: usize) -> ControlService {
 fn stinger_service() -> ControlService {
     let mut show = ShowState::new(
         "stinger show",
-        vec![input(1), input(2), input(3)],
+        named_inputs([input(1), input(2), input(3)]),
         input(1),
         input(2),
     )
@@ -89,6 +96,25 @@ fn stinger_service() -> ControlService {
             subscriber_queue: 8,
         },
     )
+}
+
+#[test]
+fn snapshot_projects_canonical_input_names_in_engine_order() {
+    let control = service(8, 2);
+    assert_eq!(
+        control
+            .snapshot()
+            .snapshot
+            .inputs
+            .iter()
+            .map(|input| (input.input.to_domain(), input.name.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (input(1), "Input 1"),
+            (input(2), "Input 2"),
+            (input(3), "Input 3"),
+        ]
+    );
 }
 
 #[test]
@@ -1139,7 +1165,7 @@ fn engine_controls_accepted_rejected_and_duplicate_behavior() {
 fn restored_engine_rejection_receipts_still_replay_after_authorization() {
     let show = ShowState::new(
         "show",
-        vec![input(1), input(2), input(3)],
+        named_inputs([input(1), input(2), input(3)]),
         input(1),
         input(2),
     )

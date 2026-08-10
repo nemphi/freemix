@@ -32,6 +32,11 @@ into control messages.
    replacement, restore, log compaction, or engine identity change forces a
    snapshot and a new cursor.
 
+Snapshots carry the bounded project-order input catalog as exact ID/name pairs.
+The canonical persisted name labels input tiles and mixer strips; clients do not
+invent ordinal display names. Input-catalog edits establish a fresh snapshot
+boundary because durable switcher events do not repeat static project metadata.
+
 ## 3. Command semantics
 
 Conceptual envelope:

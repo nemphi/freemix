@@ -3554,8 +3554,9 @@ fn restore_engine(project: &StoredProject) -> AppResult<Engine> {
     let inputs = canonical
         .inputs()
         .iter()
-        .map(|input| input.id)
+        .map(|input| (input.id, input.name.clone()))
         .collect::<Vec<_>>();
+    let input_ids = inputs.iter().map(|(input, _)| *input).collect::<Vec<_>>();
     let main_mix = canonical
         .main_mix()
         .ok_or_else(|| AppFailure("project is missing desired main mix routing".into()))?;
@@ -3564,12 +3565,12 @@ fn restore_engine(project: &StoredProject) -> AppResult<Engine> {
     let realized_preview = required_routing(routing.realized_preview_id, "realized preview")?;
     let mut show = ShowState::new(
         canonical.name(),
-        inputs.clone(),
+        inputs,
         main_mix.desired_program,
         main_mix.desired_preview,
     )?;
     restore_input_audio_strips(&mut show, canonical)?;
-    let mut realized = SwitcherState::new(inputs, realized_program, realized_preview)?;
+    let mut realized = SwitcherState::new(input_ids, realized_program, realized_preview)?;
     for config in canonical.stingers() {
         restore_stinger(&mut show, &mut realized, *config)?;
     }

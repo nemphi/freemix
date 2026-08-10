@@ -11,7 +11,9 @@ use crate::{
     StingerStatus, StructuredError, WireMessage,
 };
 
-use super::value::{client_type, durable_events, field_issues, role, runtime_domains, string_list};
+use super::value::{
+    client_type, durable_events, field_issues, input_statuses, role, runtime_domains, string_list,
+};
 use super::{CodecError, MAX_FIELD_VALUE_BYTES, MAX_LINE_BYTES, MAX_LIST_ITEMS};
 
 /// Encodes one message as a single newline-terminated record.
@@ -378,16 +380,7 @@ fn encode_snapshot(record: &mut Record, message: &SnapshotMessage) -> Result<(),
     encode_identity(record, &message.engine)?;
     record.field("revision", message.revision)?;
     record.field_str("show_name", &message.show_name)?;
-    check_count(message.inputs.len(), "inputs")?;
-    record.field_string(
-        "inputs",
-        message
-            .inputs
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(","),
-    )?;
+    record.field_string("inputs", input_statuses(&message.inputs)?)?;
     encode_input_audio_strips(record, &message.input_audio_strips)?;
     record.field("desired_program", message.desired_program)?;
     record.field("desired_preview", message.desired_preview)?;

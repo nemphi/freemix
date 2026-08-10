@@ -29,6 +29,16 @@ fn input(value: u128) -> WireInputId {
     WireInputId::new(NonZeroU128::new(value).unwrap())
 }
 
+fn input_statuses() -> Vec<fm_protocol::InputStatus> {
+    [(1, "Camera"), (2, "Slides")]
+        .into_iter()
+        .map(|(value, name)| fm_protocol::InputStatus {
+            input: input(value),
+            name: name.into(),
+        })
+        .collect()
+}
+
 fn project_id() -> ProjectId {
     ProjectId::new(NonZeroU128::new(7).unwrap())
 }
@@ -100,7 +110,7 @@ fn snapshot(revision: u64) -> SnapshotMessage {
         engine: engine(),
         revision,
         show_name: "Show".to_owned(),
-        inputs: vec![input(1), input(2)],
+        inputs: input_statuses(),
         input_audio_strips: input_audio_strips(),
         desired_program: input(1),
         desired_preview: input(2),

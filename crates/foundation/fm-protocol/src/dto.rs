@@ -606,12 +606,19 @@ pub struct InputAudioStripStatus {
     pub delay_samples: u32,
 }
 
+/// One canonical show input exposed to clients in project order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InputStatus {
+    pub input: WireInputId,
+    pub name: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SnapshotMessage {
     pub engine: EngineIdentity,
     pub revision: u64,
     pub show_name: String,
-    pub inputs: Vec<WireInputId>,
+    pub inputs: Vec<InputStatus>,
     pub input_audio_strips: Vec<InputAudioStripStatus>,
     pub desired_program: WireInputId,
     pub desired_preview: WireInputId,

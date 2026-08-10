@@ -111,7 +111,7 @@ mod tests {
 
     #[test]
     fn audio_strip_requires_current_session_permission_and_bounds() {
-        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(2, 6));
+        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(2, 7));
         let controls = AudioStripControls;
         let ready = session(&["control_audio"]);
         assert_eq!(

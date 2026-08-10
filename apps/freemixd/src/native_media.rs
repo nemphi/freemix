@@ -10991,7 +10991,19 @@ mod tests {
         let inputs = vec![old, new];
         let frame_rate = FrameRate::new(25, 1).unwrap();
         let clock_domain = EngineClockDomainId::new(NonZeroU128::new(99).unwrap());
-        let show = || ShowState::new("interval propagation", inputs.clone(), old, new).unwrap();
+        let show = || {
+            ShowState::new(
+                "interval propagation",
+                inputs
+                    .iter()
+                    .copied()
+                    .map(|input| (input, format!("Input {input}")))
+                    .collect(),
+                old,
+                new,
+            )
+            .unwrap()
+        };
 
         let mut fade = Engine::new(show(), frame_rate, clock_domain);
         fade.execute(
@@ -11095,7 +11107,16 @@ mod tests {
         let new = input(2);
         let frame_rate = FrameRate::new(25, 1).unwrap();
         let clock_domain = EngineClockDomainId::new(NonZeroU128::new(99).unwrap());
-        let show = ShowState::new("manual alpha", vec![old, new], old, new).unwrap();
+        let show = ShowState::new(
+            "manual alpha",
+            [old, new]
+                .into_iter()
+                .map(|input| (input, format!("Input {input}")))
+                .collect(),
+            old,
+            new,
+        )
+        .unwrap();
         let mut engine = Engine::new(show, frame_rate, clock_domain);
         for (key, command) in [
             (

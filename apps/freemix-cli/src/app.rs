@@ -766,7 +766,11 @@ fn default_project(name: String) -> AppResult<ProjectEngine> {
 
 fn engine_from_project(project: Project) -> AppResult<ProjectEngine> {
     let main_mix = required_main_mix(&project)?;
-    let inputs = project.inputs().iter().map(|input| input.id).collect();
+    let inputs = project
+        .inputs()
+        .iter()
+        .map(|input| (input.id, input.name.clone()))
+        .collect();
     let mut show = ShowState::new(
         project.name(),
         inputs,
@@ -1037,20 +1041,21 @@ fn load_engine(path: &Path) -> AppResult<ProjectEngine> {
     let inputs = project
         .inputs()
         .iter()
-        .map(|input| input.id)
+        .map(|input| (input.id, input.name.clone()))
         .collect::<Vec<_>>();
+    let input_ids = inputs.iter().map(|(input, _)| *input).collect::<Vec<_>>();
     let main_mix = required_main_mix(&project)?;
     let routing = stored.runtime_routing();
     let realized_program = required_routing(routing.realized_program_id, "realized program")?;
     let realized_preview = required_routing(routing.realized_preview_id, "realized preview")?;
     let mut show = ShowState::new(
         project.name(),
-        inputs.clone(),
+        inputs,
         main_mix.desired_program,
         main_mix.desired_preview,
     )?;
     restore_input_audio_strips(&mut show, &project)?;
-    let mut realized = SwitcherState::new(inputs, realized_program, realized_preview)?;
+    let mut realized = SwitcherState::new(input_ids, realized_program, realized_preview)?;
     for config in project.stingers() {
         restore_stinger(&mut show, &mut realized, *config)?;
     }
@@ -1431,8 +1436,13 @@ fn format_audio_strips(project: &Project) -> String {
         .input_audio_strips()
         .iter()
         .map(|strip| {
+            let name = project
+                .inputs()
+                .iter()
+                .find(|input| input.id == strip.input)
+                .map_or("", |input| input.name.as_str());
             format!(
-                "{}:gain_mdb={}:balance_bp={}:delay_samples={}:{}:{}",
+                "{}:{name:?}:gain_mdb={}:balance_bp={}:delay_samples={}:{}:{}",
                 strip.input,
                 strip.state.gain.get(),
                 strip.state.balance.get(),
@@ -1846,7 +1856,12 @@ mod tests {
         let program = InputId::new(NonZeroU128::new(1).unwrap());
         let preview = InputId::new(NonZeroU128::new(2).unwrap());
         let inputs = vec![program, preview];
-        let mut show = ShowState::new("restore", inputs.clone(), program, preview).unwrap();
+        let named_inputs = inputs
+            .iter()
+            .copied()
+            .map(|input| (input, format!("Input {input}")))
+            .collect();
+        let mut show = ShowState::new("restore", named_inputs, program, preview).unwrap();
         let mut realized = SwitcherState::new(inputs, program, preview).unwrap();
         let slot = fm_model::StingerSlotNumber::new(1).unwrap();
         let config = |preload| {

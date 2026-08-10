@@ -31,6 +31,7 @@ impl Default for EngineInputAudioStripState {
 pub struct ShowState {
     name: String,
     inputs: Vec<InputId>,
+    input_names: Vec<String>,
     input_audio_strips: BTreeMap<InputId, EngineInputAudioStripState>,
     desired_switcher: SwitcherState,
 }
@@ -40,11 +41,11 @@ impl ShowState {
     ///
     /// # Errors
     ///
-    /// Returns a [`ShowError`] for an empty name, an empty or duplicate input
-    /// set, or unavailable initial switcher selections.
+    /// Returns a [`ShowError`] for an empty show/input name, an empty or
+    /// duplicate input set, or unavailable initial switcher selections.
     pub fn new(
         name: impl Into<String>,
-        inputs: Vec<InputId>,
+        inputs: Vec<(InputId, String)>,
         program: InputId,
         preview: InputId,
     ) -> Result<Self, ShowError> {
@@ -55,20 +56,25 @@ impl ShowState {
         if inputs.is_empty() {
             return Err(ShowError::NoInputs);
         }
-        let distinct: HashSet<_> = inputs.iter().copied().collect();
+        if inputs.iter().any(|(_, name)| name.trim().is_empty()) {
+            return Err(ShowError::EmptyInputName);
+        }
+        let distinct: HashSet<_> = inputs.iter().map(|(input, _)| *input).collect();
         if distinct.len() != inputs.len() {
             return Err(ShowError::DuplicateInput);
         }
+        let input_ids = inputs.iter().map(|(input, _)| *input).collect::<Vec<_>>();
         let desired_switcher =
-            SwitcherState::new(inputs.clone(), program, preview).map_err(ShowError::Switcher)?;
+            SwitcherState::new(input_ids.clone(), program, preview).map_err(ShowError::Switcher)?;
         Ok(Self {
             name,
-            input_audio_strips: inputs
+            input_audio_strips: input_ids
                 .iter()
                 .copied()
                 .map(|input| (input, EngineInputAudioStripState::default()))
                 .collect(),
-            inputs,
+            inputs: input_ids,
+            input_names: inputs.into_iter().map(|(_, name)| name).collect(),
             desired_switcher,
         })
     }
@@ -81,6 +87,20 @@ impl ShowState {
     #[must_use]
     pub fn inputs(&self) -> &[InputId] {
         &self.inputs
+    }
+
+    /// Returns canonical input names in the same order as [`Self::inputs`].
+    #[must_use]
+    pub fn input_names(&self) -> &[String] {
+        &self.input_names
+    }
+
+    #[must_use]
+    pub fn input_name(&self, input: InputId) -> Option<&str> {
+        self.inputs
+            .iter()
+            .position(|candidate| *candidate == input)
+            .map(|index| self.input_names[index].as_str())
     }
 
     #[must_use]

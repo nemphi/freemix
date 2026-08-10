@@ -9,7 +9,7 @@ use fm_engine::{
     Engine, EngineCommand, EngineError, EngineInputAudioStripState, EngineManualTransitionKind,
     EngineManualTransitionPosition, EnginePrepareOutcome, EngineRestoreState, EngineSnapshot,
     MAX_INPUT_AUDIO_BALANCE_BASIS_POINTS, MAX_INPUT_AUDIO_DELAY_SAMPLES,
-    MAX_INPUT_AUDIO_GAIN_MILLIDB, ShowState, SnapshotError,
+    MAX_INPUT_AUDIO_GAIN_MILLIDB, ShowError, ShowState, SnapshotError,
 };
 use fm_scheduler::FrameNumber;
 use fm_switcher::{
@@ -24,6 +24,13 @@ fn input(value: u128) -> InputId {
     InputId::new(NonZeroU128::new(value).unwrap())
 }
 
+fn named_inputs(values: impl IntoIterator<Item = InputId>) -> Vec<(InputId, String)> {
+    values
+        .into_iter()
+        .map(|input| (input, format!("Input {input}")))
+        .collect()
+}
+
 fn output(value: u128) -> OutputId {
     OutputId::new(NonZeroU128::new(value).unwrap())
 }
@@ -36,7 +43,7 @@ fn engine() -> Engine {
     Engine::new(
         ShowState::new(
             "test show",
-            vec![input(1), input(2), input(3)],
+            named_inputs([input(1), input(2), input(3)]),
             input(1),
             input(2),
         )
@@ -53,7 +60,7 @@ fn stinger_engine(
 ) -> Engine {
     let mut show = ShowState::new(
         "stinger show",
-        vec![input(1), input(2), input(3)],
+        named_inputs([input(1), input(2), input(3)]),
         input(1),
         input(2),
     )
@@ -102,6 +109,29 @@ fn restore_persisted(
         domain(),
         restore_state,
     )
+}
+
+#[test]
+fn show_owns_exact_input_names_in_input_order() {
+    let show = ShowState::new(
+        "labels",
+        vec![(input(1), "Camera A".into()), (input(2), "Slides".into())],
+        input(1),
+        input(2),
+    )
+    .unwrap();
+    assert_eq!(show.input_names(), &["Camera A", "Slides"]);
+    assert_eq!(show.input_name(input(2)), Some("Slides"));
+    assert_eq!(show.input_name(input(3)), None);
+    assert_eq!(
+        ShowState::new(
+            "labels",
+            vec![(input(1), "Camera".into()), (input(2), "  ".into())],
+            input(1),
+            input(2),
+        ),
+        Err(ShowError::EmptyInputName)
+    );
 }
 
 #[test]

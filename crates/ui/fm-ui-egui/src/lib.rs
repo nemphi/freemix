@@ -1190,11 +1190,8 @@ fn draw_inputs(ui: &mut Ui, state: &StudioUiState, intents: &mut Vec<StudioInten
                 .show(ui, |ui| {
                     for (index, input) in view.inputs.iter().copied().enumerate() {
                         let tally = tally_state(input, view.switcher);
-                        let tile_text = format!(
-                            "{}\n{}",
-                            input_label(index + 1, input),
-                            tally.operator_label()
-                        );
+                        let tile_text =
+                            format!("{}\n{}", view.input_names[index], tally.operator_label());
                         let response = ui.add_enabled(
                             enabled,
                             Button::new(RichText::new(tile_text).color(tally_color(tally)))
@@ -1229,7 +1226,7 @@ fn label_for_input(view: &ClientView, input: InputId) -> String {
         .position(|candidate| *candidate == input)
         .map_or_else(
             || format!("Input {input}"),
-            |index| input_label(index + 1, input),
+            |index| view.input_names[index].clone(),
         )
 }
 
