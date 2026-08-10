@@ -1429,8 +1429,10 @@ mod tests {
         InputAudioStripStatus, InputStatus, ManualTransitionStatus, OverlayStatus, Role,
         ServerIdentity, SnapshotMessage, SnapshotReason, WireMessage, decode_line, encode_line,
     };
-    use fm_types::{InputId, ProjectId};
-    use fm_ui_model::{ClientModel, ProjectSnapshot};
+    use fm_types::ProjectId;
+    use fm_ui_model::{
+        ClientModel, DurableChange, DurableProjectEvent, ProjectSnapshot,
+    };
 
     #[cfg(unix)]
     use crate::SupervisedConfig;
@@ -1734,7 +1736,7 @@ mod tests {
         model
             .install_snapshot(ProjectSnapshot::from_protocol(project, snapshot))
             .unwrap();
-        let mut confirmed = model.view().unwrap();
+        let confirmed = model.view().unwrap();
         assert_eq!(
             resolve_input_audio_strip(
                 Some(&confirmed),
@@ -1754,7 +1756,23 @@ mod tests {
                 delay_samples: 0,
             })
         );
-        confirmed.input_audio_strips[0].muted = true;
+        let mut input_audio_strips = confirmed.input_audio_strips.clone();
+        input_audio_strips[0].muted = true;
+        let mut cursor = confirmed.cursor.clone();
+        cursor.revision = cursor.revision.checked_next().unwrap();
+        model
+            .apply_event(DurableProjectEvent {
+                cursor,
+                change: DurableChange::DesiredSwitcher {
+                    selection: confirmed.switcher.desired,
+                    manual_transition: confirmed.switcher.desired_manual_transition,
+                    fade_to_black: confirmed.switcher.desired_fade_to_black,
+                    overlays: confirmed.desired_overlays.clone(),
+                    input_audio_strips,
+                },
+            })
+            .unwrap();
+        let confirmed = model.view().unwrap();
         assert_eq!(
             resolve_input_audio_strip(
                 Some(&confirmed),
