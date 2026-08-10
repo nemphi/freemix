@@ -6,6 +6,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command as ProcessCommand, Stdio},
     sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, Instant},
 };
 
 use fm_client::{
@@ -69,10 +70,20 @@ struct Daemon {
 
 impl Daemon {
     fn start(project: &Path) -> Self {
-        let mut child = ProcessCommand::new(env!("CARGO_BIN_EXE_freemixd"))
-            .arg("serve")
-            .arg(project)
-            .arg("--once")
+        Self::start_with_once(project, true)
+    }
+
+    fn start_without_once(project: &Path) -> Self {
+        Self::start_with_once(project, false)
+    }
+
+    fn start_with_once(project: &Path, once: bool) -> Self {
+        let mut command = ProcessCommand::new(env!("CARGO_BIN_EXE_freemixd"));
+        command.arg("serve").arg(project);
+        if once {
+            command.arg("--once");
+        }
+        let mut child = command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -116,6 +127,16 @@ impl Daemon {
                 .read_to_string(&mut stderr)
                 .unwrap();
             panic!("daemon exited with {status}: {stderr}");
+        }
+    }
+
+    fn stop(mut self) {
+        let mut child = self.child.take().unwrap();
+        child.kill().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while child.try_wait().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "daemon did not stop within one second");
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 }
@@ -324,6 +345,41 @@ fn daemon_acknowledges_only_valid_heartbeats() {
 
     drop(client);
     daemon.wait_success();
+}
+
+#[test]
+fn malformed_post_handshake_record_does_not_stop_daemon() {
+    let directory = TestDirectory::new("malformed-post-handshake-record");
+    let project_path = directory.project_path();
+    create_project(&project_path);
+
+    let daemon = Daemon::start_without_once(&project_path);
+    let mut malformed_client = daemon.connect();
+    malformed_client
+        .reader
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    malformed_client.handshake(None);
+    assert!(matches!(malformed_client.receive(), WireMessage::Snapshot(_)));
+    malformed_client.writer.write_all(b"malformed-record\n").unwrap();
+    malformed_client.writer.flush().unwrap();
+
+    let mut closed = String::new();
+    assert_eq!(malformed_client.reader.read_line(&mut closed).unwrap(), 0);
+
+    let mut next_client = daemon.connect();
+    next_client
+        .reader
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    next_client.handshake(None);
+    assert!(matches!(next_client.receive(), WireMessage::Snapshot(_)));
+
+    drop(next_client);
+    drop(malformed_client);
+    daemon.stop();
 }
 
 #[test]

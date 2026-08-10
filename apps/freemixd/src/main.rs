@@ -54,7 +54,7 @@ use fm_persistence::{
     RuntimeRouting, StoredProject,
 };
 use fm_protocol::{
-    CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, CommandMessage, CommandPayload,
+    CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, CodecError, CommandMessage, CommandPayload,
     CommandResult, ErrorMessage, EventCursor, HandshakeOutcome as ProtocolHandshakeOutcome,
     HandshakeRequest, HandshakeResponse, HeartbeatAcknowledgementMessage, HeartbeatMessage,
     LineDecoder, ProtocolVersion, ResumeCursor, RuntimeEventMessage, ServerHello, ServerIdentity,
@@ -3503,7 +3503,7 @@ fn serve_inner(
             {
                 break reason;
             }
-            if !is_client_disconnect(error.as_ref()) {
+            if !is_client_disconnect(error.as_ref()) && !is_client_protocol_error(error.as_ref()) {
                 return Err(error);
             }
         }
@@ -4957,10 +4957,14 @@ impl MessageReader {
             };
             if read == 0 {
                 let decoder = std::mem::replace(&mut self.decoder, LineDecoder::new());
-                decoder.finish()?;
+                decoder.finish().map_err(ClientProtocolError)?;
                 return Ok(None);
             }
-            self.pending.extend(self.decoder.push(&chunk[..read])?);
+            self.pending.extend(
+                self.decoder
+                    .push(&chunk[..read])
+                    .map_err(ClientProtocolError)?,
+            );
             if let Some(message) = self.pending.pop_front() {
                 return Ok(Some(message));
             }
@@ -4985,6 +4989,10 @@ fn is_client_disconnect(error: &(dyn Error + 'static)) -> bool {
         );
     }
     error.source().is_some_and(is_client_disconnect)
+}
+
+fn is_client_protocol_error(error: &(dyn Error + 'static)) -> bool {
+    error.downcast_ref::<ClientProtocolError>().is_some()
 }
 
 fn development_principal() -> AppResult<Principal> {
@@ -5029,6 +5037,9 @@ struct AppFailure(String);
 #[derive(Debug)]
 struct ClientWriteTimeout(std::io::ErrorKind);
 
+#[derive(Debug)]
+struct ClientProtocolError(CodecError);
+
 impl fmt::Display for ClientWriteTimeout {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "client write timed out: {:?}", self.0)
@@ -5036,6 +5047,14 @@ impl fmt::Display for ClientWriteTimeout {
 }
 
 impl Error for ClientWriteTimeout {}
+
+impl fmt::Display for ClientProtocolError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "client protocol error: {}", self.0)
+    }
+}
+
+impl Error for ClientProtocolError {}
 
 impl fmt::Display for AppFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
