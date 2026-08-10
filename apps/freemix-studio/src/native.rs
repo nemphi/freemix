@@ -3,15 +3,12 @@ use std::{
     fmt,
     sync::{
         atomic::{AtomicU64, Ordering},
-        mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel},
+        mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError, sync_channel},
         Arc, Mutex, PoisonError,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-
-#[cfg(test)]
-use std::sync::mpsc::RecvTimeoutError;
 
 use eframe::egui;
 use fm_client::{
@@ -218,19 +215,6 @@ impl StateUpdates {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take()
-    }
-
-    #[cfg(test)]
-    fn recv_timeout(
-        &self,
-        timeout: Duration,
-    ) -> Result<Option<StudioUiState>, RecvTimeoutError> {
-        self.receiver.recv_timeout(timeout)?;
-        Ok(self
-            .latest
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take())
     }
 }
 
@@ -1641,9 +1625,15 @@ mod tests {
         expected: StudioConnectionStatus,
     ) {
         loop {
-            let state = updates
+            updates
+                .receiver
                 .recv_timeout(HEARTBEAT_TEST_TIMEOUT)
-                .unwrap()
+                .unwrap();
+            let state = updates
+                .latest
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
                 .expect("notification has a current state");
             if state.connection_status == expected {
                 return;
@@ -1704,7 +1694,6 @@ mod tests {
                 .unwrap()
                 .success()
         );
-        receive_connection_state(&updates, StudioConnectionStatus::Failed);
         receive_connection_state(&updates, StudioConnectionStatus::Ready);
         assert_eq!(
             fs::read_to_string(directory.path("show.freemix.launches"))
