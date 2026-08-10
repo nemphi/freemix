@@ -139,9 +139,9 @@ process-group/job and descendant cleanup. The supervised stdout readiness record
 is byte-bounded; this does not add service/media readiness or RC-008 completion.
 Studio UI state is latest-state and
 cannot block control I/O; this adds no preview delivery, service readiness, or
-transport support, and RC-008 remains planned. Project input names and video frames
-are not present in the replicated client contract, so tiles use ordinal/ID
-labels and monitor wells state that real preview delivery remains pending.
+transport support, and RC-008 remains planned. Studio Program/Preview wells display
+replicated desired and realized routing input names; this control state is not
+output-video proof, and preview delivery remains pending.
 An owned supervised daemon exit detected while Studio is idle enters the existing
 bounded reconnect/restart path; protocol mismatch, restart-limit, and fatal supervisor
 errors stay terminal, and this does not complete item 5 or RC-008 or prove service, media, or cross-platform readiness.

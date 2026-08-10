@@ -1036,8 +1036,16 @@ fn draw_messages(ui: &mut Ui, state: &StudioUiState) {
 fn draw_monitors(ui: &mut Ui, view: Option<&ClientView>) {
     let (preview, program) = view.map_or((None, None), |view| {
         (
-            Some((view.switcher.desired.preview, view)),
-            Some((view.switcher.realized.program, view)),
+            Some((
+                view.switcher.desired.preview,
+                view.switcher.realized.preview,
+                view,
+            )),
+            Some((
+                view.switcher.desired.program,
+                view.switcher.realized.program,
+                view,
+            )),
         )
     });
     if ui.available_width() >= NARROW_MONITOR_WIDTH {
@@ -1056,7 +1064,7 @@ fn draw_monitor(
     ui: &mut Ui,
     bus_label: &str,
     color: Color32,
-    selected: Option<(InputId, &ClientView)>,
+    routing: Option<(InputId, InputId, &ClientView)>,
 ) {
     Frame::new()
         .fill(MONITOR_BLACK)
@@ -1066,15 +1074,34 @@ fn draw_monitor(
             ui.set_min_height(154.0);
             ui.label(RichText::new(bus_label).strong().color(color));
             ui.add_space(28.0);
-            let selected_label = selected.map_or_else(
-                || "NO INPUT STATE".to_owned(),
-                |(input, view)| label_for_input(view, input),
+            let (routing_label, routing_text_color) = routing.map_or_else(
+                || ("ROUTING STATE UNAVAILABLE".to_owned(), MUTED),
+                |(desired, realized, view)| {
+                    (
+                        format!(
+                            "DESIRED: {} | REALIZED: {}",
+                            label_for_input(view, desired),
+                            label_for_input(view, realized),
+                        ),
+                        routing_color(desired, realized),
+                    )
+                },
             );
             ui.vertical_centered(|ui| {
-                ui.label(RichText::new(selected_label).strong().size(17.0));
-                ui.add_space(10.0);
+                ui.label(
+                    RichText::new(routing_label)
+                        .strong()
+                        .size(17.0)
+                        .color(routing_text_color),
+                );
+                ui.add_space(6.0);
                 ui.label(
                     RichText::new("VIDEO PREVIEW DELIVERY PENDING")
+                        .small()
+                        .color(MUTED),
+                );
+                ui.label(
+                    RichText::new("ROUTING STATE, NOT OUTPUT VIDEO PROOF")
                         .small()
                         .color(MUTED),
                 );
@@ -1251,6 +1278,10 @@ fn label_for_input(view: &ClientView, input: InputId) -> String {
         )
 }
 
+fn routing_color(desired: InputId, realized: InputId) -> Color32 {
+    if desired == realized { MUTED } else { AMBER }
+}
+
 const fn connection_color(status: StudioConnectionStatus) -> Color32 {
     match status {
         StudioConnectionStatus::Ready => PREVIEW,
@@ -1355,6 +1386,12 @@ mod tests {
             format!("01 | Input {}", u128::MAX)
         );
         assert_eq!(input_label(128, input(7)), "128 | Input 7");
+    }
+
+    #[test]
+    fn routing_color_marks_only_divergent_ids_amber() {
+        assert_eq!(routing_color(input(1), input(1)), MUTED);
+        assert_eq!(routing_color(input(1), input(2)), AMBER);
     }
 
     #[test]
