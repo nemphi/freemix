@@ -134,7 +134,7 @@ impl StudioConnectionStatus {
             Self::Launching => "LAUNCHING",
             Self::Connecting => "CONNECTING",
             Self::Synchronizing => "SYNCHRONIZING",
-            Self::Ready => "READY",
+            Self::Ready => "CONTROL READY",
             Self::Backoff => "RETRY BACKOFF",
             Self::Disconnected => "DISCONNECTED",
             Self::Failed => "FAILED",
@@ -1561,6 +1561,7 @@ mod tests {
             StudioConnectionStatus::ProtocolMismatch,
         ];
         assert!(StudioConnectionStatus::Ready.controls_enabled());
+        assert_eq!(StudioConnectionStatus::Ready.operator_label(), "CONTROL READY");
         for status in statuses {
             assert!(!status.controls_enabled(), "{status:?}");
             assert!(!status.operator_label().is_empty());
