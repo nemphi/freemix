@@ -1,6 +1,9 @@
 use std::{error::Error, fmt, fs, io, path::PathBuf};
 
-use crate::ProjectStore;
+use fm_model::InputKind;
+use fm_types::InputId;
+
+use crate::{ProjectStore, StoredProject};
 
 const ASSETS_DIRECTORY: &str = "assets";
 const ASSET_URI_PREFIX: &str = "asset://";
@@ -51,6 +54,55 @@ impl ProjectStore {
 
         Ok(candidate)
     }
+
+    /// Reports media inputs whose project asset cannot be resolved.
+    #[must_use]
+    pub fn audit_assets(&self, project: &StoredProject) -> Vec<AssetAuditIssue> {
+        let mut issues = project
+            .project()
+            .inputs()
+            .iter()
+            .filter_map(|input| {
+                let InputKind::Media { asset_uri } = &input.kind else {
+                    return None;
+                };
+                let reason = match self.resolve_asset_uri(asset_uri) {
+                    Ok(_) => return None,
+                    Err(AssetResolveError::InvalidUri) => AssetAuditReason::InvalidUri,
+                    Err(
+                        AssetResolveError::AssetsRootUnavailable(_)
+                        | AssetResolveError::AssetUnavailable(_),
+                    ) => AssetAuditReason::MissingAsset,
+                    Err(AssetResolveError::OutsideAssetsRoot) => {
+                        AssetAuditReason::OutsideProjectRoot
+                    }
+                    Err(AssetResolveError::NotRegularFile) => AssetAuditReason::NotRegularFile,
+                };
+                Some(AssetAuditIssue {
+                    input_id: input.id,
+                    reason,
+                })
+            })
+            .collect::<Vec<_>>();
+        issues.sort_unstable_by_key(|issue| issue.input_id);
+        issues
+    }
+}
+
+/// A project input with an unresolved media asset.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AssetAuditIssue {
+    pub input_id: InputId,
+    pub reason: AssetAuditReason,
+}
+
+/// A stable reason that a project media asset cannot be used.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AssetAuditReason {
+    InvalidUri,
+    MissingAsset,
+    OutsideProjectRoot,
+    NotRegularFile,
 }
 
 fn validate_asset_uri(uri: &str) -> Result<&str, AssetResolveError> {

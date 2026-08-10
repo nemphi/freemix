@@ -1149,6 +1149,7 @@ independently with tested recovery.
 9. Add PTZ protocols, presets as virtual inputs, mouse/joystick control.
 10. Add telestrator and web monitor.
 11. Add project append, bundle, relink, import/export, templates, undo/lock.
+The current persistence slice only audits stored media asset references; all item 11 mutation workflows remain planned.
 
 Exit: graphics/data/automation/operator ecosystem `P1` rows pass.
 
