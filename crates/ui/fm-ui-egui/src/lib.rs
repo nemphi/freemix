@@ -42,6 +42,13 @@ pub struct InputAudioStripUpdate {
     pub delay_samples: Option<u32>,
 }
 
+/// Changed appearance controls for one overlay channel.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OverlayAppearanceUpdate {
+    pub position: Option<OverlayPositionPreset>,
+    pub border: Option<OverlayBorderPreset>,
+}
+
 /// Operator actions emitted by [`StudioShell`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StudioIntent {
@@ -80,11 +87,10 @@ pub enum StudioIntent {
         transition: OverlayTransitionKind,
         duration_frames: u32,
     },
-    /// Changes the placement and border presets for one overlay channel.
+    /// Changes one or more appearance presets for one overlay channel.
     ConfigureOverlayAppearance {
         channel: WireOverlayChannelId,
-        position: OverlayPositionPreset,
-        border: OverlayBorderPreset,
+        update: OverlayAppearanceUpdate,
     },
     /// Appends the current Preview source to one overlay queue.
     QueueOverlay {
@@ -890,8 +896,10 @@ fn draw_overlay_channel(
             {
                 intents.push(StudioIntent::ConfigureOverlayAppearance {
                     channel,
-                    position: next_overlay_position(position),
-                    border,
+                    update: OverlayAppearanceUpdate {
+                        position: Some(next_overlay_position(position)),
+                        border: None,
+                    },
                 });
             }
             if ui
@@ -901,8 +909,10 @@ fn draw_overlay_channel(
             {
                 intents.push(StudioIntent::ConfigureOverlayAppearance {
                     channel,
-                    position,
-                    border: next_overlay_border(border),
+                    update: OverlayAppearanceUpdate {
+                        position: None,
+                        border: Some(next_overlay_border(border)),
+                    },
                 });
             }
             if ui

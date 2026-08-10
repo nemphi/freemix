@@ -16,7 +16,8 @@ use fm_client::{
 };
 use fm_protocol::{CommandPayload, CommandResult, DurableGap, WireInputId, WireMessage};
 use fm_ui_egui::{
-    InputAudioStripUpdate, StudioConnectionStatus, StudioIntent, StudioShell, StudioUiState,
+    InputAudioStripUpdate, OverlayAppearanceUpdate, StudioConnectionStatus, StudioIntent,
+    StudioShell, StudioUiState,
 };
 use fm_ui_model::ClientView;
 
@@ -1111,6 +1112,28 @@ fn resolve_input_audio_strip(
     })
 }
 
+fn resolve_overlay_appearance(
+    view: Option<&ClientView>,
+    channel: fm_protocol::WireOverlayChannelId,
+    update: OverlayAppearanceUpdate,
+) -> Result<CommandPayload, String> {
+    let view = view.ok_or_else(|| {
+        "Cannot edit overlay appearance before project state is synchronized".to_owned()
+    })?;
+    let overlay = view
+        .desired_overlays
+        .iter()
+        .find(|overlay| overlay.channel == channel.number())
+        .ok_or_else(|| {
+            "Cannot edit overlay appearance: channel is no longer available".to_owned()
+        })?;
+    Ok(CommandPayload::ConfigureOverlayAppearance {
+        channel,
+        position: update.position.unwrap_or(overlay.position),
+        border: update.border.unwrap_or(overlay.border),
+    })
+}
+
 fn consume_command_sequence(
     runtime: &mut StudioRuntime,
     command_id: &str,
@@ -1420,15 +1443,9 @@ fn intent_payload(
             transition,
             duration_frames,
         },
-        StudioIntent::ConfigureOverlayAppearance {
-            channel,
-            position,
-            border,
-        } => CommandPayload::ConfigureOverlayAppearance {
-            channel,
-            position,
-            border,
-        },
+        StudioIntent::ConfigureOverlayAppearance { channel, update } => {
+            return resolve_overlay_appearance(view, channel, update);
+        }
         StudioIntent::QueueOverlay { channel, source } => CommandPayload::QueueOverlay {
             channel,
             source: WireInputId::from_domain(source),
@@ -1560,7 +1577,8 @@ mod tests {
         CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, EngineIdentity, FadeToBlackPosition,
         FadeToBlackState, HandshakeOutcome, HandshakeResponse, HeartbeatAcknowledgementMessage,
         InputAudioStripStatus, InputStatus, ManualTransitionPosition, ManualTransitionStatus,
-        OverlayStatus, Role, ServerIdentity, SnapshotMessage, SnapshotReason, WireMessage,
+        OverlayBorderPreset, OverlayPositionPreset, OverlayStatus, Role, ServerIdentity,
+        SnapshotMessage, SnapshotReason, WireMessage,
         decode_line, encode_line,
     };
     use fm_types::ProjectId;
@@ -2045,6 +2063,69 @@ mod tests {
                 soloed: true,
                 follow_video: false,
                 delay_samples: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn queued_overlay_appearance_edits_merge_with_the_latest_confirmed_channel() {
+        let project = ProjectId::new(NonZeroU128::new(7).unwrap());
+        let snapshot = heartbeat_snapshot();
+        let channel = snapshot.desired_overlays[0].channel;
+        let mut model = ClientModel::new(project);
+        model
+            .install_snapshot(ProjectSnapshot::from_protocol(project, snapshot))
+            .unwrap();
+        let confirmed = model.view().unwrap();
+        assert_eq!(
+            intent_payload(
+                StudioIntent::ConfigureOverlayAppearance {
+                    channel,
+                    update: OverlayAppearanceUpdate {
+                        position: Some(OverlayPositionPreset::TopLeft),
+                        border: None,
+                    },
+                },
+                Some(&confirmed),
+            ),
+            Ok(CommandPayload::ConfigureOverlayAppearance {
+                channel,
+                position: OverlayPositionPreset::TopLeft,
+                border: OverlayBorderPreset::None,
+            })
+        );
+        let mut overlays = confirmed.desired_overlays.clone();
+        overlays[0].position = OverlayPositionPreset::TopLeft;
+        let mut cursor = confirmed.cursor.clone();
+        cursor.revision = cursor.revision.checked_next().unwrap();
+        model
+            .apply_event(DurableProjectEvent {
+                cursor,
+                change: DurableChange::DesiredSwitcher {
+                    selection: confirmed.switcher.desired,
+                    manual_transition: confirmed.switcher.desired_manual_transition,
+                    fade_to_black: confirmed.switcher.desired_fade_to_black,
+                    overlays,
+                    input_audio_strips: confirmed.input_audio_strips.clone(),
+                },
+            })
+            .unwrap();
+        let confirmed = model.view().unwrap();
+        assert_eq!(
+            intent_payload(
+                StudioIntent::ConfigureOverlayAppearance {
+                    channel,
+                    update: OverlayAppearanceUpdate {
+                        position: None,
+                        border: Some(OverlayBorderPreset::ThinWhite),
+                    },
+                },
+                Some(&confirmed),
+            ),
+            Ok(CommandPayload::ConfigureOverlayAppearance {
+                channel,
+                position: OverlayPositionPreset::TopLeft,
+                border: OverlayBorderPreset::ThinWhite,
             })
         );
     }
