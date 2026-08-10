@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use fm_client::SessionEvent;
+use fm_client::{Intake, SessionEvent};
 use freemix_studio::{Command, HELP, StudioRuntime, launch_native, parse_args};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -51,24 +51,37 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     Instant::now() >= deadline
                 })
                 .map_err(diagnostic_failure)?;
-            match runtime
-                .receive_cancellable(DIAGNOSE_POLL_INTERVAL, || Instant::now() >= deadline)
-                .map_err(diagnostic_failure)?
-            {
-                SessionEvent::HeartbeatAcknowledged { acknowledgement } => {
-                    if Instant::now() >= deadline {
-                        return Err(diagnostic_failure("deadline exceeded").into());
+            loop {
+                match runtime
+                    .receive_cancellable(DIAGNOSE_POLL_INTERVAL, || Instant::now() >= deadline)
+                    .map_err(diagnostic_failure)?
+                {
+                    SessionEvent::HeartbeatAcknowledged { acknowledgement } => {
+                        if Instant::now() >= deadline {
+                            return Err(diagnostic_failure("deadline exceeded").into());
+                        }
+                        println!(
+                            "liveness=ok sequence={} received_at_ms={}",
+                            acknowledgement.heartbeat_sequence, acknowledgement.received_at_ms
+                        );
+                        break;
                     }
-                    println!(
-                        "liveness=ok sequence={} received_at_ms={}",
-                        acknowledgement.heartbeat_sequence, acknowledgement.received_at_ms
-                    );
+                    SessionEvent::Event {
+                        intake: Intake::EventApplied,
+                        ..
+                    }
+                    | SessionEvent::RuntimeEvent {
+                        intake: Intake::RuntimeEventObserved,
+                        ..
+                    } => {}
+                    SessionEvent::Disconnected { .. } => {
+                        return Err(diagnostic_failure("EOF").into());
+                    }
+                    SessionEvent::ServerError(_) => {
+                        return Err(diagnostic_failure("server error").into());
+                    }
+                    _ => return Err(diagnostic_failure("unexpected session event").into()),
                 }
-                SessionEvent::Disconnected { .. } => return Err(diagnostic_failure("EOF").into()),
-                SessionEvent::ServerError(_) => {
-                    return Err(diagnostic_failure("server error").into());
-                }
-                _ => return Err(diagnostic_failure("unexpected session event").into()),
             }
         }
     }

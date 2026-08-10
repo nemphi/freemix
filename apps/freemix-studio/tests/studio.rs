@@ -18,8 +18,8 @@ use fm_client::{ClientError, CommandStatus, Intake, SessionEvent, SyncMode, TcpS
 use fm_protocol::{
     CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, CommandPayload, CommandResult,
     EngineIdentity, EventCursor, EventMessage, EventPayload, FadeToBlackPosition, FadeToBlackState,
-    HandshakeOutcome, HandshakeResponse, HeartbeatAcknowledgementMessage, LineDecoder,
-    ManualTransitionStatus, OverlayStatus, ProtocolVersion, Role, RuntimeEventMessage,
+    HandshakeOutcome, HandshakeResponse, HeartbeatAcknowledgementMessage, HeartbeatMessage,
+    LineDecoder, ManualTransitionStatus, OverlayStatus, ProtocolVersion, Role, RuntimeEventMessage,
     RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage, SnapshotReason, WireInputId,
     WireMessage, encode_line,
 };
@@ -545,31 +545,49 @@ fn run_diagnose(address: SocketAddr) -> Result<Output, String> {
     }
 }
 
+fn receive_diagnose_heartbeat(peer: &mut Peer, deadline: Instant) -> HeartbeatMessage {
+    let WireMessage::HandshakeRequest(request) = peer.receive_until(deadline) else {
+        panic!("expected modern handshake request");
+    };
+    assert_eq!(request.protocol, CURRENT_PROTOCOL_VERSION);
+    peer.send_until(
+        &WireMessage::HandshakeResponse(handshake(
+            project_id(),
+            4,
+            HandshakeOutcome::Snapshot {
+                reason: SnapshotReason::NoCursor,
+            },
+        )),
+        deadline,
+    );
+    peer.send_until(&WireMessage::Snapshot(snapshot(4)), deadline);
+
+    let WireMessage::Heartbeat(heartbeat) = peer.receive_until(deadline) else {
+        panic!("expected heartbeat after snapshot");
+    };
+    assert_eq!(heartbeat.last_applied.as_ref().unwrap().revision, 4);
+    heartbeat
+}
+
+fn assert_diagnose_success(output: Result<Output, String>) {
+    let output = output.unwrap_or_else(|error| panic!("{error}"));
+    assert!(
+        output.status.success(),
+        "Studio diagnose failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "liveness=ok sequence=1 received_at_ms=1234\n"
+    );
+}
+
 #[test]
 fn diagnose_reports_validated_heartbeat() {
     let (address, server_thread) = spawn_server(|listener| {
         let deadline = Instant::now() + CONNECT_TIMEOUT;
         let mut peer = Peer::accept_until(&listener, deadline);
-        let WireMessage::HandshakeRequest(request) = peer.receive_until(deadline) else {
-            panic!("expected modern handshake request");
-        };
-        assert_eq!(request.protocol, CURRENT_PROTOCOL_VERSION);
-        peer.send_until(
-            &WireMessage::HandshakeResponse(handshake(
-                project_id(),
-                4,
-                HandshakeOutcome::Snapshot {
-                    reason: SnapshotReason::NoCursor,
-                },
-            )),
-            deadline,
-        );
-        peer.send_until(&WireMessage::Snapshot(snapshot(4)), deadline);
-
-        let WireMessage::Heartbeat(heartbeat) = peer.receive_until(deadline) else {
-            panic!("expected heartbeat after snapshot");
-        };
-        assert_eq!(heartbeat.last_applied.unwrap().revision, 4);
+        let heartbeat = receive_diagnose_heartbeat(&mut peer, deadline);
         peer.send_until(
             &WireMessage::HeartbeatAcknowledgement(HeartbeatAcknowledgementMessage {
                 server: heartbeat.server,
@@ -583,16 +601,30 @@ fn diagnose_reports_validated_heartbeat() {
     let output = run_diagnose(address);
     let server = server_thread.join();
     assert!(server.is_ok(), "Studio diagnostic server failed");
-    let output = output.unwrap_or_else(|error| panic!("{error}"));
-    assert!(
-        output.status.success(),
-        "Studio diagnose failed: stderr={}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(
-        String::from_utf8(output.stdout).unwrap(),
-        "liveness=ok sequence=1 received_at_ms=1234\n"
-    );
+    assert_diagnose_success(output);
+}
+
+#[test]
+fn diagnose_ignores_state_event_before_heartbeat() {
+    let (address, server_thread) = spawn_server(|listener| {
+        let deadline = Instant::now() + CONNECT_TIMEOUT;
+        let mut peer = Peer::accept_until(&listener, deadline);
+        let heartbeat = receive_diagnose_heartbeat(&mut peer, deadline);
+        peer.send_until(&WireMessage::Event(event(5)), deadline);
+        peer.send_until(
+            &WireMessage::HeartbeatAcknowledgement(HeartbeatAcknowledgementMessage {
+                server: heartbeat.server,
+                heartbeat_sequence: heartbeat.sequence,
+                received_at_ms: 1_234,
+            }),
+            deadline,
+        );
+    });
+
+    let output = run_diagnose(address);
+    let server = server_thread.join();
+    assert!(server.is_ok(), "Studio diagnostic server failed");
+    assert_diagnose_success(output);
 }
 
 struct TestDirectory(PathBuf);
