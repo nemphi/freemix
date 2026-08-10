@@ -606,6 +606,12 @@ fn draw_overlays(
         .show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("OVERLAYS").small().strong().color(AMBER));
+                ui.label(
+                    RichText::new("D = desired. C = last daemon confirmation.")
+                        .small()
+                        .color(MUTED),
+                )
+                .on_hover_text("Confirmation is control state, not output-video proof.");
                 for channel_number in 1..=8 {
                     draw_overlay_channel(
                         ui,
@@ -644,99 +650,109 @@ fn draw_overlay_channel(
         .view
         .as_ref()
         .map(|view| view.switcher.desired.preview);
-    if ui
-        .add_enabled(
-            enabled && source.is_some(),
-            Button::new(RichText::new(format!("O{channel_number} TAKE")).strong()),
-        )
-        .on_hover_text("Take the current Preview source on this overlay channel")
-        .clicked()
-        && let Some(source) = source
-    {
-        intents.push(StudioIntent::TakeOverlay { channel, source });
-    }
-    if ui
-        .add_enabled(
-            enabled && source.is_some(),
-            Button::new(format!(
-                "Q+{}",
-                desired.map_or(0, |value| value.queued_sources.len())
-            )),
-        )
-        .on_hover_text("Append the current Preview source to this overlay queue")
-        .clicked()
-        && let Some(source) = source
-    {
-        intents.push(StudioIntent::QueueOverlay { channel, source });
-    }
-    if ui
-        .add_enabled(
-            enabled && desired.is_some_and(|value| !value.queued_sources.is_empty()),
-            Button::new("NEXT"),
-        )
-        .clicked()
-    {
-        intents.push(StudioIntent::TakeNextOverlay { channel });
-    }
-    let transition = desired.map_or(OverlayTransitionKind::Cut, |overlay| overlay.transition);
-    if ui
-        .add_enabled(
-            enabled,
-            Button::new(match transition {
-                OverlayTransitionKind::Cut => "CUT",
-                OverlayTransitionKind::Fade => "FADE",
-            }),
-        )
-        .on_hover_text("Toggle this overlay channel between Cut and Fade")
-        .clicked()
-    {
-        intents.push(StudioIntent::ConfigureOverlayTransition {
-            channel,
-            transition: match transition {
-                OverlayTransitionKind::Cut => OverlayTransitionKind::Fade,
-                OverlayTransitionKind::Fade => OverlayTransitionKind::Cut,
-            },
-            duration_frames,
+    ui.vertical(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(
+                    enabled && source.is_some(),
+                    Button::new(RichText::new(format!("O{channel_number} TAKE")).strong()),
+                )
+                .on_hover_text("Take the current Preview source on this overlay channel")
+                .clicked()
+                && let Some(source) = source
+            {
+                intents.push(StudioIntent::TakeOverlay { channel, source });
+            }
+            if ui
+                .add_enabled(
+                    enabled && source.is_some(),
+                    Button::new(format!(
+                        "Q+{}",
+                        desired.map_or(0, |value| value.queued_sources.len())
+                    )),
+                )
+                .on_hover_text("Append the current Preview source to this overlay queue")
+                .clicked()
+                && let Some(source) = source
+            {
+                intents.push(StudioIntent::QueueOverlay { channel, source });
+            }
+            if ui
+                .add_enabled(
+                    enabled && desired.is_some_and(|value| !value.queued_sources.is_empty()),
+                    Button::new("NEXT"),
+                )
+                .clicked()
+            {
+                intents.push(StudioIntent::TakeNextOverlay { channel });
+            }
+            let transition =
+                desired.map_or(OverlayTransitionKind::Cut, |overlay| overlay.transition);
+            if ui
+                .add_enabled(
+                    enabled,
+                    Button::new(match transition {
+                        OverlayTransitionKind::Cut => "CUT",
+                        OverlayTransitionKind::Fade => "FADE",
+                    }),
+                )
+                .on_hover_text("Toggle this overlay channel between Cut and Fade")
+                .clicked()
+            {
+                intents.push(StudioIntent::ConfigureOverlayTransition {
+                    channel,
+                    transition: match transition {
+                        OverlayTransitionKind::Cut => OverlayTransitionKind::Fade,
+                        OverlayTransitionKind::Fade => OverlayTransitionKind::Cut,
+                    },
+                    duration_frames,
+                });
+            }
+            let position =
+                desired.map_or(OverlayPositionPreset::FullFrame, |overlay| overlay.position);
+            let border = desired.map_or(OverlayBorderPreset::None, |overlay| overlay.border);
+            if ui
+                .add_enabled(
+                    enabled,
+                    Button::new(overlay_status::position_label(position)),
+                )
+                .on_hover_text("Cycle this overlay channel's position preset")
+                .clicked()
+            {
+                intents.push(StudioIntent::ConfigureOverlayAppearance {
+                    channel,
+                    position: next_overlay_position(position),
+                    border,
+                });
+            }
+            if ui
+                .add_enabled(enabled, Button::new(overlay_status::border_label(border)))
+                .on_hover_text("Cycle this overlay channel's white border preset")
+                .clicked()
+            {
+                intents.push(StudioIntent::ConfigureOverlayAppearance {
+                    channel,
+                    position,
+                    border: next_overlay_border(border),
+                });
+            }
+            if ui
+                .add_enabled(
+                    enabled && desired.is_some_and(|overlay| overlay.active),
+                    Button::new(RichText::new(format!("O{channel_number} OFF")).strong()),
+                )
+                .on_hover_text("Remove this overlay channel from Program")
+                .clicked()
+            {
+                intents.push(StudioIntent::OverlayOff { channel });
+            }
         });
-    }
-    let position = desired.map_or(OverlayPositionPreset::FullFrame, |overlay| overlay.position);
-    let border = desired.map_or(OverlayBorderPreset::None, |overlay| overlay.border);
-    if ui
-        .add_enabled(
-            enabled,
-            Button::new(overlay_status::position_label(position)),
-        )
-        .on_hover_text("Cycle this overlay channel's position preset")
-        .clicked()
-    {
-        intents.push(StudioIntent::ConfigureOverlayAppearance {
-            channel,
-            position: next_overlay_position(position),
-            border,
-        });
-    }
-    if ui
-        .add_enabled(enabled, Button::new(overlay_status::border_label(border)))
-        .on_hover_text("Cycle this overlay channel's white border preset")
-        .clicked()
-    {
-        intents.push(StudioIntent::ConfigureOverlayAppearance {
-            channel,
-            position,
-            border: next_overlay_border(border),
-        });
-    }
-    if ui
-        .add_enabled(
-            enabled && desired.is_some_and(|overlay| overlay.active),
-            Button::new(RichText::new(format!("O{channel_number} OFF")).strong()),
-        )
-        .on_hover_text("Remove this overlay channel from Program")
-        .clicked()
-    {
-        intents.push(StudioIntent::OverlayOff { channel });
-    }
-    ui.label(overlay_status::format(desired, realized));
+        ui.label(
+            RichText::new(overlay_status::format(channel_number, desired, realized))
+                .small()
+                .color(MUTED),
+        );
+    });
 }
 
 const fn next_overlay_position(position: OverlayPositionPreset) -> OverlayPositionPreset {
