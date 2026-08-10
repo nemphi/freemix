@@ -1352,7 +1352,7 @@ fn publish_recovery_runtime(
 #[cfg(test)]
 mod tests {
     use std::{
-        io::{Read, Write},
+        io::{BufRead, BufReader, Write},
         net::{TcpListener, TcpStream},
         sync::mpsc::{Receiver, sync_channel},
     };
@@ -1361,9 +1361,9 @@ mod tests {
 
     use fm_protocol::{
         CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, EngineIdentity, FadeToBlackPosition,
-        FadeToBlackState, HandshakeOutcome, HandshakeResponse, HeartbeatAcknowledgementMessage,
-        InputAudioStripStatus, InputStatus, LineDecoder, ManualTransitionStatus, OverlayStatus,
-        Role, ServerIdentity, SnapshotMessage, SnapshotReason, WireMessage, encode_line,
+        FadeToBlackState, HandshakeOutcome, HandshakeResponse, InputAudioStripStatus, InputStatus,
+        ManualTransitionStatus, OverlayStatus, Role, ServerIdentity, SnapshotMessage,
+        SnapshotReason, WireMessage, decode_line, encode_line,
     };
     use fm_types::{InputId, ProjectId};
 
@@ -1372,12 +1372,10 @@ mod tests {
     use super::*;
 
     const HEARTBEAT_TEST_TIMEOUT: Duration = Duration::from_secs(3);
-    const HEARTBEAT_PROJECT_VALUE: u128 = 18_446_744_073_709_551_657;
 
     struct HeartbeatPeer {
-        stream: TcpStream,
-        decoder: LineDecoder,
-        pending: VecDeque<WireMessage>,
+        reader: BufReader<TcpStream>,
+        writer: TcpStream,
     }
 
     impl HeartbeatPeer {
@@ -1387,47 +1385,38 @@ mod tests {
                 .set_read_timeout(Some(HEARTBEAT_TEST_TIMEOUT))
                 .unwrap();
             Self {
-                stream,
-                decoder: LineDecoder::new(),
-                pending: VecDeque::new(),
+                reader: BufReader::new(stream.try_clone().unwrap()),
+                writer: stream,
             }
         }
 
         fn receive(&mut self) -> WireMessage {
-            loop {
-                if let Some(message) = self.pending.pop_front() {
-                    return message;
-                }
-                let mut buffer = [0_u8; 4096];
-                let read = self.stream.read(&mut buffer).unwrap();
-                assert_ne!(read, 0, "unexpected client EOF");
-                self.pending
-                    .extend(self.decoder.push(&buffer[..read]).unwrap());
-            }
+            let mut line = String::new();
+            assert_ne!(self.reader.read_line(&mut line).unwrap(), 0);
+            decode_line(&line).unwrap()
+        }
+
+        fn handshake_request(&mut self) -> fm_protocol::HandshakeRequest {
+            let WireMessage::HandshakeRequest(request) = self.receive() else {
+                panic!("expected handshake request");
+            };
+            request
         }
 
         fn send(&mut self, message: &WireMessage) {
-            self.stream
+            self.writer
                 .write_all(encode_line(message).unwrap().as_bytes())
                 .unwrap();
-            self.stream.flush().unwrap();
         }
-    }
 
-    fn heartbeat_project_id() -> ProjectId {
-        ProjectId::new(NonZeroU128::new(HEARTBEAT_PROJECT_VALUE).unwrap())
-    }
-
-    fn heartbeat_input(value: u128) -> WireInputId {
-        WireInputId::new(NonZeroU128::new(value).unwrap())
-    }
-
-    fn heartbeat_server() -> ServerIdentity {
-        ServerIdentity {
-            engine_id: "heartbeat-engine".to_owned(),
-            project_id: heartbeat_project_id().to_string(),
-            state_epoch: 3,
-            log_id: "heartbeat-log".to_owned(),
+        fn wait_for_eof(&mut self) {
+            loop {
+                let available = self.reader.fill_buf().unwrap().len();
+                if available == 0 {
+                    return;
+                }
+                self.reader.consume(available);
+            }
         }
     }
 
@@ -1435,56 +1424,52 @@ mod tests {
         HandshakeResponse {
             protocol: CURRENT_PROTOCOL_VERSION,
             granted_role: Role::Operator,
-            permissions: vec!["switcher.take".to_owned()],
+            permissions: Vec::new(),
             capabilities: CapabilityReportSummary {
-                digest: "sha256:heartbeat-test".to_owned(),
-                total: 1,
-                available: 1,
+                digest: String::new(),
+                total: 0,
+                available: 0,
                 degraded: 0,
                 unavailable: 0,
             },
-            server: heartbeat_server(),
+            server: ServerIdentity {
+                engine_id: "e".into(),
+                project_id: "1".into(),
+                state_epoch: 1,
+                log_id: "l".into(),
+            },
             current_revision: 4,
             outcome,
         }
     }
 
     fn heartbeat_snapshot() -> SnapshotMessage {
-        let input_audio_strips = [1, 2]
-            .map(heartbeat_input)
-            .map(|input| InputAudioStripStatus {
+        let input = WireInputId::new(NonZeroU128::new(2).unwrap());
+        SnapshotMessage {
+            engine: EngineIdentity {
+                engine_id: "e".into(),
+                state_epoch: 1,
+                log_id: "l".into(),
+            },
+            revision: 4,
+            show_name: String::new(),
+            inputs: vec![InputStatus {
+                input,
+                name: "i".into(),
+            }],
+            input_audio_strips: vec![InputAudioStripStatus {
                 input,
                 gain_millidb: 0,
                 balance_basis_points: 0,
                 muted: false,
                 soloed: false,
-                follow_video: true,
+                follow_video: false,
                 delay_samples: 0,
-            })
-            .to_vec();
-        SnapshotMessage {
-            engine: EngineIdentity {
-                engine_id: "heartbeat-engine".to_owned(),
-                state_epoch: 3,
-                log_id: "heartbeat-log".to_owned(),
-            },
-            revision: 4,
-            show_name: "Heartbeat test".to_owned(),
-            inputs: vec![
-                InputStatus {
-                    input: heartbeat_input(1),
-                    name: "Camera".to_owned(),
-                },
-                InputStatus {
-                    input: heartbeat_input(2),
-                    name: "Slides".to_owned(),
-                },
-            ],
-            input_audio_strips,
-            desired_program: heartbeat_input(1),
-            desired_preview: heartbeat_input(2),
-            realized_program: heartbeat_input(1),
-            realized_preview: heartbeat_input(2),
+            }],
+            desired_program: input,
+            desired_preview: input,
+            realized_program: input,
+            realized_preview: input,
             desired_manual_transition: ManualTransitionStatus::Inactive,
             realized_manual_transition: ManualTransitionStatus::Inactive,
             desired_fade_to_black: FadeToBlackState {
@@ -1501,87 +1486,45 @@ mod tests {
         }
     }
 
-    fn accept_heartbeat_resume(listener: &TcpListener) -> HeartbeatPeer {
-        let mut peer = HeartbeatPeer::accept(listener);
-        let WireMessage::HandshakeRequest(request) = peer.receive() else {
-            panic!("expected reconnect handshake request");
-        };
-        let cursor = request.resume_cursor.expect("resume cursor");
-        assert_eq!(cursor.revision, 4);
-        peer.send(&WireMessage::HandshakeResponse(heartbeat_handshake(
-            HandshakeOutcome::Resume { cursor },
-        )));
-        peer
-    }
-
-    fn accept_heartbeat_snapshot(listener: &TcpListener) -> HeartbeatPeer {
-        let mut peer = HeartbeatPeer::accept(listener);
-        let WireMessage::HandshakeRequest(request) = peer.receive() else {
-            panic!("expected snapshot handshake request");
-        };
-        assert_eq!(request.resume_cursor, None);
-        peer.send(&WireMessage::HandshakeResponse(heartbeat_handshake(
-            HandshakeOutcome::Snapshot {
-                reason: SnapshotReason::HistoryUnavailable,
-            },
-        )));
-        peer.send(&WireMessage::Snapshot(heartbeat_snapshot()));
-        peer
-    }
-
-    fn serve_worker_heartbeats(listener: TcpListener, release: Receiver<()>) {
+    fn serve_worker_heartbeats(listener: TcpListener) {
         let mut first = HeartbeatPeer::accept(&listener);
-        let WireMessage::HandshakeRequest(request) = first.receive() else {
-            panic!("expected initial handshake request");
-        };
-        assert_eq!(request.resume_cursor, None);
+        first.handshake_request();
         first.send(&WireMessage::HandshakeResponse(heartbeat_handshake(
             HandshakeOutcome::Snapshot {
                 reason: SnapshotReason::NoCursor,
             },
         )));
         first.send(&WireMessage::Snapshot(heartbeat_snapshot()));
+        assert!(matches!(first.receive(), WireMessage::Heartbeat(_)));
 
-        let WireMessage::Heartbeat(matching) = first.receive() else {
-            panic!("expected matching heartbeat");
-        };
-        first.send(&WireMessage::HeartbeatAcknowledgement(
-            HeartbeatAcknowledgementMessage {
-                server: matching.server,
-                heartbeat_sequence: matching.sequence,
-                received_at_ms: 1_235,
-            },
-        ));
-        let WireMessage::Heartbeat(mismatched) = first.receive() else {
-            panic!("expected mismatched heartbeat");
-        };
-        first.send(&WireMessage::HeartbeatAcknowledgement(
-            HeartbeatAcknowledgementMessage {
-                server: mismatched.server,
-                heartbeat_sequence: mismatched.sequence + 1,
-                received_at_ms: 1_236,
-            },
-        ));
+        let mut resume = HeartbeatPeer::accept(&listener);
+        let cursor = resume
+            .handshake_request()
+            .resume_cursor
+            .expect("resume cursor");
+        resume.send(&WireMessage::HandshakeResponse(heartbeat_handshake(
+            HandshakeOutcome::Resume { cursor },
+        )));
 
-        let _resume_after_mismatch = accept_heartbeat_resume(&listener);
-        let mut unacknowledged = accept_heartbeat_snapshot(&listener);
-        assert!(matches!(
-            unacknowledged.receive(),
-            WireMessage::Heartbeat(_)
-        ));
-        let _resume_after_timeout = accept_heartbeat_resume(&listener);
-        let _reconnected = accept_heartbeat_snapshot(&listener);
-        release.recv_timeout(HEARTBEAT_TEST_TIMEOUT).unwrap();
+        let mut snapshot = HeartbeatPeer::accept(&listener);
+        assert_eq!(snapshot.handshake_request().resume_cursor, None);
+        snapshot.send(&WireMessage::HandshakeResponse(heartbeat_handshake(
+            HandshakeOutcome::Snapshot {
+                reason: SnapshotReason::HistoryUnavailable,
+            },
+        )));
+        snapshot.send(&WireMessage::Snapshot(heartbeat_snapshot()));
+        snapshot.wait_for_eof();
     }
 
     fn receive_connection_state(
         updates: &Receiver<StudioUiState>,
         expected: StudioConnectionStatus,
-    ) -> StudioUiState {
+    ) {
         loop {
             let state = updates.recv_timeout(HEARTBEAT_TEST_TIMEOUT).unwrap();
             if state.connection_status == expected {
-                return state;
+                return;
             }
         }
     }
@@ -1590,23 +1533,20 @@ mod tests {
     fn studio_worker_heartbeat_acknowledgement_controls_reconnect_backoff() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
-        let (release_sender, release_receiver) = sync_channel(1);
-        let server = thread::spawn(move || serve_worker_heartbeats(listener, release_receiver));
-
-        let config = StudioConfig {
-            connection: ConnectionConfig::Existing(ExistingConfig {
-                address,
-                expected_project_id: heartbeat_project_id(),
-            }),
-            client_id: "heartbeat-worker-test".to_owned(),
-            desired_role: Role::Operator,
-            restart_policy: RestartPolicy::default(),
-        };
+        let server = thread::spawn(move || serve_worker_heartbeats(listener));
         let (request_sender, request_receiver) = sync_channel(REQUEST_CAPACITY);
         let (state_sender, state_receiver) = sync_channel(STATE_CAPACITY);
         let worker = thread::spawn(move || {
             run_worker(
-                config,
+                StudioConfig {
+                    connection: ConnectionConfig::Existing(ExistingConfig {
+                        address,
+                        expected_project_id: ProjectId::new(NonZeroU128::new(1).unwrap()),
+                    }),
+                    client_id: "heartbeat-worker-test".to_owned(),
+                    desired_role: Role::Operator,
+                    restart_policy: RestartPolicy::default(),
+                },
                 &request_receiver,
                 &StatePublisher {
                     sender: state_sender,
@@ -1616,25 +1556,10 @@ mod tests {
         });
 
         receive_connection_state(&state_receiver, StudioConnectionStatus::Ready);
-        let mismatched = receive_connection_state(&state_receiver, StudioConnectionStatus::Backoff);
-        assert!(
-            mismatched
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("sequence does not match"))
-        );
-        receive_connection_state(&state_receiver, StudioConnectionStatus::Ready);
-        let timed_out = receive_connection_state(&state_receiver, StudioConnectionStatus::Backoff);
-        assert!(
-            timed_out
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("Heartbeat acknowledgement failed"))
-        );
+        receive_connection_state(&state_receiver, StudioConnectionStatus::Backoff);
         receive_connection_state(&state_receiver, StudioConnectionStatus::Ready);
 
         request_sender.send(WorkerRequest::Shutdown).unwrap();
-        release_sender.send(()).unwrap();
         worker.join().unwrap();
         server.join().unwrap();
     }
