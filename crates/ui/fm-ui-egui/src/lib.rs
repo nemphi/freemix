@@ -280,6 +280,38 @@ pub struct ManualTransitionAvailability {
     pub active_controls: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StingerSlotPresentation {
+    label: &'static str,
+    color: Color32,
+    ready: bool,
+}
+
+const fn stinger_slot_presentation(readiness: Option<StingerReadiness>) -> StingerSlotPresentation {
+    match readiness {
+        None => StingerSlotPresentation {
+            label: "UNCONFIGURED",
+            color: MUTED,
+            ready: false,
+        },
+        Some(StingerReadiness::NotRequested) => StingerSlotPresentation {
+            label: "NOT REQUESTED",
+            color: AMBER,
+            ready: false,
+        },
+        Some(StingerReadiness::Ready) => StingerSlotPresentation {
+            label: "READY",
+            color: PREVIEW,
+            ready: true,
+        },
+        Some(StingerReadiness::Missing) => StingerSlotPresentation {
+            label: "MISSING",
+            color: ERROR,
+            ready: false,
+        },
+    }
+}
+
 /// Session and replicated-state gates for manual T-bar controls.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ManualTransitionGate {
@@ -1187,17 +1219,14 @@ fn draw_transition_row(
                     });
                 }
                 for slot in 1..=8 {
-                    let ready = state.view.as_ref().is_some_and(|view| {
-                        view.stingers.iter().any(|status| {
-                            status.slot == slot && status.readiness == StingerReadiness::Ready
-                        })
+                    let readiness = state.view.as_ref().and_then(|view| {
+                        view.stingers
+                            .iter()
+                            .find(|status| status.slot == slot)
+                            .map(|status| status.readiness)
                     });
-                    if transition_button(
-                        ui,
-                        availability.stinger() && ready,
-                        &format!("S{slot}"),
-                        &format!("Fire Stinger slot {slot}"),
-                    ) {
+                    let presentation = stinger_slot_presentation(readiness);
+                    if stinger_button(ui, availability.stinger(), slot, presentation) {
                         intents.push(StudioIntent::Stinger {
                             slot: WireStingerSlotId::new(slot)
                                 .expect("Studio renders only Stinger slots 1 through 8"),
@@ -1242,6 +1271,26 @@ fn transition_button(ui: &mut Ui, enabled: bool, label: &str, hover_text: &str) 
             .min_size(Vec2::new(92.0, 32.0)),
     )
     .on_hover_text(hover_text)
+    .clicked()
+}
+
+fn stinger_button(
+    ui: &mut Ui,
+    enabled: bool,
+    slot: u8,
+    presentation: StingerSlotPresentation,
+) -> bool {
+    ui.add_enabled(
+        enabled && presentation.ready,
+        Button::new(
+            RichText::new(format!("S{slot}\n{}", presentation.label))
+                .strong()
+                .color(presentation.color),
+        )
+        .fill(Color32::from_rgb(98, 66, 17))
+        .min_size(Vec2::new(92.0, 32.0)),
+    )
+    .on_hover_text(format!("Stinger slot {slot}: {}", presentation.label))
     .clicked()
 }
 
@@ -1644,6 +1693,30 @@ mod tests {
             Some(desired_active.desired_fade_to_black),
         );
         assert!(fade_to_black.to_black);
+    }
+
+    #[test]
+    fn stinger_slot_presentation_uses_replicated_readiness() {
+        for (readiness, label, color, ready) in [
+            (None, "UNCONFIGURED", MUTED, false),
+            (
+                Some(StingerReadiness::NotRequested),
+                "NOT REQUESTED",
+                AMBER,
+                false,
+            ),
+            (Some(StingerReadiness::Ready), "READY", PREVIEW, true),
+            (Some(StingerReadiness::Missing), "MISSING", ERROR, false),
+        ] {
+            assert_eq!(
+                stinger_slot_presentation(readiness),
+                StingerSlotPresentation {
+                    label,
+                    color,
+                    ready,
+                }
+            );
+        }
     }
 
     #[test]

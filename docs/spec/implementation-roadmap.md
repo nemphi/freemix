@@ -924,8 +924,9 @@ save, preserves routing, manual-transition, Fade-to-Black, revision, frame,
 runtime-generation, and receipt state, and projects every persisted slot field
 in status output. Web exposes typed one-through-eight slot controls and preserves
 the exact requested duration. Studio exposes eight accessible numbered controls with a
-Ready replicated transition-capable session, carries typed slots into the wire
-payload, and keeps unresolved work ordered in its reconnect FIFO. Loopback
+Ready replicated transition-capable session, displays authoritative
+Unconfigured/Not Requested/Ready/Missing state for every slot, carries typed
+slots into the wire payload, and keeps unresolved work ordered in its reconnect FIFO. Loopback
 worker evidence observes exact slot, duration,
 pending-command state, durable routing, and runtime realization ordering.
 The current protocol snapshots project every configured slot field plus the
