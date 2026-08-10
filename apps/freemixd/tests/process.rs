@@ -120,7 +120,21 @@ impl Daemon {
 
     fn wait_success(mut self) {
         let mut child = self.child.take().unwrap();
-        let status = child.wait().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) => {
+                    let stopped = terminate_child(&mut child);
+                    assert!(stopped, "daemon did not stop after exit timeout");
+                    panic!("daemon did not exit within two seconds");
+                }
+                Err(error) => panic!("could not inspect daemon status: {error}"),
+            }
+        };
         if !status.success() {
             let mut stderr = String::new();
             child
@@ -355,6 +369,23 @@ fn daemon_acknowledges_only_valid_heartbeats() {
     assert_eq!(acknowledgement.heartbeat_sequence, 3);
 
     drop(client);
+    daemon.wait_success();
+}
+
+#[test]
+fn once_daemon_ignores_pre_handshake_disconnect() {
+    let directory = TestDirectory::new("once-pre-handshake-disconnect");
+    let project_path = directory.project_path();
+    create_project(&project_path);
+
+    let daemon = Daemon::start(&project_path);
+    drop(TcpStream::connect(daemon.address).unwrap());
+
+    let mut client = daemon.connect();
+    client.handshake(None);
+    assert!(matches!(client.receive(), WireMessage::Snapshot(_)));
+    drop(client);
+
     daemon.wait_success();
 }
 

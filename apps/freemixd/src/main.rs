@@ -222,6 +222,12 @@ enum DaemonShutdownReason {
     ProgramSurface,
 }
 
+#[derive(Eq, PartialEq)]
+enum OnceClientOutcome {
+    Unserved,
+    HandshakeResponseWritten,
+}
+
 fn requested_daemon_shutdown(
     native: Option<&NativeDaemon>,
     process: Option<&ProcessShutdown>,
@@ -3463,6 +3469,7 @@ fn serve_inner(
             .set_diagnostic_deadline(duration)?;
     }
 
+    let mut once_client_outcome = OnceClientOutcome::Unserved;
     let _shutdown_reason = loop {
         if let Some(reason) = requested_daemon_shutdown(native.as_ref(), process_shutdown.as_ref())
         {
@@ -3496,6 +3503,7 @@ fn serve_inner(
             &authority,
             native.as_mut(),
             process_shutdown.as_ref(),
+            &mut once_client_outcome,
         );
         if let Err(error) = result {
             if let Some(reason) =
@@ -3511,7 +3519,7 @@ fn serve_inner(
         {
             break reason;
         }
-        if once {
+        if once && once_client_outcome == OnceClientOutcome::HandshakeResponseWritten {
             break DaemonShutdownReason::Once;
         }
     };
@@ -3705,6 +3713,7 @@ fn handle_client(
     authority: &ServerIdentity,
     native: Option<&mut NativeDaemon>,
     process_shutdown: Option<&ProcessShutdown>,
+    once_client_outcome: &mut OnceClientOutcome,
 ) -> AppResult<()> {
     let handshake_deadline = Instant::now()
         .checked_add(Duration::from_millis(
@@ -3751,6 +3760,7 @@ fn handle_client(
                     &error.to_string(),
                 )),
             )?;
+            *once_client_outcome = OnceClientOutcome::HandshakeResponseWritten;
             return Ok(());
         }
     };
@@ -3762,6 +3772,7 @@ fn handle_client(
         reconciled_handshake_outcome(handshake_outcome, &handshake.sync),
     ));
     write_session_message(&mut writer, &mut session, &response)?;
+    *once_client_outcome = OnceClientOutcome::HandshakeResponseWritten;
     match handshake.sync {
         SyncPayload::Snapshot(snapshot) => {
             write_session_message(&mut writer, &mut session, &WireMessage::Snapshot(*snapshot))?;
@@ -6289,6 +6300,7 @@ mod tests {
                     &authority,
                     None,
                     None,
+                    &mut OnceClientOutcome::Unserved,
                 )
                 .unwrap();
                 if client_index == 0 {
@@ -6361,6 +6373,7 @@ mod tests {
                     &authority,
                     None,
                     None,
+                    &mut OnceClientOutcome::Unserved,
                 )
                 .unwrap();
                 if client_index == 0 {
