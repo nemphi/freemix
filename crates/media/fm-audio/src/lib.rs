@@ -66,6 +66,10 @@ pub enum AudioError {
         expected: usize,
         actual: usize,
     },
+    MeterCountMismatch {
+        expected: usize,
+        actual: usize,
+    },
     NonFiniteSample {
         channel: usize,
         sample: usize,
@@ -128,6 +132,10 @@ impl fmt::Display for AudioError {
             } => write!(
                 formatter,
                 "plane {plane} has {actual} samples; expected {expected}"
+            ),
+            Self::MeterCountMismatch { expected, actual } => write!(
+                formatter,
+                "meter buffer has {actual} channels; expected {expected}"
             ),
             Self::NonFiniteSample { channel, sample } => {
                 write!(
@@ -1370,8 +1378,43 @@ impl MasterMixer {
         validate_sample_count(samples)?;
         validate_canonical_output(&self.format, samples)?;
         validate_timed_duration(output_timing, self.format.sample_rate, samples)?;
-        self.mix_block_views_into(samples, sources, active_video_inputs, output, false)
+        self.mix_block_views_into(samples, sources, active_video_inputs, output, false, None)
             .map(drop)
+    }
+
+    /// Mixes borrowed planar sources and writes meters into caller-owned slices.
+    ///
+    /// `master_meters` uses Master channel-layout order. `input_meters` is flat,
+    /// ordered first by [`InputId`] and then by Master channel-layout order.
+    /// Both slices must have their exact required length. All structural
+    /// validation completes before output or runtime state changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::mix_planar_timed_into`] plus
+    /// [`AudioError::MeterCountMismatch`] for either meter slice.
+    pub fn mix_planar_timed_into_with_meters(
+        &mut self,
+        output_timing: fm_frame::MediaTiming,
+        samples: usize,
+        sources: &[PlanarAudioSource<'_>],
+        active_video_inputs: &[InputId],
+        output: &mut [Vec<f32>],
+        master_meters: &mut [ChannelMeter],
+        input_meters: &mut [ChannelMeter],
+    ) -> Result<(), AudioError> {
+        validate_sample_count(samples)?;
+        validate_canonical_output(&self.format, samples)?;
+        validate_timed_duration(output_timing, self.format.sample_rate, samples)?;
+        self.mix_block_views_into(
+            samples,
+            sources,
+            active_video_inputs,
+            output,
+            false,
+            Some((master_meters, input_meters)),
+        )
+        .map(drop)
     }
 
     fn timed_output(
@@ -1401,7 +1444,14 @@ impl MasterMixer {
         let channels = self.format.channels.channels().len();
         let mut output = vec![vec![0.0; samples]; channels];
         let meters = self
-            .mix_block_views_into(samples, blocks, active_video_inputs, &mut output, true)?
+            .mix_block_views_into(
+                samples,
+                blocks,
+                active_video_inputs,
+                &mut output,
+                true,
+                None,
+            )?
             .expect("metering was requested");
         Ok(MixedMaster {
             planes: output,
@@ -1418,6 +1468,7 @@ impl MasterMixer {
         active_video_inputs: &[InputId],
         output: &mut [Vec<f32>],
         measure_output: bool,
+        mut meter_output: Option<(&mut [ChannelMeter], &mut [ChannelMeter])>,
     ) -> Result<Option<RenderMeters>, AudioError> {
         validate_sample_count(samples)?;
         for (index, submission) in blocks.iter().enumerate() {
@@ -1467,12 +1518,24 @@ impl MasterMixer {
                 });
             }
         }
+        if let Some((master_meters, input_meters)) = &meter_output {
+            for (expected, actual) in [
+                (channels, master_meters.len()),
+                (self.inputs.len() * channels, input_meters.len()),
+            ] {
+                if actual != expected {
+                    return Err(AudioError::MeterCountMismatch { expected, actual });
+                }
+            }
+        }
         for plane in output.iter_mut() {
             plane[..samples].fill(0.0);
         }
         let any_soloed = self.inputs.values().any(|strip| strip.state.soloed);
-        let mut input_meters = measure_output.then(|| Vec::with_capacity(self.inputs.len()));
-        for (id, strip) in &self.inputs {
+        let metering = measure_output || meter_output.is_some();
+        let mut allocated_input_meters =
+            measure_output.then(|| Vec::with_capacity(self.inputs.len()));
+        for (input_index, (id, strip)) in self.inputs.iter().enumerate() {
             let block = blocks.iter().find_map(|submission| {
                 (submission.input() == *id).then(|| (submission.block(), submission.source_gain()))
             });
@@ -1482,7 +1545,7 @@ impl MasterMixer {
             let mut ramp = strip.ramp;
             let mut balance_ramp = strip.balance_ramp;
             let mut meter_channels =
-                measure_output.then(|| vec![ChannelMeterAccumulator::default(); channels]);
+                metering.then(|| [ChannelMeterAccumulator::default(); MAX_CHANNELS]);
             if audible {
                 let source_gain = block.map_or(SourceGain::UNITY, |(_, source_gain)| source_gain);
                 for sample in 0..samples {
@@ -1530,16 +1593,28 @@ impl MasterMixer {
                     balance_ramp.next();
                 }
             }
-            if let Some(input_meters) = &mut input_meters {
-                let channels = meter_channels
-                    .expect("input metering was requested")
-                    .into_iter()
-                    .map(|meter| meter.finish(samples))
-                    .collect();
-                input_meters.push(InputMeterReadings {
-                    input: *id,
-                    meters: MeterReadings { channels },
-                });
+            if metering {
+                let readings = meter_channels.expect("input metering was requested");
+                if let Some(input_meters) = &mut allocated_input_meters {
+                    let channels = readings[..channels]
+                        .iter()
+                        .copied()
+                        .map(|meter| meter.finish(samples))
+                        .collect();
+                    input_meters.push(InputMeterReadings {
+                        input: *id,
+                        meters: MeterReadings { channels },
+                    });
+                }
+                if let Some((_, input_meters)) = &mut meter_output {
+                    let start = input_index * channels;
+                    for (output, meter) in input_meters[start..start + channels]
+                        .iter_mut()
+                        .zip(readings)
+                    {
+                        *output = meter.finish(samples);
+                    }
+                }
             }
         }
 
@@ -1551,7 +1626,10 @@ impl MasterMixer {
             }
         }
         validate_finite_sample_prefix(output, samples)?;
-        let meters = input_meters.map(|inputs| RenderMeters {
+        if let Some((master_meters, _)) = &mut meter_output {
+            measure_plane_prefix_into(output, samples, master_meters);
+        }
+        let meters = allocated_input_meters.map(|inputs| RenderMeters {
             master: measure_plane_prefix(output, samples),
             inputs,
         });
@@ -1741,28 +1819,22 @@ fn validate_finite_sample_prefix(planes: &[Vec<f32>], samples: usize) -> Result<
 
 #[allow(clippy::cast_possible_truncation)]
 fn measure_plane_prefix(planes: &[Vec<f32>], samples: usize) -> MeterReadings {
-    let channels = planes
-        .iter()
-        .map(|plane| {
-            if samples == 0 {
-                return ChannelMeter::default();
-            }
-            let mut peak = 0.0_f32;
-            let mut squares = 0.0_f64;
-            for sample in &plane[..samples] {
-                peak = peak.max(sample.abs());
-                squares += f64::from(*sample) * f64::from(*sample);
-            }
-            let sample_count = f64::from(
-                u32::try_from(samples).expect("audio plane length is bounded below u32::MAX"),
-            );
-            ChannelMeter {
-                peak,
-                rms: (squares / sample_count).sqrt() as f32,
-            }
-        })
-        .collect();
+    let mut channels = vec![ChannelMeter::default(); planes.len()];
+    measure_plane_prefix_into(planes, samples, &mut channels);
     MeterReadings { channels }
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn measure_plane_prefix_into(planes: &[Vec<f32>], samples: usize, meters: &mut [ChannelMeter]) {
+    for (meter, plane) in meters.iter_mut().zip(planes) {
+        let mut accumulator = ChannelMeterAccumulator::default();
+        for sample in &plane[..samples] {
+            accumulator.begin_sample();
+            accumulator.add(*sample);
+            accumulator.end_sample();
+        }
+        *meter = accumulator.finish(samples);
+    }
 }
 
 fn validate_canonical_output(format: &AudioFormat, samples: usize) -> Result<(), AudioError> {
