@@ -826,7 +826,19 @@ fn handle_heartbeat_timeout(
     next_heartbeat: &mut Instant,
     started: Instant,
 ) -> bool {
-    if matches!(runtime.lifecycle(), Ok(LifecycleState::Ready)) {
+    let lifecycle = runtime.lifecycle();
+    if let Ok(LifecycleState::DaemonExited { code }) = &lifecycle {
+        recovery.realization_uncertain = runtime.session().client().model().view().is_some();
+        let _ = runtime.session_mut().disconnect();
+        recovery.reconnect_wait = ReconnectWait::from_runtime(runtime);
+        recovery.visible_error = Some(format!(
+            "Supervised daemon exited with code {code:?}; reconnecting after bounded backoff"
+        ));
+        if !publish_recovery_runtime(runtime, publisher, recovery) {
+            return false;
+        }
+    }
+    if matches!(lifecycle, Ok(LifecycleState::Ready)) {
         let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let wait_started = Instant::now();
         let mut shutdown = false;
@@ -1358,6 +1370,10 @@ mod tests {
     };
 
     use core::num::NonZeroU128;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    use std::{fs, path::PathBuf, process::Command};
 
     use fm_protocol::{
         CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, EngineIdentity, FadeToBlackPosition,
@@ -1365,9 +1381,11 @@ mod tests {
         ManualTransitionStatus, OverlayStatus, Role, ServerIdentity, SnapshotMessage,
         SnapshotReason, WireMessage, decode_line, encode_line,
     };
-    use fm_types::{InputId, ProjectId};
+    use fm_types::InputId;
 
-    use crate::{ConnectionConfig, ExistingConfig, RestartPolicy};
+    #[cfg(unix)]
+    use crate::SupervisedConfig;
+    use crate::{ConnectionConfig, RestartPolicy};
 
     use super::*;
 
@@ -1486,7 +1504,7 @@ mod tests {
         }
     }
 
-    fn serve_worker_heartbeats(listener: TcpListener) {
+    fn serve_worker_recovery(listener: TcpListener) {
         let mut first = HeartbeatPeer::accept(&listener);
         first.handshake_request();
         first.send(&WireMessage::HandshakeResponse(heartbeat_handshake(
@@ -1495,7 +1513,7 @@ mod tests {
             },
         )));
         first.send(&WireMessage::Snapshot(heartbeat_snapshot()));
-        assert!(matches!(first.receive(), WireMessage::Heartbeat(_)));
+        first.wait_for_eof();
 
         let mut resume = HeartbeatPeer::accept(&listener);
         let cursor = resume
@@ -1505,6 +1523,7 @@ mod tests {
         resume.send(&WireMessage::HandshakeResponse(heartbeat_handshake(
             HandshakeOutcome::Resume { cursor },
         )));
+        resume.wait_for_eof();
 
         let mut snapshot = HeartbeatPeer::accept(&listener);
         assert_eq!(snapshot.handshake_request().resume_cursor, None);
@@ -1515,6 +1534,49 @@ mod tests {
         )));
         snapshot.send(&WireMessage::Snapshot(heartbeat_snapshot()));
         snapshot.wait_for_eof();
+    }
+
+    #[cfg(unix)]
+    struct TestDirectory(PathBuf);
+
+    #[cfg(unix)]
+    impl TestDirectory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "freemix-studio-idle-exit-{}-{}",
+                std::process::id(),
+                worker_nonce()
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(unix)]
+    fn idle_exit_helper(directory: &TestDirectory, address: std::net::SocketAddr) -> PathBuf {
+        let path = directory.path("freemixd-test-helper");
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$2.pid\"\nprintf '%s\\n' \"$$\" >> \"$2.launches\"\nprintf 'FREEMIXD_READY\\tv=1\\taddress={address}\\tproject_id=1\\n'\nIFS= read -r hold\n"
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).unwrap();
+        path
     }
 
     fn receive_connection_state(
@@ -1529,23 +1591,30 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
-    fn studio_worker_heartbeat_acknowledgement_controls_reconnect_backoff() {
+    fn studio_worker_recovers_after_idle_supervised_daemon_exit() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
-        let server = thread::spawn(move || serve_worker_heartbeats(listener));
+        let server = thread::spawn(move || serve_worker_recovery(listener));
+        let directory = TestDirectory::new();
+        let project_bundle = directory.path("show.freemix");
+        let daemon_executable = idle_exit_helper(&directory, address);
         let (request_sender, request_receiver) = sync_channel(REQUEST_CAPACITY);
         let (state_sender, state_receiver) = sync_channel(STATE_CAPACITY);
         let worker = thread::spawn(move || {
             run_worker(
                 StudioConfig {
-                    connection: ConnectionConfig::Existing(ExistingConfig {
-                        address,
-                        expected_project_id: ProjectId::new(NonZeroU128::new(1).unwrap()),
+                    connection: ConnectionConfig::Supervised(SupervisedConfig {
+                        project_bundle,
+                        daemon_executable,
+                        listen: "127.0.0.1:0".parse().unwrap(),
                     }),
-                    client_id: "heartbeat-worker-test".to_owned(),
+                    client_id: "idle-exit-worker-test".to_owned(),
                     desired_role: Role::Operator,
-                    restart_policy: RestartPolicy::default(),
+                    restart_policy: RestartPolicy {
+                        maximum_restarts: 1,
+                    },
                 },
                 &request_receiver,
                 &StatePublisher {
@@ -1556,8 +1625,24 @@ mod tests {
         });
 
         receive_connection_state(&state_receiver, StudioConnectionStatus::Ready);
-        receive_connection_state(&state_receiver, StudioConnectionStatus::Backoff);
+        let pid_path = directory.path("show.freemix.pid");
+        let pid = fs::read_to_string(pid_path).unwrap();
+        assert!(
+            Command::new("/bin/kill")
+                .args(["-TERM", pid.trim()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        receive_connection_state(&state_receiver, StudioConnectionStatus::Failed);
         receive_connection_state(&state_receiver, StudioConnectionStatus::Ready);
+        assert_eq!(
+            fs::read_to_string(directory.path("show.freemix.launches"))
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
 
         request_sender.send(WorkerRequest::Shutdown).unwrap();
         worker.join().unwrap();

@@ -135,6 +135,9 @@ capped, and supervised daemon shutdown or restart performs bounded
 process-group/job and descendant cleanup. Project input names and video frames
 are not present in the replicated client contract, so tiles use ordinal/ID
 labels and monitor wells state that real preview delivery remains pending.
+An owned supervised daemon exit detected while Studio is idle enters the existing
+bounded reconnect/restart path; protocol mismatch, restart-limit, and fatal supervisor
+errors stay terminal, and this does not complete item 5 or RC-008 or prove service, media, or cross-platform readiness.
 `freemix-web` likewise declares only the current protocol in its client configuration.
 Its transport-free semantic presentation model preserves the existing
 permission- and protocol-gated Cut/Fade/Wipe controls and adds manual Fade/Wipe/AlphaFade/Slide
