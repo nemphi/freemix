@@ -4951,9 +4951,31 @@ fn write_message(writer: &mut TcpStream, message: &WireMessage) -> AppResult<()>
 }
 
 fn write_client_bytes(writer: &mut TcpStream, bytes: &[u8]) -> AppResult<()> {
-    writer.write_all(bytes).map_err(client_write_error)?;
+    let mut pending = PendingWrite::new(bytes.to_vec());
+    while !pending.write_once(writer).map_err(client_write_error)? {}
     writer.flush().map_err(client_write_error)?;
     Ok(())
+}
+
+struct PendingWrite {
+    bytes: Vec<u8>,
+    offset: usize,
+}
+
+impl PendingWrite {
+    fn new(bytes: Vec<u8>) -> Self {
+        assert!(!bytes.is_empty(), "encoded records are nonempty");
+        Self { bytes, offset: 0 }
+    }
+
+    fn write_once(&mut self, writer: &mut impl Write) -> std::io::Result<bool> {
+        let written = writer.write(&self.bytes[self.offset..])?;
+        if written == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        self.offset += written;
+        Ok(self.offset == self.bytes.len())
+    }
 }
 
 fn client_write_error(error: std::io::Error) -> Box<dyn Error> {
@@ -4965,6 +4987,40 @@ fn client_write_error(error: std::io::Error) -> Box<dyn Error> {
     } else {
         Box::new(error)
     }
+}
+
+#[test]
+fn pending_write_preserves_offset_across_partial_writes() {
+    struct PartialWriter {
+        bytes: Vec<u8>,
+        limit: usize,
+    }
+
+    impl Write for PartialWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let written = bytes.len().min(self.limit);
+            self.bytes.extend_from_slice(&bytes[..written]);
+            Ok(written)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let expected = b"encoded record";
+    let mut pending = PendingWrite::new(expected.to_vec());
+    let mut writer = PartialWriter {
+        bytes: Vec::new(),
+        limit: 3,
+    };
+
+    assert!(!pending.write_once(&mut writer).unwrap());
+    assert!(!pending.write_once(&mut writer).unwrap());
+    assert!(!pending.write_once(&mut writer).unwrap());
+    assert!(!pending.write_once(&mut writer).unwrap());
+    assert!(pending.write_once(&mut writer).unwrap());
+    assert_eq!(writer.bytes, expected);
 }
 
 fn handshake_code(error: &HandshakeError<Infallible>) -> &'static str {
