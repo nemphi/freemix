@@ -420,6 +420,7 @@ fn studio_shortcuts(
     ui: &mut Ui,
     gate: TransitionGate,
     can_select_preview: bool,
+    manual_transition_active_controls: bool,
     inputs: &[InputId],
     transition_duration_frames: u32,
 ) -> Vec<StudioIntent> {
@@ -428,7 +429,7 @@ fn studio_shortcuts(
     }
     let preview_available = preview_selection_available(gate, can_select_preview);
     let transition_available = transition_availability(gate).basic();
-    if !preview_available && !transition_available {
+    if !preview_available && !transition_available && !manual_transition_active_controls {
         return Vec::new();
     }
     ui.input_mut(|input| {
@@ -445,6 +446,10 @@ fn studio_shortcuts(
                 return true;
             };
             match key {
+                Key::Escape if manual_transition_active_controls => {
+                    intents.push(StudioIntent::CancelManualTransition);
+                    false
+                }
                 Key::C if transition_available => {
                     intents.push(StudioIntent::Cut);
                     false
@@ -635,10 +640,20 @@ impl StudioShell {
             .view
             .as_ref()
             .map_or(&[] as &[InputId], |view| view.inputs.as_slice());
+        let manual_transition_availability = manual_transition_availability(
+            ManualTransitionGate::from_state(state),
+            state.view.as_ref().is_some_and(|view| {
+                matches!(
+                    view.switcher.desired_manual_transition,
+                    ManualTransitionStatus::Active(_)
+                )
+            }),
+        );
         let mut intents = studio_shortcuts(
             ui,
             TransitionGate::from_state(state),
             state.can_select_preview,
+            manual_transition_availability.active_controls,
             inputs,
             self.transition_duration_frames,
         );
@@ -663,7 +678,7 @@ impl StudioShell {
                 );
                 self.set_fade_to_black_duration_frames(self.fade_to_black_duration_frames);
                 ui.add_space(8.0);
-                draw_manual_transition(ui, state, &mut intents);
+                draw_manual_transition(ui, state, manual_transition_availability, &mut intents);
                 ui.add_space(8.0);
                 draw_input_audio_strips(ui, state, &mut intents);
                 ui.add_space(8.0);
@@ -909,7 +924,12 @@ fn draw_overlay_channel(
     });
 }
 
-fn draw_manual_transition(ui: &mut Ui, state: &StudioUiState, intents: &mut Vec<StudioIntent>) {
+fn draw_manual_transition(
+    ui: &mut Ui,
+    state: &StudioUiState,
+    availability: ManualTransitionAvailability,
+    intents: &mut Vec<StudioIntent>,
+) {
     let desired = state
         .view
         .as_ref()
@@ -922,10 +942,6 @@ fn draw_manual_transition(ui: &mut Ui, state: &StudioUiState, intents: &mut Vec<
         .map_or(ManualTransitionStatus::Inactive, |view| {
             view.switcher.realized_manual_transition
         });
-    let desired_active = matches!(desired, ManualTransitionStatus::Active(_));
-    let availability =
-        manual_transition_availability(ManualTransitionGate::from_state(state), desired_active);
-
     Frame::new()
         .fill(GRAPHITE_RAISED)
         .stroke(Stroke::new(1.0, Color32::from_rgb(67, 61, 44)))
@@ -1589,7 +1605,11 @@ mod tests {
         let mut shell = StudioShell::default();
         shell.set_transition_duration_frames(42);
         let duration = shell.transition_duration_frames();
-        let run = |events, gate, can_select_preview, focused| {
+        let run = |events,
+                   gate,
+                   can_select_preview,
+                   manual_transition_active_controls,
+                   focused| {
             context.begin_pass(egui::RawInput {
                 events,
                 ..Default::default()
@@ -1604,7 +1624,14 @@ mod tests {
                     .layer_id(egui::LayerId::background())
                     .max_rect(context.viewport_rect()),
             );
-            let intents = studio_shortcuts(&mut ui, gate, can_select_preview, &inputs, duration);
+            let intents = studio_shortcuts(
+                &mut ui,
+                gate,
+                can_select_preview,
+                manual_transition_active_controls,
+                &inputs,
+                duration,
+            );
             let remaining = context.input(|input| input.events.clone());
             drop(ui);
             let _ = context.end_pass();
@@ -1616,20 +1643,24 @@ mod tests {
         };
         let (intents, remaining) = run(
             vec![
+                key(Key::Escape, Modifiers::NONE, false),
                 key(Key::C, Modifiers::NONE, false),
                 key(Key::F, Modifiers::NONE, false),
                 key(Key::Num1, Modifiers::NONE, false),
                 key(Key::Num2, shifted, false),
+                key(Key::Escape, shifted, false),
                 key(Key::Num8, Modifiers::NONE, false),
                 key(Key::Num9, Modifiers::NONE, false),
             ],
             gate,
+            true,
             true,
             false,
         );
         assert_eq!(
             intents,
             vec![
+                StudioIntent::CancelManualTransition,
                 StudioIntent::Cut,
                 StudioIntent::Fade {
                     duration_frames: duration,
@@ -1638,23 +1669,20 @@ mod tests {
                 StudioIntent::SelectPreview(input(18)),
             ]
         );
-        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining.len(), 3);
         assert!(matches!(
             remaining.as_slice(),
             [
                 Event::Key { key: Key::Num2, .. },
+                Event::Key { key: Key::Escape, .. },
                 Event::Key { key: Key::Num9, .. }
             ]
         ));
 
-        context.begin_pass(egui::RawInput {
-            events: vec![key(Key::Num3, Modifiers::NONE, false)],
-            ..Default::default()
-        });
-        let _ = context.end_pass();
         let (intents, remaining) = run(
-            vec![key(Key::Num3, Modifiers::NONE, false)],
+            vec![key(Key::Escape, Modifiers::NONE, true)],
             gate,
+            true,
             true,
             false,
         );
@@ -1668,15 +1696,17 @@ mod tests {
             manual_transition_in_flight: true,
             ..gate
         };
-        let transition_events = vec![
+        let rejected_events = vec![
+            key(Key::Escape, Modifiers::NONE, false),
             key(Key::C, Modifiers::NONE, false),
             key(Key::F, Modifiers::NONE, false),
         ];
-        let (intents, remaining) = run(transition_events.clone(), blocked, true, false);
+        let (intents, remaining) = run(rejected_events.clone(), blocked, true, false, false);
         assert!(intents.is_empty());
         assert!(matches!(
             remaining.as_slice(),
             [
+                Event::Key { key: Key::Escape, .. },
                 Event::Key { key: Key::C, .. },
                 Event::Key { key: Key::F, .. }
             ]
@@ -1687,15 +1717,17 @@ mod tests {
             gate,
             false,
             false,
+            false,
         );
         assert!(intents.is_empty());
         assert_eq!(remaining.len(), 1);
 
-        let (intents, remaining) = run(transition_events.clone(), gate, true, true);
+        let (intents, remaining) = run(rejected_events, gate, true, true, true);
         assert!(intents.is_empty());
         assert!(matches!(
             remaining.as_slice(),
             [
+                Event::Key { key: Key::Escape, .. },
                 Event::Key { key: Key::C, .. },
                 Event::Key { key: Key::F, .. }
             ]

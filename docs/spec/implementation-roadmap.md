@@ -440,8 +440,9 @@ lifecycle.
 
 Current implementation boundary for item 9: native Studio maps unmodified keys
 1–8 to Preview selection for the first eight replicated inputs and C/F to Cut/Fade
-with the current transition duration while its current Ready, permission, focus,
-bounds, and manual-transition gates allow the action. This adds no binding editor,
+with the current transition duration, and unmodified Escape to cancel a desired active manual
+T-bar, while its current Ready, view, permission, focus, non-repeat, modifier,
+and manual-control gates allow the action. This adds no binding editor,
 chords, scopes, persistence, MIDI/OSC/controller runtime, conflict handling, or
 shortcut acceptance evidence, so RC-004 remains planned.
 
