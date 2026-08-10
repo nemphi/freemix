@@ -477,6 +477,7 @@ impl DestinationOutput {
                 .reconnect()
                 .permits_attempt(self.reconnect_attempt)
         {
+            self.recover_queue_on_connect = true;
             if self.connection_target == ConnectionTarget::Primary
                 && self.config.backup_endpoint().is_some()
             {
@@ -615,11 +616,7 @@ impl DestinationOutput {
             }
             Err(error) => {
                 sink.disconnect();
-                let event = self.schedule_failure(now_ms, error);
-                if matches!(event, PollEvent::ReconnectScheduled { .. }) {
-                    self.recover_queue_on_connect = true;
-                }
-                event
+                self.schedule_failure(now_ms, error)
             }
         }
     }

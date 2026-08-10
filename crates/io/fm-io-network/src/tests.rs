@@ -392,9 +392,26 @@ fn recovery_queue_priority_accepts_first_random_access() {
     );
     assert_eq!(
         outputs.poll(destination_id(1), 300, &mut sink).unwrap(),
-        PollEvent::Connected
+        PollEvent::AwaitingRandomAccess {
+            dropped_packets: 1,
+            dropped_bytes: 6,
+        }
     );
-    assert_eq!(outputs.queue_depth(destination_id(1)), Some(1));
+    assert_eq!(
+        outputs.state(destination_id(1)),
+        Some(DestinationState::AwaitingRandomAccess)
+    );
+    outputs
+        .enqueue(
+            destination_id(1),
+            packet_with_random_access(id, 7, true, 7),
+        )
+        .unwrap();
+    assert_eq!(
+        outputs.poll(destination_id(1), 301, &mut sink).unwrap(),
+        PollEvent::PacketSent { sequence: 7 }
+    );
+    assert_eq!(sink.sequences, [5, 7]);
 }
 
 fn empty_recovery_queue(capacity: usize) -> (OutputSet, FakeSink, RenditionId) {
