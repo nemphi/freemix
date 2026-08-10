@@ -287,24 +287,36 @@ struct StingerSlotPresentation {
     ready: bool,
 }
 
-const fn stinger_slot_presentation(readiness: Option<StingerReadiness>) -> StingerSlotPresentation {
-    match readiness {
-        None => StingerSlotPresentation {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StingerSlotState {
+    Unavailable,
+    Unconfigured,
+    Readiness(StingerReadiness),
+}
+
+const fn stinger_slot_presentation(state: StingerSlotState) -> StingerSlotPresentation {
+    match state {
+        StingerSlotState::Unavailable => StingerSlotPresentation {
+            label: "STATE UNAVAILABLE",
+            color: MUTED,
+            ready: false,
+        },
+        StingerSlotState::Unconfigured => StingerSlotPresentation {
             label: "UNCONFIGURED",
             color: MUTED,
             ready: false,
         },
-        Some(StingerReadiness::NotRequested) => StingerSlotPresentation {
+        StingerSlotState::Readiness(StingerReadiness::NotRequested) => StingerSlotPresentation {
             label: "NOT REQUESTED",
             color: AMBER,
             ready: false,
         },
-        Some(StingerReadiness::Ready) => StingerSlotPresentation {
+        StingerSlotState::Readiness(StingerReadiness::Ready) => StingerSlotPresentation {
             label: "READY",
             color: PREVIEW,
             ready: true,
         },
-        Some(StingerReadiness::Missing) => StingerSlotPresentation {
+        StingerSlotState::Readiness(StingerReadiness::Missing) => StingerSlotPresentation {
             label: "MISSING",
             color: ERROR,
             ready: false,
@@ -1219,13 +1231,19 @@ fn draw_transition_row(
                     });
                 }
                 for slot in 1..=8 {
-                    let readiness = state.view.as_ref().and_then(|view| {
-                        view.stingers
-                            .iter()
-                            .find(|status| status.slot == slot)
-                            .map(|status| status.readiness)
-                    });
-                    let presentation = stinger_slot_presentation(readiness);
+                    let slot_state =
+                        state
+                            .view
+                            .as_ref()
+                            .map_or(StingerSlotState::Unavailable, |view| {
+                                view.stingers
+                                    .iter()
+                                    .find(|status| status.slot == slot)
+                                    .map_or(StingerSlotState::Unconfigured, |status| {
+                                        StingerSlotState::Readiness(status.readiness)
+                                    })
+                            });
+                    let presentation = stinger_slot_presentation(slot_state);
                     if stinger_button(ui, availability.stinger(), slot, presentation) {
                         intents.push(StudioIntent::Stinger {
                             slot: WireStingerSlotId::new(slot)
@@ -1697,19 +1715,35 @@ mod tests {
 
     #[test]
     fn stinger_slot_presentation_uses_replicated_readiness() {
-        for (readiness, label, color, ready) in [
-            (None, "UNCONFIGURED", MUTED, false),
+        for (state, label, color, ready) in [
             (
-                Some(StingerReadiness::NotRequested),
+                StingerSlotState::Unavailable,
+                "STATE UNAVAILABLE",
+                MUTED,
+                false,
+            ),
+            (StingerSlotState::Unconfigured, "UNCONFIGURED", MUTED, false),
+            (
+                StingerSlotState::Readiness(StingerReadiness::NotRequested),
                 "NOT REQUESTED",
                 AMBER,
                 false,
             ),
-            (Some(StingerReadiness::Ready), "READY", PREVIEW, true),
-            (Some(StingerReadiness::Missing), "MISSING", ERROR, false),
+            (
+                StingerSlotState::Readiness(StingerReadiness::Ready),
+                "READY",
+                PREVIEW,
+                true,
+            ),
+            (
+                StingerSlotState::Readiness(StingerReadiness::Missing),
+                "MISSING",
+                ERROR,
+                false,
+            ),
         ] {
             assert_eq!(
-                stinger_slot_presentation(readiness),
+                stinger_slot_presentation(state),
                 StingerSlotPresentation {
                     label,
                     color,
