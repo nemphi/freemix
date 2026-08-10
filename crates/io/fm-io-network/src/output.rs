@@ -232,6 +232,7 @@ pub enum DestinationState {
     Connecting,
     Live,
     Congested,
+    AwaitingRandomAccess,
     WaitingToReconnect { attempt: u32, retry_at_ms: u64 },
     Failed,
 }
@@ -243,6 +244,8 @@ pub struct NetworkTelemetry {
     packets_accepted: u64,
     packets_sent: u64,
     bytes_sent: u64,
+    recovery_dropped_packets: u64,
+    recovery_dropped_bytes: u64,
     backpressure_events: u64,
     congestion_events: u64,
     retransmitted_packets: u64,
@@ -282,6 +285,16 @@ impl NetworkTelemetry {
     #[must_use]
     pub const fn bytes_sent(&self) -> u64 {
         self.bytes_sent
+    }
+
+    #[must_use]
+    pub const fn recovery_dropped_packets(&self) -> u64 {
+        self.recovery_dropped_packets
+    }
+
+    #[must_use]
+    pub const fn recovery_dropped_bytes(&self) -> u64 {
+        self.recovery_dropped_bytes
     }
 
     #[must_use]
@@ -380,6 +393,10 @@ pub struct DestinationEnqueue {
 pub enum PollEvent {
     Idle,
     Connected,
+    AwaitingRandomAccess {
+        dropped_packets: u64,
+        dropped_bytes: u64,
+    },
     PacketSent { sequence: u64 },
     Congested,
     WaitingToReconnect { retry_at_ms: u64 },
@@ -480,16 +497,48 @@ impl DestinationOutput {
         };
         match sink.connect(&self.config, endpoint) {
             Ok(observation) => {
+                let recover_queue = self.has_connected && self.reconnect_attempt > 0;
                 if self.has_connected {
                     self.telemetry.reconnects = self.telemetry.reconnects.saturating_add(1);
                 }
                 self.has_connected = true;
                 self.reconnect_attempt = 0;
-                self.state = DestinationState::Live;
                 self.telemetry.round_trip_time_ms = observation.round_trip_time_ms;
-                PollEvent::Connected
+                if recover_queue {
+                    self.state = DestinationState::AwaitingRandomAccess;
+                    self.drop_interframes()
+                } else {
+                    self.state = DestinationState::Live;
+                    PollEvent::Connected
+                }
             }
             Err(error) => self.schedule_failure(now_ms, error),
+        }
+    }
+
+    fn drop_interframes(&mut self) -> PollEvent {
+        let mut dropped_packets = 0_u64;
+        let mut dropped_bytes = 0_u64;
+        while self.queue.front().is_some_and(|packet| !packet.random_access) {
+            let packet = self.queue.pop_front().expect("front packet exists");
+            let packet_bytes = packet.payload.len();
+            self.queued_bytes -= packet_bytes;
+            dropped_packets = dropped_packets.saturating_add(1);
+            dropped_bytes = dropped_bytes.saturating_add(
+                u64::try_from(packet_bytes).expect("bounded packet size fits in u64"),
+            );
+        }
+        self.telemetry.recovery_dropped_packets = self
+            .telemetry
+            .recovery_dropped_packets
+            .saturating_add(dropped_packets);
+        self.telemetry.recovery_dropped_bytes = self
+            .telemetry
+            .recovery_dropped_bytes
+            .saturating_add(dropped_bytes);
+        PollEvent::AwaitingRandomAccess {
+            dropped_packets,
+            dropped_bytes,
         }
     }
 
@@ -503,6 +552,16 @@ impl DestinationOutput {
                 }
                 self.state = DestinationState::Connecting;
                 return self.connect(now_ms, sink);
+            }
+            DestinationState::AwaitingRandomAccess => {
+                let Some(packet) = self.queue.front() else {
+                    return PollEvent::Idle;
+                };
+                if packet.random_access {
+                    self.state = DestinationState::Live;
+                } else {
+                    return self.drop_interframes();
+                }
             }
             DestinationState::Live | DestinationState::Congested => {}
         }

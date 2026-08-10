@@ -65,13 +65,25 @@ fn config(id: u8, capacity: usize, protocol: OutputProtocol) -> DestinationConfi
 }
 
 fn packet(rendition: RenditionId, sequence: u64) -> OutputPacket {
+    packet_with_random_access(rendition, sequence, sequence == 0, 1)
+}
+
+fn packet_with_random_access(
+    rendition: RenditionId,
+    sequence: u64,
+    random_access: bool,
+    payload_bytes: usize,
+) -> OutputPacket {
     OutputPacket::new(
         rendition,
         sequence,
         NormalizedTimestamp::from_nanos(i64::try_from(sequence).unwrap() * 1_000_000),
         NormalizedDuration::from_nanos(1_000_000).unwrap(),
-        sequence == 0,
-        Arc::<[u8]>::from(vec![u8::try_from(sequence).unwrap_or(u8::MAX)]),
+        random_access,
+        Arc::<[u8]>::from(vec![
+            u8::try_from(sequence).unwrap_or(u8::MAX);
+            payload_bytes
+        ]),
     )
     .unwrap()
     .with_encode_latency_ms(4)
@@ -225,7 +237,7 @@ fn rendition_planner_shares_exact_profiles_only() {
 }
 
 #[test]
-fn retryable_primary_write_failure_is_isolated_and_sends_once_on_backup() {
+fn reconnect_drops_interframes_and_resumes_at_queued_random_access() {
     let plan = RenditionPlanner::plan(&[
         DestinationRenditions::single(destination_id(1), profile(1_920, 1_080, 6_000_000)),
         DestinationRenditions::single(destination_id(2), profile(1_920, 1_080, 6_000_000)),
@@ -234,7 +246,7 @@ fn retryable_primary_write_failure_is_isolated_and_sends_once_on_backup() {
     let rendition = plan.renditions()[0].id();
     let mut outputs = OutputSet::new();
     outputs
-        .add_destination(config(1, 2, OutputProtocol::Rtmp))
+        .add_destination(config(1, 4, OutputProtocol::Rtmp))
         .unwrap();
     outputs
         .add_destination(config(2, 2, OutputProtocol::Rtmp))
@@ -265,6 +277,19 @@ fn retryable_primary_write_failure_is_isolated_and_sends_once_on_backup() {
         outputs.poll(destination_id(2), 10, &mut healthy).unwrap(),
         PollEvent::PacketSent { sequence: 1 }
     );
+    for sequence in 2..=4 {
+        outputs
+            .enqueue(
+                destination_id(1),
+                packet_with_random_access(
+                    rendition,
+                    sequence,
+                    sequence == 3,
+                    usize::try_from(sequence).unwrap(),
+                ),
+            )
+            .unwrap();
+    }
     assert_eq!(
         outputs.state(destination_id(2)),
         Some(DestinationState::Live)
@@ -273,29 +298,113 @@ fn retryable_primary_write_failure_is_isolated_and_sends_once_on_backup() {
         outputs.connection_target(destination_id(1)),
         Some(ConnectionTarget::Backup)
     );
-    assert_eq!(outputs.queue_depth(destination_id(1)), Some(1));
+    assert_eq!(outputs.queue_depth(destination_id(1)), Some(4));
     assert_eq!(
         outputs.poll(destination_id(1), 109, &mut sink).unwrap(),
         PollEvent::WaitingToReconnect { retry_at_ms: 110 }
     );
     assert_eq!(
         outputs.poll(destination_id(1), 110, &mut sink).unwrap(),
-        PollEvent::Connected
+        PollEvent::AwaitingRandomAccess {
+            dropped_packets: 2,
+            dropped_bytes: 3,
+        }
     );
+    assert_eq!(outputs.queue_depth(destination_id(1)), Some(2));
+    assert_eq!(outputs.queued_bytes(destination_id(1)), Some(7));
     assert_eq!(
         outputs.poll(destination_id(1), 111, &mut sink).unwrap(),
-        PollEvent::PacketSent { sequence: 1 }
+        PollEvent::PacketSent { sequence: 3 }
+    );
+    assert_eq!(
+        outputs.poll(destination_id(1), 112, &mut sink).unwrap(),
+        PollEvent::PacketSent { sequence: 4 }
     );
     assert_eq!(outputs.queue_depth(destination_id(1)), Some(0));
     assert_eq!(
         sink.connection_hosts,
         ["stream.example.test", "backup.example.test"]
     );
-    assert_eq!(sink.sequences, [1]);
+    assert_eq!(sink.sequences, [3, 4]);
     let telemetry = outputs.telemetry(destination_id(1)).unwrap();
     assert_eq!(telemetry.reconnects(), 1);
+    assert_eq!(telemetry.recovery_dropped_packets(), 2);
+    assert_eq!(telemetry.recovery_dropped_bytes(), 3);
     assert_eq!(telemetry.failure_count(), 1);
     assert_eq!(sink.disconnects, 1);
+}
+
+#[test]
+fn reconnect_without_random_access_frees_queue_and_waits() {
+    let id = rendition_id(1);
+    let mut outputs = OutputSet::new();
+    outputs
+        .add_destination(config(1, 3, OutputProtocol::Rtmp))
+        .unwrap();
+    outputs.start(destination_id(1)).unwrap();
+    let mut sink = FakeSink::with_write_results([
+        Err(SinkError::new(
+            FailureStage::Write,
+            Some(54),
+            "reset",
+            true,
+        )),
+        Ok(SinkWrite::Sent(SendObservation::default())),
+    ]);
+
+    assert_eq!(
+        outputs.poll(destination_id(1), 0, &mut sink).unwrap(),
+        PollEvent::Connected
+    );
+    for sequence in 1..=3 {
+        outputs
+            .enqueue(
+                destination_id(1),
+                packet_with_random_access(
+                    id,
+                    sequence,
+                    false,
+                    usize::try_from(sequence).unwrap(),
+                ),
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        outputs.poll(destination_id(1), 10, &mut sink).unwrap(),
+        PollEvent::ReconnectScheduled { retry_at_ms: 110 }
+    );
+    assert_eq!(
+        outputs.poll(destination_id(1), 110, &mut sink).unwrap(),
+        PollEvent::AwaitingRandomAccess {
+            dropped_packets: 3,
+            dropped_bytes: 6,
+        }
+    );
+    assert_eq!(
+        outputs.state(destination_id(1)),
+        Some(DestinationState::AwaitingRandomAccess)
+    );
+    assert_eq!(outputs.queue_depth(destination_id(1)), Some(0));
+    assert_eq!(outputs.queued_bytes(destination_id(1)), Some(0));
+    assert_eq!(
+        outputs.poll(destination_id(1), 111, &mut sink).unwrap(),
+        PollEvent::Idle
+    );
+
+    outputs
+        .enqueue(
+            destination_id(1),
+            packet_with_random_access(id, 4, true, 4),
+        )
+        .unwrap();
+    assert_eq!(
+        outputs.poll(destination_id(1), 112, &mut sink).unwrap(),
+        PollEvent::PacketSent { sequence: 4 }
+    );
+    assert_eq!(sink.sequences, [4]);
+    let telemetry = outputs.telemetry(destination_id(1)).unwrap();
+    assert_eq!(telemetry.recovery_dropped_packets(), 3);
+    assert_eq!(telemetry.recovery_dropped_bytes(), 6);
 }
 
 #[test]

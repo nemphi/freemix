@@ -1074,11 +1074,14 @@ Current implementation boundary for item 1: the transport-independent
 `fm-io-network` output state machine starts each configured destination on its
 primary endpoint. A retryable primary connection or write failure retains the
 bounded packet queue, keeps the existing retry budget and delay, and selects
-the configured backup endpoint for subsequent attempts. Backup failures do not
-alternate back to the primary, while a manual stop and start selects the
-primary again. Non-retryable failures remain terminal. No socket adapter,
-RTMP/RTMPS or SRT transport, runtime wiring, persistence, output-health UI, or
-live acceptance exists, so item 1 and `OR-005` remain planned.
+the configured backup endpoint for subsequent attempts. After a reconnect, it
+removes queued interframes before the first random-access packet and waits for
+one when the queue has none. This recovery is transport-neutral queue policy;
+it does not request a keyframe. Backup failures do not alternate back to the
+primary, while a manual stop and start selects the primary again.
+Non-retryable failures remain terminal. No socket adapter, RTMP/RTMPS or SRT
+transport, runtime wiring, persistence, output-health UI, live decoder proof,
+or live acceptance exists, so item 1 and `OR-005` remain planned.
 
 Exit: a remote-controlled headless production can stream and record
 independently with tested recovery.
