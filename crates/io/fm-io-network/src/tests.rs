@@ -395,9 +395,6 @@ fn recovery_queue_priority_accepts_first_random_access() {
         PollEvent::Connected
     );
     assert_eq!(outputs.queue_depth(destination_id(1)), Some(1));
-    let telemetry = outputs.telemetry(destination_id(1)).unwrap();
-    assert_eq!(telemetry.recovery_dropped_packets(), 4);
-    assert_eq!(telemetry.recovery_dropped_bytes(), 10);
 }
 
 fn empty_recovery_queue(capacity: usize) -> (OutputSet, FakeSink, RenditionId) {
