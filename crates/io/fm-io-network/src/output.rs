@@ -412,6 +412,7 @@ struct DestinationOutput {
     queued_bytes: usize,
     reconnect_attempt: u32,
     has_connected: bool,
+    recover_queue_on_connect: bool,
     telemetry: NetworkTelemetry,
 }
 
@@ -425,6 +426,7 @@ impl DestinationOutput {
             queued_bytes: 0,
             reconnect_attempt: 0,
             has_connected: false,
+            recover_queue_on_connect: false,
             telemetry: NetworkTelemetry::default(),
         }
     }
@@ -497,12 +499,13 @@ impl DestinationOutput {
         };
         match sink.connect(&self.config, endpoint) {
             Ok(observation) => {
-                let recover_queue = self.has_connected && self.reconnect_attempt > 0;
+                let recover_queue = self.recover_queue_on_connect;
                 if self.has_connected {
                     self.telemetry.reconnects = self.telemetry.reconnects.saturating_add(1);
                 }
                 self.has_connected = true;
                 self.reconnect_attempt = 0;
+                self.recover_queue_on_connect = false;
                 self.telemetry.round_trip_time_ms = observation.round_trip_time_ms;
                 if recover_queue {
                     self.state = DestinationState::AwaitingRandomAccess;
@@ -605,7 +608,11 @@ impl DestinationOutput {
             }
             Err(error) => {
                 sink.disconnect();
-                self.schedule_failure(now_ms, error)
+                let event = self.schedule_failure(now_ms, error);
+                if matches!(event, PollEvent::ReconnectScheduled { .. }) {
+                    self.recover_queue_on_connect = true;
+                }
+                event
             }
         }
     }
@@ -668,6 +675,7 @@ impl OutputSet {
             output.state = DestinationState::Connecting;
             output.reconnect_attempt = 0;
             output.connection_target = ConnectionTarget::Primary;
+            output.recover_queue_on_connect = false;
         }
         Ok(())
     }
@@ -691,6 +699,7 @@ impl OutputSet {
         output.queue.clear();
         output.queued_bytes = 0;
         output.reconnect_attempt = 0;
+        output.recover_queue_on_connect = false;
         Ok(())
     }
 

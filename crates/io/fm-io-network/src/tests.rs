@@ -405,6 +405,38 @@ fn reconnect_without_random_access_frees_queue_and_waits() {
     let telemetry = outputs.telemetry(destination_id(1)).unwrap();
     assert_eq!(telemetry.recovery_dropped_packets(), 3);
     assert_eq!(telemetry.recovery_dropped_bytes(), 6);
+
+    outputs.stop(destination_id(1), &mut sink).unwrap();
+    sink.connect_results.push_back(Err(SinkError::new(
+        FailureStage::Connect,
+        Some(61),
+        "refused",
+        true,
+    )));
+    outputs.start(destination_id(1)).unwrap();
+    outputs
+        .enqueue(
+            destination_id(1),
+            packet_with_random_access(id, 5, false, 5),
+        )
+        .unwrap();
+    assert_eq!(
+        outputs.poll(destination_id(1), 200, &mut sink).unwrap(),
+        PollEvent::ReconnectScheduled { retry_at_ms: 300 }
+    );
+    assert_eq!(
+        outputs.poll(destination_id(1), 300, &mut sink).unwrap(),
+        PollEvent::Connected
+    );
+    assert_eq!(outputs.queue_depth(destination_id(1)), Some(1));
+    assert_eq!(
+        outputs.poll(destination_id(1), 301, &mut sink).unwrap(),
+        PollEvent::PacketSent { sequence: 5 }
+    );
+    let telemetry = outputs.telemetry(destination_id(1)).unwrap();
+    assert_eq!(telemetry.reconnects(), 2);
+    assert_eq!(telemetry.recovery_dropped_packets(), 3);
+    assert_eq!(telemetry.recovery_dropped_bytes(), 6);
 }
 
 #[test]
