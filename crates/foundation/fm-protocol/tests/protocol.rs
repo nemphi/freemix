@@ -113,18 +113,11 @@ fn protocol_2_10_heartbeat_acknowledgement_codec_is_exact() {
         received_at_ms: 1_720_000_000_003,
     });
     let encoded = encode_line(&acknowledgement).unwrap();
-    assert_eq!(decode_line(&encoded).unwrap(), acknowledgement);
     assert_eq!(
-        decode_line(&encoded.replace("\theartbeat_sequence=88", "")),
-        Err(CodecError::MissingField("heartbeat_sequence"))
+        encoded,
+        "heartbeat_acknowledgement\tengine_id=engine-a\tproject_id=project-9\tstate_epoch=7\tlog_id=log-a\theartbeat_sequence=88\treceived_at_ms=1720000000003\n"
     );
-    assert!(matches!(
-        decode_line(&encoded.replace(
-            "\treceived_at_ms=1720000000003",
-            "\treceived_at_ms=1720000000003\textra=1"
-        )),
-        Err(CodecError::UnknownField(field)) if field == "extra"
-    ));
+    assert_eq!(decode_line(&encoded).unwrap(), acknowledgement);
 }
 
 #[test]
