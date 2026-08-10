@@ -479,6 +479,9 @@ fn helper(directory: &TestDirectory, behavior: &str) -> PathBuf {
         "ready-exit-with-descendant" => format!(
             "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$2.leader.pid\"\nsleep 30 </dev/null >/dev/null 2>&1 &\nprintf '%s\\n' \"$!\" > \"$2.descendant.pid\"\nprintf 'FREEMIXD_READY\\tv=1\\taddress=127.0.0.1:32123\\tproject_id={PROJECT_VALUE}\\n'\nsleep 0.1\nexit 7\n"
         ),
+        "oversized-readiness" => {
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$2.pid\"\nsleep 30 &\nprintf '%s\\n' \"$!\" > \"$2.descendant.pid\"\nhead -c 4097 /dev/zero | tr '\\000' x\nIFS= read -r hold\n".to_owned()
+        }
         _ => unreachable!(),
     };
     fs::write(&path, body).unwrap();
@@ -664,6 +667,29 @@ fn supervisor_cleans_descendants_before_joining_readiness_after_direct_exit() {
             .success(),
         "direct-exit descendant survived readiness cleanup"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn supervisor_rejects_oversized_readiness_and_reaps_its_group() {
+    let directory = TestDirectory::new("oversized-readiness");
+    let executable = helper(&directory, "oversized-readiness");
+    let project = directory.path("show.freemix");
+    let started = std::time::Instant::now();
+
+    let error = DaemonSupervisor::launch(
+        supervised(&directory, &executable),
+        RestartPolicy::default(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "failed to read freemixd readiness: freemixd readiness record exceeds 4096 bytes"
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let helper_pid = fs::read_to_string(project.with_extension("freemix.pid")).unwrap();
+    assert!(!process_exists(&helper_pid));
+    assert_descendant_stopped(&descendant_pid(&directory));
 }
 
 #[cfg(unix)]

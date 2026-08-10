@@ -20,6 +20,7 @@ use crate::SupervisedConfig;
 
 const READY_PREFIX: &str = "FREEMIXD_READY";
 const READY_VERSION: u8 = 1;
+const MAX_READINESS_RECORD_BYTES: usize = 4 * 1024;
 const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const PROCESS_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -397,8 +398,8 @@ impl DaemonSupervisor {
             }
         };
         let (stdout, line, bytes) = match read {
-            (stdout, line, Ok(bytes)) => (stdout, line, bytes),
-            (_, _, Err(error)) => {
+            Ok(read) => read,
+            Err(error) => {
                 reap_local_child(child);
                 return Err(SupervisorError::ReadinessIo(error));
             }
@@ -456,22 +457,65 @@ impl DaemonSupervisor {
     }
 }
 
-type ReadinessReader = JoinHandle<(BufReader<ChildStdout>, String, io::Result<usize>)>;
+type ReadinessReader = JoinHandle<io::Result<(BufReader<ChildStdout>, String, usize)>>;
 
 fn spawn_readiness_reader(stdout: ChildStdout) -> io::Result<ReadinessReader> {
     thread::Builder::new()
         .name("freemixd-readiness".to_owned())
-        .spawn(move || {
-            let mut stdout = BufReader::new(stdout);
-            let mut line = String::new();
-            let result = stdout.read_line(&mut line);
-            (stdout, line, result)
-        })
+        .spawn(move || read_readiness_record(BufReader::new(stdout)))
+}
+
+fn read_readiness_record(
+    mut stdout: BufReader<ChildStdout>,
+) -> io::Result<(BufReader<ChildStdout>, String, usize)> {
+    let mut record = Vec::with_capacity(MAX_READINESS_RECORD_BYTES);
+    loop {
+        let buffer = stdout.fill_buf()?;
+        let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') else {
+            if buffer.is_empty() {
+                return if record.is_empty() {
+                    Ok((stdout, String::new(), 0))
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "freemixd readiness record is not newline-terminated",
+                    ))
+                };
+            }
+            if buffer.len() >= MAX_READINESS_RECORD_BYTES - record.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "freemixd readiness record exceeds 4096 bytes",
+                ));
+            }
+            record.extend_from_slice(buffer);
+            let consumed = buffer.len();
+            stdout.consume(consumed);
+            continue;
+        };
+        let consumed = newline + 1;
+        if consumed > MAX_READINESS_RECORD_BYTES - record.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "freemixd readiness record exceeds 4096 bytes",
+            ));
+        }
+        record.extend_from_slice(&buffer[..consumed]);
+        stdout.consume(consumed);
+        let bytes = record.len();
+        let line = String::from_utf8(record).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "freemixd readiness record is not UTF-8",
+            )
+        })?;
+        return Ok((stdout, line, bytes));
+    }
 }
 
 fn join_readiness_reader(
     reader: ReadinessReader,
-) -> Result<(BufReader<ChildStdout>, String, io::Result<usize>), SupervisorError> {
+) -> Result<io::Result<(BufReader<ChildStdout>, String, usize)>, SupervisorError> {
     reader.join().map_err(|_| {
         SupervisorError::ReadinessIo(io::Error::other("freemixd readiness reader panicked"))
     })

@@ -135,7 +135,9 @@ attempt of up to the configured timeout, but cancellation is checked only
 before and after that attempt. Supervisor readiness and connected protocol
 read, write, and flush waits are polled and cancellable; deferred intents are
 capped, and supervised daemon shutdown or restart performs bounded
-process-group/job and descendant cleanup. Studio UI state is latest-state and
+process-group/job and descendant cleanup. The supervised stdout readiness record
+is byte-bounded; this does not add service/media readiness or RC-008 completion.
+Studio UI state is latest-state and
 cannot block control I/O; this adds no preview delivery, service readiness, or
 transport support, and RC-008 remains planned. Project input names and video frames
 are not present in the replicated client contract, so tiles use ordinal/ID
