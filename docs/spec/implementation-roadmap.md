@@ -473,11 +473,11 @@ transition, appearance, and queue state. Web exposes transport-free semantic
 controls, and Studio exposes Take Preview, Queue Preview, Take Next, Off, and
 per-channel Cut/Fade/position/border controls and displays desired and
 last-confirmed realized source, activity, opacity, queue, and appearance
-summaries for all eight channels; this is not output-video evidence. The native
-Studio position/border edits resolve the unchanged field from the latest
-confirmed desired channel before dispatching the unchanged complete protocol command.
-daemon derives a stable realization for every configured project output, unions
-their active overlay sources into one scene-execution closure, renders the
+summaries for all eight channels; this is not output-video evidence. Queued
+Studio overlay toggle and cycle actions resolve from the latest confirmed desired
+channel, so repeated clicks remain cumulative before dispatching full protocol commands.
+The native daemon derives a stable realization for every configured project output,
+unions their active overlay sources into one scene-execution closure, renders the
 authoritative Program transition or Stinger base once, and then produces and
 retains one independent GPU texture per output. Each output composites only its
 included channels source-over in channel order before Fade-to-Black, using the

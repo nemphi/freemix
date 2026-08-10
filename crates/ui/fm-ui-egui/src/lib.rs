@@ -42,13 +42,6 @@ pub struct InputAudioStripUpdate {
     pub delay_samples: Option<u32>,
 }
 
-/// Changed appearance controls for one overlay channel.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct OverlayAppearanceUpdate {
-    pub position: Option<OverlayPositionPreset>,
-    pub border: Option<OverlayBorderPreset>,
-}
-
 /// Operator actions emitted by [`StudioShell`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StudioIntent {
@@ -81,17 +74,15 @@ pub enum StudioIntent {
     },
     /// Removes one overlay channel from Program.
     OverlayOff { channel: WireOverlayChannelId },
-    /// Changes the transition used by one overlay channel.
-    ConfigureOverlayTransition {
+    /// Toggles one overlay channel between Cut and Fade.
+    ToggleOverlayTransition {
         channel: WireOverlayChannelId,
-        transition: OverlayTransitionKind,
         duration_frames: u32,
     },
-    /// Changes one or more appearance presets for one overlay channel.
-    ConfigureOverlayAppearance {
-        channel: WireOverlayChannelId,
-        update: OverlayAppearanceUpdate,
-    },
+    /// Cycles one overlay channel's position preset.
+    CycleOverlayPosition { channel: WireOverlayChannelId },
+    /// Cycles one overlay channel's border preset.
+    CycleOverlayBorder { channel: WireOverlayChannelId },
     /// Appends the current Preview source to one overlay queue.
     QueueOverlay {
         channel: WireOverlayChannelId,
@@ -874,12 +865,8 @@ fn draw_overlay_channel(
                 .on_hover_text("Toggle this overlay channel between Cut and Fade")
                 .clicked()
             {
-                intents.push(StudioIntent::ConfigureOverlayTransition {
+                intents.push(StudioIntent::ToggleOverlayTransition {
                     channel,
-                    transition: match transition {
-                        OverlayTransitionKind::Cut => OverlayTransitionKind::Fade,
-                        OverlayTransitionKind::Fade => OverlayTransitionKind::Cut,
-                    },
                     duration_frames,
                 });
             }
@@ -894,26 +881,14 @@ fn draw_overlay_channel(
                 .on_hover_text("Cycle this overlay channel's position preset")
                 .clicked()
             {
-                intents.push(StudioIntent::ConfigureOverlayAppearance {
-                    channel,
-                    update: OverlayAppearanceUpdate {
-                        position: Some(next_overlay_position(position)),
-                        border: None,
-                    },
-                });
+                intents.push(StudioIntent::CycleOverlayPosition { channel });
             }
             if ui
                 .add_enabled(enabled, Button::new(overlay_status::border_label(border)))
                 .on_hover_text("Cycle this overlay channel's white border preset")
                 .clicked()
             {
-                intents.push(StudioIntent::ConfigureOverlayAppearance {
-                    channel,
-                    update: OverlayAppearanceUpdate {
-                        position: None,
-                        border: Some(next_overlay_border(border)),
-                    },
-                });
+                intents.push(StudioIntent::CycleOverlayBorder { channel });
             }
             if ui
                 .add_enabled(
@@ -932,24 +907,6 @@ fn draw_overlay_channel(
                 .color(MUTED),
         );
     });
-}
-
-const fn next_overlay_position(position: OverlayPositionPreset) -> OverlayPositionPreset {
-    match position {
-        OverlayPositionPreset::FullFrame => OverlayPositionPreset::TopLeft,
-        OverlayPositionPreset::TopLeft => OverlayPositionPreset::TopRight,
-        OverlayPositionPreset::TopRight => OverlayPositionPreset::BottomLeft,
-        OverlayPositionPreset::BottomLeft => OverlayPositionPreset::BottomRight,
-        OverlayPositionPreset::BottomRight => OverlayPositionPreset::FullFrame,
-    }
-}
-
-const fn next_overlay_border(border: OverlayBorderPreset) -> OverlayBorderPreset {
-    match border {
-        OverlayBorderPreset::None => OverlayBorderPreset::ThinWhite,
-        OverlayBorderPreset::ThinWhite => OverlayBorderPreset::ThickWhite,
-        OverlayBorderPreset::ThickWhite => OverlayBorderPreset::None,
-    }
 }
 
 fn draw_manual_transition(ui: &mut Ui, state: &StudioUiState, intents: &mut Vec<StudioIntent>) {
