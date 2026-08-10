@@ -75,6 +75,7 @@ sequence and uses its bounded peer wait before the existing reconnect backoff.
 Incomplete pre-handshake peers expire on the same absolute heartbeat deadline.
 The one-shot CLI has finite connect/read/write deadlines and accepts only exact
 newline-terminated records up to 64 KiB.
+Simulated CLI PPM output uses same-directory write/sync/replace, not broader media or disk certification.
 This is control-plane peer liveness. It is not service readiness, production
 authentication, media health, HTTP resources, WebSocket event subscriptions,
 or transport-level production rate limits. Expired raw TCP sessions are

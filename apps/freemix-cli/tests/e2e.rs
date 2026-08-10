@@ -1292,7 +1292,7 @@ fn assert_premature_event_rejected(kind: PrematureEvent) {
 }
 
 #[test]
-fn complete_deterministic_mvp_contract() {
+fn ppm_publication_complete_deterministic_mvp_contract() {
     let context = ContractContext::new();
     let (project_id, created_status) = assert_contract_creation(&context);
     assert_initial_contract_state(&context, project_id, &created_status);
@@ -1851,6 +1851,7 @@ fn assert_contract_render(
     height: u32,
     rgb: [u8; 3],
 ) {
+    fs::write(image, b"previous complete PPM").unwrap();
     assert_success(&invoke(&[
         "render",
         context.project_path(),
@@ -1861,6 +1862,14 @@ fn assert_contract_render(
         &height.to_string(),
     ]));
     assert_solid_ppm(image, width, height, rgb);
+    assert_eq!(
+        fs::read_dir(image.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
+            .count(),
+        0
+    );
 }
 
 fn select_contract_preview(context: &ContractContext) {

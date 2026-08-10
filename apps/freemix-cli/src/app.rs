@@ -1,8 +1,9 @@
 use std::{
     error::Error,
-    fs::File,
+    fs::{self, File, OpenOptions},
+    io,
     num::NonZeroU128,
-    path::Path,
+    path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -55,6 +56,7 @@ use crate::{
 type AppResult<T> = Result<T, Box<dyn Error>>;
 static IMPLICIT_KEY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static PROJECT_ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static PPM_OUTPUT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
 struct ProjectEngine {
@@ -1361,9 +1363,7 @@ fn render(path: &Path, output: &Path, width: u32, height: u32) -> AppResult<()> 
         engine.frame_cursor().get(),
         engine.realized_switcher().program_frame(),
     )?;
-    let mut file = File::create(output)?;
-    write_ppm(&frame, &mut file)?;
-    file.sync_all()?;
+    write_ppm_atomic(output, |file| write_ppm(&frame, file))?;
     println!(
         "rendered {}x{} Program input {} to {}",
         width,
@@ -1372,6 +1372,55 @@ fn render(path: &Path, output: &Path, width: u32, height: u32) -> AppResult<()> 
         output.display()
     );
     Ok(())
+}
+
+fn write_ppm_atomic(
+    output: &Path,
+    write: impl FnOnce(&mut File) -> io::Result<()>,
+) -> io::Result<()> {
+    let parent = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut name = std::ffi::OsString::from(".");
+    name.push(output.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "PPM output has no file name")
+    })?);
+    name.push(format!(
+        ".tmp-{}-{}",
+        std::process::id(),
+        PPM_OUTPUT_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let temp = parent.join(name);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)?;
+    let mut cleanup = PpmTempGuard(Some(temp.clone()));
+    write(&mut file)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&temp, output)?;
+    cleanup.disarm();
+    #[cfg(unix)]
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+struct PpmTempGuard(Option<PathBuf>);
+
+impl PpmTempGuard {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for PpmTempGuard {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = fs::remove_file(path);
+        }
+    }
 }
 
 fn demo(path: &Path, output: Option<&Path>) -> AppResult<()> {
@@ -1840,6 +1889,38 @@ impl Error for AppFailure {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ppm_publication_write_failure_keeps_previous_target() {
+        use std::io::Write as _;
+
+        let root = std::env::temp_dir().join(format!(
+            "freemix-cli-ppm-publication-{}-{}",
+            std::process::id(),
+            PPM_OUTPUT_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        let output = root.join("output.ppm");
+        let previous = b"complete PPM";
+        fs::write(&output, previous).unwrap();
+
+        let error = write_ppm_atomic(&output, |file| {
+            file.write_all(b"partial PPM")?;
+            Err(io::Error::other("controlled write failure"))
+        })
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(fs::read(&output).unwrap(), previous);
+        assert!(fs::read_dir(&root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp-")
+        }));
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn stable_rejection_codes_round_trip_and_unknown_codes_fail() {
