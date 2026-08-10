@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use fm_frame::{NormalizedDuration, NormalizedTimestamp};
 
-use crate::{DestinationConfig, DestinationId, MAX_DESTINATIONS, RenditionId, RenditionPlan};
+use crate::{
+    DestinationConfig, DestinationId, Endpoint, MAX_DESTINATIONS, RenditionId, RenditionPlan,
+};
 
 const MAX_FAILURE_RECORDS: usize = 32;
 const MAX_PACKET_BYTES: usize = 64 * 1024 * 1024;
@@ -184,15 +186,25 @@ pub enum SinkWrite {
     Congested(CongestionObservation),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectionTarget {
+    Primary,
+    Backup,
+}
+
 /// Adapter boundary for fake or real transports. Implementations own I/O;
 /// this crate owns policy and never blocks inside its state model.
 pub trait TransportSink: Send {
-    /// Establishes the configured endpoint.
+    /// Establishes the selected endpoint with the destination configuration.
     ///
     /// # Errors
     ///
     /// Returns a classified DNS, TLS, authentication, connect, or protocol error.
-    fn connect(&mut self, config: &DestinationConfig) -> Result<ConnectionObservation, SinkError>;
+    fn connect(
+        &mut self,
+        config: &DestinationConfig,
+        endpoint: &Endpoint,
+    ) -> Result<ConnectionObservation, SinkError>;
 
     /// Attempts one packet write without taking ownership of the queued packet.
     ///
@@ -377,6 +389,7 @@ pub enum PollEvent {
 
 struct DestinationOutput {
     config: DestinationConfig,
+    connection_target: ConnectionTarget,
     state: DestinationState,
     queue: VecDeque<OutputPacket>,
     queued_bytes: usize,
@@ -390,6 +403,7 @@ impl DestinationOutput {
         Self {
             queue: VecDeque::with_capacity(config.queue_capacity().get()),
             config,
+            connection_target: ConnectionTarget::Primary,
             state: DestinationState::Stopped,
             queued_bytes: 0,
             reconnect_attempt: 0,
@@ -437,6 +451,11 @@ impl DestinationOutput {
                 .reconnect()
                 .permits_attempt(self.reconnect_attempt)
         {
+            if self.connection_target == ConnectionTarget::Primary
+                && self.config.backup_endpoint().is_some()
+            {
+                self.connection_target = ConnectionTarget::Backup;
+            }
             let retry_at_ms =
                 now_ms.saturating_add(self.config.reconnect().delay_ms(self.reconnect_attempt));
             self.state = DestinationState::WaitingToReconnect {
@@ -452,7 +471,14 @@ impl DestinationOutput {
 
     fn connect(&mut self, now_ms: u64, sink: &mut dyn TransportSink) -> PollEvent {
         self.telemetry.connect_attempts = self.telemetry.connect_attempts.saturating_add(1);
-        match sink.connect(&self.config) {
+        let endpoint = match self.connection_target {
+            ConnectionTarget::Primary => self.config.endpoint(),
+            ConnectionTarget::Backup => self
+                .config
+                .backup_endpoint()
+                .expect("backup target requires a configured endpoint"),
+        };
+        match sink.connect(&self.config, endpoint) {
             Ok(observation) => {
                 if self.has_connected {
                     self.telemetry.reconnects = self.telemetry.reconnects.saturating_add(1);
@@ -582,6 +608,7 @@ impl OutputSet {
         ) {
             output.state = DestinationState::Connecting;
             output.reconnect_attempt = 0;
+            output.connection_target = ConnectionTarget::Primary;
         }
         Ok(())
     }
@@ -676,6 +703,13 @@ impl OutputSet {
         self.destinations
             .get(&destination)
             .map(|output| output.state)
+    }
+
+    #[must_use]
+    pub fn connection_target(&self, destination: DestinationId) -> Option<ConnectionTarget> {
+        self.destinations
+            .get(&destination)
+            .map(|output| output.connection_target)
     }
 
     #[must_use]

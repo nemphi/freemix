@@ -83,6 +83,7 @@ struct FakeSink {
     write_results: VecDeque<Result<SinkWrite, SinkError>>,
     connected: bool,
     disconnects: u64,
+    connection_hosts: Vec<String>,
     sequences: Vec<u64>,
     payloads: Vec<Arc<[u8]>>,
 }
@@ -106,7 +107,12 @@ impl FakeSink {
 }
 
 impl TransportSink for FakeSink {
-    fn connect(&mut self, _config: &DestinationConfig) -> Result<ConnectionObservation, SinkError> {
+    fn connect(
+        &mut self,
+        _config: &DestinationConfig,
+        endpoint: &Endpoint,
+    ) -> Result<ConnectionObservation, SinkError> {
+        self.connection_hosts.push(endpoint.host().to_owned());
         let result = self
             .connect_results
             .pop_front()
@@ -219,7 +225,7 @@ fn rendition_planner_shares_exact_profiles_only() {
 }
 
 #[test]
-fn one_write_failure_is_isolated_and_reconnects_with_backoff() {
+fn retryable_primary_write_failure_is_isolated_and_sends_once_on_backup() {
     let plan = RenditionPlanner::plan(&[
         DestinationRenditions::single(destination_id(1), profile(1_920, 1_080, 6_000_000)),
         DestinationRenditions::single(destination_id(2), profile(1_920, 1_080, 6_000_000)),
@@ -237,19 +243,22 @@ fn one_write_failure_is_isolated_and_reconnects_with_backoff() {
     outputs.start(destination_id(2)).unwrap();
 
     let write_failure = SinkError::new(FailureStage::Write, Some(54), "reset", true);
-    let mut failed = FakeSink::with_write_results([
+    let mut sink = FakeSink::with_write_results([
         Err(write_failure),
         Ok(SinkWrite::Sent(SendObservation::default())),
     ]);
     let mut healthy = FakeSink::default();
-    outputs.poll(destination_id(1), 0, &mut failed).unwrap();
+    assert_eq!(
+        outputs.poll(destination_id(1), 0, &mut sink).unwrap(),
+        PollEvent::Connected
+    );
     outputs.poll(destination_id(2), 0, &mut healthy).unwrap();
     outputs
         .enqueue_rendition(&plan, &packet(rendition, 1))
         .unwrap();
 
     assert_eq!(
-        outputs.poll(destination_id(1), 10, &mut failed).unwrap(),
+        outputs.poll(destination_id(1), 10, &mut sink).unwrap(),
         PollEvent::ReconnectScheduled { retry_at_ms: 110 }
     );
     assert_eq!(
@@ -260,23 +269,62 @@ fn one_write_failure_is_isolated_and_reconnects_with_backoff() {
         outputs.state(destination_id(2)),
         Some(DestinationState::Live)
     );
+    assert_eq!(
+        outputs.connection_target(destination_id(1)),
+        Some(ConnectionTarget::Backup)
+    );
     assert_eq!(outputs.queue_depth(destination_id(1)), Some(1));
     assert_eq!(
-        outputs.poll(destination_id(1), 109, &mut failed).unwrap(),
+        outputs.poll(destination_id(1), 109, &mut sink).unwrap(),
         PollEvent::WaitingToReconnect { retry_at_ms: 110 }
     );
     assert_eq!(
-        outputs.poll(destination_id(1), 110, &mut failed).unwrap(),
+        outputs.poll(destination_id(1), 110, &mut sink).unwrap(),
         PollEvent::Connected
     );
     assert_eq!(
-        outputs.poll(destination_id(1), 111, &mut failed).unwrap(),
+        outputs.poll(destination_id(1), 111, &mut sink).unwrap(),
         PollEvent::PacketSent { sequence: 1 }
     );
+    assert_eq!(outputs.queue_depth(destination_id(1)), Some(0));
+    assert_eq!(
+        sink.connection_hosts,
+        ["stream.example.test", "backup.example.test"]
+    );
+    assert_eq!(sink.sequences, [1]);
     let telemetry = outputs.telemetry(destination_id(1)).unwrap();
     assert_eq!(telemetry.reconnects(), 1);
     assert_eq!(telemetry.failure_count(), 1);
-    assert_eq!(failed.disconnects, 1);
+    assert_eq!(sink.disconnects, 1);
+}
+
+#[test]
+fn non_retryable_primary_connection_failure_never_contacts_backup() {
+    let mut outputs = OutputSet::new();
+    outputs
+        .add_destination(config(1, 1, OutputProtocol::Rtmp))
+        .unwrap();
+    outputs.start(destination_id(1)).unwrap();
+    let mut sink = FakeSink::with_connect_results([Err(SinkError::new(
+        FailureStage::Authentication,
+        Some(401),
+        "rejected",
+        false,
+    ))]);
+
+    assert_eq!(
+        outputs.poll(destination_id(1), 0, &mut sink).unwrap(),
+        PollEvent::Failed
+    );
+    assert_eq!(
+        outputs.connection_target(destination_id(1)),
+        Some(ConnectionTarget::Primary)
+    );
+    assert_eq!(
+        outputs.poll(destination_id(1), 1_000, &mut sink).unwrap(),
+        PollEvent::Idle
+    );
+    assert_eq!(sink.connection_hosts, ["stream.example.test"]);
 }
 
 #[test]
