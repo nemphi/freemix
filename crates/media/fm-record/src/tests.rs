@@ -824,24 +824,50 @@ fn flush_sync_failure_retains_uncommitted_batch() {
     let recorder = id(46);
     let armed = Arc::new(AtomicBool::new(false));
     let factory = Arc::new(FailingFactory {
-        target: format::segment_name(0),
+        target: format::segment_name(1),
         armed: Arc::clone(&armed),
         fail_sync: true,
     });
     let (mut coordinator, _) = RecorderCoordinator::open_with_writer_factory(temp.path(), factory)
         .expect("open coordinator");
     coordinator
-        .start(recorder, receipt(46), config(SegmentPolicy::default()))
+        .start(recorder, receipt(46), config(SegmentPolicy::by_frames(2)))
         .expect("start recorder");
-    coordinator
-        .enqueue(recorder, video(0, 8))
-        .expect("enqueue first event");
-    coordinator
-        .enqueue(recorder, video(1, 8))
-        .expect("enqueue second event");
-    let before = coordinator
-        .snapshot(recorder)
-        .expect("snapshot before flush");
+
+    for event in [video(0, 8), video(1, 9)] {
+        coordinator
+            .enqueue(recorder, event)
+            .expect("enqueue first batch");
+    }
+    assert_eq!(coordinator.flush(recorder).expect("flush first batch"), 2);
+    coordinator.rotate(recorder).expect("rotate after first batch");
+    let directory = recording_directory(temp.path(), recorder);
+    let first = format::scan_segment(&format::segment_path(&directory, 0))
+        .expect("read durable first segment");
+    assert_eq!((first.records, first.truncated_bytes), (2, 0));
+
+    let second_batch = [video(2, 10), video(3, 11)];
+    let queued_bytes = second_batch.iter().map(RecordEvent::queue_bytes).sum();
+    let expected_path = temp.path().join("expected-second-segment.fms");
+    let mut expected_file = File::create(&expected_path).expect("create expected segment");
+    for event in &second_batch {
+        let (kind, payload) = format::encoded_event(event).expect("encode expected event");
+        format::write_frame(
+            &mut expected_file,
+            kind,
+            &payload,
+            format::MAX_ENCODED_FRAME_PAYLOAD,
+        )
+        .expect("write expected event");
+    }
+    drop(expected_file);
+    let expected = fs::read(&expected_path).expect("read expected segment");
+    fs::remove_file(expected_path).expect("remove expected segment");
+    for event in second_batch {
+        coordinator
+            .enqueue(recorder, event)
+            .expect("enqueue second batch");
+    }
     armed.store(true, Ordering::SeqCst);
 
     coordinator
@@ -851,20 +877,31 @@ fn flush_sync_failure_retains_uncommitted_batch() {
     let after = coordinator
         .snapshot(recorder)
         .expect("snapshot after flush");
-    assert_eq!(after.state, RecorderState::Failed);
     assert_eq!(
         (
+            after.state,
             after.queued_events,
             after.queued_bytes,
             after.written_frames,
             after.written_bytes,
         ),
-        (
-            before.queued_events,
-            before.queued_bytes,
-            before.written_frames,
-            before.written_bytes,
-        )
+        (RecorderState::Failed, 2, queued_bytes, 0, 0)
+    );
+    let second_path = format::segment_path(&directory, 1);
+    assert_eq!(
+        fs::read(&second_path).expect("read failed second batch"),
+        expected
+    );
+    assert!(matches!(
+        coordinator.flush(recorder),
+        Err(RecorderError::InvalidState {
+            state: RecorderState::Failed,
+            ..
+        })
+    ));
+    assert_eq!(
+        fs::read(second_path).expect("read second segment after rejected retry"),
+        expected
     );
 }
 
