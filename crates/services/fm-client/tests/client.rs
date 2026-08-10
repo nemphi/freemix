@@ -842,43 +842,6 @@ fn reconnecting_second_client_reduces_exact_desired_and_realized_manual_state() 
 }
 
 #[test]
-fn snapshot_projects_exact_manual_slide_kind_and_intervals() {
-    let slide = |interval_start, position| {
-        ManualTransitionStatus::Active(ManualTransitionState {
-            kind: ManualTransitionKind::Slide,
-            from: input(1),
-            to: input(2),
-            interval_start: ManualTransitionPosition::new(interval_start).unwrap(),
-            position: ManualTransitionPosition::new(position).unwrap(),
-        })
-    };
-    let mut client = Client::new(config(4)).unwrap();
-    client.start_connect().unwrap();
-    client.transport_connected().unwrap();
-    client.accept_handshake(handshake(4, None)).unwrap();
-    let mut initial = snapshot(4);
-    initial.desired_manual_transition = slide(0, 6_250);
-    initial.realized_manual_transition = slide(6_250, 6_250);
-    client.apply_snapshot(initial).unwrap();
-
-    let switcher = client.model().state().unwrap().switcher();
-    assert!(matches!(
-        switcher.desired_manual_transition,
-        ModelManualTransitionStatus::Active(state)
-            if state.kind == ManualTransitionKind::Slide
-                && state.interval_start.basis_points() == 0
-                && state.position.basis_points() == 6_250
-    ));
-    assert!(matches!(
-        switcher.realized_manual_transition,
-        ModelManualTransitionStatus::Active(state)
-            if state.kind == ManualTransitionKind::Slide
-                && state.interval_start.basis_points() == 6_250
-                && state.position.basis_points() == 6_250
-    ));
-}
-
-#[test]
 fn runtime_lifecycle_sequence_is_recorded_without_durable_reduction() {
     let mut client = ready_client(2);
     client

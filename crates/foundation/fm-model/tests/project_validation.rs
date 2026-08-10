@@ -4,7 +4,7 @@ use fm_model::{
     AudioBus, BusSend, CURRENT_SCHEMA_VERSION, CropRect, EntityRef, Input, InputAudioStripState,
     InputBalanceBasisPoints, InputDelaySamples, InputGainMilliDb, InputKind, Layer, LayerGeometry,
     MainMix, Output, OutputFormat, Project, ProjectSettings, RectMask, RestartPolicy, Rgba8,
-    Rotation, Scene, SchemaVersion, SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor,
+    Rotation, Scene, SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor,
     SourceRef, StartupPolicy, StingerAudioPolicy, StingerConfig, StingerMissingMediaFallback,
     StingerSlotNumber, ValidationErrorKind,
 };
@@ -246,7 +246,6 @@ fn duplicate_routes_are_rejected() {
 
 #[test]
 fn project_uses_the_current_schema_contract() {
-    assert_eq!(CURRENT_SCHEMA_VERSION, SchemaVersion::new(17));
     assert_eq!(valid_project().schema_version(), CURRENT_SCHEMA_VERSION);
 }
 

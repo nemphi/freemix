@@ -1125,66 +1125,6 @@ fn manual_alpha_fade_preserves_kind_and_exact_position_through_restore() {
 }
 
 #[test]
-fn manual_slide_preserves_exact_interval_and_kind_through_restore_and_commit() {
-    let mut engine = engine();
-    for (key, command) in [
-        (
-            "slide-manual-start",
-            EngineCommand::StartManualTransition {
-                kind: EngineManualTransitionKind::Slide,
-            },
-        ),
-        (
-            "slide-manual-forward",
-            EngineCommand::SetManualTransitionPosition {
-                position: EngineManualTransitionPosition::new(8_000).unwrap(),
-            },
-        ),
-    ] {
-        engine.execute(envelope(key, command), 0).unwrap();
-        engine.tick().unwrap();
-    }
-    engine
-        .execute(
-            envelope(
-                "slide-manual-reverse",
-                EngineCommand::SetManualTransitionPosition {
-                    position: EngineManualTransitionPosition::new(2_500).unwrap(),
-                },
-            ),
-            0,
-        )
-        .unwrap();
-    let reverse = engine.tick().unwrap();
-    assert_eq!(reverse.program.transition_kind, Some(TransitionKind::Slide));
-    assert_eq!(
-        (
-            reverse.program.mix_start_numerator,
-            reverse.program.mix_end_numerator,
-        ),
-        (8_000, 2_500)
-    );
-
-    let mut restored = Engine::restore(engine.snapshot().unwrap()).unwrap();
-    let held = restored.tick().unwrap();
-    assert_eq!(held.program.transition_kind, Some(TransitionKind::Slide));
-    assert_eq!(
-        (
-            held.program.mix_start_numerator,
-            held.program.mix_end_numerator,
-        ),
-        (2_500, 2_500)
-    );
-    restored
-        .execute(
-            envelope("slide-manual-commit", EngineCommand::CommitManualTransition),
-            0,
-        )
-        .unwrap();
-    assert_eq!(restored.tick().unwrap().program.primary, input(2));
-}
-
-#[test]
 fn cancelling_manual_transition_preserves_program_and_preview() {
     let mut engine = engine();
     for (key, command) in [

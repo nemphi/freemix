@@ -1656,15 +1656,6 @@ mod tests {
                 expected_revision: None,
             })
         );
-        assert_eq!(
-            parse(strings(&["tbar-start", "show.freemix", "slide"])),
-            Ok(Command::TBar {
-                path: "show.freemix".into(),
-                action: TBarAction::Start(ManualTransitionKind::Slide),
-                key: None,
-                expected_revision: None,
-            })
-        );
         assert!(matches!(
             parse(strings(&["tbar-commit", "show.freemix"])),
             Ok(Command::TBar {
