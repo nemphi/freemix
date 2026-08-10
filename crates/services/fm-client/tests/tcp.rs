@@ -884,6 +884,10 @@ fn runtime_sequence_gap_enters_backoff_and_retries_unresolved_command() {
     let (original_tx, original_rx) = mpsc::channel();
     let (address, server_thread) = spawn_server(move |listener| {
         let mut first = Peer::accept(&listener);
+        first
+            .stream
+            .set_read_timeout(Some(CONNECT_TIMEOUT))
+            .unwrap();
         accept_snapshot(&mut first, 4);
         let WireMessage::Command(original) = first.receive() else {
             panic!("expected original command")
@@ -896,6 +900,10 @@ fn runtime_sequence_gap_enters_backoff_and_retries_unresolved_command() {
         assert_eq!(first.stream.read(&mut [0_u8; 1]).unwrap(), 0);
 
         let mut second = Peer::accept(&listener);
+        second
+            .stream
+            .set_read_timeout(Some(CONNECT_TIMEOUT))
+            .unwrap();
         assert_eq!(accept_resume(&mut second, 4).revision, 4);
         let WireMessage::Command(retried) = second.receive() else {
             panic!("expected unresolved command retry")
