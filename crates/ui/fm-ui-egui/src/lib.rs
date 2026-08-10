@@ -4,14 +4,14 @@
 //! and returns intents. It performs no command dispatch, persistence, or I/O.
 
 use egui::{
-    Button, Color32, DragValue, Frame, Grid, Margin, RichText, ScrollArea, Stroke, Ui, Vec2,
+    Button, Color32, DragValue, Frame, Grid, Label, Margin, RichText, ScrollArea, Stroke, Ui, Vec2,
 };
 use fm_protocol::{
     ManualTransitionKind, ManualTransitionPosition, OverlayBorderPreset, OverlayPositionPreset,
     OverlayTransitionKind, StingerReadiness, WireOverlayChannelId, WireStingerSlotId,
 };
 use fm_types::InputId;
-use fm_ui_model::{ClientView, ManualTransitionStatus, SwitcherState};
+use fm_ui_model::{BusSelection, ClientView, ManualTransitionStatus, SwitcherState};
 
 mod fade_to_black;
 mod overlay_status;
@@ -1036,15 +1036,17 @@ fn draw_messages(ui: &mut Ui, state: &StudioUiState) {
 fn draw_monitors(ui: &mut Ui, view: Option<&ClientView>) {
     let (preview, program) = view.map_or((None, None), |view| {
         (
-            Some((
-                view.switcher.desired.preview,
-                view.switcher.realized.preview,
-                view,
+            Some(monitor_routing(
+                view.switcher,
+                &view.inputs,
+                &view.input_names,
+                |selection| selection.preview,
             )),
-            Some((
-                view.switcher.desired.program,
-                view.switcher.realized.program,
-                view,
+            Some(monitor_routing(
+                view.switcher,
+                &view.inputs,
+                &view.input_names,
+                |selection| selection.program,
             )),
         )
     });
@@ -1060,12 +1062,7 @@ fn draw_monitors(ui: &mut Ui, view: Option<&ClientView>) {
     }
 }
 
-fn draw_monitor(
-    ui: &mut Ui,
-    bus_label: &str,
-    color: Color32,
-    routing: Option<(InputId, InputId, &ClientView)>,
-) {
+fn draw_monitor(ui: &mut Ui, bus_label: &str, color: Color32, routing: Option<MonitorRouting>) {
     Frame::new()
         .fill(MONITOR_BLACK)
         .stroke(Stroke::new(2.0, color))
@@ -1074,26 +1071,39 @@ fn draw_monitor(
             ui.set_min_height(154.0);
             ui.label(RichText::new(bus_label).strong().color(color));
             ui.add_space(28.0);
-            let (routing_label, routing_text_color) = routing.map_or_else(
-                || ("ROUTING STATE UNAVAILABLE".to_owned(), MUTED),
-                |(desired, realized, view)| {
-                    (
-                        format!(
-                            "DESIRED: {} | REALIZED: {}",
-                            label_for_input(view, desired),
-                            label_for_input(view, realized),
-                        ),
-                        routing_color(desired, realized),
-                    )
-                },
-            );
             ui.vertical_centered(|ui| {
-                ui.label(
-                    RichText::new(routing_label)
-                        .strong()
-                        .size(17.0)
-                        .color(routing_text_color),
-                );
+                if let Some(routing) = routing {
+                    let routing_text_color = routing_color(routing.desired.0, routing.realized.0);
+                    ui.add_sized(
+                        [ui.available_width(), 0.0],
+                        Label::new(
+                            RichText::new(format!("DESIRED: {}", routing.desired.1))
+                                .strong()
+                                .size(17.0)
+                                .color(routing_text_color),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(&routing.desired.1);
+                    ui.add_sized(
+                        [ui.available_width(), 0.0],
+                        Label::new(
+                            RichText::new(format!("REALIZED: {}", routing.realized.1))
+                                .strong()
+                                .size(17.0)
+                                .color(routing_text_color),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(&routing.realized.1);
+                } else {
+                    ui.label(
+                        RichText::new("ROUTING STATE UNAVAILABLE")
+                            .strong()
+                            .size(17.0)
+                            .color(MUTED),
+                    );
+                }
                 ui.add_space(6.0);
                 ui.label(
                     RichText::new("VIDEO PREVIEW DELIVERY PENDING")
@@ -1268,13 +1278,36 @@ fn dynamic_columns(available_width: f32, spacing: f32) -> usize {
     columns
 }
 
+struct MonitorRouting {
+    desired: (InputId, String),
+    realized: (InputId, String),
+}
+
+fn monitor_routing(
+    switcher: SwitcherState,
+    inputs: &[InputId],
+    input_names: &[String],
+    select: fn(BusSelection) -> InputId,
+) -> MonitorRouting {
+    let desired = select(switcher.desired);
+    let realized = select(switcher.realized);
+    MonitorRouting {
+        desired: (desired, input_name(inputs, input_names, desired)),
+        realized: (realized, input_name(inputs, input_names, realized)),
+    }
+}
+
 fn label_for_input(view: &ClientView, input: InputId) -> String {
-    view.inputs
+    input_name(&view.inputs, &view.input_names, input)
+}
+
+fn input_name(inputs: &[InputId], input_names: &[String], input: InputId) -> String {
+    inputs
         .iter()
         .position(|candidate| *candidate == input)
         .map_or_else(
             || format!("Input {input}"),
-            |index| view.input_names[index].clone(),
+            |index| input_names[index].clone(),
         )
 }
 
@@ -1389,9 +1422,23 @@ mod tests {
     }
 
     #[test]
-    fn routing_color_marks_only_divergent_ids_amber() {
-        assert_eq!(routing_color(input(1), input(1)), MUTED);
-        assert_eq!(routing_color(input(1), input(2)), AMBER);
+    fn monitor_routing_projects_preview_and_program_names() {
+        let inputs = [input(1), input(2), input(3)];
+        let names = [
+            "Camera A".to_owned(),
+            "Camera B".to_owned(),
+            "Graphics".to_owned(),
+        ];
+        let switcher = switcher((3, 2), (1, 2));
+        let preview = monitor_routing(switcher, &inputs, &names, |selection| selection.preview);
+        let program = monitor_routing(switcher, &inputs, &names, |selection| selection.program);
+
+        assert_eq!(preview.desired, (input(2), "Camera B".to_owned()));
+        assert_eq!(preview.realized, (input(2), "Camera B".to_owned()));
+        assert_eq!(program.desired, (input(3), "Graphics".to_owned()));
+        assert_eq!(program.realized, (input(1), "Camera A".to_owned()));
+        assert_eq!(routing_color(preview.desired.0, preview.realized.0), MUTED);
+        assert_eq!(routing_color(program.desired.0, program.realized.0), AMBER);
     }
 
     #[test]
