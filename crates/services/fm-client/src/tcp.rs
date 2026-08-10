@@ -326,6 +326,7 @@ impl TcpConnection {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DisconnectCause {
     Eof,
+    ServerShutdown,
     Io(io::ErrorKind),
 }
 
@@ -766,6 +767,15 @@ impl TcpSession {
                     return Err(self.client_error(error));
                 }
                 Ok(SessionEvent::DurableGap { gap })
+            }
+            WireMessage::Error(error)
+                if error.error.code == "server_shutting_down" && error.error.retryable =>
+            {
+                let backoff = self.transition_disconnect();
+                Ok(SessionEvent::Disconnected {
+                    cause: DisconnectCause::ServerShutdown,
+                    backoff,
+                })
             }
             WireMessage::Error(error) => Ok(SessionEvent::ServerError(error)),
             WireMessage::Command(_)

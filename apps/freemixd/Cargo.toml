@@ -61,7 +61,7 @@ signal-hook = "0.3.18"
 ctrlc = "3.4.7"
 
 [dev-dependencies]
-fm-client = { path = "../../crates/services/fm-client" }
+fm-client = { path = "../../crates/services/fm-client", features = ["std-tcp"] }
 half = "2.7.1"
 image = { version = "0.25", default-features = false, features = ["png"] }
 tempfile = "3.20"

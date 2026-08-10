@@ -3722,16 +3722,16 @@ fn handle_client(
     let mut writer = stream.try_clone()?;
     let mut reader = MessageReader::new(stream);
     let mut native = native;
-    let Some(first) = read_client_message(
+    let first = match read_client_message(
         &mut reader,
         control,
         authority,
         &mut native,
         process_shutdown,
         || Ok(Instant::now() < handshake_deadline),
-    )?
-    else {
-        return Ok(());
+    )? {
+        ClientRead::Message(message) => message,
+        ClientRead::Closed | ClientRead::DaemonShutdown(_) => return Ok(()),
     };
     let (hello, handshake_outcome) = if let WireMessage::HandshakeRequest(request) = first {
         current_handshake(&request, control, durable.project().id())
@@ -3782,14 +3782,23 @@ fn handle_client(
         }
     }
 
-    while let Some(message) = read_client_message(
-        &mut reader,
-        control,
-        authority,
-        &mut native,
-        process_shutdown,
-        || session_heartbeat_active(&mut session),
-    )? {
+    loop {
+        let message = match read_client_message(
+            &mut reader,
+            control,
+            authority,
+            &mut native,
+            process_shutdown,
+            || session_heartbeat_active(&mut session),
+        )? {
+            ClientRead::Message(message) => message,
+            ClientRead::DaemonShutdown(DaemonShutdownReason::ProcessSignal) => {
+                let _ = write_session_message(&mut writer, &mut session, &shutdown_message());
+                session.disconnect(DisconnectReason::ServerShutdown);
+                break;
+            }
+            ClientRead::Closed | ClientRead::DaemonShutdown(_) => break,
+        };
         match message {
             WireMessage::Command(command) => process_command(
                 &mut writer,
@@ -3833,6 +3842,12 @@ fn handle_client(
     Ok(())
 }
 
+enum ClientRead {
+    Message(WireMessage),
+    Closed,
+    DaemonShutdown(DaemonShutdownReason),
+}
+
 fn read_client_message(
     reader: &mut MessageReader,
     control: &SharedControl,
@@ -3840,9 +3855,12 @@ fn read_client_message(
     native: &mut Option<&mut NativeDaemon>,
     process_shutdown: Option<&ProcessShutdown>,
     mut idle: impl FnMut() -> AppResult<bool>,
-) -> AppResult<Option<WireMessage>> {
-    if requested_daemon_shutdown(native.as_deref(), process_shutdown).is_some() || !idle()? {
-        return Ok(None);
+) -> AppResult<ClientRead> {
+    if let Some(reason) = requested_daemon_shutdown(native.as_deref(), process_shutdown) {
+        return Ok(ClientRead::DaemonShutdown(reason));
+    }
+    if !idle()? {
+        return Ok(ClientRead::Closed);
     }
     let message = reader.read_message_with_idle(|| {
         if requested_daemon_shutdown(native.as_deref(), process_shutdown).is_some() || !idle()? {
@@ -3853,10 +3871,12 @@ fn read_client_message(
         }
         Ok(true)
     })?;
-    if message.is_some() && !idle()? {
-        Ok(None)
+    if let Some(reason) = requested_daemon_shutdown(native.as_deref(), process_shutdown) {
+        Ok(ClientRead::DaemonShutdown(reason))
+    } else if message.is_some() && !idle()? {
+        Ok(ClientRead::Closed)
     } else {
-        Ok(message)
+        Ok(message.map_or(ClientRead::Closed, ClientRead::Message))
     }
 }
 
@@ -4907,6 +4927,19 @@ fn error_message(code: &str, message: &str) -> WireMessage {
             message: message.into(),
             fields: Vec::new(),
             retryable: false,
+        },
+    })
+}
+
+fn shutdown_message() -> WireMessage {
+    WireMessage::Error(ErrorMessage {
+        request_id: None,
+        current_revision: None,
+        error: StructuredError {
+            code: "server_shutting_down".into(),
+            message: "server is shutting down".into(),
+            fields: Vec::new(),
+            retryable: true,
         },
     })
 }

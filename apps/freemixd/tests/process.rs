@@ -10,7 +10,8 @@ use std::{
 };
 
 use fm_client::{
-    Client as ProtocolClient, ClientConfig, ClientError, ConnectionState, Intake, Outbound,
+    Client as ProtocolClient, ClientConfig, ClientError, ConnectionState, DisconnectCause, Intake,
+    Outbound, SessionEvent, TcpSession,
 };
 use fm_model::{
     AudioBus, Input, InputKind, Layer, LayerGeometry, MainMix, Output, Project, ProjectSettings,
@@ -1273,17 +1274,43 @@ fn non_loopback_bind_is_rejected_before_listening() {
 
 #[cfg(unix)]
 #[test]
-fn default_daemon_sigterm_exits_cleanly() {
-    let directory = TestDirectory::new("default-daemon-sigterm");
+fn sigterm_notifies_established_client_then_exits_cleanly() {
+    let directory = TestDirectory::new("sigterm-notifies-client");
     let project_path = directory.project_path();
     create_project(&project_path);
 
     let daemon = Daemon::start_without_once(&project_path);
+    let mut session = TcpSession::new(
+        ProtocolClient::new(ClientConfig::new(
+            "process-test",
+            ClientType::Integration,
+            Role::Operator,
+            "process-client",
+            project_id(),
+        ))
+        .unwrap(),
+    );
+    assert!(matches!(
+        session
+            .connect(daemon.address, Duration::from_secs(1))
+            .unwrap(),
+        SessionEvent::Connected { .. }
+    ));
     let status = ProcessCommand::new("/bin/kill")
         .args(["-TERM", &daemon.child.as_ref().unwrap().id().to_string()])
         .status()
         .unwrap();
     assert!(status.success(), "SIGTERM command failed: {status}");
+    let deadline = Instant::now() + Duration::from_secs(1);
+    assert!(matches!(
+        session
+            .receive_cancellable(Duration::from_millis(25), || Instant::now() >= deadline)
+            .unwrap(),
+        SessionEvent::Disconnected {
+            cause: DisconnectCause::ServerShutdown,
+            backoff,
+        } if backoff.attempt == 1
+    ));
     daemon.wait_success();
 }
 
