@@ -1783,12 +1783,12 @@ mod tests {
         }
 
         assert_eq!(
-            receiver.recv().unwrap(),
+            receiver.try_recv().unwrap(),
             WorkerRequest::Intent(StudioIntent::Cut)
         );
         assert_eq!(pending.flush(&sender), Ok(()));
         assert_eq!(
-            receiver.recv().unwrap(),
+            receiver.try_recv().unwrap(),
             WorkerRequest::Intent(manual_position(3_000))
         );
     }
@@ -1807,17 +1807,17 @@ mod tests {
         );
 
         assert_eq!(
-            receiver.recv().unwrap(),
+            receiver.try_recv().unwrap(),
             WorkerRequest::Intent(StudioIntent::Cut)
         );
         assert_eq!(pending.flush(&sender), Ok(()));
         assert_eq!(
-            receiver.recv().unwrap(),
+            receiver.try_recv().unwrap(),
             WorkerRequest::Intent(manual_position(3_000))
         );
         assert_eq!(pending.flush(&sender), Ok(()));
         assert_eq!(
-            receiver.recv().unwrap(),
+            receiver.try_recv().unwrap(),
             WorkerRequest::Intent(StudioIntent::CommitManualTransition)
         );
     }
