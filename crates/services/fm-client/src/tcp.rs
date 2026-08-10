@@ -912,14 +912,17 @@ impl TcpSession {
     }
 
     fn client_error(&mut self, error: ClientError) -> TcpSessionError {
-        if matches!(
-            self.client.state(),
-            crate::ConnectionState::ResyncRequired { .. }
-        ) {
-            self.transition_disconnect();
-            TcpSessionError::ResyncRequired(Box::new(error))
-        } else {
-            TcpSessionError::Client(error)
+        match error {
+            error @ ClientError::RuntimeSequenceGap { .. }
+            | error
+                if matches!(
+                    self.client.state(),
+                    crate::ConnectionState::ResyncRequired { .. }
+                ) => {
+                self.transition_disconnect();
+                TcpSessionError::ResyncRequired(Box::new(error))
+            }
+            error => TcpSessionError::Client(error),
         }
     }
 

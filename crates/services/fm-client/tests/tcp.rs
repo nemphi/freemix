@@ -880,6 +880,64 @@ fn event_gap_forces_snapshot_and_preserves_unresolved_command() {
 }
 
 #[test]
+fn runtime_sequence_gap_enters_backoff_and_retries_unresolved_command() {
+    let (original_tx, original_rx) = mpsc::channel();
+    let (address, server_thread) = spawn_server(move |listener| {
+        let mut first = Peer::accept(&listener);
+        accept_snapshot(&mut first, 4);
+        let WireMessage::Command(original) = first.receive() else {
+            panic!("expected original command")
+        };
+        original_tx.send(original.clone()).unwrap();
+        first.send(&WireMessage::RuntimeEvent(runtime_event(4)));
+        let mut gap = runtime_event(4);
+        gap.sequence = 3;
+        first.send(&WireMessage::RuntimeEvent(gap));
+        assert_eq!(first.stream.read(&mut [0_u8; 1]).unwrap(), 0);
+
+        let mut second = Peer::accept(&listener);
+        assert_eq!(accept_resume(&mut second, 4).revision, 4);
+        let WireMessage::Command(retried) = second.receive() else {
+            panic!("expected unresolved command retry")
+        };
+        assert_eq!(retried, original);
+    });
+
+    let mut session = TcpSession::new(client(2));
+    session.connect(address, CONNECT_TIMEOUT).unwrap();
+    let command = session
+        .queue_command(CommandPayload::Cut, "runtime-gap", Some(4), None)
+        .unwrap();
+    session.flush().unwrap();
+    assert_eq!(original_rx.recv().unwrap(), command);
+    assert!(matches!(
+        session.receive().unwrap(),
+        SessionEvent::RuntimeEvent {
+            intake: Intake::RuntimeEventObserved,
+            ..
+        }
+    ));
+    assert!(matches!(
+        session.receive(),
+        Err(TcpSessionError::ResyncRequired(error))
+            if matches!(error.as_ref(), ClientError::RuntimeSequenceGap {
+                generation: 1,
+                expected_sequence: 2,
+                received_sequence: 3,
+            })
+    ));
+    assert_eq!(session.in_flight_len(), 1);
+    assert_eq!(session.reconnect_backoff().unwrap().attempt, 1);
+    assert!(matches!(
+        session.connect(address, CONNECT_TIMEOUT).unwrap(),
+        SessionEvent::Connected {
+            mode: SyncMode::Resume
+        }
+    ));
+    server_thread.join().unwrap();
+}
+
+#[test]
 fn model_error_forces_snapshot_and_preserves_unresolved_command() {
     let (address, server_thread) = spawn_server(move |listener| {
         let mut first = Peer::accept(&listener);
