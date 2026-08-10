@@ -3636,7 +3636,7 @@ impl NativeMasterRuntime {
     /// owned audio block. A clone is retained in the bounded fake sink so
     /// existing diagnostics remain identical to [`Self::render_frame`].
     ///
-    /// Fade and Wipe linearly weight both sources across the exact interval;
+    /// Fade, Wipe, AlphaFade, Slide, and Zoom linearly weight both sources across the exact interval;
     /// Cut keeps one source at unity. This method performs no probe, decode,
     /// channel mapping, or blocking wait.
     ///
@@ -11174,6 +11174,73 @@ mod tests {
         assert_eq!(
             native_mix_plan(frame).unwrap().transition.kind(),
             TransitionKind::AlphaFade
+        );
+    }
+
+    #[test]
+    fn manual_slide_engine_interval_reaches_native_video_and_audio_plans() {
+        let old = input(1);
+        let new = input(2);
+        let frame_rate = FrameRate::new(25, 1).unwrap();
+        let clock_domain = EngineClockDomainId::new(NonZeroU128::new(99).unwrap());
+        let show = ShowState::new(
+            "manual slide",
+            [old, new]
+                .into_iter()
+                .map(|input| (input, format!("Input {input}")))
+                .collect(),
+            old,
+            new,
+        )
+        .unwrap();
+        let mut engine = Engine::new(show, frame_rate, clock_domain);
+        for (key, command) in [
+            (
+                "manual-slide-start",
+                EngineCommand::StartManualTransition {
+                    kind: EngineManualTransitionKind::Slide,
+                },
+            ),
+            (
+                "manual-slide-forward",
+                EngineCommand::SetManualTransitionPosition {
+                    position: EngineManualTransitionPosition::new(8_000).unwrap(),
+                },
+            ),
+        ] {
+            engine
+                .execute(
+                    CommandEnvelope::new(key, IdempotencyKey::new(key), command),
+                    0,
+                )
+                .unwrap();
+            let _ = engine.tick().unwrap();
+        }
+        engine
+            .execute(
+                CommandEnvelope::new(
+                    "manual-slide-reverse",
+                    IdempotencyKey::new("manual-slide-reverse"),
+                    EngineCommand::SetManualTransitionPosition {
+                        position: EngineManualTransitionPosition::new(2_500).unwrap(),
+                    },
+                ),
+                0,
+            )
+            .unwrap();
+        let frame = engine.tick().unwrap().program;
+
+        assert_eq!(
+            native_audio_mix_plan(frame).unwrap(),
+            NativeAudioMixPlan {
+                primary: old,
+                primary_gain: SourceGain::new(2_000, 7_500, 10_000).unwrap(),
+                secondary: Some((new, SourceGain::new(8_000, 2_500, 10_000).unwrap())),
+            }
+        );
+        assert_eq!(
+            native_mix_plan(frame).unwrap().transition.kind(),
+            TransitionKind::Slide
         );
     }
 

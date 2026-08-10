@@ -5,6 +5,7 @@ pub enum ManualTransitionKind {
     Fade,
     Wipe,
     AlphaFade,
+    Slide,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1136,6 +1137,7 @@ fn manual_kind(value: &str) -> Result<ManualTransitionKind, ArgsError> {
         "fade" => Ok(ManualTransitionKind::Fade),
         "wipe" => Ok(ManualTransitionKind::Wipe),
         "alpha-fade" => Ok(ManualTransitionKind::AlphaFade),
+        "slide" => Ok(ManualTransitionKind::Slide),
         _ => Err(ArgsError::InvalidChoice {
             field: "transition kind",
             value: value.to_owned(),
@@ -1654,6 +1656,15 @@ mod tests {
                 expected_revision: None,
             })
         );
+        assert_eq!(
+            parse(strings(&["tbar-start", "show.freemix", "slide"])),
+            Ok(Command::TBar {
+                path: "show.freemix".into(),
+                action: TBarAction::Start(ManualTransitionKind::Slide),
+                key: None,
+                expected_revision: None,
+            })
+        );
         assert!(matches!(
             parse(strings(&["tbar-commit", "show.freemix"])),
             Ok(Command::TBar {
@@ -1728,13 +1739,13 @@ mod tests {
                 value: 10_001,
             })
         );
-        assert_eq!(
-            parse(strings(&["tbar-start", "show.freemix", "slide"])),
+        assert!(matches!(
+            parse(strings(&["tbar-start", "show.freemix", "unknown"])),
             Err(ArgsError::InvalidChoice {
                 field: "transition kind",
-                value: "slide".into(),
+                ..
             })
-        );
+        ));
     }
 
     #[test]

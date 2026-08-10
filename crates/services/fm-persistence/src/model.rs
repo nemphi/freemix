@@ -19,6 +19,7 @@ pub enum ManualTransitionKind {
     Fade,
     Wipe,
     AlphaFade,
+    Slide,
 }
 
 /// Exact state of one active manual transition at a frame boundary.

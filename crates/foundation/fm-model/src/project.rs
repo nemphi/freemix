@@ -2,7 +2,7 @@ use fm_types::{AudioFormat, BusId, FrameRate, InputId, OutputId, ProjectId, Scen
 
 use crate::{ValidationError, validation::validate_project};
 
-pub const CURRENT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(16);
+pub const CURRENT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(17);
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct SchemaVersion(u32);

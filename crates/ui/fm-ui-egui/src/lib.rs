@@ -89,7 +89,7 @@ pub enum StudioIntent {
     Wipe { duration_frames: u32 },
     /// Fades realized Program video and audio to black or back to live.
     FadeToBlack { active: bool, duration_frames: u32 },
-    /// Starts a held manual Fade, Wipe, or `AlphaFade` transition.
+    /// Starts a held manual Fade, Wipe, `AlphaFade`, or Slide transition.
     StartManualTransition { kind: ManualTransitionKind },
     /// Sets the exact manual-transition position in basis points.
     SetManualTransitionPosition { position: ManualTransitionPosition },
@@ -844,6 +844,11 @@ fn draw_manual_start_buttons(
             ManualTransitionKind::Wipe,
             "Start a reversible manual Wipe transition",
         ),
+        (
+            "START SLIDE T-BAR",
+            ManualTransitionKind::Slide,
+            "Start a reversible manual Slide transition",
+        ),
     ] {
         let response = ui
             .add_enabled(enabled, Button::new(RichText::new(label).strong()))
@@ -937,6 +942,7 @@ fn manual_transition_label(status: ManualTransitionStatus) -> String {
                 ManualTransitionKind::Fade => "FADE",
                 ManualTransitionKind::Wipe => "WIPE",
                 ManualTransitionKind::AlphaFade => "ALPHA FADE",
+                ManualTransitionKind::Slide => "SLIDE",
             },
             state.from,
             state.to,
@@ -1544,6 +1550,14 @@ mod tests {
             manual_transition_label(alpha_fade),
             "ALPHA FADE 1->2 @ 2500 BP"
         );
+        let slide = ManualTransitionStatus::Active(ActiveManualTransition {
+            kind: ManualTransitionKind::Slide,
+            from: input(1),
+            to: input(2),
+            interval_start: ManualTransitionPosition::new(8_000).unwrap(),
+            position: ManualTransitionPosition::new(2_500).unwrap(),
+        });
+        assert_eq!(manual_transition_label(slide), "SLIDE 1->2 @ 2500 BP");
         assert_eq!(
             desired_manual_position(ManualTransitionStatus::Inactive),
             ManualTransitionPosition::START

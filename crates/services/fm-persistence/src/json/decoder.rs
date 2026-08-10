@@ -714,6 +714,7 @@ fn parse_manual_transition(value: Value) -> Result<ManualTransitionState, Decode
         "fade" => ManualTransitionKind::Fade,
         "wipe" => ManualTransitionKind::Wipe,
         "alpha_fade" => ManualTransitionKind::AlphaFade,
+        "slide" => ManualTransitionKind::Slide,
         value => return Err(unknown_enum("manual transition kind", value)),
     };
     let from_id = InputId::new(object.nonzero_u128("from_id")?);

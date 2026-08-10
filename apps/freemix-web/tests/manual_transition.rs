@@ -69,6 +69,10 @@ fn controls_have_stable_accessible_labels() {
         "Start manual AlphaFade transition"
     );
     assert_eq!(
+        ManualTransitionControl::StartSlide.accessibility_label(),
+        "Start manual Slide transition"
+    );
+    assert_eq!(
         ManualTransitionControl::Position(ManualTransitionPosition::END).accessibility_label(),
         "Manual transition position in basis points"
     );
@@ -118,6 +122,16 @@ fn idle_model_emits_all_start_kinds_and_no_active_commands() {
         ),
         Some(CommandPayload::StartManualTransition {
             kind: ManualTransitionKind::AlphaFade,
+        })
+    );
+    assert_eq!(
+        model.command_payload(
+            ManualTransitionControl::StartSlide,
+            &ConnectionState::Ready,
+            Some(&session),
+        ),
+        Some(CommandPayload::StartManualTransition {
+            kind: ManualTransitionKind::Slide,
         })
     );
     for control in [
@@ -178,6 +192,7 @@ fn active_model_emits_exact_boundary_positions_commit_and_cancel() {
         ManualTransitionControl::StartFade,
         ManualTransitionControl::StartWipe,
         ManualTransitionControl::StartAlphaFade,
+        ManualTransitionControl::StartSlide,
     ] {
         assert_eq!(
             model.command_payload(control, &ConnectionState::Ready, Some(&session)),
@@ -238,6 +253,7 @@ fn terminal_lag_waits_for_realized_inactive_before_enabling_start() {
         ManualTransitionControl::StartFade,
         ManualTransitionControl::StartWipe,
         ManualTransitionControl::StartAlphaFade,
+        ManualTransitionControl::StartSlide,
         ManualTransitionControl::Position(ManualTransitionPosition::START),
         ManualTransitionControl::Commit,
         ManualTransitionControl::Cancel,

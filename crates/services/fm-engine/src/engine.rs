@@ -30,6 +30,7 @@ pub enum EngineManualTransitionKind {
     Fade,
     Wipe,
     AlphaFade,
+    Slide,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1397,13 +1398,17 @@ const fn manual_transition_kind(kind: EngineManualTransitionKind) -> TransitionK
         EngineManualTransitionKind::Fade => TransitionKind::Fade,
         EngineManualTransitionKind::Wipe => TransitionKind::Wipe,
         EngineManualTransitionKind::AlphaFade => TransitionKind::AlphaFade,
+        EngineManualTransitionKind::Slide => TransitionKind::Slide,
     }
 }
 
 const fn manual_transition_kind_supported(kind: TransitionKind) -> bool {
     matches!(
         kind,
-        TransitionKind::Fade | TransitionKind::Wipe | TransitionKind::AlphaFade
+        TransitionKind::Fade
+            | TransitionKind::Wipe
+            | TransitionKind::AlphaFade
+            | TransitionKind::Slide
     )
 }
 
@@ -1413,7 +1418,8 @@ fn engine_manual_state(state: fm_switcher::TBarState) -> EngineManualTransitionS
             TransitionKind::Fade => EngineManualTransitionKind::Fade,
             TransitionKind::Wipe => EngineManualTransitionKind::Wipe,
             TransitionKind::AlphaFade => EngineManualTransitionKind::AlphaFade,
-            _ => unreachable!("engine manual transitions are Fade, Wipe, or AlphaFade"),
+            TransitionKind::Slide => EngineManualTransitionKind::Slide,
+            _ => unreachable!("engine manual transitions are Fade, Wipe, AlphaFade, or Slide"),
         },
         from: state.from(),
         to: state.to(),

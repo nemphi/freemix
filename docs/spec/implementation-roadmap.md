@@ -111,7 +111,7 @@ this item, so its parity rows remain planned.
 Current implementation boundary for item 5: `freemix-studio` opens a native
 `eframe`/wgpu shell by default with responsive Program/Preview monitor wells,
 stable-ID input tiles, realized/desired tally, and permission-gated Cut/Fade/Wipe
-controls. Manual Fade/Wipe T-bar controls require transition permission,
+controls. Manual Fade/Wipe/AlphaFade/Slide T-bar controls require transition permission,
 synchronized state, and Ready lifecycle. The manual panel displays
 replicated desired and realized kind, routing, and exact integer basis-point
 position. Bounded worker channels preserve strict operator FIFO while
@@ -134,7 +134,7 @@ are not present in the replicated client contract, so tiles use ordinal/ID
 labels and monitor wells state that real preview delivery remains pending.
 `freemix-web` likewise declares only the current protocol in its client configuration.
 Its transport-free semantic presentation model preserves the existing
-permission- and protocol-gated Cut/Fade/Wipe controls and adds manual Fade/Wipe
+permission- and protocol-gated Cut/Fade/Wipe controls and adds manual Fade/Wipe/AlphaFade/Slide
 Start, exact basis-point Position, Commit, and Cancel controls. Manual controls
 derive availability from Ready state, transition permission, and separate authoritative desired and realized
 manual projections. It also models protocol-gated FTB actions and exact state.
@@ -199,7 +199,7 @@ integer milli-dB gain (`-96000..=24000`), stereo balance
 0–48,000-sample delay. Native daemon preflight transactionally maps those
 records to `fm-audio::Gain` and `fm-audio::Balance` and constructs both Master
 mixer copies with the target gain, balance, and delay applied immediately.
-Protocol 2.8 carries authoritative input IDs and canonical names plus full-strip
+Protocol 2.9 carries authoritative input IDs and canonical names plus full-strip
 status in snapshots, and durable events carry full-strip state plus one
 permission-gated atomic live strip command. The engine schedules
 accepted gain, balance, mute, solo, follow-video, and delay changes together at a frame boundary, and
@@ -241,18 +241,18 @@ channel layout is enforced across pages and must map by matching labels to
 Master; there is no channel conversion.
 
 Scene inputs recursively route audio through explicit `audio_source` links to a
-physical leaf or explicit silence. Cut keeps one source at unity; Fade and Wipe
+physical leaf or explicit silence. Cut keeps one source at unity; Fade, Wipe, AlphaFade, Slide, and Zoom
 crossfade two sources with sample-linear gains from each interval's explicit
 start/end mix endpoints. Physical terminals render once per interval, but
 distinct logical strips that share one terminal remain independent mixer
 submissions with their own gain/balance/mute/solo/follow-video state and transition
 coefficients. Truly identical logical Program IDs submit once at unity.
-Automatic Fade and held or reversed Fade and Wipe T-bar movement propagate exact
+Automatic Fade and held or reversed Fade, Wipe, AlphaFade, and Slide T-bar movement propagate exact
 endpoints. The manual-transition core is exposed through `EngineCommand` and
 the current protocol, and the current schema preserves exact desired and realized
 manual state across replay-safe daemon restart. The CLI exposes local and remote manual Start, exact integer
 position, Commit, and Cancel commands; its local path restores and saves the
-current engine state. Studio exposes permission-gated manual Fade/Wipe
+current engine state. Studio exposes permission-gated manual Fade/Wipe/AlphaFade/Slide
 controls while Ready. Web now has only a current-contract transport-free semantic
 manual-control model; it still has no browser renderer or network runtime.
 Missing local audio, stills, scene silence, and
@@ -419,12 +419,12 @@ fade-out channels active until their zero-opacity endpoint, and rejects idle
 snapshots while any channel is moving. Every channel also owns a bounded
 64-source FIFO queue and deterministic full-frame, top-left, top-right,
 bottom-left, and bottom-right position presets plus none/thin-white/thick-white
-inset-border presets. Schema 16 persists the complete desired and realized
+inset-border presets. Schema 17 persists the complete desired and realized
 arrays, appearance, queue state, and exact per-input audio strips, and accepts schema
-16 only. Protocol 2.8 carries canonical input names, opacity, transition kind,
+17 only. Protocol 2.9 carries canonical input names, opacity, transition kind,
 duration, Take, Update,
 Off, output inclusion, transition/appearance configuration, Queue, Take Next,
-and atomic per-input audio-strip commands and state, and accepts protocol 2.8 only.
+and atomic per-input audio-strip commands and state, and accepts protocol 2.9 only.
 
 Control authorization treats overlay mutations as transition operations. The
 client/UI reducer validates exactly eight unique channels, active-source
@@ -459,14 +459,14 @@ output, allocation-free steady-state processing, and explicit reset. The
 reference `MasterMixer` now gives every logical strip independent raw-planar
 delay history before channel mapping and gains, advances that history with
 submitted PCM or silence on every successful Master interval, and bounds total
-retained history per mixer. Schema 16 gives every persisted input strip exact
+retained history per mixer. Schema 17 gives every persisted input strip exact
 bounded gain, stereo balance, mute, solo, follow-video, and 0–48,000-sample delay
 values and rejects missing, wrong-typed, or out-of-range fields.
 Native project compilation carries that value into physical and scene-alias
 strips, and native Master/Stinger preflight applies it transactionally to both
 active and pending mixers before gain, balance, mute, solo, follow-video, and source envelopes.
 The engine owns the live desired full-strip map and emits frame-boundary
-realization updates. Protocol 2.8 snapshots pair every input ID with its
+realization updates. Protocol 2.9 snapshots pair every input ID with its
 canonical persisted name and replicate the complete strip map; its
 `SetInputAudioStrip` command atomically carries gain, balance, mute, solo,
 follow-video, and delay and is authorized by the dedicated audio-control
@@ -682,11 +682,11 @@ terminal history, collision-triggered authoritative resync, and Studio's sticky
 terminal-uncertainty ledger cover ambiguous replay receipts. `freemix-web`
 declares only the current protocol in its client configuration. Its transport-free
 semantic presentation model preserves permission- and protocol-gated
-Cut/Fade/Wipe and adds manual Fade/Wipe Start, exact basis-point Position,
+Cut/Fade/Wipe and adds manual Fade/Wipe/AlphaFade/Slide Start, exact basis-point Position,
 Commit, and Cancel controls derived from separate authoritative desired and
 realized projections. No browser renderer or network runtime exists.
 
-The T-bar control core supports Fade and Wipe through `fm-switcher`,
+The T-bar control core supports Fade, Wipe, AlphaFade, and Slide through `fm-switcher`,
 `EngineCommand`, `fm-control`, and the current protocol with exact held,
 reversed, committed, and cancelled progress. The current schema persists
 distinct desired and realized manual state, and daemon process tests cover
@@ -779,6 +779,17 @@ macOS/Metal process acceptance now sends
 protocol Slide through a real configured Program recorder, decodes stable
 white, a Slide-specific white-left/black-right intermediate frame, then stable
 black, and verifies the settled persisted routing.
+
+Manual Slide now uses the existing T-bar contract and the existing Slide
+compositor. Exact held, forward, reversed, cancelled, committed, and restored
+basis-point intervals flow through the switcher, engine, persistence, protocol,
+durable control/client projections, local and remote CLI, Studio, and the Web
+semantic model. The daemon maps those intervals to the existing Slide video
+plan and sample-linear two-source audio crossfade. Focused non-native unit and
+process tests cover authority, projection, checkpoint restart, and terminal
+actions. This is control/runtime evidence only. It does not add a browser
+transport or renderer, and it does not certify fullscreen, hardware, or
+cross-platform output. Phase 3 item 5 and `SW-002`/`SW-004` remain planned.
 
 Centered Zoom rendering groundwork now overlays Preview on Program with
 independently floored extents
@@ -1029,7 +1040,7 @@ must contain the corresponding ordered Program/Preview blend sequence, and the
 checkpoint must be inactive with committed routing. Together these exercise
 both halves of `SW-004` on one macOS recording output. Fullscreen presentation,
 Windows/Linux adapters, and complete profile acceptance remain absent, so Phase
-3 item 5 and `SW-004` remain planned.
+3 item 5 and `SW-002`/`SW-004` remain planned.
 
 Exit: `P0` switcher, composition, audio, display, record, and control rows pass.
 

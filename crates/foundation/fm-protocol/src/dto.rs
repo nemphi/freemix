@@ -275,6 +275,7 @@ pub enum ManualTransitionKind {
     Fade,
     Wipe,
     AlphaFade,
+    Slide,
 }
 
 /// Exact normalized manual-transition position expressed in basis points.

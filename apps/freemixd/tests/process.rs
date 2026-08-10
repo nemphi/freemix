@@ -933,6 +933,125 @@ fn manual_alpha_fade_state_and_receipts_survive_restart_through_commit_and_cance
 }
 
 #[test]
+fn manual_slide_state_survives_restart_through_commit_and_cancel() {
+    for (name, terminal, swaps_routes) in [
+        (
+            "manual-slide-commit-restart",
+            CommandPayload::CommitManualTransition,
+            true,
+        ),
+        (
+            "manual-slide-cancel-restart",
+            CommandPayload::CancelManualTransition,
+            false,
+        ),
+    ] {
+        let directory = TestDirectory::new(name);
+        let project_path = directory.project_path();
+        create_project(&project_path);
+
+        let daemon = Daemon::start(&project_path);
+        let mut client = daemon.connect();
+        client.handshake_version(CURRENT_PROTOCOL_VERSION, None);
+        assert!(matches!(client.receive(), WireMessage::Snapshot(_)));
+        for (id, key, payload, revision) in [
+            (
+                "manual-slide-start",
+                "manual-slide-start-key",
+                CommandPayload::StartManualTransition {
+                    kind: ManualTransitionKind::Slide,
+                },
+                1,
+            ),
+            (
+                "manual-slide-position",
+                "manual-slide-position-key",
+                CommandPayload::SetManualTransitionPosition {
+                    position: ManualTransitionPosition::new(6_250).unwrap(),
+                },
+                2,
+            ),
+        ] {
+            client.send(&command_version(CURRENT_PROTOCOL_VERSION, id, key, payload));
+            assert!(matches!(
+                client.next_result(),
+                CommandResult::Accepted {
+                    revision: accepted,
+                    ..
+                } if accepted == revision
+            ));
+        }
+        drop(client);
+        daemon.wait_success();
+
+        let store = ProjectStore::new(&project_path).unwrap();
+        let checkpoint = store.load().unwrap();
+        let manual = checkpoint.runtime_manual_transitions();
+        assert!(matches!(
+            (manual.desired, manual.realized),
+            (Some(desired), Some(realized))
+                if desired.kind == PersistedManualTransitionKind::Slide
+                    && desired.interval_start_basis_points == 0
+                    && desired.position_basis_points == 6_250
+                    && realized.kind == PersistedManualTransitionKind::Slide
+                    && realized.interval_start_basis_points == 6_250
+                    && realized.position_basis_points == 6_250
+        ));
+
+        let daemon = Daemon::start(&project_path);
+        let mut client = daemon.connect();
+        let hello = client.handshake_version(CURRENT_PROTOCOL_VERSION, None);
+        assert_eq!(hello.current_revision, 2);
+        let WireMessage::Snapshot(snapshot) = client.receive() else {
+            panic!("restart must return a snapshot");
+        };
+        assert!(matches!(
+            (
+                snapshot.desired_manual_transition,
+                snapshot.realized_manual_transition,
+            ),
+            (
+                ManualTransitionStatus::Active(desired),
+                ManualTransitionStatus::Active(realized),
+            ) if desired.kind == ManualTransitionKind::Slide
+                && desired.interval_start == ManualTransitionPosition::START
+                && desired.position.basis_points() == 6_250
+                && realized.kind == ManualTransitionKind::Slide
+                && realized.interval_start.basis_points() == 6_250
+                && realized.position.basis_points() == 6_250
+        ));
+        client.send(&command_version(
+            CURRENT_PROTOCOL_VERSION,
+            "manual-slide-terminal",
+            "manual-slide-terminal-key",
+            terminal,
+        ));
+        assert!(matches!(
+            client.next_result(),
+            CommandResult::Accepted { revision: 3, .. }
+        ));
+        drop(client);
+        daemon.wait_success();
+
+        let final_state = store.load().unwrap();
+        assert_eq!(
+            final_state.runtime_manual_transitions(),
+            fm_persistence::RuntimeManualTransitions::default()
+        );
+        let routing = final_state.runtime_routing();
+        let expected = if swaps_routes {
+            (domain_input(2), domain_input(1))
+        } else {
+            (domain_input(1), domain_input(2))
+        };
+        assert_eq!(routing.desired_program_id, Some(expected.0));
+        assert_eq!(routing.realized_program_id, Some(expected.0));
+        assert_eq!(routing.desired_preview_id, Some(expected.1));
+        assert_eq!(routing.realized_preview_id, Some(expected.1));
+    }
+}
+
+#[test]
 fn non_current_handshake_returns_protocol_mismatch() {
     let directory = TestDirectory::new("protocol-mismatch");
     let project_path = directory.project_path();

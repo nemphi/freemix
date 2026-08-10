@@ -7,12 +7,13 @@ use fm_protocol::{
     EngineIdentity, ErrorMessage, EventCursor, EventMessage, EventPayload, FadeToBlackPosition,
     FadeToBlackState, FieldIssue, HandshakeOutcome, HeartbeatMessage, InputAudioStripStatus,
     InputStatus, LineDecoder, MAX_FIELD_VALUE_BYTES, MAX_FIELDS_PER_MESSAGE, MAX_LINE_BYTES,
-    MAX_LIST_ITEMS, MAX_MESSAGES_PER_PUSH, ManualTransitionStatus, OverlayStatus,
-    OverlayTransitionKind, ResumeCursor, RuntimeDomainBoundary, RuntimeEventMessage,
-    RuntimeFailureDisposition, RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage,
-    SnapshotReason, StingerAudioPolicy, StingerMissingMediaFallback, StingerReadiness,
-    StingerStatus, StructuredError, WireInputId, WireMessage, WireOutputId, WireOverlayChannelId,
-    WireStingerSlotId, choose_handshake_outcome, decode_line, encode_line,
+    MAX_LIST_ITEMS, MAX_MESSAGES_PER_PUSH, ManualTransitionKind, ManualTransitionPosition,
+    ManualTransitionState, ManualTransitionStatus, OverlayStatus, OverlayTransitionKind,
+    ResumeCursor, RuntimeDomainBoundary, RuntimeEventMessage, RuntimeFailureDisposition,
+    RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage, SnapshotReason, StingerAudioPolicy,
+    StingerMissingMediaFallback, StingerReadiness, StingerStatus, StructuredError, WireInputId,
+    WireMessage, WireOutputId, WireOverlayChannelId, WireStingerSlotId, choose_handshake_outcome,
+    decode_line, encode_line,
 };
 
 fn input(value: u128) -> WireInputId {
@@ -457,6 +458,43 @@ fn decoder_rejects_out_of_range_manual_position() {
             ..
         })
     ));
+}
+
+#[test]
+fn manual_slide_codec_preserves_exact_current_kind_and_interval() {
+    let start = WireMessage::Command(CommandMessage {
+        payload: CommandPayload::StartManualTransition {
+            kind: ManualTransitionKind::Slide,
+        },
+        ..command()
+    });
+    let encoded = encode_line(&start).unwrap();
+    assert!(encoded.contains("transition=slide"));
+    assert_eq!(decode_line(&encoded).unwrap(), start);
+
+    let status = ManualTransitionStatus::Active(ManualTransitionState {
+        kind: ManualTransitionKind::Slide,
+        from: input(1),
+        to: input(2),
+        interval_start: ManualTransitionPosition::new(8_000).unwrap(),
+        position: ManualTransitionPosition::new(2_500).unwrap(),
+    });
+    let event = WireMessage::Event(EventMessage {
+        cursor: cursor(),
+        payload: EventPayload::DesiredSwitcher {
+            program: input(1),
+            preview: input(2),
+            manual_transition: status,
+            fade_to_black: FadeToBlackState {
+                target_active: false,
+                position: FadeToBlackPosition::LIVE,
+            },
+            overlays: OverlayStatus::empty_channels(),
+            input_audio_strips: input_audio_strips(&[1, 2]),
+        },
+    });
+    let encoded = encode_line(&event).unwrap();
+    assert_eq!(decode_line(&encoded).unwrap(), event);
 }
 
 #[test]

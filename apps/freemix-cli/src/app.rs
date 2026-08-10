@@ -1313,7 +1313,8 @@ fn persisted_t_bar(state: TBarState) -> PersistedManualTransitionState {
         TransitionKind::Fade => PersistedManualTransitionKind::Fade,
         TransitionKind::Wipe => PersistedManualTransitionKind::Wipe,
         TransitionKind::AlphaFade => PersistedManualTransitionKind::AlphaFade,
-        _ => unreachable!("engine manual transitions are Fade, Wipe, or AlphaFade"),
+        TransitionKind::Slide => PersistedManualTransitionKind::Slide,
+        _ => unreachable!("engine manual transitions are Fade, Wipe, AlphaFade, or Slide"),
     };
     PersistedManualTransitionState::new(
         kind,
@@ -1330,6 +1331,7 @@ fn restored_t_bar(state: PersistedManualTransitionState) -> AppResult<TBarState>
         PersistedManualTransitionKind::Fade => TransitionKind::Fade,
         PersistedManualTransitionKind::Wipe => TransitionKind::Wipe,
         PersistedManualTransitionKind::AlphaFade => TransitionKind::AlphaFade,
+        PersistedManualTransitionKind::Slide => TransitionKind::Slide,
     };
     let interval_start = TBarPosition::new(state.interval_start_basis_points)
         .ok_or_else(|| AppFailure("invalid persisted manual-transition interval start".into()))?;
@@ -1559,7 +1561,10 @@ fn format_t_bar(state: Option<TBarState>) -> String {
                     TransitionKind::Fade => "fade",
                     TransitionKind::Wipe => "wipe",
                     TransitionKind::AlphaFade => "alpha_fade",
-                    _ => unreachable!("engine manual transitions are fade, wipe, or AlphaFade"),
+                    TransitionKind::Slide => "slide",
+                    _ => unreachable!(
+                        "engine manual transitions are Fade, Wipe, AlphaFade, or Slide"
+                    ),
                 },
                 state.from(),
                 state.to(),
@@ -1596,7 +1601,7 @@ Usage:
   freemix-cli overlay-queue <show.freemix> <channel:1..=8> <source-input> [--key <key>] [--expect <revision>]
   freemix-cli overlay-next <show.freemix> <channel:1..=8> [--key <key>] [--expect <revision>]
   freemix-cli wipe <show.freemix> <frames> [--key <key>] [--expect <revision>]
-  freemix-cli tbar-start <show.freemix> <fade|wipe|alpha-fade> [--key <key>] [--expect <revision>]
+  freemix-cli tbar-start <show.freemix> <fade|wipe|alpha-fade|slide> [--key <key>] [--expect <revision>]
   freemix-cli tbar-position <show.freemix> <basis-points:0..=10000> [--key <key>] [--expect <revision>]
   freemix-cli tbar-commit <show.freemix> [--key <key>] [--expect <revision>]
   freemix-cli tbar-cancel <show.freemix> [--key <key>] [--expect <revision>]
@@ -1619,7 +1624,7 @@ Usage:
   freemix-cli remote-overlay-queue <127.0.0.1:port> <channel:1..=8> <source-input> [--key <key>] [--expect <revision>]
   freemix-cli remote-overlay-next <127.0.0.1:port> <channel:1..=8> [--key <key>] [--expect <revision>]
   freemix-cli remote-wipe <127.0.0.1:port> <frames> [--key <key>] [--expect <revision>]
-  freemix-cli remote-tbar-start <127.0.0.1:port> <fade|wipe|alpha-fade> [--key <key>] [--expect <revision>]
+  freemix-cli remote-tbar-start <127.0.0.1:port> <fade|wipe|alpha-fade|slide> [--key <key>] [--expect <revision>]
   freemix-cli remote-tbar-position <127.0.0.1:port> <basis-points:0..=10000> [--key <key>] [--expect <revision>]
   freemix-cli remote-tbar-commit <127.0.0.1:port> [--key <key>] [--expect <revision>]
   freemix-cli remote-tbar-cancel <127.0.0.1:port> [--key <key>] [--expect <revision>]
@@ -1634,6 +1639,7 @@ const fn engine_manual_kind(kind: ManualTransitionKind) -> EngineManualTransitio
         ManualTransitionKind::Fade => EngineManualTransitionKind::Fade,
         ManualTransitionKind::Wipe => EngineManualTransitionKind::Wipe,
         ManualTransitionKind::AlphaFade => EngineManualTransitionKind::AlphaFade,
+        ManualTransitionKind::Slide => EngineManualTransitionKind::Slide,
     }
 }
 
@@ -1742,6 +1748,7 @@ const fn protocol_manual_kind(kind: ManualTransitionKind) -> fm_protocol::Manual
         ManualTransitionKind::Fade => fm_protocol::ManualTransitionKind::Fade,
         ManualTransitionKind::Wipe => fm_protocol::ManualTransitionKind::Wipe,
         ManualTransitionKind::AlphaFade => fm_protocol::ManualTransitionKind::AlphaFade,
+        ManualTransitionKind::Slide => fm_protocol::ManualTransitionKind::Slide,
     }
 }
 

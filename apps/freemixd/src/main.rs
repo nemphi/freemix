@@ -4634,7 +4634,8 @@ fn persisted_t_bar(state: TBarState) -> PersistedManualTransitionState {
         TransitionKind::Fade => PersistedManualTransitionKind::Fade,
         TransitionKind::Wipe => PersistedManualTransitionKind::Wipe,
         TransitionKind::AlphaFade => PersistedManualTransitionKind::AlphaFade,
-        _ => unreachable!("engine manual transitions are Fade, Wipe, or AlphaFade"),
+        TransitionKind::Slide => PersistedManualTransitionKind::Slide,
+        _ => unreachable!("engine manual transitions are Fade, Wipe, AlphaFade, or Slide"),
     };
     PersistedManualTransitionState::new(
         kind,
@@ -4651,6 +4652,7 @@ fn restored_t_bar(state: PersistedManualTransitionState) -> AppResult<TBarState>
         PersistedManualTransitionKind::Fade => TransitionKind::Fade,
         PersistedManualTransitionKind::Wipe => TransitionKind::Wipe,
         PersistedManualTransitionKind::AlphaFade => TransitionKind::AlphaFade,
+        PersistedManualTransitionKind::Slide => TransitionKind::Slide,
     };
     let interval_start = TBarPosition::new(state.interval_start_basis_points)
         .ok_or_else(|| AppFailure("invalid persisted manual-transition interval start".into()))?;

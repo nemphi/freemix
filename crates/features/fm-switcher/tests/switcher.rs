@@ -285,9 +285,70 @@ fn alpha_fade_t_bar_preserves_kind_through_hold_restore_and_commit() {
 }
 
 #[test]
+fn slide_t_bar_holds_reverses_restores_commits_and_cancels() {
+    let mut switcher = state();
+    switcher
+        .apply(SwitcherCommand::StartTBar {
+            kind: TransitionKind::Slide,
+        })
+        .unwrap();
+    switcher
+        .apply(SwitcherCommand::SetTBarPosition(
+            TBarPosition::new(8_000).unwrap(),
+        ))
+        .unwrap();
+    assert_eq!(
+        (
+            switcher.program_frame().transition_kind,
+            switcher.program_frame().mix_start_numerator,
+            switcher.program_frame().mix_end_numerator,
+        ),
+        (Some(TransitionKind::Slide), 0, 8_000)
+    );
+    assert!(switcher.advance_frame_events().is_empty());
+    switcher
+        .apply(SwitcherCommand::SetTBarPosition(
+            TBarPosition::new(2_500).unwrap(),
+        ))
+        .unwrap();
+    assert_eq!(
+        (
+            switcher.program_frame().mix_start_numerator,
+            switcher.program_frame().mix_end_numerator,
+        ),
+        (8_000, 2_500)
+    );
+    assert!(switcher.advance_frame_events().is_empty());
+
+    let mut restored = state();
+    restored.restore_t_bar(switcher.t_bar().unwrap()).unwrap();
+    assert_eq!(
+        (
+            restored.program_frame().transition_kind,
+            restored.program_frame().mix_start_numerator,
+            restored.program_frame().mix_end_numerator,
+        ),
+        (Some(TransitionKind::Slide), 2_500, 2_500)
+    );
+    restored.apply(SwitcherCommand::CommitTBar).unwrap();
+    assert_eq!(restored.program(), input(2));
+
+    restored
+        .apply(SwitcherCommand::StartTBar {
+            kind: TransitionKind::Slide,
+        })
+        .unwrap();
+    restored
+        .apply(SwitcherCommand::SetTBarPosition(TBarPosition::END))
+        .unwrap();
+    restored.apply(SwitcherCommand::CancelTBar).unwrap();
+    assert_eq!(restored.program(), input(2));
+    assert!(restored.t_bar().is_none());
+}
+
+#[test]
 fn manual_transition_rejects_every_unsupported_kind_without_mutation() {
     let unsupported = [
-        TransitionKind::Slide,
         TransitionKind::Zoom,
         TransitionKind::Stinger(StingerSlotId::new(1).unwrap()),
     ];

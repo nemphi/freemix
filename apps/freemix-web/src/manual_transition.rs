@@ -11,6 +11,7 @@ pub enum ManualTransitionControl {
     StartFade,
     StartWipe,
     StartAlphaFade,
+    StartSlide,
     Position(ManualTransitionPosition),
     Commit,
     Cancel,
@@ -24,6 +25,7 @@ impl ManualTransitionControl {
             Self::StartFade => "Start manual Fade transition",
             Self::StartWipe => "Start manual Wipe transition",
             Self::StartAlphaFade => "Start manual AlphaFade transition",
+            Self::StartSlide => "Start manual Slide transition",
             Self::Position(_) => "Manual transition position in basis points",
             Self::Commit => "Commit manual transition",
             Self::Cancel => "Cancel manual transition",
@@ -95,7 +97,7 @@ impl ManualTransitionProjection {
     }
 }
 
-/// Transport-free semantic model for manual Fade/Wipe/AlphaFade controls and presentation.
+/// Transport-free semantic model for manual Fade/Wipe/AlphaFade/Slide controls and presentation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ManualTransitionModel {
     desired: ManualTransitionProjection,
@@ -198,6 +200,9 @@ impl ManualTransitionModel {
             },
             ManualTransitionControl::StartAlphaFade => CommandPayload::StartManualTransition {
                 kind: ManualTransitionKind::AlphaFade,
+            },
+            ManualTransitionControl::StartSlide => CommandPayload::StartManualTransition {
+                kind: ManualTransitionKind::Slide,
             },
             ManualTransitionControl::Position(position) => {
                 CommandPayload::SetManualTransitionPosition { position }

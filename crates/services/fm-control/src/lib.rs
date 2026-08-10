@@ -1183,6 +1183,7 @@ fn engine_command(payload: CommandPayload) -> EngineCommand {
                 ManualTransitionKind::Fade => EngineManualTransitionKind::Fade,
                 ManualTransitionKind::Wipe => EngineManualTransitionKind::Wipe,
                 ManualTransitionKind::AlphaFade => EngineManualTransitionKind::AlphaFade,
+                ManualTransitionKind::Slide => EngineManualTransitionKind::Slide,
             },
         },
         CommandPayload::SetManualTransitionPosition { position } => {
@@ -1570,6 +1571,7 @@ fn protocol_manual_status(state: Option<EngineManualTransitionState>) -> ManualT
         EngineManualTransitionKind::Fade => ManualTransitionKind::Fade,
         EngineManualTransitionKind::Wipe => ManualTransitionKind::Wipe,
         EngineManualTransitionKind::AlphaFade => ManualTransitionKind::AlphaFade,
+        EngineManualTransitionKind::Slide => ManualTransitionKind::Slide,
     };
     ManualTransitionStatus::Active(ManualTransitionState {
         kind,

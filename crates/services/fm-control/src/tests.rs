@@ -397,6 +397,50 @@ fn manual_alpha_fade_projects_exact_authoritative_state() {
     );
 }
 
+#[test]
+fn manual_slide_projects_exact_authoritative_state() {
+    let mut control = service(8, 8);
+    for (id, payload) in [
+        (
+            "manual-slide-start",
+            CommandPayload::StartManualTransition {
+                kind: ManualTransitionKind::Slide,
+            },
+        ),
+        (
+            "manual-slide-position",
+            CommandPayload::SetManualTransitionPosition {
+                position: ManualTransitionPosition::new(6_250).unwrap(),
+            },
+        ),
+    ] {
+        let submitted = control
+            .submit(&principal(Role::Operator), command(id, id, payload), 0)
+            .unwrap();
+        assert!(matches!(
+            submitted.output.result,
+            CommandResult::Accepted { .. }
+        ));
+        control.tick(&server_identity()).unwrap();
+    }
+
+    for status in [
+        control.snapshot().snapshot.desired_manual_transition,
+        control.snapshot().snapshot.realized_manual_transition,
+    ] {
+        assert!(matches!(
+            status,
+            ManualTransitionStatus::Active(state)
+                if state.kind == ManualTransitionKind::Slide
+                    && state.position.basis_points() == 6_250
+        ));
+    }
+    assert_eq!(
+        control.engine.realized_manual_transition().unwrap().kind,
+        EngineManualTransitionKind::Slide
+    );
+}
+
 fn assert_manual_snapshot(control: &ControlService<Policy>, position: u16) {
     let desired = control.snapshot().snapshot.desired_manual_transition;
     let realized = control.snapshot().snapshot.realized_manual_transition;

@@ -218,6 +218,7 @@ fn write_manual_transition(output: &mut String, transition: Option<ManualTransit
         ManualTransitionKind::Fade => "fade",
         ManualTransitionKind::Wipe => "wipe",
         ManualTransitionKind::AlphaFade => "alpha_fade",
+        ManualTransitionKind::Slide => "slide",
     };
     write!(
         output,

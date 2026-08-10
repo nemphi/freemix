@@ -217,7 +217,7 @@ fn round_trip_preserves_exact_desired_and_realized_manual_transition_state() {
     let base = project("Manual", 11);
     let routing = base.runtime_routing();
     let desired = ManualTransitionState::new(
-        ManualTransitionKind::AlphaFade,
+        ManualTransitionKind::Slide,
         routing.desired_program_id.unwrap(),
         routing.desired_preview_id.unwrap(),
         0,
@@ -225,7 +225,7 @@ fn round_trip_preserves_exact_desired_and_realized_manual_transition_state() {
     )
     .unwrap();
     let realized = ManualTransitionState::new(
-        ManualTransitionKind::AlphaFade,
+        ManualTransitionKind::Slide,
         routing.realized_program_id.unwrap(),
         routing.realized_preview_id.unwrap(),
         6_250,
@@ -248,7 +248,7 @@ fn round_trip_preserves_exact_desired_and_realized_manual_transition_state() {
 
     assert_eq!(store.load().unwrap(), expected);
     let encoded = fs::read_to_string(store.manifest_path()).unwrap();
-    assert!(encoded.contains("\"kind\": \"alpha_fade\""));
+    assert!(encoded.contains("\"kind\": \"slide\""));
     assert!(encoded.contains("\"interval_start_basis_points\": 6250"));
     assert!(encoded.contains("\"position_basis_points\": 6250"));
 }

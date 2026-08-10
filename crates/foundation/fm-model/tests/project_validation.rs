@@ -246,7 +246,7 @@ fn duplicate_routes_are_rejected() {
 
 #[test]
 fn project_uses_the_current_schema_contract() {
-    assert_eq!(CURRENT_SCHEMA_VERSION, SchemaVersion::new(16));
+    assert_eq!(CURRENT_SCHEMA_VERSION, SchemaVersion::new(17));
     assert_eq!(valid_project().schema_version(), CURRENT_SCHEMA_VERSION);
 }
 

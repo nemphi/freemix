@@ -90,9 +90,23 @@ impl FakeRemoteServer {
     }
 
     fn start_manual_alpha_fade() -> Self {
+        Self::start_manual(
+            fm_protocol::ManualTransitionKind::AlphaFade,
+            "remote-manual-alpha",
+        )
+    }
+
+    fn start_manual_slide() -> Self {
+        Self::start_manual(
+            fm_protocol::ManualTransitionKind::Slide,
+            "remote-manual-slide",
+        )
+    }
+
+    fn start_manual(kind: fm_protocol::ManualTransitionKind, key: &'static str) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
-        let worker = thread::spawn(move || serve_manual_alpha_fade(&listener));
+        let worker = thread::spawn(move || serve_manual_start(&listener, kind, key));
         Self { address, worker }
     }
 
@@ -513,7 +527,11 @@ fn serve_automatic_transition(
     );
 }
 
-fn serve_manual_alpha_fade(listener: &TcpListener) {
+fn serve_manual_start(
+    listener: &TcpListener,
+    kind: fm_protocol::ManualTransitionKind,
+    expected_key: &str,
+) {
     let engine = EngineIdentity {
         engine_id: "project-42".into(),
         state_epoch: 1,
@@ -532,16 +550,14 @@ fn serve_manual_alpha_fade(listener: &TcpListener) {
     );
 
     let WireMessage::Command(command) = read_message(&mut reader) else {
-        panic!("expected remote manual AlphaFade command");
+        panic!("expected remote manual transition command");
     };
     assert_eq!(command.protocol, fm_protocol::CURRENT_PROTOCOL_VERSION);
     assert_eq!(
         command.payload,
-        CommandPayload::StartManualTransition {
-            kind: fm_protocol::ManualTransitionKind::AlphaFade,
-        }
+        CommandPayload::StartManualTransition { kind }
     );
-    assert_eq!(command.idempotency_key, "remote-manual-alpha");
+    assert_eq!(command.idempotency_key, expected_key);
     assert_eq!(command.expected_revision, Some(0));
     write_message(
         &mut writer,
@@ -553,7 +569,7 @@ fn serve_manual_alpha_fade(listener: &TcpListener) {
     );
     let manual_transition =
         fm_protocol::ManualTransitionStatus::Active(fm_protocol::ManualTransitionState {
-            kind: fm_protocol::ManualTransitionKind::AlphaFade,
+            kind,
             from: input(1),
             to: input(2),
             interval_start: fm_protocol::ManualTransitionPosition::START,
@@ -1030,6 +1046,23 @@ fn remote_manual_alpha_fade_preserves_kind_protocol_and_replicated_state() {
     assert!(
         stdout(&output).contains("TBar(desired=alpha_fade:1->2@0, realized=alpha_fade:1->2@0)")
     );
+    server.finish();
+}
+
+#[test]
+fn remote_manual_slide_preserves_kind_protocol_and_replicated_state() {
+    let server = FakeRemoteServer::start_manual_slide();
+    let output = invoke(&[
+        "remote-tbar-start",
+        &server.address(),
+        "slide",
+        "--key",
+        "remote-manual-slide",
+        "--expect",
+        "0",
+    ]);
+    assert_success(&output);
+    assert!(stdout(&output).contains("TBar(desired=slide:1->2@0, realized=slide:1->2@0)"));
     server.finish();
 }
 
@@ -1628,6 +1661,48 @@ fn local_manual_alpha_fade_survives_restart_and_replays_idempotently() {
     assert_success(&repeated);
     assert_eq!(stdout(&repeated), positioned_status);
     assert_eq!(manifest(&context.project), positioned_manifest);
+
+    fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
+fn local_manual_slide_survives_restart_with_exact_desired_and_realized_state() {
+    let context = ContractContext::new();
+    assert_success(&invoke(&["new", context.project_path()]));
+
+    let started = invoke(&[
+        "tbar-start",
+        context.project_path(),
+        "slide",
+        "--key",
+        "manual-slide-start",
+        "--expect",
+        "0",
+    ]);
+    assert_success(&started);
+    assert!(stdout(&started).contains("TBar(desired=slide:1->2@0, realized=slide:1->2@0)"));
+
+    let positioned = invoke(&[
+        "tbar-position",
+        context.project_path(),
+        "6250",
+        "--key",
+        "manual-slide-position",
+        "--expect",
+        "1",
+    ]);
+    assert_success(&positioned);
+    assert!(
+        stdout(&positioned).contains("TBar(desired=slide:1->2@6250, realized=slide:1->2@6250)")
+    );
+    assert_eq!(status(&context.project), stdout(&positioned));
+    let stored = manifest(&context.project);
+    assert!(stored.contains(
+        r#""desired": {"kind": "slide", "from_id": 1, "to_id": 2, "interval_start_basis_points": 0, "position_basis_points": 6250}"#
+    ));
+    assert!(stored.contains(
+        r#""realized": {"kind": "slide", "from_id": 1, "to_id": 2, "interval_start_basis_points": 6250, "position_basis_points": 6250}"#
+    ));
 
     fs::remove_dir_all(context.root).unwrap();
 }
