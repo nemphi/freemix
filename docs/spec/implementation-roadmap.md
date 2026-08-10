@@ -1070,6 +1070,16 @@ Exit: `P0` switcher, composition, audio, display, record, and control rows pass.
 10. Run process-kill, disk-full, network impairment, and 24-hour soak. (needs to be in a VM or something else, don't kill my pc)
 11. Publish the first supported hardware/capability matrix.
 
+Current implementation boundary for item 1: the transport-independent
+`fm-io-network` output state machine starts each configured destination on its
+primary endpoint. A retryable primary connection or write failure retains the
+bounded packet queue, keeps the existing retry budget and delay, and selects
+the configured backup endpoint for subsequent attempts. Backup failures do not
+alternate back to the primary, while a manual stop and start selects the
+primary again. Non-retryable failures remain terminal. No socket adapter,
+RTMP/RTMPS or SRT transport, runtime wiring, persistence, output-health UI, or
+live acceptance exists, so item 1 and `OR-005` remain planned.
+
 Exit: a remote-controlled headless production can stream and record
 independently with tested recovery.
 
