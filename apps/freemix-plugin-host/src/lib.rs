@@ -706,7 +706,7 @@ impl std::error::Error for RunError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use std::io::{BufReader, Cursor};
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(ToString::to_string).collect()
@@ -913,7 +913,23 @@ mod tests {
 
     #[test]
     fn control_loop_rejects_oversized_line() {
-        let input = Cursor::new(vec![b'x'; MAX_CONTROL_LINE_BYTES + 1]);
+        let mut accepted = b"shutdown".to_vec();
+        accepted.resize(MAX_CONTROL_LINE_BYTES - 1, b'\r');
+        accepted.push(b'\n');
+        let mut accepted_output = Vec::new();
+        let mut accepted_lifecycle = Lifecycle::new();
+        run_control_loop(
+            BufReader::with_capacity(64, Cursor::new(accepted)),
+            &mut accepted_output,
+            &mut accepted_lifecycle,
+        )
+        .unwrap();
+        assert_eq!(accepted_output, b"shutting-down\n");
+
+        let input = BufReader::with_capacity(
+            64,
+            Cursor::new(vec![b'x'; MAX_CONTROL_LINE_BYTES + 1]),
+        );
         let mut output = Vec::new();
         let mut lifecycle = Lifecycle::new();
 
