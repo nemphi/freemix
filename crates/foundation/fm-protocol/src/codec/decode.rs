@@ -703,14 +703,24 @@ fn decode_overlay_status(
     let included_outputs = if outputs.is_empty() {
         Vec::new()
     } else {
-        outputs
+        let included_outputs = outputs
             .split(',')
             .map(|output| NonZeroU128::new(output.parse().ok()?).map(WireOutputId::new))
             .collect::<Option<Vec<_>>>()
             .ok_or_else(|| CodecError::InvalidField {
                 field,
                 value: entry.to_owned(),
-            })?
+            })?;
+        let mut output_ids = BTreeSet::new();
+        for output in &included_outputs {
+            if !output_ids.insert(output.to_string()) {
+                return Err(CodecError::InvalidField {
+                    field,
+                    value: entry.to_owned(),
+                });
+            }
+        }
+        included_outputs
     };
     Ok(OverlayStatus {
         channel,

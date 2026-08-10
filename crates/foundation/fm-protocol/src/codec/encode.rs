@@ -445,6 +445,15 @@ fn encode_overlays(
             if overlay.queued_sources.len() > 64 {
                 return Err(CodecError::TooManyItems("overlay queue"));
             }
+            let mut included_outputs = BTreeSet::new();
+            for output in &overlay.included_outputs {
+                if !included_outputs.insert(output.to_string()) {
+                    return Err(CodecError::InvalidField {
+                        field,
+                        value: output.to_string(),
+                    });
+                }
+            }
             let outputs = overlay
                 .included_outputs
                 .iter()

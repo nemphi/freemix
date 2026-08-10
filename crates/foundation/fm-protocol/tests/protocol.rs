@@ -316,6 +316,43 @@ fn input_statuses_reject_duplicate_ids() {
 }
 
 #[test]
+fn overlay_included_outputs_reject_duplicates() {
+    let mut duplicate = snapshot(input_statuses(&[(1, "camera"), (2, "slides")]));
+    let WireMessage::Snapshot(snapshot_message) = &mut duplicate else {
+        unreachable!();
+    };
+    snapshot_message.desired_overlays[0].included_outputs =
+        vec![output(7_000_000_001), output(7_000_000_001)];
+    assert!(matches!(
+        encode_line(&duplicate),
+        Err(CodecError::InvalidField {
+            field: "desired_overlays",
+            ..
+        })
+    ));
+
+    let mut valid = snapshot(input_statuses(&[(1, "camera"), (2, "slides")]));
+    let WireMessage::Snapshot(snapshot_message) = &mut valid else {
+        unreachable!();
+    };
+    snapshot_message.desired_overlays[0].included_outputs =
+        vec![output(7_000_000_001), output(7_000_000_002)];
+    let valid = encode_line(&valid).unwrap();
+    let duplicate = valid.replace(
+        "7000000001%2C7000000002",
+        "7000000001%2C7000000001",
+    );
+    assert_ne!(duplicate, valid);
+    assert!(matches!(
+        decode_line(&duplicate),
+        Err(CodecError::InvalidField {
+            field: "desired_overlays",
+            ..
+        })
+    ));
+}
+
+#[test]
 fn input_audio_strip_status_rejects_duplicates_and_out_of_range_controls() {
     let strip_event = |input_audio_strips| {
         WireMessage::Event(EventMessage {
