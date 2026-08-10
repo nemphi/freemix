@@ -805,11 +805,19 @@ impl MeterReadings {
     }
 }
 
+/// Meter readings for one configured input strip.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InputMeterReadings {
+    pub input: InputId,
+    pub meters: MeterReadings,
+}
+
 /// Result of one Master bus render.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MasterOutput {
     pub block: AudioBlock,
     pub meters: MeterReadings,
+    pub input_meters: Vec<InputMeterReadings>,
 }
 
 /// Result of one timed Master bus render using the canonical media block.
@@ -817,6 +825,7 @@ pub struct MasterOutput {
 pub struct TimedMasterOutput {
     pub block: fm_frame::AudioBlock,
     pub meters: MeterReadings,
+    pub input_meters: Vec<InputMeterReadings>,
 }
 
 /// One borrowed planar source for allocation-free Master mixing.
@@ -942,6 +951,49 @@ impl<'a> MixerSubmission<PlanarAudioSource<'a>> for PlanarAudioSource<'a> {
 struct MixedMaster {
     planes: Vec<Vec<f32>>,
     meters: MeterReadings,
+    input_meters: Vec<InputMeterReadings>,
+}
+
+struct RenderMeters {
+    master: MeterReadings,
+    inputs: Vec<InputMeterReadings>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ChannelMeterAccumulator {
+    sample: f32,
+    peak: f32,
+    squares: f64,
+}
+
+impl ChannelMeterAccumulator {
+    fn begin_sample(&mut self) {
+        self.sample = 0.0;
+    }
+
+    fn add(&mut self, contribution: f32) -> bool {
+        self.sample += contribution;
+        self.sample.is_finite()
+    }
+
+    fn end_sample(&mut self) {
+        self.peak = self.peak.max(self.sample.abs());
+        self.squares += f64::from(self.sample) * f64::from(self.sample);
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn finish(self, samples: usize) -> ChannelMeter {
+        if samples == 0 {
+            return ChannelMeter::default();
+        }
+        let sample_count = f64::from(
+            u32::try_from(samples).expect("audio sample count is bounded below u32::MAX"),
+        );
+        ChannelMeter {
+            peak: self.peak,
+            rms: (self.squares / sample_count).sqrt() as f32,
+        }
+    }
 }
 
 /// Deterministic planar float mixer with one Master bus.
@@ -1239,6 +1291,7 @@ impl MasterMixer {
         Ok(MasterOutput {
             block,
             meters: mixed.meters,
+            input_meters: mixed.input_meters,
         })
     }
 
@@ -1335,6 +1388,7 @@ impl MasterMixer {
         Ok(TimedMasterOutput {
             block,
             meters: mixed.meters,
+            input_meters: mixed.input_meters,
         })
     }
 
@@ -1351,7 +1405,8 @@ impl MasterMixer {
             .expect("metering was requested");
         Ok(MixedMaster {
             planes: output,
-            meters,
+            meters: meters.master,
+            input_meters: meters.inputs,
         })
     }
 
@@ -1363,7 +1418,7 @@ impl MasterMixer {
         active_video_inputs: &[InputId],
         output: &mut [Vec<f32>],
         measure_output: bool,
-    ) -> Result<Option<MeterReadings>, AudioError> {
+    ) -> Result<Option<RenderMeters>, AudioError> {
         validate_sample_count(samples)?;
         for (index, submission) in blocks.iter().enumerate() {
             let id = submission.input();
@@ -1416,6 +1471,7 @@ impl MasterMixer {
             plane[..samples].fill(0.0);
         }
         let any_soloed = self.inputs.values().any(|strip| strip.state.soloed);
+        let mut input_meters = measure_output.then(|| Vec::with_capacity(self.inputs.len()));
         for (id, strip) in &self.inputs {
             let block = blocks.iter().find_map(|submission| {
                 (submission.input() == *id).then(|| (submission.block(), submission.source_gain()))
@@ -1425,9 +1481,16 @@ impl MasterMixer {
                 && (!strip.state.follow_video || active_video_inputs.contains(id));
             let mut ramp = strip.ramp;
             let mut balance_ramp = strip.balance_ramp;
+            let mut meter_channels =
+                measure_output.then(|| vec![ChannelMeterAccumulator::default(); channels]);
             if audible {
                 let source_gain = block.map_or(SourceGain::UNITY, |(_, source_gain)| source_gain);
                 for sample in 0..samples {
+                    if let Some(meter_channels) = &mut meter_channels {
+                        for meter in meter_channels.iter_mut() {
+                            meter.begin_sample();
+                        }
+                    }
                     let strip_gain = ramp.next();
                     let balance = balance_ramp.next();
                     let source_gain = source_gain.at_sample(sample, samples);
@@ -1436,8 +1499,9 @@ impl MasterMixer {
                         let delayed = strip.delay.preview_sample(source, sample, input);
                         let balance_gain =
                             balance_gain(balance, self.format.channels.channels()[destination]);
-                        let mapped = output[destination][sample]
-                            + delayed * strip_gain * balance_gain * source_gain * coefficient;
+                        let contribution =
+                            delayed * strip_gain * balance_gain * source_gain * coefficient;
+                        let mapped = output[destination][sample] + contribution;
                         if !mapped.is_finite() {
                             return Err(AudioError::NonFiniteSample {
                                 channel: destination,
@@ -1445,6 +1509,19 @@ impl MasterMixer {
                             });
                         }
                         output[destination][sample] = mapped;
+                        if let Some(meter_channels) = &mut meter_channels
+                            && !meter_channels[destination].add(contribution)
+                        {
+                            return Err(AudioError::NonFiniteSample {
+                                channel: destination,
+                                sample,
+                            });
+                        }
+                    }
+                    if let Some(meter_channels) = &mut meter_channels {
+                        for meter in meter_channels.iter_mut() {
+                            meter.end_sample();
+                        }
                     }
                 }
             } else {
@@ -1452,6 +1529,17 @@ impl MasterMixer {
                     ramp.next();
                     balance_ramp.next();
                 }
+            }
+            if let Some(input_meters) = &mut input_meters {
+                let channels = meter_channels
+                    .expect("input metering was requested")
+                    .into_iter()
+                    .map(|meter| meter.finish(samples))
+                    .collect();
+                input_meters.push(InputMeterReadings {
+                    input: *id,
+                    meters: MeterReadings { channels },
+                });
             }
         }
 
@@ -1463,7 +1551,10 @@ impl MasterMixer {
             }
         }
         validate_finite_sample_prefix(output, samples)?;
-        let meters = measure_output.then(|| measure_plane_prefix(output, samples));
+        let meters = input_meters.map(|inputs| RenderMeters {
+            master: measure_plane_prefix(output, samples),
+            inputs,
+        });
         self.commit_render(samples, blocks);
         Ok(meters)
     }
