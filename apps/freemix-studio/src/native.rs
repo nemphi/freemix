@@ -90,6 +90,36 @@ fn try_enqueue(
     })
 }
 
+fn coalesce_adjacent_intent(tail: &mut StudioIntent, incoming: StudioIntent) -> bool {
+    match (tail, incoming) {
+        (
+            StudioIntent::SetManualTransitionPosition { position: current },
+            StudioIntent::SetManualTransitionPosition { position },
+        ) => {
+            *current = position;
+            true
+        }
+        (
+            StudioIntent::SetInputAudioStrip {
+                input: current_input,
+                update: current_update,
+            },
+            StudioIntent::SetInputAudioStrip { input, update },
+        ) if *current_input == input => {
+            current_update.gain_millidb = update.gain_millidb.or(current_update.gain_millidb);
+            current_update.balance_basis_points = update
+                .balance_basis_points
+                .or(current_update.balance_basis_points);
+            current_update.muted = update.muted.or(current_update.muted);
+            current_update.soloed = update.soloed.or(current_update.soloed);
+            current_update.follow_video = update.follow_video.or(current_update.follow_video);
+            current_update.delay_samples = update.delay_samples.or(current_update.delay_samples);
+            true
+        }
+        _ => false,
+    }
+}
+
 struct PendingIntents {
     intents: VecDeque<StudioIntent>,
 }
@@ -130,12 +160,9 @@ impl PendingIntents {
     }
 
     fn push(&mut self, intent: StudioIntent) -> Result<(), EnqueueError> {
-        if let (
-            Some(StudioIntent::SetManualTransitionPosition { position: current }),
-            StudioIntent::SetManualTransitionPosition { position },
-        ) = (self.intents.back_mut(), intent)
+        if let Some(tail) = self.intents.back_mut()
+            && coalesce_adjacent_intent(tail, intent)
         {
-            *current = position;
             return Ok(());
         }
         if self.intents.len() == REQUEST_CAPACITY {
@@ -428,6 +455,16 @@ impl WorkerRecovery {
         intent: StudioIntent,
         publisher: &StatePublisher,
     ) -> bool {
+        if let Some(tail) = self.deferred_intents.back_mut()
+            && coalesce_adjacent_intent(tail, intent)
+        {
+            return publish_deferred_runtime(
+                runtime,
+                publisher,
+                &self.deferred_intents,
+                self.error(),
+            );
+        }
         if self.deferred_intents.len() == DEFERRED_INTENT_CAPACITY {
             self.deferred_rejections = self.deferred_rejections.saturating_add(1);
             return publish_runtime(runtime, publisher, self.error());
@@ -526,10 +563,15 @@ fn cancellation_requested(
     match requests.try_recv() {
         Ok(WorkerRequest::Shutdown) | Err(TryRecvError::Disconnected) => true,
         Ok(WorkerRequest::Intent(intent)) => {
-            if deferred_intents.len() < DEFERRED_INTENT_CAPACITY {
-                deferred_intents.push_back(intent);
-            } else {
+            if let Some(tail) = deferred_intents.back_mut()
+                && coalesce_adjacent_intent(tail, intent)
+            {
+                return false;
+            }
+            if deferred_intents.len() == DEFERRED_INTENT_CAPACITY {
                 *deferred_rejections = deferred_rejections.saturating_add(1);
+            } else {
+                deferred_intents.push_back(intent);
             }
             false
         }
@@ -1791,6 +1833,67 @@ mod tests {
             receiver.try_recv().unwrap(),
             WorkerRequest::Intent(manual_position(3_000))
         );
+    }
+
+    #[test]
+    fn pending_intents_coalesce_adjacent_audio_updates_without_crossing_boundaries() {
+        let input = WireInputId::new(NonZeroU128::new(2).unwrap()).to_domain();
+        let other_input = WireInputId::new(NonZeroU128::new(3).unwrap()).to_domain();
+        let mut pending = PendingIntents::new();
+        assert_eq!(
+            pending.push(StudioIntent::SetInputAudioStrip {
+                input,
+                update: InputAudioStripUpdate {
+                    muted: Some(true),
+                    ..InputAudioStripUpdate::default()
+                },
+            }),
+            Ok(())
+        );
+        for value in 0..=REQUEST_CAPACITY {
+            assert_eq!(
+                pending.push(StudioIntent::SetInputAudioStrip {
+                    input,
+                    update: InputAudioStripUpdate {
+                        gain_millidb: Some(value as i32),
+                        balance_basis_points: Some(-(value as i32)),
+                        delay_samples: Some(value as u32),
+                        ..InputAudioStripUpdate::default()
+                    },
+                }),
+                Ok(())
+            );
+        }
+        assert_eq!(
+            pending.intents,
+            VecDeque::from([StudioIntent::SetInputAudioStrip {
+                input,
+                update: InputAudioStripUpdate {
+                    gain_millidb: Some(REQUEST_CAPACITY as i32),
+                    balance_basis_points: Some(-(REQUEST_CAPACITY as i32)),
+                    muted: Some(true),
+                    delay_samples: Some(REQUEST_CAPACITY as u32),
+                    ..InputAudioStripUpdate::default()
+                },
+            }])
+        );
+
+        assert_eq!(
+            pending.push(StudioIntent::SetInputAudioStrip {
+                input: other_input,
+                update: InputAudioStripUpdate::default(),
+            }),
+            Ok(())
+        );
+        assert_eq!(pending.push(StudioIntent::Cut), Ok(()));
+        assert_eq!(
+            pending.push(StudioIntent::SetInputAudioStrip {
+                input: other_input,
+                update: InputAudioStripUpdate::default(),
+            }),
+            Ok(())
+        );
+        assert_eq!(pending.intents.len(), 4);
     }
 
     #[test]

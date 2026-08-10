@@ -125,8 +125,10 @@ synchronized state, and Ready lifecycle. The manual panel displays
 replicated desired and realized kind, routing, and exact integer basis-point
 position. Bounded worker channels preserve strict operator FIFO while
 recovering, and later intents cannot overtake unresolved commands. Native Studio
-locally retains bounded unsent intents and coalesces adjacent manual-position
-values while preserving action order. `fm-client` retains a
+locally retains bounded unsent intents and coalesces adjacent manual-position values
+and same-input audio-strip field edits; action and input boundaries preserve order.
+This latest-value rule can suppress intermediate unsent manual or audio effects.
+`fm-client` retains a
 bounded terminal command history (256 by default, configurable through 65,536),
 while replay-receipt collisions mark affected sent commands terminal-uncertain,
 force authoritative snapshot resynchronization, and remain visibly sticky in
@@ -240,8 +242,8 @@ so a muted or video-inactive soloed strip can intentionally produce silence.
 Local and remote CLI commands, Studio controls,
 and the Web semantic control model expose the same bounded mutation. Restart
 restores engine desired state from the canonical strips and checkpoints it back
-to the project. Studio resolves queued field edits against the latest confirmed
-strip before dispatch. Current-contract persistence, generated-audio, AFV
+to the project. Studio resolves coalesced adjacent audio field edits against the latest
+confirmed strip before dispatch. Current-contract persistence, generated-audio, AFV
 selected/inactive, mute, solo, immediate startup gain/balance/delay, live full-strip realization,
 and failed-preflight no-partial-state tests cover this slice.
 
