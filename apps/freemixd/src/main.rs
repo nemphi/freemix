@@ -6452,7 +6452,8 @@ mod tests {
         )
         .unwrap();
         terminated_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert!(reader.read_message_with_idle(|| Ok(false)).unwrap().is_none());
+        let mut eof = [0_u8; 1];
+        assert_eq!(reader.stream.read(&mut eof).unwrap(), 0);
         drop(client);
 
         let next_client = TcpStream::connect(address).unwrap();
