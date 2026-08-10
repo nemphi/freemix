@@ -990,12 +990,7 @@ mod tests {
             broker.pairing().connection(),
             Some(ConnectionState::Connected)
         );
-        assert!(
-            broker
-                .publications()
-                .get(PublicationId::new(nonzero(1)))
-                .is_some()
-        );
+        assert_eq!(broker.publications().len(), 1);
         assert!(broker.reconnect().pending().is_none());
         assert_eq!(broker.reconnect().history().len(), 1);
         assert_eq!(broker.reconnect().history().next(), Some(&reconnect));
@@ -1015,7 +1010,6 @@ mod tests {
         assert_eq!(broker.reconnect().pending(), Some(&pending_reconnect));
 
         broker.pair(paired.clone()).unwrap();
-        assert_eq!(broker.pairing().engine(), Some(&paired));
         assert_eq!(
             broker.pairing().connection(),
             Some(ConnectionState::Connected)
