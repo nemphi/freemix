@@ -3819,11 +3819,17 @@ fn handle_client(
                             received_at_ms,
                         }),
                     )?,
-                    Err(message) => write_error(&mut writer, "invalid_heartbeat", &message)?,
+                    Err(message) => write_session_error(
+                        &mut writer,
+                        &mut session,
+                        "invalid_heartbeat",
+                        &message,
+                    )?,
                 }
             }
-            _ => write_error(
+            _ => write_session_error(
                 &mut writer,
+                &mut session,
                 "unexpected_message",
                 "only command and heartbeat messages are accepted after the handshake",
             )?,
@@ -4884,20 +4890,30 @@ fn write_session_message(
     Ok(())
 }
 
+fn write_session_error(
+    writer: &mut TcpStream,
+    session: &mut Session,
+    code: &str,
+    message: &str,
+) -> AppResult<()> {
+    write_session_message(writer, session, &error_message(code, message))
+}
+
 fn write_error(writer: &mut TcpStream, code: &str, message: &str) -> AppResult<()> {
-    write_message(
-        writer,
-        &WireMessage::Error(ErrorMessage {
-            request_id: None,
-            current_revision: None,
-            error: StructuredError {
-                code: code.into(),
-                message: message.into(),
-                fields: Vec::new(),
-                retryable: false,
-            },
-        }),
-    )
+    write_message(writer, &error_message(code, message))
+}
+
+fn error_message(code: &str, message: &str) -> WireMessage {
+    WireMessage::Error(ErrorMessage {
+        request_id: None,
+        current_revision: None,
+        error: StructuredError {
+            code: code.into(),
+            message: message.into(),
+            fields: Vec::new(),
+            retryable: false,
+        },
+    })
 }
 
 fn write_message(writer: &mut TcpStream, message: &WireMessage) -> AppResult<()> {
@@ -6423,7 +6439,8 @@ mod tests {
         client
             .set_write_timeout(Some(Duration::from_secs(1)))
             .unwrap();
-        let (_, server) = complete_test_handshake(&client);
+        let (mut reader, mut server) = complete_test_handshake(&client);
+        server.project_id = "wrong-project".into();
         write_message(
             &mut client.try_clone().unwrap(),
             &WireMessage::Heartbeat(HeartbeatMessage {
@@ -6435,6 +6452,7 @@ mod tests {
         )
         .unwrap();
         terminated_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(reader.read_message_with_idle(|| Ok(false)).unwrap().is_none());
         drop(client);
 
         let next_client = TcpStream::connect(address).unwrap();
