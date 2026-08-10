@@ -6202,7 +6202,8 @@ mod tests {
         let project_path = directory.path().join("show.freemix");
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
-        let (accepted_tx, accepted_rx) = std::sync::mpsc::sync_channel(1);
+        let (progress_tx, progress_rx) = std::sync::mpsc::sync_channel(1);
+        let accepted_tx = progress_tx.clone();
         let server_thread = thread::spawn(move || {
             let store = ProjectStore::new(project_path).unwrap();
             let mut durable = test_project();
@@ -6226,7 +6227,7 @@ mod tests {
             for client_index in 0..2 {
                 let (stream, _) = listener.accept().unwrap();
                 if client_index == 0 {
-                    accepted_tx.send(()).unwrap();
+                    accepted_tx.send(Instant::now()).unwrap();
                 }
                 handle_client(
                     stream,
@@ -6243,16 +6244,49 @@ mod tests {
             }
         });
 
-        let incomplete_peer = TcpStream::connect(address).unwrap();
-        accepted_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let mut incomplete_peer = TcpStream::connect(address).unwrap();
+        let accepted_at = progress_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let writer_thread = thread::spawn(move || {
+            let deadline = accepted_at.checked_add(HANDSHAKE_TIMEOUT).unwrap();
+            let mut crossed_deadline = false;
+            let mut next_write = accepted_at;
+            loop {
+                if Instant::now() < next_write {
+                    thread::yield_now();
+                    continue;
+                }
+                let result = incomplete_peer.write(b"x");
+                next_write += Duration::from_millis(10);
+                let now = Instant::now();
+                if !crossed_deadline && now >= deadline {
+                    progress_tx.send(now).unwrap();
+                    crossed_deadline = true;
+                }
+                match result {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::BrokenPipe
+                                | std::io::ErrorKind::ConnectionReset
+                        ) =>
+                    {
+                        break;
+                    }
+                    Err(error) => panic!("partial handshake write failed: {error}"),
+                }
+            }
+        });
+        progress_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         let next_peer = TcpStream::connect(address).unwrap();
         next_peer
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
         complete_test_handshake(&next_peer);
 
-        drop(incomplete_peer);
         drop(next_peer);
+        writer_thread.join().unwrap();
         server_thread.join().unwrap();
     }
 
