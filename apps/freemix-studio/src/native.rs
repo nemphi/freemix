@@ -1378,8 +1378,8 @@ mod tests {
     use fm_protocol::{
         CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, EngineIdentity, FadeToBlackPosition,
         FadeToBlackState, HandshakeOutcome, HandshakeResponse, InputAudioStripStatus, InputStatus,
-        ManualTransitionStatus, OverlayStatus, Role, ServerIdentity, SnapshotMessage,
-        SnapshotReason, WireMessage, decode_line, encode_line,
+        HeartbeatAcknowledgementMessage, ManualTransitionStatus, OverlayStatus, Role,
+        ServerIdentity, SnapshotMessage, SnapshotReason, WireMessage, decode_line, encode_line,
     };
     use fm_types::InputId;
 
@@ -1427,13 +1427,22 @@ mod tests {
                 .unwrap();
         }
 
-        fn wait_for_eof(&mut self) {
+        fn acknowledge_heartbeats_until_eof(&mut self) {
             loop {
-                let available = self.reader.fill_buf().unwrap().len();
-                if available == 0 {
+                let mut line = String::new();
+                if self.reader.read_line(&mut line).unwrap() == 0 {
                     return;
                 }
-                self.reader.consume(available);
+                let WireMessage::Heartbeat(heartbeat) = decode_line(&line).unwrap() else {
+                    panic!("expected heartbeat");
+                };
+                self.send(&WireMessage::HeartbeatAcknowledgement(
+                    HeartbeatAcknowledgementMessage {
+                        server: heartbeat.server,
+                        heartbeat_sequence: heartbeat.sequence,
+                        received_at_ms: heartbeat.sent_at_ms,
+                    },
+                ));
             }
         }
     }
@@ -1513,7 +1522,7 @@ mod tests {
             },
         )));
         first.send(&WireMessage::Snapshot(heartbeat_snapshot()));
-        first.wait_for_eof();
+        first.acknowledge_heartbeats_until_eof();
 
         let mut resume = HeartbeatPeer::accept(&listener);
         let cursor = resume
@@ -1523,7 +1532,7 @@ mod tests {
         resume.send(&WireMessage::HandshakeResponse(heartbeat_handshake(
             HandshakeOutcome::Resume { cursor },
         )));
-        resume.wait_for_eof();
+        resume.acknowledge_heartbeats_until_eof();
 
         let mut snapshot = HeartbeatPeer::accept(&listener);
         assert_eq!(snapshot.handshake_request().resume_cursor, None);
@@ -1533,7 +1542,7 @@ mod tests {
             },
         )));
         snapshot.send(&WireMessage::Snapshot(heartbeat_snapshot()));
-        snapshot.wait_for_eof();
+        snapshot.acknowledge_heartbeats_until_eof();
     }
 
     #[cfg(unix)]
