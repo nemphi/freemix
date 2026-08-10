@@ -151,7 +151,7 @@ const CAMERA_RECOVERY_POLICY: CameraRecoveryPolicy = CameraRecoveryPolicy {
     rearm_backoff: Duration::from_secs(10),
     shutdown_timeout: Duration::from_secs(15),
 };
-const NATIVE_CLIENT_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
+const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
 #[cfg(feature = "native-media")]
 const PROGRAM_RECORDER_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(feature = "native-media")]
@@ -3674,6 +3674,12 @@ fn model_audio_strip_state(state: EngineInputAudioStripState) -> InputAudioStrip
     }
 }
 
+fn configure_client_socket(stream: &TcpStream) -> std::io::Result<()> {
+    stream.set_nodelay(true)?;
+    stream.set_read_timeout(Some(CLIENT_READ_POLL_INTERVAL))?;
+    stream.set_write_timeout(Some(CLIENT_WRITE_TIMEOUT))
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn handle_client(
     stream: TcpStream,
@@ -3691,11 +3697,7 @@ fn handle_client(
             server.config().session_limits.heartbeat_timeout_ms,
         ))
         .ok_or_else(|| AppFailure("handshake deadline exceeds Instant range".into()))?;
-    stream.set_nodelay(true)?;
-    stream.set_read_timeout(Some(CLIENT_READ_POLL_INTERVAL))?;
-    if native.is_some() {
-        stream.set_write_timeout(Some(NATIVE_CLIENT_WRITE_TIMEOUT))?;
-    }
+    configure_client_socket(&stream)?;
     let mut writer = stream.try_clone()?;
     let mut reader = MessageReader::new(stream);
     let mut native = native;
@@ -6162,7 +6164,22 @@ mod tests {
     }
 
     #[test]
-    fn native_client_write_timeouts_are_disconnects() {
+    fn client_socket_configuration_sets_read_and_write_timeouts() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let _client = TcpStream::connect(address).unwrap();
+        let (server_stream, _) = listener.accept().unwrap();
+
+        configure_client_socket(&server_stream).unwrap();
+
+        let read_timeout = server_stream.read_timeout().unwrap();
+        let write_timeout = server_stream.write_timeout().unwrap();
+        assert_eq!(read_timeout, Some(CLIENT_READ_POLL_INTERVAL));
+        assert_eq!(write_timeout, Some(CLIENT_WRITE_TIMEOUT));
+    }
+
+    #[test]
+    fn client_write_timeouts_are_disconnects() {
         for kind in [std::io::ErrorKind::TimedOut, std::io::ErrorKind::WouldBlock] {
             let error = client_write_error(std::io::Error::from(kind));
             assert!(is_client_disconnect(error.as_ref()));
