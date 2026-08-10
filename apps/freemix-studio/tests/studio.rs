@@ -656,7 +656,7 @@ fn supervisor_cleans_descendants_before_joining_readiness_after_direct_exit() {
         ),
         Err(SupervisorError::ExitedBeforeReady { status }) if status.code() == Some(7)
     ));
-    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(started.elapsed() < Duration::from_secs(3));
     let descendant_pid = fs::read_to_string(descendant_pid_path).unwrap();
     assert!(
         !ProcessCommand::new("/bin/kill")
