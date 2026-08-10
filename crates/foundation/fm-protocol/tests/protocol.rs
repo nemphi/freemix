@@ -104,6 +104,33 @@ fn command() -> CommandMessage {
     }
 }
 
+fn snapshot(inputs: Vec<InputStatus>) -> WireMessage {
+    WireMessage::Snapshot(SnapshotMessage {
+        engine: identity(),
+        revision: 9,
+        show_name: "My Show\nA".to_owned(),
+        inputs,
+        input_audio_strips: input_audio_strips(&[1, 2]),
+        desired_program: input(2),
+        desired_preview: input(1),
+        realized_program: input(1),
+        realized_preview: input(2),
+        desired_manual_transition: ManualTransitionStatus::Inactive,
+        realized_manual_transition: ManualTransitionStatus::Inactive,
+        desired_fade_to_black: FadeToBlackState {
+            target_active: false,
+            position: FadeToBlackPosition::LIVE,
+        },
+        realized_fade_to_black: FadeToBlackState {
+            target_active: false,
+            position: FadeToBlackPosition::LIVE,
+        },
+        stingers: Vec::new(),
+        desired_overlays: OverlayStatus::empty_channels(),
+        realized_overlays: OverlayStatus::empty_channels(),
+    })
+}
+
 #[test]
 fn protocol_2_10_heartbeat_acknowledgement_codec_is_exact() {
     assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(2, 10));
@@ -240,30 +267,7 @@ fn every_message_variant_round_trips() {
             current_revision: 9,
             retryable: false,
         }),
-        WireMessage::Snapshot(SnapshotMessage {
-            engine: identity(),
-            revision: 9,
-            show_name: "My Show\nA".to_owned(),
-            inputs: input_statuses(&[(1, "Camera, A"), (2, "Slides ~ Main")]),
-            input_audio_strips: input_audio_strips(&[1, 2]),
-            desired_program: input(2),
-            desired_preview: input(1),
-            realized_program: input(1),
-            realized_preview: input(2),
-            desired_manual_transition: ManualTransitionStatus::Inactive,
-            realized_manual_transition: ManualTransitionStatus::Inactive,
-            desired_fade_to_black: FadeToBlackState {
-                target_active: false,
-                position: FadeToBlackPosition::LIVE,
-            },
-            realized_fade_to_black: FadeToBlackState {
-                target_active: false,
-                position: FadeToBlackPosition::LIVE,
-            },
-            stingers: Vec::new(),
-            desired_overlays: OverlayStatus::empty_channels(),
-            realized_overlays: OverlayStatus::empty_channels(),
-        }),
+        snapshot(input_statuses(&[(1, "Camera, A"), (2, "Slides ~ Main")])),
         WireMessage::Event(EventMessage {
             cursor: cursor(),
             payload: EventPayload::DesiredSwitcher {
@@ -283,6 +287,32 @@ fn every_message_variant_round_trips() {
         let encoded = encode_line(&message).unwrap();
         assert_eq!(decode_line(&encoded).unwrap(), message);
     }
+}
+
+#[test]
+fn input_statuses_reject_duplicate_ids() {
+    let duplicate = snapshot(input_statuses(&[(1, "camera"), (1, "slides")]));
+    assert!(matches!(
+        encode_line(&duplicate),
+        Err(CodecError::InvalidField {
+            field: "inputs",
+            ..
+        })
+    ));
+
+    let valid = encode_line(&snapshot(input_statuses(&[(1, "camera"), (2, "slides")])))
+        .unwrap();
+    let duplicate = valid.replace(
+        "inputs=1%7Ecamera%2C2%7Eslides",
+        "inputs=1%7Ecamera%2C1%7Eslides",
+    );
+    assert!(matches!(
+        decode_line(&duplicate),
+        Err(CodecError::InvalidField {
+            field: "inputs",
+            ..
+        })
+    ));
 }
 
 #[test]

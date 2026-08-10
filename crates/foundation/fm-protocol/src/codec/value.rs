@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use crate::{
     ClientType, CodecError, DurableEvent, FieldIssue, InputStatus, ProtocolVersion, Role,
     RuntimeDomainBoundary,
@@ -100,7 +102,7 @@ pub(super) fn parse_string_list(value: &str) -> Result<Vec<String>, CodecError> 
 }
 
 pub(super) fn input_statuses(values: &[InputStatus]) -> Result<String, CodecError> {
-    bounded_join(values, MAX_LIST_ITEMS, "inputs", |input| {
+    let encoded = bounded_join(values, MAX_LIST_ITEMS, "inputs", |input| {
         if input.name.trim().is_empty() {
             return Err(CodecError::InvalidField {
                 field: "inputs",
@@ -108,7 +110,17 @@ pub(super) fn input_statuses(values: &[InputStatus]) -> Result<String, CodecErro
             });
         }
         Ok(format!("{}~{}", input.input, escape_bounded(&input.name)?))
-    })
+    })?;
+    let mut inputs = BTreeSet::new();
+    for input in values {
+        if !inputs.insert(input.input.get()) {
+            return Err(CodecError::InvalidField {
+                field: "inputs",
+                value: input.input.to_string(),
+            });
+        }
+    }
+    Ok(encoded)
 }
 
 pub(super) fn parse_input_statuses(value: &str) -> Result<Vec<InputStatus>, CodecError> {
@@ -119,6 +131,7 @@ pub(super) fn parse_input_statuses(value: &str) -> Result<Vec<InputStatus>, Code
         });
     }
     check_items(value, ',', MAX_LIST_ITEMS, "inputs")?;
+    let mut inputs = BTreeSet::new();
     value
         .split(',')
         .map(|entry| {
@@ -134,11 +147,18 @@ pub(super) fn parse_input_statuses(value: &str) -> Result<Vec<InputStatus>, Code
                     value: value.to_owned(),
                 });
             }
-            Ok(InputStatus {
-                input: crate::WireInputId::new(input.ok_or_else(|| CodecError::InvalidField {
+            let input = crate::WireInputId::new(input.ok_or_else(|| CodecError::InvalidField {
                     field: "inputs",
                     value: value.to_owned(),
-                })?),
+                })?);
+            if !inputs.insert(input.get()) {
+                return Err(CodecError::InvalidField {
+                    field: "inputs",
+                    value: value.to_owned(),
+                });
+            }
+            Ok(InputStatus {
+                input,
                 name,
             })
         })
