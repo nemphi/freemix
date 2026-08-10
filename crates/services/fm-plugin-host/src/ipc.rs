@@ -87,6 +87,10 @@ impl BoundedIpcQueue {
         self.messages.pop_front()
     }
 
+    pub fn front(&self) -> Option<&IpcMessage> {
+        self.messages.front()
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.messages.len()

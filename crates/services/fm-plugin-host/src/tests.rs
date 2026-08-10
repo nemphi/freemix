@@ -21,6 +21,7 @@ impl SignatureVerifier for FakeVerifier {
 struct FakeChildController {
     next_child: ChildId,
     spawn_results: VecDeque<Result<ChildId, ChildError>>,
+    send_results: VecDeque<Result<(), ChildError>>,
     spawned: Vec<(PluginId, ResourceBudget)>,
     sent: Vec<(ChildId, IpcMessage)>,
     terminated: Vec<ChildId>,
@@ -38,6 +39,9 @@ impl ChildController for FakeChildController {
     }
 
     fn send(&mut self, child: ChildId, message: &IpcMessage) -> Result<(), ChildError> {
+        if let Some(result) = self.send_results.pop_front() {
+            result?;
+        }
         self.sent.push((child, message.clone()));
         Ok(())
     }
@@ -340,6 +344,50 @@ fn ipc_queue_is_bounded_and_flushes_fifo_after_ready() {
 
     supervisor.start(plugin_id, 1).unwrap();
     supervisor.poll(2, [ChildEvent::Ready { child: 1 }]);
+    assert_eq!(
+        supervisor
+            .controller()
+            .sent
+            .iter()
+            .map(|(_, message)| message.id)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert_eq!(supervisor.status(plugin_id).unwrap().queued_messages, 0);
+}
+
+#[test]
+fn ipc_send_failure_retains_fifo_for_restart() {
+    let plugin = artifact("ipc-retry", "plugin.ipc-retry");
+    let plugin_id = plugin.manifest.plugin_id();
+    let mut controller = FakeChildController::default();
+    controller
+        .send_results
+        .push_back(Err(ChildError::new("send failed")));
+    let mut supervisor = Supervisor::new(
+        catalog(vec![plugin]),
+        controller,
+        supervisor_policy(),
+        IpcLimits::new(2, 4),
+    )
+    .unwrap();
+
+    supervisor
+        .enqueue(plugin_id, IpcMessage::new(1, b"one".to_vec()), 0)
+        .unwrap();
+    supervisor
+        .enqueue(plugin_id, IpcMessage::new(2, b"two".to_vec()), 0)
+        .unwrap();
+    supervisor.start(plugin_id, 0).unwrap();
+    supervisor.poll(1, [ChildEvent::Ready { child: 1 }]);
+
+    let status = supervisor.status(plugin_id).unwrap();
+    assert_eq!(status.state, InstanceState::Backoff);
+    assert_eq!(status.queued_messages, 2);
+
+    supervisor.poll(11, []);
+    supervisor.poll(12, [ChildEvent::Ready { child: 2 }]);
+
     assert_eq!(
         supervisor
             .controller()

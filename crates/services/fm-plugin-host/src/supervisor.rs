@@ -571,18 +571,23 @@ impl<C: ChildController> Supervisor<C> {
             };
             let Some(message) = self
                 .instances
-                .get_mut(&plugin_key(id))
+                .get(&plugin_key(id))
                 .expect("id was resolved from an instance")
                 .queue
-                .pop()
+                .front()
             else {
                 return;
             };
             let message_id = message.id;
-            if let Err(error) = self.controller.send(child, &message) {
+            if let Err(error) = self.controller.send(child, message) {
                 self.fail(id, now_ms, Failure::IpcFailed(error.reason), true);
                 return;
             }
+            self.instances
+                .get_mut(&plugin_key(id))
+                .expect("id was resolved from an instance")
+                .queue
+                .pop();
             self.record(now_ms, id, AuditEvent::IpcSent { message_id });
         }
     }
