@@ -11,6 +11,7 @@ use fm_frame::{
 };
 use image::codecs::jpeg::JpegEncoder;
 use image::codecs::png::PngEncoder;
+use image::codecs::webp::WebPEncoder;
 use image::{ExtendedColorType, ImageEncoder};
 
 fn timing() -> MediaTiming {
@@ -38,6 +39,32 @@ fn jpeg_rgb(width: u32, height: u32, rgb: &[u8]) -> Vec<u8> {
     JpegEncoder::new_with_quality(&mut encoded, 100)
         .write_image(rgb, width, height, ExtendedColorType::Rgb8)
         .unwrap();
+    encoded
+}
+
+fn webp_rgba(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    WebPEncoder::new_lossless(&mut encoded)
+        .write_image(rgba, width, height, ExtendedColorType::Rgba8)
+        .unwrap();
+    encoded
+}
+
+fn animated_webp(rgba: &[u8]) -> Vec<u8> {
+    let still = webp_rgba(1, 1, rgba);
+    let frame_chunk = &still[12..];
+    let mut encoded = b"RIFF\0\0\0\0WEBPVP8X".to_vec();
+    encoded.extend_from_slice(&10_u32.to_le_bytes());
+    encoded.extend_from_slice(&[0x12, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    encoded.extend_from_slice(b"ANIM");
+    encoded.extend_from_slice(&6_u32.to_le_bytes());
+    encoded.extend_from_slice(&[0; 6]);
+    encoded.extend_from_slice(b"ANMF");
+    encoded.extend_from_slice(&(16_u32 + u32::try_from(frame_chunk.len()).unwrap()).to_le_bytes());
+    encoded.extend_from_slice(&[0; 16]);
+    encoded.extend_from_slice(frame_chunk);
+    let riff_size = u32::try_from(encoded.len() - 8).unwrap();
+    encoded[4..8].copy_from_slice(&riff_size.to_le_bytes());
     encoded
 }
 
@@ -123,6 +150,51 @@ fn sniffs_jpeg_from_signature_without_decoding() {
     assert_eq!(
         sniff_still_format(b"\xff\xd8not a valid JPEG"),
         Ok(StillFormat::Jpeg)
+    );
+}
+
+#[test]
+fn webp_is_exact_straight_rgba_with_metadata_and_timing() {
+    let pixels = [11, 22, 33, 0, 44, 55, 66, 127];
+    let encoded = webp_rgba(2, 1, &pixels);
+
+    assert_eq!(sniff_still_format(&encoded), Ok(StillFormat::WebP));
+    assert_eq!(
+        sniff_still_format(&encoded[..11]),
+        Err(StillDecodeError::UnsupportedFormat)
+    );
+    assert_eq!(
+        sniff_still_format(b"RIFF\0\0\0\0NOPE"),
+        Err(StillDecodeError::UnsupportedFormat)
+    );
+
+    let decoded = decode_still(&encoded, timing(), StillDecodeLimits::default()).unwrap();
+    assert_eq!(decoded.format, StillFormat::WebP);
+    assert_eq!(
+        (
+            decoded.source_dimensions.width(),
+            decoded.source_dimensions.height()
+        ),
+        (2, 1)
+    );
+    assert!(decoded.source_has_alpha);
+    assert!(!decoded.orientation_applied);
+    assert_eq!(decoded.frame.timing(), timing());
+    assert_eq!(decoded.frame.payload().format(), PixelFormat::Rgba8);
+    assert_eq!(decoded.frame.payload().plane(0).unwrap().stride(), 8);
+    assert_eq!(bytes(&decoded), pixels);
+    assert_eq!(decoded.frame.metadata(), Some(expected_metadata()));
+}
+
+#[test]
+fn rejects_animated_webp_before_static_decode() {
+    assert_eq!(
+        decode_still(
+            &animated_webp(&[1, 2, 3, 127]),
+            timing(),
+            StillDecodeLimits::default()
+        ),
+        Err(StillDecodeError::AnimatedWebpUnsupported)
     );
 }
 

@@ -102,6 +102,9 @@ completion. Expired raw TCP sessions are reclaimed.
 9. Instrument latency, queue depth, frame drops, and GPU time.
 10. Pass the first one-hour Basic Show scenario on each Tier-1 OS.
 
+For item 2, the native retained-still path accepts bounded static PNG, JPEG,
+and WebP, rejects APNG and animated WebP, and does not complete color/bars, file playback, IN-008, or its acceptance.
+
 Current implementation boundary for item 4: `fm-compositor` executes bounded
 native `CompositionPlan` layers with crop, nearest scaling, quarter-turn
 rotation, translation, opacity, stable z-order, premultiplied source-over, and
