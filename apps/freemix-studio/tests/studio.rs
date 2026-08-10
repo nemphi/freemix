@@ -5,7 +5,7 @@ use std::{
     net::{SocketAddr, TcpListener, TcpStream},
     num::NonZeroU128,
     path::{Path, PathBuf},
-    process::{Command as ProcessCommand, Output, Stdio},
+    process::{Child, Command as ProcessCommand, Output, Stdio},
     sync::atomic::{AtomicU64, Ordering},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -209,11 +209,48 @@ impl Peer {
         }
     }
 
+    fn accept_until(listener: &TcpListener, deadline: Instant) -> Self {
+        listener.set_nonblocking(true).unwrap();
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    return Self {
+                        stream,
+                        decoder: LineDecoder::new(),
+                        pending: VecDeque::new(),
+                    };
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "timed out waiting for Studio");
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("cannot accept Studio: {error}"),
+            }
+        }
+    }
+
     fn receive(&mut self) -> WireMessage {
         loop {
             if let Some(message) = self.pending.pop_front() {
                 return message;
             }
+            let mut buffer = [0_u8; 4096];
+            let read = self.stream.read(&mut buffer).unwrap();
+            assert_ne!(read, 0, "unexpected client EOF");
+            self.pending
+                .extend(self.decoder.push(&buffer[..read]).unwrap());
+        }
+    }
+
+    fn receive_until(&mut self, deadline: Instant) -> WireMessage {
+        loop {
+            if let Some(message) = self.pending.pop_front() {
+                return message;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "timed out reading Studio message");
+            self.stream.set_read_timeout(Some(remaining)).unwrap();
             let mut buffer = [0_u8; 4096];
             let read = self.stream.read(&mut buffer).unwrap();
             assert_ne!(read, 0, "unexpected client EOF");
@@ -435,7 +472,29 @@ fn existing_runtime_accepts_the_current_contract() {
     server_thread.join().unwrap();
 }
 
-fn run_diagnose(address: SocketAddr) -> Output {
+fn diagnose_cleanup(mut child: Child, failure: impl std::fmt::Display) -> String {
+    let kill = child.kill().err();
+    match child.wait_with_output() {
+        Ok(output) => match kill {
+            Some(error) => format!(
+                "{failure}; cannot kill Studio diagnose: {error}; stderr={}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            None => format!(
+                "{failure}; Studio diagnose was killed: stderr={}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        },
+        Err(error) => match kill {
+            Some(kill) => {
+                format!("{failure}; cannot kill Studio diagnose: {kill}; cannot reap it: {error}")
+            }
+            None => format!("{failure}; cannot reap Studio diagnose: {error}"),
+        },
+    }
+}
+
+fn run_diagnose(address: SocketAddr) -> Result<Output, String> {
     let mut child = ProcessCommand::new(env!("CARGO_BIN_EXE_freemix-studio"))
         .args([
             "--diagnose",
@@ -447,27 +506,27 @@ fn run_diagnose(address: SocketAddr) -> Output {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .unwrap();
+        .map_err(|error| format!("cannot start Studio diagnose: {error}"))?;
     let deadline = Instant::now() + CONNECT_TIMEOUT;
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => return child.wait_with_output().unwrap(),
+            Ok(Some(_)) => {
+                return child
+                    .wait_with_output()
+                    .map_err(|error| format!("cannot collect Studio diagnose output: {error}"));
+            }
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
             Ok(None) => {
-                let _ = child.kill();
-                let output = child.wait_with_output().unwrap();
-                panic!(
-                    "Studio diagnose did not exit before {CONNECT_TIMEOUT:?}: stderr={}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
+                return Err(diagnose_cleanup(
+                    child,
+                    format!("Studio diagnose did not exit before {CONNECT_TIMEOUT:?}"),
+                ));
             }
             Err(error) => {
-                let _ = child.kill();
-                let output = child.wait_with_output().unwrap();
-                panic!(
-                    "cannot wait for Studio diagnose: {error}; stderr={}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
+                return Err(diagnose_cleanup(
+                    child,
+                    format!("cannot wait for Studio diagnose: {error}"),
+                ));
             }
         }
     }
@@ -476,8 +535,9 @@ fn run_diagnose(address: SocketAddr) -> Output {
 #[test]
 fn diagnose_reports_validated_heartbeat() {
     let (address, server_thread) = spawn_server(|listener| {
-        let mut peer = Peer::accept(&listener);
-        let WireMessage::HandshakeRequest(request) = peer.receive() else {
+        let deadline = Instant::now() + CONNECT_TIMEOUT;
+        let mut peer = Peer::accept_until(&listener, deadline);
+        let WireMessage::HandshakeRequest(request) = peer.receive_until(deadline) else {
             panic!("expected modern handshake request");
         };
         assert_eq!(request.protocol, CURRENT_PROTOCOL_VERSION);
@@ -490,7 +550,7 @@ fn diagnose_reports_validated_heartbeat() {
         )));
         peer.send(&WireMessage::Snapshot(snapshot(4)));
 
-        let WireMessage::Heartbeat(heartbeat) = peer.receive() else {
+        let WireMessage::Heartbeat(heartbeat) = peer.receive_until(deadline) else {
             panic!("expected heartbeat after snapshot");
         };
         assert_eq!(heartbeat.sequence, 1);
@@ -505,6 +565,9 @@ fn diagnose_reports_validated_heartbeat() {
     });
 
     let output = run_diagnose(address);
+    let server = server_thread.join();
+    assert!(server.is_ok(), "Studio diagnostic server failed");
+    let output = output.unwrap_or_else(|error| panic!("{error}"));
     assert!(
         output.status.success(),
         "Studio diagnose failed: stderr={}",
@@ -514,7 +577,6 @@ fn diagnose_reports_validated_heartbeat() {
         String::from_utf8(output.stdout).unwrap(),
         "liveness=ok sequence=1 received_at_ms=1234\n"
     );
-    server_thread.join().unwrap();
 }
 
 struct TestDirectory(PathBuf);

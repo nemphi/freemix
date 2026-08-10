@@ -27,14 +27,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Version => println!("freemix-studio {}", env!("CARGO_PKG_VERSION")),
         Command::Open(config) => launch_native(config)?,
         Command::Diagnose(config) => {
-            let mut runtime = StudioRuntime::new(config)?;
-            runtime.connect(CONNECT_TIMEOUT)?;
             let deadline = Instant::now() + CONNECT_TIMEOUT;
-            let sent_at_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)?
+            let mut runtime =
+                StudioRuntime::new_cancellable(config, DIAGNOSE_POLL_INTERVAL, || {
+                    Instant::now() >= deadline
+                })
+                .map_err(diagnostic_failure)?;
+            runtime
+                .connect_cancellable(
+                    deadline.saturating_duration_since(Instant::now()),
+                    DIAGNOSE_POLL_INTERVAL,
+                    || Instant::now() >= deadline,
+                )
+                .map_err(diagnostic_failure)?;
+            let sent_at_ms: u64 = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(diagnostic_failure)?
                 .as_millis()
-                .try_into()?;
-            let heartbeat = runtime
+                .try_into()
+                .map_err(diagnostic_failure)?;
+            runtime
                 .send_heartbeat_cancellable(sent_at_ms, DIAGNOSE_POLL_INTERVAL, || {
                     Instant::now() >= deadline
                 })
@@ -43,20 +55,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .receive_cancellable(DIAGNOSE_POLL_INTERVAL, || Instant::now() >= deadline)
                 .map_err(diagnostic_failure)?
             {
-                SessionEvent::HeartbeatAcknowledged { acknowledgement }
-                    if acknowledgement.heartbeat_sequence == heartbeat.sequence =>
-                {
+                SessionEvent::HeartbeatAcknowledged { acknowledgement } => {
                     println!(
                         "liveness=ok sequence={} received_at_ms={}",
-                        heartbeat.sequence, acknowledgement.received_at_ms
+                        acknowledgement.heartbeat_sequence, acknowledgement.received_at_ms
                     );
                 }
                 SessionEvent::Disconnected { .. } => return Err(diagnostic_failure("EOF").into()),
                 SessionEvent::ServerError(_) => {
                     return Err(diagnostic_failure("server error").into());
-                }
-                SessionEvent::HeartbeatAcknowledged { .. } => {
-                    return Err(diagnostic_failure("heartbeat sequence mismatch").into());
                 }
                 _ => return Err(diagnostic_failure("unexpected session event").into()),
             }

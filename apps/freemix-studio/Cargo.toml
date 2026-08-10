@@ -12,12 +12,10 @@ fm-client = { path = "../../crates/services/fm-client", features = ["std-tcp"] }
 fm-protocol = { path = "../../crates/foundation/fm-protocol" }
 fm-types = { path = "../../crates/foundation/fm-types" }
 fm-ui-egui = { path = "../../crates/ui/fm-ui-egui" }
+fm-ui-model = { path = "../../crates/ui/fm-ui-model" }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.27.1", default-features = false, features = ["signal"] }
-
-[dev-dependencies]
-fm-ui-model = { path = "../../crates/ui/fm-ui-model" }
 
 [lints]
 workspace = true
