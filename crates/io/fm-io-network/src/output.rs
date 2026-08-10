@@ -432,6 +432,13 @@ impl DestinationOutput {
     }
 
     fn enqueue(&mut self, packet: OutputPacket) -> EnqueueStatus {
+        if self.queue.len() == self.config.queue_capacity().get()
+            && matches!(self.state, DestinationState::AwaitingRandomAccess)
+            && packet.random_access
+            && !self.queue.iter().any(|queued| queued.random_access)
+        {
+            let _ = self.drop_interframes();
+        }
         if self.queue.len() == self.config.queue_capacity().get() {
             self.telemetry.backpressure_events =
                 self.telemetry.backpressure_events.saturating_add(1);
@@ -703,7 +710,8 @@ impl OutputSet {
         Ok(())
     }
 
-    /// Enqueues one packet without evicting old media.
+    /// Enqueues one packet with bounded recovery priority for a random-access
+    /// packet.
     ///
     /// # Errors
     ///

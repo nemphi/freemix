@@ -1076,9 +1076,11 @@ primary endpoint. A retryable primary connection or write failure retains the
 bounded packet queue, keeps the existing retry budget and delay, and selects
 the configured backup endpoint for subsequent attempts. After a reconnect, it
 removes queued interframes before the first random-access packet and waits for
-one when the queue has none. This recovery is transport-neutral queue policy;
-it does not request a keyframe. Backup failures do not alternate back to the
-primary, while a manual stop and start selects the primary again.
+one when the queue has none. The first incoming random-access packet has queue
+priority when that recovery queue is full only with interframes. This recovery
+is transport-neutral queue policy; it does not request a keyframe. Backup
+failures do not alternate back to the primary, while a manual stop and start
+selects the primary again.
 Non-retryable failures remain terminal. No socket adapter, RTMP/RTMPS or SRT
 transport, runtime wiring, persistence, output-health UI, live decoder proof,
 or live acceptance exists, so item 1 and `OR-005` remain planned.
