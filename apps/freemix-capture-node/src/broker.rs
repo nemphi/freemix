@@ -560,6 +560,7 @@ pub enum PairingError {
         paired: EngineIdentity,
         attempted: EngineIdentity,
     },
+    AlreadyConnected,
     NotPaired,
     AlreadyDisconnected,
 }
@@ -577,6 +578,7 @@ impl fmt::Display for PairingError {
                 attempted.state_epoch,
                 attempted.log_id
             ),
+            Self::AlreadyConnected => formatter.write_str("paired engine is already connected"),
             Self::NotPaired => formatter.write_str("capture session is not paired"),
             Self::AlreadyDisconnected => {
                 formatter.write_str("paired engine is already disconnected")
@@ -736,9 +738,12 @@ impl CaptureBroker {
     ///
     /// # Errors
     ///
-    /// Rejects logged-out sessions and identity changes.
+    /// Rejects logged-out sessions, active pairings, and reconnect identity changes.
     pub fn pair(&mut self, engine: EngineIdentity) -> Result<(), BrokerError> {
         self.require_active()?;
+        if self.pairing.connection() == Some(ConnectionState::Connected) {
+            return Err(PairingError::AlreadyConnected.into());
+        }
         if let Some(paired) = self.pairing.engine()
             && paired != &engine
         {
@@ -964,19 +969,59 @@ mod tests {
         let mut broker = broker(2);
         let paired = engine("engine-a", 7, "log-a");
         broker.pair(paired.clone()).unwrap();
-        broker.disconnect(1_000, "closed".to_owned()).unwrap();
+        broker.update_permission(PermissionKind::Camera, PermissionState::Granted);
+        broker
+            .publish(publication(1, CaptureSource::Camera, false))
+            .unwrap();
+        broker.disconnect(500, "first close".to_owned()).unwrap();
         broker.pair(paired.clone()).unwrap();
+        let reconnect = broker.reconnect().history().next().unwrap().clone();
+
+        assert_eq!(
+            broker.pair(paired.clone()),
+            Err(BrokerError::Pairing(PairingError::AlreadyConnected))
+        );
+        assert_eq!(
+            broker.pair(engine("engine-b", 8, "log-b")),
+            Err(BrokerError::Pairing(PairingError::AlreadyConnected))
+        );
         assert_eq!(broker.pairing().engine(), Some(&paired));
         assert_eq!(
             broker.pairing().connection(),
             Some(ConnectionState::Connected)
         );
+        assert!(
+            broker
+                .publications()
+                .get(PublicationId::new(nonzero(1)))
+                .is_some()
+        );
+        assert!(broker.reconnect().pending().is_none());
+        assert_eq!(broker.reconnect().history().len(), 1);
+        assert_eq!(broker.reconnect().history().next(), Some(&reconnect));
+
+        broker.disconnect(1_000, "closed".to_owned()).unwrap();
+        let pending_reconnect = broker.reconnect().pending().unwrap().clone();
 
         assert!(matches!(
             broker.pair(engine("engine-a", 8, "log-b")),
             Err(BrokerError::Pairing(PairingError::IdentityMismatch { .. }))
         ));
         assert_eq!(broker.pairing().engine(), Some(&paired));
+        assert_eq!(
+            broker.pairing().connection(),
+            Some(ConnectionState::Disconnected)
+        );
+        assert_eq!(broker.reconnect().pending(), Some(&pending_reconnect));
+
+        broker.pair(paired.clone()).unwrap();
+        assert_eq!(broker.pairing().engine(), Some(&paired));
+        assert_eq!(
+            broker.pairing().connection(),
+            Some(ConnectionState::Connected)
+        );
+        assert!(broker.reconnect().pending().is_none());
+        assert_eq!(broker.reconnect().history().len(), 2);
     }
 
     #[test]
