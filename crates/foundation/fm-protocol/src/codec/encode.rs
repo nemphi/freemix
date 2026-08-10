@@ -447,7 +447,7 @@ fn encode_overlays(
             }
             let mut included_outputs = BTreeSet::new();
             for output in &overlay.included_outputs {
-                if !included_outputs.insert(output.to_string()) {
+                if !included_outputs.insert(output.to_domain().get()) {
                     return Err(CodecError::InvalidField {
                         field,
                         value: output.to_string(),

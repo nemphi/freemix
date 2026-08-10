@@ -713,7 +713,7 @@ fn decode_overlay_status(
             })?;
         let mut output_ids = BTreeSet::new();
         for output in &included_outputs {
-            if !output_ids.insert(output.to_string()) {
+            if !output_ids.insert(output.to_domain().get()) {
                 return Err(CodecError::InvalidField {
                     field,
                     value: entry.to_owned(),
