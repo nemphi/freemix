@@ -289,12 +289,13 @@ fn format_input_audio_strips(state: &fm_ui_model::ProjectState) -> String {
             .iter()
             .map(|status| {
                 format!(
-                    "{}:{:?}:{}:{}:{}:{}:{}",
+                    "{}:{:?}:{}:{}:{}:{}:{}:{}",
                     status.input,
                     state.input_name(status.input).unwrap_or(""),
                     status.gain_millidb,
                     status.balance_basis_points,
                     status.muted,
+                    status.soloed,
                     status.follow_video,
                     status.delay_samples
                 )

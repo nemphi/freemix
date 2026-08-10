@@ -1243,6 +1243,7 @@ fn command_result_is_represented_before_its_events() {
                     gain_millidb: 0,
                     balance_basis_points: 0,
                     muted: false,
+                    soloed: false,
                     follow_video: true,
                     delay_samples: 0,
                 })
@@ -1266,6 +1267,7 @@ fn input_audio_strip_flows_through_authorization_snapshot_event_and_frame() {
                     gain_millidb: -6_000,
                     balance_basis_points: 2_500,
                     muted: true,
+                    soloed: true,
                     follow_video: false,
                     delay_samples: 2_400,
                 },
@@ -1310,6 +1312,7 @@ fn input_audio_strip_flows_through_authorization_snapshot_event_and_frame() {
                 gain_millidb: -6_000,
                 balance_basis_points: 2_500,
                 muted: true,
+                soloed: true,
                 follow_video: false,
                 delay_samples: 2_400,
             }

@@ -446,6 +446,7 @@ pub enum CommandPayload {
         gain_millidb: i32,
         balance_basis_points: i32,
         muted: bool,
+        soloed: bool,
         follow_video: bool,
         delay_samples: u32,
     },
@@ -602,6 +603,7 @@ pub struct InputAudioStripStatus {
     pub gain_millidb: i32,
     pub balance_basis_points: i32,
     pub muted: bool,
+    pub soloed: bool,
     pub follow_video: bool,
     pub delay_samples: u32,
 }

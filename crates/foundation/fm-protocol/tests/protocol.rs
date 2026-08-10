@@ -37,6 +37,7 @@ fn input_audio_strips(values: &[u128]) -> Vec<InputAudioStripStatus> {
             gain_millidb: 0,
             balance_basis_points: 0,
             muted: false,
+            soloed: false,
             follow_video: true,
             delay_samples: 0,
         })
@@ -112,6 +113,7 @@ fn every_message_variant_round_trips() {
                 gain_millidb: -6_000,
                 balance_basis_points: 2_500,
                 muted: true,
+                soloed: true,
                 follow_video: false,
                 delay_samples: 2_400,
             },
@@ -291,6 +293,7 @@ fn input_audio_strip_status_rejects_duplicates_and_out_of_range_controls() {
             gain_millidb: 0,
             balance_basis_points: 0,
             muted: false,
+            soloed: false,
             follow_video: true,
             delay_samples: 0,
         },
@@ -299,6 +302,7 @@ fn input_audio_strip_status_rejects_duplicates_and_out_of_range_controls() {
             gain_millidb: -6_000,
             balance_basis_points: 5_000,
             muted: true,
+            soloed: true,
             follow_video: false,
             delay_samples: 1,
         },
@@ -314,20 +318,24 @@ fn input_audio_strip_status_rejects_duplicates_and_out_of_range_controls() {
     let valid = encode_line(&strip_event(input_audio_strips(&[1, 2]))).unwrap();
     for malformed in [
         valid.replace(
-            "1%3A0%3A0%3A0%3A1%3A0%2C2%3A0%3A0%3A0%3A1%3A0",
-            "1%3A0%3A0%3A0%3A1%3A0%2C1%3A0%3A0%3A0%3A1%3A0",
+            "1%3A0%3A0%3A0%3A0%3A1%3A0%2C2%3A0%3A0%3A0%3A0%3A1%3A0",
+            "1%3A0%3A0%3A0%3A0%3A1%3A0%2C1%3A0%3A0%3A0%3A0%3A1%3A0",
         ),
         valid.replace(
-            "1%3A0%3A0%3A0%3A1%3A0%2C2%3A0%3A0%3A0%3A1%3A0",
-            "1%3A0%3A0%3A0%3A1%3A0%2C2%3A0%3A0%3A0%3A1%3A48001",
+            "1%3A0%3A0%3A0%3A0%3A1%3A0%2C2%3A0%3A0%3A0%3A0%3A1%3A0",
+            "1%3A0%3A0%3A0%3A0%3A1%3A0%2C2%3A0%3A0%3A0%3A0%3A1%3A48001",
         ),
         valid.replace(
-            "1%3A0%3A0%3A0%3A1%3A0%2C2%3A0%3A0%3A0%3A1%3A0",
-            "1%3A0%3A0%3A0%3A1%3A0%2C2%3A24001%3A0%3A0%3A1%3A0",
+            "1%3A0%3A0%3A0%3A0%3A1%3A0%2C2%3A0%3A0%3A0%3A0%3A1%3A0",
+            "1%3A0%3A0%3A0%3A0%3A1%3A0%2C2%3A24001%3A0%3A0%3A0%3A1%3A0",
         ),
         valid.replace(
-            "1%3A0%3A0%3A0%3A1%3A0%2C2%3A0%3A0%3A0%3A1%3A0",
-            "1%3A0%3A0%3A0%3A1%3A0%2C2%3A0%3A10001%3A0%3A1%3A0",
+            "1%3A0%3A0%3A0%3A0%3A1%3A0%2C2%3A0%3A0%3A0%3A0%3A1%3A0",
+            "1%3A0%3A0%3A0%3A0%3A1%3A0%2C2%3A0%3A10001%3A0%3A0%3A1%3A0",
+        ),
+        valid.replace(
+            "1%3A0%3A0%3A0%3A0%3A1%3A0%2C2%3A0%3A0%3A0%3A0%3A1%3A0",
+            "1%3A0%3A0%3A0%3A0%3A1%3A0%2C2%3A0%3A0%3A0%3A2%3A1%3A0",
         ),
     ] {
         assert!(matches!(

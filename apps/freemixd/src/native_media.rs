@@ -4792,6 +4792,7 @@ fn native_audio_input_state(state: InputAudioStripState) -> Result<InputState, N
         balance: Balance::from_basis_points(state.balance.get())
             .ok_or(NativeMasterError::InvalidFormat)?,
         muted: state.muted,
+        soloed: state.soloed,
         follow_video: state.follow_video,
     })
 }
@@ -8231,6 +8232,7 @@ mod tests {
                 balance: InputBalanceBasisPoints::CENTER,
                 delay_samples: Default::default(),
                 muted: false,
+                soloed: false,
                 follow_video: false,
             },
         ));
@@ -8287,6 +8289,7 @@ mod tests {
                 balance: InputBalanceBasisPoints::CENTER,
                 delay_samples: Default::default(),
                 muted: false,
+                soloed: false,
                 follow_video: true,
             },
         ));
@@ -8297,6 +8300,7 @@ mod tests {
                 balance: InputBalanceBasisPoints::CENTER,
                 delay_samples: Default::default(),
                 muted: false,
+                soloed: false,
                 follow_video: true,
             },
         ));
@@ -8323,6 +8327,7 @@ mod tests {
                 balance: InputBalanceBasisPoints::CENTER,
                 delay_samples: Default::default(),
                 muted: true,
+                soloed: false,
                 follow_video: true,
             },
         ));
@@ -8350,6 +8355,7 @@ mod tests {
             balance: InputBalanceBasisPoints::new(-2_500).unwrap(),
             delay_samples: InputDelaySamples::new(17).unwrap(),
             muted: true,
+            soloed: true,
             follow_video: false,
         };
         assert!(project.set_input_audio_strip(input(1), persisted));
@@ -8358,6 +8364,7 @@ mod tests {
             balance: InputBalanceBasisPoints::new(2_500).unwrap(),
             delay_samples: InputDelaySamples::new(23).unwrap(),
             muted: false,
+            soloed: false,
             follow_video: true,
         };
         assert!(project.set_input_audio_strip(input(2), alias_persisted));
@@ -8413,6 +8420,7 @@ mod tests {
                 balance: InputBalanceBasisPoints::CENTER,
                 delay_samples: Default::default(),
                 muted: false,
+                soloed: false,
                 follow_video: true,
             },
         ));
@@ -8490,6 +8498,7 @@ mod tests {
             gain: InputGainMilliDb::new(-6_000).unwrap(),
             balance: InputBalanceBasisPoints::new(2_500).unwrap(),
             muted: false,
+            soloed: true,
             follow_video: false,
             delay_samples: InputDelaySamples::new(2).unwrap(),
         };

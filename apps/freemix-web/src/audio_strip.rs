@@ -58,6 +58,7 @@ impl AudioStripControls {
         gain_millidb: i32,
         balance_basis_points: i32,
         muted: bool,
+        soloed: bool,
         follow_video: bool,
         delay_samples: u32,
         connection_state: &ConnectionState,
@@ -73,6 +74,7 @@ impl AudioStripControls {
             gain_millidb,
             balance_basis_points,
             muted,
+            soloed,
             follow_video,
             delay_samples,
         })
@@ -111,7 +113,7 @@ mod tests {
 
     #[test]
     fn audio_strip_requires_current_session_permission_and_bounds() {
-        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(2, 7));
+        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(2, 8));
         let controls = AudioStripControls;
         let ready = session(&["control_audio"]);
         assert_eq!(
@@ -119,6 +121,7 @@ mod tests {
                 input(7),
                 -6_000,
                 2_500,
+                true,
                 true,
                 false,
                 2_400,
@@ -130,6 +133,7 @@ mod tests {
                 gain_millidb: -6_000,
                 balance_basis_points: 2_500,
                 muted: true,
+                soloed: true,
                 follow_video: false,
                 delay_samples: 2_400,
             })
@@ -139,6 +143,7 @@ mod tests {
                 input(7),
                 24_001,
                 0,
+                false,
                 false,
                 true,
                 0,
@@ -152,6 +157,7 @@ mod tests {
                 input(7),
                 0,
                 0,
+                false,
                 false,
                 true,
                 48_001,
@@ -165,6 +171,7 @@ mod tests {
                 input(7),
                 0,
                 10_001,
+                false,
                 false,
                 true,
                 0,

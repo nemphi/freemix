@@ -84,6 +84,7 @@ pub fn run(command: Command) -> AppResult<()> {
             gain_millidb,
             balance_basis_points,
             muted,
+            soloed,
             follow_video,
             delay_samples,
         } => mutate(
@@ -94,6 +95,7 @@ pub fn run(command: Command) -> AppResult<()> {
                     gain_millidb,
                     balance_basis_points,
                     muted,
+                    soloed,
                     follow_video,
                     delay_samples,
                 )?,
@@ -400,6 +402,7 @@ pub fn run(command: Command) -> AppResult<()> {
             gain_millidb,
             balance_basis_points,
             muted,
+            soloed,
             follow_video,
             delay_samples,
             key,
@@ -420,6 +423,7 @@ pub fn run(command: Command) -> AppResult<()> {
                     })?
                     .get(),
                 muted,
+                soloed,
                 follow_video,
                 delay_samples: InputDelaySamples::new(delay_samples)
                     .ok_or_else(|| AppFailure("delay samples must be in 0..=48000".into()))?
@@ -1097,6 +1101,7 @@ fn engine_audio_strip_state(
     gain_millidb: i32,
     balance_basis_points: i32,
     muted: bool,
+    soloed: bool,
     follow_video: bool,
     delay_samples: u32,
 ) -> AppResult<EngineInputAudioStripState> {
@@ -1108,6 +1113,7 @@ fn engine_audio_strip_state(
             .ok_or_else(|| AppFailure("balance must be in -10000..=10000 basis points".into()))?
             .get(),
         muted,
+        soloed,
         follow_video,
         delay_samples: InputDelaySamples::new(delay_samples)
             .ok_or_else(|| AppFailure("delay samples must be in 0..=48000".into()))?
@@ -1123,6 +1129,7 @@ fn restore_input_audio_strips(show: &mut ShowState, project: &Project) -> AppRes
                 gain_millidb: strip.state.gain.get(),
                 balance_basis_points: strip.state.balance.get(),
                 muted: strip.state.muted,
+                soloed: strip.state.soloed,
                 follow_video: strip.state.follow_video,
                 delay_samples: strip.state.delay_samples.get(),
             },
@@ -1142,6 +1149,7 @@ fn sync_input_audio_strips(project: &mut Project, show: &ShowState) -> AppResult
             balance: InputBalanceBasisPoints::new(state.balance_basis_points)
                 .expect("engine input audio balance is bounded by the model contract"),
             muted: state.muted,
+            soloed: state.soloed,
             follow_video: state.follow_video,
             delay_samples: InputDelaySamples::new(state.delay_samples)
                 .expect("engine input audio delay is bounded by the model contract"),
@@ -1442,12 +1450,13 @@ fn format_audio_strips(project: &Project) -> String {
                 .find(|input| input.id == strip.input)
                 .map_or("", |input| input.name.as_str());
             format!(
-                "{}:{name:?}:gain_mdb={}:balance_bp={}:delay_samples={}:{}:{}",
+                "{}:{name:?}:gain_mdb={}:balance_bp={}:delay_samples={}:{}:{}:{}",
                 strip.input,
                 strip.state.gain.get(),
                 strip.state.balance.get(),
                 strip.state.delay_samples.get(),
                 if strip.state.muted { "muted" } else { "live" },
+                if strip.state.soloed { "solo" } else { "mix" },
                 if strip.state.follow_video {
                     "afv"
                 } else {
@@ -1568,7 +1577,7 @@ FreeMix deterministic MVP
 Usage:
   freemix-cli new <show.freemix> [--name <name>]
   freemix-cli status <show.freemix>
-  freemix-cli audio-strip <show.freemix> <input> <gain-millidb:-96000..=24000> <balance-bp:-10000..=10000> <muted:on|off> <follow-video:on|off> <delay-samples:0..=48000>
+  freemix-cli audio-strip <show.freemix> <input> <gain-millidb:-96000..=24000> <balance-bp:-10000..=10000> <muted:on|off> <soloed:on|off> <follow-video:on|off> <delay-samples:0..=48000>
   freemix-cli preview <show.freemix> <input> [--key <key>] [--expect <revision>]
   freemix-cli cut <show.freemix> [--key <key>] [--expect <revision>]
   freemix-cli fade <show.freemix> <frames> [--key <key>] [--expect <revision>]
@@ -1593,7 +1602,7 @@ Usage:
   freemix-cli tbar-cancel <show.freemix> [--key <key>] [--expect <revision>]
   freemix-cli ftb <show.freemix> <live|black> <frames> [--key <key>] [--expect <revision>]
   freemix-cli remote-status <127.0.0.1:port>
-  freemix-cli remote-audio-strip <127.0.0.1:port> <input> <gain-millidb:-96000..=24000> <balance-bp:-10000..=10000> <muted:on|off> <follow-video:on|off> <delay-samples:0..=48000> [--key <key>] [--expect <revision>]
+  freemix-cli remote-audio-strip <127.0.0.1:port> <input> <gain-millidb:-96000..=24000> <balance-bp:-10000..=10000> <muted:on|off> <soloed:on|off> <follow-video:on|off> <delay-samples:0..=48000> [--key <key>] [--expect <revision>]
   freemix-cli remote-preview <127.0.0.1:port> <input> [--key <key>] [--expect <revision>]
   freemix-cli remote-cut <127.0.0.1:port> [--key <key>] [--expect <revision>]
   freemix-cli remote-fade <127.0.0.1:port> <frames> [--key <key>] [--expect <revision>]

@@ -1102,6 +1102,7 @@ fn engine_command(payload: CommandPayload) -> EngineCommand {
             gain_millidb,
             balance_basis_points,
             muted,
+            soloed,
             follow_video,
             delay_samples,
         } => EngineCommand::SetInputAudioStrip {
@@ -1110,6 +1111,7 @@ fn engine_command(payload: CommandPayload) -> EngineCommand {
                 gain_millidb,
                 balance_basis_points,
                 muted,
+                soloed,
                 follow_video,
                 delay_samples,
             },
@@ -1437,6 +1439,7 @@ fn protocol_input_audio_strips(engine: &Engine) -> Vec<InputAudioStripStatus> {
             gain_millidb: state.gain_millidb,
             balance_basis_points: state.balance_basis_points,
             muted: state.muted,
+            soloed: state.soloed,
             follow_video: state.follow_video,
             delay_samples: state.delay_samples,
         })

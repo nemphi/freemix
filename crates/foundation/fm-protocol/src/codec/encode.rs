@@ -141,21 +141,8 @@ fn encode_command(record: &mut Record, message: &CommandMessage) -> Result<(), C
     record.optional("expected_revision", message.expected_revision)?;
     record.optional("deadline_ms", message.deadline_ms)?;
     match message.payload {
-        CommandPayload::SetInputAudioStrip {
-            input,
-            gain_millidb,
-            balance_basis_points,
-            muted,
-            follow_video,
-            delay_samples,
-        } => {
-            record.field("payload", "input_audio_strip")?;
-            record.field("input", input)?;
-            record.field("gain_millidb", gain_millidb)?;
-            record.field("balance_basis_points", balance_basis_points)?;
-            record.field("muted", u8::from(muted))?;
-            record.field("follow_video", u8::from(follow_video))?;
-            record.field("delay_samples", delay_samples)?;
+        payload @ CommandPayload::SetInputAudioStrip { .. } => {
+            encode_input_audio_strip_command(record, payload)?;
         }
         CommandPayload::SelectPreview { input } => {
             record.field("payload", "select_preview")?;
@@ -233,6 +220,32 @@ fn encode_command(record: &mut Record, message: &CommandMessage) -> Result<(), C
         }
     }
     Ok(())
+}
+
+fn encode_input_audio_strip_command(
+    record: &mut Record,
+    payload: CommandPayload,
+) -> Result<(), CodecError> {
+    let CommandPayload::SetInputAudioStrip {
+        input,
+        gain_millidb,
+        balance_basis_points,
+        muted,
+        soloed,
+        follow_video,
+        delay_samples,
+    } = payload
+    else {
+        unreachable!("input audio strip encoder received another command")
+    };
+    record.field("payload", "input_audio_strip")?;
+    record.field("input", input)?;
+    record.field("gain_millidb", gain_millidb)?;
+    record.field("balance_basis_points", balance_basis_points)?;
+    record.field("muted", u8::from(muted))?;
+    record.field("soloed", u8::from(soloed))?;
+    record.field("follow_video", u8::from(follow_video))?;
+    record.field("delay_samples", delay_samples)
 }
 
 fn encode_overlay_command(record: &mut Record, payload: CommandPayload) -> Result<(), CodecError> {
@@ -479,11 +492,12 @@ fn encode_input_audio_strips(
             return Err(CodecError::InvalidField {
                 field: "input_audio_strips",
                 value: format!(
-                    "{}:{}:{}:{}:{}:{}",
+                    "{}:{}:{}:{}:{}:{}:{}",
                     status.input,
                     status.gain_millidb,
                     status.balance_basis_points,
                     u8::from(status.muted),
+                    u8::from(status.soloed),
                     u8::from(status.follow_video),
                     status.delay_samples
                 ),
@@ -496,11 +510,12 @@ fn encode_input_audio_strips(
             .iter()
             .map(|status| {
                 format!(
-                    "{}:{}:{}:{}:{}:{}",
+                    "{}:{}:{}:{}:{}:{}:{}",
                     status.input,
                     status.gain_millidb,
                     status.balance_basis_points,
                     u8::from(status.muted),
+                    u8::from(status.soloed),
                     u8::from(status.follow_video),
                     status.delay_samples
                 )

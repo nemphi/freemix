@@ -11,6 +11,7 @@ pub struct EngineInputAudioStripState {
     pub gain_millidb: i32,
     pub balance_basis_points: i32,
     pub muted: bool,
+    pub soloed: bool,
     pub follow_video: bool,
     pub delay_samples: u32,
 }
@@ -21,6 +22,7 @@ impl Default for EngineInputAudioStripState {
             gain_millidb: 0,
             balance_basis_points: 0,
             muted: false,
+            soloed: false,
             follow_video: true,
             delay_samples: 0,
         }

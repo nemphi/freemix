@@ -2,7 +2,7 @@ use fm_types::{AudioFormat, BusId, FrameRate, InputId, OutputId, ProjectId, Scen
 
 use crate::{ValidationError, validation::validate_project};
 
-pub const CURRENT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(15);
+pub const CURRENT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(16);
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct SchemaVersion(u32);
@@ -350,6 +350,7 @@ pub struct InputAudioStripState {
     pub balance: InputBalanceBasisPoints,
     pub delay_samples: InputDelaySamples,
     pub muted: bool,
+    pub soloed: bool,
     pub follow_video: bool,
 }
 
@@ -360,6 +361,7 @@ impl Default for InputAudioStripState {
             balance: InputBalanceBasisPoints::CENTER,
             delay_samples: InputDelaySamples::ZERO,
             muted: false,
+            soloed: false,
             follow_video: true,
         }
     }

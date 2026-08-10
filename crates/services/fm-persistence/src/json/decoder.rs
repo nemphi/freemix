@@ -207,6 +207,7 @@ fn parse_input_audio_strip(value: Value) -> Result<InputAudioStrip, DecodeError>
                 },
             )?,
             muted: object.boolean("muted")?,
+            soloed: object.boolean("soloed")?,
             follow_video: object.boolean("follow_video")?,
         },
     };

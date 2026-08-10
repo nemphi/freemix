@@ -348,6 +348,7 @@ fn serve_audio_strip(listener: &TcpListener) {
             gain_millidb: -6_000,
             balance_basis_points: 2_500,
             muted: true,
+            soloed: true,
             follow_video: false,
             delay_samples: 2_400,
         },
@@ -381,6 +382,7 @@ fn serve_audio_strip(listener: &TcpListener) {
                         gain_millidb: 0,
                         balance_basis_points: 0,
                         muted: false,
+                        soloed: false,
                         follow_video: true,
                         delay_samples: 0,
                     },
@@ -389,6 +391,7 @@ fn serve_audio_strip(listener: &TcpListener) {
                         gain_millidb: -6_000,
                         balance_basis_points: 2_500,
                         muted: true,
+                        soloed: true,
                         follow_video: false,
                         delay_samples: 2_400,
                     },
@@ -937,6 +940,7 @@ fn input_audio_strips() -> Vec<fm_protocol::InputAudioStripStatus> {
             gain_millidb: 0,
             balance_basis_points: 0,
             muted: false,
+            soloed: false,
             follow_video: true,
             delay_samples: 0,
         })
@@ -1087,6 +1091,7 @@ fn remote_audio_strip_preserves_controls_and_replicated_state() {
         "-6000",
         "2500",
         "on",
+        "on",
         "off",
         "2400",
         "--key",
@@ -1096,7 +1101,7 @@ fn remote_audio_strip_preserves_controls_and_replicated_state() {
     ]);
     assert_success(&output);
     assert!(stdout(&output).contains(
-        "AudioStrips=[1:\"Camera\":0:0:false:true:0,2:\"Slides\":-6000:2500:true:false:2400]"
+        "AudioStrips=[1:\"Camera\":0:0:false:false:true:0,2:\"Slides\":-6000:2500:true:true:false:2400]"
     ));
     server.finish();
 }

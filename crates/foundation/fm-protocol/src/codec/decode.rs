@@ -254,6 +254,7 @@ fn decode_command_payload(
             gain_millidb: fields.parse_required("gain_millidb")?,
             balance_basis_points: fields.parse_required("balance_basis_points")?,
             muted: fields.boolean("muted")?,
+            soloed: fields.boolean("soloed")?,
             follow_video: fields.boolean("follow_video")?,
             delay_samples: fields.parse_required("delay_samples")?,
         },
@@ -558,6 +559,7 @@ fn decode_input_audio_strips(
             let gain_millidb = parts.next().ok_or_else(invalid)?;
             let balance_basis_points = parts.next().ok_or_else(invalid)?;
             let muted = parts.next().ok_or_else(invalid)?;
+            let soloed = parts.next().ok_or_else(invalid)?;
             let follow_video = parts.next().ok_or_else(invalid)?;
             let delay_samples = parts.next().ok_or_else(invalid)?;
             if parts.next().is_some() {
@@ -568,6 +570,11 @@ fn decode_input_audio_strips(
                 gain_millidb: gain_millidb.parse().map_err(|_| invalid())?,
                 balance_basis_points: balance_basis_points.parse().map_err(|_| invalid())?,
                 muted: match muted {
+                    "0" => false,
+                    "1" => true,
+                    _ => return Err(invalid()),
+                },
+                soloed: match soloed {
                     "0" => false,
                     "1" => true,
                     _ => return Err(invalid()),

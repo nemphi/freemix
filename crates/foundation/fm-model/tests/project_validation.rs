@@ -246,7 +246,7 @@ fn duplicate_routes_are_rejected() {
 
 #[test]
 fn project_uses_the_current_schema_contract() {
-    assert_eq!(CURRENT_SCHEMA_VERSION, SchemaVersion::new(15));
+    assert_eq!(CURRENT_SCHEMA_VERSION, SchemaVersion::new(16));
     assert_eq!(valid_project().schema_version(), CURRENT_SCHEMA_VERSION);
 }
 
@@ -357,6 +357,7 @@ fn persisted_input_gain_is_exact_and_bounded() {
             balance: InputBalanceBasisPoints::CENTER,
             delay_samples: InputDelaySamples::ZERO,
             muted: false,
+            soloed: false,
             follow_video: true,
         }
     );

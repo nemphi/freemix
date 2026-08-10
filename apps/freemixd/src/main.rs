@@ -3650,6 +3650,7 @@ fn restore_input_audio_strips(show: &mut ShowState, project: &fm_model::Project)
                 gain_millidb: strip.state.gain.get(),
                 balance_basis_points: strip.state.balance.get(),
                 muted: strip.state.muted,
+                soloed: strip.state.soloed,
                 follow_video: strip.state.follow_video,
                 delay_samples: strip.state.delay_samples.get(),
             },
@@ -3665,6 +3666,7 @@ fn model_audio_strip_state(state: EngineInputAudioStripState) -> InputAudioStrip
         balance: InputBalanceBasisPoints::new(state.balance_basis_points)
             .expect("engine input audio balance is bounded by the model contract"),
         muted: state.muted,
+        soloed: state.soloed,
         follow_video: state.follow_video,
         delay_samples: InputDelaySamples::new(state.delay_samples)
             .expect("engine input audio delay is bounded by the model contract"),
@@ -7563,6 +7565,7 @@ mod tests {
                     gain_millidb: -9_000,
                     balance_basis_points: 2_500,
                     muted: true,
+                    soloed: true,
                     follow_video: false,
                     delay_samples: 1_200,
                 },
@@ -7580,6 +7583,7 @@ mod tests {
                 gain: InputGainMilliDb::new(-9_000).unwrap(),
                 balance: InputBalanceBasisPoints::new(2_500).unwrap(),
                 muted: true,
+                soloed: true,
                 follow_video: false,
                 delay_samples: InputDelaySamples::new(1_200).unwrap(),
             })
@@ -7751,6 +7755,7 @@ mod tests {
                 balance: InputBalanceBasisPoints::CENTER,
                 delay_samples: Default::default(),
                 muted: false,
+                soloed: false,
                 follow_video: true,
             },
         ));

@@ -79,6 +79,7 @@ pub enum Command {
         gain_millidb: i32,
         balance_basis_points: i32,
         muted: bool,
+        soloed: bool,
         follow_video: bool,
         delay_samples: u32,
     },
@@ -222,6 +223,7 @@ pub enum Command {
         gain_millidb: i32,
         balance_basis_points: i32,
         muted: bool,
+        soloed: bool,
         follow_video: bool,
         delay_samples: u32,
         key: Option<String>,
@@ -522,6 +524,7 @@ fn parse_audio_strip(mut arguments: impl Iterator<Item = String>) -> Result<Comm
         "balance basis points",
     )?;
     let muted = boolean_choice(&required(&mut arguments, "muted")?, "muted")?;
+    let soloed = boolean_choice(&required(&mut arguments, "soloed")?, "soloed")?;
     let follow_video = boolean_choice(&required(&mut arguments, "follow video")?, "follow video")?;
     let delay_samples = number(&required(&mut arguments, "delay samples")?, "delay samples")?;
     reject_extra(&mut arguments)?;
@@ -531,6 +534,7 @@ fn parse_audio_strip(mut arguments: impl Iterator<Item = String>) -> Result<Comm
         gain_millidb,
         balance_basis_points,
         muted,
+        soloed,
         follow_video,
         delay_samples,
     })
@@ -959,6 +963,7 @@ fn parse_remote_audio_strip(
         "balance basis points",
     )?;
     let muted = boolean_choice(&required(&mut arguments, "muted")?, "muted")?;
+    let soloed = boolean_choice(&required(&mut arguments, "soloed")?, "soloed")?;
     let follow_video = boolean_choice(&required(&mut arguments, "follow video")?, "follow video")?;
     let delay_samples = number(&required(&mut arguments, "delay samples")?, "delay samples")?;
     let (key, expected_revision) = command_options(arguments)?;
@@ -968,6 +973,7 @@ fn parse_remote_audio_strip(
         gain_millidb,
         balance_basis_points,
         muted,
+        soloed,
         follow_video,
         delay_samples,
         key,
@@ -1757,6 +1763,7 @@ mod tests {
                 "-6000",
                 "2500",
                 "on",
+                "on",
                 "off",
                 "48000",
             ])),
@@ -1766,6 +1773,7 @@ mod tests {
                 gain_millidb: -6_000,
                 balance_basis_points: 2_500,
                 muted: true,
+                soloed: true,
                 follow_video: false,
                 delay_samples: 48_000,
             })
@@ -1782,6 +1790,7 @@ mod tests {
                 "-6000",
                 "-2500",
                 "off",
+                "off",
                 "on",
                 "2400",
                 "--key",
@@ -1795,6 +1804,7 @@ mod tests {
                 gain_millidb: -6_000,
                 balance_basis_points: -2_500,
                 muted: false,
+                soloed: false,
                 follow_video: true,
                 delay_samples: 2_400,
                 key: Some("delay".into()),

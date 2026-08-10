@@ -137,6 +137,7 @@ pub struct InputAudioStripStatus {
     pub gain_millidb: i32,
     pub balance_basis_points: i32,
     pub muted: bool,
+    pub soloed: bool,
     pub follow_video: bool,
     pub delay_samples: u32,
 }
@@ -1552,6 +1553,7 @@ fn protocol_input_audio_strips(
             gain_millidb: status.gain_millidb,
             balance_basis_points: status.balance_basis_points,
             muted: status.muted,
+            soloed: status.soloed,
             follow_video: status.follow_video,
             delay_samples: status.delay_samples,
         })

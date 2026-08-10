@@ -38,6 +38,7 @@ pub enum StudioIntent {
         gain_millidb: i32,
         balance_basis_points: i32,
         muted: bool,
+        soloed: bool,
         follow_video: bool,
         delay_samples: u32,
     },
@@ -522,6 +523,7 @@ fn draw_input_audio_strips(ui: &mut Ui, state: &StudioUiState, intents: &mut Vec
                     let mut gain_millidb = status.gain_millidb;
                     let mut balance_basis_points = status.balance_basis_points;
                     let mut muted = status.muted;
+                    let mut soloed = status.soloed;
                     let mut follow_video = status.follow_video;
                     let mut delay_samples = status.delay_samples;
                     let gain_changed = ui
@@ -547,6 +549,9 @@ fn draw_input_audio_strips(ui: &mut Ui, state: &StudioUiState, intents: &mut Vec
                     let mute_changed = ui
                         .add_enabled(enabled, egui::Checkbox::new(&mut muted, "MUTE"))
                         .changed();
+                    let solo_changed = ui
+                        .add_enabled(enabled, egui::Checkbox::new(&mut soloed, "SOLO"))
+                        .changed();
                     let follow_changed = ui
                         .add_enabled(
                             enabled,
@@ -566,6 +571,7 @@ fn draw_input_audio_strips(ui: &mut Ui, state: &StudioUiState, intents: &mut Vec
                     if gain_changed
                         || balance_changed
                         || mute_changed
+                        || solo_changed
                         || follow_changed
                         || delay_changed
                     {
@@ -574,6 +580,7 @@ fn draw_input_audio_strips(ui: &mut Ui, state: &StudioUiState, intents: &mut Vec
                             gain_millidb,
                             balance_basis_points,
                             muted,
+                            soloed,
                             follow_video,
                             delay_samples,
                         });
@@ -1555,6 +1562,7 @@ mod tests {
                 gain_millidb: -6_000,
                 balance_basis_points: 2_500,
                 muted: true,
+                soloed: true,
                 follow_video: false,
                 delay_samples: 2_400,
             },
@@ -1563,6 +1571,7 @@ mod tests {
                 gain_millidb: -6_000,
                 balance_basis_points: 2_500,
                 muted: true,
+                soloed: true,
                 follow_video: false,
                 delay_samples: 2_400,
             }

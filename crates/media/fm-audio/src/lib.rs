@@ -606,6 +606,7 @@ pub struct InputState {
     pub gain: Gain,
     pub balance: Balance,
     pub muted: bool,
+    pub soloed: bool,
     pub follow_video: bool,
 }
 
@@ -615,6 +616,7 @@ impl Default for InputState {
             gain: Gain::UNITY,
             balance: Balance::CENTER,
             muted: false,
+            soloed: false,
             follow_video: false,
         }
     }
@@ -1413,11 +1415,13 @@ impl MasterMixer {
         for plane in output.iter_mut() {
             plane[..samples].fill(0.0);
         }
+        let any_soloed = self.inputs.values().any(|strip| strip.state.soloed);
         for (id, strip) in &self.inputs {
             let block = blocks.iter().find_map(|submission| {
                 (submission.input() == *id).then(|| (submission.block(), submission.source_gain()))
             });
             let audible = !strip.state.muted
+                && (!any_soloed || strip.state.soloed)
                 && (!strip.state.follow_video || active_video_inputs.contains(id));
             let mut ramp = strip.ramp;
             let mut balance_ramp = strip.balance_ramp;
@@ -2151,6 +2155,7 @@ mod tests {
                     ChannelMapping::identity(mono_format().channels).unwrap(),
                     InputState {
                         muted: is_muted,
+                        soloed: false,
                         follow_video: true,
                         ..InputState::default()
                     },
@@ -2487,6 +2492,7 @@ mod tests {
                     gain: Gain::from_db(-6.020_6).unwrap(),
                     balance: Balance::CENTER,
                     muted: false,
+                    soloed: false,
                     follow_video: false,
                 },
             )
@@ -2500,6 +2506,7 @@ mod tests {
                     gain: Gain::UNITY,
                     balance: Balance::CENTER,
                     muted: false,
+                    soloed: false,
                     follow_video: true,
                 },
             )
@@ -2519,6 +2526,7 @@ mod tests {
             gain: Gain::UNITY,
             balance: Balance::CENTER,
             muted: true,
+            soloed: false,
             follow_video: true,
         };
         mixer.set_input_state(second_id, muted, 0).unwrap();
@@ -2584,6 +2592,73 @@ mod tests {
     }
 
     #[test]
+    fn solo_gates_other_strips_while_mute_and_follow_video_remain_independent() {
+        let format = mono_format();
+        let first = input_id(1);
+        let second = input_id(2);
+        let first_block = AudioBlock::from_planar(format.clone(), vec![vec![0.25; 2]]).unwrap();
+        let second_block = AudioBlock::from_planar(format.clone(), vec![vec![0.5; 2]]).unwrap();
+        let mut mixer = MasterMixer::new(format.clone()).unwrap();
+        for input in [first, second] {
+            mixer
+                .add_input(
+                    input,
+                    format.clone(),
+                    ChannelMapping::identity(format.channels.clone()).unwrap(),
+                    InputState::default(),
+                )
+                .unwrap();
+        }
+
+        mixer
+            .set_input_state(
+                first,
+                InputState {
+                    soloed: true,
+                    ..InputState::default()
+                },
+                0,
+            )
+            .unwrap();
+        let output = mixer
+            .mix(2, &[(first, &first_block), (second, &second_block)], None)
+            .unwrap();
+        assert_eq!(output.block.plane(0).unwrap(), &[0.25, 0.25]);
+
+        mixer
+            .set_input_state(
+                first,
+                InputState {
+                    soloed: true,
+                    follow_video: true,
+                    ..InputState::default()
+                },
+                0,
+            )
+            .unwrap();
+        let output = mixer
+            .mix(2, &[(first, &first_block), (second, &second_block)], None)
+            .unwrap();
+        assert_eq!(output.block.plane(0).unwrap(), &[0.0, 0.0]);
+
+        mixer
+            .set_input_state(
+                first,
+                InputState {
+                    muted: true,
+                    soloed: true,
+                    ..InputState::default()
+                },
+                0,
+            )
+            .unwrap();
+        let output = mixer
+            .mix(2, &[(first, &first_block), (second, &second_block)], None)
+            .unwrap();
+        assert_eq!(output.block.plane(0).unwrap(), &[0.0, 0.0]);
+    }
+
+    #[test]
     fn logical_alias_reuses_source_mapping_with_independent_strip_controls() {
         let format = mono_format();
         let source = input_id(1);
@@ -2606,6 +2681,7 @@ mod tests {
                     gain: Gain::from_db(-6.020_6).unwrap(),
                     balance: Balance::CENTER,
                     muted: false,
+                    soloed: false,
                     follow_video: true,
                 },
             )

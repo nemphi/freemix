@@ -141,6 +141,7 @@ fn input_audio_strip_is_durable_and_realized_on_its_scheduled_frame() {
         gain_millidb: -6_000,
         balance_basis_points: 2_500,
         muted: true,
+        soloed: true,
         follow_video: false,
         delay_samples: 2_400,
     };
@@ -213,6 +214,7 @@ fn input_audio_strip_rejects_unknown_inputs_and_out_of_range_values() {
                             gain_millidb,
                             balance_basis_points,
                             muted: false,
+                            soloed: false,
                             follow_video: true,
                             delay_samples,
                         },

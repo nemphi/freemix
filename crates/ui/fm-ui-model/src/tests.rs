@@ -45,6 +45,7 @@ fn input_audio_strips() -> Vec<InputAudioStripStatus> {
             gain_millidb: 0,
             balance_basis_points: 0,
             muted: false,
+            soloed: false,
             follow_video: true,
             delay_samples: 0,
         })

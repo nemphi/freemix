@@ -181,7 +181,7 @@ metadata-output/decode bounds plus subprocess timeouts can reject deep playback
 or restore transactionally.
 
 `fm-audio` provides a deterministic reference Master with planar F32 mapping,
-gain/stereo-balance/mute/follow-video, meters, timed canonical blocks,
+gain/stereo-balance/mute/solo/follow-video, meters, timed canonical blocks,
 sample-count timing validation, and transactional gain and balance ramps. Its bounded
 `ClockMappedAudioSynchronizer` is now connected to native `freemixd` local-file
 audio. The daemon accepts source rates such as 44.1 kHz and linearly resamples
@@ -195,31 +195,34 @@ later switching does not replay stale audio.
 
 The current schema also persists one exact per-input audio strip as bounded
 integer milli-dB gain (`-96000..=24000`), stereo balance
-(`-10000..=10000` basis points), mute, follow-video, and a bounded
+(`-10000..=10000` basis points), mute, solo, follow-video, and a bounded
 0–48,000-sample delay. Native daemon preflight transactionally maps those
 records to `fm-audio::Gain` and `fm-audio::Balance` and constructs both Master
 mixer copies with the target gain, balance, and delay applied immediately.
-Protocol 2.7 carries authoritative input IDs and canonical names plus full-strip
+Protocol 2.8 carries authoritative input IDs and canonical names plus full-strip
 status in snapshots, and durable events carry full-strip state plus one
 permission-gated atomic live strip command. The engine schedules
-accepted gain, balance, mute, follow-video, and delay changes together at a frame boundary, and
+accepted gain, balance, mute, solo, follow-video, and delay changes together at a frame boundary, and
 native realization updates active and pending Master/Stinger mixers and the
 checkpoint project atomically. Live gain and balance changes then ramp linearly
 over 240 samples (5 ms at the 48 kHz project Master rate) while mute,
-follow-video, and delay take effect at the next rendered sample; restored strips
+solo, follow-video, and delay take effect at the next rendered sample; restored strips
 remain immediate. Balance is linear after channel mapping: negative values
 attenuate the right destination, positive values attenuate the left destination,
 and non-stereo destination labels remain at unity.
+Solo is solo-in-place across the logical Master strips: if any strip is soloed,
+every non-soloed strip is gated. Mute and follow-video remain independent gates,
+so a muted or video-inactive soloed strip can intentionally produce silence.
 Local and remote CLI commands, Studio controls,
 and the Web semantic control model expose the same bounded mutation. Restart
 restores engine desired state from the canonical strips and checkpoints it back
 to the project. Current-contract persistence, generated-audio, AFV
-selected/inactive, mute, immediate startup gain/balance/delay, live full-strip realization,
+selected/inactive, mute, solo, immediate startup gain/balance/delay, live full-strip realization,
 and failed-preflight no-partial-state tests cover this slice.
 
 Studio input tiles and mixer strips use exact persisted input names carried by
 the snapshot rather than generated ordinal labels. There are still no audio
-meters in Studio, solo/PFL, strip-name editing/groups, bus
+meters in Studio, PFL, strip-name editing/groups, bus
 sends, microphone automix, device-audio path,
 device-clock correction, native EQ/gate/compressor/limiter, or acceptance
 evidence. Phase 2 item 7 is partial, Phase 3 item 3 is partial, and
@@ -242,7 +245,7 @@ physical leaf or explicit silence. Cut keeps one source at unity; Fade and Wipe
 crossfade two sources with sample-linear gains from each interval's explicit
 start/end mix endpoints. Physical terminals render once per interval, but
 distinct logical strips that share one terminal remain independent mixer
-submissions with their own gain/balance/mute/follow-video state and transition
+submissions with their own gain/balance/mute/solo/follow-video state and transition
 coefficients. Truly identical logical Program IDs submit once at unity.
 Automatic Fade and held or reversed Fade and Wipe T-bar movement propagate exact
 endpoints. The manual-transition core is exposed through `EngineCommand` and
@@ -416,12 +419,12 @@ fade-out channels active until their zero-opacity endpoint, and rejects idle
 snapshots while any channel is moving. Every channel also owns a bounded
 64-source FIFO queue and deterministic full-frame, top-left, top-right,
 bottom-left, and bottom-right position presets plus none/thin-white/thick-white
-inset-border presets. Schema 15 persists the complete desired and realized
+inset-border presets. Schema 16 persists the complete desired and realized
 arrays, appearance, queue state, and exact per-input audio strips, and accepts schema
-15 only. Protocol 2.7 carries canonical input names, opacity, transition kind,
+16 only. Protocol 2.8 carries canonical input names, opacity, transition kind,
 duration, Take, Update,
 Off, output inclusion, transition/appearance configuration, Queue, Take Next,
-and atomic per-input audio-strip commands and state, and accepts protocol 2.7 only.
+and atomic per-input audio-strip commands and state, and accepts protocol 2.8 only.
 
 Control authorization treats overlay mutations as transition operations. The
 client/UI reducer validates exactly eight unique channels, active-source
@@ -456,20 +459,20 @@ output, allocation-free steady-state processing, and explicit reset. The
 reference `MasterMixer` now gives every logical strip independent raw-planar
 delay history before channel mapping and gains, advances that history with
 submitted PCM or silence on every successful Master interval, and bounds total
-retained history per mixer. Schema 15 gives every persisted input strip exact
-bounded gain, stereo balance, mute, follow-video, and 0–48,000-sample delay
+retained history per mixer. Schema 16 gives every persisted input strip exact
+bounded gain, stereo balance, mute, solo, follow-video, and 0–48,000-sample delay
 values and rejects missing, wrong-typed, or out-of-range fields.
 Native project compilation carries that value into physical and scene-alias
 strips, and native Master/Stinger preflight applies it transactionally to both
-active and pending mixers before gain, balance, mute, follow-video, and source envelopes.
+active and pending mixers before gain, balance, mute, solo, follow-video, and source envelopes.
 The engine owns the live desired full-strip map and emits frame-boundary
-realization updates. Protocol 2.7 snapshots pair every input ID with its
+realization updates. Protocol 2.8 snapshots pair every input ID with its
 canonical persisted name and replicate the complete strip map; its
-`SetInputAudioStrip` command atomically carries gain, balance, mute,
+`SetInputAudioStrip` command atomically carries gain, balance, mute, solo,
 follow-video, and delay and is authorized by the dedicated audio-control
 permission. The daemon applies each update transactionally to every active and
 pending ordinary/Stinger mixer, with 240-sample linear live gain and balance
-ramps and next-sample mute/follow-video/delay changes, before checkpointing the
+ramps and next-sample mute/solo/follow-video/delay changes, before checkpointing the
 canonical project. The local and remote CLI expose the command, exact status,
 and input labels; Studio renders persisted names with Ready- and
 permission-gated per-input controls; Web exposes the equivalent
