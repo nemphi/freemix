@@ -720,7 +720,10 @@ remote Start, integer `0..=10_000` basis-point position, Commit, and Cancel
 commands; local command processes restore/mutate/save the engine checkpoint,
 and remote commands use the current contract. Studio presents replicated desired and realized kind, routing, and
 exact position without treating widget state as engine truth. Its manual
-controls require Ready state and transition permission. Reconnect handling
+controls require Ready state and transition permission. While either replicated
+manual state is active, Studio disables automatic Program/Preview transitions and
+input-bank Preview selection, but leaves Fade-to-Black and overlay controls
+independently gated. Reconnect handling
 preserves strict worker FIFO. Web's transport-free semantic model
 retains the manual controls and adds FTB live/black actions, a bounded duration,
 exact separate desired and realized state, reversal through the opposite target,

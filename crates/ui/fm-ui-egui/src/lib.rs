@@ -254,6 +254,7 @@ pub struct TransitionGate {
     pub connection_status: StudioConnectionStatus,
     pub has_view: bool,
     pub can_transition: bool,
+    pub manual_transition_in_flight: bool,
 }
 
 impl TransitionGate {
@@ -263,6 +264,10 @@ impl TransitionGate {
             connection_status: state.connection_status,
             has_view: state.view.is_some(),
             can_transition: state.can_transition,
+            manual_transition_in_flight: match &state.view {
+                Some(view) => manual_transition_in_flight(view.switcher),
+                None => false,
+            },
         }
     }
 }
@@ -297,7 +302,10 @@ impl ManualTransitionGate {
 /// Computes transition availability without drawing or dispatching intents.
 #[must_use]
 pub const fn transition_availability(gate: TransitionGate) -> TransitionAvailability {
-    let base = gate.connection_status.controls_enabled() && gate.has_view && gate.can_transition;
+    let base = gate.connection_status.controls_enabled()
+        && gate.has_view
+        && gate.can_transition
+        && !gate.manual_transition_in_flight;
     TransitionAvailability {
         base: TransitionBaseAvailability {
             basic: base,
@@ -310,6 +318,23 @@ pub const fn transition_availability(gate: TransitionGate) -> TransitionAvailabi
         alpha_fade: base,
         wipe: base,
     }
+}
+
+const fn manual_transition_in_flight(switcher: SwitcherState) -> bool {
+    matches!(
+        switcher.desired_manual_transition,
+        ManualTransitionStatus::Active(_)
+    ) || matches!(
+        switcher.realized_manual_transition,
+        ManualTransitionStatus::Active(_)
+    )
+}
+
+const fn preview_selection_available(gate: TransitionGate, can_select_preview: bool) -> bool {
+    gate.connection_status.controls_enabled()
+        && gate.has_view
+        && can_select_preview
+        && !gate.manual_transition_in_flight
 }
 
 /// Computes manual T-bar availability without drawing or dispatching intents.
@@ -1228,9 +1253,10 @@ fn draw_inputs(ui: &mut Ui, state: &StudioUiState, intents: &mut Vec<StudioInten
     });
     ui.add_space(4.0);
 
-    let enabled = state.connection_status.controls_enabled()
-        && state.view.is_some()
-        && state.can_select_preview;
+    let enabled = preview_selection_available(
+        TransitionGate::from_state(state),
+        state.can_select_preview,
+    );
     ScrollArea::vertical()
         .id_salt("studio-input-bank")
         .auto_shrink([false, false])
@@ -1515,6 +1541,7 @@ mod tests {
             connection_status: StudioConnectionStatus::Ready,
             has_view: true,
             can_transition: true,
+            manual_transition_in_flight: false,
         };
         assert_eq!(
             transition_availability(base),
@@ -1567,6 +1594,48 @@ mod tests {
                     wipe: false,
                 }
             );
+        }
+    }
+
+    #[test]
+    fn manual_transition_in_flight_blocks_conflicting_operator_controls() {
+        let active = ManualTransitionStatus::Active(ActiveManualTransition {
+            kind: ManualTransitionKind::Fade,
+            from: input(1),
+            to: input(2),
+            interval_start: ManualTransitionPosition::START,
+            position: ManualTransitionPosition::START,
+        });
+        let mut desired_active = switcher((1, 2), (1, 2));
+        desired_active.desired_manual_transition = active;
+        let mut realized_active = switcher((1, 2), (1, 2));
+        realized_active.realized_manual_transition = active;
+        for switcher in [desired_active, realized_active] {
+            let gate = TransitionGate {
+                connection_status: StudioConnectionStatus::Ready,
+                has_view: true,
+                can_transition: true,
+                manual_transition_in_flight: manual_transition_in_flight(switcher),
+            };
+            assert!(gate.manual_transition_in_flight);
+            let automatic = transition_availability(gate);
+            assert!(!automatic.basic());
+            assert!(!automatic.alpha_fade);
+            assert!(!automatic.wipe);
+            assert!(!automatic.slide());
+            assert!(!automatic.zoom());
+            assert!(!automatic.stinger());
+            assert!(!preview_selection_available(gate, true));
+            let fade_to_black = fade_to_black::fade_to_black_availability(
+                fade_to_black::FadeToBlackGate {
+                    connection_status: StudioConnectionStatus::Ready,
+                    has_view: true,
+                    can_transition: true,
+                },
+                Some(switcher.desired_fade_to_black),
+            );
+            assert!(fade_to_black.to_black);
+            assert!(fade_to_black.duration);
         }
     }
 
