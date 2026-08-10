@@ -4419,7 +4419,9 @@ fn command_ticks(
         | CommandPayload::FadeToBlack {
             duration_frames, ..
         } => duration_frames,
-        CommandPayload::TakeOverlay { channel, .. } | CommandPayload::OverlayOff { channel } => {
+        CommandPayload::TakeOverlay { channel, .. }
+        | CommandPayload::OverlayOff { channel }
+        | CommandPayload::TakeNextOverlay { channel } => {
             let channel =
                 OverlayChannelId::new(channel.number()).expect("wire overlay channels are bounded");
             prepared.overlay_transition_ticks(channel)
@@ -4434,7 +4436,6 @@ fn command_ticks(
         | CommandPayload::ConfigureOverlayTransition { .. }
         | CommandPayload::ConfigureOverlayAppearance { .. }
         | CommandPayload::QueueOverlay { .. }
-        | CommandPayload::TakeNextOverlay { .. }
         | CommandPayload::StartManualTransition { .. }
         | CommandPayload::SetManualTransitionPosition { .. }
         | CommandPayload::CommitManualTransition
@@ -7535,6 +7536,79 @@ mod tests {
         let mut expected_project = original_project;
         expected_project.set_main_mix(durable.project().main_mix().unwrap());
         assert_eq!(durable.project(), &expected_project);
+    }
+
+    #[test]
+    fn queued_fade_take_next_settles_before_checkpoint() {
+        let mut durable = test_project();
+        let mut control = test_control(&durable);
+        let saver = CountingSaver::default();
+        let server = test_server(&control);
+        let channel = fm_protocol::WireOverlayChannelId::new(1).unwrap();
+
+        execute_durable_command(
+            &mut control,
+            &saver,
+            &mut durable,
+            &operator(),
+            &server,
+            &test_command(
+                "overlay-transition",
+                "overlay-transition-key",
+                CommandPayload::ConfigureOverlayTransition {
+                    channel,
+                    transition: fm_protocol::OverlayTransitionKind::Fade,
+                    duration_frames: 4,
+                },
+            ),
+            0,
+        )
+        .unwrap();
+        execute_durable_command(
+            &mut control,
+            &saver,
+            &mut durable,
+            &operator(),
+            &server,
+            &test_command(
+                "overlay-queue",
+                "overlay-queue-key",
+                CommandPayload::QueueOverlay {
+                    channel,
+                    source: fm_protocol::WireInputId::from_domain(test_input_id(2)),
+                },
+            ),
+            0,
+        )
+        .unwrap();
+        let next = execute_durable_command(
+            &mut control,
+            &saver,
+            &mut durable,
+            &operator(),
+            &server,
+            &test_command(
+                "overlay-next",
+                "overlay-next-key",
+                CommandPayload::TakeNextOverlay { channel },
+            ),
+            0,
+        )
+        .unwrap();
+
+        assert!(matches!(next.submission.output.result, CommandResult::Accepted { .. }));
+        assert_eq!(durable.position().frames_rendered, 6);
+        let restored = restore_engine(&durable).unwrap().snapshot().unwrap();
+        let live = live_engine_snapshot(&mut control);
+        assert_eq!(live, restored);
+        let channel = OverlayChannelId::new(channel.number()).unwrap();
+        let desired = live.show().desired_switcher().overlay(channel);
+        let realized = live.realized_switcher().overlay(channel);
+        assert_eq!(desired, realized);
+        assert_eq!(desired.source(), Some(test_input_id(2)));
+        assert!(desired.is_active());
+        assert_eq!(desired.opacity(), u8::MAX);
+        assert!(desired.queued_sources().is_empty());
     }
 
     #[test]
