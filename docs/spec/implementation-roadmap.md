@@ -457,8 +457,8 @@ configuration; status prints both desired and realized arrays with opacity,
 transition, appearance, and queue state. Web exposes transport-free semantic
 controls, and Studio exposes Take Preview, Queue Preview, Take Next, Off, and
 per-channel Cut/Fade/position/border controls and displays desired and
-last-confirmed realized overlay state for all eight channels; this is not
-output-video evidence. The native
+last-confirmed realized source, activity, opacity, queue, and appearance
+summaries for all eight channels; this is not output-video evidence. The native
 daemon derives a stable realization for every configured project output, unions
 their active overlay sources into one scene-execution closure, renders the
 authoritative Program transition or Stinger base once, and then produces and
