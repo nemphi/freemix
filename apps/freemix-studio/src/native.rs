@@ -90,10 +90,71 @@ fn try_enqueue(
     })
 }
 
+struct PendingIntents {
+    intents: VecDeque<StudioIntent>,
+}
+
+impl PendingIntents {
+    fn new() -> Self {
+        Self {
+            intents: VecDeque::with_capacity(REQUEST_CAPACITY),
+        }
+    }
+
+    fn submit(
+        &mut self,
+        sender: &SyncSender<WorkerRequest>,
+        intent: StudioIntent,
+    ) -> Result<(), EnqueueError> {
+        if self.intents.is_empty() {
+            match try_enqueue(sender, WorkerRequest::Intent(intent)) {
+                Ok(()) => return Ok(()),
+                Err(EnqueueError::Disconnected) => return Err(EnqueueError::Disconnected),
+                Err(EnqueueError::Full) => {}
+            }
+        }
+        self.push(intent)
+    }
+
+    fn flush(&mut self, sender: &SyncSender<WorkerRequest>) -> Result<(), EnqueueError> {
+        while let Some(intent) = self.intents.front().copied() {
+            match try_enqueue(sender, WorkerRequest::Intent(intent)) {
+                Ok(()) => {
+                    self.intents.pop_front();
+                }
+                Err(EnqueueError::Full) => return Ok(()),
+                Err(EnqueueError::Disconnected) => return Err(EnqueueError::Disconnected),
+            }
+        }
+        Ok(())
+    }
+
+    fn push(&mut self, intent: StudioIntent) -> Result<(), EnqueueError> {
+        if let (
+            Some(StudioIntent::SetManualTransitionPosition { position: current }),
+            StudioIntent::SetManualTransitionPosition { position },
+        ) = (self.intents.back_mut(), intent)
+        {
+            *current = position;
+            return Ok(());
+        }
+        if self.intents.len() == REQUEST_CAPACITY {
+            return Err(EnqueueError::Full);
+        }
+        self.intents.push_back(intent);
+        Ok(())
+    }
+
+    fn clear(&mut self) {
+        self.intents.clear();
+    }
+}
+
 struct StudioApp {
     shell: StudioShell,
     state: StudioUiState,
     requests: Option<SyncSender<WorkerRequest>>,
+    pending_intents: PendingIntents,
     updates: Option<StateUpdates>,
     worker: Option<JoinHandle<()>>,
     shutdown_sent: bool,
@@ -116,6 +177,7 @@ impl StudioApp {
             shell: StudioShell::default(),
             state: StudioUiState::new(StudioConnectionStatus::Launching),
             requests: Some(request_sender),
+            pending_intents: PendingIntents::new(),
             updates: Some(updates),
             worker: Some(worker),
             shutdown_sent: false,
@@ -124,6 +186,38 @@ impl StudioApp {
 
     fn report_enqueue_error(&mut self, error: EnqueueError) {
         self.state.error = Some(error.to_string());
+    }
+
+    fn enqueue_intent(&mut self, intent: StudioIntent) {
+        let result = self
+            .requests
+            .as_ref()
+            .map_or(Err(EnqueueError::Disconnected), |sender| {
+                self.pending_intents.submit(sender, intent)
+            });
+        if let Err(error) = result {
+            self.handle_enqueue_error(error);
+        }
+    }
+
+    fn flush_pending_intents(&mut self) {
+        let result = self
+            .requests
+            .as_ref()
+            .map_or(Err(EnqueueError::Disconnected), |sender| {
+                self.pending_intents.flush(sender)
+            });
+        if let Err(error) = result {
+            self.handle_enqueue_error(error);
+        }
+    }
+
+    fn handle_enqueue_error(&mut self, error: EnqueueError) {
+        if error == EnqueueError::Disconnected {
+            self.pending_intents.clear();
+            self.requests.take();
+        }
+        self.report_enqueue_error(error);
     }
 
     fn send_shutdown(&mut self) {
@@ -146,12 +240,9 @@ impl eframe::App for StudioApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.flush_pending_intents();
         for intent in self.shell.draw(ui, &self.state) {
-            if let Some(requests) = &self.requests
-                && let Err(error) = try_enqueue(requests, WorkerRequest::Intent(intent))
-            {
-                self.report_enqueue_error(error);
-            }
+            self.enqueue_intent(intent);
         }
     }
 
@@ -1426,8 +1517,9 @@ mod tests {
     use fm_protocol::{
         CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, EngineIdentity, FadeToBlackPosition,
         FadeToBlackState, HandshakeOutcome, HandshakeResponse, HeartbeatAcknowledgementMessage,
-        InputAudioStripStatus, InputStatus, ManualTransitionStatus, OverlayStatus, Role,
-        ServerIdentity, SnapshotMessage, SnapshotReason, WireMessage, decode_line, encode_line,
+        InputAudioStripStatus, InputStatus, ManualTransitionPosition, ManualTransitionStatus,
+        OverlayStatus, Role, ServerIdentity, SnapshotMessage, SnapshotReason, WireMessage,
+        decode_line, encode_line,
     };
     use fm_types::ProjectId;
     use fm_ui_model::{
@@ -1671,6 +1763,63 @@ mod tests {
         );
         drop(updates);
         assert!(!publisher.publish(StudioUiState::new(StudioConnectionStatus::Failed)));
+    }
+
+    fn manual_position(basis_points: u16) -> StudioIntent {
+        StudioIntent::SetManualTransitionPosition {
+            position: ManualTransitionPosition::new(basis_points).unwrap(),
+        }
+    }
+
+    #[test]
+    fn pending_intents_coalesce_manual_positions_after_outer_queue_full() {
+        let (sender, receiver) = sync_channel(1);
+        sender
+            .send(WorkerRequest::Intent(StudioIntent::Cut))
+            .unwrap();
+        let mut pending = PendingIntents::new();
+        for position in [1_000, 2_000, 3_000] {
+            assert_eq!(pending.submit(&sender, manual_position(position)), Ok(()));
+        }
+
+        assert_eq!(
+            receiver.recv().unwrap(),
+            WorkerRequest::Intent(StudioIntent::Cut)
+        );
+        assert_eq!(pending.flush(&sender), Ok(()));
+        assert_eq!(
+            receiver.recv().unwrap(),
+            WorkerRequest::Intent(manual_position(3_000))
+        );
+    }
+
+    #[test]
+    fn pending_intents_keep_manual_position_before_commit_after_retry() {
+        let (sender, receiver) = sync_channel(1);
+        sender
+            .send(WorkerRequest::Intent(StudioIntent::Cut))
+            .unwrap();
+        let mut pending = PendingIntents::new();
+        assert_eq!(pending.submit(&sender, manual_position(3_000)), Ok(()));
+        assert_eq!(
+            pending.submit(&sender, StudioIntent::CommitManualTransition),
+            Ok(())
+        );
+
+        assert_eq!(
+            receiver.recv().unwrap(),
+            WorkerRequest::Intent(StudioIntent::Cut)
+        );
+        assert_eq!(pending.flush(&sender), Ok(()));
+        assert_eq!(
+            receiver.recv().unwrap(),
+            WorkerRequest::Intent(manual_position(3_000))
+        );
+        assert_eq!(pending.flush(&sender), Ok(()));
+        assert_eq!(
+            receiver.recv().unwrap(),
+            WorkerRequest::Intent(StudioIntent::CommitManualTransition)
+        );
     }
 
     #[cfg(unix)]

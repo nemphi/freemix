@@ -124,7 +124,9 @@ controls. Manual Fade/Wipe/AlphaFade/Slide T-bar controls require transition per
 synchronized state, and Ready lifecycle. The manual panel displays
 replicated desired and realized kind, routing, and exact integer basis-point
 position. Bounded worker channels preserve strict operator FIFO while
-recovering, and later intents cannot overtake unresolved commands. `fm-client` retains a
+recovering, and later intents cannot overtake unresolved commands. Native Studio
+locally retains bounded unsent intents and coalesces adjacent manual-position
+values while preserving action order. `fm-client` retains a
 bounded terminal command history (256 by default, configurable through 65,536),
 while replay-receipt collisions mark affected sent commands terminal-uncertain,
 force authoritative snapshot resynchronization, and remain visibly sticky in
