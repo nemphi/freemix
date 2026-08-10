@@ -7545,56 +7545,44 @@ mod tests {
         let saver = CountingSaver::default();
         let server = test_server(&control);
         let channel = fm_protocol::WireOverlayChannelId::new(1).unwrap();
+        let mut execute = |id, key, payload| {
+            execute_durable_command(
+                &mut control,
+                &saver,
+                &mut durable,
+                &operator(),
+                &server,
+                &test_command(id, key, payload),
+                0,
+            )
+        };
 
-        execute_durable_command(
-            &mut control,
-            &saver,
-            &mut durable,
-            &operator(),
-            &server,
-            &test_command(
-                "overlay-transition",
-                "overlay-transition-key",
-                CommandPayload::ConfigureOverlayTransition {
-                    channel,
-                    transition: fm_protocol::OverlayTransitionKind::Fade,
-                    duration_frames: 4,
-                },
-            ),
-            0,
+        execute(
+            "overlay-transition",
+            "overlay-transition-key",
+            CommandPayload::ConfigureOverlayTransition {
+                channel,
+                transition: fm_protocol::OverlayTransitionKind::Fade,
+                duration_frames: 4,
+            },
         )
         .unwrap();
-        execute_durable_command(
-            &mut control,
-            &saver,
-            &mut durable,
-            &operator(),
-            &server,
-            &test_command(
-                "overlay-queue",
-                "overlay-queue-key",
-                CommandPayload::QueueOverlay {
-                    channel,
-                    source: fm_protocol::WireInputId::from_domain(test_input_id(2)),
-                },
-            ),
-            0,
+        execute(
+            "overlay-queue",
+            "overlay-queue-key",
+            CommandPayload::QueueOverlay {
+                channel,
+                source: fm_protocol::WireInputId::from_domain(test_input_id(2)),
+            },
         )
         .unwrap();
-        let next = execute_durable_command(
-            &mut control,
-            &saver,
-            &mut durable,
-            &operator(),
-            &server,
-            &test_command(
-                "overlay-next",
-                "overlay-next-key",
-                CommandPayload::TakeNextOverlay { channel },
-            ),
-            0,
+        let next = execute(
+            "overlay-next",
+            "overlay-next-key",
+            CommandPayload::TakeNextOverlay { channel },
         )
         .unwrap();
+        drop(execute);
 
         assert!(matches!(next.submission.output.result, CommandResult::Accepted { .. }));
         assert_eq!(durable.position().frames_rendered, 6);
