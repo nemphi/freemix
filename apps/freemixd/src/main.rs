@@ -1508,10 +1508,8 @@ impl NativeProgramRecorder {
     fn fail(&mut self, failure: String, app_capture_failure: bool) {
         if let Some((failure, app_capture_failure)) = self.capture.fail(failure, app_capture_failure)
         {
-            eprintln!(
-                "FREEMIXD_RECORDER_FAILURE\tv=1\tapp_capture_failure={app_capture_failure}\tfailure={}",
-                diagnostic_field(failure),
-            );
+            let notice = recorder_failure_notice(failure, app_capture_failure);
+            eprintln!("{notice}");
             self.recorder.request_cancel();
         }
     }
@@ -2874,6 +2872,14 @@ fn diagnostic_field(value: &str) -> String {
             character => character,
         })
         .collect()
+}
+
+#[cfg(feature = "native-media")]
+fn recorder_failure_notice(failure: &str, app_capture_failure: bool) -> String {
+    format!(
+        "FREEMIXD_RECORDER_FAILURE\tv=1\tapp_capture_failure={app_capture_failure}\tfailure={}",
+        diagnostic_field(failure),
+    )
 }
 
 fn capabilities_digest(native: bool, fullscreen: bool, recorder: bool) -> &'static str {
@@ -6394,17 +6400,18 @@ mod tests {
 
     #[cfg(feature = "native-media")]
     #[test]
-    fn recorder_capture_failure_policy_emits_one_notice() {
+    fn recorder_capture_failure_policy_formats_one_sanitized_notice() {
         let mut policy = RecorderCapturePolicy::default();
-        assert!(policy.active());
-        let first = policy
-            .fail("readback:first".to_owned(), true)
-            .map(|(failure, app_capture_failure)| (failure.to_owned(), app_capture_failure));
-        assert_eq!(first, Some(("readback:first".to_owned(), true)));
-        assert!(!policy.active());
+        let Some((failure, app_capture_failure)) =
+            policy.fail("readback:first\tline\nend".to_owned(), true)
+        else {
+            panic!("first failure must emit a notice");
+        };
+        assert_eq!(
+            recorder_failure_notice(failure, app_capture_failure),
+            "FREEMIXD_RECORDER_FAILURE\tv=1\tapp_capture_failure=true\tfailure=readback:first line end",
+        );
         assert!(policy.fail("enqueue:second".to_owned(), false).is_none());
-        assert_eq!(policy.first_failure.as_deref(), Some("readback:first"));
-        assert!(policy.app_capture_failure);
     }
 
     #[cfg(feature = "native-media")]
