@@ -127,22 +127,20 @@ impl Daemon {
                 Ok(None) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(10));
                 }
-                Ok(None) => {
-                    let stopped = terminate_child(&mut child);
-                    assert!(stopped, "daemon did not stop after exit timeout");
-                    panic!("daemon did not exit within two seconds");
+                Ok(None) => terminate_after_wait_failure(
+                    &mut child,
+                    "daemon did not exit within two seconds",
+                ),
+                Err(error) => {
+                    terminate_after_wait_failure(
+                        &mut child,
+                        &format!("could not inspect daemon status: {error}"),
+                    );
                 }
-                Err(error) => panic!("could not inspect daemon status: {error}"),
             }
         };
         if !status.success() {
-            let mut stderr = String::new();
-            child
-                .stderr
-                .take()
-                .unwrap()
-                .read_to_string(&mut stderr)
-                .unwrap();
+            let stderr = child_stderr(&mut child);
             panic!("daemon exited with {status}: {stderr}");
         }
     }
@@ -173,6 +171,23 @@ fn terminate_child(child: &mut Child) -> bool {
             Ok(None) | Err(_) => return false,
         }
     }
+}
+
+fn terminate_after_wait_failure(child: &mut Child, failure: &str) -> ! {
+    let stopped = terminate_child(child);
+    let stderr = stopped.then(|| child_stderr(child));
+    panic!("{failure}; cleanup_stopped={stopped}; stderr={stderr:?}");
+}
+
+fn child_stderr(child: &mut Child) -> String {
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    stderr
 }
 
 struct Client {
