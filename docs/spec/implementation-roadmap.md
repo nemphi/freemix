@@ -337,8 +337,11 @@ FFmpeg, and writes fragmented MP4 with H.264/libx264 and AAC into a caller-owned
 exclusive empty file. Queue admission, retained bytes, connection/no-progress,
 stop/kill, child reaping, output flush/sync, and sticky failures are bounded. A
 paced pre-readiness barrier requires both a completed raw pair and observed mux
-output; `FREEMIXD_RECORDER` reports frozen pair, output-byte, finalization,
-cleanup, and failure state. `--record-program` enables this path only with
+output; the first capture, backend, readback, frame, or enqueue failure emits a
+sanitized immediate `FREEMIXD_RECORDER_FAILURE` record before cancellation,
+while the final `FREEMIXD_RECORDER` record remains the shutdown result with no
+live telemetry, alerting, restart, or fault-tolerant recording.
+`--record-program` enables this path only with
 `--native-media`; Unix signals and Windows Ctrl-C stop acceptance, settle any
 remaining Fade control state without rendering shutdown-only frames, checkpoint,
 and finalize without publishing false runtime-realized events. Separate

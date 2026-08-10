@@ -1407,13 +1407,16 @@ impl RecorderCapturePolicy {
         self.first_failure.is_none()
     }
 
-    fn fail(&mut self, failure: String, app_capture_failure: bool) -> bool {
+    fn fail(&mut self, failure: String, app_capture_failure: bool) -> Option<(&str, bool)> {
         if self.first_failure.is_some() {
-            return false;
+            return None;
         }
         self.first_failure = Some(failure);
         self.app_capture_failure = app_capture_failure;
-        true
+        Some((
+            self.first_failure.as_deref().expect("failure was stored"),
+            app_capture_failure,
+        ))
     }
 }
 
@@ -1503,7 +1506,12 @@ impl NativeProgramRecorder {
     }
 
     fn fail(&mut self, failure: String, app_capture_failure: bool) {
-        if self.capture.fail(failure, app_capture_failure) {
+        if let Some((failure, app_capture_failure)) = self.capture.fail(failure, app_capture_failure)
+        {
+            eprintln!(
+                "FREEMIXD_RECORDER_FAILURE\tv=1\tapp_capture_failure={app_capture_failure}\tfailure={}",
+                diagnostic_field(failure),
+            );
             self.recorder.request_cancel();
         }
     }
@@ -6133,7 +6141,7 @@ mod tests {
     fn recorder_capability_is_configured_support_not_live_health() {
         let digest = capabilities_digest(true, false, true);
         let mut policy = RecorderCapturePolicy::default();
-        assert!(policy.fail("backend:failed".to_owned(), false));
+        assert!(policy.fail("backend:failed".to_owned(), false).is_some());
         assert_eq!(digest, capabilities_digest(true, false, true));
         assert!(!policy.active());
     }
@@ -6386,12 +6394,15 @@ mod tests {
 
     #[cfg(feature = "native-media")]
     #[test]
-    fn recorder_capture_failure_policy_is_sticky_and_stops_capture_only() {
+    fn recorder_capture_failure_policy_emits_one_notice() {
         let mut policy = RecorderCapturePolicy::default();
         assert!(policy.active());
-        assert!(policy.fail("readback:first".to_owned(), true));
+        let first = policy
+            .fail("readback:first".to_owned(), true)
+            .map(|(failure, app_capture_failure)| (failure.to_owned(), app_capture_failure));
+        assert_eq!(first, Some(("readback:first".to_owned(), true)));
         assert!(!policy.active());
-        assert!(!policy.fail("enqueue:second".to_owned(), false));
+        assert!(policy.fail("enqueue:second".to_owned(), false).is_none());
         assert_eq!(policy.first_failure.as_deref(), Some("readback:first"));
         assert!(policy.app_capture_failure);
     }
