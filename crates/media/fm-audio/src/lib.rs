@@ -1550,7 +1550,7 @@ impl MasterMixer {
                 let source_gain = block.map_or(SourceGain::UNITY, |(_, source_gain)| source_gain);
                 for sample in 0..samples {
                     if let Some(meter_channels) = &mut meter_channels {
-                        for meter in meter_channels.iter_mut() {
+                        for meter in meter_channels[..channels].iter_mut() {
                             meter.begin_sample();
                         }
                     }
@@ -1582,7 +1582,7 @@ impl MasterMixer {
                         }
                     }
                     if let Some(meter_channels) = &mut meter_channels {
-                        for meter in meter_channels.iter_mut() {
+                        for meter in meter_channels[..channels].iter_mut() {
                             meter.end_sample();
                         }
                     }

@@ -1,8 +1,8 @@
 use std::num::NonZeroU128;
 
 use fm_audio::{
-    AudioBlock, AudioError, Balance, ChannelMapping, ChannelMeter, ClippingPolicy, Gain,
-    InputState, MasterMixer, MasterOutput, PlanarAudioSource, SourceGain,
+    AudioBlock, AudioError, Balance, ChannelMapping, ChannelMappingRoute, ChannelMeter,
+    ClippingPolicy, Gain, InputState, MasterMixer, MasterOutput, PlanarAudioSource, SourceGain,
 };
 use fm_frame::{
     ClockDomainId, MediaTiming, NormalizedDuration, NormalizedTimestamp, OriginalTimestamp,
@@ -247,19 +247,68 @@ fn planar_meter_slices_match_allocating_reference_in_stable_order() {
     let format = stereo_format();
     let first = input(1);
     let silent = input(2);
-    let planes = vec![vec![1.0; 4]; 2];
+    let muted = input(3);
+    let follow_video = input(4);
+    let not_soloed = input(5);
+    let planes = vec![vec![1.0; 4], vec![0.5; 4]];
     let mut reference = MasterMixer::new(format.clone()).unwrap();
-    add_input(&mut reference, silent, &format, InputState::default());
-    add_input(
-        &mut reference,
-        first,
-        &format,
-        InputState {
-            gain: Gain::from_linear(0.5).unwrap(),
-            balance: Balance::from_basis_points(5_000).unwrap(),
-            ..InputState::default()
-        },
-    );
+    for (id, state) in [
+        (
+            follow_video,
+            InputState {
+                soloed: true,
+                follow_video: true,
+                ..InputState::default()
+            },
+        ),
+        (
+            silent,
+            InputState {
+                soloed: true,
+                ..InputState::default()
+            },
+        ),
+        (not_soloed, InputState::default()),
+        (
+            muted,
+            InputState {
+                muted: true,
+                soloed: true,
+                ..InputState::default()
+            },
+        ),
+    ] {
+        add_input(&mut reference, id, &format, state);
+    }
+    reference
+        .add_input(
+            first,
+            format.clone(),
+            ChannelMapping::new(
+                format.channels.clone(),
+                format.channels.clone(),
+                vec![
+                    ChannelMappingRoute {
+                        source: Channel::Left,
+                        destination: Channel::Right,
+                        coefficient: 1.0,
+                    },
+                    ChannelMappingRoute {
+                        source: Channel::Right,
+                        destination: Channel::Left,
+                        coefficient: 1.0,
+                    },
+                ],
+            )
+            .unwrap(),
+            InputState {
+                gain: Gain::from_linear(0.5).unwrap(),
+                balance: Balance::from_basis_points(5_000).unwrap(),
+                soloed: true,
+                ..InputState::default()
+            },
+        )
+        .unwrap();
     reference.set_input_delay(first, 1).unwrap();
     let mut planar = reference.clone();
     let source_gain = SourceGain::new(0, 1, 1).unwrap();
@@ -270,18 +319,21 @@ fn planar_meter_slices_match_allocating_reference_in_stable_order() {
         planes.clone(),
     )
     .unwrap();
+    let submitted = [first, muted, follow_video, not_soloed];
+    let blocks = submitted.map(|id| (id, &block, source_gain));
     let expected = reference
-        .mix_timed_with_source_gains(timing(4), 4, &[(first, &block, source_gain)], &[])
+        .mix_timed_with_source_gains(timing(4), 4, &blocks, &[first])
         .unwrap();
     let mut output = vec![vec![0.0; 4]; 2];
     let mut master_meters = [ChannelMeter::default(); 2];
-    let mut input_meters = [ChannelMeter::default(); 4];
+    let mut input_meters = [ChannelMeter::default(); 10];
+    let sources = submitted.map(|id| planar_source(id, &format, &planes, 4, source_gain));
     planar
         .mix_planar_timed_into_with_meters(
             timing(4),
             4,
-            &[planar_source(first, &format, &planes, 4, source_gain)],
-            &[],
+            &sources,
+            &[first],
             &mut output,
             &mut master_meters,
             &mut input_meters,
@@ -291,25 +343,26 @@ fn planar_meter_slices_match_allocating_reference_in_stable_order() {
     assert_eq!(output, expected.block.planes());
     assert_eq!(
         output,
-        [vec![0.0, 0.125, 0.1875, 0.25], vec![0.0, 0.25, 0.375, 0.5]]
+        [
+            vec![0.0, 0.0625, 0.09375, 0.125],
+            vec![0.0, 0.25, 0.375, 0.5]
+        ]
     );
     assert_eq!(master_meters, expected.meters.channels());
     assert_eq!(
-        [
-            expected.input_meters[0].input,
-            expected.input_meters[1].input
-        ],
-        [first, silent]
+        expected
+            .input_meters
+            .iter()
+            .map(|reading| reading.input)
+            .collect::<Vec<_>>(),
+        [first, silent, muted, follow_video, not_soloed]
     );
-    assert_eq!(
-        &input_meters[..2],
-        expected.input_meters[0].meters.channels()
-    );
-    assert_eq!(
-        &input_meters[2..],
-        expected.input_meters[1].meters.channels()
-    );
-    assert_eq!(&input_meters[2..], &[ChannelMeter::default(); 2]);
+    for (actual, expected) in input_meters.chunks_exact(2).zip(&expected.input_meters) {
+        assert_eq!(actual, expected.meters.channels());
+    }
+    assert_meter(input_meters[0], 0.125, (0.028_320_312_5_f32 / 4.0).sqrt());
+    assert_meter(input_meters[1], 0.5, (0.453_125_f32 / 4.0).sqrt());
+    assert_eq!(&input_meters[2..], &[ChannelMeter::default(); 8]);
 }
 
 fn timing(samples: usize) -> MediaTiming {
