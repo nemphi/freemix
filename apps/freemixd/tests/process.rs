@@ -230,12 +230,25 @@ impl Client {
     }
 
     fn handshake(&mut self, cursor: Option<EventCursor>) -> TestHandshake {
-        self.handshake_version(CURRENT_PROTOCOL_VERSION, cursor)
+        self.handshake_as(Role::Operator, cursor)
+    }
+
+    fn handshake_as(&mut self, role: Role, cursor: Option<EventCursor>) -> TestHandshake {
+        self.handshake_version_as(CURRENT_PROTOCOL_VERSION, role, cursor)
     }
 
     fn handshake_version(
         &mut self,
         version: ProtocolVersion,
+        cursor: Option<EventCursor>,
+    ) -> TestHandshake {
+        self.handshake_version_as(version, Role::Operator, cursor)
+    }
+
+    fn handshake_version_as(
+        &mut self,
+        version: ProtocolVersion,
+        role: Role,
         cursor: Option<EventCursor>,
     ) -> TestHandshake {
         let resume_cursor = cursor.map(|cursor| ResumeCursor {
@@ -251,7 +264,7 @@ impl Client {
             protocol: version,
             build: "process-test".into(),
             client_type: ClientType::Integration,
-            desired_role: Role::Operator,
+            desired_role: role,
             resume_cursor,
         }));
         let WireMessage::HandshakeResponse(response) = self.receive() else {
@@ -760,6 +773,136 @@ fn current_client_receives_structured_handshake_rejection() {
     ));
 
     drop(transport);
+    daemon.wait_success();
+}
+
+#[test]
+fn remote_input_rename_is_authorized_replicated_replay_safe_and_survives_restart() {
+    let directory = TestDirectory::new("remote-input-rename");
+    let project_path = directory.project_path();
+    create_rename_project(&project_path);
+
+    let daemon = Daemon::start_without_once(&project_path);
+    let mut unauthorized = daemon.connect();
+    unauthorized.handshake_as(Role::Operator, None);
+    assert!(matches!(unauthorized.receive(), WireMessage::Snapshot(_)));
+    unauthorized.send(&command(
+        "rename-denied",
+        "rename-denied-key",
+        CommandPayload::RenameInput {
+            input: input(1),
+            name: "Denied name".into(),
+        },
+    ));
+    assert!(matches!(
+        unauthorized.next_result(),
+        CommandResult::Rejected {
+            code,
+            current_revision: 0,
+            ..
+        } if code == "permission_denied"
+    ));
+    drop(unauthorized);
+
+    let mut graphics = daemon.connect();
+    graphics.handshake_as(Role::Graphics, None);
+    assert!(matches!(graphics.receive(), WireMessage::Snapshot(_)));
+    graphics.send(&command(
+        "rename-accepted",
+        "rename-accepted-key",
+        CommandPayload::RenameInput {
+            input: input(1),
+            name: "Camera Left".into(),
+        },
+    ));
+    let accepted = graphics.receive();
+    let WireMessage::CommandResult(CommandResult::Accepted {
+        id,
+        revision,
+        scheduled_frame,
+    }) = &accepted
+    else {
+        panic!("unexpected rename result: {accepted:?}");
+    };
+    assert_eq!(
+        (id.as_str(), *revision, *scheduled_frame),
+        ("rename-accepted", 1, Some(0))
+    );
+    assert!(matches!(
+        graphics.receive(),
+        WireMessage::Event(event)
+            if event.cursor.revision == 1
+                && matches!(
+                    event.payload,
+                    fm_protocol::EventPayload::InputRenamed { input: renamed, ref name }
+                        if renamed == input(1) && name == "Camera Left"
+                )
+    ));
+    assert!(matches!(
+        graphics.receive(),
+        WireMessage::RuntimeEvent(runtime)
+            if runtime.revision == 1
+                && runtime.generation == 1
+                && matches!(
+                    runtime.event,
+                    RuntimeLifecycleEvent::Realized { ref domain, .. }
+                        if domain == "project"
+                )
+    ));
+
+    graphics.send(&command(
+        "rename-replay",
+        "rename-accepted-key",
+        CommandPayload::RenameInput {
+            input: input(1),
+            name: "Replay must not apply".into(),
+        },
+    ));
+    assert!(matches!(
+        graphics.next_result(),
+        CommandResult::Accepted {
+            id,
+            revision: 1,
+            ..
+        } if id == "rename-accepted"
+    ));
+    drop(graphics);
+
+    let mut snapshot_client = daemon.connect();
+    let handshake = snapshot_client.handshake_as(Role::Graphics, None);
+    assert_eq!(handshake.current_revision, 1);
+    let WireMessage::Snapshot(snapshot) = snapshot_client.receive() else {
+        panic!("expected snapshot after input rename");
+    };
+    assert!(
+        snapshot
+            .inputs
+            .iter()
+            .any(|status| status.input == input(1) && status.name == "Camera Left")
+    );
+    drop(snapshot_client);
+    daemon.stop();
+
+    let persisted = ProjectStore::new(&project_path).unwrap().load().unwrap();
+    assert_eq!(persisted.position().revision, 1);
+    assert_eq!(persisted.position().frames_rendered, 1);
+    assert_eq!(persisted.idempotency_receipts().len(), 1);
+    assert_eq!(persisted.project().inputs()[0].name, "Camera Left");
+
+    let daemon = Daemon::start(&project_path);
+    let mut restarted = daemon.connect();
+    let handshake = restarted.handshake_as(Role::Graphics, None);
+    assert_eq!(handshake.current_revision, 1);
+    let WireMessage::Snapshot(snapshot) = restarted.receive() else {
+        panic!("expected snapshot after restart");
+    };
+    assert!(
+        snapshot
+            .inputs
+            .iter()
+            .any(|status| status.input == input(1) && status.name == "Camera Left")
+    );
+    drop(restarted);
     daemon.wait_success();
 }
 
@@ -1568,6 +1711,61 @@ fn create_project(path: &Path) {
     )
     .unwrap();
     ProjectStore::new(path).unwrap().save(&project).unwrap();
+}
+
+fn create_rename_project(path: &Path) {
+    let frame_rate = FrameRate::new(25, 1).unwrap();
+    let mut project = Project::new(
+        project_id(),
+        "Rename Test",
+        ProjectSettings {
+            frame_rate,
+            video: VideoFormat {
+                dimensions: VideoDimensions::new(16, 16).unwrap(),
+                frame_rate,
+                pixel_format: PixelFormat::Rgba8,
+                scan: ScanMode::Progressive,
+                color: ColorMetadata::default(),
+            },
+            audio: AudioFormat {
+                sample_rate: SampleRate::new(44_100).unwrap(),
+                sample_format: SampleFormat::I24,
+                channels: ChannelLayout::stereo(),
+            },
+        },
+    );
+    for number in 1..=2 {
+        project.add_input(Input {
+            id: domain_input(number),
+            name: format!("Input {number}"),
+            kind: InputKind::Simulated(SimulatedInput::new(
+                SimulatedVideo::Bars,
+                SimulatedAudio::Silence,
+            )),
+            required_capabilities: Vec::new(),
+        });
+    }
+    project.set_main_mix(MainMix::new(domain_input(1), domain_input(2)));
+    let stored = StoredProject::from_project(
+        project,
+        RuntimeRouting {
+            desired_program_id: Some(domain_input(1)),
+            realized_program_id: Some(domain_input(1)),
+            desired_preview_id: Some(domain_input(2)),
+            realized_preview_id: Some(domain_input(2)),
+        },
+        ProjectPosition {
+            revision: 0,
+            state_epoch: 1,
+            event_sequence: 0,
+            frames_rendered: 0,
+            runtime_generation: 0,
+            clock_time_nanos: 0,
+        },
+        Vec::new(),
+    )
+    .unwrap();
+    ProjectStore::new(path).unwrap().save(&stored).unwrap();
 }
 
 fn canonical_project() -> Project {

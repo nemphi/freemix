@@ -4503,7 +4503,8 @@ fn command_ticks(
                 OverlayChannelId::new(channel.number()).expect("wire overlay channels are bounded");
             prepared.overlay_transition_ticks(channel)
         }
-        CommandPayload::SetInputAudioStrip { .. }
+        CommandPayload::RenameInput { .. }
+        | CommandPayload::SetInputAudioStrip { .. }
         | CommandPayload::SelectPreview { .. }
         | CommandPayload::Cut
         | CommandPayload::ConfigureStinger { .. }
@@ -4573,6 +4574,16 @@ fn stored_project_with_receipts(
     let realized = snapshot.realized_switcher();
     let mut project = durable.project().clone();
     project.set_main_mix(MainMix::new(desired.program(), desired.preview()));
+    for (&input, name) in show.inputs().iter().zip(show.input_names()) {
+        if project
+            .inputs()
+            .iter()
+            .find(|candidate| candidate.id == input)
+            .is_none_or(|candidate| candidate.name != *name)
+        {
+            project.rename_input(input, name.clone())?;
+        }
+    }
     for (&input, &state) in show.input_audio_strips() {
         if !project.set_input_audio_strip(input, model_audio_strip_state(state)) {
             return Err(

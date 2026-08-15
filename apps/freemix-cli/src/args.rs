@@ -84,6 +84,13 @@ pub enum Command {
         follow_video: bool,
         delay_samples: u32,
     },
+    Rename {
+        path: PathBuf,
+        input: u128,
+        name: String,
+        key: Option<String>,
+        expected_revision: Option<u64>,
+    },
     Preview {
         path: PathBuf,
         input: u128,
@@ -227,6 +234,13 @@ pub enum Command {
         soloed: bool,
         follow_video: bool,
         delay_samples: u32,
+        key: Option<String>,
+        expected_revision: Option<u64>,
+    },
+    RemoteRename {
+        address: SocketAddr,
+        input: u128,
+        name: String,
         key: Option<String>,
         expected_revision: Option<u64>,
     },
@@ -427,6 +441,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
             Ok(Command::Status { path })
         }
         "audio-strip" => parse_audio_strip(arguments),
+        "rename" => parse_rename(arguments),
         "preview" => {
             let path = required_path(&mut arguments, "project path")?;
             let input = number(&required(&mut arguments, "input")?, "input")?;
@@ -463,6 +478,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
         "ftb" => parse_local_fade_to_black(arguments),
         "remote-status" => parse_remote_status(arguments),
         "remote-audio-strip" => parse_remote_audio_strip(arguments),
+        "remote-rename" => parse_remote_rename(arguments),
         "remote-preview" => parse_remote_preview(arguments),
         "remote-cut" => parse_remote_cut(arguments),
         "remote-fade" | "remote-alpha-fade" | "remote-slide" | "remote-zoom" | "remote-wipe" => {
@@ -538,6 +554,20 @@ fn parse_audio_strip(mut arguments: impl Iterator<Item = String>) -> Result<Comm
         soloed,
         follow_video,
         delay_samples,
+    })
+}
+
+fn parse_rename(mut arguments: impl Iterator<Item = String>) -> Result<Command, ArgsError> {
+    let path = required_path(&mut arguments, "project path")?;
+    let input = number(&required(&mut arguments, "input")?, "input")?;
+    let name = nonblank(&mut arguments, "input name")?;
+    let (key, expected_revision) = command_options(arguments)?;
+    Ok(Command::Rename {
+        path,
+        input,
+        name,
+        key,
+        expected_revision,
     })
 }
 
@@ -982,6 +1012,20 @@ fn parse_remote_audio_strip(
     })
 }
 
+fn parse_remote_rename(mut arguments: impl Iterator<Item = String>) -> Result<Command, ArgsError> {
+    let address = socket_address(&required(&mut arguments, "address")?)?;
+    let input = number(&required(&mut arguments, "input")?, "input")?;
+    let name = nonblank(&mut arguments, "input name")?;
+    let (key, expected_revision) = command_options(arguments)?;
+    Ok(Command::RemoteRename {
+        address,
+        input,
+        name,
+        key,
+        expected_revision,
+    })
+}
+
 fn parse_remote_preview(mut arguments: impl Iterator<Item = String>) -> Result<Command, ArgsError> {
     let address = socket_address(&required(&mut arguments, "address")?)?;
     let input = number(&required(&mut arguments, "input")?, "input")?;
@@ -1098,6 +1142,18 @@ fn required(
     field: &'static str,
 ) -> Result<String, ArgsError> {
     arguments.next().ok_or(ArgsError::MissingValue(field))
+}
+
+fn nonblank(
+    arguments: &mut impl Iterator<Item = String>,
+    field: &'static str,
+) -> Result<String, ArgsError> {
+    let value = required(arguments, field)?;
+    if value.trim().is_empty() {
+        Err(ArgsError::BlankValue(field))
+    } else {
+        Ok(value)
+    }
 }
 
 fn required_path(

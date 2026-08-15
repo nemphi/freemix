@@ -20,7 +20,7 @@ type RemoteResult<T> = Result<T, Box<dyn Error>>;
 const REMOTE_IO_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub fn status(address: SocketAddr) -> RemoteResult<()> {
-    let remote = Remote::connect(address)?;
+    let remote = Remote::connect(address, Role::Operator)?;
     remote.print_status()
 }
 
@@ -30,12 +30,43 @@ pub fn execute(
     key: Option<String>,
     expected_revision: Option<u64>,
 ) -> RemoteResult<()> {
-    let mut remote = Remote::connect(address)?;
+    let completion = CommandCompletion::for_payload(&payload);
+    let role = if completion == CommandCompletion::Project {
+        Role::Graphics
+    } else {
+        Role::Operator
+    };
+    let mut remote = Remote::connect(address, role)?;
     let key = match key {
         Some(key) => key,
-        None => implicit_key(payload)?,
+        None => implicit_key(&payload)?,
     };
-    remote.execute(payload, key, expected_revision)
+    remote.execute(payload, key, expected_revision, completion)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommandCompletion {
+    Project,
+    Audio,
+    Switcher,
+}
+
+impl CommandCompletion {
+    fn for_payload(payload: &CommandPayload) -> Self {
+        match payload {
+            CommandPayload::RenameInput { .. } => Self::Project,
+            CommandPayload::SetInputAudioStrip { .. } => Self::Audio,
+            _ => Self::Switcher,
+        }
+    }
+
+    const fn domain(self) -> &'static str {
+        match self {
+            Self::Project => "project",
+            Self::Audio => "audio",
+            Self::Switcher => "switcher",
+        }
+    }
 }
 
 struct Remote {
@@ -46,7 +77,7 @@ struct Remote {
 }
 
 impl Remote {
-    fn connect(address: SocketAddr) -> RemoteResult<Self> {
+    fn connect(address: SocketAddr, role: Role) -> RemoteResult<Self> {
         if !address.ip().is_loopback() {
             return Err(RemoteFailure(format!(
                 "development mode requires a loopback address, got {}",
@@ -64,7 +95,7 @@ impl Remote {
             protocol: CURRENT_PROTOCOL_VERSION,
             build: format!("freemix-cli-{}", env!("CARGO_PKG_VERSION")),
             client_type: ClientType::Cli,
-            desired_role: Role::Operator,
+            desired_role: role,
             resume_cursor: None,
         }))?;
 
@@ -91,7 +122,7 @@ impl Remote {
         let mut client = Client::new(ClientConfig::new(
             env!("CARGO_PKG_VERSION"),
             ClientType::Cli,
-            Role::Operator,
+            role,
             unique_client_id()?,
             project_id,
         ))?;
@@ -141,6 +172,7 @@ impl Remote {
         payload: CommandPayload,
         key: String,
         expected_revision: Option<u64>,
+        completion: CommandCompletion,
     ) -> RemoteResult<()> {
         let queued = self
             .client
@@ -180,25 +212,44 @@ impl Remote {
                 Err(RemoteFailure(format!("{code}: {message}")).into())
             }
             CommandResult::Accepted { revision, .. } => {
-                self.read_command_events(revision)?;
+                let already_applied = self
+                    .client
+                    .model()
+                    .reconnect_cursor()
+                    .is_some_and(|cursor| cursor.revision.get() >= revision);
+                if !already_applied {
+                    self.read_command_events(revision, completion)?;
+                }
                 self.print_status()
             }
         }
     }
 
-    fn read_command_events(&mut self, revision: u64) -> RemoteResult<()> {
+    fn read_command_events(
+        &mut self,
+        revision: u64,
+        completion: CommandCompletion,
+    ) -> RemoteResult<()> {
         let mut durable = false;
         let mut realized = false;
         while !durable || !realized {
             match self.read()? {
                 WireMessage::Event(event) => {
                     let matches_revision = event.cursor.revision == revision;
-                    if matches_revision
-                        && !matches!(event.payload, EventPayload::DesiredSwitcher { .. })
-                    {
-                        return Err(
-                            RemoteFailure("command event was not desired_switcher".into()).into(),
-                        );
+                    let expected_event = match &event.payload {
+                        EventPayload::InputRenamed { .. } => {
+                            completion == CommandCompletion::Project
+                        }
+                        EventPayload::DesiredSwitcher { .. }
+                        | EventPayload::StingerSlotsChanged { .. } => {
+                            completion != CommandCompletion::Project
+                        }
+                    };
+                    if matches_revision && !expected_event {
+                        return Err(RemoteFailure(
+                            "command event has the wrong durable domain".into(),
+                        )
+                        .into());
                     }
                     self.client.intake(WireMessage::Event(event))?;
                     durable |= matches_revision;
@@ -208,7 +259,7 @@ impl Remote {
                         && matches!(
                             &runtime.event,
                             RuntimeLifecycleEvent::Realized { domain, .. }
-                                if domain == "switcher"
+                                if domain == completion.domain()
                         );
                     self.client.intake(WireMessage::RuntimeEvent(runtime))?;
                     realized |= matches_realization;
@@ -413,7 +464,7 @@ fn result_id(result: &CommandResult) -> &str {
     }
 }
 
-fn implicit_key(payload: CommandPayload) -> RemoteResult<String> {
+fn implicit_key(payload: &CommandPayload) -> RemoteResult<String> {
     let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     Ok(format!(
         "remote-cli:{timestamp:032x}:{:08x}:{payload:?}",

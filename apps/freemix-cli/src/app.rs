@@ -106,6 +106,22 @@ pub fn run(command: Command) -> AppResult<()> {
             None,
             None,
         )?,
+        Command::Rename {
+            path,
+            input,
+            name,
+            key,
+            expected_revision,
+        } => mutate(
+            &path,
+            EngineCommand::RenameInput {
+                input: input_id(input)?,
+                name,
+            },
+            1,
+            key,
+            expected_revision,
+        )?,
         Command::Preview {
             path,
             input,
@@ -430,6 +446,24 @@ pub fn run(command: Command) -> AppResult<()> {
                 delay_samples: InputDelaySamples::new(delay_samples)
                     .ok_or_else(|| AppFailure("delay samples must be in 0..=48000".into()))?
                     .get(),
+            },
+            key,
+            expected_revision,
+        )?,
+        Command::RemoteRename {
+            address,
+            input,
+            name,
+            key,
+            expected_revision,
+        } => remote::execute(
+            address,
+            fm_protocol::CommandPayload::RenameInput {
+                input: fm_protocol::WireInputId::new(
+                    NonZeroU128::new(input)
+                        .ok_or_else(|| AppFailure("input ID must be nonzero".into()))?,
+                ),
+                name,
             },
             key,
             expected_revision,
@@ -836,7 +870,7 @@ fn execute(
 ) -> AppResult<ExecuteResult> {
     let key = match key {
         Some(key) => key,
-        None => generate_implicit_key(command, expected_revision)?,
+        None => generate_implicit_key(&command, expected_revision)?,
     };
     let mut envelope = CommandEnvelope::new(format!("command-{key}"), key, command);
     if let Some(revision) = expected_revision {
@@ -861,7 +895,7 @@ fn execute(
 }
 
 fn generate_implicit_key(
-    command: EngineCommand,
+    command: &EngineCommand,
     expected_revision: Option<u64>,
 ) -> AppResult<String> {
     let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
@@ -976,6 +1010,7 @@ fn save_engine(path: &Path, project_engine: &ProjectEngine) -> AppResult<()> {
     let realized = snapshot.realized_switcher();
     let mut project = project_engine.project.clone();
     project.set_main_mix(MainMix::new(desired.program(), desired.preview()));
+    sync_input_names(&mut project, snapshot.show())?;
     sync_input_audio_strips(&mut project, snapshot.show())?;
     let stored = StoredProject::from_project_with_complete_runtime_state(
         project,
@@ -1009,6 +1044,20 @@ fn save_engine(path: &Path, project_engine: &ProjectEngine) -> AppResult<()> {
             .collect::<AppResult<Vec<_>>>()?,
     )?;
     ProjectStore::new(path)?.save(&stored)?;
+    Ok(())
+}
+
+fn sync_input_names(project: &mut Project, show: &ShowState) -> AppResult<()> {
+    for (&input, name) in show.inputs().iter().zip(show.input_names()) {
+        if project
+            .inputs()
+            .iter()
+            .find(|candidate| candidate.id == input)
+            .is_none_or(|candidate| candidate.name != *name)
+        {
+            project.rename_input(input, name.clone())?;
+        }
+    }
     Ok(())
 }
 
@@ -1632,6 +1681,7 @@ Usage:
   freemix-cli new <show.freemix> [--name <name>]
   freemix-cli status <show.freemix>
   freemix-cli audio-strip <show.freemix> <input> <gain-millidb:-96000..=24000> <balance-bp:-10000..=10000> <muted:on|off> <soloed:on|off> <follow-video:on|off> <delay-samples:0..=48000>
+  freemix-cli rename <show.freemix> <input> <name> [--key <key>] [--expect <revision>]
   freemix-cli preview <show.freemix> <input> [--key <key>] [--expect <revision>]
   freemix-cli cut <show.freemix> [--key <key>] [--expect <revision>]
   freemix-cli fade <show.freemix> <frames> [--key <key>] [--expect <revision>]
@@ -1657,6 +1707,7 @@ Usage:
   freemix-cli ftb <show.freemix> <live|black> <frames> [--key <key>] [--expect <revision>]
   freemix-cli remote-status <127.0.0.1:port>
   freemix-cli remote-audio-strip <127.0.0.1:port> <input> <gain-millidb:-96000..=24000> <balance-bp:-10000..=10000> <muted:on|off> <soloed:on|off> <follow-video:on|off> <delay-samples:0..=48000> [--key <key>] [--expect <revision>]
+  freemix-cli remote-rename <127.0.0.1:port> <input> <name> [--key <key>] [--expect <revision>]
   freemix-cli remote-preview <127.0.0.1:port> <input> [--key <key>] [--expect <revision>]
   freemix-cli remote-cut <127.0.0.1:port> [--key <key>] [--expect <revision>]
   freemix-cli remote-fade <127.0.0.1:port> <frames> [--key <key>] [--expect <revision>]
