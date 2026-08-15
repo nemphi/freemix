@@ -846,7 +846,22 @@ fn draw_input_audio_strips(ui: &mut Ui, state: &StudioUiState, intents: &mut Vec
                     let mut soloed = status.soloed;
                     let mut follow_video = status.follow_video;
                     let mut delay_samples = status.delay_samples;
-                    let gain_changed = ui
+                    let fader_changed = ui
+                        .scope(|ui| {
+                            ui.spacing_mut().slider_width = 120.0;
+                            ui.spacing_mut().interact_size.y = 28.0;
+                            ui.add_enabled(
+                                enabled,
+                                egui::Slider::new(&mut gain_millidb, -96_000..=24_000)
+                                    .vertical()
+                                    .step_by(100.0)
+                                    .show_value(false),
+                            )
+                            .on_hover_text("Input gain in one-thousandth of a decibel")
+                            .changed()
+                        })
+                        .inner;
+                    let entry_changed = ui
                         .add_enabled(
                             enabled,
                             DragValue::new(&mut gain_millidb)
@@ -856,6 +871,12 @@ fn draw_input_audio_strips(ui: &mut Ui, state: &StudioUiState, intents: &mut Vec
                         )
                         .on_hover_text("Input gain in one-thousandth of a decibel")
                         .changed();
+                    ui.label(
+                        RichText::new(format!("{:.3} dB", f64::from(gain_millidb) / 1000.0))
+                            .small()
+                            .color(MUTED),
+                    );
+                    let gain_changed = fader_changed || entry_changed;
                     let balance_changed = ui
                         .add_enabled(
                             enabled,

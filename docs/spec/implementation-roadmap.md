@@ -275,9 +275,11 @@ an optimistic change or changes current switcher state. Studio exposes compact
 Up/Down controls
 for one-step reorder, gated by the current Ready session and EditProject
 permission; the native worker resolves each move against the latest confirmed
-order and the daemon remains final authority. Input add/remove, duplicate, categories,
-colors, pause, close, offline, relink, and import remain planned. There are still
-no audio meters in Studio, PFL, strip-name editor, strip groups, bus
+order and the daemon remains final authority. Input add/remove, duplicate,
+categories, colors, pause, close, offline, relink, and import remain planned.
+Studio now has a compact permission-gated gain fader with exact milli-dB entry.
+There are still no audio meters in Studio, PFL, strip-name editor, strip groups,
+bus
 sends, microphone automix, device-audio path,
 device-clock correction, native EQ/gate/compressor/limiter, or acceptance
 evidence. Phase 2 item 7 is partial, Phase 3 item 3 is partial, and
