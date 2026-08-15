@@ -26,6 +26,7 @@ Client options:
   --role <ROLE>          viewer, graphics, audio, replay, operator, or admin
                          [default: operator]
   --max-restarts <COUNT> Maximum supervised daemon restarts [default: 3]
+  --osc-listen <ADDR>    Receive OSC control on a loopback address and nonzero port
   --diagnose             Run the one-shot TCP connection diagnostic instead of Studio
   -h, --help             Print help
   -V, --version          Print version";
@@ -45,6 +46,7 @@ pub struct StudioConfig {
     pub client_id: String,
     pub desired_role: Role,
     pub restart_policy: RestartPolicy,
+    pub osc_listen: Option<SocketAddr>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -93,6 +95,8 @@ pub enum ArgsError {
     SupervisedOnly(&'static str),
     ExistingOnly(&'static str),
     NonLoopbackListen(SocketAddr),
+    InvalidOscListen(SocketAddr),
+    OscUnavailableInDiagnose,
     UnknownArgument(String),
 }
 
@@ -130,6 +134,13 @@ impl fmt::Display for ArgsError {
                 formatter,
                 "supervised listen address must be loopback, got {address}"
             ),
+            Self::InvalidOscListen(address) => write!(
+                formatter,
+                "OSC listen address must be loopback with a nonzero port, got {address}"
+            ),
+            Self::OscUnavailableInDiagnose => {
+                formatter.write_str("--osc-listen cannot be used with --diagnose")
+            }
             Self::UnknownArgument(argument) => write!(formatter, "unknown argument `{argument}`"),
         }
     }
@@ -159,6 +170,7 @@ pub fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<Command
     let mut client_id = None;
     let mut role = None;
     let mut maximum_restarts = None;
+    let mut osc_listen = None;
     let mut diagnose = None;
     let mut arguments = arguments.into_iter();
     while let Some(option) = arguments.next() {
@@ -203,12 +215,25 @@ pub fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<Command
                     .map_err(|_| ArgsError::InvalidRestartCount(value))?;
                 set_once(&mut maximum_restarts, count, "--max-restarts")?;
             }
+            "--osc-listen" => {
+                let value = required(&mut arguments, "--osc-listen")?;
+                let address = socket_address("--osc-listen", &value)?;
+                set_once(&mut osc_listen, address, "--osc-listen")?;
+            }
             "--diagnose" => set_once(&mut diagnose, (), "--diagnose")?,
             _ => return Err(ArgsError::UnknownArgument(option)),
         }
     }
 
     let connection = connection_config(project, daemon, listen, connect, project_id)?;
+    if diagnose.is_some() && osc_listen.is_some() {
+        return Err(ArgsError::OscUnavailableInDiagnose);
+    }
+    if let Some(address) = osc_listen
+        && (!address.ip().is_loopback() || address.port() == 0)
+    {
+        return Err(ArgsError::InvalidOscListen(address));
+    }
 
     let config = StudioConfig {
         connection,
@@ -217,6 +242,7 @@ pub fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<Command
         restart_policy: RestartPolicy {
             maximum_restarts: maximum_restarts.unwrap_or(3),
         },
+        osc_listen,
     };
     Ok(if diagnose.is_some() {
         Command::Diagnose(config)

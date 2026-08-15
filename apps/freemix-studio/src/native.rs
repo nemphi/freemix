@@ -1984,6 +1984,7 @@ mod tests {
                     restart_policy: RestartPolicy {
                         maximum_restarts: 1,
                     },
+                    osc_listen: None,
                 },
                 &request_receiver,
                 &publisher,

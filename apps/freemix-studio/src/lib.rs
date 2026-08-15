@@ -2,6 +2,7 @@
 
 mod args;
 mod native;
+mod osc;
 mod runtime;
 mod supervisor;
 
