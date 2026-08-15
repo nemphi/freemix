@@ -170,6 +170,7 @@ pub struct StudioUiState {
     pub can_control_audio: bool,
     pub pending_commands: usize,
     pub notice: Option<String>,
+    pub external_notice: Option<String>,
     pub error: Option<String>,
 }
 
@@ -185,6 +186,7 @@ impl StudioUiState {
             can_control_audio: false,
             pending_commands: 0,
             notice: None,
+            external_notice: None,
             error: None,
         }
     }
@@ -1243,6 +1245,9 @@ fn draw_messages(ui: &mut Ui, state: &StudioUiState) {
         );
     }
     if let Some(notice) = &state.notice {
+        ui.label(RichText::new(format!("NOTICE | {notice}")).color(AMBER));
+    }
+    if let Some(notice) = &state.external_notice {
         ui.label(RichText::new(format!("NOTICE | {notice}")).color(AMBER));
     }
 }

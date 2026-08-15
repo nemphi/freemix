@@ -192,6 +192,7 @@ struct StudioApp {
     shutdown_sent: bool,
     osc: Option<OscReceiver>,
     osc_rejected: u64,
+    osc_notice: Option<String>,
 }
 
 impl StudioApp {
@@ -218,6 +219,7 @@ impl StudioApp {
             shutdown_sent: false,
             osc,
             osc_rejected: 0,
+            osc_notice: None,
         })
     }
 
@@ -267,19 +269,10 @@ impl StudioApp {
     }
 
     fn drain_osc(&mut self) {
-        let mut actions = Vec::with_capacity(8);
-        if let Some(osc) = &self.osc {
-            for _ in 0..8 {
-                match osc.try_recv() {
-                    Ok(action) => actions.push(action),
-                    Err(
-                        std::sync::mpsc::TryRecvError::Empty
-                        | std::sync::mpsc::TryRecvError::Disconnected,
-                    ) => break,
-                }
-            }
-        }
-        for action in actions {
+        for _ in 0..8 {
+            let Some(action) = self.osc.as_ref().and_then(|osc| osc.try_recv().ok()) else {
+                break;
+            };
             let action = match action {
                 OscAction::SelectPreview(number) => ExternalStudioAction::SelectPreview(number),
                 OscAction::Cut => ExternalStudioAction::Cut,
@@ -301,12 +294,15 @@ impl StudioApp {
         if let Some(osc) = &self.osc {
             let counters = osc.counters();
             let rejected = counters.rejected.saturating_add(self.osc_rejected);
-            if counters.malformed > 0 || rejected > 0 || counters.overflow > 0 {
-                self.state.notice = Some(format!(
+            if counters.failed > 0 {
+                self.osc_notice = Some("OSC receive failed".to_owned());
+            } else if counters.malformed > 0 || rejected > 0 || counters.overflow > 0 {
+                self.osc_notice = Some(format!(
                     "OSC malformed={} rejected={} overflow={}",
                     counters.malformed, rejected, counters.overflow
                 ));
             }
+            self.state.external_notice = self.osc_notice.clone();
         }
     }
 }
@@ -2176,33 +2172,29 @@ mod tests {
             .unwrap();
         let receiver = OscReceiver::bind(address).unwrap();
         let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
-        for _ in 0..16 {
+        let queued = [
+            "/freemix/switcher/preview/1",
+            "/freemix/switcher/cut",
+            "/freemix/switcher/fade",
+            "/freemix/switcher/preview/1",
+            "/freemix/switcher/cut",
+            "/freemix/switcher/fade",
+            "/freemix/switcher/preview/1",
+            "/freemix/switcher/cut",
+        ]
+        .iter()
+        .flat_map(|address| [*address, *address])
+        .collect::<Vec<_>>();
+        for address in queued.iter().chain(std::iter::once(&queued[0])) {
             sender
-                .send_to(
-                    &osc_message(&format!("/freemix/switcher/preview/{}", 1)),
-                    receiver.local_addr(),
-                )
+                .send_to(&osc_message(address), receiver.local_addr())
                 .unwrap();
         }
         let deadline = Instant::now() + Duration::from_secs(1);
         while receiver.counters().overflow == 0 && Instant::now() < deadline {
             sleep(Duration::from_millis(5));
         }
-        let mut first_frame = Vec::new();
-        for _ in 0..8 {
-            if let Ok(action) = receiver.try_recv() {
-                first_frame.push(action);
-            }
-        }
-        assert_eq!(first_frame.len(), 8);
-        assert_eq!(receiver.counters().overflow, 0);
-        let mut second_frame = Vec::new();
-        for _ in 0..8 {
-            if let Ok(action) = receiver.try_recv() {
-                second_frame.push(action);
-            }
-        }
-        assert_eq!(second_frame.len(), 8);
+        assert_eq!(receiver.counters().overflow, 1);
 
         let project = ProjectId::new(NonZeroU128::new(7).unwrap());
         let mut model = ClientModel::new(project);
@@ -2232,6 +2224,32 @@ mod tests {
                 duration_frames: 84
             })
         );
+        let mut black = ready.clone();
+        black
+            .view
+            .as_mut()
+            .unwrap()
+            .switcher
+            .desired_fade_to_black
+            .target_active = true;
+        assert_eq!(
+            external_intent(
+                &black,
+                ExternalStudioAction::FadeToBlack { active: false },
+                42,
+                84
+            ),
+            Some(StudioIntent::FadeToBlack {
+                active: false,
+                duration_frames: 84
+            })
+        );
+        assert_eq!(
+            external_intent(&ready, ExternalStudioAction::Fade, 42, 84),
+            Some(StudioIntent::Fade {
+                duration_frames: 42
+            })
+        );
         let mut manual = ready.clone();
         manual
             .view
@@ -2247,34 +2265,83 @@ mod tests {
                 position: ManualTransitionPosition::START,
             });
         assert!(external_intent(&manual, ExternalStudioAction::Cut, 42, 84).is_none());
+        manual
+            .view
+            .as_mut()
+            .unwrap()
+            .switcher
+            .desired_manual_transition = fm_ui_model::ManualTransitionStatus::Inactive;
+        manual
+            .view
+            .as_mut()
+            .unwrap()
+            .switcher
+            .realized_manual_transition =
+            fm_ui_model::ManualTransitionStatus::Active(fm_ui_model::ActiveManualTransition {
+                kind: fm_protocol::ManualTransitionKind::Fade,
+                from: view.switcher.realized.preview,
+                to: view.switcher.realized.program,
+                interval_start: ManualTransitionPosition::START,
+                position: ManualTransitionPosition::START,
+            });
+        assert!(external_intent(&manual, ExternalStudioAction::Cut, 42, 84).is_none());
         let denied = StudioUiState::new(StudioConnectionStatus::Synchronizing)
-            .with_view(view)
+            .with_view(view.clone())
             .with_switcher_permissions(true, true);
         assert!(external_intent(&denied, ExternalStudioAction::Cut, 42, 84).is_none());
 
-        let (tx, rx) = sync_channel(1);
-        tx.send(WorkerRequest::Intent(StudioIntent::Cut)).unwrap();
-        let mut pending = PendingIntents::new();
-        for action in first_frame.into_iter().chain(second_frame) {
-            let action = match action {
-                OscAction::SelectPreview(number) => ExternalStudioAction::SelectPreview(number),
-                _ => unreachable!(),
-            };
-            pending
-                .submit(&tx, external_intent(&ready, action, 42, 84).unwrap())
-                .unwrap();
-        }
-        assert_eq!(pending.intents.len(), 16);
-        assert_eq!(rx.try_recv(), Ok(WorkerRequest::Intent(StudioIntent::Cut)));
-        let mut order = Vec::new();
-        while order.len() < 16 {
-            pending.flush(&tx).unwrap();
-            if let Ok(WorkerRequest::Intent(intent)) = rx.try_recv() {
-                order.push(intent);
-            }
-        }
-        assert_eq!(order.len(), 16);
-        drop(receiver);
+        let (tx, rx) = sync_channel(REQUEST_CAPACITY);
+        let mut app = StudioApp {
+            shell: StudioShell::default(),
+            state: ready,
+            requests: Some(tx),
+            pending_intents: PendingIntents::new(),
+            updates: None,
+            worker: None,
+            shutdown_sent: false,
+            osc: Some(receiver),
+            osc_rejected: 0,
+            osc_notice: None,
+        };
+        app.shell.set_transition_duration_frames(42);
+        app.shell.set_fade_to_black_duration_frames(84);
+        app.drain_osc();
+        assert_eq!(app.pending_intents.intents.len(), 0);
+        app.drain_osc();
+        let order = rx
+            .try_iter()
+            .map(|request| match request {
+                WorkerRequest::Intent(intent) => intent,
+                WorkerRequest::Shutdown => panic!("unexpected shutdown"),
+            })
+            .collect::<Vec<_>>();
+        let expected = [
+            StudioIntent::SelectPreview(view.inputs[0]),
+            StudioIntent::SelectPreview(view.inputs[0]),
+            StudioIntent::Cut,
+            StudioIntent::Cut,
+            StudioIntent::Fade {
+                duration_frames: 42,
+            },
+            StudioIntent::Fade {
+                duration_frames: 42,
+            },
+            StudioIntent::SelectPreview(view.inputs[0]),
+            StudioIntent::SelectPreview(view.inputs[0]),
+            StudioIntent::Cut,
+            StudioIntent::Cut,
+            StudioIntent::Fade {
+                duration_frames: 42,
+            },
+            StudioIntent::Fade {
+                duration_frames: 42,
+            },
+            StudioIntent::SelectPreview(view.inputs[0]),
+            StudioIntent::SelectPreview(view.inputs[0]),
+            StudioIntent::Cut,
+            StudioIntent::Cut,
+        ];
+        assert_eq!(order, expected);
     }
 
     fn osc_message(address: &str) -> Vec<u8> {

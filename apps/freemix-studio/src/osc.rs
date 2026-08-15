@@ -28,6 +28,7 @@ pub(crate) struct OscCounters {
     pub(crate) malformed: u64,
     pub(crate) rejected: u64,
     pub(crate) overflow: u64,
+    pub(crate) failed: u64,
 }
 
 #[derive(Default)]
@@ -35,6 +36,7 @@ struct SharedCounters {
     malformed: AtomicU64,
     rejected: AtomicU64,
     overflow: AtomicU64,
+    failed: AtomicU64,
 }
 
 pub(crate) struct OscReceiver {
@@ -72,6 +74,7 @@ impl OscReceiver {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn local_addr(&self) -> SocketAddr {
         self.local_address
     }
@@ -85,6 +88,7 @@ impl OscReceiver {
             malformed: self.counters.malformed.load(Ordering::Relaxed),
             rejected: self.counters.rejected.load(Ordering::Relaxed),
             overflow: self.counters.overflow.load(Ordering::Relaxed),
+            failed: self.counters.failed.load(Ordering::Relaxed),
         }
     }
 
@@ -153,7 +157,10 @@ fn receive_loop(
                     error.kind(),
                     io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                 ) => {}
-            Err(_) => break,
+            Err(_) => {
+                counters.failed.fetch_add(1, Ordering::Relaxed);
+                break;
+            }
         }
     }
 }
