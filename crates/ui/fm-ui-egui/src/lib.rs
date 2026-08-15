@@ -12,6 +12,7 @@ use fm_protocol::{
     OverlayTransitionKind, StingerReadiness, WireOverlayChannelId, WireStingerSlotId,
 };
 use fm_types::InputId;
+use fm_types::MAX_INPUT_NAME_BYTES;
 use fm_ui_model::{BusSelection, ClientView, ManualTransitionStatus, StingerStatus, SwitcherState};
 
 mod fade_to_black;
@@ -49,13 +50,15 @@ pub enum InputMoveDirection {
 }
 
 /// Operator actions emitted by [`StudioShell`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StudioIntent {
     /// Moves one input by one position in the current project order.
     MoveInput {
         input: InputId,
         direction: InputMoveDirection,
     },
+    /// Renames one input using the exact submitted text.
+    RenameInput { input: InputId, name: String },
     /// Updates changed Master-strip controls on one input.
     SetInputAudioStrip {
         input: InputId,
@@ -689,6 +692,14 @@ pub const fn tally_state(input: InputId, switcher: SwitcherState) -> TallyState 
 pub struct StudioShell {
     transition_duration_frames: u32,
     fade_to_black_duration_frames: u32,
+    rename_draft: Option<RenameDraft>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RenameDraft {
+    input: InputId,
+    name: String,
+    confirmed_name: String,
 }
 
 impl StudioShell {
@@ -737,6 +748,7 @@ impl StudioShell {
             .view
             .as_ref()
             .map_or(&[] as &[InputId], |view| view.inputs.as_slice());
+        self.reconcile_rename_draft(state.view.as_ref());
         let manual_transition_controls = manual_transition_availability(
             ManualTransitionGate::from_state(state),
             state.view.as_ref().is_some_and(|view| {
@@ -780,7 +792,7 @@ impl StudioShell {
                 ui.add_space(8.0);
                 draw_input_audio_strips(ui, state, &mut intents);
                 ui.add_space(8.0);
-                draw_inputs(ui, state, &mut intents);
+                self.draw_inputs(ui, state, &mut intents);
             });
         intents
     }
@@ -1238,6 +1250,7 @@ impl Default for StudioShell {
         Self {
             transition_duration_frames: Self::DEFAULT_TRANSITION_DURATION_FRAMES,
             fade_to_black_duration_frames: Self::DEFAULT_TRANSITION_DURATION_FRAMES,
+            rename_draft: None,
         }
     }
 }
@@ -1516,81 +1529,172 @@ fn stinger_button(
     .clicked()
 }
 
-fn draw_inputs(ui: &mut Ui, state: &StudioUiState, intents: &mut Vec<StudioIntent>) {
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("INPUT BANK").small().strong());
-        ui.separator();
-        let count = state.view.as_ref().map_or(0, |view| view.inputs.len());
-        ui.label(
-            RichText::new(format!("{count} SOURCES"))
-                .small()
-                .color(MUTED),
-        );
-    });
-    ui.add_space(4.0);
+impl StudioShell {
+    fn reconcile_rename_draft(&mut self, view: Option<&ClientView>) {
+        let Some(draft) = &mut self.rename_draft else {
+            return;
+        };
+        let Some(view) = view else {
+            self.rename_draft = None;
+            return;
+        };
+        let Some(index) = view.inputs.iter().position(|input| *input == draft.input) else {
+            self.rename_draft = None;
+            return;
+        };
+        let current = &view.input_names[index];
+        if current != &draft.confirmed_name {
+            if draft.name == draft.confirmed_name {
+                draft.name = current.clone();
+            }
+            draft.confirmed_name = current.clone();
+        }
+    }
 
-    let enabled =
-        preview_selection_available(TransitionGate::from_state(state), state.can_select_preview);
-    let reorder_enabled = state.connection_status.controls_enabled()
-        && state.can_edit_project
-        && state.view.is_some();
-    ScrollArea::vertical()
-        .id_salt("studio-input-bank")
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            let Some(view) = &state.view else {
-                ui.label(RichText::new("INPUT STATE UNAVAILABLE").color(MUTED));
-                return;
-            };
-            let columns = dynamic_columns(ui.available_width(), ui.spacing().item_spacing.x);
-            Grid::new("studio-input-grid")
-                .num_columns(columns)
-                .spacing(Vec2::new(6.0, 6.0))
-                .show(ui, |ui| {
-                    for (index, input) in view.inputs.iter().copied().enumerate() {
-                        let tally = tally_state(input, view.switcher);
-                        let tile_text =
-                            format!("{}\n{}", view.input_names[index], tally.operator_label());
-                        ui.vertical(|ui| {
-                            let response = ui.add_enabled(
-                                enabled,
-                                Button::new(RichText::new(tile_text).color(tally_color(tally)))
-                                    .fill(tally_fill(tally))
-                                    .stroke(Stroke::new(1.0, tally_color(tally)))
-                                    .min_size(Vec2::new(MIN_TILE_WIDTH, 52.0)),
-                            );
-                            if response.clicked() {
-                                intents.push(StudioIntent::SelectPreview(input));
-                            }
-                            ui.horizontal(|ui| {
-                                let up = ui.add_enabled(
-                                    reorder_enabled && index > 0,
-                                    Button::new("UP").small(),
+    fn draw_inputs(&mut self, ui: &mut Ui, state: &StudioUiState, intents: &mut Vec<StudioIntent>) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("INPUT BANK").small().strong());
+            ui.separator();
+            let count = state.view.as_ref().map_or(0, |view| view.inputs.len());
+            ui.label(
+                RichText::new(format!("{count} SOURCES"))
+                    .small()
+                    .color(MUTED),
+            );
+        });
+        ui.add_space(4.0);
+
+        let enabled = preview_selection_available(
+            TransitionGate::from_state(state),
+            state.can_select_preview,
+        );
+        let reorder_enabled = state.connection_status.controls_enabled()
+            && state.can_edit_project
+            && state.view.is_some();
+        ScrollArea::vertical()
+            .id_salt("studio-input-bank")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let Some(view) = state.view.clone() else {
+                    ui.label(RichText::new("INPUT STATE UNAVAILABLE").color(MUTED));
+                    return;
+                };
+                let columns = dynamic_columns(ui.available_width(), ui.spacing().item_spacing.x);
+                Grid::new("studio-input-grid")
+                    .num_columns(columns)
+                    .spacing(Vec2::new(6.0, 6.0))
+                    .show(ui, |ui| {
+                        for (index, input) in view.inputs.iter().copied().enumerate() {
+                            let tally = tally_state(input, view.switcher);
+                            let tile_text =
+                                format!("{}\n{}", view.input_names[index], tally.operator_label());
+                            ui.vertical(|ui| {
+                                let response = ui.add_enabled(
+                                    enabled,
+                                    Button::new(RichText::new(tile_text).color(tally_color(tally)))
+                                        .fill(tally_fill(tally))
+                                        .stroke(Stroke::new(1.0, tally_color(tally)))
+                                        .min_size(Vec2::new(MIN_TILE_WIDTH, 52.0)),
                                 );
-                                if up.clicked() {
-                                    intents.push(StudioIntent::MoveInput {
-                                        input,
-                                        direction: InputMoveDirection::Up,
-                                    });
+                                if response.clicked() {
+                                    intents.push(StudioIntent::SelectPreview(input));
                                 }
-                                let down = ui.add_enabled(
-                                    reorder_enabled && index + 1 < view.inputs.len(),
-                                    Button::new("DOWN").small(),
-                                );
-                                if down.clicked() {
-                                    intents.push(StudioIntent::MoveInput {
+                                ui.horizontal(|ui| {
+                                    let up = ui.add_enabled(
+                                        reorder_enabled && index > 0,
+                                        Button::new("UP").small(),
+                                    );
+                                    if up.clicked() {
+                                        intents.push(StudioIntent::MoveInput {
+                                            input,
+                                            direction: InputMoveDirection::Up,
+                                        });
+                                    }
+                                    let down = ui.add_enabled(
+                                        reorder_enabled && index + 1 < view.inputs.len(),
+                                        Button::new("DOWN").small(),
+                                    );
+                                    if down.clicked() {
+                                        intents.push(StudioIntent::MoveInput {
+                                            input,
+                                            direction: InputMoveDirection::Down,
+                                        });
+                                    }
+                                    if ui
+                                        .add_enabled(reorder_enabled, Button::new("RENAME").small())
+                                        .clicked()
+                                    {
+                                        self.rename_draft = Some(RenameDraft {
+                                            input,
+                                            name: view.input_names[index].clone(),
+                                            confirmed_name: view.input_names[index].clone(),
+                                        });
+                                    }
+                                });
+                                if self
+                                    .rename_draft
+                                    .as_ref()
+                                    .is_some_and(|draft| draft.input == input)
+                                {
+                                    self.draw_rename_editor(
+                                        ui,
+                                        state,
                                         input,
-                                        direction: InputMoveDirection::Down,
-                                    });
+                                        &view.input_names[index],
+                                        intents,
+                                    );
                                 }
                             });
-                        });
-                        if (index + 1) % columns == 0 {
-                            ui.end_row();
+                            if (index + 1) % columns == 0 {
+                                ui.end_row();
+                            }
                         }
-                    }
-                });
+                    });
+            });
+    }
+
+    fn draw_rename_editor(
+        &mut self,
+        ui: &mut Ui,
+        state: &StudioUiState,
+        input: InputId,
+        current: &str,
+        intents: &mut Vec<StudioIntent>,
+    ) {
+        let Some(draft) = &mut self.rename_draft else {
+            return;
+        };
+        let duplicate = state.view.as_ref().is_some_and(|view| {
+            view.inputs
+                .iter()
+                .enumerate()
+                .any(|(index, other)| *other != input && view.input_names[index] == draft.name)
         });
+        let valid = !draft.name.trim().is_empty()
+            && draft.name.len() <= MAX_INPUT_NAME_BYTES
+            && !duplicate
+            && draft.name != current;
+        let mut close = false;
+        ui.horizontal(|ui| {
+            ui.add(egui::TextEdit::singleline(&mut draft.name).desired_width(MIN_TILE_WIDTH));
+            if ui
+                .add_enabled(valid, Button::new("APPLY").small())
+                .clicked()
+            {
+                intents.push(StudioIntent::RenameInput {
+                    input,
+                    name: draft.name.clone(),
+                });
+                close = true;
+            }
+            if ui.button("CANCEL").clicked() {
+                close = true;
+            }
+        });
+        if close {
+            self.rename_draft = None;
+        }
+    }
 }
 
 fn dynamic_columns(available_width: f32, spacing: f32) -> usize {

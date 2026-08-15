@@ -64,7 +64,7 @@ pub fn launch_native(config: StudioConfig) -> Result<(), eframe::Error> {
     )
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum WorkerRequest {
     Intent(StudioIntent),
     Shutdown,
@@ -142,7 +142,7 @@ impl PendingIntents {
         intent: StudioIntent,
     ) -> Result<(), EnqueueError> {
         if self.intents.is_empty() {
-            match try_enqueue(sender, WorkerRequest::Intent(intent)) {
+            match try_enqueue(sender, WorkerRequest::Intent(intent.clone())) {
                 Ok(()) => return Ok(()),
                 Err(EnqueueError::Disconnected) => return Err(EnqueueError::Disconnected),
                 Err(EnqueueError::Full) => {}
@@ -152,7 +152,7 @@ impl PendingIntents {
     }
 
     fn flush(&mut self, sender: &SyncSender<WorkerRequest>) -> Result<(), EnqueueError> {
-        while let Some(intent) = self.intents.front().copied() {
+        while let Some(intent) = self.intents.front().cloned() {
             match try_enqueue(sender, WorkerRequest::Intent(intent)) {
                 Ok(()) => {
                     self.intents.pop_front();
@@ -166,7 +166,7 @@ impl PendingIntents {
 
     fn push(&mut self, intent: StudioIntent) -> Result<(), EnqueueError> {
         if let Some(tail) = self.intents.back_mut()
-            && coalesce_adjacent_intent(tail, intent)
+            && coalesce_adjacent_intent(tail, intent.clone())
         {
             return Ok(());
         }
@@ -504,7 +504,7 @@ impl WorkerRecovery {
         publisher: &StatePublisher,
     ) -> bool {
         if let Some(tail) = self.deferred_intents.back_mut()
-            && coalesce_adjacent_intent(tail, intent)
+            && coalesce_adjacent_intent(tail, intent.clone())
         {
             return publish_deferred_runtime(
                 runtime,
@@ -624,7 +624,7 @@ fn cancellation_requested(
         Ok(WorkerRequest::Shutdown) | Err(TryRecvError::Disconnected) => true,
         Ok(WorkerRequest::Intent(intent)) => {
             if let Some(tail) = deferred_intents.back_mut()
-                && coalesce_adjacent_intent(tail, intent)
+                && coalesce_adjacent_intent(tail, intent.clone())
             {
                 return false;
             }
@@ -1514,6 +1514,16 @@ fn intent_payload(
     view: Option<&ClientView>,
 ) -> Result<CommandPayload, String> {
     let payload = match intent {
+        StudioIntent::RenameInput { input, name } => {
+            let view = view.ok_or_else(|| "Project state is not synchronized".to_owned())?;
+            if !view.inputs.contains(&input) {
+                return Err("Input no longer exists".to_owned());
+            }
+            CommandPayload::RenameInput {
+                input: WireInputId::from_domain(input),
+                name,
+            }
+        }
         StudioIntent::MoveInput { input, direction } => {
             return resolve_input_move(view, input, direction);
         }
@@ -2126,7 +2136,7 @@ mod tests {
                 delay_samples: Some(0),
             },
         };
-        assert_eq!(pending.intents, VecDeque::from([coalesced]));
+        assert_eq!(pending.intents, VecDeque::from([coalesced.clone()]));
 
         let other = StudioIntent::SetInputAudioStrip {
             input: other_input,
@@ -2135,12 +2145,12 @@ mod tests {
                 ..InputAudioStripUpdate::default()
             },
         };
-        assert_eq!(pending.push(other), Ok(()));
+        assert_eq!(pending.push(other.clone()), Ok(()));
         assert_eq!(pending.push(StudioIntent::Cut), Ok(()));
-        assert_eq!(pending.push(other), Ok(()));
+        assert_eq!(pending.push(other.clone()), Ok(()));
         assert_eq!(
             pending.intents,
-            VecDeque::from([coalesced, other, StudioIntent::Cut, other])
+            VecDeque::from([coalesced.clone(), other.clone(), StudioIntent::Cut, other])
         );
     }
 
@@ -2573,7 +2583,7 @@ mod tests {
         };
         let assert_target = |view: &ClientView, active| {
             assert_eq!(
-                intent_payload(intent, Some(view)),
+                intent_payload(intent.clone(), Some(view)),
                 Ok(CommandPayload::FadeToBlack {
                     active,
                     duration_frames: 84,
