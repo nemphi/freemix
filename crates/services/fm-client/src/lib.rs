@@ -271,7 +271,7 @@ impl fmt::Display for ClientError {
             Self::QueueFull { capacity } => {
                 write!(formatter, "outbound queue reached capacity {capacity}")
             }
-            Self::EmptyIdempotencyKey => formatter.write_str("idempotency key must not be empty"),
+            Self::EmptyIdempotencyKey => formatter.write_str("idempotency key must not be blank"),
             Self::DuplicateIdempotencyKey(key) => {
                 write!(formatter, "idempotency key {key:?} is already in use")
             }
@@ -816,7 +816,7 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// Requires ready state, queue space, and a unique nonempty idempotency key.
+    /// Requires ready state, queue space, and a unique nonblank idempotency key.
     pub fn queue_command(
         &mut self,
         payload: CommandPayload,
