@@ -902,6 +902,7 @@ fn draw_overlay_channel(
         .map(|view| view.switcher.desired.preview);
     ui.vertical(|ui| {
         ui.horizontal_wrapped(|ui| {
+            let update = overlay_update_intent(enabled, channel, desired, source);
             if ui
                 .add_enabled(
                     enabled && source.is_some(),
@@ -915,14 +916,14 @@ fn draw_overlay_channel(
             }
             if ui
                 .add_enabled(
-                    enabled && desired.is_some_and(|overlay| overlay.active) && source.is_some(),
+                    update.is_some(),
                     Button::new(RichText::new(format!("O{channel_number} UPDATE")).strong()),
                 )
                 .on_hover_text("Update this active overlay channel from the current Preview source")
                 .clicked()
-                && let Some(source) = source
+                && let Some(update) = update
             {
-                intents.push(StudioIntent::UpdateOverlay { channel, source });
+                intents.push(update);
             }
             if ui
                 .add_enabled(
@@ -1002,6 +1003,18 @@ fn draw_overlay_channel(
                 .color(MUTED),
         );
     });
+}
+
+fn overlay_update_intent(
+    enabled: bool,
+    channel: WireOverlayChannelId,
+    desired: Option<&fm_ui_model::OverlayStatus>,
+    source: Option<InputId>,
+) -> Option<StudioIntent> {
+    if !enabled || !desired.is_some_and(|overlay| overlay.active) {
+        return None;
+    }
+    source.map(|source| StudioIntent::UpdateOverlay { channel, source })
 }
 
 fn draw_manual_transition(
@@ -2330,5 +2343,89 @@ mod tests {
         let intents = shell.draw(&mut ui, &state);
         let _output = context.end_pass();
         assert!(intents.is_empty());
+    }
+
+    #[test]
+    fn overlay_update_availability_uses_desired_active_channel_and_preview_source() {
+        let channel = WireOverlayChannelId::new(3).unwrap();
+        let preview = input(42);
+        let desired_active = overlay_status(true);
+        let realized_only_active = (overlay_status(false), overlay_status(true));
+        let desired_active_realized_inactive = (overlay_status(true), overlay_status(false));
+        assert!(realized_only_active.1.active);
+        assert!(!desired_active_realized_inactive.1.active);
+        let enabled = |status: StudioConnectionStatus, has_view: bool, can_transition: bool| {
+            status.controls_enabled() && has_view && can_transition
+        };
+        let ready = enabled(StudioConnectionStatus::Ready, true, true);
+
+        assert_eq!(
+            overlay_update_intent(ready, channel, Some(&desired_active), Some(preview)),
+            Some(StudioIntent::UpdateOverlay {
+                channel,
+                source: preview,
+            })
+        );
+        // A realized-only active channel must not enable UPDATE.
+        assert!(
+            overlay_update_intent(ready, channel, Some(&realized_only_active.0), Some(preview),)
+                .is_none()
+        );
+        assert!(overlay_update_intent(ready, channel, Some(&desired_active), None,).is_none());
+        assert!(
+            overlay_update_intent(
+                enabled(StudioConnectionStatus::Ready, false, true),
+                channel,
+                Some(&desired_active),
+                Some(preview),
+            )
+            .is_none()
+        );
+        assert!(
+            overlay_update_intent(
+                enabled(StudioConnectionStatus::Ready, true, false),
+                channel,
+                Some(&desired_active),
+                Some(preview),
+            )
+            .is_none()
+        );
+        assert!(
+            overlay_update_intent(
+                enabled(StudioConnectionStatus::Connecting, true, true),
+                channel,
+                Some(&desired_active_realized_inactive.0),
+                Some(preview),
+            )
+            .is_none()
+        );
+        // A desired active channel remains allowed while realized state is inactive.
+        assert_eq!(
+            overlay_update_intent(
+                ready,
+                channel,
+                Some(&desired_active_realized_inactive.0),
+                Some(preview),
+            ),
+            Some(StudioIntent::UpdateOverlay {
+                channel,
+                source: preview
+            })
+        );
+    }
+
+    fn overlay_status(active: bool) -> fm_ui_model::OverlayStatus {
+        fm_ui_model::OverlayStatus {
+            channel: 3,
+            source: Some(input(7)),
+            active,
+            opacity: 255,
+            transition: OverlayTransitionKind::Cut,
+            duration_frames: 1,
+            position: OverlayPositionPreset::FullFrame,
+            border: OverlayBorderPreset::None,
+            queued_sources: Vec::new(),
+            included_outputs: Vec::new(),
+        }
     }
 }
