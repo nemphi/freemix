@@ -24,7 +24,7 @@ Connection options:
 Client options:
   --client-id <ID>       Protocol client identity [default: freemix-studio]
   --role <ROLE>          viewer, graphics, audio, replay, operator, or admin
-                         [default: operator]
+                         [default: operator; viewer with --diagnose]
   --max-restarts <COUNT> Maximum supervised daemon restarts [default: 3]
   --osc-listen <ADDR>    Receive OSC control on a loopback address and nonzero port
   --diagnose             Run the one-shot TCP connection diagnostic instead of Studio
@@ -238,7 +238,11 @@ pub fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<Command
     let config = StudioConfig {
         connection,
         client_id: client_id.unwrap_or_else(|| "freemix-studio".to_owned()),
-        desired_role: role.unwrap_or(Role::Operator),
+        desired_role: role.unwrap_or(if diagnose.is_some() {
+            Role::Viewer
+        } else {
+            Role::Operator
+        }),
         restart_policy: RestartPolicy {
             maximum_restarts: maximum_restarts.unwrap_or(3),
         },

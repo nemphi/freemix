@@ -552,16 +552,17 @@ fn receive_diagnose_heartbeat(peer: &mut Peer, deadline: Instant) -> HeartbeatMe
         panic!("expected modern handshake request");
     };
     assert_eq!(request.protocol, CURRENT_PROTOCOL_VERSION);
-    peer.send_until(
-        &WireMessage::HandshakeResponse(handshake(
-            project_id(),
-            4,
-            HandshakeOutcome::Snapshot {
-                reason: SnapshotReason::NoCursor,
-            },
-        )),
-        deadline,
+    assert_eq!(request.desired_role, Role::Viewer);
+    let mut response = handshake(
+        project_id(),
+        4,
+        HandshakeOutcome::Snapshot {
+            reason: SnapshotReason::NoCursor,
+        },
     );
+    response.granted_role = Role::Viewer;
+    response.permissions = vec!["view_status".to_owned()];
+    peer.send_until(&WireMessage::HandshakeResponse(response), deadline);
     peer.send_until(&WireMessage::Snapshot(snapshot(4)), deadline);
 
     let WireMessage::Heartbeat(heartbeat) = peer.receive_until(deadline) else {
