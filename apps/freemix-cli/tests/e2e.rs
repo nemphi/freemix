@@ -53,8 +53,8 @@ impl FakeRemoteServer {
         })
     }
 
-    fn start_diagnostics() -> Self {
-        Self::start_test_peer(|stream| serve_diagnostics_peer(stream))
+    fn start_diagnostics(response_log_id: &'static str) -> Self {
+        Self::start_test_peer(move |stream| serve_diagnostics_peer(stream, response_log_id))
     }
 
     fn start_unterminated_response() -> Self {
@@ -240,7 +240,7 @@ fn serve_remote_sessions(listener: &TcpListener) {
     }
 }
 
-fn serve_diagnostics_peer(stream: TcpStream) {
+fn serve_diagnostics_peer(stream: TcpStream, response_log_id: &str) {
     let engine = EngineIdentity {
         engine_id: "diag-engine".into(),
         state_epoch: 7,
@@ -271,7 +271,7 @@ fn serve_diagnostics_peer(stream: TcpStream) {
         }),
     );
     let mut response_engine = engine.clone();
-    response_engine.log_id = "mismatched-log".into();
+    response_engine.log_id = response_log_id.into();
     write_message(
         &mut writer,
         &WireMessage::DiagnosticsResponse(fm_protocol::DiagnosticsResponse {
@@ -1166,11 +1166,23 @@ fn remote_status_times_out_when_peer_sends_no_response() {
 }
 
 #[test]
-fn remote_diagnostics_correlates_request_and_allows_interleaved_runtime_event() {
-    let server = FakeRemoteServer::start_diagnostics();
-    let output = invoke_bounded(&["remote-diagnostics", &server.address()]);
-    assert_failure_contains(&output, "diagnostics response does not match the request");
+fn remote_diagnostics_reports_exact_identity_and_rejects_mismatched_log_id() {
+    let server = FakeRemoteServer::start_diagnostics("secret-log");
+    let address = server.address();
+    let output = invoke_bounded(&["remote-diagnostics", &address]);
     server.finish();
+    assert_success(&output);
+    let rendered = stdout(&output);
+    assert_eq!(
+        rendered,
+        "diagnostics=v1 engine_id=diag-engine state_epoch=7 revision=12 retained_oldest=3 retained_newest=12 subscribers=2/8 retained_limit=64 subscriber_queue=16"
+    );
+    assert!(!rendered.contains("log_id"));
+
+    let server = FakeRemoteServer::start_diagnostics("mismatched-log");
+    let output = invoke_bounded(&["remote-diagnostics", &server.address()]);
+    server.finish();
+    assert_failure_contains(&output, "diagnostics response does not match the request");
 }
 
 #[test]
