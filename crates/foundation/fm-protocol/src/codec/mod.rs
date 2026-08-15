@@ -15,6 +15,17 @@ pub const MAX_LIST_ITEMS: usize = 256;
 pub const MAX_BATCH_EVENTS: usize = 256;
 pub const MAX_MESSAGES_PER_PUSH: usize = 1024;
 
+fn validate_request_id(value: &str) -> Result<(), CodecError> {
+    if value.trim().is_empty() {
+        Err(CodecError::InvalidField {
+            field: "request_id",
+            value: value.to_owned(),
+        })
+    } else {
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CodecError {
     LineTooLong,

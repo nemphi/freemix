@@ -34,7 +34,7 @@ into control messages.
    replacement, restore, log compaction, or engine identity change forces a
    snapshot and a new cursor.
 
-The current Protocol 2.12 implementation uses bounded newline-delimited raw TCP.
+The current Protocol 2.13 implementation uses bounded newline-delimited raw TCP.
 Studio keeps one expected heartbeat sequence and waits for its matching
 acknowledgement within the bounded peer wait. EOF, timeout, wrong server
 identity, or wrong sequence enters the existing reconnect backoff. The server
@@ -104,6 +104,16 @@ semantics. The server persists idempotency results for at least the project
 recovery window and never replays an irreversible action after restart. A client
 whose result was lost queries the idempotency key and receives the original
 receipt and latest realization outcome.
+
+Diagnostics are a read-only query, separate from the durable command envelope. A
+`diagnostics_request` carries only `protocol` and non-blank `request_id`; it is not
+a command, does not mutate state, and has no idempotency or revision precondition.
+The matching `diagnostics_response` carries request ID, engine identity,
+`current_revision`, optional retained revision bounds, and subscriber limits and
+counts. Exact fields are `oldest_retained_revision`, `newest_retained_revision`,
+`subscriber_count`, `retained_events_limit`, `subscriber_limit`, and
+`subscriber_queue_limit`. These fields do not claim readiness, health,
+capabilities, authentication state, session counters, paths, or error details.
 
 ## 4. Events and telemetry
 

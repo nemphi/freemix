@@ -3,15 +3,15 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     CapabilityReportMessage, CapabilityReportSummary, CodecError, CommandMessage, CommandPayload,
-    CommandResult, DurableEventBatch, DurableGap, EngineIdentity, ErrorMessage, EventCursor,
-    EventMessage, EventPayload, FadeToBlackPosition, FadeToBlackState, HandshakeOutcome,
-    HandshakeRequest, HandshakeResponse, HeartbeatAcknowledgementMessage, HeartbeatMessage,
-    InputAudioStripStatus, ManualTransitionKind, ManualTransitionPosition, ManualTransitionState,
-    ManualTransitionStatus, OverlayStatus, ResumeCursor, RuntimeEventMessage,
-    RuntimeFailureDisposition, RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage,
-    SnapshotReason, StingerAudioPolicy, StingerMissingMediaFallback, StingerReadiness,
-    StingerStatus, StructuredError, WireInputId, WireMessage, WireOutputId, WireOverlayChannelId,
-    WireStingerSlotId,
+    CommandResult, DiagnosticsRequest, DiagnosticsResponse, DurableEventBatch, DurableGap,
+    EngineIdentity, ErrorMessage, EventCursor, EventMessage, EventPayload, FadeToBlackPosition,
+    FadeToBlackState, HandshakeOutcome, HandshakeRequest, HandshakeResponse,
+    HeartbeatAcknowledgementMessage, HeartbeatMessage, InputAudioStripStatus, ManualTransitionKind,
+    ManualTransitionPosition, ManualTransitionState, ManualTransitionStatus, OverlayStatus,
+    ResumeCursor, RuntimeEventMessage, RuntimeFailureDisposition, RuntimeLifecycleEvent,
+    ServerIdentity, SnapshotMessage, SnapshotReason, StingerAudioPolicy,
+    StingerMissingMediaFallback, StingerReadiness, StingerStatus, StructuredError, WireInputId,
+    WireMessage, WireOutputId, WireOverlayChannelId, WireStingerSlotId,
 };
 
 use super::value::{
@@ -21,7 +21,7 @@ use super::value::{
 };
 use super::{
     MAX_FIELD_NAME_BYTES, MAX_FIELD_VALUE_BYTES, MAX_FIELDS_PER_MESSAGE, MAX_LINE_BYTES,
-    MAX_LIST_ITEMS, MAX_MESSAGES_PER_PUSH,
+    MAX_LIST_ITEMS, MAX_MESSAGES_PER_PUSH, validate_request_id,
 };
 
 /// Decodes exactly one newline-terminated wire record.
@@ -68,6 +68,12 @@ pub fn decode_line(line: &str) -> Result<WireMessage, CodecError> {
         }
         "capability_report" => {
             WireMessage::CapabilityReport(decode_capability_report(&mut fields)?)
+        }
+        "diagnostics_request" => {
+            WireMessage::DiagnosticsRequest(decode_diagnostics_request(&mut fields)?)
+        }
+        "diagnostics_response" => {
+            WireMessage::DiagnosticsResponse(decode_diagnostics_response(&mut fields)?)
         }
         "error" => WireMessage::Error(decode_error_message(&mut fields)?),
         _ => return Err(CodecError::UnknownMessage(kind.to_owned())),
@@ -1270,6 +1276,40 @@ fn decode_capability_summary(fields: &mut Fields) -> Result<CapabilityReportSumm
         });
     }
     Ok(summary)
+}
+
+fn decode_diagnostics_request(fields: &mut Fields) -> Result<DiagnosticsRequest, CodecError> {
+    let protocol = fields.required("protocol")?;
+    let request_id = fields.required("request_id")?;
+    validate_request_id(&request_id)?;
+    Ok(DiagnosticsRequest {
+        protocol: parse_version(&protocol).ok_or(CodecError::InvalidField {
+            field: "protocol",
+            value: protocol,
+        })?,
+        request_id,
+    })
+}
+
+fn decode_diagnostics_response(fields: &mut Fields) -> Result<DiagnosticsResponse, CodecError> {
+    let protocol = fields.required("protocol")?;
+    let request_id = fields.required("request_id")?;
+    validate_request_id(&request_id)?;
+    Ok(DiagnosticsResponse {
+        protocol: parse_version(&protocol).ok_or(CodecError::InvalidField {
+            field: "protocol",
+            value: protocol,
+        })?,
+        request_id,
+        engine: decode_identity(fields)?,
+        current_revision: fields.parse_required("current_revision")?,
+        oldest_retained_revision: fields.parse_optional("oldest_retained_revision")?,
+        newest_retained_revision: fields.parse_optional("newest_retained_revision")?,
+        subscriber_count: fields.parse_required("subscriber_count")?,
+        retained_events_limit: fields.parse_required("retained_events_limit")?,
+        subscriber_limit: fields.parse_required("subscriber_limit")?,
+        subscriber_queue_limit: fields.parse_required("subscriber_queue_limit")?,
+    })
 }
 
 fn decode_error_message(fields: &mut Fields) -> Result<ErrorMessage, CodecError> {

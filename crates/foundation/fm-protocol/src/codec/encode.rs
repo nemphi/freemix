@@ -2,20 +2,22 @@ use std::collections::BTreeSet;
 
 use crate::{
     CapabilityReportMessage, CapabilityReportSummary, CommandMessage, CommandPayload,
-    CommandResult, DurableEventBatch, DurableGap, EngineIdentity, ErrorMessage, EventCursor,
-    EventMessage, EventPayload, FadeToBlackState, HandshakeOutcome, HandshakeRequest,
-    HandshakeResponse, HeartbeatAcknowledgementMessage, HeartbeatMessage, InputAudioStripStatus,
-    ManualTransitionKind, ManualTransitionStatus, OverlayStatus, ResumeCursor, RuntimeEventMessage,
-    RuntimeFailureDisposition, RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage,
-    SnapshotReason, StingerAudioPolicy, StingerMissingMediaFallback, StingerReadiness,
-    StingerStatus, StructuredError, WireMessage,
+    CommandResult, DiagnosticsRequest, DiagnosticsResponse, DurableEventBatch, DurableGap,
+    EngineIdentity, ErrorMessage, EventCursor, EventMessage, EventPayload, FadeToBlackState,
+    HandshakeOutcome, HandshakeRequest, HandshakeResponse, HeartbeatAcknowledgementMessage,
+    HeartbeatMessage, InputAudioStripStatus, ManualTransitionKind, ManualTransitionStatus,
+    OverlayStatus, ResumeCursor, RuntimeEventMessage, RuntimeFailureDisposition,
+    RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage, SnapshotReason, StingerAudioPolicy,
+    StingerMissingMediaFallback, StingerReadiness, StingerStatus, StructuredError, WireMessage,
 };
 
 use super::value::{
     client_type, durable_events, field_issues, input_ids, input_statuses, role, runtime_domains,
     string_list,
 };
-use super::{CodecError, MAX_FIELD_VALUE_BYTES, MAX_LINE_BYTES, MAX_LIST_ITEMS};
+use super::{
+    CodecError, MAX_FIELD_VALUE_BYTES, MAX_LINE_BYTES, MAX_LIST_ITEMS, validate_request_id,
+};
 
 /// Encodes one message as a single newline-terminated record.
 ///
@@ -42,6 +44,12 @@ pub fn encode_line(message: &WireMessage) -> Result<String, CodecError> {
             encode_heartbeat_acknowledgement(&mut record, message)?;
         }
         WireMessage::CapabilityReport(message) => encode_capability_report(&mut record, message)?,
+        WireMessage::DiagnosticsRequest(message) => {
+            encode_diagnostics_request(&mut record, message)?
+        }
+        WireMessage::DiagnosticsResponse(message) => {
+            encode_diagnostics_response(&mut record, message)?
+        }
         WireMessage::Error(message) => encode_error_message(&mut record, message)?,
     }
     record.finish()
@@ -987,6 +995,34 @@ fn encode_capability_summary(
     record.field("capability_available", summary.available)?;
     record.field("capability_degraded", summary.degraded)?;
     record.field("capability_unavailable", summary.unavailable)
+}
+
+fn encode_diagnostics_request(
+    record: &mut Record,
+    message: &DiagnosticsRequest,
+) -> Result<(), CodecError> {
+    record.kind("diagnostics_request");
+    record.field("protocol", message.protocol)?;
+    validate_request_id(&message.request_id)?;
+    record.field_str("request_id", &message.request_id)
+}
+
+fn encode_diagnostics_response(
+    record: &mut Record,
+    message: &DiagnosticsResponse,
+) -> Result<(), CodecError> {
+    record.kind("diagnostics_response");
+    record.field("protocol", message.protocol)?;
+    validate_request_id(&message.request_id)?;
+    record.field_str("request_id", &message.request_id)?;
+    encode_identity(record, &message.engine)?;
+    record.field("current_revision", message.current_revision)?;
+    record.optional("oldest_retained_revision", message.oldest_retained_revision)?;
+    record.optional("newest_retained_revision", message.newest_retained_revision)?;
+    record.field("subscriber_count", message.subscriber_count)?;
+    record.field("retained_events_limit", message.retained_events_limit)?;
+    record.field("subscriber_limit", message.subscriber_limit)?;
+    record.field("subscriber_queue_limit", message.subscriber_queue_limit)
 }
 
 fn encode_error_message(record: &mut Record, message: &ErrorMessage) -> Result<(), CodecError> {

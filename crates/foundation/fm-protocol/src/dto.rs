@@ -778,6 +778,26 @@ pub struct CapabilityReportMessage {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiagnosticsRequest {
+    pub protocol: ProtocolVersion,
+    pub request_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiagnosticsResponse {
+    pub protocol: ProtocolVersion,
+    pub request_id: String,
+    pub engine: EngineIdentity,
+    pub current_revision: u64,
+    pub oldest_retained_revision: Option<u64>,
+    pub newest_retained_revision: Option<u64>,
+    pub subscriber_count: u32,
+    pub retained_events_limit: u32,
+    pub subscriber_limit: u32,
+    pub subscriber_queue_limit: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WireMessage {
     Command(CommandMessage),
     CommandResult(CommandResult),
@@ -791,5 +811,7 @@ pub enum WireMessage {
     Heartbeat(HeartbeatMessage),
     HeartbeatAcknowledgement(HeartbeatAcknowledgementMessage),
     CapabilityReport(CapabilityReportMessage),
+    DiagnosticsRequest(DiagnosticsRequest),
+    DiagnosticsResponse(DiagnosticsResponse),
     Error(ErrorMessage),
 }

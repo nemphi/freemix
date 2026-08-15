@@ -3,17 +3,18 @@ use core::{fmt::Write, num::NonZeroU128};
 use fm_command::{Deadline, Revision, StateEpoch};
 use fm_protocol::{
     CURRENT_PROTOCOL_VERSION, CapabilityReportMessage, CapabilityReportSummary, CodecError,
-    CommandMessage, CommandPayload, CommandResult, DurableEvent, DurableEventBatch, DurableGap,
-    EngineIdentity, ErrorMessage, EventCursor, EventMessage, EventPayload, FadeToBlackPosition,
-    FadeToBlackState, FieldIssue, HandshakeOutcome, HeartbeatAcknowledgementMessage,
-    HeartbeatMessage, InputAudioStripStatus, InputStatus, LineDecoder, MAX_FIELD_VALUE_BYTES,
-    MAX_FIELDS_PER_MESSAGE, MAX_LINE_BYTES, MAX_LIST_ITEMS, MAX_MESSAGES_PER_PUSH,
-    ManualTransitionKind, ManualTransitionPosition, ManualTransitionState, ManualTransitionStatus,
-    OverlayStatus, OverlayTransitionKind, ProtocolVersion, ResumeCursor, RuntimeDomainBoundary,
-    RuntimeEventMessage, RuntimeFailureDisposition, RuntimeLifecycleEvent, ServerIdentity,
-    SnapshotMessage, SnapshotReason, StingerAudioPolicy, StingerMissingMediaFallback,
-    StingerReadiness, StingerStatus, StructuredError, WireInputId, WireMessage, WireOutputId,
-    WireOverlayChannelId, WireStingerSlotId, choose_handshake_outcome, decode_line, encode_line,
+    CommandMessage, CommandPayload, CommandResult, DiagnosticsRequest, DiagnosticsResponse,
+    DurableEvent, DurableEventBatch, DurableGap, EngineIdentity, ErrorMessage, EventCursor,
+    EventMessage, EventPayload, FadeToBlackPosition, FadeToBlackState, FieldIssue,
+    HandshakeOutcome, HeartbeatAcknowledgementMessage, HeartbeatMessage, InputAudioStripStatus,
+    InputStatus, LineDecoder, MAX_FIELD_VALUE_BYTES, MAX_FIELDS_PER_MESSAGE, MAX_LINE_BYTES,
+    MAX_LIST_ITEMS, MAX_MESSAGES_PER_PUSH, ManualTransitionKind, ManualTransitionPosition,
+    ManualTransitionState, ManualTransitionStatus, OverlayStatus, OverlayTransitionKind,
+    ProtocolVersion, ResumeCursor, RuntimeDomainBoundary, RuntimeEventMessage,
+    RuntimeFailureDisposition, RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage,
+    SnapshotReason, StingerAudioPolicy, StingerMissingMediaFallback, StingerReadiness,
+    StingerStatus, StructuredError, WireInputId, WireMessage, WireOutputId, WireOverlayChannelId,
+    WireStingerSlotId, choose_handshake_outcome, decode_line, encode_line,
 };
 
 fn input(value: u128) -> WireInputId {
@@ -132,8 +133,8 @@ fn snapshot(inputs: Vec<InputStatus>) -> WireMessage {
 }
 
 #[test]
-fn protocol_2_12_heartbeat_acknowledgement_codec_is_exact() {
-    assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(2, 12));
+fn protocol_2_13_heartbeat_acknowledgement_codec_is_exact() {
+    assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(2, 13));
     let acknowledgement = WireMessage::HeartbeatAcknowledgement(HeartbeatAcknowledgementMessage {
         server: server_identity(),
         heartbeat_sequence: 88,
@@ -151,6 +152,22 @@ fn protocol_2_12_heartbeat_acknowledgement_codec_is_exact() {
 #[allow(clippy::too_many_lines)]
 fn every_message_variant_round_trips() {
     let messages = vec![
+        WireMessage::DiagnosticsRequest(DiagnosticsRequest {
+            protocol: CURRENT_PROTOCOL_VERSION,
+            request_id: "diag-01".to_owned(),
+        }),
+        WireMessage::DiagnosticsResponse(DiagnosticsResponse {
+            protocol: CURRENT_PROTOCOL_VERSION,
+            request_id: "diag-01".to_owned(),
+            engine: identity(),
+            current_revision: 1_842,
+            oldest_retained_revision: Some(1_700),
+            newest_retained_revision: Some(1_842),
+            subscriber_count: 3,
+            retained_events_limit: 4_096,
+            subscriber_limit: 16,
+            subscriber_queue_limit: 256,
+        }),
         WireMessage::Command(CommandMessage {
             payload: CommandPayload::ReorderInputs {
                 inputs: vec![input(2), input(1)],
@@ -300,9 +317,24 @@ fn every_message_variant_round_trips() {
         assert_eq!(decode_line(&encoded).unwrap(), message);
     }
 
+    assert!(matches!(
+        decode_line("diagnostics_request\tprotocol=2.13\trequest_id= \n"),
+        Err(CodecError::InvalidField {
+            field: "request_id",
+            ..
+        })
+    ));
+    assert_eq!(
+        decode_line(&format!(
+            "diagnostics_request\tprotocol=2.13\trequest_id={}\n",
+            "x".repeat(MAX_FIELD_VALUE_BYTES + 1)
+        )),
+        Err(CodecError::FieldValueTooLong)
+    );
+
     for malformed in [
-        "command\tprotocol=2.12\tid=01K%3Atest\tidempotency_key=operator-7%3A01K\tpayload=input_reorder\tinputs=\n",
-        "command\tprotocol=2.12\tid=01K%3Atest\tidempotency_key=operator-7%3A01K\tpayload=input_reorder\tinputs=1%2C1\n",
+        "command\tprotocol=2.13\tid=01K%3Atest\tidempotency_key=operator-7%3A01K\tpayload=input_reorder\tinputs=\n",
+        "command\tprotocol=2.13\tid=01K%3Atest\tidempotency_key=operator-7%3A01K\tpayload=input_reorder\tinputs=1%2C1\n",
     ] {
         assert!(matches!(
             decode_line(malformed),

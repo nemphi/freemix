@@ -11,15 +11,16 @@ pub use codec::{
 };
 pub use dto::{
     CapabilityReportMessage, CapabilityReportSummary, ClientType, CommandMessage, CommandPayload,
-    CommandResult, DurableEvent, DurableEventBatch, DurableGap, EngineIdentity, ErrorMessage,
-    EventCursor, EventMessage, EventPayload, FadeToBlackPosition, FadeToBlackState, FieldIssue,
-    HandshakeOutcome, HandshakeRequest, HandshakeResponse, HeartbeatAcknowledgementMessage,
-    HeartbeatMessage, InputAudioStripStatus, InputStatus, ManualTransitionKind,
-    ManualTransitionPosition, ManualTransitionState, ManualTransitionStatus, OverlayBorderPreset,
-    OverlayPositionPreset, OverlayStatus, OverlayTransitionKind, ResumeCursor, Role,
-    RuntimeDomainBoundary, RuntimeEventMessage, RuntimeFailureDisposition, RuntimeLifecycleEvent,
-    ServerHello, ServerIdentity, SnapshotMessage, SnapshotReason, StingerAudioPolicy,
-    StingerMissingMediaFallback, StingerReadiness, StingerStatus, StructuredError, WireInputId,
-    WireMessage, WireOutputId, WireOverlayChannelId, WireStingerSlotId, choose_handshake_outcome,
+    CommandResult, DiagnosticsRequest, DiagnosticsResponse, DurableEvent, DurableEventBatch,
+    DurableGap, EngineIdentity, ErrorMessage, EventCursor, EventMessage, EventPayload,
+    FadeToBlackPosition, FadeToBlackState, FieldIssue, HandshakeOutcome, HandshakeRequest,
+    HandshakeResponse, HeartbeatAcknowledgementMessage, HeartbeatMessage, InputAudioStripStatus,
+    InputStatus, ManualTransitionKind, ManualTransitionPosition, ManualTransitionState,
+    ManualTransitionStatus, OverlayBorderPreset, OverlayPositionPreset, OverlayStatus,
+    OverlayTransitionKind, ResumeCursor, Role, RuntimeDomainBoundary, RuntimeEventMessage,
+    RuntimeFailureDisposition, RuntimeLifecycleEvent, ServerHello, ServerIdentity, SnapshotMessage,
+    SnapshotReason, StingerAudioPolicy, StingerMissingMediaFallback, StingerReadiness,
+    StingerStatus, StructuredError, WireInputId, WireMessage, WireOutputId, WireOverlayChannelId,
+    WireStingerSlotId, choose_handshake_outcome,
 };
 pub use version::{CURRENT_PROTOCOL_VERSION, ProtocolVersion};
