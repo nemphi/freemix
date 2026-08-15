@@ -132,7 +132,7 @@ fn snapshot(inputs: Vec<InputStatus>) -> WireMessage {
 }
 
 #[test]
-fn protocol_2_11_heartbeat_acknowledgement_codec_is_exact() {
+fn protocol_2_12_heartbeat_acknowledgement_codec_is_exact() {
     assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(2, 12));
     let acknowledgement = WireMessage::HeartbeatAcknowledgement(HeartbeatAcknowledgementMessage {
         server: server_identity(),
@@ -151,6 +151,12 @@ fn protocol_2_11_heartbeat_acknowledgement_codec_is_exact() {
 #[allow(clippy::too_many_lines)]
 fn every_message_variant_round_trips() {
     let messages = vec![
+        WireMessage::Command(CommandMessage {
+            payload: CommandPayload::ReorderInputs {
+                inputs: vec![input(2), input(1)],
+            },
+            ..command()
+        }),
         WireMessage::Command(CommandMessage {
             payload: CommandPayload::SetInputAudioStrip {
                 input: input(42),
@@ -282,10 +288,29 @@ fn every_message_variant_round_trips() {
                 input_audio_strips: input_audio_strips(&[1, 2]),
             },
         }),
+        WireMessage::Event(EventMessage {
+            cursor: cursor(),
+            payload: EventPayload::InputOrderChanged {
+                inputs: vec![input(2), input(1)],
+            },
+        }),
     ];
     for message in messages {
         let encoded = encode_line(&message).unwrap();
         assert_eq!(decode_line(&encoded).unwrap(), message);
+    }
+
+    for malformed in [
+        "command\tprotocol=2.12\tid=01K%3Atest\tidempotency_key=operator-7%3A01K\tpayload=input_reorder\tinputs=\n",
+        "command\tprotocol=2.12\tid=01K%3Atest\tidempotency_key=operator-7%3A01K\tpayload=input_reorder\tinputs=1%2C1\n",
+    ] {
+        assert!(matches!(
+            decode_line(malformed),
+            Err(CodecError::InvalidField {
+                field: "inputs",
+                ..
+            })
+        ));
     }
 }
 

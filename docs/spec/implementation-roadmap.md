@@ -68,7 +68,7 @@ saved, restarted, resumed, and tested deterministically.
 Current Phase 1 control boundary: the daemon, protocol, and client exercise a
 versioned raw TCP session with handshake, snapshot/resume, commands, events,
 development authentication, bounded bidirectional heartbeat acknowledgement,
-and deterministic model tests. Protocol 2.11 retains the protocol 2.10 rule
+and deterministic model tests. Protocol 2.12 retains the protocol 2.10 rule
 that the daemon acknowledges only a validated heartbeat with the session server identity, the exact client
 heartbeat sequence, and the server receive time. Studio accepts one expected
 sequence and uses its bounded peer wait before the existing reconnect backoff.
@@ -234,7 +234,7 @@ integer milli-dB gain (`-96000..=24000`), stereo balance
 0–48,000-sample delay. Native daemon preflight transactionally maps those
 records to `fm-audio::Gain` and `fm-audio::Balance` and constructs both Master
 mixer copies with the target gain, balance, and delay applied immediately.
-Protocol 2.11 carries authoritative input IDs and canonical names plus full-strip
+Protocol 2.12 carries authoritative input IDs and canonical names plus full-strip
 status in snapshots. It adds an EditProject-authorized input rename command and
 a small durable rename event without changing the snapshot shape. Other durable
 events carry full-strip state plus one permission-gated atomic live strip command. The engine schedules
@@ -480,10 +480,10 @@ snapshots while any channel is moving. Every channel also owns a bounded
 bottom-left, and bottom-right position presets plus none/thin-white/thick-white
 inset-border presets. Schema 17 persists the complete desired and realized
 arrays, appearance, queue state, and exact per-input audio strips, and accepts schema
-17 only. Protocol 2.11 carries canonical input names, durable input renames, opacity, transition kind,
+17 only. Protocol 2.12 carries canonical input names, durable input renames, opacity, transition kind,
 duration, Take, Update,
 Off, output inclusion, transition/appearance configuration, Queue, Take Next,
-and atomic per-input audio-strip commands and state, and accepts protocol 2.11 only.
+and atomic per-input audio-strip commands and state, and accepts protocol 2.12 only.
 
 Control authorization treats overlay mutations as transition operations. The
 client/UI reducer validates exactly eight unique channels, active-source
@@ -530,7 +530,7 @@ Native project compilation carries that value into physical and scene-alias
 strips, and native Master/Stinger preflight applies it transactionally to both
 active and pending mixers before gain, balance, mute, solo, follow-video, and source envelopes.
 The engine owns the live desired full-strip map and emits frame-boundary
-realization updates. Protocol 2.11 snapshots pair every input ID with its
+realization updates. Protocol 2.12 snapshots pair every input ID with its
 canonical persisted name and replicate the complete strip map; its
 `SetInputAudioStrip` command atomically carries gain, balance, mute, solo,
 follow-video, and delay and is authorized by the dedicated audio-control

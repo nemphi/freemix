@@ -1066,7 +1066,7 @@ impl<A: AuthorizationHook> ControlService<A> {
 
 const fn runtime_domain(command: &EngineCommand) -> &'static str {
     match command {
-        EngineCommand::RenameInput { .. } => "project",
+        EngineCommand::ReorderInputs { .. } | EngineCommand::RenameInput { .. } => "project",
         EngineCommand::SetInputAudioStrip { .. } => "audio",
         _ => "switcher",
     }
