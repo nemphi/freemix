@@ -681,6 +681,24 @@ fn commands_have_monotonic_ids_and_results_reconcile_through_ui_model() {
 }
 
 #[test]
+fn whitespace_only_idempotency_key_does_not_mutate_command_state() {
+    let mut client = ready_client(4);
+
+    assert_eq!(
+        client.queue_command(CommandPayload::Cut, " \t\n", None, None),
+        Err(ClientError::EmptyIdempotencyKey)
+    );
+    assert_eq!(client.outbound_len(), 0);
+    assert_eq!(client.retained_command_count(), 0);
+    assert!(client.model().pending_commands().is_empty());
+
+    let command = client
+        .queue_command(CommandPayload::Cut, "accepted", None, None)
+        .unwrap();
+    assert_eq!(command.id, "diagnostic-a:1");
+}
+
+#[test]
 fn wipe_command_is_queued_with_its_exact_duration() {
     let mut client = ready_client(1);
     let command = client

@@ -834,7 +834,7 @@ impl Client {
             .protocol;
         self.ensure_queue_space()?;
         let idempotency_key = idempotency_key.into();
-        if idempotency_key.is_empty() {
+        if idempotency_key.trim().is_empty() {
             return Err(ClientError::EmptyIdempotencyKey);
         }
         if self.idempotency_keys.contains(&idempotency_key) {
