@@ -148,19 +148,16 @@ pub(super) fn parse_input_statuses(value: &str) -> Result<Vec<InputStatus>, Code
                 });
             }
             let input = crate::WireInputId::new(input.ok_or_else(|| CodecError::InvalidField {
-                    field: "inputs",
-                    value: value.to_owned(),
-                })?);
+                field: "inputs",
+                value: value.to_owned(),
+            })?);
             if !inputs.insert(input.get()) {
                 return Err(CodecError::InvalidField {
                     field: "inputs",
                     value: value.to_owned(),
                 });
             }
-            Ok(InputStatus {
-                input,
-                name,
-            })
+            Ok(InputStatus { input, name })
         })
         .collect()
 }

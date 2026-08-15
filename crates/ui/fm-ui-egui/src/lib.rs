@@ -1561,7 +1561,10 @@ mod tests {
             StudioConnectionStatus::ProtocolMismatch,
         ];
         assert!(StudioConnectionStatus::Ready.controls_enabled());
-        assert_eq!(StudioConnectionStatus::Ready.operator_label(), "CONTROL READY");
+        assert_eq!(
+            StudioConnectionStatus::Ready.operator_label(),
+            "CONTROL READY"
+        );
         for status in statuses {
             assert!(!status.controls_enabled(), "{status:?}");
             assert!(!status.operator_label().is_empty());
@@ -1606,11 +1609,7 @@ mod tests {
         let mut shell = StudioShell::default();
         shell.set_transition_duration_frames(42);
         let duration = shell.transition_duration_frames();
-        let run = |events,
-                   gate,
-                   can_select_preview,
-                   manual_transition_active_controls,
-                   focused| {
+        let run = |events, gate, can_select_preview, manual_transition_active_controls, focused| {
             context.begin_pass(egui::RawInput {
                 events,
                 ..Default::default()
@@ -1675,7 +1674,10 @@ mod tests {
             remaining.as_slice(),
             [
                 Event::Key { key: Key::Num2, .. },
-                Event::Key { key: Key::Escape, .. },
+                Event::Key {
+                    key: Key::Escape,
+                    ..
+                },
                 Event::Key { key: Key::Num9, .. }
             ]
         ));
@@ -1726,7 +1728,10 @@ mod tests {
         assert!(matches!(
             remaining.as_slice(),
             [
-                Event::Key { key: Key::Escape, .. },
+                Event::Key {
+                    key: Key::Escape,
+                    ..
+                },
                 Event::Key { key: Key::C, .. },
                 Event::Key { key: Key::F, .. }
             ]
@@ -1747,7 +1752,10 @@ mod tests {
         assert!(matches!(
             remaining.as_slice(),
             [
-                Event::Key { key: Key::Escape, .. },
+                Event::Key {
+                    key: Key::Escape,
+                    ..
+                },
                 Event::Key { key: Key::C, .. },
                 Event::Key { key: Key::F, .. }
             ]

@@ -341,22 +341,14 @@ fn recovery_queue_priority_accepts_first_random_access() {
         outputs
             .enqueue(
                 destination_id(1),
-                packet_with_random_access(
-                    id,
-                    sequence,
-                    false,
-                    usize::try_from(sequence).unwrap(),
-                ),
+                packet_with_random_access(id, sequence, false, usize::try_from(sequence).unwrap()),
             )
             .unwrap();
     }
     assert_eq!(outputs.queue_depth(destination_id(1)), Some(3));
     assert_eq!(
         outputs
-            .enqueue(
-                destination_id(1),
-                packet_with_random_access(id, 5, true, 5),
-            )
+            .enqueue(destination_id(1), packet_with_random_access(id, 5, true, 5),)
             .unwrap(),
         EnqueueStatus::Accepted
     );
@@ -402,10 +394,7 @@ fn recovery_queue_priority_accepts_first_random_access() {
         Some(DestinationState::AwaitingRandomAccess)
     );
     outputs
-        .enqueue(
-            destination_id(1),
-            packet_with_random_access(id, 7, true, 7),
-        )
+        .enqueue(destination_id(1), packet_with_random_access(id, 7, true, 7))
         .unwrap();
     assert_eq!(
         outputs.poll(destination_id(1), 301, &mut sink).unwrap(),
@@ -453,29 +442,18 @@ fn empty_recovery_queue(capacity: usize) -> (OutputSet, FakeSink, RenditionId) {
 fn recovery_queue_priority_preserves_queued_random_access() {
     let (mut outputs, mut sink, id) = empty_recovery_queue(3);
     outputs
-        .enqueue(
-            destination_id(1),
-            packet_with_random_access(id, 2, true, 2),
-        )
+        .enqueue(destination_id(1), packet_with_random_access(id, 2, true, 2))
         .unwrap();
     for sequence in 3..=4 {
         outputs
             .enqueue(
                 destination_id(1),
-                packet_with_random_access(
-                    id,
-                    sequence,
-                    false,
-                    usize::try_from(sequence).unwrap(),
-                ),
+                packet_with_random_access(id, sequence, false, usize::try_from(sequence).unwrap()),
             )
             .unwrap();
     }
     let rejected = outputs
-        .enqueue(
-            destination_id(1),
-            packet_with_random_access(id, 5, true, 5),
-        )
+        .enqueue(destination_id(1), packet_with_random_access(id, 5, true, 5))
         .unwrap();
     let EnqueueStatus::Backpressure(rejected) = rejected else {
         panic!("protected recovery packet did not keep normal backpressure");

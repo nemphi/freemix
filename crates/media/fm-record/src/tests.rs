@@ -840,7 +840,9 @@ fn flush_sync_failure_retains_uncommitted_batch() {
             .expect("enqueue first batch");
     }
     assert_eq!(coordinator.flush(recorder).expect("flush first batch"), 2);
-    coordinator.rotate(recorder).expect("rotate after first batch");
+    coordinator
+        .rotate(recorder)
+        .expect("rotate after first batch");
     let directory = recording_directory(temp.path(), recorder);
     let first = format::scan_segment(&format::segment_path(&directory, 0))
         .expect("read durable first segment");

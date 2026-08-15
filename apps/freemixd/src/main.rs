@@ -1514,7 +1514,8 @@ impl NativeProgramRecorder {
     }
 
     fn fail(&mut self, failure: String, app_capture_failure: bool) {
-        if let Some((failure, app_capture_failure)) = self.capture.fail(failure, app_capture_failure)
+        if let Some((failure, app_capture_failure)) =
+            self.capture.fail(failure, app_capture_failure)
         {
             let notice = recorder_failure_notice(failure, app_capture_failure);
             eprintln!("{notice}");
@@ -7754,7 +7755,10 @@ mod tests {
         .unwrap();
         drop(execute);
 
-        assert!(matches!(next.submission.output.result, CommandResult::Accepted { .. }));
+        assert!(matches!(
+            next.submission.output.result,
+            CommandResult::Accepted { .. }
+        ));
         assert_eq!(durable.position().frames_rendered, 6);
         let restored = restore_engine(&durable).unwrap().snapshot().unwrap();
         let live = live_engine_snapshot(&mut control);
@@ -7879,7 +7883,10 @@ mod tests {
         assert_eq!(durable.position().runtime_generation, 1);
         let restored = restore_engine(&durable).unwrap().snapshot().unwrap();
         assert_eq!(live_engine_snapshot(&mut control), restored);
-        for state in [restored.show().desired_switcher(), restored.realized_switcher()] {
+        for state in [
+            restored.show().desired_switcher(),
+            restored.realized_switcher(),
+        ] {
             assert_eq!(
                 (state.program(), state.preview()),
                 (test_input_id(2), test_input_id(1))

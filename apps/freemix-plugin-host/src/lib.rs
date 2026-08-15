@@ -926,10 +926,8 @@ mod tests {
         .unwrap();
         assert_eq!(accepted_output, b"shutting-down\n");
 
-        let input = BufReader::with_capacity(
-            64,
-            Cursor::new(vec![b'x'; MAX_CONTROL_LINE_BYTES + 1]),
-        );
+        let input =
+            BufReader::with_capacity(64, Cursor::new(vec![b'x'; MAX_CONTROL_LINE_BYTES + 1]));
         let mut output = Vec::new();
         let mut lifecycle = Lifecycle::new();
 

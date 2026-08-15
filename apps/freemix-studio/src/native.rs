@@ -2,9 +2,9 @@ use std::{
     collections::VecDeque,
     fmt,
     sync::{
+        Arc, Mutex, PoisonError,
         atomic::{AtomicU64, Ordering},
         mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError, sync_channel},
-        Arc, Mutex, PoisonError,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -318,10 +318,7 @@ fn state_mailbox(repaint_context: egui::Context) -> (StatePublisher, StateUpdate
 
 impl StatePublisher {
     fn publish(&self, state: StudioUiState) -> bool {
-        *self
-            .latest
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(state);
+        *self.latest.lock().unwrap_or_else(PoisonError::into_inner) = Some(state);
         match self.sender.try_send(()) {
             Ok(()) | Err(TrySendError::Full(())) => {
                 self.repaint_context.request_repaint();
@@ -1600,13 +1597,10 @@ mod tests {
         FadeToBlackState, HandshakeOutcome, HandshakeResponse, HeartbeatAcknowledgementMessage,
         InputAudioStripStatus, InputStatus, ManualTransitionPosition, ManualTransitionStatus,
         OverlayBorderPreset, OverlayPositionPreset, OverlayStatus, Role, ServerIdentity,
-        SnapshotMessage, SnapshotReason, WireMessage,
-        decode_line, encode_line,
+        SnapshotMessage, SnapshotReason, WireMessage, decode_line, encode_line,
     };
     use fm_types::ProjectId;
-    use fm_ui_model::{
-        ClientModel, DurableChange, DurableProjectEvent, ProjectSnapshot,
-    };
+    use fm_ui_model::{ClientModel, DurableChange, DurableProjectEvent, ProjectSnapshot};
 
     #[cfg(unix)]
     use crate::SupervisedConfig;
@@ -1813,10 +1807,7 @@ mod tests {
         path
     }
 
-    fn receive_connection_state(
-        updates: &StateUpdates,
-        expected: StudioConnectionStatus,
-    ) {
+    fn receive_connection_state(updates: &StateUpdates, expected: StudioConnectionStatus) {
         loop {
             updates
                 .receiver
@@ -1889,10 +1880,7 @@ mod tests {
                 ..InputAudioStripUpdate::default()
             },
         };
-        assert_eq!(
-            pending.push(initial),
-            Ok(())
-        );
+        assert_eq!(pending.push(initial), Ok(()));
         for value in 1..=REQUEST_CAPACITY {
             assert_eq!(
                 pending.push(StudioIntent::SetInputAudioStrip {
@@ -1918,10 +1906,7 @@ mod tests {
                 delay_samples: Some(0),
             },
         };
-        assert_eq!(
-            pending.intents,
-            VecDeque::from([coalesced])
-        );
+        assert_eq!(pending.intents, VecDeque::from([coalesced]));
 
         let other = StudioIntent::SetInputAudioStrip {
             input: other_input,

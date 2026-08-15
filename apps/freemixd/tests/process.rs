@@ -510,8 +510,14 @@ fn malformed_post_handshake_record_does_not_stop_daemon() {
         .set_read_timeout(Some(Duration::from_secs(1)))
         .unwrap();
     malformed_client.handshake(None);
-    assert!(matches!(malformed_client.receive(), WireMessage::Snapshot(_)));
-    malformed_client.writer.write_all(b"malformed-record\n").unwrap();
+    assert!(matches!(
+        malformed_client.receive(),
+        WireMessage::Snapshot(_)
+    ));
+    malformed_client
+        .writer
+        .write_all(b"malformed-record\n")
+        .unwrap();
     malformed_client.writer.flush().unwrap();
 
     let mut closed = String::new();

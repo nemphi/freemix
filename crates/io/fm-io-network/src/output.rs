@@ -397,10 +397,16 @@ pub enum PollEvent {
         dropped_packets: u64,
         dropped_bytes: u64,
     },
-    PacketSent { sequence: u64 },
+    PacketSent {
+        sequence: u64,
+    },
     Congested,
-    WaitingToReconnect { retry_at_ms: u64 },
-    ReconnectScheduled { retry_at_ms: u64 },
+    WaitingToReconnect {
+        retry_at_ms: u64,
+    },
+    ReconnectScheduled {
+        retry_at_ms: u64,
+    },
     Failed,
 }
 
@@ -530,7 +536,11 @@ impl DestinationOutput {
     fn drop_interframes(&mut self) -> PollEvent {
         let mut dropped_packets = 0_u64;
         let mut dropped_bytes = 0_u64;
-        while self.queue.front().is_some_and(|packet| !packet.random_access) {
+        while self
+            .queue
+            .front()
+            .is_some_and(|packet| !packet.random_access)
+        {
             let packet = self.queue.pop_front().expect("front packet exists");
             let packet_bytes = packet.payload.len();
             self.queued_bytes -= packet_bytes;

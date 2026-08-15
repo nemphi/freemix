@@ -300,8 +300,7 @@ fn input_statuses_reject_duplicate_ids() {
         })
     ));
 
-    let valid = encode_line(&snapshot(input_statuses(&[(1, "camera"), (2, "slides")])))
-        .unwrap();
+    let valid = encode_line(&snapshot(input_statuses(&[(1, "camera"), (2, "slides")]))).unwrap();
     let duplicate = valid.replace(
         "inputs=1%7Ecamera%2C2%7Eslides",
         "inputs=1%7Ecamera%2C1%7Eslides",
@@ -338,10 +337,7 @@ fn overlay_included_outputs_reject_duplicates() {
     snapshot_message.desired_overlays[0].included_outputs =
         vec![output(7_000_000_001), output(7_000_000_002)];
     let valid = encode_line(&valid).unwrap();
-    let duplicate = valid.replace(
-        "7000000001%2C7000000002",
-        "7000000001%2C7000000001",
-    );
+    let duplicate = valid.replace("7000000001%2C7000000002", "7000000001%2C7000000001");
     assert_ne!(duplicate, valid);
     assert!(matches!(
         decode_line(&duplicate),
