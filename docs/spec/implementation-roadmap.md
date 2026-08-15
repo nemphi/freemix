@@ -81,6 +81,7 @@ Studio diagnose checks one bounded raw-TCP heartbeat acknowledgement and keeps
 waiting when validated durable or runtime state arrives first.
 The default simulated daemon cooperatively stops after Unix SIGINT/SIGTERM or Windows Ctrl-C through bounded listener polling.
 Simulated CLI PPM output uses same-directory write/sync/replace, not broader media or disk certification.
+Local CLI loads reject unapplied journal batches without recovering or mutating journal state; torn-final-only state remains readable.
 This is control-plane peer liveness. It is not service readiness, production
 authentication, media health, HTTP resources, WebSocket event subscriptions,
 or transport-level production rate limits. The simulated non-native raw-TCP

@@ -1073,7 +1073,7 @@ fn remove_stinger(path: &Path, slot: StingerSlotNumber) -> AppResult<()> {
 
 fn update_stingers(path: &Path, update: impl FnOnce(&mut Project)) -> AppResult<()> {
     let store = ProjectStore::new(path)?;
-    let stored = store.load()?;
+    let stored = load_stored_project(path)?;
     let mut project = stored.project().clone();
     update(&mut project);
     let configured = StoredProject::from_project_with_complete_runtime_state(
@@ -1398,7 +1398,19 @@ fn restored_t_bar(state: PersistedManualTransitionState) -> AppResult<TBarState>
 }
 
 fn load_stored_project(path: &Path) -> AppResult<StoredProject> {
-    Ok(ProjectStore::new(path)?.load()?)
+    let store = ProjectStore::new(path)?;
+    let project = store.load()?;
+    if store.journal_path().try_exists()? {
+        let scan = store.scan_journal()?;
+        if !scan.batches().is_empty() {
+            return Err(AppFailure(
+                "project has unapplied journal batches that freemix-cli cannot safely interpret"
+                    .into(),
+            )
+            .into());
+        }
+    }
+    Ok(project)
 }
 
 fn render(path: &Path, output: &Path, width: u32, height: u32) -> AppResult<()> {
@@ -1940,6 +1952,7 @@ impl Error for AppFailure {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fm_persistence::MutationBatch;
 
     #[test]
     fn ppm_publication_write_failure_keeps_previous_target() {
@@ -1997,6 +2010,61 @@ mod tests {
                 .to_string()
                 .contains("unknown rejection code `future_code`")
         );
+    }
+
+    #[test]
+    fn local_load_rejects_unapplied_batch_without_mutating_bundle() {
+        let root = std::env::temp_dir().join(format!(
+            "freemix-cli-journal-{}-{}",
+            std::process::id(),
+            PROJECT_ID_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("show.freemix");
+        save_engine(&path, &default_project("Journal".into()).unwrap()).unwrap();
+        let store = ProjectStore::new(&path).unwrap();
+        store
+            .append_batch(&MutationBatch::new(1, 0, 1, b"unapplied".to_vec()))
+            .unwrap();
+        let manifest = fs::read(path.join("project.json")).unwrap();
+        let record = store.journal_path().join("00000000000000000001.batch");
+        let journal = fs::read(&record).unwrap();
+
+        let error = load_stored_project(&path).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "project has unapplied journal batches that freemix-cli cannot safely interpret"
+        );
+        assert_eq!(fs::read(path.join("project.json")).unwrap(), manifest);
+        assert_eq!(fs::read(record).unwrap(), journal);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn local_load_allows_torn_final_record_and_leaves_it_in_place() {
+        let root = std::env::temp_dir().join(format!(
+            "freemix-cli-journal-{}-{}",
+            std::process::id(),
+            PROJECT_ID_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("show.freemix");
+        save_engine(&path, &default_project("Journal".into()).unwrap()).unwrap();
+        let store = ProjectStore::new(&path).unwrap();
+        store
+            .append_batch(&MutationBatch::new(1, 0, 1, b"torn".to_vec()))
+            .unwrap();
+        let record = store.journal_path().join("00000000000000000001.batch");
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&record)
+            .unwrap()
+            .set_len(12)
+            .unwrap();
+
+        assert!(load_stored_project(&path).is_ok());
+        assert!(record.exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
