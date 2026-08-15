@@ -14,9 +14,13 @@ pub const MAX_FIELD_VALUE_BYTES: usize = 48 * 1024;
 pub const MAX_LIST_ITEMS: usize = 256;
 pub const MAX_BATCH_EVENTS: usize = 256;
 pub const MAX_MESSAGES_PER_PUSH: usize = 1024;
+pub const MAX_REQUEST_ID_BYTES: usize = 128;
 
 fn validate_request_id(value: &str) -> Result<(), CodecError> {
-    if value.trim().is_empty() {
+    if value.is_empty()
+        || value.len() > MAX_REQUEST_ID_BYTES
+        || !value.bytes().all(|byte| byte.is_ascii_graphic())
+    {
         Err(CodecError::InvalidField {
             field: "request_id",
             value: value.to_owned(),

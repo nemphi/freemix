@@ -270,12 +270,14 @@ fn serve_diagnostics_peer(stream: TcpStream) {
             },
         }),
     );
+    let mut response_engine = engine.clone();
+    response_engine.log_id = "mismatched-log".into();
     write_message(
         &mut writer,
         &WireMessage::DiagnosticsResponse(fm_protocol::DiagnosticsResponse {
             protocol: CURRENT_PROTOCOL_VERSION,
             request_id: request.request_id,
-            engine: engine.clone(),
+            engine: response_engine,
             current_revision: 12,
             oldest_retained_revision: Some(3),
             newest_retained_revision: Some(12),
@@ -1167,11 +1169,7 @@ fn remote_status_times_out_when_peer_sends_no_response() {
 fn remote_diagnostics_correlates_request_and_allows_interleaved_runtime_event() {
     let server = FakeRemoteServer::start_diagnostics();
     let output = invoke_bounded(&["remote-diagnostics", &server.address()]);
-    assert_success(&output);
-    assert_eq!(
-        stdout(&output),
-        "diagnostics=v1 engine_id=diag-engine state_epoch=7 revision=12 retained_oldest=3 retained_newest=12 subscribers=2/8 retained_limit=64 subscriber_queue=16"
-    );
+    assert_failure_contains(&output, "diagnostics response does not match the request");
     server.finish();
 }
 

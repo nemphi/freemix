@@ -3,7 +3,7 @@ use std::{
     io::{BufRead, BufReader, Write},
     net::{SocketAddr, TcpStream},
     num::NonZeroU128,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use fm_client::{Client, ClientConfig, Intake, Outbound};
@@ -27,13 +27,14 @@ pub fn status(address: SocketAddr) -> RemoteResult<()> {
 
 pub fn diagnostics(address: SocketAddr) -> RemoteResult<()> {
     let mut remote = Remote::connect(address, Role::Viewer)?;
+    let deadline = Instant::now() + REMOTE_IO_TIMEOUT;
     let request_id = format!("cli-diagnostics-{}", unique_client_id()?);
     remote.write(&WireMessage::DiagnosticsRequest(DiagnosticsRequest {
         protocol: CURRENT_PROTOCOL_VERSION,
         request_id: request_id.clone(),
     }))?;
     let response = loop {
-        match remote.read()? {
+        match remote.read_until(deadline)? {
             WireMessage::DiagnosticsResponse(response) => break response,
             WireMessage::Event(event) => {
                 remote.client.intake(WireMessage::Event(event))?;
@@ -53,6 +54,7 @@ pub fn diagnostics(address: SocketAddr) -> RemoteResult<()> {
         || response.protocol != CURRENT_PROTOCOL_VERSION
         || response.engine.engine_id != remote.server.engine_id
         || response.engine.state_epoch != remote.server.state_epoch
+        || response.engine.log_id != remote.server.log_id
     {
         return Err(RemoteFailure("diagnostics response does not match the request".into()).into());
     }
@@ -398,8 +400,23 @@ impl Remote {
     }
 
     fn read(&mut self) -> RemoteResult<WireMessage> {
+        self.read_until_inner(None)
+    }
+
+    fn read_until(&mut self, deadline: Instant) -> RemoteResult<WireMessage> {
+        self.read_until_inner(Some(deadline))
+    }
+
+    fn read_until_inner(&mut self, deadline: Option<Instant>) -> RemoteResult<WireMessage> {
         let mut line = Vec::with_capacity(MAX_LINE_BYTES);
         loop {
+            if let Some(deadline) = deadline {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(RemoteFailure("daemon response timed out".into()).into());
+                }
+                self.reader.get_mut().set_read_timeout(Some(remaining))?;
+            }
             let (count, complete) = {
                 let buffer = match self.reader.fill_buf() {
                     Ok(buffer) => buffer,

@@ -331,6 +331,43 @@ fn every_message_variant_round_trips() {
         )),
         Err(CodecError::FieldValueTooLong)
     );
+    assert_eq!(
+        decode_line(&format!(
+            "diagnostics_request\tprotocol=2.13\trequest_id={}\n",
+            "x".repeat(129)
+        )),
+        Err(CodecError::InvalidField {
+            field: "request_id",
+            value: "x".repeat(129),
+        })
+    );
+    assert_eq!(
+        decode_line("diagnostics_request\tprotocol=2.13\trequest_id=x%09y\n"),
+        Err(CodecError::InvalidField {
+            field: "request_id",
+            value: "x\ty".to_owned(),
+        })
+    );
+    assert_eq!(
+        encode_line(&WireMessage::DiagnosticsRequest(DiagnosticsRequest {
+            protocol: CURRENT_PROTOCOL_VERSION,
+            request_id: "x".repeat(129),
+        })),
+        Err(CodecError::InvalidField {
+            field: "request_id",
+            value: "x".repeat(129),
+        })
+    );
+    assert_eq!(
+        encode_line(&WireMessage::DiagnosticsRequest(DiagnosticsRequest {
+            protocol: CURRENT_PROTOCOL_VERSION,
+            request_id: "x\ty".to_owned(),
+        })),
+        Err(CodecError::InvalidField {
+            field: "request_id",
+            value: "x\ty".to_owned(),
+        })
+    );
 
     for malformed in [
         "command\tprotocol=2.13\tid=01K%3Atest\tidempotency_key=operator-7%3A01K\tpayload=input_reorder\tinputs=\n",
