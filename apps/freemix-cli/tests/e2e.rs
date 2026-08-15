@@ -925,7 +925,7 @@ fn write_handshake_version_with_manual(
 fn handshake_permissions(role: Role) -> Vec<String> {
     match role {
         Role::Viewer => vec!["view_status".into()],
-        Role::Audio => ["view_status", "control_audio", "edit_project"]
+        Role::Audio => ["view_status", "control_audio"]
             .into_iter()
             .map(str::to_owned)
             .collect(),

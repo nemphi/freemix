@@ -136,11 +136,7 @@ impl Policy {
         );
         grants.insert(
             Role::Audio,
-            set([
-                Permission::ViewStatus,
-                Permission::ControlAudio,
-                Permission::EditProject,
-            ]),
+            set([Permission::ViewStatus, Permission::ControlAudio]),
         );
         grants.insert(
             Role::Operator,

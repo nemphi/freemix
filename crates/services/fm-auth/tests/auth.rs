@@ -45,7 +45,7 @@ fn production_role_matrix_is_least_privilege() {
     let cases = [
         (Role::Viewer, [true, false, false, false, false, false]),
         (Role::Graphics, [true, false, false, false, true, false]),
-        (Role::Audio, [true, false, false, true, true, false]),
+        (Role::Audio, [true, false, false, true, false, false]),
         (Role::Operator, [true, true, true, true, false, false]),
         (Role::Admin, [true, true, true, true, true, true]),
     ];
