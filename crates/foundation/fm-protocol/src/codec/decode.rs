@@ -15,8 +15,9 @@ use crate::{
 };
 
 use super::value::{
-    parse_client_type, parse_durable_events, parse_field_issues, parse_input_statuses, parse_role,
-    parse_runtime_domains, parse_string_list, parse_version, unescape,
+    parse_client_type, parse_durable_events, parse_field_issues, parse_input_ids,
+    parse_input_statuses, parse_role, parse_runtime_domains, parse_string_list, parse_version,
+    unescape,
 };
 use super::{
     MAX_FIELD_NAME_BYTES, MAX_FIELD_VALUE_BYTES, MAX_FIELDS_PER_MESSAGE, MAX_LINE_BYTES,
@@ -253,6 +254,9 @@ fn decode_command_payload(
     payload_name: String,
 ) -> Result<CommandPayload, CodecError> {
     Ok(match payload_name.as_str() {
+        "input_reorder" => CommandPayload::ReorderInputs {
+            inputs: parse_input_ids(&fields.required("inputs")?)?,
+        },
         "input_rename" => CommandPayload::RenameInput {
             input: fields.input("input")?,
             name: fields.required("name")?,
@@ -839,6 +843,9 @@ fn invalid_stingers(value: &str) -> CodecError {
 fn decode_event(fields: &mut Fields) -> Result<EventMessage, CodecError> {
     let event = fields.required("event")?;
     let payload = match event.as_str() {
+        "input_order_changed" => EventPayload::InputOrderChanged {
+            inputs: parse_input_ids(&fields.required("inputs")?)?,
+        },
         "input_renamed" => EventPayload::InputRenamed {
             input: fields.input("input")?,
             name: fields.required("name")?,

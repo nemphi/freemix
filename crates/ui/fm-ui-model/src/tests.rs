@@ -650,3 +650,42 @@ fn runtime_revision_errors_are_separate_from_durable_gaps() {
     ));
     assert!(matches!(model.sync_status(), SyncStatus::Behind { .. }));
 }
+
+#[test]
+fn input_order_change_reorders_pairs_and_rejects_wrong_set_atomically() {
+    let project_id = project(11);
+    let mut model = ClientModel::new(project_id);
+    model.install_snapshot(snapshot(project_id, 4)).unwrap();
+    let identity = model.reconnect_cursor().unwrap().engine.clone();
+
+    assert!(matches!(
+        model.apply_event(event(
+            project_id,
+            identity.clone(),
+            5,
+            DurableChange::InputOrderChanged {
+                inputs: vec![input(3), input(1), input(2)],
+            },
+        )),
+        Ok(EventApplied::Applied { .. })
+    ));
+    let state = model.state().unwrap();
+    assert_eq!(state.inputs(), &[input(3), input(1), input(2)]);
+    assert_eq!(state.input_name(input(3)), Some("Guest"));
+    assert_eq!(state.input_name(input(1)), Some("Camera"));
+    assert_eq!(state.input_audio_strips(), &input_audio_strips());
+
+    let before = state.clone();
+    assert_eq!(
+        model.apply_event(event(
+            project_id,
+            identity,
+            6,
+            DurableChange::InputOrderChanged {
+                inputs: vec![input(3), input(1), input(99)],
+            },
+        )),
+        Err(ModelError::InvalidInputOrder)
+    );
+    assert_eq!(model.state().unwrap(), &before);
+}

@@ -239,6 +239,9 @@ impl ProjectSnapshot {
 /// A UI-owned durable desired-state change.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DurableChange {
+    InputOrderChanged {
+        inputs: Vec<InputId>,
+    },
     InputRenamed {
         input: InputId,
         name: String,
@@ -272,6 +275,12 @@ impl DurableProjectEvent {
     #[must_use]
     pub fn from_protocol(project_id: ProjectId, message: EventMessage) -> Self {
         let change = match message.payload {
+            EventPayload::InputOrderChanged { inputs } => DurableChange::InputOrderChanged {
+                inputs: inputs
+                    .into_iter()
+                    .map(fm_protocol::WireInputId::to_domain)
+                    .collect(),
+            },
             EventPayload::InputRenamed { input, name } => DurableChange::InputRenamed {
                 input: input.to_domain(),
                 name,
@@ -596,6 +605,7 @@ pub enum ModelError {
     RevisionExhausted,
     DuplicateInput(InputId),
     InvalidInputNames,
+    InvalidInputOrder,
     InvalidInputAudioStrips,
     DuplicateStingerSlot(u8),
     InvalidStingerSlot(u8),
@@ -673,6 +683,7 @@ impl fmt::Display for ModelError {
             ),
             Self::RevisionExhausted => formatter.write_str("revision counter is exhausted"),
             Self::DuplicateInput(input) => write!(formatter, "snapshot repeats input {input}"),
+            Self::InvalidInputOrder => formatter.write_str("input order does not match the current input set"),
             Self::InvalidInputNames => formatter.write_str(
                 "input names must contain one unique, nonblank label within the byte limit for each show input",
             ),
@@ -1459,6 +1470,17 @@ fn validate_input_audio_strips(
 
 fn validate_change(change: &DurableChange, state: &ProjectState) -> Result<(), ModelError> {
     let (selection, manual_transition, stingers, overlays, input_audio_strips) = match change {
+        DurableChange::InputOrderChanged { inputs } => {
+            let current: HashSet<_> = state.inputs.iter().copied().collect();
+            let proposed: HashSet<_> = inputs.iter().copied().collect();
+            if inputs.len() != state.inputs.len()
+                || proposed.len() != inputs.len()
+                || current != proposed
+            {
+                return Err(ModelError::InvalidInputOrder);
+            }
+            return Ok(());
+        }
         DurableChange::InputRenamed { input, name } => {
             let index = state
                 .inputs
@@ -1531,6 +1553,21 @@ fn validate_optimistic(change: OptimisticChange, inputs: &[InputId]) -> Result<(
 
 fn apply_change(state: &mut ProjectState, change: DurableChange) {
     match change {
+        DurableChange::InputOrderChanged { inputs } => {
+            let names = inputs
+                .iter()
+                .map(|input| {
+                    let index = state
+                        .inputs
+                        .iter()
+                        .position(|candidate| candidate == input)
+                        .expect("validated input order must exist");
+                    state.input_names[index].clone()
+                })
+                .collect();
+            state.inputs = inputs;
+            state.input_names = names;
+        }
         DurableChange::InputRenamed { input, name } => {
             let index = state
                 .inputs

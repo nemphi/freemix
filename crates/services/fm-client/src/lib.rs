@@ -856,7 +856,8 @@ impl Client {
             CommandPayload::SelectPreview { input } => {
                 Some(OptimisticChange::DesiredPreview(input.to_domain()))
             }
-            CommandPayload::RenameInput { .. }
+            CommandPayload::ReorderInputs { .. }
+            | CommandPayload::RenameInput { .. }
             | CommandPayload::SetInputAudioStrip { .. }
             | CommandPayload::Cut
             | CommandPayload::Fade { .. }

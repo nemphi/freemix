@@ -12,7 +12,8 @@ use crate::{
 };
 
 use super::value::{
-    client_type, durable_events, field_issues, input_statuses, role, runtime_domains, string_list,
+    client_type, durable_events, field_issues, input_ids, input_statuses, role, runtime_domains,
+    string_list,
 };
 use super::{CodecError, MAX_FIELD_VALUE_BYTES, MAX_LINE_BYTES, MAX_LIST_ITEMS};
 
@@ -144,6 +145,10 @@ fn encode_command(record: &mut Record, message: &CommandMessage) -> Result<(), C
     record.optional("expected_revision", message.expected_revision)?;
     record.optional("deadline_ms", message.deadline_ms)?;
     match &message.payload {
+        CommandPayload::ReorderInputs { inputs } => {
+            record.field("payload", "input_reorder")?;
+            record.field_string("inputs", input_ids(inputs)?)?;
+        }
         CommandPayload::RenameInput { input, name } => {
             record.field("payload", "input_rename")?;
             record.field("input", input)?;
@@ -614,6 +619,10 @@ fn encode_event(record: &mut Record, message: &EventMessage) -> Result<(), Codec
     record.kind("event");
     encode_cursor(record, &message.cursor)?;
     match &message.payload {
+        EventPayload::InputOrderChanged { inputs } => {
+            record.field("event", "input_order_changed")?;
+            record.field_string("inputs", input_ids(inputs)?)?;
+        }
         EventPayload::InputRenamed { input, name } => {
             record.field("event", "input_renamed")?;
             record.field("input", input)?;

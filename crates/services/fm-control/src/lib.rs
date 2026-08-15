@@ -1074,7 +1074,9 @@ const fn runtime_domain(command: &EngineCommand) -> &'static str {
 
 const fn command_class(payload: &CommandPayload) -> CommandClass {
     match payload {
-        CommandPayload::RenameInput { .. } => CommandClass::EditProject,
+        CommandPayload::ReorderInputs { .. } | CommandPayload::RenameInput { .. } => {
+            CommandClass::EditProject
+        }
         CommandPayload::SetInputAudioStrip { .. } => CommandClass::ControlAudio,
         CommandPayload::SelectPreview { .. } => CommandClass::SelectPreview,
         CommandPayload::Cut
@@ -1104,6 +1106,9 @@ const fn command_class(payload: &CommandPayload) -> CommandClass {
 
 fn engine_command(payload: &CommandPayload) -> EngineCommand {
     match payload {
+        CommandPayload::ReorderInputs { inputs } => EngineCommand::ReorderInputs {
+            inputs: inputs.iter().copied().map(WireInputId::to_domain).collect(),
+        },
         CommandPayload::RenameInput { input, name } => EngineCommand::RenameInput {
             input: input.to_domain(),
             name: name.clone(),
@@ -1354,6 +1359,18 @@ fn engine_submission(
                 name: name.clone(),
             }
         } else {
+            let input_order_changed = outcome.events.iter().find_map(|event| {
+                let EngineEvent::InputOrderChanged { inputs } = &event.payload else {
+                    return None;
+                };
+                Some(EventPayload::InputOrderChanged {
+                    inputs: inputs
+                        .iter()
+                        .copied()
+                        .map(WireInputId::from_domain)
+                        .collect(),
+                })
+            });
             let stinger_slots_changed = outcome.events.iter().any(|event| {
                 matches!(
                     &event.payload,
@@ -1379,6 +1396,8 @@ fn engine_submission(
                     overlays,
                     input_audio_strips,
                 }
+            } else if let Some(payload) = input_order_changed {
+                payload
             } else {
                 EventPayload::DesiredSwitcher {
                     program,

@@ -442,6 +442,9 @@ impl OverlayStatus {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CommandPayload {
+    ReorderInputs {
+        inputs: Vec<WireInputId>,
+    },
     RenameInput {
         input: WireInputId,
         name: String,
@@ -643,6 +646,9 @@ pub struct SnapshotMessage {
 /// A durable state change. Runtime progress uses [`RuntimeEventMessage`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EventPayload {
+    InputOrderChanged {
+        inputs: Vec<WireInputId>,
+    },
     InputRenamed {
         input: WireInputId,
         name: String,

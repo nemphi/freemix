@@ -162,6 +162,62 @@ pub(super) fn parse_input_statuses(value: &str) -> Result<Vec<InputStatus>, Code
         .collect()
 }
 
+pub(super) fn input_ids(values: &[crate::WireInputId]) -> Result<String, CodecError> {
+    if values.len() > MAX_LIST_ITEMS {
+        return Err(CodecError::TooManyItems("inputs"));
+    }
+    let encoded = bounded_join(values, MAX_LIST_ITEMS, "inputs", |input| {
+        Ok(input.to_string())
+    })?;
+    if values.is_empty() {
+        return Err(CodecError::InvalidField {
+            field: "inputs",
+            value: encoded,
+        });
+    }
+    let mut seen = BTreeSet::new();
+    for input in values {
+        if !seen.insert(input.get()) {
+            return Err(CodecError::InvalidField {
+                field: "inputs",
+                value: input.to_string(),
+            });
+        }
+    }
+    Ok(encoded)
+}
+
+pub(super) fn parse_input_ids(value: &str) -> Result<Vec<crate::WireInputId>, CodecError> {
+    if value.is_empty() {
+        return Err(CodecError::InvalidField {
+            field: "inputs",
+            value: value.to_owned(),
+        });
+    }
+    check_items(value, ',', MAX_LIST_ITEMS, "inputs")?;
+    let mut seen = BTreeSet::new();
+    value
+        .split(',')
+        .map(|entry| {
+            let input = entry
+                .parse::<u128>()
+                .ok()
+                .and_then(core::num::NonZeroU128::new);
+            let input = crate::WireInputId::new(input.ok_or_else(|| CodecError::InvalidField {
+                field: "inputs",
+                value: value.to_owned(),
+            })?);
+            if !seen.insert(input.get()) {
+                return Err(CodecError::InvalidField {
+                    field: "inputs",
+                    value: value.to_owned(),
+                });
+            }
+            Ok(input)
+        })
+        .collect()
+}
+
 pub(super) fn field_issues(values: &[FieldIssue]) -> Result<String, CodecError> {
     bounded_join(values, MAX_LIST_ITEMS, "fields", |issue| {
         Ok(format!(

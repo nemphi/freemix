@@ -133,7 +133,7 @@ fn snapshot(inputs: Vec<InputStatus>) -> WireMessage {
 
 #[test]
 fn protocol_2_11_heartbeat_acknowledgement_codec_is_exact() {
-    assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(2, 11));
+    assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(2, 12));
     let acknowledgement = WireMessage::HeartbeatAcknowledgement(HeartbeatAcknowledgementMessage {
         server: server_identity(),
         heartbeat_sequence: 88,
