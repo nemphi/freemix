@@ -34,7 +34,7 @@ into control messages.
    replacement, restore, log compaction, or engine identity change forces a
    snapshot and a new cursor.
 
-The current Protocol 2.10 implementation uses bounded newline-delimited raw TCP.
+The current Protocol 2.11 implementation uses bounded newline-delimited raw TCP.
 Studio keeps one expected heartbeat sequence and waits for its matching
 acknowledgement within the bounded peer wait. EOF, timeout, wrong server
 identity, or wrong sequence enters the existing reconnect backoff. The server
@@ -44,8 +44,8 @@ authentication, media health, or the planned HTTP/WebSocket transport.
 
 Snapshots carry the bounded project-order input catalog as exact ID/name pairs.
 The canonical persisted name labels input tiles and mixer strips; clients do not
-invent ordinal display names. Input-catalog edits establish a fresh snapshot
-boundary because durable switcher events do not repeat static project metadata.
+invent ordinal display names. The `input_renamed` event carries name-only input
+catalog edits. Structural input catalog edits require a fresh snapshot.
 
 ## 3. Command semantics
 

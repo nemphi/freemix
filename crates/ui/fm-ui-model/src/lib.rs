@@ -673,8 +673,9 @@ impl fmt::Display for ModelError {
             ),
             Self::RevisionExhausted => formatter.write_str("revision counter is exhausted"),
             Self::DuplicateInput(input) => write!(formatter, "snapshot repeats input {input}"),
-            Self::InvalidInputNames => formatter
-                .write_str("input names must contain one nonempty label for each show input"),
+            Self::InvalidInputNames => formatter.write_str(
+                "input names must contain one unique, nonblank label within the byte limit for each show input",
+            ),
             Self::InvalidInputAudioStrips => formatter.write_str(
                 "input audio strips must contain each show input exactly once with gain in -96000..=24000 millidB, balance in -10000..=10000 basis points, and delay in 0..=48000 samples",
             ),
@@ -1319,12 +1320,19 @@ fn validate_engine(engine: &EngineIdentity) -> Result<(), ModelError> {
     }
 }
 
+fn valid_input_name(name: &str) -> bool {
+    !name.trim().is_empty() && name.len() <= MAX_INPUT_NAME_BYTES
+}
+
 fn validate_snapshot_inputs(snapshot: &ProjectSnapshot) -> Result<(), ModelError> {
-    if snapshot.input_names.len() != snapshot.inputs.len()
-        || snapshot
-            .input_names
-            .iter()
-            .any(|name| name.trim().is_empty())
+    if snapshot.input_names.len() != snapshot.inputs.len() {
+        return Err(ModelError::InvalidInputNames);
+    }
+    let mut input_names = HashSet::with_capacity(snapshot.input_names.len());
+    if snapshot
+        .input_names
+        .iter()
+        .any(|name| !valid_input_name(name) || !input_names.insert(name.as_str()))
     {
         return Err(ModelError::InvalidInputNames);
     }
@@ -1457,8 +1465,7 @@ fn validate_change(change: &DurableChange, state: &ProjectState) -> Result<(), M
                 .iter()
                 .position(|candidate| candidate == input)
                 .ok_or(ModelError::UnknownInput(*input))?;
-            if name.trim().is_empty()
-                || name.len() > MAX_INPUT_NAME_BYTES
+            if !valid_input_name(name)
                 || state
                     .input_names
                     .iter()
