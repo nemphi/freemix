@@ -2,7 +2,7 @@ use core::fmt;
 use std::collections::{BTreeMap, HashSet};
 
 use fm_switcher::{StingerDescriptor, StingerSlotId, SwitcherEvent, SwitcherState, TBarState};
-use fm_types::{InputId, RenameInputError, validate_input_name};
+use fm_types::{InputId, MAX_INPUT_NAME_BYTES, RenameInputError, validate_input_name};
 
 use crate::ShowError;
 
@@ -43,7 +43,7 @@ impl ShowState {
     ///
     /// # Errors
     ///
-    /// Returns a [`ShowError`] for an empty show/input name, an empty or
+    /// Returns a [`ShowError`] for an invalid show/input name, an empty or
     /// duplicate input set, or unavailable initial switcher selections.
     pub fn new(
         name: impl Into<String>,
@@ -60,6 +60,16 @@ impl ShowState {
         }
         if inputs.iter().any(|(_, name)| name.trim().is_empty()) {
             return Err(ShowError::EmptyInputName);
+        }
+        if inputs
+            .iter()
+            .any(|(_, name)| name.len() > MAX_INPUT_NAME_BYTES)
+        {
+            return Err(ShowError::InputNameTooLong);
+        }
+        let distinct_names: HashSet<_> = inputs.iter().map(|(_, name)| name.as_str()).collect();
+        if distinct_names.len() != inputs.len() {
+            return Err(ShowError::DuplicateInputName);
         }
         let distinct: HashSet<_> = inputs.iter().map(|(input, _)| *input).collect();
         if distinct.len() != inputs.len() {

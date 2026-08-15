@@ -137,6 +137,36 @@ fn show_owns_exact_input_names_in_input_order() {
 
 #[test]
 fn rename_input_is_bounded_unique_and_replay_safe() {
+    let initial = ShowState::new(
+        "initial names",
+        vec![(input(1), "Camera".into()), (input(2), "camera".into())],
+        input(1),
+        input(2),
+    )
+    .unwrap();
+    assert_eq!(initial.input_names(), &["Camera", "camera"]);
+    assert_eq!(
+        ShowState::new(
+            "initial names",
+            vec![
+                (input(1), "Camera".into()),
+                (input(2), "x".repeat(MAX_INPUT_NAME_BYTES + 1)),
+            ],
+            input(1),
+            input(2),
+        ),
+        Err(ShowError::InputNameTooLong)
+    );
+    assert_eq!(
+        ShowState::new(
+            "initial names",
+            vec![(input(1), "Camera".into()), (input(2), "Camera".into())],
+            input(1),
+            input(2),
+        ),
+        Err(ShowError::DuplicateInputName)
+    );
+
     let mut engine = engine();
     let command = envelope(
         "rename",

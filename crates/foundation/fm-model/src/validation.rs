@@ -1,4 +1,4 @@
-use fm_types::{BusId, InputId, OutputId, SceneId};
+use fm_types::{BusId, InputId, MAX_INPUT_NAME_BYTES, OutputId, SceneId};
 
 use crate::{
     InputKind, Project, ProjectSettings, RestartPolicy, SimulatedAudio, SourceRef,
@@ -185,6 +185,7 @@ fn validate_unique_entities(project: &Project, errors: &mut Vec<ValidationError>
             .inputs()
             .iter()
             .map(|input| (input.id, input.name.as_str(), EntityRef::Input(input.id))),
+        true,
     );
     duplicates(
         errors,
@@ -192,6 +193,7 @@ fn validate_unique_entities(project: &Project, errors: &mut Vec<ValidationError>
             .scenes()
             .iter()
             .map(|scene| (scene.id, scene.name.as_str(), EntityRef::Scene(scene.id))),
+        false,
     );
     duplicates(
         errors,
@@ -199,6 +201,7 @@ fn validate_unique_entities(project: &Project, errors: &mut Vec<ValidationError>
             .audio_buses()
             .iter()
             .map(|bus| (bus.id, bus.name.as_str(), EntityRef::AudioBus(bus.id))),
+        false,
     );
     duplicates(
         errors,
@@ -209,6 +212,7 @@ fn validate_unique_entities(project: &Project, errors: &mut Vec<ValidationError>
                 EntityRef::Output(output.id),
             )
         }),
+        false,
     );
 }
 
@@ -216,6 +220,13 @@ fn validate_inputs(project: &Project, errors: &mut Vec<ValidationError>) {
     for input in project.inputs() {
         let entity = Some(EntityRef::Input(input.id));
         require_name(errors, entity, "name", &input.name);
+        if input.name.len() > MAX_INPUT_NAME_BYTES {
+            errors.push(ValidationError {
+                entity,
+                field: "name",
+                kind: ValidationErrorKind::OutOfRange,
+            });
+        }
         match &input.kind {
             InputKind::Color => {}
             InputKind::Media { asset_uri } => {
@@ -491,7 +502,7 @@ fn require_name(
     }
 }
 
-fn duplicates<'a, I, Id>(errors: &mut Vec<ValidationError>, items: I)
+fn duplicates<'a, I, Id>(errors: &mut Vec<ValidationError>, items: I, case_sensitive_names: bool)
 where
     I: IntoIterator<Item = (Id, &'a str, EntityRef)>,
     Id: Copy + Eq,
@@ -506,9 +517,13 @@ where
             });
         }
         if !name.trim().is_empty()
-            && items[..index]
-                .iter()
-                .any(|(_, prior, _)| prior.eq_ignore_ascii_case(name))
+            && items[..index].iter().any(|(_, prior, _)| {
+                if case_sensitive_names {
+                    *prior == name
+                } else {
+                    prior.eq_ignore_ascii_case(name)
+                }
+            })
         {
             errors.push(ValidationError {
                 entity: Some(entity),

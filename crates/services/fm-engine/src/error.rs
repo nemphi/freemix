@@ -4,12 +4,14 @@ use fm_clock::ClockError;
 use fm_command::CounterOverflow;
 use fm_scheduler::{ActionError, TickError};
 use fm_switcher::SwitcherError;
-use fm_types::InputId;
+use fm_types::{InputId, MAX_INPUT_NAME_BYTES};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShowError {
     EmptyName,
     EmptyInputName,
+    InputNameTooLong,
+    DuplicateInputName,
     NoInputs,
     DuplicateInput,
     UnknownInput(InputId),
@@ -21,6 +23,11 @@ impl fmt::Display for ShowError {
         match self {
             Self::EmptyName => formatter.write_str("show name must not be empty"),
             Self::EmptyInputName => formatter.write_str("show input names must not be empty"),
+            Self::InputNameTooLong => write!(
+                formatter,
+                "show input names must not exceed {MAX_INPUT_NAME_BYTES} bytes"
+            ),
+            Self::DuplicateInputName => formatter.write_str("show input names must be unique"),
             Self::NoInputs => formatter.write_str("show must contain at least one input"),
             Self::DuplicateInput => formatter.write_str("show input identifiers must be unique"),
             Self::UnknownInput(input) => write!(formatter, "show does not contain input {input}"),

@@ -4,13 +4,14 @@ use fm_model::{
     AudioBus, BusSend, CURRENT_SCHEMA_VERSION, CropRect, EntityRef, Input, InputAudioStripState,
     InputBalanceBasisPoints, InputDelaySamples, InputGainMilliDb, InputKind, Layer, LayerGeometry,
     MainMix, Output, OutputFormat, Project, ProjectSettings, RectMask, RestartPolicy, Rgba8,
-    Rotation, Scene, SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor,
-    SourceRef, StartupPolicy, StingerAudioPolicy, StingerConfig, StingerMissingMediaFallback,
+    Rotation, Scene, SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef,
+    StartupPolicy, StingerAudioPolicy, StingerConfig, StingerMissingMediaFallback,
     StingerSlotNumber, ValidationErrorKind,
 };
 use fm_types::{
-    AudioFormat, BusId, ChannelLayout, ColorMetadata, FrameRate, InputId, OutputId, PixelFormat,
-    ProjectId, SampleFormat, SampleRate, ScanMode, SceneId, VideoDimensions, VideoFormat,
+    AudioFormat, BusId, ChannelLayout, ColorMetadata, FrameRate, InputId, MAX_INPUT_NAME_BYTES,
+    OutputId, PixelFormat, ProjectId, SampleFormat, SampleRate, ScanMode, SceneId, VideoDimensions,
+    VideoFormat,
 };
 
 fn project_id(value: u128) -> ProjectId {
@@ -440,8 +441,28 @@ fn dangling_references_and_malformed_capabilities_are_reported_together() {
 fn identifiers_and_names_must_be_unique_per_collection() {
     let mut project = valid_project();
     project.add_input(Input {
-        id: input_id(1),
+        id: input_id(2),
         name: "camera".into(),
+        kind: InputKind::Color,
+        required_capabilities: Vec::new(),
+    });
+    assert_eq!(project.validate(), Ok(()));
+
+    project.add_input(Input {
+        id: input_id(1),
+        name: "Camera copy".into(),
+        kind: InputKind::Color,
+        required_capabilities: Vec::new(),
+    });
+    project.add_input(Input {
+        id: input_id(3),
+        name: "Camera".into(),
+        kind: InputKind::Color,
+        required_capabilities: Vec::new(),
+    });
+    project.add_input(Input {
+        id: input_id(4),
+        name: "x".repeat(MAX_INPUT_NAME_BYTES + 1),
         kind: InputKind::Color,
         required_capabilities: Vec::new(),
     });
@@ -452,11 +473,15 @@ fn identifiers_and_names_must_be_unique_per_collection() {
             .iter()
             .any(|error| error.kind == ValidationErrorKind::DuplicateId)
     );
-    assert!(
-        errors
-            .iter()
-            .any(|error| error.kind == ValidationErrorKind::DuplicateName)
-    );
+    assert!(errors.iter().any(|error| {
+        error.entity == Some(EntityRef::Input(input_id(3)))
+            && error.kind == ValidationErrorKind::DuplicateName
+    }));
+    assert!(errors.iter().any(|error| {
+        error.entity == Some(EntityRef::Input(input_id(4)))
+            && error.field == "name"
+            && error.kind == ValidationErrorKind::OutOfRange
+    }));
 }
 
 #[test]
