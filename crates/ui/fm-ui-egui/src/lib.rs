@@ -94,6 +94,8 @@ pub enum StudioIntent {
     Wipe { duration_frames: u32 },
     /// Fades realized Program video and audio to black or back to live.
     FadeToBlack { active: bool, duration_frames: u32 },
+    /// Toggles Fade-to-Black from the latest confirmed desired target.
+    ToggleFadeToBlack { duration_frames: u32 },
     /// Starts a held manual Fade, Wipe, `AlphaFade`, or Slide transition.
     StartManualTransition { kind: ManualTransitionKind },
     /// Sets the exact manual-transition position in basis points.
@@ -423,6 +425,7 @@ fn studio_shortcuts(
     manual_transition_active_controls: bool,
     inputs: &[InputId],
     transition_duration_frames: u32,
+    fade_to_black_duration_frames: u32,
 ) -> Vec<StudioIntent> {
     if ui.ctx().egui_wants_keyboard_input() {
         return Vec::new();
@@ -446,6 +449,12 @@ fn studio_shortcuts(
                 return true;
             };
             match key {
+                Key::B if transition_available => {
+                    intents.push(StudioIntent::ToggleFadeToBlack {
+                        duration_frames: fade_to_black_duration_frames,
+                    });
+                    false
+                }
                 Key::Escape if manual_transition_active_controls => {
                     intents.push(StudioIntent::CancelManualTransition);
                     false
@@ -656,6 +665,7 @@ impl StudioShell {
             manual_transition_controls.active_controls,
             inputs,
             self.transition_duration_frames,
+            self.fade_to_black_duration_frames,
         );
         Frame::new()
             .fill(GRAPHITE)
@@ -1590,7 +1600,7 @@ mod tests {
     }
 
     #[test]
-    fn studio_shortcuts_preserve_order_duration_and_rejected_events() {
+    fn fade_to_black_shortcut_preserves_order_durations_and_operator_gates() {
         let inputs = [11, 12, 13, 14, 15, 16, 17, 18].map(input);
         let gate = TransitionGate {
             connection_status: StudioConnectionStatus::Ready,
@@ -1609,6 +1619,8 @@ mod tests {
         let mut shell = StudioShell::default();
         shell.set_transition_duration_frames(42);
         let duration = shell.transition_duration_frames();
+        shell.set_fade_to_black_duration_frames(84);
+        let fade_to_black_duration = shell.fade_to_black_duration_frames();
         let run = |events, gate, can_select_preview, manual_transition_active_controls, focused| {
             context.begin_pass(egui::RawInput {
                 events,
@@ -1631,6 +1643,7 @@ mod tests {
                 manual_transition_active_controls,
                 &inputs,
                 duration,
+                fade_to_black_duration,
             );
             let remaining = context.input(|input| input.events.clone());
             drop(ui);
@@ -1644,9 +1657,11 @@ mod tests {
         let (intents, remaining) = run(
             vec![
                 key(Key::Escape, Modifiers::NONE, false),
+                key(Key::B, Modifiers::NONE, false),
                 key(Key::C, Modifiers::NONE, false),
                 key(Key::F, Modifiers::NONE, false),
                 key(Key::Num1, Modifiers::NONE, false),
+                key(Key::B, shifted, false),
                 key(Key::Num2, shifted, false),
                 key(Key::Escape, shifted, false),
                 key(Key::Num8, Modifiers::NONE, false),
@@ -1661,6 +1676,9 @@ mod tests {
             intents,
             vec![
                 StudioIntent::CancelManualTransition,
+                StudioIntent::ToggleFadeToBlack {
+                    duration_frames: fade_to_black_duration,
+                },
                 StudioIntent::Cut,
                 StudioIntent::Fade {
                     duration_frames: duration,
@@ -1669,10 +1687,10 @@ mod tests {
                 StudioIntent::SelectPreview(input(18)),
             ]
         );
-        assert_eq!(remaining.len(), 3);
         assert!(matches!(
             remaining.as_slice(),
             [
+                Event::Key { key: Key::B, .. },
                 Event::Key { key: Key::Num2, .. },
                 Event::Key {
                     key: Key::Escape,
@@ -1689,8 +1707,8 @@ mod tests {
         let _ = context.end_pass();
         let (intents, remaining) = run(
             vec![
+                key(Key::B, Modifiers::NONE, true),
                 key(Key::Num3, Modifiers::NONE, false),
-                key(Key::Escape, Modifiers::NONE, true),
             ],
             gate,
             true,
@@ -1702,12 +1720,12 @@ mod tests {
             remaining.as_slice(),
             [
                 Event::Key {
-                    key: Key::Num3,
+                    key: Key::B,
                     repeat: true,
                     ..
                 },
                 Event::Key {
-                    key: Key::Escape,
+                    key: Key::Num3,
                     repeat: true,
                     ..
                 }
@@ -1720,6 +1738,7 @@ mod tests {
         };
         let rejected_events = vec![
             key(Key::Escape, Modifiers::NONE, false),
+            key(Key::B, Modifiers::NONE, false),
             key(Key::C, Modifiers::NONE, false),
             key(Key::F, Modifiers::NONE, false),
         ];
@@ -1732,6 +1751,7 @@ mod tests {
                     key: Key::Escape,
                     ..
                 },
+                Event::Key { key: Key::B, .. },
                 Event::Key { key: Key::C, .. },
                 Event::Key { key: Key::F, .. }
             ]
@@ -1747,6 +1767,31 @@ mod tests {
         assert!(intents.is_empty());
         assert_eq!(remaining.len(), 1);
 
+        for blocked in [
+            TransitionGate {
+                connection_status: StudioConnectionStatus::Synchronizing,
+                ..gate
+            },
+            TransitionGate {
+                has_view: false,
+                ..gate
+            },
+            TransitionGate {
+                can_transition: false,
+                ..gate
+            },
+        ] {
+            let (intents, remaining) = run(
+                vec![key(Key::B, Modifiers::NONE, false)],
+                blocked,
+                true,
+                false,
+                false,
+            );
+            assert!(intents.is_empty());
+            assert_eq!(remaining.len(), 1);
+        }
+
         let (intents, remaining) = run(rejected_events, gate, true, true, true);
         assert!(intents.is_empty());
         assert!(matches!(
@@ -1756,6 +1801,7 @@ mod tests {
                     key: Key::Escape,
                     ..
                 },
+                Event::Key { key: Key::B, .. },
                 Event::Key { key: Key::C, .. },
                 Event::Key { key: Key::F, .. }
             ]

@@ -1478,6 +1478,13 @@ fn intent_payload(
             active,
             duration_frames,
         },
+        StudioIntent::ToggleFadeToBlack { duration_frames } => {
+            let view = view.ok_or_else(|| "Project state is not synchronized".to_owned())?;
+            CommandPayload::FadeToBlack {
+                active: !view.switcher.desired_fade_to_black.target_active,
+                duration_frames,
+            }
+        }
         StudioIntent::StartManualTransition { kind } => {
             CommandPayload::StartManualTransition { kind }
         }
@@ -2099,6 +2106,52 @@ mod tests {
 
     fn assert_overlay_payload(view: &ClientView, intent: StudioIntent, expected: CommandPayload) {
         assert_eq!(intent_payload(intent, Some(view)), Ok(expected));
+    }
+
+    #[test]
+    fn fade_to_black_shortcut_resolves_each_press_from_latest_confirmed_desired_target() {
+        let project = ProjectId::new(NonZeroU128::new(7).unwrap());
+        let mut model = ClientModel::new(project);
+        model
+            .install_snapshot(ProjectSnapshot::from_protocol(
+                project,
+                heartbeat_snapshot(),
+            ))
+            .unwrap();
+        let confirmed = model.view().unwrap();
+        let intent = StudioIntent::ToggleFadeToBlack {
+            duration_frames: 84,
+        };
+        let assert_target = |view: &ClientView, active| {
+            assert_eq!(
+                intent_payload(intent, Some(view)),
+                Ok(CommandPayload::FadeToBlack {
+                    active,
+                    duration_frames: 84,
+                })
+            );
+        };
+        assert_target(&confirmed, true);
+
+        let mut cursor = confirmed.cursor.clone();
+        cursor.revision = cursor.revision.checked_next().unwrap();
+        model
+            .apply_event(DurableProjectEvent {
+                cursor,
+                change: DurableChange::DesiredSwitcher {
+                    selection: confirmed.switcher.desired,
+                    manual_transition: confirmed.switcher.desired_manual_transition,
+                    fade_to_black: FadeToBlackState {
+                        target_active: true,
+                        position: FadeToBlackPosition::LIVE,
+                    },
+                    overlays: confirmed.desired_overlays.clone(),
+                    input_audio_strips: confirmed.input_audio_strips.clone(),
+                },
+            })
+            .unwrap();
+        let confirmed = model.view().unwrap();
+        assert_target(&confirmed, false);
     }
 
     #[test]
