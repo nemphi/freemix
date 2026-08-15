@@ -268,7 +268,10 @@ uniqueness, then changes only the matching name at the durable revision. It also
 carries an authoritative full input reorder through the EditProject command and
 durable input-order event; the daemon persists that vector order and restores
 ID-attached names and audio/routing state. Neither command applies an optimistic
-change or changes current switcher state. Input add/remove, duplicate, categories,
+change or changes current switcher state. Studio exposes compact Up/Down controls
+for one-step reorder, gated by the current Ready session and EditProject
+permission; the native worker resolves each move against the latest confirmed
+order and the daemon remains final authority. Input add/remove, duplicate, categories,
 colors, pause, close, offline, relink, and import remain planned. There are still
 no audio meters in Studio, PFL, strip-name editor, strip groups, bus
 sends, microphone automix, device-audio path,

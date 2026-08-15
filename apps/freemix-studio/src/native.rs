@@ -19,8 +19,8 @@ use fm_protocol::{
     OverlayTransitionKind, WireInputId, WireMessage,
 };
 use fm_ui_egui::{
-    ExternalStudioAction, InputAudioStripUpdate, StudioConnectionStatus, StudioIntent, StudioShell,
-    StudioUiState, TerminalUncertaintyNotice, external_intent,
+    ExternalStudioAction, InputAudioStripUpdate, InputMoveDirection, StudioConnectionStatus,
+    StudioIntent, StudioShell, StudioUiState, TerminalUncertaintyNotice, external_intent,
 };
 use fm_ui_model::ClientView;
 
@@ -1198,6 +1198,30 @@ fn resolve_input_audio_strip(
     })
 }
 
+fn resolve_input_move(
+    view: Option<&ClientView>,
+    input: fm_types::InputId,
+    direction: InputMoveDirection,
+) -> Result<CommandPayload, String> {
+    let view = view
+        .ok_or_else(|| "Cannot reorder inputs before project state is synchronized".to_owned())?;
+    let index = view
+        .inputs
+        .iter()
+        .position(|candidate| *candidate == input)
+        .ok_or_else(|| "Cannot reorder inputs: input is no longer available".to_owned())?;
+    let neighbor = match direction {
+        InputMoveDirection::Up => index.checked_sub(1),
+        InputMoveDirection::Down => (index + 1 < view.inputs.len()).then_some(index + 1),
+    }
+    .ok_or_else(|| "Cannot reorder inputs: input is already at the edge".to_owned())?;
+    let mut inputs = view.inputs.clone();
+    inputs.swap(index, neighbor);
+    Ok(CommandPayload::ReorderInputs {
+        inputs: inputs.into_iter().map(WireInputId::from_domain).collect(),
+    })
+}
+
 fn desired_overlay<'view>(
     view: Option<&'view ClientView>,
     channel: fm_protocol::WireOverlayChannelId,
@@ -1490,6 +1514,9 @@ fn intent_payload(
     view: Option<&ClientView>,
 ) -> Result<CommandPayload, String> {
     let payload = match intent {
+        StudioIntent::MoveInput { input, direction } => {
+            return resolve_input_move(view, input, direction);
+        }
         StudioIntent::SetInputAudioStrip { input, update } => {
             return resolve_input_audio_strip(view, input, update);
         }
@@ -1622,9 +1649,12 @@ fn runtime_state(runtime: &mut StudioRuntime, error: Option<String>) -> StudioUi
     let (can_select_preview, can_transition) = switcher_permissions(permissions);
     let can_control_audio =
         permissions.is_some_and(|values| values.iter().any(|value| value == "control_audio"));
+    let can_edit_project =
+        permissions.is_some_and(|values| values.iter().any(|value| value == "edit_project"));
     let mut state = StudioUiState::new(connection_status)
         .with_switcher_permissions(can_select_preview, can_transition)
-        .with_audio_permission(can_control_audio);
+        .with_audio_permission(can_control_audio)
+        .with_edit_project_permission(can_edit_project);
     if connection_status == StudioConnectionStatus::Ready {
         state.view = client.model().view();
     }
@@ -2261,6 +2291,49 @@ mod tests {
                 soloed: true,
                 follow_video: false,
                 delay_samples: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn input_moves_resolve_each_step_from_latest_confirmed_order() {
+        let project = ProjectId::new(NonZeroU128::new(7).unwrap());
+        let ids = [2_u128, 3, 4].map(|id| WireInputId::new(NonZeroU128::new(id).unwrap()));
+        let mut model = ClientModel::new(project);
+        model
+            .install_snapshot(ProjectSnapshot::from_protocol(
+                project,
+                heartbeat_snapshot(),
+            ))
+            .unwrap();
+        let mut first = model.view().unwrap();
+        first.inputs = ids.map(WireInputId::to_domain).to_vec();
+        let first_payload = intent_payload(
+            StudioIntent::MoveInput {
+                input: ids[0].to_domain(),
+                direction: InputMoveDirection::Down,
+            },
+            Some(&first),
+        )
+        .unwrap();
+        assert_eq!(
+            first_payload,
+            CommandPayload::ReorderInputs {
+                inputs: vec![ids[1], ids[0], ids[2]]
+            }
+        );
+        let mut latest = first.clone();
+        latest.inputs = vec![ids[1].to_domain(), ids[0].to_domain(), ids[2].to_domain()];
+        assert_eq!(
+            intent_payload(
+                StudioIntent::MoveInput {
+                    input: ids[0].to_domain(),
+                    direction: InputMoveDirection::Down,
+                },
+                Some(&latest),
+            ),
+            Ok(CommandPayload::ReorderInputs {
+                inputs: vec![ids[1], ids[2], ids[0]]
             })
         );
     }

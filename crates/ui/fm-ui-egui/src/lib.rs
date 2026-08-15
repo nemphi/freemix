@@ -42,9 +42,20 @@ pub struct InputAudioStripUpdate {
     pub delay_samples: Option<u32>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InputMoveDirection {
+    Up,
+    Down,
+}
+
 /// Operator actions emitted by [`StudioShell`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StudioIntent {
+    /// Moves one input by one position in the current project order.
+    MoveInput {
+        input: InputId,
+        direction: InputMoveDirection,
+    },
     /// Updates changed Master-strip controls on one input.
     SetInputAudioStrip {
         input: InputId,
@@ -180,6 +191,7 @@ pub struct StudioUiState {
     pub can_select_preview: bool,
     pub can_transition: bool,
     pub can_control_audio: bool,
+    pub can_edit_project: bool,
     pub pending_commands: usize,
     pub notice: Option<String>,
     pub external_notice: Option<String>,
@@ -197,6 +209,7 @@ impl StudioUiState {
             can_select_preview: false,
             can_transition: false,
             can_control_audio: false,
+            can_edit_project: false,
             pending_commands: 0,
             notice: None,
             external_notice: None,
@@ -228,6 +241,13 @@ impl StudioUiState {
     #[must_use]
     pub const fn with_audio_permission(mut self, can_control_audio: bool) -> Self {
         self.can_control_audio = can_control_audio;
+        self
+    }
+
+    /// Applies the granted project-edit permission.
+    #[must_use]
+    pub const fn with_edit_project_permission(mut self, can_edit_project: bool) -> Self {
+        self.can_edit_project = can_edit_project;
         self
     }
 }
@@ -1511,6 +1531,9 @@ fn draw_inputs(ui: &mut Ui, state: &StudioUiState, intents: &mut Vec<StudioInten
 
     let enabled =
         preview_selection_available(TransitionGate::from_state(state), state.can_select_preview);
+    let reorder_enabled = state.connection_status.controls_enabled()
+        && state.can_edit_project
+        && state.view.is_some();
     ScrollArea::vertical()
         .id_salt("studio-input-bank")
         .auto_shrink([false, false])
@@ -1528,16 +1551,40 @@ fn draw_inputs(ui: &mut Ui, state: &StudioUiState, intents: &mut Vec<StudioInten
                         let tally = tally_state(input, view.switcher);
                         let tile_text =
                             format!("{}\n{}", view.input_names[index], tally.operator_label());
-                        let response = ui.add_enabled(
-                            enabled,
-                            Button::new(RichText::new(tile_text).color(tally_color(tally)))
-                                .fill(tally_fill(tally))
-                                .stroke(Stroke::new(1.0, tally_color(tally)))
-                                .min_size(Vec2::new(MIN_TILE_WIDTH, 52.0)),
-                        );
-                        if response.clicked() {
-                            intents.push(StudioIntent::SelectPreview(input));
-                        }
+                        ui.vertical(|ui| {
+                            let response = ui.add_enabled(
+                                enabled,
+                                Button::new(RichText::new(tile_text).color(tally_color(tally)))
+                                    .fill(tally_fill(tally))
+                                    .stroke(Stroke::new(1.0, tally_color(tally)))
+                                    .min_size(Vec2::new(MIN_TILE_WIDTH, 52.0)),
+                            );
+                            if response.clicked() {
+                                intents.push(StudioIntent::SelectPreview(input));
+                            }
+                            ui.horizontal(|ui| {
+                                let up = ui.add_enabled(
+                                    reorder_enabled && index > 0,
+                                    Button::new("UP").small(),
+                                );
+                                if up.clicked() {
+                                    intents.push(StudioIntent::MoveInput {
+                                        input,
+                                        direction: InputMoveDirection::Up,
+                                    });
+                                }
+                                let down = ui.add_enabled(
+                                    reorder_enabled && index + 1 < view.inputs.len(),
+                                    Button::new("DOWN").small(),
+                                );
+                                if down.clicked() {
+                                    intents.push(StudioIntent::MoveInput {
+                                        input,
+                                        direction: InputMoveDirection::Down,
+                                    });
+                                }
+                            });
+                        });
                         if (index + 1) % columns == 0 {
                             ui.end_row();
                         }
