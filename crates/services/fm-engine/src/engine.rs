@@ -1419,8 +1419,7 @@ fn reorder_inputs_rejection(error: InputOrderError) -> Rejection {
         InputOrderError::UnknownInput(_) => RejectionCode::NotFound,
         InputOrderError::EmptyOrder
         | InputOrderError::WrongLength { .. }
-        | InputOrderError::DuplicateInput(_)
-        | InputOrderError::MissingInput(_) => RejectionCode::InvalidCommand,
+        | InputOrderError::DuplicateInput(_) => RejectionCode::InvalidCommand,
     };
     Rejection::new(code, error.to_string())
 }

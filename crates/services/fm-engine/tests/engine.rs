@@ -19,7 +19,9 @@ use fm_switcher::{
     StingerDescriptor, StingerSlotId, SwitcherEvent, SwitcherState, TBarPosition, TBarState,
     TransitionKind,
 };
-use fm_types::{FrameRate, InputId, MAX_INPUT_NAME_BYTES, OutputId};
+use fm_types::{
+    FrameRate, InputId, InputOrderError, MAX_INPUT_NAME_BYTES, OutputId, validate_input_order,
+};
 
 fn input(value: u128) -> InputId {
     InputId::new(NonZeroU128::new(value).unwrap())
@@ -239,6 +241,34 @@ fn rename_input_is_bounded_unique_and_replay_safe() {
 #[test]
 fn reorder_inputs_preserves_id_references_and_rejects_invalid_orders_atomically() {
     let mut engine = engine();
+    let current = [input(1), input(2), input(3)];
+    for (requested, expected) in [
+        (vec![], InputOrderError::EmptyOrder),
+        (
+            vec![input(1), input(2)],
+            InputOrderError::WrongLength {
+                expected: 3,
+                actual: 2,
+            },
+        ),
+        (
+            vec![input(1), input(2), input(4), input(3)],
+            InputOrderError::WrongLength {
+                expected: 3,
+                actual: 4,
+            },
+        ),
+        (
+            vec![input(1), input(2), input(99)],
+            InputOrderError::UnknownInput(input(99)),
+        ),
+        (
+            vec![input(1), input(1), input(3)],
+            InputOrderError::DuplicateInput(input(1)),
+        ),
+    ] {
+        assert_eq!(validate_input_order(&current, &requested), Err(expected));
+    }
     let strip = EngineInputAudioStripState {
         gain_millidb: -1_000,
         ..EngineInputAudioStripState::default()
@@ -286,6 +316,30 @@ fn reorder_inputs_preserves_id_references_and_rejects_invalid_orders_atomically(
             inputs: vec![input(3), input(1), input(2)]
         }
     );
+    let before_tick_show = engine.show().clone();
+    let before_tick_realized = engine.realized_switcher().clone();
+    let before_tick_cursor = engine.frame_cursor();
+    assert_eq!(before_tick_show.inputs(), &[input(3), input(1), input(2)]);
+    assert_eq!(before_tick_realized.inputs(), &current);
+
+    let replay = engine
+        .execute(
+            envelope(
+                "reorder",
+                EngineCommand::ReorderInputs {
+                    inputs: vec![input(3), input(1), input(2)],
+                },
+            ),
+            0,
+        )
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.receipt, accepted.receipt);
+    assert!(replay.events.is_empty());
+    assert_eq!(engine.show(), &before_tick_show);
+    assert_eq!(engine.realized_switcher(), &before_tick_realized);
+    assert_eq!(engine.frame_cursor(), before_tick_cursor);
+
     engine.tick().unwrap();
     let snapshot = engine.snapshot().unwrap();
     assert_eq!(snapshot.show().inputs(), &[input(3), input(1), input(2)]);
@@ -293,6 +347,19 @@ fn reorder_inputs_preserves_id_references_and_rejects_invalid_orders_atomically(
         snapshot.realized_switcher().inputs(),
         &[input(3), input(1), input(2)]
     );
+    let after_tick = snapshot.clone();
+    engine
+        .execute(
+            envelope(
+                "reorder",
+                EngineCommand::ReorderInputs {
+                    inputs: vec![input(3), input(1), input(2)],
+                },
+            ),
+            0,
+        )
+        .unwrap();
+    assert_eq!(engine.snapshot().unwrap(), after_tick);
     assert_eq!(
         snapshot.show().input_names(),
         &["Input 3", "Input 1", "Input 2"]

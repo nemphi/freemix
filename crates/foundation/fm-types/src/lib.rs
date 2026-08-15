@@ -38,7 +38,6 @@ pub enum InputOrderError {
     WrongLength { expected: usize, actual: usize },
     UnknownInput(InputId),
     DuplicateInput(InputId),
-    MissingInput(InputId),
 }
 
 impl core::fmt::Display for InputOrderError {
@@ -53,9 +52,6 @@ impl core::fmt::Display for InputOrderError {
             }
             Self::UnknownInput(input) => write!(formatter, "input {input} does not exist"),
             Self::DuplicateInput(input) => write!(formatter, "input {input} occurs more than once"),
-            Self::MissingInput(input) => {
-                write!(formatter, "input {input} is missing from the order")
-            }
         }
     }
 }
@@ -83,11 +79,6 @@ pub fn validate_input_order(
     for (index, input) in requested.iter().enumerate() {
         if requested[..index].contains(input) {
             return Err(InputOrderError::DuplicateInput(*input));
-        }
-    }
-    for input in current {
-        if !requested.contains(input) {
-            return Err(InputOrderError::MissingInput(*input));
         }
     }
     Ok(())
