@@ -2018,14 +2018,12 @@ mod tests {
             state.notice.as_deref(),
             Some("Queued 1 command(s) in operator FIFO")
         );
-        let error = state.error.unwrap();
-        for text in [
-            "reconnect pending",
-            "\"local-1\" (server receipt \"server-1\")",
-            "\"local-2\" (server receipt \"server-2\")",
-        ] {
-            assert!(error.contains(text), "missing {text:?} in {error:?}");
-        }
+        assert_eq!(
+            state.error.as_deref(),
+            Some(
+                "reconnect pending; Terminal command uncertainty remains after authoritative resync: \"local-1\" (server receipt \"server-1\"), \"local-2\" (server receipt \"server-2\")"
+            )
+        );
         drop(runtime);
         server.join().unwrap();
     }
