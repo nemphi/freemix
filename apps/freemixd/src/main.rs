@@ -4505,6 +4505,7 @@ fn command_ticks(
             prepared.overlay_transition_ticks(channel)
         }
         CommandPayload::RenameInput { .. }
+        | CommandPayload::ReorderInputs { .. }
         | CommandPayload::SetInputAudioStrip { .. }
         | CommandPayload::SelectPreview { .. }
         | CommandPayload::Cut
@@ -4575,6 +4576,14 @@ fn stored_project_with_receipts(
     let realized = snapshot.realized_switcher();
     let mut project = durable.project().clone();
     project.set_main_mix(MainMix::new(desired.program(), desired.preview()));
+    if project
+        .inputs()
+        .iter()
+        .map(|input| input.id)
+        .ne(show.inputs().iter().copied())
+    {
+        project.reorder_inputs(show.inputs().to_vec())?;
+    }
     for (&input, name) in show.inputs().iter().zip(show.input_names()) {
         if project
             .inputs()

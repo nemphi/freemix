@@ -793,11 +793,10 @@ fn remote_input_rename_is_authorized_replicated_replay_safe_and_survives_restart
     unauthorized.handshake_as(Role::Operator, None);
     assert!(matches!(unauthorized.receive(), WireMessage::Snapshot(_)));
     unauthorized.send(&command(
-        "rename-denied",
-        "rename-denied-key",
-        CommandPayload::RenameInput {
-            input: input(1),
-            name: "Denied name".into(),
+        "reorder-denied",
+        "reorder-denied-key",
+        CommandPayload::ReorderInputs {
+            inputs: vec![input(2), input(1)],
         },
     ));
     assert!(matches!(
@@ -844,6 +843,7 @@ fn remote_input_rename_is_authorized_replicated_replay_safe_and_survives_restart
                         if renamed == input(1) && name == "Camera Left"
                 )
     ));
+
     assert!(matches!(
         graphics.receive(),
         WireMessage::RuntimeEvent(runtime)
@@ -856,6 +856,31 @@ fn remote_input_rename_is_authorized_replicated_replay_safe_and_survives_restart
                 )
     ));
 
+    graphics.send(&command(
+        "reorder-accepted",
+        "reorder-accepted-key",
+        CommandPayload::ReorderInputs {
+            inputs: vec![input(2), input(1)],
+        },
+    ));
+    assert!(matches!(
+        graphics.next_result(),
+        CommandResult::Accepted {
+            id,
+            revision: 2,
+            scheduled_frame: Some(1),
+        } if id == "reorder-accepted"
+    ));
+    assert!(matches!(
+        graphics.receive(),
+        WireMessage::Event(event)
+            if event.cursor.revision == 2
+                && matches!(
+                    event.payload,
+                    fm_protocol::EventPayload::InputOrderChanged { ref inputs }
+                        if inputs == &vec![input(2), input(1)]
+                )
+    ));
     graphics.send(&command(
         "rename-replay",
         "rename-accepted-key",
@@ -872,41 +897,80 @@ fn remote_input_rename_is_authorized_replicated_replay_safe_and_survives_restart
             ..
         } if id == "rename-accepted"
     ));
+    graphics.send(&command(
+        "reorder-replay",
+        "reorder-accepted-key",
+        CommandPayload::ReorderInputs {
+            inputs: vec![input(1), input(2)],
+        },
+    ));
+    assert!(matches!(
+        graphics.next_result(),
+        CommandResult::Accepted {
+            id,
+            revision: 2,
+            ..
+        } if id == "reorder-accepted"
+    ));
     drop(graphics);
 
     let mut snapshot_client = daemon.connect();
     let handshake = snapshot_client.handshake_as(Role::Graphics, None);
-    assert_eq!(handshake.current_revision, 1);
+    assert_eq!(handshake.current_revision, 2);
     let WireMessage::Snapshot(snapshot) = snapshot_client.receive() else {
         panic!("expected snapshot after input rename");
     };
-    assert!(
+    assert_eq!(
         snapshot
             .inputs
             .iter()
-            .any(|status| status.input == input(1) && status.name == "Camera Left")
+            .map(|status| (status.input, status.name.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(input(2), "Input 2"), (input(1), "Camera Left")]
     );
     drop(snapshot_client);
     daemon.stop();
 
     let persisted = ProjectStore::new(&project_path).unwrap().load().unwrap();
-    assert_eq!(persisted.position().revision, 1);
-    assert_eq!(persisted.position().frames_rendered, 1);
-    assert_eq!(persisted.idempotency_receipts().len(), 1);
-    assert_eq!(persisted.project().inputs()[0].name, "Camera Left");
+    assert_eq!(persisted.position().revision, 2);
+    assert_eq!(persisted.position().frames_rendered, 2);
+    assert_eq!(persisted.idempotency_receipts().len(), 2);
+    assert_eq!(
+        persisted
+            .project()
+            .inputs()
+            .iter()
+            .map(|input| (input.id, input.name.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (domain_input(2), "Input 2"),
+            (domain_input(1), "Camera Left")
+        ]
+    );
+    assert_eq!(
+        persisted
+            .project()
+            .input_audio_strips()
+            .iter()
+            .map(|strip| strip.input)
+            .collect::<Vec<_>>(),
+        vec![domain_input(2), domain_input(1)]
+    );
 
     let daemon = Daemon::start(&project_path);
     let mut restarted = daemon.connect();
     let handshake = restarted.handshake_as(Role::Graphics, None);
-    assert_eq!(handshake.current_revision, 1);
+    assert_eq!(handshake.current_revision, 2);
     let WireMessage::Snapshot(snapshot) = restarted.receive() else {
         panic!("expected snapshot after restart");
     };
-    assert!(
+    assert_eq!(
         snapshot
             .inputs
             .iter()
-            .any(|status| status.input == input(1) && status.name == "Camera Left")
+            .map(|status| (status.input, status.name.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(input(2), "Input 2"), (input(1), "Camera Left")]
     );
     drop(restarted);
     daemon.wait_success();

@@ -260,8 +260,12 @@ and failed-preflight no-partial-state tests cover this slice.
 Studio input tiles and mixer strips use exact persisted input names carried by
 the snapshot rather than generated ordinal labels. The client reducer validates
 each rename against the current input set, the 128-byte limit, and exact name
-uniqueness, then changes only the matching name at the durable revision. It does
-not apply an optimistic rename or change current switcher state. There are still
+uniqueness, then changes only the matching name at the durable revision. It also
+carries an authoritative full input reorder through the EditProject command and
+durable input-order event; the daemon persists that vector order and restores
+ID-attached names and audio/routing state. Neither command applies an optimistic
+change or changes current switcher state. Input add/remove, duplicate, categories,
+colors, pause, close, offline, relink, and import remain planned. There are still
 no audio meters in Studio, PFL, strip-name editor, strip groups, bus
 sends, microphone automix, device-audio path,
 device-clock correction, native EQ/gate/compressor/limiter, or acceptance

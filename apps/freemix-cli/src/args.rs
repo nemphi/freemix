@@ -91,6 +91,12 @@ pub enum Command {
         key: Option<String>,
         expected_revision: Option<u64>,
     },
+    Reorder {
+        path: PathBuf,
+        inputs: Vec<u128>,
+        key: Option<String>,
+        expected_revision: Option<u64>,
+    },
     Preview {
         path: PathBuf,
         input: u128,
@@ -241,6 +247,12 @@ pub enum Command {
         address: SocketAddr,
         input: u128,
         name: String,
+        key: Option<String>,
+        expected_revision: Option<u64>,
+    },
+    RemoteReorder {
+        address: SocketAddr,
+        inputs: Vec<u128>,
         key: Option<String>,
         expected_revision: Option<u64>,
     },
@@ -442,6 +454,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
         }
         "audio-strip" => parse_audio_strip(arguments),
         "rename" => parse_rename(arguments),
+        "input-reorder" => parse_reorder(arguments, false),
         "preview" => {
             let path = required_path(&mut arguments, "project path")?;
             let input = number(&required(&mut arguments, "input")?, "input")?;
@@ -479,6 +492,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
         "remote-status" => parse_remote_status(arguments),
         "remote-audio-strip" => parse_remote_audio_strip(arguments),
         "remote-rename" => parse_remote_rename(arguments),
+        "remote-input-reorder" => parse_reorder(arguments, true),
         "remote-preview" => parse_remote_preview(arguments),
         "remote-cut" => parse_remote_cut(arguments),
         "remote-fade" | "remote-alpha-fade" | "remote-slide" | "remote-zoom" | "remote-wipe" => {
@@ -569,6 +583,54 @@ fn parse_rename(mut arguments: impl Iterator<Item = String>) -> Result<Command, 
         key,
         expected_revision,
     })
+}
+
+fn parse_reorder(
+    mut arguments: impl Iterator<Item = String>,
+    remote: bool,
+) -> Result<Command, ArgsError> {
+    let path_or_address = required(
+        &mut arguments,
+        if remote { "address" } else { "project path" },
+    )?;
+    let mut inputs = Vec::new();
+    let mut options = Vec::new();
+    let mut positional = true;
+    while let Some(argument) = arguments.next() {
+        if argument.starts_with("--") {
+            positional = false;
+            options.push(argument);
+            if matches!(
+                options.last().map(String::as_str),
+                Some("--key" | "--expect")
+            ) {
+                options.push(required(&mut arguments, "option value")?);
+            }
+        } else if positional {
+            inputs.push(number(&argument, "input")?);
+        } else {
+            options.push(argument);
+        }
+    }
+    if inputs.is_empty() {
+        return Err(ArgsError::MissingValue("input"));
+    }
+    let (key, expected_revision) = command_options(options.into_iter())?;
+    if remote {
+        Ok(Command::RemoteReorder {
+            address: socket_address(&path_or_address)?,
+            inputs,
+            key,
+            expected_revision,
+        })
+    } else {
+        Ok(Command::Reorder {
+            path: PathBuf::from(path_or_address),
+            inputs,
+            key,
+            expected_revision,
+        })
+    }
 }
 
 fn parse_local_overlay(

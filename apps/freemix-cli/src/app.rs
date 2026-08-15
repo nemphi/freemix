@@ -122,6 +122,23 @@ pub fn run(command: Command) -> AppResult<()> {
             key,
             expected_revision,
         )?,
+        Command::Reorder {
+            path,
+            inputs,
+            key,
+            expected_revision,
+        } => mutate(
+            &path,
+            EngineCommand::ReorderInputs {
+                inputs: inputs
+                    .into_iter()
+                    .map(input_id)
+                    .collect::<AppResult<Vec<_>>>()?,
+            },
+            1,
+            key,
+            expected_revision,
+        )?,
         Command::Preview {
             path,
             input,
@@ -464,6 +481,27 @@ pub fn run(command: Command) -> AppResult<()> {
                         .ok_or_else(|| AppFailure("input ID must be nonzero".into()))?,
                 ),
                 name,
+            },
+            key,
+            expected_revision,
+        )?,
+        Command::RemoteReorder {
+            address,
+            inputs,
+            key,
+            expected_revision,
+        } => remote::execute(
+            address,
+            fm_protocol::CommandPayload::ReorderInputs {
+                inputs: inputs
+                    .into_iter()
+                    .map(|input| {
+                        NonZeroU128::new(input)
+                            .ok_or_else(|| AppFailure("input ID must be nonzero".into()))
+                            .map(fm_protocol::WireInputId::new)
+                            .map_err(|error| -> Box<dyn Error> { Box::new(error) })
+                    })
+                    .collect::<AppResult<Vec<_>>>()?,
             },
             key,
             expected_revision,

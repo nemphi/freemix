@@ -166,7 +166,9 @@ impl Session {
         self.ensure_connected()?;
 
         let class = match command.payload {
-            CommandPayload::RenameInput { .. } => CommandClass::EditProject,
+            CommandPayload::RenameInput { .. } | CommandPayload::ReorderInputs { .. } => {
+                CommandClass::EditProject
+            }
             CommandPayload::SetInputAudioStrip { .. } => CommandClass::ControlAudio,
             CommandPayload::SelectPreview { .. } => CommandClass::SelectPreview,
             CommandPayload::Cut

@@ -54,7 +54,9 @@ enum CommandCompletion {
 impl CommandCompletion {
     fn for_payload(payload: &CommandPayload) -> Self {
         match payload {
-            CommandPayload::RenameInput { .. } => Self::Project,
+            CommandPayload::RenameInput { .. } | CommandPayload::ReorderInputs { .. } => {
+                Self::Project
+            }
             CommandPayload::SetInputAudioStrip { .. } => Self::Audio,
             _ => Self::Switcher,
         }
@@ -237,7 +239,8 @@ impl Remote {
                 WireMessage::Event(event) => {
                     let matches_revision = event.cursor.revision == revision;
                     let expected_event = match &event.payload {
-                        EventPayload::InputRenamed { .. } => {
+                        EventPayload::InputRenamed { .. }
+                        | EventPayload::InputOrderChanged { .. } => {
                             completion == CommandCompletion::Project
                         }
                         EventPayload::DesiredSwitcher { .. }
