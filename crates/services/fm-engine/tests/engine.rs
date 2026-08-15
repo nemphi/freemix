@@ -237,6 +237,104 @@ fn rename_input_is_bounded_unique_and_replay_safe() {
 }
 
 #[test]
+fn reorder_inputs_preserves_id_references_and_rejects_invalid_orders_atomically() {
+    let mut engine = engine();
+    let strip = EngineInputAudioStripState {
+        gain_millidb: -1_000,
+        ..EngineInputAudioStripState::default()
+    };
+    engine
+        .execute(
+            envelope(
+                "reorder-strip",
+                EngineCommand::SetInputAudioStrip {
+                    input: input(2),
+                    state: strip,
+                },
+            ),
+            0,
+        )
+        .unwrap();
+    engine
+        .execute(
+            envelope(
+                "reorder-overlay",
+                EngineCommand::TakeOverlay {
+                    channel: OverlayChannelId::new(1).unwrap(),
+                    source: input(3),
+                },
+            ),
+            0,
+        )
+        .unwrap();
+    engine.tick().unwrap();
+
+    let accepted = engine
+        .execute(
+            envelope(
+                "reorder",
+                EngineCommand::ReorderInputs {
+                    inputs: vec![input(3), input(1), input(2)],
+                },
+            ),
+            0,
+        )
+        .unwrap();
+    assert_eq!(
+        accepted.events[0].payload,
+        EngineEvent::InputOrderChanged {
+            inputs: vec![input(3), input(1), input(2)]
+        }
+    );
+    engine.tick().unwrap();
+    let snapshot = engine.snapshot().unwrap();
+    assert_eq!(snapshot.show().inputs(), &[input(3), input(1), input(2)]);
+    assert_eq!(
+        snapshot.realized_switcher().inputs(),
+        &[input(3), input(1), input(2)]
+    );
+    assert_eq!(
+        snapshot.show().input_names(),
+        &["Input 3", "Input 1", "Input 2"]
+    );
+    assert_eq!(snapshot.show().input_audio_strip(input(2)), Some(strip));
+    assert_eq!(snapshot.show().desired_switcher().program(), input(1));
+    assert_eq!(snapshot.show().desired_switcher().preview(), input(2));
+    let overlay = snapshot
+        .realized_switcher()
+        .overlay(OverlayChannelId::new(1).unwrap());
+    assert_eq!(overlay.source(), Some(input(3)));
+    let before_invalid_show = snapshot.show().clone();
+    let before_invalid_revision = snapshot.revision();
+
+    for (key, inputs, code) in [
+        (
+            "duplicate",
+            vec![input(3), input(1), input(1)],
+            RejectionCode::InvalidCommand,
+        ),
+        (
+            "unknown",
+            vec![input(3), input(1), input(99)],
+            RejectionCode::NotFound,
+        ),
+        (
+            "missing",
+            vec![input(3), input(1)],
+            RejectionCode::InvalidCommand,
+        ),
+    ] {
+        let rejected = engine
+            .execute(envelope(key, EngineCommand::ReorderInputs { inputs }), 0)
+            .unwrap();
+        assert_eq!(rejected.receipt.rejected().unwrap().rejection.code, code);
+        let after = engine.snapshot().unwrap();
+        assert_eq!(after.show(), &before_invalid_show);
+        assert_eq!(after.revision(), before_invalid_revision);
+    }
+}
+
+#[test]
 fn input_audio_strip_is_durable_and_realized_on_its_scheduled_frame() {
     let mut engine = engine();
     let state = EngineInputAudioStripState {

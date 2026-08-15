@@ -32,6 +32,67 @@ pub enum RenameInputError {
     DuplicateName,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InputOrderError {
+    EmptyOrder,
+    WrongLength { expected: usize, actual: usize },
+    UnknownInput(InputId),
+    DuplicateInput(InputId),
+    MissingInput(InputId),
+}
+
+impl core::fmt::Display for InputOrderError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::EmptyOrder => formatter.write_str("input order must not be empty"),
+            Self::WrongLength { expected, actual } => {
+                write!(
+                    formatter,
+                    "input order must contain {expected} inputs, got {actual}"
+                )
+            }
+            Self::UnknownInput(input) => write!(formatter, "input {input} does not exist"),
+            Self::DuplicateInput(input) => write!(formatter, "input {input} occurs more than once"),
+            Self::MissingInput(input) => {
+                write!(formatter, "input {input} is missing from the order")
+            }
+        }
+    }
+}
+
+impl std::error::Error for InputOrderError {}
+
+pub fn validate_input_order(
+    current: &[InputId],
+    requested: &[InputId],
+) -> Result<(), InputOrderError> {
+    if requested.is_empty() {
+        return Err(InputOrderError::EmptyOrder);
+    }
+    if requested.len() != current.len() {
+        return Err(InputOrderError::WrongLength {
+            expected: current.len(),
+            actual: requested.len(),
+        });
+    }
+    for input in requested {
+        if !current.contains(input) {
+            return Err(InputOrderError::UnknownInput(*input));
+        }
+    }
+    for (index, input) in requested.iter().enumerate() {
+        if requested[..index].contains(input) {
+            return Err(InputOrderError::DuplicateInput(*input));
+        }
+    }
+    for input in current {
+        if !requested.contains(input) {
+            return Err(InputOrderError::MissingInput(*input));
+        }
+    }
+    Ok(())
+}
+
 impl core::fmt::Display for RenameInputError {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {

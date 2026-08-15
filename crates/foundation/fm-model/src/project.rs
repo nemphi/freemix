@@ -1,6 +1,6 @@
 use fm_types::{
-    AudioFormat, BusId, FrameRate, InputId, OutputId, ProjectId, RenameInputError, SceneId,
-    VideoFormat, validate_input_name,
+    AudioFormat, BusId, FrameRate, InputId, InputOrderError, OutputId, ProjectId, RenameInputError,
+    SceneId, VideoFormat, validate_input_name, validate_input_order,
 };
 
 use crate::{ValidationError, validation::validate_project};
@@ -155,6 +155,23 @@ impl Project {
             return Err(RenameInputError::DuplicateName);
         }
         self.inputs[index].name = name;
+        Ok(())
+    }
+
+    pub fn reorder_inputs(&mut self, inputs: Vec<InputId>) -> Result<(), InputOrderError> {
+        let current = self.inputs.iter().map(|input| input.id).collect::<Vec<_>>();
+        validate_input_order(&current, &inputs)?;
+        let reordered = inputs
+            .iter()
+            .map(|input| {
+                self.inputs
+                    .iter()
+                    .find(|candidate| candidate.id == *input)
+                    .expect("validated input order contains only project inputs")
+                    .clone()
+            })
+            .collect();
+        self.inputs = reordered;
         Ok(())
     }
 

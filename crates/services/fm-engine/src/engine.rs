@@ -13,7 +13,7 @@ use fm_switcher::{
     ProgramFrame, StingerDescriptor, StingerSlotId, SwitcherCommand, SwitcherError, SwitcherEvent,
     SwitcherState, TBarPosition, TransitionKind,
 };
-use fm_types::{FrameRate, InputId, OutputId, RenameInputError};
+use fm_types::{FrameRate, InputId, InputOrderError, OutputId, RenameInputError};
 
 use crate::{EngineError, EngineInputAudioStripState, ShowState, SnapshotError};
 
@@ -76,6 +76,9 @@ pub struct EngineFadeToBlackState {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EngineCommand {
+    ReorderInputs {
+        inputs: Vec<InputId>,
+    },
     RenameInput {
         input: InputId,
         name: String,
@@ -168,6 +171,7 @@ pub struct EngineAcceptance {
 pub enum EngineEvent {
     DesiredSwitcherChanged(EngineCommand),
     InputRenamed { input: InputId, name: String },
+    InputOrderChanged { inputs: Vec<InputId> },
 }
 
 pub type EngineCommandOutcome = ApplyOutcome<EngineAcceptance, EngineEvent>;
@@ -577,6 +581,7 @@ impl Engine {
                 if let Some(kind) = runtime_busy
                     && !matches!(&command, EngineCommand::FadeToBlack { .. })
                     && !matches!(&command, EngineCommand::RenameInput { .. })
+                    && !matches!(&command, EngineCommand::ReorderInputs { .. })
                     && !is_overlay_command(&command)
                 {
                     let name = match kind {
@@ -615,6 +620,7 @@ impl Engine {
                     None
                 }
                 EngineCommand::RenameInput { .. }
+                | EngineCommand::ReorderInputs { .. }
                 | EngineCommand::SetInputAudioStrip { .. }
                 | EngineCommand::TakeOverlay { .. }
                 | EngineCommand::UpdateOverlay { .. }
@@ -930,6 +936,17 @@ impl Mutation<ShowState, EngineEvent, EngineAcceptance> for EngineMutation {
                 target_frame: self.target_frame,
             });
         }
+        if let EngineCommand::ReorderInputs { inputs } = &self.command {
+            state
+                .reorder_inputs(inputs.clone())
+                .map_err(reorder_inputs_rejection)?;
+            events.push(EngineEvent::InputOrderChanged {
+                inputs: inputs.clone(),
+            });
+            return Ok(EngineAcceptance {
+                target_frame: self.target_frame,
+            });
+        }
         if let EngineCommand::SetInputAudioStrip {
             input,
             state: strip_state,
@@ -998,6 +1015,9 @@ impl Mutation<ShowState, EngineEvent, EngineAcceptance> for EngineMutation {
         let switcher_command = match &self.command {
             EngineCommand::RenameInput { .. } => {
                 unreachable!("input renames return before switcher command mapping")
+            }
+            EngineCommand::ReorderInputs { .. } => {
+                unreachable!("input reorders return before switcher command mapping")
             }
             EngineCommand::SetInputAudioStrip { .. } => {
                 unreachable!("audio-strip mutations return before switcher command mapping")
@@ -1232,6 +1252,12 @@ fn apply_runtime(
     ) {
         return Ok(Vec::new());
     }
+    if let EngineCommand::ReorderInputs { inputs } = command {
+        switcher
+            .reorder_inputs(inputs)
+            .expect("accepted engine input orders are validated");
+        return Ok(Vec::new());
+    }
     if let EngineCommand::FadeToBlack {
         active,
         duration_frames,
@@ -1247,6 +1273,9 @@ fn apply_runtime(
     switcher.apply(match command {
         EngineCommand::RenameInput { .. } => {
             unreachable!("input renames return before switcher command mapping")
+        }
+        EngineCommand::ReorderInputs { .. } => {
+            unreachable!("input reorders return before switcher command mapping")
         }
         EngineCommand::SetInputAudioStrip { .. } => {
             unreachable!("audio-strip commands return before switcher command mapping")
@@ -1381,6 +1410,17 @@ fn rename_input_rejection(error: RenameInputError) -> Rejection {
             RejectionCode::InvalidCommand
         }
         RenameInputError::DuplicateName => RejectionCode::Conflict,
+    };
+    Rejection::new(code, error.to_string())
+}
+
+fn reorder_inputs_rejection(error: InputOrderError) -> Rejection {
+    let code = match error {
+        InputOrderError::UnknownInput(_) => RejectionCode::NotFound,
+        InputOrderError::EmptyOrder
+        | InputOrderError::WrongLength { .. }
+        | InputOrderError::DuplicateInput(_)
+        | InputOrderError::MissingInput(_) => RejectionCode::InvalidCommand,
     };
     Rejection::new(code, error.to_string())
 }

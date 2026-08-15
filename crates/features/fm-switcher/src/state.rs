@@ -1,4 +1,4 @@
-use fm_types::{InputId, OutputId};
+use fm_types::{InputId, InputOrderError, OutputId, validate_input_order};
 
 use crate::{
     FadeToBlackAdvance, FadeToBlackController, FadeToBlackError, FadeToBlackFrame,
@@ -65,6 +65,12 @@ impl SwitcherState {
     #[must_use]
     pub fn inputs(&self) -> &[InputId] {
         &self.inputs
+    }
+
+    pub fn reorder_inputs(&mut self, inputs: Vec<InputId>) -> Result<(), InputOrderError> {
+        validate_input_order(&self.inputs, &inputs)?;
+        self.inputs = inputs;
+        Ok(())
     }
 
     #[must_use]

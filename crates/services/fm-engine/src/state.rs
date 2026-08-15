@@ -2,7 +2,9 @@ use core::fmt;
 use std::collections::{BTreeMap, HashSet};
 
 use fm_switcher::{StingerDescriptor, StingerSlotId, SwitcherEvent, SwitcherState, TBarState};
-use fm_types::{InputId, MAX_INPUT_NAME_BYTES, RenameInputError, validate_input_name};
+use fm_types::{
+    InputId, InputOrderError, MAX_INPUT_NAME_BYTES, RenameInputError, validate_input_name,
+};
 
 use crate::ShowError;
 
@@ -137,6 +139,24 @@ impl ShowState {
             return Err(RenameInputError::DuplicateName);
         }
         self.input_names[index] = name;
+        Ok(())
+    }
+
+    pub fn reorder_inputs(&mut self, inputs: Vec<InputId>) -> Result<(), InputOrderError> {
+        let mut desired_switcher = self.desired_switcher.clone();
+        desired_switcher.reorder_inputs(inputs.clone())?;
+        fm_types::validate_input_order(&self.inputs, &inputs)?;
+        let names = inputs
+            .iter()
+            .map(|input| {
+                self.input_name(*input)
+                    .expect("validated input order contains only show inputs")
+                    .to_owned()
+            })
+            .collect();
+        self.inputs = inputs;
+        self.input_names = names;
+        self.desired_switcher = desired_switcher;
         Ok(())
     }
 
