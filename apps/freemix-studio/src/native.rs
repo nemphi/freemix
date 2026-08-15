@@ -1725,7 +1725,7 @@ mod tests {
 
     #[cfg(unix)]
     use crate::SupervisedConfig;
-    use crate::{ConnectionConfig, RestartPolicy};
+    use crate::{ConnectionConfig, ExistingConfig, RestartPolicy};
 
     use super::*;
 
@@ -1957,6 +1957,77 @@ mod tests {
         );
         drop(updates);
         assert!(!publisher.publish(StudioUiState::new(StudioConnectionStatus::Failed)));
+    }
+
+    #[test]
+    fn recovery_publication_preserves_terminal_uncertainties_and_deferred_fifo() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut peer = HeartbeatPeer::accept(&listener);
+            peer.handshake_request();
+            peer.send(&WireMessage::HandshakeResponse(heartbeat_handshake(
+                HandshakeOutcome::Snapshot {
+                    reason: SnapshotReason::NoCursor,
+                },
+            )));
+            peer.send(&WireMessage::Snapshot(heartbeat_snapshot()));
+            peer.acknowledge_heartbeats_until_eof();
+        });
+        let project = ProjectId::new(NonZeroU128::new(1).unwrap());
+        let mut runtime = StudioRuntime::new(StudioConfig {
+            connection: ConnectionConfig::Existing(ExistingConfig {
+                address,
+                expected_project_id: project,
+            }),
+            client_id: "terminal-uncertainty-publication-test".to_owned(),
+            desired_role: Role::Operator,
+            restart_policy: RestartPolicy {
+                maximum_restarts: 0,
+            },
+            osc_listen: None,
+        })
+        .unwrap();
+        runtime.connect(HEARTBEAT_TEST_TIMEOUT).unwrap();
+
+        let first = TerminalUncertaintyNotice {
+            command_id: "local-1".to_owned(),
+            received_command_id: "server-1".to_owned(),
+        };
+        let second = TerminalUncertaintyNotice {
+            command_id: "local-2".to_owned(),
+            received_command_id: "server-2".to_owned(),
+        };
+        let mut recovery = WorkerRecovery::new(Some("reconnect pending".to_owned()), None);
+        recovery.terminal_uncertainties = vec![first.clone(), second.clone()];
+        recovery.deferred_intents.push_back(StudioIntent::Cut);
+        let (publisher, updates) = state_mailbox(egui::Context::default());
+
+        assert!(publish_recovery_runtime(
+            &mut runtime,
+            &publisher,
+            &recovery
+        ));
+        let _ = updates
+            .receiver
+            .recv_timeout(HEARTBEAT_TEST_TIMEOUT)
+            .unwrap();
+        let state = updates.latest.lock().unwrap().take().unwrap();
+        assert_eq!(state.terminal_uncertainties, vec![first, second]);
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("Queued 1 command(s) in operator FIFO")
+        );
+        let error = state.error.unwrap();
+        for text in [
+            "reconnect pending",
+            "\"local-1\" (server receipt \"server-1\")",
+            "\"local-2\" (server receipt \"server-2\")",
+        ] {
+            assert!(error.contains(text), "missing {text:?} in {error:?}");
+        }
+        drop(runtime);
+        server.join().unwrap();
     }
 
     fn manual_position(basis_points: u16) -> StudioIntent {

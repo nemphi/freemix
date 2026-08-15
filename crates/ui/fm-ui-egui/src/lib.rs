@@ -165,7 +165,7 @@ impl StudioConnectionStatus {
     }
 }
 
-/// Owned render input for one studio frame.
+/// Owned render input for a terminally uncertain command.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TerminalUncertaintyNotice {
     pub command_id: String,
