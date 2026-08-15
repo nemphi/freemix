@@ -431,6 +431,7 @@ pub fn run(command: Command) -> AppResult<()> {
             expected_revision,
         )?,
         Command::RemoteStatus { address } => remote::status(address)?,
+        Command::RemoteDiagnostics { address } => remote::diagnostics(address)?,
         Command::RemoteAudioStrip {
             address,
             input,
@@ -1757,6 +1758,7 @@ Usage:
   freemix-cli tbar-cancel <show.freemix> [--key <key>] [--expect <revision>]
   freemix-cli ftb <show.freemix> <live|black> <frames> [--key <key>] [--expect <revision>]
   freemix-cli remote-status <127.0.0.1:port>
+  freemix-cli remote-diagnostics <127.0.0.1:port>
   freemix-cli remote-audio-strip <127.0.0.1:port> <input> <gain-millidb:-96000..=24000> <balance-bp:-10000..=10000> <muted:on|off> <soloed:on|off> <follow-video:on|off> <delay-samples:0..=48000> [--key <key>] [--expect <revision>]
   freemix-cli remote-rename <127.0.0.1:port> <input> <name> [--key <key>] [--expect <revision>]
   freemix-cli remote-preview <127.0.0.1:port> <input> [--key <key>] [--expect <revision>]

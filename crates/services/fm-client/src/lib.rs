@@ -536,6 +536,8 @@ impl Client {
             | WireMessage::DurableEventBatch(_)
             | WireMessage::Heartbeat(_)
             | WireMessage::CapabilityReport(_)
+            | WireMessage::DiagnosticsRequest(_)
+            | WireMessage::DiagnosticsResponse(_)
             | WireMessage::Error(_) => Err(ClientError::UnexpectedMessage),
         }
     }

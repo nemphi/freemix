@@ -53,6 +53,10 @@ impl FakeRemoteServer {
         })
     }
 
+    fn start_diagnostics() -> Self {
+        Self::start_test_peer(|stream| serve_diagnostics_peer(stream))
+    }
+
     fn start_unterminated_response() -> Self {
         Self::start_test_peer(|stream| {
             stream.set_read_timeout(Some(TEST_PEER_TIMEOUT)).unwrap();
@@ -234,6 +238,63 @@ fn serve_remote_sessions(listener: &TcpListener) {
             input(1),
         );
     }
+}
+
+fn serve_diagnostics_peer(stream: TcpStream) {
+    let engine = EngineIdentity {
+        engine_id: "diag-engine".into(),
+        state_epoch: 7,
+        log_id: "secret-log".into(),
+    };
+    stream.set_read_timeout(Some(TEST_PEER_TIMEOUT)).unwrap();
+    stream.set_write_timeout(Some(TEST_PEER_TIMEOUT)).unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(stream);
+    let hello = read_message(&mut reader);
+    assert_handshake_request_viewer(hello);
+    write_handshake(&mut writer, &engine, 0);
+    let WireMessage::DiagnosticsRequest(request) = read_message(&mut reader) else {
+        panic!("expected diagnostics request");
+    };
+    write_message(
+        &mut writer,
+        &WireMessage::RuntimeEvent(RuntimeEventMessage {
+            server: server_identity(&engine),
+            revision: 0,
+            generation: 1,
+            sequence: 1,
+            event: RuntimeLifecycleEvent::Realized {
+                domain: "switcher".into(),
+                manual_transition: fm_protocol::ManualTransitionStatus::Inactive,
+                fade_to_black: live_fade_to_black(),
+            },
+        }),
+    );
+    write_message(
+        &mut writer,
+        &WireMessage::DiagnosticsResponse(fm_protocol::DiagnosticsResponse {
+            protocol: CURRENT_PROTOCOL_VERSION,
+            request_id: request.request_id,
+            engine: engine.clone(),
+            current_revision: 12,
+            oldest_retained_revision: Some(3),
+            newest_retained_revision: Some(12),
+            subscriber_count: 2,
+            retained_events_limit: 64,
+            subscriber_limit: 8,
+            subscriber_queue_limit: 16,
+        }),
+    );
+}
+
+fn assert_handshake_request_viewer(message: WireMessage) {
+    let WireMessage::HandshakeRequest(hello) = message else {
+        panic!("expected handshake request");
+    };
+    assert_eq!(hello.desired_role, Role::Viewer);
+    assert_eq!(hello.client_type, ClientType::Cli);
+    assert_eq!(hello.protocol, CURRENT_PROTOCOL_VERSION);
+    assert_eq!(hello.resume_cursor, None);
 }
 
 fn serve_peer_event_interleave(listener: &TcpListener) {
@@ -1099,6 +1160,18 @@ fn remote_status_times_out_when_peer_sends_no_response() {
     let server = FakeRemoteServer::start_silent_response();
     let output = invoke_bounded(&["remote-status", &server.address()]);
     assert_failure_contains(&output, "daemon response timed out");
+    server.finish();
+}
+
+#[test]
+fn remote_diagnostics_correlates_request_and_allows_interleaved_runtime_event() {
+    let server = FakeRemoteServer::start_diagnostics();
+    let output = invoke_bounded(&["remote-diagnostics", &server.address()]);
+    assert_success(&output);
+    assert_eq!(
+        stdout(&output),
+        "diagnostics=v1 engine_id=diag-engine state_epoch=7 revision=12 retained_oldest=3 retained_newest=12 subscribers=2/8 retained_limit=64 subscriber_queue=16"
+    );
     server.finish();
 }
 

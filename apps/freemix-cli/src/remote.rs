@@ -8,9 +8,10 @@ use std::{
 
 use fm_client::{Client, ClientConfig, Intake, Outbound};
 use fm_protocol::{
-    CURRENT_PROTOCOL_VERSION, ClientType, CommandPayload, CommandResult, EventPayload,
-    FadeToBlackState, HandshakeOutcome, HandshakeRequest, MAX_LINE_BYTES, Role,
-    RuntimeLifecycleEvent, ServerIdentity, WireMessage, decode_line, encode_line,
+    CURRENT_PROTOCOL_VERSION, ClientType, CommandPayload, CommandResult, DiagnosticsRequest,
+    DiagnosticsResponse, EventPayload, FadeToBlackState, HandshakeOutcome, HandshakeRequest,
+    MAX_LINE_BYTES, Role, RuntimeLifecycleEvent, ServerIdentity, WireMessage, decode_line,
+    encode_line,
 };
 use fm_types::ProjectId;
 use fm_ui_model::ManualTransitionStatus;
@@ -22,6 +23,75 @@ const REMOTE_IO_TIMEOUT: Duration = Duration::from_secs(2);
 pub fn status(address: SocketAddr) -> RemoteResult<()> {
     let remote = Remote::connect(address, Role::Operator)?;
     remote.print_status()
+}
+
+pub fn diagnostics(address: SocketAddr) -> RemoteResult<()> {
+    let mut remote = Remote::connect(address, Role::Viewer)?;
+    let request_id = format!("cli-diagnostics-{}", unique_client_id()?);
+    remote.write(&WireMessage::DiagnosticsRequest(DiagnosticsRequest {
+        protocol: CURRENT_PROTOCOL_VERSION,
+        request_id: request_id.clone(),
+    }))?;
+    let response = loop {
+        match remote.read()? {
+            WireMessage::DiagnosticsResponse(response) => break response,
+            WireMessage::Event(event) => {
+                remote.client.intake(WireMessage::Event(event))?;
+            }
+            WireMessage::RuntimeEvent(event) => {
+                remote.client.intake(WireMessage::RuntimeEvent(event))?;
+            }
+            WireMessage::Error(error) => return Err(protocol_error(&error.error).into()),
+            _ => {
+                return Err(
+                    RemoteFailure("expected diagnostics_response from daemon".into()).into(),
+                );
+            }
+        }
+    };
+    if response.request_id != request_id
+        || response.protocol != CURRENT_PROTOCOL_VERSION
+        || response.engine.engine_id != remote.server.engine_id
+        || response.engine.state_epoch != remote.server.state_epoch
+    {
+        return Err(RemoteFailure("diagnostics response does not match the request".into()).into());
+    }
+    print_diagnostics(&response);
+    Ok(())
+}
+
+fn print_diagnostics(response: &DiagnosticsResponse) {
+    println!(
+        "diagnostics=v1 engine_id={} state_epoch={} revision={} retained_oldest={} retained_newest={} subscribers={}/{} retained_limit={} subscriber_queue={}",
+        sanitize_identity(&response.engine.engine_id),
+        response.engine.state_epoch,
+        response.current_revision,
+        optional_number(response.oldest_retained_revision),
+        optional_number(response.newest_retained_revision),
+        response.subscriber_count,
+        response.subscriber_limit,
+        response.retained_events_limit,
+        response.subscriber_queue_limit,
+    );
+}
+
+fn optional_number(value: Option<u64>) -> String {
+    value.map_or_else(|| "none".to_owned(), |value| value.to_string())
+}
+
+fn sanitize_identity(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .filter(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
+        .take(96)
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "unknown".to_owned()
+    } else {
+        sanitized
+    }
 }
 
 pub fn execute(
@@ -76,6 +146,7 @@ struct Remote {
     writer: TcpStream,
     client: Client,
     project_id: ProjectId,
+    server: ServerIdentity,
 }
 
 impl Remote {
@@ -121,6 +192,7 @@ impl Remote {
         }
 
         let project_id = project_id(&response.server)?;
+        let server = response.server.clone();
         let mut client = Client::new(ClientConfig::new(
             env!("CARGO_PKG_VERSION"),
             ClientType::Cli,
@@ -150,6 +222,7 @@ impl Remote {
 
         remote.client = client;
         remote.project_id = project_id;
+        remote.server = server;
         Ok(remote)
     }
 
@@ -166,6 +239,12 @@ impl Remote {
                 placeholder,
             ))?,
             project_id: placeholder,
+            server: ServerIdentity {
+                engine_id: "uninitialized".into(),
+                project_id: placeholder.to_string(),
+                state_epoch: 0,
+                log_id: "uninitialized".into(),
+            },
         })
     }
 

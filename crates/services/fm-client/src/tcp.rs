@@ -784,7 +784,9 @@ impl TcpSession {
             | WireMessage::HandshakeResponse(_)
             | WireMessage::DurableEventBatch(_)
             | WireMessage::Heartbeat(_)
-            | WireMessage::CapabilityReport(_) => {
+            | WireMessage::CapabilityReport(_)
+            | WireMessage::DiagnosticsRequest(_)
+            | WireMessage::DiagnosticsResponse(_) => {
                 self.transition_disconnect();
                 Err(TcpSessionError::UnexpectedMessage)
             }

@@ -231,6 +231,9 @@ pub enum Command {
     RemoteStatus {
         address: SocketAddr,
     },
+    RemoteDiagnostics {
+        address: SocketAddr,
+    },
     RemoteAudioStrip {
         address: SocketAddr,
         input: u128,
@@ -490,6 +493,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
         }
         "ftb" => parse_local_fade_to_black(arguments),
         "remote-status" => parse_remote_status(arguments),
+        "remote-diagnostics" => parse_remote_diagnostics(arguments),
         "remote-audio-strip" => parse_remote_audio_strip(arguments),
         "remote-rename" => parse_remote_rename(arguments),
         "remote-input-reorder" => parse_reorder(arguments, true),
@@ -1043,6 +1047,14 @@ fn parse_remote_status(mut arguments: impl Iterator<Item = String>) -> Result<Co
     let address = socket_address(&required(&mut arguments, "address")?)?;
     reject_extra(&mut arguments)?;
     Ok(Command::RemoteStatus { address })
+}
+
+fn parse_remote_diagnostics(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Command, ArgsError> {
+    let address = socket_address(&required(&mut arguments, "address")?)?;
+    reject_extra(&mut arguments)?;
+    Ok(Command::RemoteDiagnostics { address })
 }
 
 fn parse_remote_audio_strip(
