@@ -103,10 +103,10 @@ pub fn execute(
     expected_revision: Option<u64>,
 ) -> RemoteResult<()> {
     let completion = CommandCompletion::for_payload(&payload);
-    let role = if completion == CommandCompletion::Project {
-        Role::Graphics
-    } else {
-        Role::Operator
+    let role = match completion {
+        CommandCompletion::Project => Role::Graphics,
+        CommandCompletion::Audio => Role::Audio,
+        CommandCompletion::Switcher => Role::Operator,
     };
     let mut remote = Remote::connect(address, role)?;
     let key = match key {

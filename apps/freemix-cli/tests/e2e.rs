@@ -493,8 +493,8 @@ fn serve_audio_strip(listener: &TcpListener) {
     let (stream, _) = listener.accept().unwrap();
     let mut writer = stream.try_clone().unwrap();
     let mut reader = BufReader::new(stream);
-    assert_handshake_request(read_message(&mut reader));
-    write_handshake(&mut writer, &engine, 0);
+    assert_handshake_request_role(read_message(&mut reader), Role::Audio);
+    write_handshake_role(&mut writer, &engine, 0, Role::Audio);
 
     let WireMessage::Command(command) = read_message(&mut reader) else {
         panic!("expected remote input-audio-strip command");
@@ -925,6 +925,10 @@ fn write_handshake_version_with_manual(
 fn handshake_permissions(role: Role) -> Vec<String> {
     match role {
         Role::Viewer => vec!["view_status".into()],
+        Role::Audio => ["view_status", "control_audio", "edit_project"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
         Role::Operator => [
             "view_status",
             "select_preview",
@@ -934,7 +938,7 @@ fn handshake_permissions(role: Role) -> Vec<String> {
         .into_iter()
         .map(str::to_owned)
         .collect(),
-        _ => unreachable!("test handshake role must be Viewer or Operator"),
+        _ => unreachable!("test handshake role must be Viewer, Audio, or Operator"),
     }
 }
 
