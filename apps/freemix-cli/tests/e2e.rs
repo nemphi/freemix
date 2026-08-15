@@ -120,6 +120,13 @@ impl FakeRemoteServer {
         Self { address, worker }
     }
 
+    fn start_stinger_configuration() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || serve_stinger_configuration(&listener));
+        Self { address, worker }
+    }
+
     fn start_fade_to_black() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -583,6 +590,90 @@ fn serve_stinger(listener: &TcpListener) {
         },
         "remote-stinger",
     );
+}
+
+fn serve_stinger_configuration(listener: &TcpListener) {
+    let engine = EngineIdentity {
+        engine_id: "project-42".into(),
+        state_epoch: 1,
+        log_id: "fake-remote-log".into(),
+    };
+    let expected = [
+        CommandPayload::ConfigureStinger {
+            slot: fm_protocol::WireStingerSlotId::new(3).unwrap(),
+            media_input: input(2),
+            preload: true,
+            cut_point_frames: 45,
+            audio_policy: fm_protocol::StingerAudioPolicy::MixWithProgram,
+            missing_media_fallback: fm_protocol::StingerMissingMediaFallback::Fade,
+        },
+        CommandPayload::RemoveStinger {
+            slot: fm_protocol::WireStingerSlotId::new(3).unwrap(),
+        },
+    ];
+    for (index, expected_payload) in expected.into_iter().enumerate() {
+        let revision = index as u64;
+        let (stream, _) = listener.accept().unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        let mut reader = BufReader::new(stream);
+        assert_handshake_request(read_message(&mut reader));
+        write_handshake(&mut writer, &engine, revision);
+        let WireMessage::Command(command) = read_message(&mut reader) else {
+            panic!("expected stinger command");
+        };
+        assert_command(
+            &command,
+            expected_payload,
+            if index == 0 {
+                "configure-stinger"
+            } else {
+                "remove-stinger"
+            },
+            revision,
+        );
+        let new_revision = revision + 1;
+        write_message(
+            &mut writer,
+            &WireMessage::CommandResult(CommandResult::Accepted {
+                id: command.id,
+                revision: new_revision,
+                scheduled_frame: None,
+            }),
+        );
+        let cursor = EventCursor {
+            engine: engine.clone(),
+            revision: new_revision,
+        };
+        write_message(
+            &mut writer,
+            &WireMessage::Event(EventMessage {
+                cursor,
+                payload: EventPayload::StingerSlotsChanged {
+                    program: input(1),
+                    preview: input(2),
+                    manual_transition: fm_protocol::ManualTransitionStatus::Inactive,
+                    fade_to_black: live_fade_to_black(),
+                    stingers: Vec::new(),
+                    overlays: OverlayStatus::empty_channels(),
+                    input_audio_strips: input_audio_strips(),
+                },
+            }),
+        );
+        write_message(
+            &mut writer,
+            &WireMessage::RuntimeEvent(RuntimeEventMessage {
+                server: server_identity(&engine),
+                revision: new_revision,
+                generation: new_revision,
+                sequence: 1,
+                event: RuntimeLifecycleEvent::Realized {
+                    domain: "switcher".into(),
+                    manual_transition: fm_protocol::ManualTransitionStatus::Inactive,
+                    fade_to_black: live_fade_to_black(),
+                },
+            }),
+        );
+    }
 }
 
 fn serve_automatic_transition(
@@ -1345,6 +1436,37 @@ fn remote_stinger_preserves_slot_duration_and_protocol() {
         "0",
     ]);
     assert_success(&output);
+    server.finish();
+}
+
+#[test]
+fn remote_stinger_configure_and_remove_preserve_current_protocol() {
+    let server = FakeRemoteServer::start_stinger_configuration();
+    let configured = invoke(&[
+        "remote-stinger-configure",
+        &server.address(),
+        "3",
+        "2",
+        "true",
+        "45",
+        "mix-with-program",
+        "fade",
+        "--key",
+        "configure-stinger",
+        "--expect",
+        "0",
+    ]);
+    assert_success(&configured);
+    let removed = invoke(&[
+        "remote-stinger-remove",
+        &server.address(),
+        "3",
+        "--key",
+        "remove-stinger",
+        "--expect",
+        "1",
+    ]);
+    assert_success(&removed);
     server.finish();
 }
 

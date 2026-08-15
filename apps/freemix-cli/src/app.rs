@@ -601,6 +601,47 @@ pub fn run(command: Command) -> AppResult<()> {
             key,
             expected_revision,
         )?,
+        Command::RemoteStingerConfigure {
+            address,
+            slot,
+            media_input,
+            preload,
+            cut_point_frames,
+            audio_policy,
+            fallback,
+            key,
+            expected_revision,
+        } => remote::execute(
+            address,
+            fm_protocol::CommandPayload::ConfigureStinger {
+                slot: fm_protocol::WireStingerSlotId::new(slot)
+                    .expect("CLI parser validates Stinger slots"),
+                media_input: fm_protocol::WireInputId::new(
+                    NonZeroU128::new(media_input)
+                        .ok_or_else(|| AppFailure("media input ID must be nonzero".into()))?,
+                ),
+                preload,
+                cut_point_frames,
+                audio_policy: protocol_stinger_audio_policy(audio_policy),
+                missing_media_fallback: protocol_stinger_fallback(fallback),
+            },
+            key,
+            expected_revision,
+        )?,
+        Command::RemoteStingerRemove {
+            address,
+            slot,
+            key,
+            expected_revision,
+        } => remote::execute(
+            address,
+            fm_protocol::CommandPayload::RemoveStinger {
+                slot: fm_protocol::WireStingerSlotId::new(slot)
+                    .expect("CLI parser validates Stinger slots"),
+            },
+            key,
+            expected_revision,
+        )?,
         Command::RemoteOverlayTake {
             address,
             channel,
@@ -1784,6 +1825,8 @@ Usage:
   freemix-cli remote-slide <127.0.0.1:port> <frames> [--key <key>] [--expect <revision>]
   freemix-cli remote-zoom <127.0.0.1:port> <frames> [--key <key>] [--expect <revision>]
   freemix-cli remote-stinger <127.0.0.1:port> <slot:1..=8> <frames> [--key <key>] [--expect <revision>]
+  freemix-cli remote-stinger-configure <127.0.0.1:port> <slot:1..=8> <media-input> <true|false> <cut-point-frames> <muted|stinger-only|mix-with-program> <cut|fade|keep-program> [--key <key>] [--expect <revision>]
+  freemix-cli remote-stinger-remove <127.0.0.1:port> <slot:1..=8> [--key <key>] [--expect <revision>]
   freemix-cli remote-overlay-take <127.0.0.1:port> <channel:1..=8> <source-input> [--key <key>] [--expect <revision>]
   freemix-cli remote-overlay-update <127.0.0.1:port> <channel:1..=8> <source-input> [--key <key>] [--expect <revision>]
   freemix-cli remote-overlay-off <127.0.0.1:port> <channel:1..=8> [--key <key>] [--expect <revision>]
@@ -1861,6 +1904,26 @@ const fn protocol_overlay_border(kind: CliOverlayBorder) -> fm_protocol::Overlay
         CliOverlayBorder::None => fm_protocol::OverlayBorderPreset::None,
         CliOverlayBorder::ThinWhite => fm_protocol::OverlayBorderPreset::ThinWhite,
         CliOverlayBorder::ThickWhite => fm_protocol::OverlayBorderPreset::ThickWhite,
+    }
+}
+
+const fn protocol_stinger_audio_policy(
+    policy: CliStingerAudioPolicy,
+) -> fm_protocol::StingerAudioPolicy {
+    match policy {
+        CliStingerAudioPolicy::Muted => fm_protocol::StingerAudioPolicy::Muted,
+        CliStingerAudioPolicy::StingerOnly => fm_protocol::StingerAudioPolicy::StingerOnly,
+        CliStingerAudioPolicy::MixWithProgram => fm_protocol::StingerAudioPolicy::MixWithProgram,
+    }
+}
+
+const fn protocol_stinger_fallback(
+    fallback: CliStingerFallback,
+) -> fm_protocol::StingerMissingMediaFallback {
+    match fallback {
+        CliStingerFallback::Cut => fm_protocol::StingerMissingMediaFallback::Cut,
+        CliStingerFallback::Fade => fm_protocol::StingerMissingMediaFallback::Fade,
+        CliStingerFallback::KeepProgram => fm_protocol::StingerMissingMediaFallback::KeepProgram,
     }
 }
 

@@ -301,6 +301,23 @@ pub enum Command {
         key: Option<String>,
         expected_revision: Option<u64>,
     },
+    RemoteStingerConfigure {
+        address: SocketAddr,
+        slot: u8,
+        media_input: u128,
+        preload: bool,
+        cut_point_frames: u32,
+        audio_policy: StingerAudioPolicy,
+        fallback: StingerFallback,
+        key: Option<String>,
+        expected_revision: Option<u64>,
+    },
+    RemoteStingerRemove {
+        address: SocketAddr,
+        slot: u8,
+        key: Option<String>,
+        expected_revision: Option<u64>,
+    },
     RemoteOverlayTake {
         address: SocketAddr,
         channel: u8,
@@ -503,6 +520,8 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
             parse_remote_timed_transition(&command, arguments)
         }
         "remote-stinger" => parse_remote_stinger(arguments),
+        "remote-stinger-configure" => parse_remote_stinger_configuration(arguments),
+        "remote-stinger-remove" => parse_remote_stinger_removal(arguments),
         "remote-overlay-take"
         | "remote-overlay-update"
         | "remote-overlay-off"
@@ -905,44 +924,8 @@ fn parse_stinger_configuration(
     mut arguments: impl Iterator<Item = String>,
 ) -> Result<Command, ArgsError> {
     let path = required_path(&mut arguments, "project path")?;
-    let slot = stinger_slot(&required(&mut arguments, "Stinger slot")?)?;
-    let media_input = number(&required(&mut arguments, "media input")?, "media input")?;
-    let preload = match required(&mut arguments, "preload")?.as_str() {
-        "true" => true,
-        "false" => false,
-        value => {
-            return Err(ArgsError::InvalidChoice {
-                field: "preload",
-                value: value.to_owned(),
-            });
-        }
-    };
-    let cut_point_frames = number(
-        &required(&mut arguments, "cut point frames")?,
-        "cut point frames",
-    )?;
-    let audio_policy = match required(&mut arguments, "Stinger audio policy")?.as_str() {
-        "muted" => StingerAudioPolicy::Muted,
-        "stinger-only" => StingerAudioPolicy::StingerOnly,
-        "mix-with-program" => StingerAudioPolicy::MixWithProgram,
-        value => {
-            return Err(ArgsError::InvalidChoice {
-                field: "Stinger audio policy",
-                value: value.to_owned(),
-            });
-        }
-    };
-    let fallback = match required(&mut arguments, "Stinger fallback")?.as_str() {
-        "cut" => StingerFallback::Cut,
-        "fade" => StingerFallback::Fade,
-        "keep-program" => StingerFallback::KeepProgram,
-        value => {
-            return Err(ArgsError::InvalidChoice {
-                field: "Stinger fallback",
-                value: value.to_owned(),
-            });
-        }
-    };
+    let (slot, media_input, preload, cut_point_frames, audio_policy, fallback) =
+        parse_stinger_configuration_fields(&mut arguments)?;
     reject_extra(&mut arguments)?;
     Ok(Command::StingerConfigure {
         path,
@@ -953,6 +936,57 @@ fn parse_stinger_configuration(
         audio_policy,
         fallback,
     })
+}
+
+fn parse_stinger_configuration_fields(
+    arguments: &mut impl Iterator<Item = String>,
+) -> Result<(u8, u128, bool, u32, StingerAudioPolicy, StingerFallback), ArgsError> {
+    let slot = stinger_slot(&required(arguments, "Stinger slot")?)?;
+    let media_input = number(&required(arguments, "media input")?, "media input")?;
+    let preload = match required(arguments, "preload")?.as_str() {
+        "true" => true,
+        "false" => false,
+        value => {
+            return Err(ArgsError::InvalidChoice {
+                field: "preload",
+                value: value.to_owned(),
+            });
+        }
+    };
+    let cut_point_frames = number(
+        &required(arguments, "cut point frames")?,
+        "cut point frames",
+    )?;
+    let audio_policy = match required(arguments, "Stinger audio policy")?.as_str() {
+        "muted" => StingerAudioPolicy::Muted,
+        "stinger-only" => StingerAudioPolicy::StingerOnly,
+        "mix-with-program" => StingerAudioPolicy::MixWithProgram,
+        value => {
+            return Err(ArgsError::InvalidChoice {
+                field: "Stinger audio policy",
+                value: value.to_owned(),
+            });
+        }
+    };
+    let fallback = match required(arguments, "Stinger fallback")?.as_str() {
+        "cut" => StingerFallback::Cut,
+        "fade" => StingerFallback::Fade,
+        "keep-program" => StingerFallback::KeepProgram,
+        value => {
+            return Err(ArgsError::InvalidChoice {
+                field: "Stinger fallback",
+                value: value.to_owned(),
+            });
+        }
+    };
+    Ok((
+        slot,
+        media_input,
+        preload,
+        cut_point_frames,
+        audio_policy,
+        fallback,
+    ))
 }
 
 fn parse_stinger_removal(
@@ -1173,6 +1207,40 @@ fn parse_remote_stinger(mut arguments: impl Iterator<Item = String>) -> Result<C
         address,
         slot,
         frames,
+        key,
+        expected_revision,
+    })
+}
+
+fn parse_remote_stinger_configuration(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Command, ArgsError> {
+    let address = socket_address(&required(&mut arguments, "address")?)?;
+    let (slot, media_input, preload, cut_point_frames, audio_policy, fallback) =
+        parse_stinger_configuration_fields(&mut arguments)?;
+    let (key, expected_revision) = command_options(arguments)?;
+    Ok(Command::RemoteStingerConfigure {
+        address,
+        slot,
+        media_input,
+        preload,
+        cut_point_frames,
+        audio_policy,
+        fallback,
+        key,
+        expected_revision,
+    })
+}
+
+fn parse_remote_stinger_removal(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Command, ArgsError> {
+    let address = socket_address(&required(&mut arguments, "address")?)?;
+    let slot = stinger_slot(&required(&mut arguments, "Stinger slot")?)?;
+    let (key, expected_revision) = command_options(arguments)?;
+    Ok(Command::RemoteStingerRemove {
+        address,
+        slot,
         key,
         expected_revision,
     })
