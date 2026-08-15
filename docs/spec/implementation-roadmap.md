@@ -473,8 +473,9 @@ and Escape to cancel a desired active manual T-bar, while its current Ready, vie
 permission, focus, non-repeat, modifier, and manual-control gates allow the action. This adds no binding editor,
 chords, scopes, persistence, MIDI/controller runtime, conflict handling, or
 shortcut acceptance evidence. When configured, native Studio also accepts the
-bounded loopback OSC action contract with the same current view, permission, and
-manual-transition gates; malformed, rejected, and overflow counts are visible to
+bounded loopback OSC action contract, including zero-argument manual commit and
+cancel, with the same current view, permission, and manual-transition gates;
+malformed, rejected, and overflow counts are visible to
 the operator. RC-004 remains planned.
 
 Current implementation boundary for item 6: the switcher and engine now own

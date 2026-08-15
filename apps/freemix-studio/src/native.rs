@@ -278,6 +278,8 @@ impl StudioApp {
                 OscAction::Cut => ExternalStudioAction::Cut,
                 OscAction::Fade => ExternalStudioAction::Fade,
                 OscAction::FadeToBlack { active } => ExternalStudioAction::FadeToBlack { active },
+                OscAction::CommitManualTransition => ExternalStudioAction::CommitManualTransition,
+                OscAction::CancelManualTransition => ExternalStudioAction::CancelManualTransition,
             };
             let intent = external_intent(
                 &self.state,
@@ -2462,19 +2464,34 @@ mod tests {
             })
         );
         let mut manual = ready.clone();
+        let active_manual_transition = fm_ui_model::ActiveManualTransition {
+            kind: fm_protocol::ManualTransitionKind::Fade,
+            from: view.switcher.desired.preview,
+            to: view.switcher.desired.program,
+            interval_start: ManualTransitionPosition::START,
+            position: ManualTransitionPosition::START,
+        };
         manual
             .view
             .as_mut()
             .unwrap()
             .switcher
             .desired_manual_transition =
-            fm_ui_model::ManualTransitionStatus::Active(fm_ui_model::ActiveManualTransition {
-                kind: fm_protocol::ManualTransitionKind::Fade,
-                from: view.switcher.desired.preview,
-                to: view.switcher.desired.program,
-                interval_start: ManualTransitionPosition::START,
-                position: ManualTransitionPosition::START,
-            });
+            fm_ui_model::ManualTransitionStatus::Active(active_manual_transition);
+        assert!(
+            external_intent(&ready, ExternalStudioAction::CommitManualTransition, 42, 84).is_none()
+        );
+        let manual_ready = manual.clone();
+        let manual_denied = manual.clone().with_switcher_permissions(true, false);
+        assert!(
+            external_intent(
+                &manual_denied,
+                ExternalStudioAction::CancelManualTransition,
+                42,
+                84
+            )
+            .is_none()
+        );
         assert!(external_intent(&manual, ExternalStudioAction::Cut, 42, 84).is_none());
         manual
             .view
@@ -2553,6 +2570,34 @@ mod tests {
             StudioIntent::Cut,
         ];
         assert_eq!(order, expected);
+
+        app.state = manual_ready;
+        let osc_address = app.osc.as_ref().unwrap().local_addr();
+        for address in [
+            "/freemix/switcher/manual/commit",
+            "/freemix/switcher/manual/cancel",
+        ] {
+            sender.send_to(&osc_message(address), osc_address).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut manual_order = Vec::new();
+        while manual_order.len() < 2 && Instant::now() < deadline {
+            app.drain_osc();
+            manual_order.extend(rx.try_iter().map(|request| match request {
+                WorkerRequest::Intent(intent) => intent,
+                WorkerRequest::Shutdown => panic!("unexpected shutdown"),
+            }));
+            if manual_order.len() < 2 {
+                sleep(Duration::from_millis(5));
+            }
+        }
+        assert_eq!(
+            manual_order,
+            [
+                StudioIntent::CommitManualTransition,
+                StudioIntent::CancelManualTransition,
+            ]
+        );
     }
 
     fn osc_message(address: &str) -> Vec<u8> {

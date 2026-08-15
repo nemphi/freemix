@@ -21,6 +21,8 @@ pub(crate) enum OscAction {
     Cut,
     Fade,
     FadeToBlack { active: bool },
+    CommitManualTransition,
+    CancelManualTransition,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -183,6 +185,8 @@ fn decode(datagram: &[u8]) -> Result<OscAction, ()> {
         "/freemix/switcher/fade" => Ok(OscAction::Fade),
         "/freemix/switcher/ftb/live" => Ok(OscAction::FadeToBlack { active: false }),
         "/freemix/switcher/ftb/black" => Ok(OscAction::FadeToBlack { active: true }),
+        "/freemix/switcher/manual/commit" => Ok(OscAction::CommitManualTransition),
+        "/freemix/switcher/manual/cancel" => Ok(OscAction::CancelManualTransition),
         _ => Err(()),
     }
 }
@@ -223,6 +227,14 @@ mod tests {
             (
                 "/freemix/switcher/ftb/black",
                 OscAction::FadeToBlack { active: true },
+            ),
+            (
+                "/freemix/switcher/manual/commit",
+                OscAction::CommitManualTransition,
+            ),
+            (
+                "/freemix/switcher/manual/cancel",
+                OscAction::CancelManualTransition,
             ),
         ];
         for (address, action) in cases {

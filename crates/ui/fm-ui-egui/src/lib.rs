@@ -132,6 +132,8 @@ pub enum ExternalStudioAction {
     Cut,
     Fade,
     FadeToBlack { active: bool },
+    CommitManualTransition,
+    CancelManualTransition,
 }
 
 /// Native studio connection lifecycle as presented to an operator.
@@ -489,6 +491,29 @@ pub fn external_intent(
             (allowed && !gate.manual_transition_in_flight).then_some(StudioIntent::FadeToBlack {
                 active,
                 duration_frames: fade_to_black_duration_frames,
+            })
+        }
+        ExternalStudioAction::CommitManualTransition
+        | ExternalStudioAction::CancelManualTransition => {
+            let active = state.view.as_ref().is_some_and(|view| {
+                matches!(
+                    view.switcher.desired_manual_transition,
+                    ManualTransitionStatus::Active(_)
+                )
+            });
+            let available =
+                manual_transition_availability(ManualTransitionGate::from_state(state), active);
+            if !available.active_controls {
+                return None;
+            }
+            Some(match action {
+                ExternalStudioAction::CommitManualTransition => {
+                    StudioIntent::CommitManualTransition
+                }
+                ExternalStudioAction::CancelManualTransition => {
+                    StudioIntent::CancelManualTransition
+                }
+                _ => unreachable!(),
             })
         }
         _ => None,
