@@ -389,4 +389,16 @@ impl StudioRuntime {
     ) -> Result<SessionEvent, StudioError> {
         Ok(self.session.receive_cancellable(poll_interval, cancelled)?)
     }
+
+    /// Sends one diagnostics request and waits for its validated response.
+    pub fn send_diagnostics_cancellable(
+        &mut self,
+        request_id: impl Into<String>,
+        poll_interval: Duration,
+        cancelled: impl FnMut() -> bool,
+    ) -> Result<SessionEvent, StudioError> {
+        Ok(self
+            .session
+            .send_diagnostics_cancellable(request_id, poll_interval, cancelled)?)
+    }
 }

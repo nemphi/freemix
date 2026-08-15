@@ -17,11 +17,11 @@ use std::os::unix::fs::PermissionsExt;
 use fm_client::{ClientError, CommandStatus, Intake, SessionEvent, SyncMode, TcpSessionError};
 use fm_protocol::{
     CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, CommandPayload, CommandResult,
-    EngineIdentity, EventCursor, EventMessage, EventPayload, FadeToBlackPosition, FadeToBlackState,
-    HandshakeOutcome, HandshakeResponse, HeartbeatAcknowledgementMessage, HeartbeatMessage,
-    LineDecoder, ManualTransitionStatus, OverlayStatus, ProtocolVersion, Role, RuntimeEventMessage,
-    RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage, SnapshotReason, WireInputId,
-    WireMessage, encode_line,
+    DiagnosticsResponse, EngineIdentity, EventCursor, EventMessage, EventPayload,
+    FadeToBlackPosition, FadeToBlackState, HandshakeOutcome, HandshakeResponse,
+    HeartbeatAcknowledgementMessage, HeartbeatMessage, LineDecoder, ManualTransitionStatus,
+    OverlayStatus, ProtocolVersion, Role, RuntimeEventMessage, RuntimeLifecycleEvent,
+    ServerIdentity, SnapshotMessage, SnapshotReason, WireInputId, WireMessage, encode_line,
 };
 use fm_types::ProjectId;
 use freemix_studio::{
@@ -579,34 +579,12 @@ fn assert_diagnose_success(output: Result<Output, String>) {
     );
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "liveness=ok sequence=1 received_at_ms=1234\n"
+        "liveness=ok sequence=1 received_at_ms=1234\ndiagnostics=v1 engine_id=engine-studio state_epoch=3 revision=5 retained_oldest=4 retained_newest=5 subscribers=1/8 retained_limit=64 subscriber_queue=16\n"
     );
 }
 
 #[test]
-fn diagnose_reports_validated_heartbeat() {
-    let (address, server_thread) = spawn_server(|listener| {
-        let deadline = Instant::now() + CONNECT_TIMEOUT;
-        let mut peer = Peer::accept_until(&listener, deadline);
-        let heartbeat = receive_diagnose_heartbeat(&mut peer, deadline);
-        peer.send_until(
-            &WireMessage::HeartbeatAcknowledgement(HeartbeatAcknowledgementMessage {
-                server: heartbeat.server,
-                heartbeat_sequence: heartbeat.sequence,
-                received_at_ms: 1_234,
-            }),
-            deadline,
-        );
-    });
-
-    let output = run_diagnose(address);
-    let server = server_thread.join();
-    assert!(server.is_ok(), "Studio diagnostic server failed");
-    assert_diagnose_success(output);
-}
-
-#[test]
-fn diagnose_ignores_state_event_before_heartbeat() {
+fn diagnose_reports_validated_heartbeat_and_control_diagnostics() {
     let (address, server_thread) = spawn_server(|listener| {
         let deadline = Instant::now() + CONNECT_TIMEOUT;
         let mut peer = Peer::accept_until(&listener, deadline);
@@ -617,6 +595,32 @@ fn diagnose_ignores_state_event_before_heartbeat() {
                 server: heartbeat.server,
                 heartbeat_sequence: heartbeat.sequence,
                 received_at_ms: 1_234,
+            }),
+            deadline,
+        );
+        let WireMessage::DiagnosticsRequest(request) = peer.receive_until(deadline) else {
+            panic!("expected diagnostics request");
+        };
+        assert!(!request.request_id.is_empty());
+        assert!(request.request_id.len() <= 128);
+        assert!(
+            request
+                .request_id
+                .bytes()
+                .all(|byte| byte.is_ascii_graphic())
+        );
+        peer.send_until(
+            &WireMessage::DiagnosticsResponse(DiagnosticsResponse {
+                protocol: CURRENT_PROTOCOL_VERSION,
+                request_id: request.request_id,
+                engine: engine(),
+                current_revision: 5,
+                oldest_retained_revision: Some(4),
+                newest_retained_revision: Some(5),
+                subscriber_count: 1,
+                retained_events_limit: 64,
+                subscriber_limit: 8,
+                subscriber_queue_limit: 16,
             }),
             deadline,
         );

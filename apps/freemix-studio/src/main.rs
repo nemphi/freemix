@@ -5,6 +5,7 @@ use std::{
 };
 
 use fm_client::{Intake, SessionEvent};
+use fm_protocol::DiagnosticsResponse;
 use freemix_studio::{Command, HELP, StudioRuntime, launch_native, parse_args};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -64,6 +65,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             "liveness=ok sequence={} received_at_ms={}",
                             acknowledgement.heartbeat_sequence, acknowledgement.received_at_ms
                         );
+                        let request_id = format!(
+                            "studio-diagnostics-{}-{}",
+                            std::process::id(),
+                            SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .map_err(diagnostic_failure)?
+                                .as_nanos()
+                        );
+                        let SessionEvent::DiagnosticsResponse { response } = runtime
+                            .send_diagnostics_cancellable(
+                                request_id,
+                                DIAGNOSE_POLL_INTERVAL,
+                                || Instant::now() >= deadline,
+                            )
+                            .map_err(diagnostic_failure)?
+                        else {
+                            return Err(diagnostic_failure("unexpected diagnostics event").into());
+                        };
+                        println_diagnostics(&response);
                         break;
                     }
                     SessionEvent::Event {
@@ -86,6 +106,40 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+fn println_diagnostics(response: &DiagnosticsResponse) {
+    println!(
+        "diagnostics=v1 engine_id={} state_epoch={} revision={} retained_oldest={} retained_newest={} subscribers={}/{} retained_limit={} subscriber_queue={}",
+        sanitize_identity(&response.engine.engine_id),
+        response.engine.state_epoch,
+        response.current_revision,
+        optional_number(response.oldest_retained_revision),
+        optional_number(response.newest_retained_revision),
+        response.subscriber_count,
+        response.subscriber_limit,
+        response.retained_events_limit,
+        response.subscriber_queue_limit,
+    );
+}
+
+fn optional_number(value: Option<u64>) -> String {
+    value.map_or_else(|| "none".to_owned(), |value| value.to_string())
+}
+
+fn sanitize_identity(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .filter(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
+        .take(96)
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "unknown".to_owned()
+    } else {
+        sanitized
+    }
 }
 
 fn diagnostic_failure(error: impl std::fmt::Display) -> io::Error {

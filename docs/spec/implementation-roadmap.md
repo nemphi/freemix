@@ -82,7 +82,8 @@ newline-terminated records up to 64 KiB.
 While the CLI waits for a command, it applies valid peer events but still
 requires the accepted revision's durable event and realized runtime event.
 Studio diagnose checks one bounded raw-TCP heartbeat acknowledgement and keeps
-waiting when validated durable or runtime state arrives first.
+waiting when validated durable or runtime state arrives first, then reports
+validated point-in-time control diagnostics. RC-015 remains planned.
 The default simulated daemon cooperatively stops after Unix SIGINT/SIGTERM or Windows Ctrl-C through bounded listener polling.
 Simulated CLI PPM output uses same-directory write/sync/replace, not broader media or disk certification.
 Local CLI loads reject unapplied journal batches without recovering or mutating journal state; torn-final-only state remains readable.

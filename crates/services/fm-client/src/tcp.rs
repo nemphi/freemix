@@ -5,9 +5,9 @@ use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
 use fm_protocol::{
-    CodecError, CommandPayload, CommandResult, DurableGap, ErrorMessage, EventMessage,
-    HandshakeOutcome, HeartbeatAcknowledgementMessage, LineDecoder, RuntimeEventMessage,
-    WireMessage, encode_line,
+    CURRENT_PROTOCOL_VERSION, CodecError, CommandPayload, CommandResult, DiagnosticsRequest,
+    DiagnosticsResponse, DurableGap, ErrorMessage, EventMessage, HandshakeOutcome,
+    HeartbeatAcknowledgementMessage, LineDecoder, RuntimeEventMessage, WireMessage, encode_line,
 };
 
 use crate::{Client, ClientError, Intake, Outbound, ReconnectBackoff, SyncMode};
@@ -351,6 +351,9 @@ pub enum SessionEvent {
     HeartbeatAcknowledged {
         acknowledgement: HeartbeatAcknowledgementMessage,
     },
+    DiagnosticsResponse {
+        response: DiagnosticsResponse,
+    },
     DurableGap {
         gap: DurableGap,
     },
@@ -435,6 +438,7 @@ pub struct TcpSession {
     client: Client,
     connection: Option<TcpConnection>,
     sent_commands: VecDeque<String>,
+    pending_diagnostics: Option<String>,
 }
 
 impl TcpSession {
@@ -444,6 +448,7 @@ impl TcpSession {
             client,
             connection: None,
             sent_commands: VecDeque::new(),
+            pending_diagnostics: None,
         }
     }
 
@@ -721,6 +726,85 @@ impl TcpSession {
         self.handle_received(message)
     }
 
+    /// Sends one diagnostics request and waits for its matching response.
+    /// Valid durable and runtime events may arrive while waiting.
+    pub fn send_diagnostics_cancellable(
+        &mut self,
+        request_id: impl Into<String>,
+        poll_interval: Duration,
+        mut cancelled: impl FnMut() -> bool,
+    ) -> Result<SessionEvent, TcpSessionError> {
+        if self.connection.is_none() {
+            return Err(TcpSessionError::NotConnected);
+        }
+        if self.pending_diagnostics.is_some() {
+            return Err(TcpSessionError::UnexpectedMessage);
+        }
+        let request_id = request_id.into();
+        if request_id.is_empty()
+            || request_id.len() > 128
+            || !request_id.bytes().all(|byte| byte.is_ascii_graphic())
+        {
+            return Err(TcpSessionError::Client(ClientError::InvalidConfig(
+                "diagnostics request ID must be 1-128 ASCII graphic bytes",
+            )));
+        }
+        self.pending_diagnostics = Some(request_id.clone());
+        let mut wait = PollCancellation {
+            interval: poll_interval,
+            cancelled: &mut cancelled,
+        };
+        let result = (|| {
+            self.send_wire_wait(
+                &WireMessage::DiagnosticsRequest(DiagnosticsRequest {
+                    protocol: CURRENT_PROTOCOL_VERSION,
+                    request_id: request_id.clone(),
+                }),
+                Some(&mut wait),
+            )?;
+            self.flush_wire_wait(Some(&mut wait))?;
+            loop {
+                let Some(message) = self.read_wire_wait(Some(&mut wait))? else {
+                    return Err(self.disconnected(DisconnectCause::Eof));
+                };
+                match message {
+                    WireMessage::DiagnosticsResponse(response) => {
+                        if response.protocol != CURRENT_PROTOCOL_VERSION
+                            || response.request_id != request_id
+                            || self.client.session().is_none_or(|session| {
+                                response.engine.engine_id != session.server.engine_id
+                                    || response.engine.state_epoch != session.server.state_epoch
+                                    || response.engine.log_id != session.server.log_id
+                            })
+                        {
+                            self.transition_disconnect();
+                            return Err(TcpSessionError::UnexpectedMessage);
+                        }
+                        return Ok(SessionEvent::DiagnosticsResponse { response });
+                    }
+                    WireMessage::Event(event) => {
+                        let intake = self.intake(WireMessage::Event(event.clone()))?;
+                        if intake != Intake::EventApplied {
+                            return Err(TcpSessionError::UnexpectedMessage);
+                        }
+                    }
+                    WireMessage::RuntimeEvent(event) => {
+                        let intake = self.intake(WireMessage::RuntimeEvent(event.clone()))?;
+                        if intake != Intake::RuntimeEventObserved {
+                            return Err(TcpSessionError::UnexpectedMessage);
+                        }
+                    }
+                    _ => {
+                        self.transition_disconnect();
+                        return Err(TcpSessionError::UnexpectedMessage);
+                    }
+                }
+            }
+        })();
+        self.pending_diagnostics = None;
+        result
+    }
+
     fn handle_received(
         &mut self,
         message: Option<WireMessage>,
@@ -978,6 +1062,7 @@ impl TcpSession {
     }
 
     fn transition_disconnect(&mut self) -> ReconnectBackoff {
+        self.pending_diagnostics = None;
         self.connection.take();
         self.client.transport_disconnected()
     }
