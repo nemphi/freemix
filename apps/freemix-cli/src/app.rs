@@ -1748,6 +1748,7 @@ Usage:
   freemix-cli status <show.freemix>
   freemix-cli audio-strip <show.freemix> <input> <gain-millidb:-96000..=24000> <balance-bp:-10000..=10000> <muted:on|off> <soloed:on|off> <follow-video:on|off> <delay-samples:0..=48000>
   freemix-cli rename <show.freemix> <input> <name> [--key <key>] [--expect <revision>]
+  freemix-cli input-reorder <show.freemix> <input> [<input>...] [--key <key>] [--expect <revision>]
   freemix-cli preview <show.freemix> <input> [--key <key>] [--expect <revision>]
   freemix-cli cut <show.freemix> [--key <key>] [--expect <revision>]
   freemix-cli fade <show.freemix> <frames> [--key <key>] [--expect <revision>]
@@ -1775,6 +1776,7 @@ Usage:
   freemix-cli remote-diagnostics <127.0.0.1:port>
   freemix-cli remote-audio-strip <127.0.0.1:port> <input> <gain-millidb:-96000..=24000> <balance-bp:-10000..=10000> <muted:on|off> <soloed:on|off> <follow-video:on|off> <delay-samples:0..=48000> [--key <key>] [--expect <revision>]
   freemix-cli remote-rename <127.0.0.1:port> <input> <name> [--key <key>] [--expect <revision>]
+  freemix-cli remote-input-reorder <127.0.0.1:port> <input> [<input>...] [--key <key>] [--expect <revision>]
   freemix-cli remote-preview <127.0.0.1:port> <input> [--key <key>] [--expect <revision>]
   freemix-cli remote-cut <127.0.0.1:port> [--key <key>] [--expect <revision>]
   freemix-cli remote-fade <127.0.0.1:port> <frames> [--key <key>] [--expect <revision>]
