@@ -19,10 +19,12 @@ use fm_protocol::{
     OverlayTransitionKind, WireInputId, WireMessage,
 };
 use fm_ui_egui::{
-    InputAudioStripUpdate, StudioConnectionStatus, StudioIntent, StudioShell, StudioUiState,
+    ExternalStudioAction, InputAudioStripUpdate, StudioConnectionStatus, StudioIntent, StudioShell,
+    StudioUiState, external_intent,
 };
 use fm_ui_model::ClientView;
 
+use crate::osc::{OscAction, OscReceiver};
 use crate::{LifecycleState, StudioConfig, StudioRuntime};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -188,6 +190,8 @@ struct StudioApp {
     updates: Option<StateUpdates>,
     worker: Option<JoinHandle<()>>,
     shutdown_sent: bool,
+    osc: Option<OscReceiver>,
+    osc_rejected: u64,
 }
 
 impl StudioApp {
@@ -195,6 +199,7 @@ impl StudioApp {
         config: StudioConfig,
         creation_context: &eframe::CreationContext<'_>,
     ) -> Result<Self, std::io::Error> {
+        let osc = config.osc_listen.map(OscReceiver::bind).transpose()?;
         let (request_sender, request_receiver) = sync_channel(REQUEST_CAPACITY);
         let repaint_context = creation_context.egui_ctx.clone();
         let (publisher, updates) = state_mailbox(repaint_context);
@@ -211,6 +216,8 @@ impl StudioApp {
             updates: Some(updates),
             worker: Some(worker),
             shutdown_sent: false,
+            osc,
+            osc_rejected: 0,
         })
     }
 
@@ -258,6 +265,50 @@ impl StudioApp {
             self.shutdown_sent = true;
         }
     }
+
+    fn drain_osc(&mut self) {
+        let mut actions = Vec::with_capacity(8);
+        if let Some(osc) = &self.osc {
+            for _ in 0..8 {
+                match osc.try_recv() {
+                    Ok(action) => actions.push(action),
+                    Err(
+                        std::sync::mpsc::TryRecvError::Empty
+                        | std::sync::mpsc::TryRecvError::Disconnected,
+                    ) => break,
+                }
+            }
+        }
+        for action in actions {
+            let action = match action {
+                OscAction::SelectPreview(number) => ExternalStudioAction::SelectPreview(number),
+                OscAction::Cut => ExternalStudioAction::Cut,
+                OscAction::Fade => ExternalStudioAction::Fade,
+                OscAction::FadeToBlack { active } => ExternalStudioAction::FadeToBlack { active },
+            };
+            let intent = external_intent(
+                &self.state,
+                action,
+                self.shell.transition_duration_frames(),
+                self.shell.fade_to_black_duration_frames(),
+            );
+            if let Some(intent) = intent {
+                self.enqueue_intent(intent);
+            } else {
+                self.osc_rejected = self.osc_rejected.saturating_add(1);
+            }
+        }
+        if let Some(osc) = &self.osc {
+            let counters = osc.counters();
+            let rejected = counters.rejected.saturating_add(self.osc_rejected);
+            if counters.malformed > 0 || rejected > 0 || counters.overflow > 0 {
+                self.state.notice = Some(format!(
+                    "OSC malformed={} rejected={} overflow={}",
+                    counters.malformed, rejected, counters.overflow
+                ));
+            }
+        }
+    }
 }
 
 impl eframe::App for StudioApp {
@@ -267,6 +318,7 @@ impl eframe::App for StudioApp {
                 self.state = state;
             }
         }
+        self.drain_osc();
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -278,6 +330,9 @@ impl eframe::App for StudioApp {
 
     fn on_exit(&mut self) {
         self.send_shutdown();
+        if let Some(osc) = self.osc.take() {
+            let _ = osc.shutdown();
+        }
     }
 }
 
@@ -285,6 +340,9 @@ impl Drop for StudioApp {
     fn drop(&mut self) {
         self.send_shutdown();
         self.requests.take();
+        if let Some(osc) = self.osc.take() {
+            let _ = osc.shutdown();
+        }
         self.updates.take();
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
@@ -1589,8 +1647,9 @@ fn publish_recovery_runtime(
 mod tests {
     use std::{
         io::{BufRead, BufReader, Write},
-        net::{TcpListener, TcpStream},
+        net::{TcpListener, TcpStream, UdpSocket},
         sync::mpsc::sync_channel,
+        thread::sleep,
     };
 
     use core::num::NonZeroU128;
@@ -2107,6 +2166,127 @@ mod tests {
 
     fn assert_overlay_payload(view: &ClientView, intent: StudioIntent, expected: CommandPayload) {
         assert_eq!(intent_payload(intent, Some(view)), Ok(expected));
+    }
+
+    #[test]
+    fn osc_ingress_obeys_limits_gates_and_worker_order() {
+        let address = UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let receiver = OscReceiver::bind(address).unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        for _ in 0..16 {
+            sender
+                .send_to(
+                    &osc_message(&format!("/freemix/switcher/preview/{}", 1)),
+                    receiver.local_addr(),
+                )
+                .unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while receiver.counters().overflow == 0 && Instant::now() < deadline {
+            sleep(Duration::from_millis(5));
+        }
+        let mut first_frame = Vec::new();
+        for _ in 0..8 {
+            if let Ok(action) = receiver.try_recv() {
+                first_frame.push(action);
+            }
+        }
+        assert_eq!(first_frame.len(), 8);
+        assert_eq!(receiver.counters().overflow, 0);
+        let mut second_frame = Vec::new();
+        for _ in 0..8 {
+            if let Ok(action) = receiver.try_recv() {
+                second_frame.push(action);
+            }
+        }
+        assert_eq!(second_frame.len(), 8);
+
+        let project = ProjectId::new(NonZeroU128::new(7).unwrap());
+        let mut model = ClientModel::new(project);
+        model
+            .install_snapshot(ProjectSnapshot::from_protocol(
+                project,
+                heartbeat_snapshot(),
+            ))
+            .unwrap();
+        let view = model.view().unwrap();
+        let ready = StudioUiState::new(StudioConnectionStatus::Ready)
+            .with_view(view.clone())
+            .with_switcher_permissions(true, true);
+        assert_eq!(
+            external_intent(&ready, ExternalStudioAction::SelectPreview(1), 42, 84),
+            Some(StudioIntent::SelectPreview(view.inputs[0]))
+        );
+        assert_eq!(
+            external_intent(
+                &ready,
+                ExternalStudioAction::FadeToBlack { active: true },
+                42,
+                84
+            ),
+            Some(StudioIntent::FadeToBlack {
+                active: true,
+                duration_frames: 84
+            })
+        );
+        let mut manual = ready.clone();
+        manual
+            .view
+            .as_mut()
+            .unwrap()
+            .switcher
+            .desired_manual_transition =
+            fm_ui_model::ManualTransitionStatus::Active(fm_ui_model::ActiveManualTransition {
+                kind: fm_protocol::ManualTransitionKind::Fade,
+                from: view.switcher.desired.preview,
+                to: view.switcher.desired.program,
+                interval_start: ManualTransitionPosition::START,
+                position: ManualTransitionPosition::START,
+            });
+        assert!(external_intent(&manual, ExternalStudioAction::Cut, 42, 84).is_none());
+        let denied = StudioUiState::new(StudioConnectionStatus::Synchronizing)
+            .with_view(view)
+            .with_switcher_permissions(true, true);
+        assert!(external_intent(&denied, ExternalStudioAction::Cut, 42, 84).is_none());
+
+        let (tx, rx) = sync_channel(1);
+        tx.send(WorkerRequest::Intent(StudioIntent::Cut)).unwrap();
+        let mut pending = PendingIntents::new();
+        for action in first_frame.into_iter().chain(second_frame) {
+            let action = match action {
+                OscAction::SelectPreview(number) => ExternalStudioAction::SelectPreview(number),
+                _ => unreachable!(),
+            };
+            pending
+                .submit(&tx, external_intent(&ready, action, 42, 84).unwrap())
+                .unwrap();
+        }
+        assert_eq!(pending.intents.len(), 16);
+        assert_eq!(rx.try_recv(), Ok(WorkerRequest::Intent(StudioIntent::Cut)));
+        let mut order = Vec::new();
+        while order.len() < 16 {
+            pending.flush(&tx).unwrap();
+            if let Ok(WorkerRequest::Intent(intent)) = rx.try_recv() {
+                order.push(intent);
+            }
+        }
+        assert_eq!(order.len(), 16);
+        drop(receiver);
+    }
+
+    fn osc_message(address: &str) -> Vec<u8> {
+        let mut message = Vec::new();
+        for value in [address, ","] {
+            message.extend_from_slice(value.as_bytes());
+            message.push(0);
+            while !message.len().is_multiple_of(4) {
+                message.push(0);
+            }
+        }
+        message
     }
 
     #[test]

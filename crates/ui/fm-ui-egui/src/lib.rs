@@ -106,6 +106,15 @@ pub enum StudioIntent {
     CancelManualTransition,
 }
 
+/// External control actions accepted by native Studio ingress.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExternalStudioAction {
+    SelectPreview(u8),
+    Cut,
+    Fade,
+    FadeToBlack { active: bool },
+}
+
 /// Native studio connection lifecycle as presented to an operator.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum StudioConnectionStatus {
@@ -402,6 +411,49 @@ const fn preview_selection_available(gate: TransitionGate, can_select_preview: b
         && gate.has_view
         && can_select_preview
         && !gate.manual_transition_in_flight
+}
+
+/// Converts one external action using the latest replicated state and current operator gates.
+#[must_use]
+pub fn external_intent(
+    state: &StudioUiState,
+    action: ExternalStudioAction,
+    transition_duration_frames: u32,
+    fade_to_black_duration_frames: u32,
+) -> Option<StudioIntent> {
+    let gate = TransitionGate::from_state(state);
+    let transition = transition_availability(gate).basic();
+    match action {
+        ExternalStudioAction::SelectPreview(number) => state
+            .view
+            .as_ref()
+            .and_then(|view| view.inputs.get(usize::from(number.checked_sub(1)?)))
+            .copied()
+            .filter(|_| preview_selection_available(gate, state.can_select_preview))
+            .map(StudioIntent::SelectPreview),
+        ExternalStudioAction::Cut if transition => Some(StudioIntent::Cut),
+        ExternalStudioAction::Fade if transition => Some(StudioIntent::Fade {
+            duration_frames: transition_duration_frames,
+        }),
+        ExternalStudioAction::FadeToBlack { active } => {
+            let desired = state
+                .view
+                .as_ref()
+                .map(|view| view.switcher.desired_fade_to_black);
+            let availability =
+                fade_to_black_availability(FadeToBlackGate::from_state(state), desired);
+            let allowed = if active {
+                availability.to_black
+            } else {
+                availability.to_live
+            };
+            (allowed && !gate.manual_transition_in_flight).then_some(StudioIntent::FadeToBlack {
+                active,
+                duration_frames: fade_to_black_duration_frames,
+            })
+        }
+        _ => None,
+    }
 }
 
 const fn numbered_preview_index(key: Key) -> Option<usize> {

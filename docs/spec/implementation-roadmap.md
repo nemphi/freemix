@@ -455,8 +455,11 @@ Current implementation boundary for item 9: native Studio maps unmodified keys
 with the current transition duration, B to toggle FTB with its dedicated duration,
 and Escape to cancel a desired active manual T-bar, while its current Ready, view,
 permission, focus, non-repeat, modifier, and manual-control gates allow the action. This adds no binding editor,
-chords, scopes, persistence, MIDI/OSC/controller runtime, conflict handling, or
-shortcut acceptance evidence, so RC-004 remains planned.
+chords, scopes, persistence, MIDI/controller runtime, conflict handling, or
+shortcut acceptance evidence. When configured, native Studio also accepts the
+bounded loopback OSC action contract with the same current view, permission, and
+manual-transition gates; malformed, rejected, and overflow counts are visible to
+the operator. RC-004 remains planned.
 
 Current implementation boundary for item 6: the switcher and engine now own
 eight independently addressed overlay channels with a retained source, exact
