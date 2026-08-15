@@ -1158,7 +1158,7 @@ fn configure_stinger(path: &Path, config: StingerConfig) -> AppResult<()> {
 
 fn add_input(path: &Path, input: InputId, name: String) -> AppResult<()> {
     let store = ProjectStore::new(path)?;
-    let stored = store.load()?;
+    let stored = load_stored_project(path)?;
     let mut project = stored.project().clone();
     project.add_input(Input {
         id: input,
@@ -1816,6 +1816,7 @@ FreeMix deterministic MVP
 
 Usage:
   freemix-cli new <show.freemix> [--name <name>]
+  freemix-cli input-add <show.freemix> <nonzero-input-id> <name>
   freemix-cli status <show.freemix>
   freemix-cli audio-strip <show.freemix> <input> <gain-millidb:-96000..=24000> <balance-bp:-10000..=10000> <muted:on|off> <soloed:on|off> <follow-video:on|off> <delay-samples:0..=48000>
   freemix-cli rename <show.freemix> <input> <name> [--key <key>] [--expect <revision>]
