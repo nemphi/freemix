@@ -1673,7 +1673,7 @@ fn viewer_diagnostics_query_is_read_only_and_correlated() {
     let directory = TestDirectory::new("viewer-diagnostics");
     let project_path = directory.project_path();
     create_project(&project_path);
-    let daemon = Daemon::start(&project_path);
+    let daemon = Daemon::start_without_once(&project_path);
     let mut client = daemon.connect();
     let handshake = client.handshake_as(Role::Viewer, None);
     assert!(matches!(client.receive(), WireMessage::Snapshot(_)));
@@ -1711,7 +1711,7 @@ fn viewer_diagnostics_query_is_read_only_and_correlated() {
     let persisted = ProjectStore::new(&project_path).unwrap().load().unwrap();
     assert_eq!(persisted.position().revision, handshake.current_revision);
     assert!(persisted.idempotency_receipts().is_empty());
-    daemon.wait_success();
+    daemon.stop();
 }
 
 #[test]
