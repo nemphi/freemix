@@ -748,7 +748,7 @@ impl StudioShell {
             .view
             .as_ref()
             .map_or(&[] as &[InputId], |view| view.inputs.as_slice());
-        self.reconcile_rename_draft(state.view.as_ref());
+        self.reconcile_rename_draft(state);
         let manual_transition_controls = manual_transition_availability(
             ManualTransitionGate::from_state(state),
             state.view.as_ref().is_some_and(|view| {
@@ -1529,12 +1529,20 @@ fn stinger_button(
     .clicked()
 }
 
+fn project_editing_available(state: &StudioUiState) -> bool {
+    state.connection_status.controls_enabled() && state.can_edit_project && state.view.is_some()
+}
+
 impl StudioShell {
-    fn reconcile_rename_draft(&mut self, view: Option<&ClientView>) {
+    fn reconcile_rename_draft(&mut self, state: &StudioUiState) {
         let Some(draft) = &mut self.rename_draft else {
             return;
         };
-        let Some(view) = view else {
+        if !project_editing_available(state) {
+            self.rename_draft = None;
+            return;
+        }
+        let Some(view) = state.view.as_ref() else {
             self.rename_draft = None;
             return;
         };
@@ -1568,14 +1576,12 @@ impl StudioShell {
             TransitionGate::from_state(state),
             state.can_select_preview,
         );
-        let reorder_enabled = state.connection_status.controls_enabled()
-            && state.can_edit_project
-            && state.view.is_some();
+        let reorder_enabled = project_editing_available(state);
         ScrollArea::vertical()
             .id_salt("studio-input-bank")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                let Some(view) = state.view.clone() else {
+                let Some(view) = state.view.as_ref() else {
                     ui.label(RichText::new("INPUT STATE UNAVAILABLE").color(MUTED));
                     return;
                 };
