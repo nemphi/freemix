@@ -20,7 +20,7 @@ use fm_protocol::{
 };
 use fm_ui_egui::{
     ExternalStudioAction, InputAudioStripUpdate, StudioConnectionStatus, StudioIntent, StudioShell,
-    StudioUiState, external_intent,
+    StudioUiState, TerminalUncertaintyNotice, external_intent,
 };
 use fm_ui_model::ClientView;
 
@@ -480,12 +480,6 @@ struct WorkerRecovery {
     terminal_uncertainties: Vec<TerminalUncertaintyNotice>,
 }
 
-#[derive(Debug, Eq, PartialEq)]
-struct TerminalUncertaintyNotice {
-    command_id: String,
-    received_command_id: String,
-}
-
 impl WorkerRecovery {
     fn new(visible_error: Option<String>, reconnect_wait: Option<ReconnectWait>) -> Self {
         Self {
@@ -517,14 +511,26 @@ impl WorkerRecovery {
                 publisher,
                 &self.deferred_intents,
                 self.error(),
+                &self.terminal_uncertainties,
             );
         }
         if self.deferred_intents.len() == DEFERRED_INTENT_CAPACITY {
             self.deferred_rejections = self.deferred_rejections.saturating_add(1);
-            return publish_runtime(runtime, publisher, self.error());
+            return publish_runtime_with_uncertainties(
+                runtime,
+                publisher,
+                self.error(),
+                &self.terminal_uncertainties,
+            );
         }
         self.deferred_intents.push_back(intent);
-        publish_deferred_runtime(runtime, publisher, &self.deferred_intents, self.error())
+        publish_deferred_runtime(
+            runtime,
+            publisher,
+            &self.deferred_intents,
+            self.error(),
+            &self.terminal_uncertainties,
+        )
     }
 
     fn error(&self) -> Option<String> {
@@ -829,19 +835,33 @@ fn handle_worker_intent(
         ));
         return publish_recovery_runtime(runtime, publisher, recovery);
     }
-    let command_id = match begin_intent(runtime, intent, keys, publisher, recovery.error()) {
+    let command_id = match begin_intent(
+        runtime,
+        intent,
+        keys,
+        publisher,
+        recovery.error(),
+        &recovery.terminal_uncertainties,
+    ) {
         Ok(command_id) => command_id,
         Err(error) => {
             recovery.visible_error = Some(error);
-            return publish_runtime(runtime, publisher, recovery.error());
+            return publish_runtime_with_uncertainties(
+                runtime,
+                publisher,
+                recovery.error(),
+                &recovery.terminal_uncertainties,
+            );
         }
     };
     recovery.pending_command = Some(command_id.clone());
     let persistent_error = recovery.terminal_error();
+    let terminal_uncertainties = recovery.terminal_uncertainties.clone();
     let publication = CommandPublication {
         publisher,
         publish_updates: true,
         persistent_error: persistent_error.as_deref(),
+        terminal_uncertainties: &terminal_uncertainties,
     };
     let result = flush_worker(runtime, requests, recovery).and_then(|()| {
         consume_command_sequence(
@@ -989,10 +1009,12 @@ fn resume_pending_command(
             recovery.pending_command = None;
         } else {
             let persistent_error = recovery.terminal_error();
+            let terminal_uncertainties = recovery.terminal_uncertainties.clone();
             let publication = CommandPublication {
                 publisher,
                 publish_updates: !recovery.realization_uncertain,
                 persistent_error: persistent_error.as_deref(),
+                terminal_uncertainties: &terminal_uncertainties,
             };
             let result = consume_command_sequence(
                 runtime,
@@ -1104,7 +1126,12 @@ fn handle_heartbeat_timeout(
                     runtime.session().client().model().view().is_some();
                 recovery.reconnect_wait = ReconnectWait::from_runtime(runtime);
             }
-            if !publish_runtime(runtime, publisher, recovery.error()) {
+            if !publish_runtime_with_uncertainties(
+                runtime,
+                publisher,
+                recovery.error(),
+                &recovery.terminal_uncertainties,
+            ) {
                 return false;
             }
         }
@@ -1119,6 +1146,7 @@ fn begin_intent(
     keys: &mut IdempotencyKeys,
     publisher: &StatePublisher,
     persistent_error: Option<String>,
+    terminal_uncertainties: &[TerminalUncertaintyNotice],
 ) -> Result<String, String> {
     let view = runtime.session().client().model().view();
     let payload = intent_payload(intent, view.as_ref())?;
@@ -1134,7 +1162,12 @@ fn begin_intent(
         .map_err(|error| format!("Could not queue command: {error}"))?;
 
     // This publication exposes SelectPreview's optimistic desired state before I/O.
-    if !publish_runtime(runtime, publisher, persistent_error) {
+    if !publish_runtime_with_uncertainties(
+        runtime,
+        publisher,
+        persistent_error,
+        terminal_uncertainties,
+    ) {
         return Err("Studio UI disconnected".to_owned());
     }
     Ok(command.id)
@@ -1274,6 +1307,7 @@ struct CommandPublication<'a> {
     publisher: &'a StatePublisher,
     publish_updates: bool,
     persistent_error: Option<&'a str>,
+    terminal_uncertainties: &'a [TerminalUncertaintyNotice],
 }
 
 impl CommandPublication<'_> {
@@ -1283,13 +1317,14 @@ impl CommandPublication<'_> {
         deferred_rejections: usize,
     ) -> Result<(), WorkerFailure> {
         if self.publish_updates
-            && !publish_runtime(
+            && !publish_runtime_with_uncertainties(
                 runtime,
                 self.publisher,
                 combined_error(
                     self.persistent_error.map(str::to_owned),
                     deferred_rejections,
                 ),
+                self.terminal_uncertainties,
             )
         {
             Err(WorkerFailure::Fatal("Studio UI disconnected".to_owned()))
@@ -1300,13 +1335,14 @@ impl CommandPublication<'_> {
 
     fn rejection(self, runtime: &mut StudioRuntime, error: String, deferred_rejections: usize) {
         if self.publish_updates {
-            publish_runtime(
+            publish_runtime_with_uncertainties(
                 runtime,
                 self.publisher,
                 combined_error(
                     join_errors(Some(error), self.persistent_error.map(str::to_owned)),
                     deferred_rejections,
                 ),
+                self.terminal_uncertainties,
             );
         }
     }
@@ -1612,13 +1648,26 @@ fn publish_runtime(
     publisher.publish(runtime_state(runtime, error))
 }
 
+fn publish_runtime_with_uncertainties(
+    runtime: &mut StudioRuntime,
+    publisher: &StatePublisher,
+    error: Option<String>,
+    terminal_uncertainties: &[TerminalUncertaintyNotice],
+) -> bool {
+    let mut state = runtime_state(runtime, error);
+    state.terminal_uncertainties = terminal_uncertainties.to_vec();
+    publisher.publish(state)
+}
+
 fn publish_deferred_runtime(
     runtime: &mut StudioRuntime,
     publisher: &StatePublisher,
     deferred: &VecDeque<StudioIntent>,
     error: Option<String>,
+    terminal_uncertainties: &[TerminalUncertaintyNotice],
 ) -> bool {
     let mut state = runtime_state(runtime, error);
+    state.terminal_uncertainties = terminal_uncertainties.to_vec();
     state.notice = Some(format!(
         "Queued {} command(s) in operator FIFO",
         deferred.len()
@@ -1632,13 +1681,19 @@ fn publish_recovery_runtime(
     recovery: &WorkerRecovery,
 ) -> bool {
     if recovery.deferred_intents.is_empty() {
-        publish_runtime(runtime, publisher, recovery.error())
+        publish_runtime_with_uncertainties(
+            runtime,
+            publisher,
+            recovery.error(),
+            &recovery.terminal_uncertainties,
+        )
     } else {
         publish_deferred_runtime(
             runtime,
             publisher,
             &recovery.deferred_intents,
             recovery.error(),
+            &recovery.terminal_uncertainties,
         )
     }
 }

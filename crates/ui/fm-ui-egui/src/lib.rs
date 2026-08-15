@@ -166,6 +166,13 @@ impl StudioConnectionStatus {
 }
 
 /// Owned render input for one studio frame.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TerminalUncertaintyNotice {
+    pub command_id: String,
+    pub received_command_id: String,
+}
+
+/// Owned render input for one studio frame.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct StudioUiState {
     pub connection_status: StudioConnectionStatus,
@@ -177,6 +184,7 @@ pub struct StudioUiState {
     pub notice: Option<String>,
     pub external_notice: Option<String>,
     pub error: Option<String>,
+    pub terminal_uncertainties: Vec<TerminalUncertaintyNotice>,
 }
 
 impl StudioUiState {
@@ -193,6 +201,7 @@ impl StudioUiState {
             notice: None,
             external_notice: None,
             error: None,
+            terminal_uncertainties: Vec::new(),
         }
     }
 
@@ -1278,6 +1287,15 @@ fn draw_messages(ui: &mut Ui, state: &StudioUiState) {
     }
     if let Some(notice) = &state.external_notice {
         ui.label(RichText::new(format!("NOTICE | {notice}")).color(AMBER));
+    }
+    for uncertainty in &state.terminal_uncertainties {
+        ui.label(
+            RichText::new(format!(
+                "Command {} | Server receipt {}",
+                uncertainty.command_id, uncertainty.received_command_id
+            ))
+            .color(AMBER),
+        );
     }
 }
 
