@@ -55,11 +55,11 @@ use fm_persistence::{
 };
 use fm_protocol::{
     CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, CodecError, CommandMessage, CommandPayload,
-    CommandResult, ErrorMessage, EventCursor, EventMessage,
-    HandshakeOutcome as ProtocolHandshakeOutcome, HandshakeRequest, HandshakeResponse,
-    HeartbeatAcknowledgementMessage, HeartbeatMessage, LineDecoder, ProtocolVersion, ResumeCursor,
-    RuntimeEventMessage, ServerHello, ServerIdentity, StructuredError, WireMessage,
-    choose_handshake_outcome, encode_line,
+    CommandResult, DiagnosticsRequest, DiagnosticsResponse, ErrorMessage, EventCursor,
+    EventMessage, HandshakeOutcome as ProtocolHandshakeOutcome, HandshakeRequest,
+    HandshakeResponse, HeartbeatAcknowledgementMessage, HeartbeatMessage, LineDecoder,
+    ProtocolVersion, ResumeCursor, RuntimeEventMessage, ServerHello, ServerIdentity,
+    StructuredError, WireMessage, choose_handshake_outcome, encode_line,
 };
 use fm_server::{
     AuthenticationMode, ControlPlane, DisconnectReason, HandshakeError, Heartbeat, InitialSync,
@@ -3851,6 +3851,30 @@ fn handle_client(
                     )?,
                 }
             }
+            WireMessage::DiagnosticsRequest(request) => {
+                let encoded_bytes =
+                    encode_line(&WireMessage::DiagnosticsRequest(request.clone()))?.len();
+                if let Err(error) =
+                    session.admit_diagnostics(&request, encoded_bytes, now_millis()?)
+                {
+                    let current_revision = control.borrow().diagnostics().current_revision;
+                    write_session_message(
+                        &mut writer,
+                        &mut session,
+                        &WireMessage::Error(ErrorMessage {
+                            request_id: Some(request.request_id),
+                            current_revision: Some(current_revision),
+                            error: structured_session_error(&error),
+                        }),
+                    )?;
+                } else {
+                    write_session_message(
+                        &mut writer,
+                        &mut session,
+                        &WireMessage::DiagnosticsResponse(diagnostics_response(control, request)?),
+                    )?;
+                }
+            }
             _ => write_session_error(
                 &mut writer,
                 &mut session,
@@ -4960,6 +4984,42 @@ fn session_rejection(
         message: error.to_string(),
         fields: Vec::new(),
         current_revision,
+        retryable,
+    }
+}
+
+fn diagnostics_response(
+    control: &SharedControl,
+    request: DiagnosticsRequest,
+) -> AppResult<DiagnosticsResponse> {
+    let diagnostics = control.borrow().diagnostics();
+    Ok(DiagnosticsResponse {
+        protocol: request.protocol,
+        request_id: request.request_id,
+        engine: diagnostics.engine,
+        current_revision: diagnostics.current_revision,
+        oldest_retained_revision: diagnostics.oldest_retained_revision,
+        newest_retained_revision: diagnostics.newest_retained_revision,
+        subscriber_count: u32::try_from(diagnostics.subscriber_count)?,
+        retained_events_limit: u32::try_from(diagnostics.limits.retained_events)?,
+        subscriber_limit: u32::try_from(diagnostics.limits.max_subscribers)?,
+        subscriber_queue_limit: u32::try_from(diagnostics.limits.subscriber_queue)?,
+    })
+}
+
+fn structured_session_error(error: &SessionError) -> StructuredError {
+    let (code, retryable) = match error {
+        SessionError::Authorization(_) => ("permission_denied", false),
+        SessionError::ProtocolMismatch { .. } => ("protocol_mismatch", false),
+        SessionError::CommandTooLarge { .. }
+        | SessionError::InboundRateLimited
+        | SessionError::OutboundRateLimited => ("resource_exhausted", true),
+        _ => ("session_error", false),
+    };
+    StructuredError {
+        code: code.into(),
+        message: error.to_string(),
+        fields: Vec::new(),
         retryable,
     }
 }

@@ -68,7 +68,11 @@ saved, restarted, resumed, and tested deterministically.
 Current Phase 1 control boundary: the daemon, protocol, and client exercise a
 versioned raw TCP session with handshake, snapshot/resume, commands, events,
 development authentication, bounded bidirectional heartbeat acknowledgement,
-and deterministic model tests. Protocol 2.12 retains the protocol 2.10 rule
+and deterministic model tests. Protocol 2.13 adds one bounded, read-only
+control-plane diagnostics query, authorized by `ViewStatus`; it reports the
+point-in-time control diagnostics and does not mutate engine or durable state.
+It is not telemetry, health, or readiness, and RC-015 remains planned.
+Protocol 2.12 retains the protocol 2.10 rule
 that the daemon acknowledges only a validated heartbeat with the session server identity, the exact client
 heartbeat sequence, and the server receive time. Studio accepts one expected
 sequence and uses its bounded peer wait before the existing reconnect backoff.

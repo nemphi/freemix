@@ -24,11 +24,11 @@ use fm_persistence::{
 };
 use fm_protocol::{
     CURRENT_PROTOCOL_VERSION, ClientType, CommandMessage, CommandPayload, CommandResult,
-    EngineIdentity, EventCursor, HandshakeOutcome, HandshakeRequest, HeartbeatMessage,
-    ManualTransitionKind, ManualTransitionPosition, ManualTransitionStatus, ProtocolVersion,
-    ResumeCursor, Role, RuntimeLifecycleEvent, ServerIdentity, SnapshotReason, StingerAudioPolicy,
-    StingerMissingMediaFallback, WireInputId, WireMessage, WireStingerSlotId, decode_line,
-    encode_line,
+    DiagnosticsRequest, DiagnosticsResponse, EngineIdentity, EventCursor, HandshakeOutcome,
+    HandshakeRequest, HeartbeatMessage, ManualTransitionKind, ManualTransitionPosition,
+    ManualTransitionStatus, ProtocolVersion, ResumeCursor, Role, RuntimeLifecycleEvent,
+    ServerIdentity, SnapshotReason, StingerAudioPolicy, StingerMissingMediaFallback, WireInputId,
+    WireMessage, WireStingerSlotId, decode_line, encode_line,
 };
 use fm_types::{
     AudioFormat, BusId, ChannelLayout, ColorMetadata, FrameRate, InputId, OutputId, PixelFormat,
@@ -1665,6 +1665,52 @@ fn non_current_handshake_returns_protocol_mismatch() {
             if matches!(&response.outcome, HandshakeOutcome::Rejected { error } if error.code == "protocol_mismatch")
     ));
     drop(client);
+    daemon.wait_success();
+}
+
+#[test]
+fn viewer_diagnostics_query_is_read_only_and_correlated() {
+    let directory = TestDirectory::new("viewer-diagnostics");
+    let project_path = directory.project_path();
+    create_project(&project_path);
+    let daemon = Daemon::start(&project_path);
+    let mut client = daemon.connect();
+    let handshake = client.handshake_as(Role::Viewer, None);
+    assert!(matches!(client.receive(), WireMessage::Snapshot(_)));
+    client.send(&WireMessage::DiagnosticsRequest(DiagnosticsRequest {
+        protocol: CURRENT_PROTOCOL_VERSION,
+        request_id: "diagnostics-1".into(),
+    }));
+    let response = client.receive();
+    let WireMessage::DiagnosticsResponse(DiagnosticsResponse {
+        protocol,
+        request_id,
+        engine,
+        current_revision,
+        oldest_retained_revision,
+        newest_retained_revision,
+        subscriber_count,
+        retained_events_limit,
+        subscriber_limit,
+        subscriber_queue_limit,
+    }) = response
+    else {
+        panic!("expected diagnostics response");
+    };
+    assert_eq!(protocol, CURRENT_PROTOCOL_VERSION);
+    assert_eq!(request_id, "diagnostics-1");
+    assert_eq!(engine, handshake.engine);
+    assert_eq!(current_revision, handshake.current_revision);
+    assert_eq!(oldest_retained_revision, None);
+    assert_eq!(newest_retained_revision, None);
+    assert_eq!(subscriber_count, 1);
+    assert!(retained_events_limit > 0);
+    assert!(subscriber_limit > 0);
+    assert!(subscriber_queue_limit > 0);
+    drop(client);
+    let persisted = ProjectStore::new(&project_path).unwrap().load().unwrap();
+    assert_eq!(persisted.position().revision, handshake.current_revision);
+    assert!(persisted.idempotency_receipts().is_empty());
     daemon.wait_success();
 }
 

@@ -11,7 +11,7 @@ use fm_auth::Principal;
 use fm_control::{LiveEvent, Subscription};
 use fm_persistence::{ProjectStore, StoredProject};
 use fm_protocol::{
-    HandshakeOutcome as ProtocolHandshakeOutcome, HandshakeResponse,
+    ErrorMessage, HandshakeOutcome as ProtocolHandshakeOutcome, HandshakeResponse,
     HeartbeatAcknowledgementMessage, LineDecoder, ServerIdentity, StructuredError, WireMessage,
     encode_line,
 };
@@ -20,9 +20,10 @@ use fm_server::{Server, Session, SyncPayload};
 use super::{
     AppResult, CLIENT_READ_POLL_INTERVAL, CLIENT_WRITE_TIMEOUT, CommandDelivery, ControlHandle,
     DaemonShutdownReason, PendingWrite, ProcessShutdown, SharedControl, current_handshake,
-    error_message, execute_session_command, handshake_code, handshake_response,
-    is_client_session_termination, now_millis, reconciled_handshake_outcome, record_heartbeat,
-    rejected_handshake_response, server_identity, shutdown_message,
+    diagnostics_response, error_message, execute_session_command, handshake_code,
+    handshake_response, is_client_session_termination, now_millis, reconciled_handshake_outcome,
+    record_heartbeat, rejected_handshake_response, server_identity, shutdown_message,
+    structured_session_error,
 };
 
 const MAX_PEERS: usize = 2;
@@ -389,6 +390,30 @@ impl Runtime<'_> {
                     Err(message) => error_message("invalid_heartbeat", &message),
                 };
                 peer.queue(&message, Accounting::Session)?;
+                Ok(())
+            }
+            WireMessage::DiagnosticsRequest(request) => {
+                let encoded_bytes = encode_line(&WireMessage::DiagnosticsRequest(request.clone()))
+                    .map_err(|_| ())?
+                    .len();
+                let session = peer.session.as_mut().expect("active peers have sessions");
+                let response = match session.admit_diagnostics(
+                    &request,
+                    encoded_bytes,
+                    now_millis().map_err(|_| ())?,
+                ) {
+                    Ok(()) => WireMessage::DiagnosticsResponse(
+                        diagnostics_response(self.control, request).map_err(|_| ())?,
+                    ),
+                    Err(error) => WireMessage::Error(ErrorMessage {
+                        request_id: Some(request.request_id),
+                        current_revision: Some(
+                            self.control.borrow().diagnostics().current_revision,
+                        ),
+                        error: structured_session_error(&error),
+                    }),
+                };
+                peer.queue(&response, Accounting::Session)?;
                 Ok(())
             }
             _ => {

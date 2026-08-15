@@ -1,7 +1,10 @@
 use std::{collections::VecDeque, error::Error, fmt};
 
 use fm_auth::{AuthorizationDenial, CommandClass, Policy, Principal};
-use fm_protocol::{CommandMessage, CommandPayload, EngineIdentity, EventCursor, ProtocolVersion};
+use fm_protocol::{
+    CommandMessage, CommandPayload, DiagnosticsRequest, EngineIdentity, EventCursor,
+    ProtocolVersion,
+};
 
 use crate::{RateLimit, SessionLimits};
 
@@ -224,6 +227,38 @@ impl Session {
             .inbound_commands_admitted_total
             .saturating_add(1);
         self.accounting.inbound_commands_inflight += 1;
+        Ok(())
+    }
+
+    /// Authorizes and accounts for one read-only diagnostics query.
+    pub fn admit_diagnostics(
+        &mut self,
+        request: &DiagnosticsRequest,
+        encoded_bytes: usize,
+        now_ms: u64,
+    ) -> Result<(), SessionError> {
+        self.ensure_connected()?;
+        self.policy
+            .authorize(&self.principal, CommandClass::ViewStatus)?;
+        if request.protocol != self.protocol {
+            return Err(SessionError::ProtocolMismatch {
+                expected: self.protocol,
+                received: request.protocol,
+            });
+        }
+        if encoded_bytes > self.limits.max_command_bytes {
+            return Err(SessionError::CommandTooLarge {
+                size: encoded_bytes,
+                maximum: self.limits.max_command_bytes,
+            });
+        }
+        if !self
+            .inbound_window
+            .has_capacity(now_ms, self.limits.inbound_commands)
+        {
+            return Err(SessionError::InboundRateLimited);
+        }
+        self.inbound_window.record();
         Ok(())
     }
 
