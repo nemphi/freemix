@@ -14,9 +14,9 @@ use fm_client::{
     Outbound, SessionEvent, TcpSession,
 };
 use fm_model::{
-    AudioBus, Input, InputKind, Layer, LayerGeometry, MainMix, Output, Project, ProjectSettings,
-    RectMask, RestartPolicy, Rgba8, Rotation, Scene, SimulatedAudio, SimulatedInput,
-    SimulatedVideo, SolidColor, SourceRef, StartupPolicy,
+    AudioBus, Input, InputAudioStripState, InputGainMilliDb, InputKind, Layer, LayerGeometry,
+    MainMix, Output, Project, ProjectSettings, RectMask, RestartPolicy, Rgba8, Rotation, Scene,
+    SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef, StartupPolicy,
 };
 use fm_persistence::{
     ManualTransitionKind as PersistedManualTransitionKind, ProjectPosition, ProjectStore,
@@ -952,9 +952,24 @@ fn remote_input_rename_is_authorized_replicated_replay_safe_and_survives_restart
             .project()
             .input_audio_strips()
             .iter()
-            .map(|strip| strip.input)
-            .collect::<Vec<_>>(),
-        vec![domain_input(2), domain_input(1)]
+            .find(|strip| strip.input == domain_input(1))
+            .unwrap()
+            .state
+            .gain
+            .get(),
+        -1_000
+    );
+    assert_eq!(
+        persisted
+            .project()
+            .input_audio_strips()
+            .iter()
+            .find(|strip| strip.input == domain_input(2))
+            .unwrap()
+            .state
+            .gain
+            .get(),
+        -2_000
     );
 
     let daemon = Daemon::start(&project_path);
@@ -1815,6 +1830,20 @@ fn create_rename_project(path: &Path) {
             required_capabilities: Vec::new(),
         });
     }
+    assert!(project.set_input_audio_strip(
+        domain_input(1),
+        InputAudioStripState {
+            gain: InputGainMilliDb::new(-1_000).unwrap(),
+            ..InputAudioStripState::default()
+        }
+    ));
+    assert!(project.set_input_audio_strip(
+        domain_input(2),
+        InputAudioStripState {
+            gain: InputGainMilliDb::new(-2_000).unwrap(),
+            ..InputAudioStripState::default()
+        }
+    ));
     project.set_main_mix(MainMix::new(domain_input(1), domain_input(2)));
     let stored = StoredProject::from_project(
         project,

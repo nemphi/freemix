@@ -1048,6 +1048,7 @@ fn save_engine(path: &Path, project_engine: &ProjectEngine) -> AppResult<()> {
     let realized = snapshot.realized_switcher();
     let mut project = project_engine.project.clone();
     project.set_main_mix(MainMix::new(desired.program(), desired.preview()));
+    project.reorder_inputs(snapshot.show().inputs().to_vec())?;
     sync_input_names(&mut project, snapshot.show())?;
     sync_input_audio_strips(&mut project, snapshot.show())?;
     let stored = StoredProject::from_project_with_complete_runtime_state(
