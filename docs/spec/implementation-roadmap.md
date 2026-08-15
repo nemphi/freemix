@@ -486,7 +486,8 @@ references, and output inclusion uniqueness. CLI local and remote commands
 cover Take, Update, Off, inclusion, Queue, Take Next, and Cut/Fade/appearance
 configuration; status prints both desired and realized arrays with opacity,
 transition, appearance, and queue state. Web exposes transport-free semantic
-controls, and Studio exposes Take Preview, Queue Preview, Take Next, Off, and
+controls, and Studio exposes Take Preview, Update Preview on active channels,
+Queue Preview, Take Next, Off, and
 per-channel Cut/Fade/position/border controls and displays desired and
 last-confirmed realized source, activity, opacity, queue, and appearance
 summaries for all eight channels; this is not output-video evidence. Queued

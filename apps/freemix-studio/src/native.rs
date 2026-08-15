@@ -1478,6 +1478,10 @@ fn intent_payload(
             channel,
             source: WireInputId::from_domain(source),
         },
+        StudioIntent::UpdateOverlay { channel, source } => CommandPayload::UpdateOverlay {
+            channel,
+            source: WireInputId::from_domain(source),
+        },
         StudioIntent::OverlayOff { channel } => CommandPayload::OverlayOff { channel },
         StudioIntent::ToggleOverlayTransition {
             channel,
@@ -2412,6 +2416,23 @@ mod tests {
             .install_snapshot(ProjectSnapshot::from_protocol(project, snapshot))
             .unwrap();
         let confirmed = model.view().unwrap();
+        let preview = confirmed.switcher.desired.preview;
+        apply_overlay_change(&mut model, &confirmed, |overlay| {
+            overlay.active = true;
+            overlay.source = Some(preview);
+        });
+        let confirmed = model.view().unwrap();
+        assert_overlay_payload(
+            &confirmed,
+            StudioIntent::UpdateOverlay {
+                channel,
+                source: confirmed.switcher.desired.preview,
+            },
+            CommandPayload::UpdateOverlay {
+                channel,
+                source: WireInputId::from_domain(confirmed.switcher.desired.preview),
+            },
+        );
         assert_overlay_payload(
             &confirmed,
             StudioIntent::ToggleOverlayTransition {

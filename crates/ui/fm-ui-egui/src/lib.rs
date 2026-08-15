@@ -72,6 +72,11 @@ pub enum StudioIntent {
         channel: WireOverlayChannelId,
         source: InputId,
     },
+    /// Updates the source on one active independent overlay channel.
+    UpdateOverlay {
+        channel: WireOverlayChannelId,
+        source: InputId,
+    },
     /// Removes one overlay channel from Program.
     OverlayOff { channel: WireOverlayChannelId },
     /// Toggles one overlay channel between Cut and Fade.
@@ -907,6 +912,17 @@ fn draw_overlay_channel(
                 && let Some(source) = source
             {
                 intents.push(StudioIntent::TakeOverlay { channel, source });
+            }
+            if ui
+                .add_enabled(
+                    enabled && desired.is_some_and(|overlay| overlay.active) && source.is_some(),
+                    Button::new(RichText::new(format!("O{channel_number} UPDATE")).strong()),
+                )
+                .on_hover_text("Update this active overlay channel from the current Preview source")
+                .clicked()
+                && let Some(source) = source
+            {
+                intents.push(StudioIntent::UpdateOverlay { channel, source });
             }
             if ui
                 .add_enabled(
