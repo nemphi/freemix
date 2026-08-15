@@ -2221,7 +2221,7 @@ mod tests {
         assert_eq!(
             manual_transition_availability(available, true),
             ManualTransitionAvailability {
-                start: false,
+                start: true,
                 alpha_fade_start_exposed: true,
                 active_controls: true,
             }
