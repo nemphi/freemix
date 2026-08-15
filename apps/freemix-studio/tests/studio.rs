@@ -185,6 +185,7 @@ fn existing_config(address: SocketAddr, expected_project_id: ProjectId) -> Studi
         client_id: "studio-test".to_owned(),
         desired_role: Role::Operator,
         restart_policy: RestartPolicy::default(),
+        osc_listen: None,
     }
 }
 
