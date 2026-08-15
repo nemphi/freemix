@@ -136,6 +136,10 @@ pub enum ExternalStudioAction {
     SelectPreview(u8),
     Cut,
     Fade,
+    AlphaFade,
+    Slide,
+    Zoom,
+    Wipe,
     FadeToBlack { active: bool },
     CommitManualTransition,
     CancelManualTransition,
@@ -479,6 +483,18 @@ pub fn external_intent(
             .map(StudioIntent::SelectPreview),
         ExternalStudioAction::Cut if transition => Some(StudioIntent::Cut),
         ExternalStudioAction::Fade if transition => Some(StudioIntent::Fade {
+            duration_frames: transition_duration_frames,
+        }),
+        ExternalStudioAction::AlphaFade if transition => Some(StudioIntent::AlphaFade {
+            duration_frames: transition_duration_frames,
+        }),
+        ExternalStudioAction::Slide if transition => Some(StudioIntent::Slide {
+            duration_frames: transition_duration_frames,
+        }),
+        ExternalStudioAction::Zoom if transition => Some(StudioIntent::Zoom {
+            duration_frames: transition_duration_frames,
+        }),
+        ExternalStudioAction::Wipe if transition => Some(StudioIntent::Wipe {
             duration_frames: transition_duration_frames,
         }),
         ExternalStudioAction::FadeToBlack { active } => {

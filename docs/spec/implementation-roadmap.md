@@ -478,7 +478,8 @@ permission, focus, non-repeat, modifier, and manual-control gates allow the acti
 chords, scopes, persistence, MIDI/controller runtime, conflict handling, or
 shortcut acceptance evidence. When configured, native Studio also accepts the
 bounded loopback OSC action contract, including zero-argument manual commit and
-cancel, with the same current view, permission, and manual-transition gates;
+cancel and automatic AlphaFade, Slide, Zoom, and Wipe actions, with the same
+current view, permission, and manual-transition gates;
 malformed, rejected, and overflow counts are visible to
 the operator. RC-004 remains planned.
 

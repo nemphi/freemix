@@ -20,6 +20,10 @@ pub(crate) enum OscAction {
     SelectPreview(u8),
     Cut,
     Fade,
+    AlphaFade,
+    Slide,
+    Zoom,
+    Wipe,
     FadeToBlack { active: bool },
     CommitManualTransition,
     CancelManualTransition,
@@ -183,6 +187,10 @@ fn decode(datagram: &[u8]) -> Result<OscAction, ()> {
     match address {
         "/freemix/switcher/cut" => Ok(OscAction::Cut),
         "/freemix/switcher/fade" => Ok(OscAction::Fade),
+        "/freemix/switcher/alpha-fade" => Ok(OscAction::AlphaFade),
+        "/freemix/switcher/slide" => Ok(OscAction::Slide),
+        "/freemix/switcher/zoom" => Ok(OscAction::Zoom),
+        "/freemix/switcher/wipe" => Ok(OscAction::Wipe),
         "/freemix/switcher/ftb/live" => Ok(OscAction::FadeToBlack { active: false }),
         "/freemix/switcher/ftb/black" => Ok(OscAction::FadeToBlack { active: true }),
         "/freemix/switcher/manual/commit" => Ok(OscAction::CommitManualTransition),
@@ -220,6 +228,10 @@ mod tests {
         let cases = [
             ("/freemix/switcher/cut", OscAction::Cut),
             ("/freemix/switcher/fade", OscAction::Fade),
+            ("/freemix/switcher/alpha-fade", OscAction::AlphaFade),
+            ("/freemix/switcher/slide", OscAction::Slide),
+            ("/freemix/switcher/zoom", OscAction::Zoom),
+            ("/freemix/switcher/wipe", OscAction::Wipe),
             (
                 "/freemix/switcher/ftb/live",
                 OscAction::FadeToBlack { active: false },

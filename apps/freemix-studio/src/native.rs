@@ -278,6 +278,10 @@ impl StudioApp {
                 OscAction::SelectPreview(number) => ExternalStudioAction::SelectPreview(number),
                 OscAction::Cut => ExternalStudioAction::Cut,
                 OscAction::Fade => ExternalStudioAction::Fade,
+                OscAction::AlphaFade => ExternalStudioAction::AlphaFade,
+                OscAction::Slide => ExternalStudioAction::Slide,
+                OscAction::Zoom => ExternalStudioAction::Zoom,
+                OscAction::Wipe => ExternalStudioAction::Wipe,
                 OscAction::FadeToBlack { active } => ExternalStudioAction::FadeToBlack { active },
                 OscAction::CommitManualTransition => ExternalStudioAction::CommitManualTransition,
                 OscAction::CancelManualTransition => ExternalStudioAction::CancelManualTransition,
@@ -2492,6 +2496,34 @@ mod tests {
                 duration_frames: 42
             })
         );
+        for (action, intent) in [
+            (
+                ExternalStudioAction::AlphaFade,
+                StudioIntent::AlphaFade {
+                    duration_frames: 42,
+                },
+            ),
+            (
+                ExternalStudioAction::Slide,
+                StudioIntent::Slide {
+                    duration_frames: 42,
+                },
+            ),
+            (
+                ExternalStudioAction::Zoom,
+                StudioIntent::Zoom {
+                    duration_frames: 42,
+                },
+            ),
+            (
+                ExternalStudioAction::Wipe,
+                StudioIntent::Wipe {
+                    duration_frames: 42,
+                },
+            ),
+        ] {
+            assert_eq!(external_intent(&ready, action, 42, 84), Some(intent));
+        }
         let mut manual = ready.clone();
         let active_manual_transition = fm_ui_model::ActiveManualTransition {
             kind: fm_protocol::ManualTransitionKind::Fade,
