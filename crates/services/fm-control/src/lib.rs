@@ -27,7 +27,7 @@ use fm_protocol::{
     CommandMessage, CommandPayload, CommandResult, EngineIdentity, EventCursor, EventMessage,
     EventPayload, FadeToBlackPosition, FadeToBlackState, FieldIssue, InputAudioStripStatus,
     InputStatus, ManualTransitionKind, ManualTransitionPosition, ManualTransitionState,
-    ManualTransitionStatus, OverlayBorderPreset as ProtocolOverlayBorder,
+    ManualTransitionStatus, OutputStatus, OverlayBorderPreset as ProtocolOverlayBorder,
     OverlayPositionPreset as ProtocolOverlayPosition, OverlayStatus,
     OverlayTransitionKind as ProtocolOverlayTransition, RuntimeEventMessage, RuntimeLifecycleEvent,
     ServerIdentity, SnapshotMessage, StingerAudioPolicy as ProtocolStingerAudioPolicy,
@@ -1458,6 +1458,15 @@ fn snapshot_record(engine: &Engine, identity: &EngineIdentity) -> SnapshotRecord
             .map(|(input, name)| InputStatus {
                 input: WireInputId::from_domain(input),
                 name,
+            })
+            .collect(),
+        outputs: engine
+            .show()
+            .outputs()
+            .iter()
+            .map(|(output, name)| OutputStatus {
+                output: WireOutputId::from_domain(*output),
+                name: name.clone(),
             })
             .collect(),
         input_audio_strips: protocol_input_audio_strips(engine),

@@ -196,6 +196,11 @@ impl WireOutputId {
     }
 
     #[must_use]
+    pub const fn get(self) -> NonZeroU128 {
+        self.0
+    }
+
+    #[must_use]
     pub const fn from_domain(value: OutputId) -> Self {
         Self(value.get())
     }
@@ -623,12 +628,20 @@ pub struct InputStatus {
     pub name: String,
 }
 
+/// One canonical show output exposed to clients in project order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OutputStatus {
+    pub output: WireOutputId,
+    pub name: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SnapshotMessage {
     pub engine: EngineIdentity,
     pub revision: u64,
     pub show_name: String,
     pub inputs: Vec<InputStatus>,
+    pub outputs: Vec<OutputStatus>,
     pub input_audio_strips: Vec<InputAudioStripStatus>,
     pub desired_program: WireInputId,
     pub desired_preview: WireInputId,

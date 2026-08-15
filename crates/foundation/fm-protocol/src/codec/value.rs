@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 
 use crate::{
-    ClientType, CodecError, DurableEvent, FieldIssue, InputStatus, ProtocolVersion, Role,
-    RuntimeDomainBoundary,
+    ClientType, CodecError, DurableEvent, FieldIssue, InputStatus, OutputStatus, ProtocolVersion,
+    Role, RuntimeDomainBoundary,
 };
 
 use super::{MAX_BATCH_EVENTS, MAX_FIELD_VALUE_BYTES, MAX_LIST_ITEMS};
@@ -158,6 +158,69 @@ pub(super) fn parse_input_statuses(value: &str) -> Result<Vec<InputStatus>, Code
                 });
             }
             Ok(InputStatus { input, name })
+        })
+        .collect()
+}
+
+pub(super) fn output_statuses(values: &[OutputStatus]) -> Result<String, CodecError> {
+    let encoded = bounded_join(values, MAX_LIST_ITEMS, "outputs", |output| {
+        if output.name.trim().is_empty() {
+            return Err(CodecError::InvalidField {
+                field: "outputs",
+                value: output.name.clone(),
+            });
+        }
+        Ok(format!(
+            "{}~{}",
+            output.output,
+            escape_bounded(&output.name)?
+        ))
+    })?;
+    let mut outputs = BTreeSet::new();
+    for output in values {
+        if !outputs.insert(output.output.get()) {
+            return Err(CodecError::InvalidField {
+                field: "outputs",
+                value: output.output.to_string(),
+            });
+        }
+    }
+    Ok(encoded)
+}
+
+pub(super) fn parse_output_statuses(value: &str) -> Result<Vec<OutputStatus>, CodecError> {
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+    check_items(value, ',', MAX_LIST_ITEMS, "outputs")?;
+    let mut outputs = BTreeSet::new();
+    value
+        .split(',')
+        .map(|entry| {
+            let (output, name) = entry.split_once('~').ok_or(CodecError::InvalidRecord)?;
+            let output = output
+                .parse::<u128>()
+                .ok()
+                .and_then(core::num::NonZeroU128::new);
+            let name = unescape(name)?;
+            if name.trim().is_empty() {
+                return Err(CodecError::InvalidField {
+                    field: "outputs",
+                    value: value.to_owned(),
+                });
+            }
+            let output =
+                crate::WireOutputId::new(output.ok_or_else(|| CodecError::InvalidField {
+                    field: "outputs",
+                    value: value.to_owned(),
+                })?);
+            if !outputs.insert(output.get()) {
+                return Err(CodecError::InvalidField {
+                    field: "outputs",
+                    value: value.to_owned(),
+                });
+            }
+            Ok(OutputStatus { output, name })
         })
         .collect()
 }

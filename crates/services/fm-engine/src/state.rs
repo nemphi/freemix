@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use fm_switcher::{StingerDescriptor, StingerSlotId, SwitcherEvent, SwitcherState, TBarState};
 use fm_types::{
-    InputId, InputOrderError, MAX_INPUT_NAME_BYTES, RenameInputError, validate_input_name,
+    InputId, InputOrderError, MAX_INPUT_NAME_BYTES, OutputId, RenameInputError, validate_input_name,
 };
 
 use crate::ShowError;
@@ -36,6 +36,7 @@ pub struct ShowState {
     name: String,
     inputs: Vec<InputId>,
     input_names: Vec<String>,
+    outputs: Vec<(OutputId, String)>,
     input_audio_strips: BTreeMap<InputId, EngineInputAudioStripState>,
     desired_switcher: SwitcherState,
 }
@@ -89,8 +90,33 @@ impl ShowState {
                 .collect(),
             inputs: input_ids,
             input_names: inputs.into_iter().map(|(_, name)| name).collect(),
+            outputs: Vec::new(),
             desired_switcher,
         })
+    }
+
+    /// Sets the fixed output roster that overlay inclusion can target.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a name is blank or when an identifier or
+    /// case-insensitive name is repeated.
+    pub fn with_outputs(mut self, outputs: Vec<(OutputId, String)>) -> Result<Self, ShowError> {
+        let mut identifiers = HashSet::with_capacity(outputs.len());
+        let mut names = HashSet::with_capacity(outputs.len());
+        for (output, name) in &outputs {
+            if name.trim().is_empty() {
+                return Err(ShowError::EmptyOutputName);
+            }
+            if !identifiers.insert(*output) {
+                return Err(ShowError::DuplicateOutput(*output));
+            }
+            if !names.insert(name.to_ascii_lowercase()) {
+                return Err(ShowError::DuplicateOutputName);
+            }
+        }
+        self.outputs = outputs;
+        Ok(self)
     }
 
     #[must_use]
@@ -115,6 +141,11 @@ impl ShowState {
             .iter()
             .position(|candidate| *candidate == input)
             .map(|index| self.input_names[index].as_str())
+    }
+
+    #[must_use]
+    pub fn outputs(&self) -> &[(OutputId, String)] {
+        &self.outputs
     }
 
     /// Renames one durable input while preserving the exact supplied text.

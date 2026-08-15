@@ -16,8 +16,8 @@ use crate::{
 
 use super::value::{
     parse_client_type, parse_durable_events, parse_field_issues, parse_input_ids,
-    parse_input_statuses, parse_role, parse_runtime_domains, parse_string_list, parse_version,
-    unescape,
+    parse_input_statuses, parse_output_statuses, parse_role, parse_runtime_domains,
+    parse_string_list, parse_version, unescape,
 };
 use super::{
     MAX_FIELD_NAME_BYTES, MAX_FIELD_VALUE_BYTES, MAX_FIELDS_PER_MESSAGE, MAX_LINE_BYTES,
@@ -537,6 +537,7 @@ fn decode_snapshot(fields: &mut Fields) -> Result<SnapshotMessage, CodecError> {
         revision: fields.parse_required("revision")?,
         show_name: fields.required("show_name")?,
         inputs,
+        outputs: parse_output_statuses(&fields.required("outputs")?)?,
         input_audio_strips: decode_input_audio_strips(fields)?,
         desired_program: fields.input("desired_program")?,
         desired_preview: fields.input("desired_preview")?,

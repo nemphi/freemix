@@ -855,6 +855,13 @@ fn engine_from_project(project: Project) -> AppResult<ProjectEngine> {
         inputs,
         main_mix.desired_program,
         main_mix.desired_preview,
+    )?
+    .with_outputs(
+        project
+            .outputs()
+            .iter()
+            .map(|output| (output.id, output.name.clone()))
+            .collect(),
     )?;
     restore_input_audio_strips(&mut show, &project)?;
     let engine = Engine::new(show, project.settings().frame_rate, clock_domain());
@@ -1148,6 +1155,13 @@ fn load_engine(path: &Path) -> AppResult<ProjectEngine> {
         inputs,
         main_mix.desired_program,
         main_mix.desired_preview,
+    )?
+    .with_outputs(
+        project
+            .outputs()
+            .iter()
+            .map(|output| (output.id, output.name.clone()))
+            .collect(),
     )?;
     restore_input_audio_strips(&mut show, &project)?;
     let mut realized = SwitcherState::new(input_ids, realized_program, realized_preview)?;

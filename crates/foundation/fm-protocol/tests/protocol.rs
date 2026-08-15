@@ -9,12 +9,12 @@ use fm_protocol::{
     HandshakeOutcome, HeartbeatAcknowledgementMessage, HeartbeatMessage, InputAudioStripStatus,
     InputStatus, LineDecoder, MAX_FIELD_VALUE_BYTES, MAX_FIELDS_PER_MESSAGE, MAX_LINE_BYTES,
     MAX_LIST_ITEMS, MAX_MESSAGES_PER_PUSH, ManualTransitionKind, ManualTransitionPosition,
-    ManualTransitionState, ManualTransitionStatus, OverlayStatus, OverlayTransitionKind,
-    ProtocolVersion, ResumeCursor, RuntimeDomainBoundary, RuntimeEventMessage,
-    RuntimeFailureDisposition, RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage,
-    SnapshotReason, StingerAudioPolicy, StingerMissingMediaFallback, StingerReadiness,
-    StingerStatus, StructuredError, WireInputId, WireMessage, WireOutputId, WireOverlayChannelId,
-    WireStingerSlotId, choose_handshake_outcome, decode_line, encode_line,
+    ManualTransitionState, ManualTransitionStatus, OutputStatus, OverlayStatus,
+    OverlayTransitionKind, ProtocolVersion, ResumeCursor, RuntimeDomainBoundary,
+    RuntimeEventMessage, RuntimeFailureDisposition, RuntimeLifecycleEvent, ServerIdentity,
+    SnapshotMessage, SnapshotReason, StingerAudioPolicy, StingerMissingMediaFallback,
+    StingerReadiness, StingerStatus, StructuredError, WireInputId, WireMessage, WireOutputId,
+    WireOverlayChannelId, WireStingerSlotId, choose_handshake_outcome, decode_line, encode_line,
 };
 
 fn input(value: u128) -> WireInputId {
@@ -111,6 +111,16 @@ fn snapshot(inputs: Vec<InputStatus>) -> WireMessage {
         revision: 9,
         show_name: "My Show\nA".to_owned(),
         inputs,
+        outputs: vec![
+            OutputStatus {
+                output: output(7),
+                name: "Main".into(),
+            },
+            OutputStatus {
+                output: output(8),
+                name: "Aux".into(),
+            },
+        ],
         input_audio_strips: input_audio_strips(&[1, 2]),
         desired_program: input(2),
         desired_preview: input(1),
@@ -133,8 +143,8 @@ fn snapshot(inputs: Vec<InputStatus>) -> WireMessage {
 }
 
 #[test]
-fn protocol_2_13_heartbeat_acknowledgement_codec_is_exact() {
-    assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(2, 13));
+fn protocol_2_14_heartbeat_acknowledgement_codec_is_exact() {
+    assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(2, 14));
     let acknowledgement = WireMessage::HeartbeatAcknowledgement(HeartbeatAcknowledgementMessage {
         server: server_identity(),
         heartbeat_sequence: 88,
@@ -406,6 +416,46 @@ fn input_statuses_reject_duplicate_ids() {
             ..
         })
     ));
+}
+
+#[test]
+fn output_statuses_preserve_escaped_order_and_reject_duplicate_ids() {
+    let mut message = snapshot(input_statuses(&[(1, "camera"), (2, "slides")]));
+    let WireMessage::Snapshot(snapshot) = &mut message else {
+        unreachable!();
+    };
+    snapshot.outputs = vec![
+        OutputStatus {
+            output: output(7),
+            name: "Clean, Main".into(),
+        },
+        OutputStatus {
+            output: output(8),
+            name: "Aux ~ ISO".into(),
+        },
+    ];
+    let encoded = encode_line(&message).unwrap();
+    assert_eq!(decode_line(&encoded), Ok(message.clone()));
+
+    let mut duplicate = message.clone();
+    let WireMessage::Snapshot(snapshot) = &mut duplicate else {
+        unreachable!();
+    };
+    snapshot.outputs[1].output = output(7);
+    assert!(matches!(
+        encode_line(&duplicate),
+        Err(CodecError::InvalidField {
+            field: "outputs",
+            ..
+        })
+    ));
+
+    let WireMessage::Snapshot(snapshot) = &mut message else {
+        unreachable!();
+    };
+    snapshot.outputs.clear();
+    let encoded = encode_line(&message).unwrap();
+    assert_eq!(decode_line(&encoded), Ok(message));
 }
 
 #[test]

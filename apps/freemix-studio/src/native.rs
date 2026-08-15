@@ -16,8 +16,9 @@ use fm_client::{
 };
 use fm_protocol::{
     CommandPayload, CommandResult, DurableGap, OverlayBorderPreset, OverlayPositionPreset,
-    OverlayTransitionKind, WireInputId, WireMessage,
+    OverlayTransitionKind, WireInputId, WireMessage, WireOutputId,
 };
+use fm_types::OutputId;
 use fm_ui_egui::{
     ExternalStudioAction, InputAudioStripUpdate, InputMoveDirection, StudioConnectionStatus,
     StudioIntent, StudioShell, StudioUiState, TerminalUncertaintyNotice, external_intent,
@@ -1238,6 +1239,24 @@ fn desired_overlay<'view>(
     Ok(overlay)
 }
 
+fn desired_overlay_output_included(
+    view: Option<&ClientView>,
+    channel: fm_protocol::WireOverlayChannelId,
+    output: OutputId,
+) -> Result<bool, String> {
+    let view =
+        view.ok_or_else(|| "Cannot edit overlay before project state is synchronized".to_owned())?;
+    let overlay = desired_overlay(Some(view), channel)?;
+    if !view
+        .outputs
+        .iter()
+        .any(|candidate| candidate.output == output)
+    {
+        return Err("Cannot edit overlay: output is no longer available".to_owned());
+    }
+    Ok(overlay.included_outputs.contains(&output))
+}
+
 fn consume_command_sequence(
     runtime: &mut StudioRuntime,
     command_id: &str,
@@ -1603,6 +1622,14 @@ fn intent_payload(
             source: WireInputId::from_domain(source),
         },
         StudioIntent::TakeNextOverlay { channel } => CommandPayload::TakeNextOverlay { channel },
+        StudioIntent::ToggleOverlayOutput { channel, output } => {
+            let included = desired_overlay_output_included(view, channel, output)?;
+            CommandPayload::SetOverlayOutputInclusion {
+                channel,
+                output: WireOutputId::from_domain(output),
+                included: !included,
+            }
+        }
         StudioIntent::Wipe { duration_frames } => CommandPayload::Wipe { duration_frames },
         StudioIntent::FadeToBlack {
             active,
@@ -1759,8 +1786,9 @@ mod tests {
         CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, EngineIdentity, FadeToBlackPosition,
         FadeToBlackState, HandshakeOutcome, HandshakeResponse, HeartbeatAcknowledgementMessage,
         InputAudioStripStatus, InputStatus, ManualTransitionPosition, ManualTransitionStatus,
-        OverlayBorderPreset, OverlayPositionPreset, OverlayStatus, Role, ServerIdentity,
-        SnapshotMessage, SnapshotReason, WireMessage, decode_line, encode_line,
+        OutputStatus, OverlayBorderPreset, OverlayPositionPreset, OverlayStatus, Role,
+        ServerIdentity, SnapshotMessage, SnapshotReason, WireMessage, WireOutputId, decode_line,
+        encode_line,
     };
     use fm_types::ProjectId;
     use fm_ui_model::{ClientModel, DurableChange, DurableProjectEvent, ProjectSnapshot};
@@ -1866,6 +1894,7 @@ mod tests {
                 input,
                 name: "i".into(),
             }],
+            outputs: Vec::new(),
             input_audio_strips: vec![InputAudioStripStatus {
                 input,
                 gain_millidb: 0,
@@ -2661,7 +2690,12 @@ mod tests {
     #[test]
     fn queued_overlay_actions_resolve_from_the_latest_confirmed_channel() {
         let project = ProjectId::new(NonZeroU128::new(7).unwrap());
-        let snapshot = heartbeat_snapshot();
+        let output = WireOutputId::new(NonZeroU128::new(9).unwrap());
+        let mut snapshot = heartbeat_snapshot();
+        snapshot.outputs = vec![OutputStatus {
+            output,
+            name: "Program".into(),
+        }];
         let channel = snapshot.desired_overlays[0].channel;
         let mut model = ClientModel::new(project);
         model
@@ -2697,8 +2731,21 @@ mod tests {
                 duration_frames: 42,
             },
         );
+        assert_overlay_payload(
+            &confirmed,
+            StudioIntent::ToggleOverlayOutput {
+                channel,
+                output: output.to_domain(),
+            },
+            CommandPayload::SetOverlayOutputInclusion {
+                channel,
+                output,
+                included: true,
+            },
+        );
         apply_overlay_change(&mut model, &confirmed, |overlay| {
             overlay.transition = OverlayTransitionKind::Fade;
+            overlay.included_outputs.push(output.to_domain());
         });
         let confirmed = model.view().unwrap();
         assert_overlay_payload(
@@ -2711,6 +2758,18 @@ mod tests {
                 channel,
                 transition: OverlayTransitionKind::Cut,
                 duration_frames: 42,
+            },
+        );
+        assert_overlay_payload(
+            &confirmed,
+            StudioIntent::ToggleOverlayOutput {
+                channel,
+                output: output.to_domain(),
+            },
+            CommandPayload::SetOverlayOutputInclusion {
+                channel,
+                output,
+                included: false,
             },
         );
         apply_overlay_change(&mut model, &confirmed, |overlay| {

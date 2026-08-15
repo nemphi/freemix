@@ -12,8 +12,8 @@ use crate::{
 };
 
 use super::value::{
-    client_type, durable_events, field_issues, input_ids, input_statuses, role, runtime_domains,
-    string_list,
+    client_type, durable_events, field_issues, input_ids, input_statuses, output_statuses, role,
+    runtime_domains, string_list,
 };
 use super::{
     CodecError, MAX_FIELD_VALUE_BYTES, MAX_LINE_BYTES, MAX_LIST_ITEMS, validate_request_id,
@@ -419,6 +419,7 @@ fn encode_snapshot(record: &mut Record, message: &SnapshotMessage) -> Result<(),
     record.field("revision", message.revision)?;
     record.field_str("show_name", &message.show_name)?;
     record.field_string("inputs", input_statuses(&message.inputs)?)?;
+    record.field_string("outputs", output_statuses(&message.outputs)?)?;
     encode_input_audio_strips(record, &message.input_audio_strips)?;
     record.field("desired_program", message.desired_program)?;
     record.field("desired_preview", message.desired_preview)?;

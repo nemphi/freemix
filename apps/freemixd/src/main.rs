@@ -3609,6 +3609,13 @@ fn restore_engine(project: &StoredProject) -> AppResult<Engine> {
         inputs,
         main_mix.desired_program,
         main_mix.desired_preview,
+    )?
+    .with_outputs(
+        canonical
+            .outputs()
+            .iter()
+            .map(|output| (output.id, output.name.clone()))
+            .collect(),
     )?;
     restore_input_audio_strips(&mut show, canonical)?;
     let mut realized = SwitcherState::new(input_ids, realized_program, realized_preview)?;

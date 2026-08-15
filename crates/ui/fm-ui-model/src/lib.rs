@@ -142,6 +142,12 @@ pub struct InputAudioStripStatus {
     pub delay_samples: u32,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OutputStatus {
+    pub output: OutputId,
+    pub name: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ActiveManualTransition {
     pub kind: ManualTransitionKind,
@@ -180,6 +186,7 @@ pub struct ProjectSnapshot {
     pub show_name: String,
     pub inputs: Vec<InputId>,
     pub input_names: Vec<String>,
+    pub outputs: Vec<OutputStatus>,
     pub input_audio_strips: Vec<InputAudioStripStatus>,
     pub stingers: Vec<StingerStatus>,
     pub desired_overlays: Vec<OverlayStatus>,
@@ -200,6 +207,14 @@ impl ProjectSnapshot {
             .into_iter()
             .map(|input| (input.input.to_domain(), input.name))
             .unzip();
+        let outputs = message
+            .outputs
+            .into_iter()
+            .map(|output| OutputStatus {
+                output: output.output.to_domain(),
+                name: output.name,
+            })
+            .collect();
         Self {
             cursor: ProjectCursor {
                 project_id,
@@ -209,6 +224,7 @@ impl ProjectSnapshot {
             show_name: message.show_name,
             inputs,
             input_names,
+            outputs,
             input_audio_strips,
             stingers,
             desired_overlays,
@@ -368,6 +384,7 @@ pub struct ProjectState {
     show_name: String,
     inputs: Vec<InputId>,
     input_names: Vec<String>,
+    outputs: Vec<OutputStatus>,
     input_audio_strips: Vec<InputAudioStripStatus>,
     stingers: Vec<StingerStatus>,
     desired_overlays: Vec<OverlayStatus>,
@@ -400,6 +417,11 @@ impl ProjectState {
     }
 
     #[must_use]
+    pub fn outputs(&self) -> &[OutputStatus] {
+        &self.outputs
+    }
+
+    #[must_use]
     pub fn stingers(&self) -> &[StingerStatus] {
         &self.stingers
     }
@@ -427,6 +449,7 @@ pub struct ClientView {
     pub show_name: String,
     pub inputs: Vec<InputId>,
     pub input_names: Vec<String>,
+    pub outputs: Vec<OutputStatus>,
     pub input_audio_strips: Vec<InputAudioStripStatus>,
     pub stingers: Vec<StingerStatus>,
     pub desired_overlays: Vec<OverlayStatus>,
@@ -605,6 +628,8 @@ pub enum ModelError {
     RevisionExhausted,
     DuplicateInput(InputId),
     InvalidInputNames,
+    DuplicateOutput(OutputId),
+    InvalidOutputNames,
     InvalidInputOrder,
     InvalidInputAudioStrips,
     DuplicateStingerSlot(u8),
@@ -622,6 +647,7 @@ pub enum ModelError {
     },
     DuplicateOverlayOutput(u8),
     UnknownInput(InputId),
+    UnknownOutput(OutputId),
     InvalidManualTransitionRouting,
     DuplicateCommand(CommandId),
     UnknownCommand(CommandId),
@@ -687,6 +713,10 @@ impl fmt::Display for ModelError {
             Self::InvalidInputNames => formatter.write_str(
                 "input names must contain one unique, nonblank label within the byte limit for each show input",
             ),
+            Self::DuplicateOutput(output) => write!(formatter, "snapshot repeats output {output}"),
+            Self::InvalidOutputNames => formatter.write_str(
+                "output names must contain one unique, nonblank label for each output",
+            ),
             Self::InvalidInputAudioStrips => formatter.write_str(
                 "input audio strips must contain each show input exactly once with gain in -96000..=24000 millidB, balance in -10000..=10000 basis points, and delay in 0..=48000 samples",
             ),
@@ -721,6 +751,7 @@ impl fmt::Display for ModelError {
                 write!(formatter, "overlay channel {channel} repeats an output")
             }
             Self::UnknownInput(input) => write!(formatter, "unknown input {input}"),
+            Self::UnknownOutput(output) => write!(formatter, "unknown output {output}"),
             Self::InvalidManualTransitionRouting => formatter
                 .write_str("manual transition endpoints do not match Program and Preview routing"),
             Self::DuplicateCommand(id) => write!(formatter, "command {id} is already pending"),
@@ -801,6 +832,7 @@ impl ClientModel {
             show_name: state.show_name.clone(),
             inputs: state.inputs.clone(),
             input_names: state.input_names.clone(),
+            outputs: state.outputs.clone(),
             input_audio_strips: state.input_audio_strips.clone(),
             stingers: state.stingers.clone(),
             desired_overlays: state.desired_overlays.clone(),
@@ -976,6 +1008,7 @@ impl ClientModel {
             show_name: snapshot.show_name,
             inputs: snapshot.inputs,
             input_names: snapshot.input_names,
+            outputs: snapshot.outputs,
             input_audio_strips: snapshot.input_audio_strips,
             stingers: snapshot.stingers,
             desired_overlays: snapshot.desired_overlays,
@@ -1335,6 +1368,10 @@ fn valid_input_name(name: &str) -> bool {
     !name.trim().is_empty() && name.len() <= MAX_INPUT_NAME_BYTES
 }
 
+fn valid_output_name(name: &str) -> bool {
+    !name.trim().is_empty()
+}
+
 fn validate_snapshot_inputs(snapshot: &ProjectSnapshot) -> Result<(), ModelError> {
     if snapshot.input_names.len() != snapshot.inputs.len() {
         return Err(ModelError::InvalidInputNames);
@@ -1353,6 +1390,18 @@ fn validate_snapshot_inputs(snapshot: &ProjectSnapshot) -> Result<(), ModelError
             return Err(ModelError::DuplicateInput(*input));
         }
     }
+    let mut output_names = HashSet::with_capacity(snapshot.outputs.len());
+    let mut outputs = HashSet::with_capacity(snapshot.outputs.len());
+    for output in &snapshot.outputs {
+        if !valid_output_name(&output.name)
+            || !output_names.insert(output.name.to_ascii_lowercase())
+        {
+            return Err(ModelError::InvalidOutputNames);
+        }
+        if !outputs.insert(output.output) {
+            return Err(ModelError::DuplicateOutput(output.output));
+        }
+    }
     for input in [
         snapshot.switcher.desired.program,
         snapshot.switcher.desired.preview,
@@ -1365,8 +1414,8 @@ fn validate_snapshot_inputs(snapshot: &ProjectSnapshot) -> Result<(), ModelError
     }
     validate_stingers(&snapshot.stingers, &inputs)?;
     validate_input_audio_strips(&snapshot.input_audio_strips, &inputs)?;
-    validate_overlays(&snapshot.desired_overlays, &inputs)?;
-    validate_overlays(&snapshot.realized_overlays, &inputs)?;
+    validate_overlays(&snapshot.desired_overlays, &inputs, &outputs)?;
+    validate_overlays(&snapshot.realized_overlays, &inputs, &outputs)?;
     validate_manual_transition(
         snapshot.switcher.desired_manual_transition,
         snapshot.switcher.desired,
@@ -1383,6 +1432,7 @@ fn validate_snapshot_inputs(snapshot: &ProjectSnapshot) -> Result<(), ModelError
 fn validate_overlays(
     overlays: &[OverlayStatus],
     inputs: &HashSet<InputId>,
+    outputs: &HashSet<OutputId>,
 ) -> Result<(), ModelError> {
     if overlays.len() != 8 {
         return Err(ModelError::InvalidOverlayCount(overlays.len()));
@@ -1417,12 +1467,19 @@ fn validate_overlays(
                 return Err(ModelError::UnknownInput(*source));
             }
         }
-        let outputs = overlay
+        if let Some(output) = overlay
+            .included_outputs
+            .iter()
+            .find(|output| !outputs.contains(output))
+        {
+            return Err(ModelError::UnknownOutput(*output));
+        }
+        let included_outputs = overlay
             .included_outputs
             .iter()
             .copied()
             .collect::<HashSet<_>>();
-        if outputs.len() != overlay.included_outputs.len() {
+        if included_outputs.len() != overlay.included_outputs.len() {
             return Err(ModelError::DuplicateOverlayOutput(overlay.channel));
         }
     }
@@ -1537,7 +1594,8 @@ fn validate_change(change: &DurableChange, state: &ProjectState) -> Result<(), M
     if let Some(stingers) = stingers {
         validate_stingers(stingers, &input_set)?;
     }
-    validate_overlays(overlays, &input_set)?;
+    let output_set = state.outputs.iter().map(|output| output.output).collect();
+    validate_overlays(overlays, &input_set, &output_set)?;
     validate_input_audio_strips(input_audio_strips, &input_set)?;
     Ok(())
 }

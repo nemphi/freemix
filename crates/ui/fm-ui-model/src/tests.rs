@@ -12,6 +12,10 @@ fn input(value: u128) -> InputId {
     InputId::new(NonZeroU128::new(value).unwrap())
 }
 
+fn output(value: u128) -> OutputId {
+    OutputId::new(NonZeroU128::new(value).unwrap())
+}
+
 fn engine(id: &str, epoch: u64, log: &str) -> EngineIdentity {
     EngineIdentity {
         engine_id: id.into(),
@@ -62,6 +66,16 @@ fn snapshot(project_id: ProjectId, revision: u64) -> ProjectSnapshot {
         show_name: "Show".into(),
         inputs: vec![input(1), input(2), input(3)],
         input_names: vec!["Camera".into(), "Slides".into(), "Guest".into()],
+        outputs: vec![
+            OutputStatus {
+                output: output(1),
+                name: "Main".into(),
+            },
+            OutputStatus {
+                output: output(2),
+                name: "Aux".into(),
+            },
+        ],
         input_audio_strips: input_audio_strips(),
         stingers: Vec::new(),
         desired_overlays: overlays(),
@@ -287,6 +301,48 @@ fn ignores_exact_duplicates_but_rejects_conflicting_ones() {
         Err(ModelError::ConflictingDuplicate { .. })
     ));
     assert_eq!(model.sync_status(), &SyncStatus::RequiresSnapshot);
+}
+
+#[test]
+fn exposes_ordered_outputs_and_rejects_invalid_output_references() {
+    let project_id = project(10);
+    let mut model = ClientModel::new(project_id);
+    model.install_snapshot(snapshot(project_id, 1)).unwrap();
+    let view = model.view().unwrap();
+    assert_eq!(
+        view.outputs
+            .iter()
+            .map(|output| output.output)
+            .collect::<Vec<_>>(),
+        vec![output(1), output(2)]
+    );
+
+    let mut duplicate = snapshot(project_id, 2);
+    duplicate.outputs[1].output = output(1);
+    assert_eq!(
+        model.install_snapshot(duplicate),
+        Err(ModelError::DuplicateOutput(output(1)))
+    );
+
+    let mut unknown_snapshot = snapshot(project_id, 2);
+    unknown_snapshot.desired_overlays[0]
+        .included_outputs
+        .push(output(3));
+    assert_eq!(
+        model.install_snapshot(unknown_snapshot),
+        Err(ModelError::UnknownOutput(output(3)))
+    );
+
+    let identity = model.reconnect_cursor().unwrap().engine.clone();
+    let mut unknown_event = desired(BusSelection::new(input(1), input(2)));
+    let DurableChange::DesiredSwitcher { overlays, .. } = &mut unknown_event else {
+        unreachable!()
+    };
+    overlays[0].included_outputs.push(output(3));
+    assert_eq!(
+        model.apply_event(event(project_id, identity, 2, unknown_event)),
+        Err(ModelError::UnknownOutput(output(3)))
+    );
 }
 
 #[test]

@@ -11,12 +11,16 @@ use fm_protocol::{
     WireInputId, WireMessage, WireStingerSlotId,
 };
 use fm_switcher::{MissingMediaFallback, StingerAudioPolicy, StingerDescriptor, StingerSlotId};
-use fm_types::{FrameRate, InputId};
+use fm_types::{FrameRate, InputId, OutputId};
 
 use super::*;
 
 fn input(value: u128) -> InputId {
     InputId::new(NonZeroU128::new(value).unwrap())
+}
+
+fn output(value: u128) -> OutputId {
+    OutputId::new(NonZeroU128::new(value).unwrap())
 }
 
 fn named_inputs(values: impl IntoIterator<Item = InputId>) -> Vec<(InputId, String)> {
@@ -58,6 +62,43 @@ fn service(retained_events: usize, subscriber_queue: usize) -> ControlService {
             subscriber_queue,
         },
     )
+}
+
+#[test]
+fn snapshot_preserves_configured_output_roster_order() {
+    let show = ShowState::new(
+        "show",
+        named_inputs([input(1), input(2)]),
+        input(1),
+        input(2),
+    )
+    .unwrap()
+    .with_outputs(vec![
+        (output(7), "Clean".into()),
+        (output(3), "Dirty".into()),
+    ])
+    .unwrap();
+    let control = ControlService::new(
+        Engine::new(
+            show,
+            FrameRate::new(60, 1).unwrap(),
+            ClockDomainId::new(NonZeroU128::new(1).unwrap()),
+        ),
+        Policy::production(),
+        "engine-a",
+        "log-a",
+        ControlLimits::default(),
+    );
+    assert_eq!(
+        control
+            .snapshot()
+            .snapshot
+            .outputs
+            .iter()
+            .map(|output| (output.output.to_domain(), output.name.as_str()))
+            .collect::<Vec<_>>(),
+        [(output(7), "Clean"), (output(3), "Dirty")]
+    );
 }
 
 fn stinger_service() -> ControlService {

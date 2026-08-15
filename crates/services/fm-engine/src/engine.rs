@@ -1155,6 +1155,17 @@ fn apply_overlay_mutation(
         command,
         target_frame,
     } = mutation;
+    if let EngineCommand::SetOverlayOutputInclusion { output, .. } = &command
+        && !state
+            .outputs()
+            .iter()
+            .any(|(candidate, _)| candidate == output)
+    {
+        return Err(Rejection::new(
+            RejectionCode::NotFound,
+            format!("show does not contain output {output}"),
+        ));
+    }
     let switcher_command = match &command {
         EngineCommand::TakeOverlay { channel, source } => SwitcherCommand::TakeOverlay {
             channel: *channel,

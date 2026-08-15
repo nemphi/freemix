@@ -68,10 +68,12 @@ saved, restarted, resumed, and tested deterministically.
 Current Phase 1 control boundary: the daemon, protocol, and client exercise a
 versioned raw TCP session with handshake, snapshot/resume, commands, events,
 development authentication, bounded bidirectional heartbeat acknowledgement,
-and deterministic model tests. Protocol 2.13 adds one bounded, read-only
+and deterministic model tests. Protocol 2.13 added one bounded, read-only
 control-plane diagnostics query, authorized by `ViewStatus`; it reports the
 point-in-time control diagnostics and does not mutate engine or durable state.
 It is not telemetry, health, or readiness, and RC-015 remains planned.
+Protocol 2.14 adds the ordered configured output ID/name roster required for
+exact overlay-output inclusion controls; it does not prove output delivery.
 Protocol 2.12 retains the protocol 2.10 rule
 that the daemon acknowledges only a validated heartbeat with the session server identity, the exact client
 heartbeat sequence, and the server receive time. Studio accepts one expected
@@ -506,10 +508,12 @@ cover Take, Update, Off, inclusion, Queue, Take Next, and Cut/Fade/appearance
 configuration; status prints both desired and realized arrays with opacity,
 transition, appearance, and queue state. Web exposes transport-free semantic
 controls, and Studio exposes Take Preview, Update Preview on active channels,
-Queue Preview, Take Next, Off, and
-per-channel Cut/Fade/position/border controls and displays desired and
-last-confirmed realized source, activity, opacity, queue, and appearance
-summaries for all eight channels; this is not output-video evidence. Queued
+Queue Preview, Take Next, Off, and per-channel Cut/Fade/position/border
+controls plus one persisted-name output inclusion toggle for every configured
+output. Studio displays desired and last-confirmed realized source, activity,
+opacity, queue, and appearance summaries for all eight channels; its output
+toggles reflect the latest confirmed desired inclusion state. This is not
+output-video evidence. Queued
 Studio overlay toggle and cycle actions resolve from the latest confirmed desired
 channel, so repeated clicks remain cumulative before dispatching full protocol commands.
 The native daemon derives a stable realization for every configured project output,

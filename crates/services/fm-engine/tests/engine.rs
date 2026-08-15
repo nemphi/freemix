@@ -50,10 +50,44 @@ fn engine() -> Engine {
             input(1),
             input(2),
         )
+        .unwrap()
+        .with_outputs(vec![(output(9), "Program".into())])
         .unwrap(),
         FrameRate::new(25, 1).unwrap(),
         domain(),
     )
+}
+
+#[test]
+fn unknown_overlay_output_is_rejected_before_mutation() {
+    let mut engine = engine();
+    let channel = OverlayChannelId::new(1).unwrap();
+    let outcome = engine
+        .execute(
+            envelope(
+                "unknown-overlay-output",
+                EngineCommand::SetOverlayOutputInclusion {
+                    channel,
+                    output: output(10),
+                    included: true,
+                },
+            ),
+            0,
+        )
+        .unwrap();
+    assert_eq!(
+        outcome.receipt.rejected().unwrap().rejection.code,
+        RejectionCode::NotFound
+    );
+    assert_eq!(engine.revision(), Revision::new(0));
+    assert!(
+        engine
+            .show()
+            .desired_switcher()
+            .overlay(channel)
+            .included_outputs()
+            .is_empty()
+    );
 }
 
 fn stinger_engine(

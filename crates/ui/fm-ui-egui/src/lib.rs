@@ -11,8 +11,8 @@ use fm_protocol::{
     ManualTransitionKind, ManualTransitionPosition, OverlayBorderPreset, OverlayPositionPreset,
     OverlayTransitionKind, StingerReadiness, WireOverlayChannelId, WireStingerSlotId,
 };
-use fm_types::InputId;
 use fm_types::MAX_INPUT_NAME_BYTES;
+use fm_types::{InputId, OutputId};
 use fm_ui_model::{BusSelection, ClientView, ManualTransitionStatus, StingerStatus, SwitcherState};
 
 mod fade_to_black;
@@ -109,6 +109,11 @@ pub enum StudioIntent {
     },
     /// Takes and removes the head of one overlay queue.
     TakeNextOverlay { channel: WireOverlayChannelId },
+    /// Toggles one overlay channel's inclusion on one configured output.
+    ToggleOverlayOutput {
+        channel: WireOverlayChannelId,
+        output: OutputId,
+    },
     /// Performs a Wipe transition with a duration in frames.
     Wipe { duration_frames: u32 },
     /// Fades realized Program video and audio to black or back to live.
@@ -1084,6 +1089,45 @@ fn draw_overlay_channel(
                 intents.push(StudioIntent::OverlayOff { channel });
             }
         });
+        let outputs = state.view.as_ref().map(|view| view.outputs.as_slice());
+        match outputs {
+            Some(outputs) if !outputs.is_empty() => {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("OUTPUTS").small().color(MUTED));
+                    for output in outputs {
+                        let mut included = desired.is_some_and(|overlay| {
+                            overlay.included_outputs.contains(&output.output)
+                        });
+                        if ui
+                            .add_enabled(
+                                enabled && desired.is_some(),
+                                egui::Checkbox::new(&mut included, &output.name),
+                            )
+                            .changed()
+                        {
+                            intents.push(StudioIntent::ToggleOverlayOutput {
+                                channel,
+                                output: output.output,
+                            });
+                        }
+                    }
+                });
+            }
+            Some(_) => {
+                ui.label(
+                    RichText::new("OUTPUTS unavailable: no configured outputs")
+                        .small()
+                        .color(MUTED),
+                );
+            }
+            None => {
+                ui.label(
+                    RichText::new("OUTPUTS unavailable: project state not synchronized")
+                        .small()
+                        .color(MUTED),
+                );
+            }
+        }
         ui.label(
             RichText::new(overlay_status::format(channel_number, desired, realized))
                 .small()

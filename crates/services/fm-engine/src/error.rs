@@ -4,7 +4,7 @@ use fm_clock::ClockError;
 use fm_command::CounterOverflow;
 use fm_scheduler::{ActionError, TickError};
 use fm_switcher::SwitcherError;
-use fm_types::{InputId, MAX_INPUT_NAME_BYTES};
+use fm_types::{InputId, MAX_INPUT_NAME_BYTES, OutputId};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShowError {
@@ -14,6 +14,9 @@ pub enum ShowError {
     DuplicateInputName,
     NoInputs,
     DuplicateInput,
+    EmptyOutputName,
+    DuplicateOutputName,
+    DuplicateOutput(OutputId),
     UnknownInput(InputId),
     Switcher(SwitcherError),
 }
@@ -30,6 +33,11 @@ impl fmt::Display for ShowError {
             Self::DuplicateInputName => formatter.write_str("show input names must be unique"),
             Self::NoInputs => formatter.write_str("show must contain at least one input"),
             Self::DuplicateInput => formatter.write_str("show input identifiers must be unique"),
+            Self::EmptyOutputName => formatter.write_str("show output names must not be empty"),
+            Self::DuplicateOutputName => formatter.write_str("show output names must be unique"),
+            Self::DuplicateOutput(output) => {
+                write!(formatter, "show output identifier {output} is duplicated")
+            }
             Self::UnknownInput(input) => write!(formatter, "show does not contain input {input}"),
             Self::Switcher(error) => error.fmt(formatter),
         }

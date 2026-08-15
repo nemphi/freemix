@@ -103,6 +103,7 @@ fn snapshot(revision: u64) -> SnapshotMessage {
         revision,
         show_name: "Studio test".to_owned(),
         inputs: input_statuses(),
+        outputs: Vec::new(),
         input_audio_strips: input_audio_strips(),
         desired_program: input(1),
         desired_preview: input(2),
