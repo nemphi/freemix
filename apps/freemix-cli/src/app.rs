@@ -79,6 +79,9 @@ pub fn run(command: Command) -> AppResult<()> {
             save_engine(&path, &project)?;
             print_status(&project);
         }
+        Command::InputAdd { path, input, name } => {
+            add_input(&path, input_id(input)?, name)?;
+        }
         Command::Status { path } => print_status(&load_engine(&path)?),
         Command::AudioStrip {
             path,
@@ -1151,6 +1154,33 @@ fn sync_input_names(project: &mut Project, show: &ShowState) -> AppResult<()> {
 
 fn configure_stinger(path: &Path, config: StingerConfig) -> AppResult<()> {
     update_stingers(path, |project| project.set_stinger(config))
+}
+
+fn add_input(path: &Path, input: InputId, name: String) -> AppResult<()> {
+    let store = ProjectStore::new(path)?;
+    let stored = store.load()?;
+    let mut project = stored.project().clone();
+    project.add_input(Input {
+        id: input,
+        name,
+        kind: InputKind::Simulated(SimulatedInput::new(
+            SimulatedVideo::Bars,
+            SimulatedAudio::Silence,
+        )),
+        required_capabilities: Vec::new(),
+    });
+    let configured = StoredProject::from_project_with_complete_runtime_state(
+        project,
+        stored.runtime_routing(),
+        stored.runtime_manual_transitions(),
+        stored.runtime_fade_to_black(),
+        stored.runtime_overlays().clone(),
+        stored.position(),
+        stored.idempotency_receipts().to_vec(),
+    )?;
+    store.save(&configured)?;
+    print_status(&load_engine(path)?);
+    Ok(())
 }
 
 fn remove_stinger(path: &Path, slot: StingerSlotNumber) -> AppResult<()> {

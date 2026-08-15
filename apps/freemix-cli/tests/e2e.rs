@@ -10,6 +10,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use fm_model::{InputKind, SimulatedAudio, SimulatedVideo};
+use fm_persistence::ProjectStore;
 use fm_protocol::{
     CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, ClientType, CommandMessage, CommandPayload,
     CommandResult, EngineIdentity, EventCursor, EventMessage, EventPayload, HandshakeOutcome,
@@ -17,6 +19,7 @@ use fm_protocol::{
     RuntimeEventMessage, RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage, SnapshotReason,
     WireInputId, WireMessage, decode_line, encode_line,
 };
+use fm_types::InputId;
 
 static TEST_ROOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -1808,6 +1811,40 @@ fn local_fade_to_black_settles_persists_and_reverses() {
     assert!(stdout(&live).contains("FTB(desired=live@0/65535, realized=live@0/65535)"));
     assert_eq!(status(&context.project), stdout(&live));
 
+    fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
+fn local_input_add_persists_default_simulated_strip() {
+    let context = ContractContext::new();
+    assert_success(&invoke(&["new", context.project_path()]));
+    let name = "Exact  input name  ";
+    let added = invoke(&["input-add", context.project_path(), "3", name]);
+    assert_success(&added);
+
+    let stored = ProjectStore::new(&context.project).unwrap().load().unwrap();
+    let input = stored
+        .project()
+        .inputs()
+        .iter()
+        .find(|input| input.id == InputId::new(NonZeroU128::new(3).unwrap()))
+        .unwrap();
+    assert_eq!(input.name, name);
+    assert!(matches!(
+        &input.kind,
+        InputKind::Simulated(simulated)
+            if simulated.video == SimulatedVideo::Bars
+                && simulated.audio == SimulatedAudio::Silence
+    ));
+    assert_eq!(
+        stored.project().input_audio_strip(input.id).unwrap(),
+        Default::default()
+    );
+
+    let before_duplicate = manifest(&context.project);
+    let duplicate = invoke(&["input-add", context.project_path(), "3", "Other"]);
+    assert_failure_contains(&duplicate, "domain project failed validation");
+    assert_eq!(manifest(&context.project), before_duplicate);
     fs::remove_dir_all(context.root).unwrap();
 }
 

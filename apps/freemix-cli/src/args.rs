@@ -71,6 +71,11 @@ pub enum Command {
         path: PathBuf,
         name: String,
     },
+    InputAdd {
+        path: PathBuf,
+        input: u128,
+        name: String,
+    },
     Status {
         path: PathBuf,
     },
@@ -467,6 +472,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
     };
     match command.as_str() {
         "new" => parse_new(arguments),
+        "input-add" => parse_input_add(arguments),
         "status" => {
             let path = required_path(&mut arguments, "project path")?;
             reject_extra(&mut arguments)?;
@@ -862,6 +868,14 @@ fn parse_new(mut arguments: impl Iterator<Item = String>) -> Result<Command, Arg
         }
     }
     Ok(Command::New { path, name })
+}
+
+fn parse_input_add(mut arguments: impl Iterator<Item = String>) -> Result<Command, ArgsError> {
+    let path = required_path(&mut arguments, "project path")?;
+    let input = number(&required(&mut arguments, "input")?, "input")?;
+    let name = required(&mut arguments, "input name")?;
+    reject_extra(&mut arguments)?;
+    Ok(Command::InputAdd { path, input, name })
 }
 
 fn parse_local_timed_transition(
