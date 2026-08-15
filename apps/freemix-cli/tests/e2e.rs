@@ -47,7 +47,7 @@ impl FakeRemoteServer {
         Self::start_test_peer(|stream| {
             stream.set_read_timeout(Some(TEST_PEER_TIMEOUT)).unwrap();
             let mut reader = BufReader::new(stream);
-            assert_handshake_request(read_message(&mut reader));
+            assert_handshake_request_viewer(read_message(&mut reader));
             let mut byte = [0];
             assert_eq!(reader.get_mut().read(&mut byte).unwrap(), 0);
         })
@@ -63,7 +63,7 @@ impl FakeRemoteServer {
             stream.set_write_timeout(Some(TEST_PEER_TIMEOUT)).unwrap();
             let mut writer = stream.try_clone().unwrap();
             let mut reader = BufReader::new(stream);
-            assert_handshake_request(read_message(&mut reader));
+            assert_handshake_request_viewer(read_message(&mut reader));
             if let Err(error) = writer.write_all(&vec![b'x'; MAX_LINE_BYTES + 1]) {
                 assert!(matches!(
                     error.kind(),
@@ -195,8 +195,13 @@ fn serve_remote_sessions(listener: &TcpListener) {
         let (stream, _) = listener.accept().unwrap();
         let mut writer = stream.try_clone().unwrap();
         let mut reader = BufReader::new(stream);
-        assert_handshake_request(read_message(&mut reader));
-        write_handshake(&mut writer, &engine, revision);
+        let role = if matches!(session, 0 | 4) {
+            Role::Viewer
+        } else {
+            Role::Operator
+        };
+        assert_handshake_request_role(read_message(&mut reader), role);
+        write_handshake_role(&mut writer, &engine, revision, role);
 
         if matches!(session, 0 | 4) {
             continue;
@@ -252,7 +257,7 @@ fn serve_diagnostics_peer(stream: TcpStream, response_log_id: &str) {
     let mut reader = BufReader::new(stream);
     let hello = read_message(&mut reader);
     assert_handshake_request_viewer(hello);
-    write_handshake(&mut writer, &engine, 0);
+    write_handshake_role(&mut writer, &engine, 0, Role::Viewer);
     let WireMessage::DiagnosticsRequest(request) = read_message(&mut reader) else {
         panic!("expected diagnostics request");
     };
@@ -290,10 +295,14 @@ fn serve_diagnostics_peer(stream: TcpStream, response_log_id: &str) {
 }
 
 fn assert_handshake_request_viewer(message: WireMessage) {
+    assert_handshake_request_role(message, Role::Viewer);
+}
+
+fn assert_handshake_request_role(message: WireMessage, expected_role: Role) {
     let WireMessage::HandshakeRequest(hello) = message else {
         panic!("expected handshake request");
     };
-    assert_eq!(hello.desired_role, Role::Viewer);
+    assert_eq!(hello.desired_role, expected_role);
     assert_eq!(hello.client_type, ClientType::Cli);
     assert_eq!(hello.protocol, CURRENT_PROTOCOL_VERSION);
     assert_eq!(hello.resume_cursor, None);
@@ -767,6 +776,7 @@ fn serve_manual_position(listener: &TcpListener) {
         0,
         fm_protocol::CURRENT_PROTOCOL_VERSION,
         initial_manual,
+        Role::Operator,
     );
 
     let WireMessage::Command(command) = read_message(&mut reader) else {
@@ -835,31 +845,26 @@ fn serve_manual_position(listener: &TcpListener) {
 }
 
 fn assert_handshake_request(message: WireMessage) {
-    let WireMessage::HandshakeRequest(hello) = message else {
-        panic!("expected handshake request");
-    };
-    assert_eq!(hello.protocol, CURRENT_PROTOCOL_VERSION);
-    assert_eq!(hello.client_type, ClientType::Cli);
-    assert_eq!(hello.desired_role, Role::Operator);
-    assert_eq!(hello.resume_cursor, None);
+    assert_handshake_request_role(message, Role::Operator);
 }
 
 fn write_handshake(writer: &mut TcpStream, engine: &EngineIdentity, revision: u64) {
-    write_handshake_version(writer, engine, revision, CURRENT_PROTOCOL_VERSION);
+    write_handshake_role(writer, engine, revision, Role::Operator);
 }
 
-fn write_handshake_version(
+fn write_handshake_role(
     writer: &mut TcpStream,
     engine: &EngineIdentity,
     revision: u64,
-    protocol: ProtocolVersion,
+    role: Role,
 ) {
     write_handshake_version_with_manual(
         writer,
         engine,
         revision,
-        protocol,
+        CURRENT_PROTOCOL_VERSION,
         fm_protocol::ManualTransitionStatus::Inactive,
+        role,
     );
 }
 
@@ -869,13 +874,15 @@ fn write_handshake_version_with_manual(
     revision: u64,
     protocol: ProtocolVersion,
     manual_transition: fm_protocol::ManualTransitionStatus,
+    role: Role,
 ) {
+    let permissions = handshake_permissions(role);
     write_message(
         writer,
         &WireMessage::HandshakeResponse(HandshakeResponse {
             protocol,
-            granted_role: Role::Operator,
-            permissions: vec!["switcher.write".into()],
+            granted_role: role,
+            permissions,
             capabilities: CapabilityReportSummary {
                 digest: "fake-capabilities".into(),
                 total: 0,
@@ -915,6 +922,22 @@ fn write_handshake_version_with_manual(
     );
 }
 
+fn handshake_permissions(role: Role) -> Vec<String> {
+    match role {
+        Role::Viewer => vec!["view_status".into()],
+        Role::Operator => [
+            "view_status",
+            "select_preview",
+            "transition",
+            "control_audio",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
+        _ => unreachable!("test handshake role must be Viewer or Operator"),
+    }
+}
+
 fn write_handshake_version_with_fade_to_black(
     writer: &mut TcpStream,
     engine: &EngineIdentity,
@@ -927,7 +950,7 @@ fn write_handshake_version_with_fade_to_black(
         &WireMessage::HandshakeResponse(HandshakeResponse {
             protocol,
             granted_role: Role::Operator,
-            permissions: vec!["switcher.write".into()],
+            permissions: handshake_permissions(Role::Operator),
             capabilities: CapabilityReportSummary {
                 digest: "fake-capabilities".into(),
                 total: 0,

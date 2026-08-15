@@ -21,7 +21,7 @@ type RemoteResult<T> = Result<T, Box<dyn Error>>;
 const REMOTE_IO_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub fn status(address: SocketAddr) -> RemoteResult<()> {
-    let remote = Remote::connect(address, Role::Operator)?;
+    let remote = Remote::connect(address, Role::Viewer)?;
     remote.print_status()
 }
 
