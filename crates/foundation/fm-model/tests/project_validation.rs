@@ -628,7 +628,7 @@ fn scene_input_missing_scene_and_audio_references_are_reported() {
 }
 
 #[test]
-fn output_route_changes_only_sources_after_validating_all_references() {
+fn checked_output_creation_and_route_validate_references_without_mutation() {
     let mut project = valid_project();
     project.add_scene(Scene {
         id: scene_id(2),
@@ -636,11 +636,46 @@ fn output_route_changes_only_sources_after_validating_all_references() {
         background: Rgba8::OPAQUE_BLACK,
         layers: Vec::new(),
     });
-    project.add_audio_bus(AudioBus {
-        id: bus_id(2),
-        name: "Aux".into(),
-        sends: Vec::new(),
-    });
+    project
+        .add_audio_bus_checked(AudioBus {
+            id: bus_id(2),
+            name: "Aux".into(),
+            sends: Vec::new(),
+        })
+        .unwrap();
+    let buses_before_duplicate = project.audio_buses().to_vec();
+    assert!(matches!(
+        project.add_audio_bus_checked(AudioBus {
+            id: bus_id(3),
+            name: "mAsTeR".into(),
+            sends: Vec::new(),
+        }),
+        Err(fm_model::AddAudioBusError::DuplicateName)
+    ));
+    assert_eq!(project.audio_buses(), buses_before_duplicate);
+    project
+        .add_output_checked(Output {
+            id: output_id(2),
+            name: "Auxiliary".into(),
+            video_source: scene_id(2),
+            audio_source: bus_id(2),
+            startup: StartupPolicy::Stopped,
+            required_capabilities: Vec::new(),
+        })
+        .unwrap();
+    let outputs_before_duplicate = project.outputs().to_vec();
+    assert!(matches!(
+        project.add_output_checked(Output {
+            id: output_id(3),
+            name: "pRoGrAm".into(),
+            video_source: scene_id(2),
+            audio_source: bus_id(2),
+            startup: StartupPolicy::Stopped,
+            required_capabilities: Vec::new(),
+        }),
+        Err(fm_model::AddOutputError::DuplicateName)
+    ));
+    assert_eq!(project.outputs(), outputs_before_duplicate);
     let before = project.outputs().to_vec();
     project
         .set_output_route(output_id(1), scene_id(2), bus_id(2))

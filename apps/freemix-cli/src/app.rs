@@ -18,11 +18,11 @@ use fm_engine::{
     EngineManualTransitionKind, EngineManualTransitionPosition, EngineRestoreState, ShowState,
 };
 use fm_model::{
-    CropRect, Input, InputAudioStripState, InputBalanceBasisPoints, InputDelaySamples,
+    AudioBus, CropRect, Input, InputAudioStripState, InputBalanceBasisPoints, InputDelaySamples,
     InputGainMilliDb, InputKind, Layer, LayerGeometry, MainMix, Project, ProjectSettings, RectMask,
     Rgba8 as ModelRgba8, Rotation, Scene, SimulatedAudio, SimulatedInput, SimulatedVideo,
-    SolidColor, SourceRef, StingerAudioPolicy as ModelStingerAudioPolicy, StingerConfig,
-    StingerMissingMediaFallback, StingerSlotNumber,
+    SolidColor, SourceRef, StartupPolicy, StingerAudioPolicy as ModelStingerAudioPolicy,
+    StingerConfig, StingerMissingMediaFallback, StingerSlotNumber,
 };
 use fm_persistence::{
     FadeToBlackState as PersistedFadeToBlackState, IdempotencyReceipt,
@@ -83,6 +83,22 @@ pub fn run(command: Command) -> AppResult<()> {
         Command::InputAdd { path, input, name } => {
             add_input(&path, input_id(input)?, name)?;
         }
+        Command::AudioBusAdd { path, bus, name } => {
+            add_audio_bus(&path, bus_id(bus)?, name)?;
+        }
+        Command::OutputAdd {
+            path,
+            output,
+            scene,
+            bus,
+            name,
+        } => add_output(
+            &path,
+            output_id(output)?,
+            scene_id(scene)?,
+            bus_id(bus)?,
+            name,
+        )?,
         Command::OutputRoute {
             path,
             output,
@@ -1372,6 +1388,61 @@ fn add_scene_input(path: &Path, input: InputId, scene: SceneId, name: String) ->
     Ok(())
 }
 
+fn add_audio_bus(path: &Path, bus: BusId, name: String) -> AppResult<()> {
+    let store = ProjectStore::new(path)?;
+    let stored = load_stored_project(path)?;
+    let mut project = stored.project().clone();
+    project.add_audio_bus_checked(AudioBus {
+        id: bus,
+        name,
+        sends: Vec::new(),
+    })?;
+    let configured = StoredProject::from_project_with_complete_runtime_state(
+        project,
+        stored.runtime_routing(),
+        stored.runtime_manual_transitions(),
+        stored.runtime_fade_to_black(),
+        stored.runtime_overlays().clone(),
+        stored.position(),
+        stored.idempotency_receipts().to_vec(),
+    )?;
+    store.save(&configured)?;
+    print_status(&load_engine(path)?);
+    Ok(())
+}
+
+fn add_output(
+    path: &Path,
+    output: OutputId,
+    scene: SceneId,
+    bus: BusId,
+    name: String,
+) -> AppResult<()> {
+    let store = ProjectStore::new(path)?;
+    let stored = load_stored_project(path)?;
+    let mut project = stored.project().clone();
+    project.add_output_checked(fm_model::Output {
+        id: output,
+        name,
+        video_source: scene,
+        audio_source: bus,
+        startup: StartupPolicy::Stopped,
+        required_capabilities: Vec::new(),
+    })?;
+    let configured = StoredProject::from_project_with_complete_runtime_state(
+        project,
+        stored.runtime_routing(),
+        stored.runtime_manual_transitions(),
+        stored.runtime_fade_to_black(),
+        stored.runtime_overlays().clone(),
+        stored.position(),
+        stored.idempotency_receipts().to_vec(),
+    )?;
+    store.save(&configured)?;
+    print_status(&load_engine(path)?);
+    Ok(())
+}
+
 fn set_output_route(path: &Path, output: OutputId, scene: SceneId, bus: BusId) -> AppResult<()> {
     let store = ProjectStore::new(path)?;
     let stored = load_stored_project(path)?;
@@ -2466,7 +2537,9 @@ FreeMix deterministic MVP
 Usage:
   freemix-cli new <show.freemix> [--name <name>]
   freemix-cli input-add <show.freemix> <nonzero-input-id> <name>
-  freemix-cli output-route <preconfigured-show.freemix> <existing-output-id> <existing-scene-id> <existing-bus-id>
+  freemix-cli audio-bus-add <show.freemix> <nonzero-bus-id> <name>
+  freemix-cli output-add <show.freemix> <nonzero-output-id> <nonzero-scene-id> <nonzero-bus-id> <name>
+  freemix-cli output-route <show.freemix> <existing-output-id> <existing-scene-id> <existing-bus-id>
   freemix-cli scene-input-add <show.freemix> <nonzero-input-id> <nonzero-scene-id> <name>
   freemix-cli scene-input-audio-source <show.freemix> <scene-input-id> <source-input-id>
   freemix-cli scene-input-audio-source-clear <show.freemix> <scene-input-id>

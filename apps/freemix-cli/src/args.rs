@@ -76,6 +76,18 @@ pub enum Command {
         input: u128,
         name: String,
     },
+    AudioBusAdd {
+        path: PathBuf,
+        bus: u128,
+        name: String,
+    },
+    OutputAdd {
+        path: PathBuf,
+        output: u128,
+        scene: u128,
+        bus: u128,
+        name: String,
+    },
     OutputRoute {
         path: PathBuf,
         output: u128,
@@ -601,6 +613,8 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
     match command.as_str() {
         "new" => parse_new(arguments),
         "input-add" => parse_input_add(arguments),
+        "audio-bus-add" => parse_audio_bus_add(arguments),
+        "output-add" => parse_output_add(arguments),
         "output-route" => parse_output_route(arguments),
         "scene-input-add" => parse_scene_input_add(arguments),
         "scene-input-audio-source" => parse_scene_input_audio_source(arguments),
@@ -748,6 +762,30 @@ fn parse_output_route(mut arguments: impl Iterator<Item = String>) -> Result<Com
         output,
         scene,
         bus,
+    })
+}
+
+fn parse_audio_bus_add(mut arguments: impl Iterator<Item = String>) -> Result<Command, ArgsError> {
+    let path = required_path(&mut arguments, "project path")?;
+    let bus = number(&required(&mut arguments, "bus")?, "bus")?;
+    let name = nonblank(&mut arguments, "bus name")?;
+    reject_extra(&mut arguments)?;
+    Ok(Command::AudioBusAdd { path, bus, name })
+}
+
+fn parse_output_add(mut arguments: impl Iterator<Item = String>) -> Result<Command, ArgsError> {
+    let path = required_path(&mut arguments, "project path")?;
+    let output = number(&required(&mut arguments, "output")?, "output")?;
+    let scene = number(&required(&mut arguments, "scene")?, "scene")?;
+    let bus = number(&required(&mut arguments, "bus")?, "bus")?;
+    let name = nonblank(&mut arguments, "output name")?;
+    reject_extra(&mut arguments)?;
+    Ok(Command::OutputAdd {
+        path,
+        output,
+        scene,
+        bus,
+        name,
     })
 }
 

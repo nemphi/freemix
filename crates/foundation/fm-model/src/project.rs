@@ -24,6 +24,20 @@ pub enum SetOutputRouteError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AddAudioBusError {
+    DuplicateId(BusId),
+    DuplicateName,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AddOutputError {
+    DuplicateId(OutputId),
+    DuplicateName,
+    UnknownScene(SceneId),
+    UnknownBus(BusId),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AddSceneLayerError {
     UnknownScene(SceneId),
 }
@@ -135,6 +149,30 @@ impl std::fmt::Display for SetOutputRouteError {
 }
 
 impl std::error::Error for SetOutputRouteError {}
+
+impl std::fmt::Display for AddAudioBusError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DuplicateId(id) => write!(formatter, "duplicate audio bus {id}"),
+            Self::DuplicateName => formatter.write_str("duplicate audio bus name"),
+        }
+    }
+}
+
+impl std::error::Error for AddAudioBusError {}
+
+impl std::fmt::Display for AddOutputError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DuplicateId(id) => write!(formatter, "duplicate output {id}"),
+            Self::DuplicateName => formatter.write_str("duplicate output name"),
+            Self::UnknownScene(scene) => write!(formatter, "unknown scene {scene}"),
+            Self::UnknownBus(bus) => write!(formatter, "unknown audio bus {bus}"),
+        }
+    }
+}
+
+impl std::error::Error for AddOutputError {}
 
 impl std::fmt::Display for RemoveInputError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -603,8 +641,60 @@ impl Project {
         self.audio_buses.push(bus);
     }
 
+    pub fn add_audio_bus_checked(&mut self, bus: AudioBus) -> Result<(), AddAudioBusError> {
+        if self
+            .audio_buses
+            .iter()
+            .any(|candidate| candidate.id == bus.id)
+        {
+            return Err(AddAudioBusError::DuplicateId(bus.id));
+        }
+        if self
+            .audio_buses
+            .iter()
+            .any(|candidate| candidate.name.eq_ignore_ascii_case(&bus.name))
+        {
+            return Err(AddAudioBusError::DuplicateName);
+        }
+        self.audio_buses.push(bus);
+        Ok(())
+    }
+
     pub fn add_output(&mut self, output: Output) {
         self.outputs.push(output);
+    }
+
+    pub fn add_output_checked(&mut self, output: Output) -> Result<(), AddOutputError> {
+        if self
+            .outputs
+            .iter()
+            .any(|candidate| candidate.id == output.id)
+        {
+            return Err(AddOutputError::DuplicateId(output.id));
+        }
+        if self
+            .outputs
+            .iter()
+            .any(|candidate| candidate.name.eq_ignore_ascii_case(&output.name))
+        {
+            return Err(AddOutputError::DuplicateName);
+        }
+        if !self
+            .scenes
+            .iter()
+            .any(|candidate| candidate.id == output.video_source)
+        {
+            return Err(AddOutputError::UnknownScene(output.video_source));
+        }
+        if !self
+            .audio_buses
+            .iter()
+            .any(|candidate| candidate.id == output.audio_source)
+        {
+            return Err(AddOutputError::UnknownBus(output.audio_source));
+        }
+        self.outputs.push(output);
+        Ok(())
     }
 
     pub fn set_output_route(

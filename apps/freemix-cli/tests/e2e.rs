@@ -11,8 +11,8 @@ use std::{
 };
 
 use fm_model::{
-    AudioBus, InputKind, LayerGeometry, Output as ModelOutput, RectMask, Rgba8, Rotation, Scene,
-    SimulatedAudio, SimulatedInput, SimulatedVideo, SourceRef, StartupPolicy,
+    InputKind, LayerGeometry, RectMask, Rgba8, Rotation, SimulatedAudio, SimulatedInput,
+    SimulatedVideo, SourceRef, StartupPolicy,
 };
 use fm_persistence::{MutationBatch, ProjectStore, StoredProject};
 use fm_protocol::{
@@ -1948,58 +1948,102 @@ fn journal_bytes(store: &ProjectStore) -> Vec<(PathBuf, Vec<u8>)> {
 fn local_output_route_persists_existing_route_and_rejects_unknown_reference() {
     let context = ContractContext::new();
     assert_success(&invoke(&["new", context.project_path()]));
+    assert_success(&invoke(&[
+        "scene-input-add",
+        context.project_path(),
+        "10",
+        "10",
+        "Wide",
+    ]));
+    assert_success(&invoke(&[
+        "scene-input-add",
+        context.project_path(),
+        "11",
+        "11",
+        "Close",
+    ]));
+    assert_success(&invoke(&[
+        "audio-bus-add",
+        context.project_path(),
+        "20",
+        "Master",
+    ]));
+    assert_success(&invoke(&[
+        "audio-bus-add",
+        context.project_path(),
+        "21",
+        "Aux",
+    ]));
+    assert_success(&invoke(&[
+        "output-add",
+        context.project_path(),
+        "30",
+        "10",
+        "20",
+        "Program",
+    ]));
+    assert_success(&invoke(&[
+        "output-add",
+        context.project_path(),
+        "31",
+        "11",
+        "21",
+        "Auxiliary",
+    ]));
     let store = ProjectStore::new(&context.project).unwrap();
-    let initial = store.load().unwrap();
-    let mut project = initial.project().clone();
-    let scene_wide = SceneId::new(NonZeroU128::new(10).unwrap());
-    let scene_close = SceneId::new(NonZeroU128::new(11).unwrap());
-    let bus_master = BusId::new(NonZeroU128::new(20).unwrap());
-    let bus_aux = BusId::new(NonZeroU128::new(21).unwrap());
-    let output_id = OutputId::new(NonZeroU128::new(30).unwrap());
-    for (id, name) in [(scene_wide, "Wide"), (scene_close, "Close")] {
-        project.add_scene(Scene {
-            id,
-            name: name.into(),
-            background: Rgba8::OPAQUE_BLACK,
-            layers: Vec::new(),
-        });
-    }
-    for (id, name) in [(bus_master, "Master"), (bus_aux, "Aux")] {
-        project.add_audio_bus(AudioBus {
-            id,
-            name: name.into(),
-            sends: Vec::new(),
-        });
-    }
-    project.add_output(ModelOutput {
-        id: output_id,
-        name: "Program".into(),
-        video_source: scene_wide,
-        audio_source: bus_master,
-        startup: StartupPolicy::ReconcileDesiredState,
-        required_capabilities: vec!["output.test".into()],
-    });
-    let configured = StoredProject::from_project_with_complete_runtime_state(
-        project,
-        initial.runtime_routing(),
-        initial.runtime_manual_transitions(),
-        initial.runtime_fade_to_black(),
-        initial.runtime_overlays().clone(),
-        initial.position(),
-        initial.idempotency_receipts().to_vec(),
-    )
-    .unwrap();
-    store.save(&configured).unwrap();
     let before = store.load().unwrap();
-    let mut expected_project = before.project().clone();
-    expected_project
-        .set_output_route(output_id, scene_close, bus_aux)
-        .unwrap();
+    assert_eq!(before.project().audio_buses().len(), 2);
+    assert_eq!(
+        before.project().audio_buses()[0].id,
+        BusId::new(NonZeroU128::new(20).unwrap())
+    );
+    assert_eq!(before.project().audio_buses()[0].name, "Master");
+    assert!(before.project().audio_buses()[0].sends.is_empty());
+    assert_eq!(
+        before.project().audio_buses()[1].id,
+        BusId::new(NonZeroU128::new(21).unwrap())
+    );
+    assert_eq!(before.project().audio_buses()[1].name, "Aux");
+    assert!(before.project().audio_buses()[1].sends.is_empty());
+    assert_eq!(before.project().outputs().len(), 2);
+    assert_eq!(
+        before.project().outputs()[0].id,
+        OutputId::new(NonZeroU128::new(30).unwrap())
+    );
+    assert_eq!(
+        before.project().outputs()[0].video_source,
+        SceneId::new(NonZeroU128::new(10).unwrap())
+    );
+    assert_eq!(
+        before.project().outputs()[0].audio_source,
+        BusId::new(NonZeroU128::new(20).unwrap())
+    );
+    assert_eq!(
+        before.project().outputs()[0].startup,
+        StartupPolicy::Stopped
+    );
+    assert!(
+        before.project().outputs()[0]
+            .required_capabilities
+            .is_empty()
+    );
+    assert_eq!(
+        before.project().outputs()[1].id,
+        OutputId::new(NonZeroU128::new(31).unwrap())
+    );
 
     let changed = invoke(&["output-route", context.project_path(), "30", "11", "21"]);
     assert_success(&changed);
     let after = store.load().unwrap();
-    assert_eq!(after.project(), &expected_project);
+    assert_eq!(
+        after.project().outputs()[0].video_source,
+        SceneId::new(NonZeroU128::new(11).unwrap())
+    );
+    assert_eq!(
+        after.project().outputs()[0].audio_source,
+        BusId::new(NonZeroU128::new(21).unwrap())
+    );
+    assert_eq!(after.project().outputs()[1], before.project().outputs()[1]);
     assert_eq!(after.runtime_routing(), before.runtime_routing());
     assert_eq!(
         after.runtime_manual_transitions(),
@@ -2015,12 +2059,52 @@ fn local_output_route_persists_existing_route_and_rejects_unknown_reference() {
     assert_success(&invoke(&["status", context.project_path()]));
 
     let unchanged_manifest = fs::read(context.project.join("project.json")).unwrap();
-    let rejected = invoke(&["output-route", context.project_path(), "30", "999", "21"]);
+    let rejected = invoke(&["audio-bus-add", context.project_path(), "22", "mAsTeR"]);
+    assert_failure_contains(&rejected, "duplicate audio bus name");
+    assert_eq!(
+        fs::read(context.project.join("project.json")).unwrap(),
+        unchanged_manifest
+    );
+    let rejected = invoke(&[
+        "output-add",
+        context.project_path(),
+        "32",
+        "10",
+        "20",
+        "pRoGrAm",
+    ]);
+    assert_failure_contains(&rejected, "duplicate output name");
+    assert_eq!(
+        fs::read(context.project.join("project.json")).unwrap(),
+        unchanged_manifest
+    );
+    let rejected = invoke(&[
+        "output-add",
+        context.project_path(),
+        "32",
+        "999",
+        "20",
+        "New",
+    ]);
     assert_failure_contains(&rejected, "unknown scene 999");
     assert_eq!(
         fs::read(context.project.join("project.json")).unwrap(),
         unchanged_manifest
     );
+    let rejected = invoke(&[
+        "output-add",
+        context.project_path(),
+        "32",
+        "10",
+        "999",
+        "New",
+    ]);
+    assert_failure_contains(&rejected, "unknown audio bus 999");
+    assert_eq!(
+        fs::read(context.project.join("project.json")).unwrap(),
+        unchanged_manifest
+    );
+    assert_success(&invoke(&["status", context.project_path()]));
     fs::remove_dir_all(context.root).unwrap();
 }
 

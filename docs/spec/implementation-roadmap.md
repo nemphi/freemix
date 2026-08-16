@@ -139,8 +139,8 @@ described under Phase 3 item 4 instead of rejecting scene inputs. Feathered or
 non-rectangular masks, keys, effects, per-output realization, live
 edits/replanning, and cross-platform or hardware certification remain outside
 this item, so its parity rows remain planned; the CLI now provides a bounded
-local persisted output-route editor for existing outputs, scenes, and buses in
-a preconfigured project, while SW-012 remains planned for runtime output
+local CLI can construct buses and outputs, then edit routes, for the next-open
+project, while SW-012 remains planned for runtime output
 realization, clean feed/fullscreen/health/recovery, and live acceptance.
 
 Current implementation boundary for item 5: `freemix-studio` opens a native
