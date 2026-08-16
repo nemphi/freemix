@@ -24,11 +24,12 @@ use fm_persistence::{
 };
 use fm_protocol::{
     CURRENT_PROTOCOL_VERSION, ClientType, CommandMessage, CommandPayload, CommandResult,
-    DiagnosticsRequest, DiagnosticsResponse, EngineIdentity, EventCursor, HandshakeOutcome,
-    HandshakeRequest, HeartbeatMessage, ManualTransitionKind, ManualTransitionPosition,
-    ManualTransitionStatus, ProtocolVersion, ResumeCursor, Role, RuntimeLifecycleEvent,
-    ServerIdentity, SnapshotReason, StingerAudioPolicy, StingerMissingMediaFallback, WireInputId,
-    WireMessage, WireStingerSlotId, decode_line, encode_line,
+    DiagnosticsRequest, DiagnosticsResponse, EngineIdentity, EventCursor, EventPayload,
+    HandshakeOutcome, HandshakeRequest, HeartbeatMessage, ManualTransitionKind,
+    ManualTransitionPosition, ManualTransitionStatus, ProtocolVersion, ResumeCursor, Role,
+    RuntimeLifecycleEvent, ServerIdentity, SnapshotReason, StingerAudioPolicy,
+    StingerMissingMediaFallback, WireInputId, WireMessage, WireStingerSlotId, decode_line,
+    encode_line,
 };
 use fm_types::{
     AudioFormat, BusId, ChannelLayout, ColorMetadata, FrameRate, InputId, OutputId, PixelFormat,
@@ -76,6 +77,54 @@ impl Daemon {
 
     fn start_without_once(project: &Path) -> Self {
         Self::start_with_once(project, false)
+    }
+
+    fn start_web(project: &Path, token: &str) -> (Self, SocketAddr) {
+        let mut child = ProcessCommand::new(env!("CARGO_BIN_EXE_freemixd"))
+            .arg("serve")
+            .arg(project)
+            .args(["--listen", "127.0.0.1:0", "--web-listen", "127.0.0.1:0"])
+            .env("FREEMIXD_WEB_TOKEN", token)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let mut output = BufReader::new(stdout);
+        let mut line = String::new();
+        output.read_line(&mut line).unwrap();
+        let readiness = line.parse::<ReadinessRecord>().unwrap_or_else(|error| {
+            if !terminate_child(&mut child) {
+                panic!(
+                    "daemon did not become ready: {error}; stdout={line:?}; cleanup timed out after one second"
+                );
+            }
+            panic!(
+                "daemon did not become ready: {error}; stdout={line:?}, stderr={:?}",
+                child_stderr(&mut child)
+            );
+        });
+        let mut web_line = String::new();
+        output.read_line(&mut web_line).unwrap();
+        let web_address = web_line
+            .strip_prefix("FREEMIXD_WEB_READY\tv=1\taddress=")
+            .and_then(|line| line.strip_suffix('\n'))
+            .and_then(|address| address.parse().ok())
+            .unwrap_or_else(|| {
+                let stopped = terminate_child(&mut child);
+                panic!(
+                    "daemon did not publish exact web readiness: stdout={line:?}{web_line:?}; cleanup_stopped={stopped}; stderr={:?}",
+                    child_stderr(&mut child)
+                );
+            });
+        (
+            Self {
+                child: Some(child),
+                address: readiness.address,
+                project_id: readiness.project_id,
+            },
+            web_address,
+        )
     }
 
     fn start_with_once(project: &Path, once: bool) -> Self {
@@ -1775,6 +1824,182 @@ fn sigterm_notifies_established_client_then_exits_cleanly() {
         } if backoff.attempt == 1
     ));
     daemon.wait_success();
+}
+
+#[cfg(unix)]
+#[test]
+fn websocket_control_is_authenticated_ordered_and_raw_compatible() {
+    let directory = TestDirectory::new("websocket-control");
+    let project_path = directory.project_path();
+    create_project(&project_path);
+    let configured_token = "configured-token-0123456789abcdef";
+    let presented_token = "presented-token-0123456789abcdef";
+    let (daemon, web_address) = Daemon::start_web(&project_path, configured_token);
+    let timeout = Duration::from_secs(1);
+    let request = |token: &str| {
+        tungstenite::http::Request::builder()
+            .uri(format!("ws://{web_address}/v1/control"))
+            .header("Host", web_address.to_string())
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Version", "13")
+            .header(
+                "Sec-WebSocket-Key",
+                tungstenite::handshake::client::generate_key(),
+            )
+            .header("Authorization", format!("Bearer {token}"))
+            .body(())
+            .unwrap()
+    };
+    let configure = |stream: &TcpStream| {
+        stream.set_read_timeout(Some(timeout)).unwrap();
+        stream.set_write_timeout(Some(timeout)).unwrap();
+    };
+
+    let unauthorized_stream = TcpStream::connect_timeout(&web_address, timeout).unwrap();
+    configure(&unauthorized_stream);
+    let unauthorized_request = request(presented_token);
+    match tungstenite::client::client(unauthorized_request, unauthorized_stream) {
+        Err(tungstenite::HandshakeError::Failure(tungstenite::Error::Http(response))) => {
+            assert_eq!(
+                response.status(),
+                tungstenite::http::StatusCode::UNAUTHORIZED
+            );
+            let response = format!("{response:?}");
+            assert!(!response.contains(configured_token));
+            assert!(!response.contains(presented_token));
+        }
+        result => panic!("unauthorized WebSocket upgrade result: {result:?}"),
+    }
+
+    let websocket_stream = TcpStream::connect_timeout(&web_address, timeout).unwrap();
+    configure(&websocket_stream);
+    let websocket_request = request(configured_token);
+    let (mut websocket, _) =
+        tungstenite::client::client(websocket_request, websocket_stream).unwrap();
+    let receive = |websocket: &mut tungstenite::WebSocket<TcpStream>| -> WireMessage {
+        match websocket.read().unwrap() {
+            tungstenite::Message::Text(text) => {
+                assert!(text.as_str().ends_with('\n'));
+                decode_line(text.as_str()).unwrap()
+            }
+            message => panic!("expected WebSocket text frame, got {message:?}"),
+        }
+    };
+    let send = |websocket: &mut tungstenite::WebSocket<TcpStream>, message: &WireMessage| {
+        websocket
+            .send(tungstenite::Message::text(encode_line(message).unwrap()))
+            .unwrap();
+    };
+    send(
+        &mut websocket,
+        &WireMessage::HandshakeRequest(HandshakeRequest {
+            protocol: CURRENT_PROTOCOL_VERSION,
+            build: "process-test".into(),
+            client_type: ClientType::Integration,
+            desired_role: Role::Operator,
+            resume_cursor: None,
+        }),
+    );
+    assert!(matches!(
+        receive(&mut websocket),
+        WireMessage::HandshakeResponse(response)
+            if response.protocol == CURRENT_PROTOCOL_VERSION
+                && response.granted_role == Role::Operator
+    ));
+    assert!(matches!(receive(&mut websocket), WireMessage::Snapshot(_)));
+
+    let mut raw_session = TcpSession::new(
+        ProtocolClient::new(ClientConfig::new(
+            "process-test",
+            ClientType::Integration,
+            Role::Operator,
+            "raw-process-client",
+            project_id(),
+        ))
+        .unwrap(),
+    );
+    assert!(matches!(
+        raw_session.connect(daemon.address, timeout).unwrap(),
+        SessionEvent::Connected { .. }
+    ));
+    assert_eq!(raw_session.client().state(), &ConnectionState::Ready);
+
+    send(
+        &mut websocket,
+        &command_version(
+            CURRENT_PROTOCOL_VERSION,
+            "web-cut",
+            "web-cut-key",
+            CommandPayload::Cut,
+        ),
+    );
+    assert!(matches!(
+        receive(&mut websocket),
+        WireMessage::CommandResult(CommandResult::Accepted { id, revision: 1, .. })
+            if id == "web-cut"
+    ));
+    let WireMessage::Event(event) = receive(&mut websocket) else {
+        panic!("expected durable switcher event");
+    };
+    assert_eq!(event.cursor.revision, 1);
+    assert!(matches!(
+        event.payload,
+        EventPayload::DesiredSwitcher { program, preview, .. }
+            if program == input(2) && preview == input(1)
+    ));
+    let WireMessage::RuntimeEvent(runtime) = receive(&mut websocket) else {
+        panic!("expected switcher runtime event");
+    };
+    assert_eq!(runtime.revision, 1);
+    assert!(matches!(
+        runtime.event,
+        RuntimeLifecycleEvent::Realized { domain, .. } if domain == "switcher"
+    ));
+
+    let status = ProcessCommand::new("/bin/kill")
+        .args(["-TERM", &daemon.child.as_ref().unwrap().id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success(), "SIGTERM command failed: {status}");
+    assert!(matches!(
+        receive(&mut websocket),
+        WireMessage::Error(error) if error.error.code == "server_shutting_down"
+    ));
+    assert!(matches!(
+        websocket.read(),
+        Ok(tungstenite::Message::Close(_)) | Err(_)
+    ));
+    let deadline = Instant::now() + timeout;
+    loop {
+        match raw_session
+            .receive_cancellable(Duration::from_millis(25), || Instant::now() >= deadline)
+            .unwrap()
+        {
+            SessionEvent::Disconnected {
+                cause: DisconnectCause::ServerShutdown,
+                ..
+            } => break,
+            SessionEvent::Disconnected { cause, .. } => {
+                panic!("raw client disconnected unexpectedly: {cause:?}")
+            }
+            _ => assert!(Instant::now() < deadline, "raw client shutdown timed out"),
+        }
+    }
+    drop(websocket);
+    drop(raw_session);
+    daemon.wait_success();
+
+    let stored = ProjectStore::new(&project_path).unwrap().load().unwrap();
+    assert_eq!(stored.position().revision, 1);
+    assert!(stored.idempotency_receipts().iter().any(|receipt| {
+        receipt.key() == "web-cut-key"
+            && receipt.command_id() == "web-cut"
+            && matches!(
+                receipt.outcome(),
+                fm_persistence::ReceiptOutcome::Accepted { revision: 1, .. }
+            )
+    }));
 }
 
 #[test]
