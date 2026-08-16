@@ -39,6 +39,96 @@ pub enum DuplicateSceneInputError {
     InvalidProject(Vec<ValidationError>),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AddSceneInputError {
+    DuplicateSceneId(SceneId),
+    DuplicateInputId(InputId),
+    EmptySceneName,
+    DuplicateSceneName,
+    EmptyInputName,
+    InputNameTooLong,
+    DuplicateInputName,
+    InvalidProject(Vec<ValidationError>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NewSceneInputError {
+    DuplicateSceneId(SceneId),
+    DuplicateInputId(InputId),
+    EmptySceneName,
+    DuplicateSceneName,
+    EmptyInputName,
+    InputNameTooLong,
+    DuplicateInputName,
+}
+
+impl Project {
+    fn validate_new_scene_input(
+        &self,
+        scene: SceneId,
+        scene_name: &str,
+        input: InputId,
+        input_name: &str,
+    ) -> Result<(), NewSceneInputError> {
+        if self.scenes.iter().any(|candidate| candidate.id == scene) {
+            return Err(NewSceneInputError::DuplicateSceneId(scene));
+        }
+        if self.inputs.iter().any(|candidate| candidate.id == input) {
+            return Err(NewSceneInputError::DuplicateInputId(input));
+        }
+        if scene_name.trim().is_empty() {
+            return Err(NewSceneInputError::EmptySceneName);
+        }
+        if self
+            .scenes
+            .iter()
+            .any(|candidate| candidate.name.eq_ignore_ascii_case(scene_name))
+        {
+            return Err(NewSceneInputError::DuplicateSceneName);
+        }
+        if input_name.trim().is_empty() {
+            return Err(NewSceneInputError::EmptyInputName);
+        }
+        if input_name.len() > fm_types::MAX_INPUT_NAME_BYTES {
+            return Err(NewSceneInputError::InputNameTooLong);
+        }
+        if self
+            .inputs
+            .iter()
+            .any(|candidate| candidate.name == input_name)
+        {
+            return Err(NewSceneInputError::DuplicateInputName);
+        }
+        Ok(())
+    }
+}
+
+macro_rules! map_new_scene_input_error {
+    ($error:expr, $target:ident) => {
+        match $error {
+            NewSceneInputError::DuplicateSceneId(value) => $target::DuplicateSceneId(value),
+            NewSceneInputError::DuplicateInputId(value) => $target::DuplicateInputId(value),
+            NewSceneInputError::EmptySceneName => $target::EmptySceneName,
+            NewSceneInputError::DuplicateSceneName => $target::DuplicateSceneName,
+            NewSceneInputError::EmptyInputName => $target::EmptyInputName,
+            NewSceneInputError::InputNameTooLong => $target::InputNameTooLong,
+            NewSceneInputError::DuplicateInputName => $target::DuplicateInputName,
+        }
+    };
+}
+
+impl From<NewSceneInputError> for AddSceneInputError {
+    fn from(error: NewSceneInputError) -> Self {
+        map_new_scene_input_error!(error, AddSceneInputError)
+    }
+}
+
+impl From<NewSceneInputError> for DuplicateSceneInputError {
+    fn from(error: NewSceneInputError) -> Self {
+        map_new_scene_input_error!(error, DuplicateSceneInputError)
+    }
+}
+
 impl std::fmt::Display for DuplicateSceneInputError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -60,6 +150,27 @@ impl std::fmt::Display for DuplicateSceneInputError {
 }
 
 impl std::error::Error for DuplicateSceneInputError {}
+
+impl std::fmt::Display for AddSceneInputError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DuplicateSceneId(scene) => write!(formatter, "scene {scene} already exists"),
+            Self::DuplicateInputId(input) => write!(formatter, "input {input} already exists"),
+            Self::EmptySceneName => formatter.write_str("scene name must not be empty"),
+            Self::DuplicateSceneName => formatter.write_str("scene name is already in use"),
+            Self::EmptyInputName => formatter.write_str("input name must not be empty"),
+            Self::InputNameTooLong => write!(
+                formatter,
+                "input name must not exceed {} bytes",
+                fm_types::MAX_INPUT_NAME_BYTES
+            ),
+            Self::DuplicateInputName => formatter.write_str("input name is already in use"),
+            Self::InvalidProject(errors) => write!(formatter, "invalid project ({})", errors.len()),
+        }
+    }
+}
+
+impl std::error::Error for AddSceneInputError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplaceInputError {
@@ -576,6 +687,38 @@ impl Project {
         self.scenes.push(scene);
     }
 
+    pub fn add_scene_input_checked(
+        &mut self,
+        scene: SceneId,
+        scene_name: String,
+        input: InputId,
+        input_name: String,
+    ) -> Result<(), AddSceneInputError> {
+        self.validate_new_scene_input(scene, &scene_name, input, &input_name)
+            .map_err(AddSceneInputError::from)?;
+        let mut candidate = self.clone();
+        candidate.add_scene(Scene {
+            id: scene,
+            name: scene_name,
+            background: Rgba8::OPAQUE_BLACK,
+            layers: Vec::new(),
+        });
+        candidate.add_input(Input {
+            id: input,
+            name: input_name,
+            kind: InputKind::Scene {
+                scene_id: scene,
+                audio_source: None,
+            },
+            required_capabilities: Vec::new(),
+        });
+        candidate
+            .validate()
+            .map_err(AddSceneInputError::InvalidProject)?;
+        *self = candidate;
+        Ok(())
+    }
+
     pub fn duplicate_scene_input_checked(
         &mut self,
         source_scene: SceneId,
@@ -589,31 +732,8 @@ impl Project {
             .iter()
             .find(|scene| scene.id == source_scene)
             .ok_or(DuplicateSceneInputError::UnknownSourceScene(source_scene))?;
-        if self.scenes.iter().any(|scene| scene.id == new_scene) {
-            return Err(DuplicateSceneInputError::DuplicateSceneId(new_scene));
-        }
-        if self.inputs.iter().any(|input| input.id == new_input) {
-            return Err(DuplicateSceneInputError::DuplicateInputId(new_input));
-        }
-        if scene_name.trim().is_empty() {
-            return Err(DuplicateSceneInputError::EmptySceneName);
-        }
-        if self
-            .scenes
-            .iter()
-            .any(|scene| scene.name.eq_ignore_ascii_case(&scene_name))
-        {
-            return Err(DuplicateSceneInputError::DuplicateSceneName);
-        }
-        if input_name.trim().is_empty() {
-            return Err(DuplicateSceneInputError::EmptyInputName);
-        }
-        if input_name.len() > fm_types::MAX_INPUT_NAME_BYTES {
-            return Err(DuplicateSceneInputError::InputNameTooLong);
-        }
-        if self.inputs.iter().any(|input| input.name == input_name) {
-            return Err(DuplicateSceneInputError::DuplicateInputName);
-        }
+        self.validate_new_scene_input(new_scene, &scene_name, new_input, &input_name)
+            .map_err(DuplicateSceneInputError::from)?;
         let mut candidate = self.clone();
         let mut scene = source.clone();
         scene.id = new_scene;

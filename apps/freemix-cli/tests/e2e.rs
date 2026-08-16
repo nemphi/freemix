@@ -2669,9 +2669,12 @@ fn local_scene_input_add_persists_empty_scene_without_routing() {
     );
 
     let before_duplicate = manifest(&context.project);
+    let store = ProjectStore::new(&context.project).unwrap();
+    let journal_before_duplicate = journal_bytes(&store);
     let duplicate = invoke(&["scene-input-add", context.project_path(), "3", "8", "Other"]);
-    assert_failure_contains(&duplicate, "domain project failed validation");
+    assert_failure_contains(&duplicate, "input 3 already exists");
     assert_eq!(manifest(&context.project), before_duplicate);
+    assert_eq!(journal_bytes(&store), journal_before_duplicate);
     fs::remove_dir_all(context.root).unwrap();
 }
 

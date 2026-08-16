@@ -1,13 +1,14 @@
 use std::num::NonZeroU128;
 
 use fm_model::{
-    AudioBus, BusSend, CURRENT_SCHEMA_VERSION, CropRect, DuplicateSceneInputError, EntityRef,
-    Input, InputAudioStripState, InputBalanceBasisPoints, InputDelaySamples, InputGainMilliDb,
-    InputKind, Layer, LayerGeometry, MainMix, Output, OutputFormat, Project, ProjectSettings,
-    RectMask, RemoveAudioBusError, RemoveInputError, RemoveOutputError, RemoveSceneError,
-    RenameSceneError, RestartPolicy, Rgba8, Rotation, Scene, SimulatedAudio, SimulatedInput,
-    SimulatedVideo, SolidColor, SourceRef, StartupPolicy, StingerAudioPolicy, StingerConfig,
-    StingerMissingMediaFallback, StingerSlotNumber, ValidationErrorKind,
+    AddSceneInputError, AudioBus, BusSend, CURRENT_SCHEMA_VERSION, CropRect,
+    DuplicateSceneInputError, EntityRef, Input, InputAudioStripState, InputBalanceBasisPoints,
+    InputDelaySamples, InputGainMilliDb, InputKind, Layer, LayerGeometry, MainMix, Output,
+    OutputFormat, Project, ProjectSettings, RectMask, RemoveAudioBusError, RemoveInputError,
+    RemoveOutputError, RemoveSceneError, RenameSceneError, RestartPolicy, Rgba8, Rotation, Scene,
+    SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef, StartupPolicy,
+    StingerAudioPolicy, StingerConfig, StingerMissingMediaFallback, StingerSlotNumber,
+    ValidationErrorKind,
 };
 use fm_types::{
     AudioFormat, BusId, ChannelLayout, ColorMetadata, FrameRate, InputId, MAX_INPUT_NAME_BYTES,
@@ -269,6 +270,93 @@ fn duplicate_scene_input_is_atomic_and_preserves_layer_fields() {
         InputNameTooLong,
     );
     reject(s1, s3, i3, "New", "Camera", DuplicateInputName);
+}
+
+#[test]
+fn add_scene_input_is_atomic_and_uses_current_name_contract() {
+    use AddSceneInputError::*;
+
+    let mut project = valid_project();
+    project
+        .add_scene_input_checked(scene_id(2), "  Exact  ".into(), input_id(2), "Exact".into())
+        .unwrap();
+    assert_eq!(project.scenes()[1].name, "  Exact  ");
+    assert_eq!(project.inputs()[1].name, "Exact");
+    assert_eq!(project.scenes()[1].background, Rgba8::OPAQUE_BLACK);
+    assert!(matches!(
+        project.inputs()[1].kind,
+        InputKind::Scene {
+            scene_id: added_scene,
+            audio_source: None
+        } if added_scene == scene_id(2)
+    ));
+    assert!(project.inputs()[1].required_capabilities.is_empty());
+    assert_eq!(
+        project.input_audio_strip(input_id(2)),
+        Some(Default::default())
+    );
+
+    let mut reject = |scene: SceneId, input: InputId, scene_name: &str, input_name: &str, error| {
+        let before = project.clone();
+        assert_eq!(
+            project.add_scene_input_checked(
+                scene,
+                scene_name.to_owned(),
+                input,
+                input_name.to_owned(),
+            ),
+            Err(error)
+        );
+        assert_eq!(project, before);
+    };
+    for (scene, input, scene_name, input_name, error) in [
+        (
+            scene_id(2),
+            input_id(3),
+            "New",
+            "New",
+            DuplicateSceneId(scene_id(2)),
+        ),
+        (
+            scene_id(3),
+            input_id(1),
+            "New",
+            "New",
+            DuplicateInputId(input_id(1)),
+        ),
+        (scene_id(3), input_id(3), " ", "New", EmptySceneName),
+        (scene_id(3), input_id(3), "wide", "New", DuplicateSceneName),
+        (scene_id(3), input_id(3), "New", "\t", EmptyInputName),
+        (
+            scene_id(3),
+            input_id(3),
+            "New",
+            "Camera",
+            DuplicateInputName,
+        ),
+    ] {
+        reject(scene, input, scene_name, input_name, error);
+    }
+    reject(
+        scene_id(3),
+        input_id(3),
+        "New",
+        &"x".repeat(MAX_INPUT_NAME_BYTES + 1),
+        InputNameTooLong,
+    );
+
+    let mut invalid = project.clone();
+    invalid.add_input(Input {
+        id: input_id(9),
+        name: "x".repeat(MAX_INPUT_NAME_BYTES + 1),
+        kind: InputKind::Color,
+        required_capabilities: Vec::new(),
+    });
+    let expected = invalid.validate().unwrap_err();
+    assert_eq!(
+        invalid.add_scene_input_checked(scene_id(9), "New".into(), input_id(10), "New".into()),
+        Err(InvalidProject(expected))
+    );
 }
 
 #[test]

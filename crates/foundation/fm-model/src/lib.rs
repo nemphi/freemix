@@ -3,7 +3,7 @@ mod project;
 mod validation;
 
 pub use project::{
-    AddAudioBusError, AddOutputError, AddSceneLayerError, AudioBus, BusSend,
+    AddAudioBusError, AddOutputError, AddSceneInputError, AddSceneLayerError, AudioBus, BusSend,
     CURRENT_SCHEMA_VERSION, CropRect, DuplicateSceneInputError, Input, InputAudioStrip,
     InputAudioStripState, InputBalanceBasisPoints, InputDelaySamples, InputGainMilliDb, InputKind,
     Layer, LayerGeometry, MainMix, Output, OutputFormat, Project, ProjectSettings, RectMask,

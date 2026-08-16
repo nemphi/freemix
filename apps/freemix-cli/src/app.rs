@@ -20,9 +20,9 @@ use fm_engine::{
 use fm_model::{
     AudioBus, CropRect, Input, InputAudioStripState, InputBalanceBasisPoints, InputDelaySamples,
     InputGainMilliDb, InputKind, Layer, LayerGeometry, MainMix, Project, ProjectSettings, RectMask,
-    Rgba8 as ModelRgba8, Rotation, Scene, SimulatedAudio, SimulatedInput, SimulatedVideo,
-    SolidColor, SourceRef, StartupPolicy, StingerAudioPolicy as ModelStingerAudioPolicy,
-    StingerConfig, StingerMissingMediaFallback, StingerSlotNumber,
+    Rgba8 as ModelRgba8, Rotation, SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor,
+    SourceRef, StartupPolicy, StingerAudioPolicy as ModelStingerAudioPolicy, StingerConfig,
+    StingerMissingMediaFallback, StingerSlotNumber,
 };
 use fm_persistence::validate_asset_uri;
 use fm_persistence::{
@@ -1463,24 +1463,9 @@ fn relink_media_input(path: &Path, input: InputId, asset_uri: String) -> AppResu
 }
 
 fn add_scene_input(path: &Path, input: InputId, scene: SceneId, name: String) -> AppResult<()> {
-    let store = ProjectStore::new(path)?;
     let stored = load_stored_project(path)?;
     let mut project = stored.project().clone();
-    project.add_scene(Scene {
-        id: scene,
-        name: name.clone(),
-        background: ModelRgba8::OPAQUE_BLACK,
-        layers: Vec::new(),
-    });
-    project.add_input(Input {
-        id: input,
-        name,
-        kind: InputKind::Scene {
-            scene_id: scene,
-            audio_source: None,
-        },
-        required_capabilities: Vec::new(),
-    });
+    project.add_scene_input_checked(scene, name.clone(), input, name)?;
     let configured = StoredProject::from_project_with_complete_runtime_state(
         project,
         stored.runtime_routing(),
@@ -1490,7 +1475,7 @@ fn add_scene_input(path: &Path, input: InputId, scene: SceneId, name: String) ->
         stored.position(),
         stored.idempotency_receipts().to_vec(),
     )?;
-    store.save(&configured)?;
+    ProjectStore::new(path)?.save(&configured)?;
     print_status(&load_engine(path)?);
     Ok(())
 }

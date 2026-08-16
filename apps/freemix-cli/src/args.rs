@@ -1243,7 +1243,7 @@ fn parse_scene_input_add(
     let path = required_path(&mut arguments, "project path")?;
     let input = number(&required(&mut arguments, "input")?, "input")?;
     let scene = number(&required(&mut arguments, "scene")?, "scene")?;
-    let name = required(&mut arguments, "input name")?;
+    let name = nonblank(&mut arguments, "input name")?;
     reject_extra(&mut arguments)?;
     Ok(Command::SceneInputAdd {
         path,
