@@ -1684,9 +1684,27 @@ fn local_zoom_settles_and_preserves_idempotency_contract() {
 }
 
 #[test]
-fn local_configured_stinger_settles_and_preserves_idempotency_contract() {
+fn local_stinger_configure_rejects_unknown_input_without_persistence() {
     let context = ContractContext::new();
     assert_success(&invoke(&["new", context.project_path()]));
+    let store = ProjectStore::new(&context.project).unwrap();
+    let manifest_path = context.project.join("project.json");
+    let manifest_before = fs::read(&manifest_path).unwrap();
+    let journal_before = journal_bytes(&store);
+    let unknown = invoke(&[
+        "stinger-configure",
+        context.project_path(),
+        "8",
+        "99",
+        "true",
+        "1",
+        "muted",
+        "cut",
+    ]);
+    assert_failure_contains(&unknown, "unknown stinger media input 99");
+    assert_eq!(fs::read(&manifest_path).unwrap(), manifest_before);
+    assert_eq!(journal_bytes(&store), journal_before);
+
     let configured = invoke(&[
         "stinger-configure",
         context.project_path(),

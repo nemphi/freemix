@@ -6,9 +6,9 @@ use fm_model::{
     InputAudioStripState, InputBalanceBasisPoints, InputDelaySamples, InputGainMilliDb, InputKind,
     Layer, LayerGeometry, MainMix, Output, OutputFormat, Project, ProjectSettings, RectMask,
     RemoveAudioBusError, RemoveInputError, RemoveOutputError, RemoveSceneError, RenameSceneError,
-    RestartPolicy, Rgba8, Rotation, Scene, SceneLayerError, SimulatedAudio, SimulatedInput,
-    SimulatedVideo, SolidColor, SourceRef, StartupPolicy, StingerAudioPolicy, StingerConfig,
-    StingerMissingMediaFallback, StingerSlotNumber, ValidationErrorKind,
+    RestartPolicy, Rgba8, Rotation, Scene, SceneLayerError, SetStingerError, SimulatedAudio,
+    SimulatedInput, SimulatedVideo, SolidColor, SourceRef, StartupPolicy, StingerAudioPolicy,
+    StingerConfig, StingerMissingMediaFallback, StingerSlotNumber, ValidationErrorKind,
 };
 use fm_types::{
     AudioFormat, BusId, ChannelLayout, ColorMetadata, FrameRate, InputId, MAX_INPUT_NAME_BYTES,
@@ -932,6 +932,35 @@ fn stinger_slots_can_be_reconfigured_and_removed_without_duplicates() {
     assert!(project.stingers().is_empty());
     assert_eq!(project.remove_stinger(first.slot), None);
     assert_eq!(project.validate(), Ok(()));
+}
+
+#[test]
+fn set_stinger_checked_rejects_unknown_input_without_mutation() {
+    let mut project = valid_project();
+    let config = |slot, input, cut| {
+        StingerConfig::new(
+            StingerSlotNumber::new(slot).unwrap(),
+            input_id(input),
+            false,
+            cut,
+            StingerAudioPolicy::Muted,
+            StingerMissingMediaFallback::Cut,
+        )
+    };
+    project.set_stinger_checked(config(1, 1, 3)).unwrap();
+    let before = project.clone();
+    let unknown = config(1, 99, 9);
+    assert_eq!(
+        project.set_stinger_checked(unknown),
+        Err(SetStingerError::UnknownInput(input_id(99)))
+    );
+    assert_eq!(project, before);
+
+    let second = config(2, 1, 7);
+    project.set_stinger_checked(second).unwrap();
+    let replacement = config(1, 1, 11);
+    project.set_stinger_checked(replacement).unwrap();
+    assert_eq!(project.stingers(), &[replacement, second]);
 }
 
 #[test]

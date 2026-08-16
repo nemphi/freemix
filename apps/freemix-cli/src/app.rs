@@ -1400,7 +1400,9 @@ fn sync_input_names(project: &mut Project, show: &ShowState) -> AppResult<()> {
 }
 
 fn configure_stinger(path: &Path, config: StingerConfig) -> AppResult<()> {
-    update_stingers(path, |project| project.set_stinger(config))
+    update_stingers(path, |project| {
+        project.set_stinger_checked(config).map_err(Into::into)
+    })
 }
 
 fn add_input(path: &Path, input: InputId, name: String) -> AppResult<()> {
@@ -2034,14 +2036,18 @@ fn replace_input_simulated(path: &Path, input: InputId) -> AppResult<()> {
 fn remove_stinger(path: &Path, slot: StingerSlotNumber) -> AppResult<()> {
     update_stingers(path, |project| {
         let _ = project.remove_stinger(slot);
+        Ok(())
     })
 }
 
-fn update_stingers(path: &Path, update: impl FnOnce(&mut Project)) -> AppResult<()> {
+fn update_stingers(
+    path: &Path,
+    update: impl FnOnce(&mut Project) -> AppResult<()>,
+) -> AppResult<()> {
     let store = ProjectStore::new(path)?;
     let stored = load_stored_project(path)?;
     let mut project = stored.project().clone();
-    update(&mut project);
+    update(&mut project)?;
     let configured = StoredProject::from_project_with_complete_runtime_state(
         project,
         stored.runtime_routing(),

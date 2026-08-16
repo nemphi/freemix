@@ -19,6 +19,21 @@ pub enum AddInputError {
     DuplicateName,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SetStingerError {
+    UnknownInput(InputId),
+}
+
+impl std::fmt::Display for SetStingerError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownInput(input) => write!(formatter, "unknown stinger media input {input}"),
+        }
+    }
+}
+
+impl std::error::Error for SetStingerError {}
+
 impl std::fmt::Display for AddInputError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1332,6 +1347,18 @@ impl Project {
         } else {
             self.stingers.push(stinger);
         }
+    }
+
+    pub fn set_stinger_checked(&mut self, stinger: StingerConfig) -> Result<(), SetStingerError> {
+        if !self
+            .inputs
+            .iter()
+            .any(|input| input.id == stinger.media_input)
+        {
+            return Err(SetStingerError::UnknownInput(stinger.media_input));
+        }
+        self.set_stinger(stinger);
+        Ok(())
     }
 
     /// Removes one configured Stinger slot.

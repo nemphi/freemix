@@ -11,8 +11,8 @@ pub use project::{
     RelinkMediaInputError, RemoveAudioBusError, RemoveInputError, RemoveOutputError,
     RemoveSceneError, RenameSceneError, ReplaceInputError, RestartPolicy, Rgba8, Rotation, Scene,
     SceneInputAudioSourceError, SceneLayerError, SchemaVersion, SetOutputRouteError,
-    SetSceneBackgroundError, SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef,
-    StartupPolicy, StingerAudioPolicy, StingerConfig, StingerMissingMediaFallback,
-    StingerSlotNumber,
+    SetSceneBackgroundError, SetStingerError, SimulatedAudio, SimulatedInput, SimulatedVideo,
+    SolidColor, SourceRef, StartupPolicy, StingerAudioPolicy, StingerConfig,
+    StingerMissingMediaFallback, StingerSlotNumber,
 };
 pub use validation::{EntityRef, ValidationError, ValidationErrorKind};
