@@ -3469,78 +3469,20 @@ fn serve_inner(
             .set_diagnostic_deadline(duration)?;
     }
 
-    let _shutdown_reason = if native.is_none() {
-        non_native_sessions::run(
-            listener,
-            &server,
-            &control,
-            &store,
-            &mut durable,
-            &principal,
-            process_shutdown
-                .as_ref()
-                .expect("server has a process shutdown signal"),
-            once,
-        )?
-    } else {
-        let mut once_client_outcome = OnceClientOutcome::Unserved;
-        loop {
-            if let Some(reason) =
-                requested_daemon_shutdown(native.as_ref(), process_shutdown.as_ref())
-            {
-                break reason;
-            }
-            let stream = match listener.accept() {
-                Ok((stream, _)) => stream,
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    if let Some(native) = &mut native {
-                        native.tick_if_due(&mut control.borrow_mut(), &authority)?;
-                    }
-                    thread::sleep(NATIVE_IO_POLL_INTERVAL);
-                    continue;
-                }
-                Err(error) => return Err(error.into()),
-            };
-            let result = handle_client(
-                stream,
-                &server,
-                &control,
-                &store,
-                &mut durable,
-                &principal,
-                &authority,
-                native.as_mut(),
-                process_shutdown.as_ref(),
-                &mut once_client_outcome,
-            );
-            if let Err(error) = result {
-                if let Some(reason) =
-                    requested_daemon_shutdown(native.as_ref(), process_shutdown.as_ref())
-                {
-                    break reason;
-                }
-                if !is_client_disconnect(error.as_ref())
-                    && !is_client_protocol_error(error.as_ref())
-                    && !is_client_session_termination(error.as_ref())
-                {
-                    return Err(error);
-                }
-            }
-            if let Some(reason) =
-                requested_daemon_shutdown(native.as_ref(), process_shutdown.as_ref())
-            {
-                break reason;
-            }
-            if once && once_client_outcome == OnceClientOutcome::HandshakeResponseWritten {
-                break DaemonShutdownReason::Once;
-            }
-        }
-    };
+    let _shutdown_reason = non_native_sessions::run(
+        listener,
+        &server,
+        &control,
+        &store,
+        &mut durable,
+        &principal,
+        native.as_mut(),
+        &authority,
+        process_shutdown
+            .as_ref()
+            .expect("server has a process shutdown signal"),
+        once,
+    )?;
     if native.is_some() {
         checkpoint_native(&control, &store, &mut durable)?;
     }

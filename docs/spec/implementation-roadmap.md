@@ -91,11 +91,13 @@ Simulated CLI PPM output uses same-directory write/sync/replace, not broader med
 Local CLI loads reject unapplied journal batches without recovering or mutating journal state; torn-final-only state remains readable.
 This is control-plane peer liveness. It is not service readiness, production
 authentication, media health, HTTP resources, WebSocket event subscriptions,
-or transport-level production rate limits. The simulated non-native raw-TCP
-daemon has a bounded single-thread two-peer scheduler: an idle Viewer can
-receive live events while an Operator controls the show. Native mode remains
-single-client. This is not HTTP/WebSocket/service/media readiness or RC-008
-completion. Expired raw TCP sessions are reclaimed.
+or transport-level production rate limits. Native and non-native raw TCP now
+share the bounded single-thread scheduler: an idle Viewer can receive live
+events while an Operator controls the show, and native mode remains limited to
+one peer. Native-media acceptance is not proven on this Mac. This is
+prerequisite transport infrastructure only; AU-001 meter protocol and Studio
+transport remain planned. It is not HTTP/WebSocket/service/media readiness or
+RC-008 completion. Expired raw TCP sessions are reclaimed.
 
 ## 4. Phase 2 — GPU playback switcher (10–14 weeks)
 

@@ -19,11 +19,11 @@ use fm_server::{Server, Session, SyncPayload};
 
 use super::{
     AppResult, CLIENT_READ_POLL_INTERVAL, CLIENT_WRITE_TIMEOUT, CommandDelivery, ControlHandle,
-    DaemonShutdownReason, PendingWrite, ProcessShutdown, SharedControl, current_handshake,
-    diagnostics_response, error_message, execute_session_command, handshake_code,
-    handshake_response, is_client_session_termination, now_millis, reconciled_handshake_outcome,
-    record_heartbeat, rejected_handshake_response, server_identity, shutdown_message,
-    structured_session_error,
+    DaemonShutdownReason, NativeDaemon, PendingWrite, ProcessShutdown, SharedControl,
+    current_handshake, diagnostics_response, error_message, execute_session_command,
+    handshake_code, handshake_response, is_client_session_termination, now_millis,
+    reconciled_handshake_outcome, record_heartbeat, rejected_handshake_response,
+    requested_daemon_shutdown, server_identity, shutdown_message, structured_session_error,
 };
 
 const MAX_PEERS: usize = 2;
@@ -143,12 +143,15 @@ pub(super) fn run(
     store: &ProjectStore,
     durable: &mut StoredProject,
     principal: &Principal,
+    native: Option<&mut NativeDaemon>,
+    authority: &ServerIdentity,
     process_shutdown: &ProcessShutdown,
     once: bool,
 ) -> AppResult<DaemonShutdownReason> {
     let handshake_timeout =
         Duration::from_millis(server.config().session_limits.heartbeat_timeout_ms);
-    let mut peers = Vec::with_capacity(MAX_PEERS);
+    let peer_limit = if native.is_some() { 1 } else { MAX_PEERS };
+    let mut peers = Vec::with_capacity(peer_limit);
     let mut next_peer_id = 0_u64;
     let mut once_peer = None;
     let runtime = Runtime {
@@ -158,14 +161,14 @@ pub(super) fn run(
         principal,
         process_shutdown,
     };
+    let mut native = native;
 
     loop {
-        if process_shutdown.requested() {
-            shutdown_peers(&mut peers, control);
-            return Ok(DaemonShutdownReason::ProcessSignal);
+        if let Some(reason) = requested_daemon_shutdown(native.as_deref(), Some(process_shutdown)) {
+            return Ok(shutdown_for_reason(reason, &mut peers, control));
         }
 
-        if once_peer.is_none() && (!once || peers.is_empty()) && peers.len() < MAX_PEERS {
+        if once_peer.is_none() && (!once || peers.is_empty()) && peers.len() < peer_limit {
             match listener.accept() {
                 Ok((stream, _)) => {
                     if stream.set_nonblocking(true).is_ok() && stream.set_nodelay(true).is_ok() {
@@ -223,14 +226,23 @@ pub(super) fn run(
             let Some(message) = message else {
                 continue;
             };
-            match runtime.dispatch(&mut peers[index], message, durable) {
-                Ok(()) => drain_live(&mut peers, &mut close, &mut live_budget),
+            match runtime.dispatch(&mut peers[index], message, durable, native.as_deref_mut()) {
+                Ok(()) => {}
                 Err(DispatchError::Peer) => close[index] = true,
                 Err(DispatchError::Daemon(error)) => {
                     shutdown_peers(&mut peers, control);
                     return Err(error);
                 }
             }
+        }
+        if let Some(native) = native.as_deref_mut() {
+            if let Err(error) = native.tick_if_due(&mut control.borrow_mut(), authority) {
+                shutdown_peers(&mut peers, control);
+                return Err(error);
+            }
+        }
+        if let Some(reason) = requested_daemon_shutdown(native.as_deref(), Some(process_shutdown)) {
+            return Ok(shutdown_for_reason(reason, &mut peers, control));
         }
         drain_live(&mut peers, &mut close, &mut live_budget);
 
@@ -268,10 +280,6 @@ pub(super) fn run(
             }
         }
 
-        if process_shutdown.requested() {
-            shutdown_peers(&mut peers, control);
-            return Ok(DaemonShutdownReason::ProcessSignal);
-        }
         if let Some(id) = once_peer
             && peers
                 .iter()
@@ -280,6 +288,9 @@ pub(super) fn run(
         {
             close_all(&mut peers, control);
             return Ok(DaemonShutdownReason::Once);
+        }
+        if let Some(reason) = requested_daemon_shutdown(native.as_deref(), Some(process_shutdown)) {
+            return Ok(shutdown_for_reason(reason, &mut peers, control));
         }
         thread::sleep(CLIENT_READ_POLL_INTERVAL);
     }
@@ -339,6 +350,7 @@ impl Runtime<'_> {
         peer: &mut Peer,
         message: WireMessage,
         durable: &mut StoredProject,
+        native: Option<&mut NativeDaemon>,
     ) -> Result<(), DispatchError> {
         if peer.phase == Phase::AwaitHandshake {
             return self.handshake(peer, message, durable);
@@ -355,7 +367,7 @@ impl Runtime<'_> {
                         .as_ref()
                         .expect("active peers have identities"),
                     &command,
-                    None,
+                    native,
                     Some(self.process_shutdown),
                 )
                 .map_err(|error| {
@@ -650,6 +662,19 @@ fn close_all(peers: &mut Vec<Peer>, control: &SharedControl) {
     while let Some(peer) = peers.pop() {
         close_peer(peer, control);
     }
+}
+
+fn shutdown_for_reason(
+    reason: DaemonShutdownReason,
+    peers: &mut Vec<Peer>,
+    control: &SharedControl,
+) -> DaemonShutdownReason {
+    match reason {
+        DaemonShutdownReason::ProcessSignal => shutdown_peers(peers, control),
+        DaemonShutdownReason::ProgramSurface => close_all(peers, control),
+        DaemonShutdownReason::Once => unreachable!("once is handled below"),
+    }
+    reason
 }
 
 fn close_peer(mut peer: Peer, control: &SharedControl) {
