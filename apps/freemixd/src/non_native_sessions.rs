@@ -432,10 +432,7 @@ pub(super) fn run(
         }
 
         if let Some(id) = once_peer
-            && peers
-                .iter()
-                .find(|peer| peer.id == id)
-                .is_none_or(|peer| peer.phase == Phase::Active)
+            && !peers.iter().any(|peer| peer.id == id)
         {
             close_all(&mut peers, control);
             return Ok(DaemonShutdownReason::Once);

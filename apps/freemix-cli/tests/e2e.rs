@@ -2042,7 +2042,7 @@ fn local_media_input_add_persists_offline_asset_contract() {
         "Other",
         "asset://other.ppm",
     ]);
-    assert_failure_contains(&duplicate_id, "domain project failed validation");
+    assert_failure_contains(&duplicate_id, "input 9 already exists");
     assert_eq!(
         fs::read(context.project.join("project.json")).unwrap(),
         manifest_before_failure
@@ -2055,7 +2055,7 @@ fn local_media_input_add_persists_offline_asset_contract() {
         "Media  input ",
         "asset://other.ppm",
     ]);
-    assert_failure_contains(&duplicate_name, "domain project failed validation");
+    assert_failure_contains(&duplicate_name, "input name is already in use");
     assert_eq!(
         fs::read(context.project.join("project.json")).unwrap(),
         manifest_before_failure
