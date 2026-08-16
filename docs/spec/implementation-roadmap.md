@@ -274,8 +274,8 @@ the order after restart. Studio now has a compact permission-gated rename editor
 The local `input-add`, `input-duplicate`, `input-remove`, and
 `input-replace-simulated` commands persist input state for the next project open
 only; live lifecycle and general relink/import remain planned.
-Live input lifecycle remains planned. The rename and
-reorder commands carry input identity; audio and routing state remain separate.
+The rename and reorder commands carry input identity; audio and routing state
+remain separate.
 Neither command applies an optimistic change or changes current switcher state.
 Studio exposes compact Up/Down controls
 for one-step reorder, gated by the current Ready session and EditProject
