@@ -18,11 +18,11 @@ use fm_engine::{
     EngineManualTransitionKind, EngineManualTransitionPosition, EngineRestoreState, ShowState,
 };
 use fm_model::{
-    Input, InputAudioStripState, InputBalanceBasisPoints, InputDelaySamples, InputGainMilliDb,
-    InputKind, Layer, LayerGeometry, MainMix, Project, ProjectSettings, Rgba8 as ModelRgba8,
-    Rotation, Scene, SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef,
-    StingerAudioPolicy as ModelStingerAudioPolicy, StingerConfig, StingerMissingMediaFallback,
-    StingerSlotNumber,
+    CropRect, Input, InputAudioStripState, InputBalanceBasisPoints, InputDelaySamples,
+    InputGainMilliDb, InputKind, Layer, LayerGeometry, MainMix, Project, ProjectSettings,
+    Rgba8 as ModelRgba8, Rotation, Scene, SimulatedAudio, SimulatedInput, SimulatedVideo,
+    SolidColor, SourceRef, StingerAudioPolicy as ModelStingerAudioPolicy, StingerConfig,
+    StingerMissingMediaFallback, StingerSlotNumber,
 };
 use fm_persistence::{
     FadeToBlackState as PersistedFadeToBlackState, IdempotencyReceipt,
@@ -123,6 +123,23 @@ pub fn run(command: Command) -> AppResult<()> {
             index,
             LayerGeometry::new(x, y, width, height, cli_rotation(rotation)),
         )?,
+        Command::SceneLayerCrop {
+            path,
+            scene,
+            index,
+            x,
+            y,
+            width,
+            height,
+        } => set_scene_layer_crop(
+            &path,
+            scene_id(scene)?,
+            index,
+            Some(CropRect::new(x, y, width, height)),
+        )?,
+        Command::SceneLayerCropClear { path, scene, index } => {
+            set_scene_layer_crop(&path, scene_id(scene)?, index, None)?
+        }
         Command::InputRemove { path, input } => remove_input(&path, input_id(input)?)?,
         Command::InputDuplicate {
             path,
@@ -1379,6 +1396,30 @@ fn set_scene_layer_geometry(
     Ok(())
 }
 
+fn set_scene_layer_crop(
+    path: &Path,
+    scene: SceneId,
+    index: usize,
+    crop: Option<CropRect>,
+) -> AppResult<()> {
+    let store = ProjectStore::new(path)?;
+    let stored = load_stored_project(path)?;
+    let mut project = stored.project().clone();
+    project.set_scene_layer_crop(scene, index, crop)?;
+    let configured = StoredProject::from_project_with_complete_runtime_state(
+        project,
+        stored.runtime_routing(),
+        stored.runtime_manual_transitions(),
+        stored.runtime_fade_to_black(),
+        stored.runtime_overlays().clone(),
+        stored.position(),
+        stored.idempotency_receipts().to_vec(),
+    )?;
+    store.save(&configured)?;
+    print_status(&load_engine(path)?);
+    Ok(())
+}
+
 fn remove_input(path: &Path, input: InputId) -> AppResult<()> {
     let stored = load_stored_project(path)?;
     let runtime = stored.runtime_routing();
@@ -2125,6 +2166,8 @@ Usage:
   freemix-cli scene-layer-remove <show.freemix> <scene-id> <zero-based-layer-index>
   freemix-cli scene-layer-appearance <show.freemix> <scene-id> <zero-based-layer-index> <enabled:on|off> <opacity:0..=255>
   freemix-cli scene-layer-geometry <show.freemix> <scene-id> <zero-based-layer-index> <x> <y> <width> <height> <rotation:0|90|180|270>
+  freemix-cli scene-layer-crop <show.freemix> <scene-id> <zero-based-layer-index> <x> <y> <width> <height>
+  freemix-cli scene-layer-crop-clear <show.freemix> <scene-id> <zero-based-layer-index>
   freemix-cli input-remove <show.freemix> <input-id>
   freemix-cli input-duplicate <show.freemix> <source-input-id> <new-nonzero-input-id> <new-name>
   freemix-cli input-replace-simulated <show.freemix> <input-id>

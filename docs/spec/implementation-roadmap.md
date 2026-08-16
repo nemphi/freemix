@@ -130,7 +130,9 @@ including the persisted rectangular mask, through the bounded scene planner
 described under Phase 3 item 4 instead of rejecting scene inputs. Feathered or
 non-rectangular masks, keys, effects, per-output realization, live
 edits/replanning, and cross-platform or hardware certification remain outside
-this item, so its parity rows remain planned.
+this item, so its parity rows remain planned. The local CLI scene-layer crop
+set/clear commands are the next-open footholds; local scene rendering, live
+editing, masks/effects, IN-020, and parity remain planned.
 
 Current implementation boundary for item 5: `freemix-studio` opens a native
 `eframe`/wgpu shell by default with responsive Program/Preview monitor wells,

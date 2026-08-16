@@ -392,6 +392,30 @@ impl Project {
         Ok(())
     }
 
+    pub fn set_scene_layer_crop(
+        &mut self,
+        scene: SceneId,
+        index: usize,
+        crop: Option<CropRect>,
+    ) -> Result<(), SceneLayerError> {
+        let target = self
+            .scenes
+            .iter_mut()
+            .find(|candidate| candidate.id == scene)
+            .ok_or(SceneLayerError::UnknownScene(scene))?;
+        let length = target.layers.len();
+        let layer = target
+            .layers
+            .get_mut(index)
+            .ok_or(SceneLayerError::LayerIndexOutOfRange {
+                scene,
+                index,
+                length,
+            })?;
+        layer.crop = crop;
+        Ok(())
+    }
+
     pub fn add_audio_bus(&mut self, bus: AudioBus) {
         self.audio_buses.push(bus);
     }

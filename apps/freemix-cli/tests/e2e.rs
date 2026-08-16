@@ -2226,6 +2226,98 @@ fn local_scene_layer_geometry_preserves_other_layer_state() {
 }
 
 #[test]
+fn local_scene_layer_crop_set_and_clear_preserves_project_state() {
+    let context = ContractContext::new();
+    assert_success(&invoke(&["new", context.project_path()]));
+    assert_success(&invoke(&[
+        "scene-input-add",
+        context.project_path(),
+        "3",
+        "7",
+        "Scene",
+    ]));
+    assert_success(&invoke(&[
+        "scene-layer-add",
+        context.project_path(),
+        "7",
+        "1",
+        "4",
+        "Layer",
+    ]));
+    let before = ProjectStore::new(&context.project_path())
+        .unwrap()
+        .load()
+        .unwrap();
+    assert_success(&invoke(&[
+        "scene-layer-crop",
+        context.project_path(),
+        "7",
+        "0",
+        "10",
+        "20",
+        "640",
+        "480",
+    ]));
+    let cropped = ProjectStore::new(&context.project_path())
+        .unwrap()
+        .load()
+        .unwrap();
+    assert_eq!(
+        (
+            cropped.runtime_routing(),
+            cropped.runtime_manual_transitions(),
+            cropped.runtime_fade_to_black(),
+            cropped.runtime_overlays(),
+            cropped.position(),
+            cropped.idempotency_receipts(),
+        ),
+        (
+            before.runtime_routing(),
+            before.runtime_manual_transitions(),
+            before.runtime_fade_to_black(),
+            before.runtime_overlays(),
+            before.position(),
+            before.idempotency_receipts(),
+        )
+    );
+    let mut expected_layers = before.project().scenes()[0].layers.clone();
+    expected_layers[0].crop = Some(fm_model::CropRect::new(10, 20, 640, 480));
+    assert_eq!(cropped.project().scenes()[0].layers, expected_layers);
+
+    assert_success(&invoke(&[
+        "scene-layer-crop-clear",
+        context.project_path(),
+        "7",
+        "0",
+    ]));
+    let cleared = ProjectStore::new(&context.project_path())
+        .unwrap()
+        .load()
+        .unwrap();
+    assert_eq!(
+        cleared.project().scenes()[0].layers,
+        before.project().scenes()[0].layers
+    );
+
+    let before_invalid = manifest(&context.project);
+    assert_failure_contains(
+        &invoke(&[
+            "scene-layer-crop",
+            context.project_path(),
+            "7",
+            "0",
+            "10",
+            "20",
+            "0",
+            "480",
+        ]),
+        "domain project failed validation",
+    );
+    assert_eq!(manifest(&context.project), before_invalid);
+    fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
 fn local_input_duplicate_copies_source_and_strip() {
     let context = ContractContext::new();
     assert_success(&invoke(&["new", context.project_path()]));
