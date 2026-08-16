@@ -2,19 +2,20 @@ use core::{fmt::Write, num::NonZeroU128};
 
 use fm_command::{Deadline, Revision, StateEpoch};
 use fm_protocol::{
-    CURRENT_PROTOCOL_VERSION, CapabilityReportMessage, CapabilityReportSummary, CodecError,
-    CommandMessage, CommandPayload, CommandResult, DiagnosticsRequest, DiagnosticsResponse,
-    DurableEvent, DurableEventBatch, DurableGap, EngineIdentity, ErrorMessage, EventCursor,
-    EventMessage, EventPayload, FadeToBlackPosition, FadeToBlackState, FieldIssue,
-    HandshakeOutcome, HeartbeatAcknowledgementMessage, HeartbeatMessage, InputAudioStripStatus,
-    InputStatus, LineDecoder, MAX_FIELD_VALUE_BYTES, MAX_FIELDS_PER_MESSAGE, MAX_LINE_BYTES,
-    MAX_LIST_ITEMS, MAX_MESSAGES_PER_PUSH, ManualTransitionKind, ManualTransitionPosition,
-    ManualTransitionState, ManualTransitionStatus, OutputStatus, OverlayStatus,
-    OverlayTransitionKind, ProtocolVersion, ResumeCursor, RuntimeDomainBoundary,
-    RuntimeEventMessage, RuntimeFailureDisposition, RuntimeLifecycleEvent, ServerIdentity,
-    SnapshotMessage, SnapshotReason, StingerAudioPolicy, StingerMissingMediaFallback,
-    StingerReadiness, StingerStatus, StructuredError, WireInputId, WireMessage, WireOutputId,
-    WireOverlayChannelId, WireStingerSlotId, choose_handshake_outcome, decode_line, encode_line,
+    AudioMeterChannel, AudioMetersMessage, CURRENT_PROTOCOL_VERSION, CapabilityReportMessage,
+    CapabilityReportSummary, CodecError, CommandMessage, CommandPayload, CommandResult,
+    DiagnosticsRequest, DiagnosticsResponse, DurableEvent, DurableEventBatch, DurableGap,
+    EngineIdentity, ErrorMessage, EventCursor, EventMessage, EventPayload, FadeToBlackPosition,
+    FadeToBlackState, FieldIssue, HandshakeOutcome, HeartbeatAcknowledgementMessage,
+    HeartbeatMessage, InputAudioMeters, InputAudioStripStatus, InputStatus, LineDecoder,
+    MAX_FIELD_VALUE_BYTES, MAX_FIELDS_PER_MESSAGE, MAX_LINE_BYTES, MAX_LIST_ITEMS,
+    MAX_MESSAGES_PER_PUSH, ManualTransitionKind, ManualTransitionPosition, ManualTransitionState,
+    ManualTransitionStatus, OutputStatus, OverlayStatus, OverlayTransitionKind, ProtocolVersion,
+    ResumeCursor, RuntimeDomainBoundary, RuntimeEventMessage, RuntimeFailureDisposition,
+    RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage, SnapshotReason, StingerAudioPolicy,
+    StingerMissingMediaFallback, StingerReadiness, StingerStatus, StructuredError, WireInputId,
+    WireMessage, WireOutputId, WireOverlayChannelId, WireStingerSlotId, choose_handshake_outcome,
+    decode_line, encode_line,
 };
 
 fn input(value: u128) -> WireInputId {
@@ -143,8 +144,8 @@ fn snapshot(inputs: Vec<InputStatus>) -> WireMessage {
 }
 
 #[test]
-fn protocol_2_14_heartbeat_acknowledgement_codec_is_exact() {
-    assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(2, 14));
+fn protocol_2_15_heartbeat_acknowledgement_codec_is_exact() {
+    assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(2, 15));
     let acknowledgement = WireMessage::HeartbeatAcknowledgement(HeartbeatAcknowledgementMessage {
         server: server_identity(),
         heartbeat_sequence: 88,
@@ -159,9 +160,76 @@ fn protocol_2_14_heartbeat_acknowledgement_codec_is_exact() {
 }
 
 #[test]
+fn audio_meter_codec_is_bounded_and_exact() {
+    let message = WireMessage::AudioMeters(AudioMetersMessage {
+        server: server_identity(),
+        sequence: 9,
+        frame: 42,
+        start_sample: 80_000,
+        end_sample: 81_920,
+        master: vec![
+            AudioMeterChannel {
+                peak_millionths: 4_000_000,
+                rms_millionths: 500_000,
+            },
+            AudioMeterChannel {
+                peak_millionths: 250_000,
+                rms_millionths: 125_000,
+            },
+        ],
+        inputs: vec![InputAudioMeters {
+            input: input(3),
+            channels: vec![
+                AudioMeterChannel {
+                    peak_millionths: 500_000,
+                    rms_millionths: 250_000,
+                },
+                AudioMeterChannel::default(),
+            ],
+        }],
+    });
+    let encoded = encode_line(&message).unwrap();
+    assert_eq!(
+        encoded,
+        "audio_meters\tengine_id=engine-a\tproject_id=project-9\tstate_epoch=7\tlog_id=log-a\tsequence=9\tframe=42\tstart_sample=80000\tend_sample=81920\tmaster=4000000%3A500000%2C250000%3A125000\tinputs=3%7E500000%3A250000%2C0%3A0\n"
+    );
+    assert_eq!(decode_line(&encoded).unwrap(), message);
+
+    let invalid = encoded.replace("inputs=3%7E", "inputs=3%7E500000%3A250000%2C0%3A0%3B3%7E");
+    assert!(matches!(
+        decode_line(&invalid),
+        Err(CodecError::InvalidField {
+            field: "inputs",
+            ..
+        })
+    ));
+
+    let WireMessage::AudioMeters(mut wrong_channels) = message else {
+        unreachable!()
+    };
+    wrong_channels.inputs[0].channels.pop();
+    assert!(matches!(
+        encode_line(&WireMessage::AudioMeters(wrong_channels)),
+        Err(CodecError::InvalidField {
+            field: "inputs",
+            ..
+        })
+    ));
+}
+
+#[test]
 #[allow(clippy::too_many_lines)]
 fn every_message_variant_round_trips() {
     let messages = vec![
+        WireMessage::AudioMeters(AudioMetersMessage {
+            server: server_identity(),
+            sequence: 1,
+            frame: 1,
+            start_sample: 0,
+            end_sample: 1,
+            master: vec![AudioMeterChannel::default()],
+            inputs: Vec::new(),
+        }),
         WireMessage::DiagnosticsRequest(DiagnosticsRequest {
             protocol: CURRENT_PROTOCOL_VERSION,
             request_id: "diag-01".to_owned(),

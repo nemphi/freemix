@@ -13,10 +13,11 @@ use fm_client::{
     SessionEvent, SyncMode, TcpSession, TcpSessionError,
 };
 use fm_protocol::{
-    CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, ClientType, CodecError, CommandPayload,
-    CommandResult, EngineIdentity, EventCursor, EventMessage, EventPayload, FadeToBlackPosition,
-    FadeToBlackState, HandshakeOutcome, HandshakeRequest, HandshakeResponse, LineDecoder,
-    MAX_LINE_BYTES, ManualTransitionStatus, OverlayStatus, ProtocolVersion, ResumeCursor, Role,
+    AudioMeterChannel, AudioMetersMessage, CURRENT_PROTOCOL_VERSION, CapabilityReportSummary,
+    ClientType, CodecError, CommandPayload, CommandResult, EngineIdentity, EventCursor,
+    EventMessage, EventPayload, FadeToBlackPosition, FadeToBlackState, HandshakeOutcome,
+    HandshakeRequest, HandshakeResponse, InputAudioMeters, LineDecoder, MAX_LINE_BYTES,
+    ManualTransitionStatus, OverlayStatus, ProtocolVersion, ResumeCursor, Role,
     RuntimeEventMessage, RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage, SnapshotReason,
     WireInputId, WireMessage, encode_line,
 };
@@ -167,6 +168,27 @@ fn runtime_event(revision: u64) -> RuntimeEventMessage {
                 position: FadeToBlackPosition::LIVE,
             },
         },
+    }
+}
+
+fn audio_meters(sequence: u64) -> AudioMetersMessage {
+    AudioMetersMessage {
+        server: server(),
+        sequence,
+        frame: sequence,
+        start_sample: sequence * 1_920,
+        end_sample: (sequence + 1) * 1_920,
+        master: vec![AudioMeterChannel {
+            peak_millionths: 500_000,
+            rms_millionths: 250_000,
+        }],
+        inputs: vec![InputAudioMeters {
+            input: input(1),
+            channels: vec![AudioMeterChannel {
+                peak_millionths: 250_000,
+                rms_millionths: 125_000,
+            }],
+        }],
     }
 }
 
@@ -328,6 +350,33 @@ fn snapshot_heartbeat_command_result_and_events_preserve_wire_order() {
     assert!(matches!(
         session.receive(),
         Err(TcpSessionError::NotConnected)
+    ));
+    server_thread.join().unwrap();
+}
+
+#[test]
+fn audio_meters_are_ephemeral_and_strictly_ordered() {
+    let (address, server_thread) = spawn_server(|listener| {
+        let mut peer = Peer::accept(&listener);
+        accept_snapshot(&mut peer, 4);
+        peer.send(&WireMessage::AudioMeters(audio_meters(5)));
+        peer.send(&WireMessage::AudioMeters(audio_meters(5)));
+    });
+
+    let mut session = TcpSession::new(client(4));
+    session.connect(address, CONNECT_TIMEOUT).unwrap();
+    assert!(matches!(
+        session.receive().unwrap(),
+        SessionEvent::AudioMeters { meters } if meters.sequence == 5
+    ));
+    assert_eq!(session.client().last_applied_cursor().unwrap().revision, 4);
+    assert!(matches!(
+        session.receive(),
+        Err(TcpSessionError::UnexpectedMessage)
+    ));
+    assert!(matches!(
+        session.client().state(),
+        ConnectionState::Backoff(_)
     ));
     server_thread.join().unwrap();
 }

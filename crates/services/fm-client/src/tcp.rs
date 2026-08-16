@@ -5,9 +5,10 @@ use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
 use fm_protocol::{
-    CURRENT_PROTOCOL_VERSION, CodecError, CommandPayload, CommandResult, DiagnosticsRequest,
-    DiagnosticsResponse, DurableGap, ErrorMessage, EventMessage, HandshakeOutcome,
-    HeartbeatAcknowledgementMessage, LineDecoder, RuntimeEventMessage, WireMessage, encode_line,
+    AudioMetersMessage, CURRENT_PROTOCOL_VERSION, CodecError, CommandPayload, CommandResult,
+    DiagnosticsRequest, DiagnosticsResponse, DurableGap, ErrorMessage, EventMessage,
+    HandshakeOutcome, HeartbeatAcknowledgementMessage, LineDecoder, RuntimeEventMessage,
+    WireMessage, encode_line,
 };
 
 use crate::{Client, ClientError, Intake, Outbound, ReconnectBackoff, SyncMode};
@@ -351,6 +352,9 @@ pub enum SessionEvent {
     HeartbeatAcknowledged {
         acknowledgement: HeartbeatAcknowledgementMessage,
     },
+    AudioMeters {
+        meters: AudioMetersMessage,
+    },
     DiagnosticsResponse {
         response: DiagnosticsResponse,
     },
@@ -439,6 +443,7 @@ pub struct TcpSession {
     connection: Option<TcpConnection>,
     sent_commands: VecDeque<String>,
     pending_diagnostics: Option<String>,
+    last_audio_meter_sequence: Option<u64>,
 }
 
 impl TcpSession {
@@ -449,6 +454,7 @@ impl TcpSession {
             connection: None,
             sent_commands: VecDeque::new(),
             pending_diagnostics: None,
+            last_audio_meter_sequence: None,
         }
     }
 
@@ -794,6 +800,9 @@ impl TcpSession {
                             return Err(TcpSessionError::UnexpectedMessage);
                         }
                     }
+                    WireMessage::AudioMeters(meters) => {
+                        self.validate_audio_meters(&meters)?;
+                    }
                     _ => {
                         self.transition_disconnect();
                         return Err(TcpSessionError::UnexpectedMessage);
@@ -840,6 +849,10 @@ impl TcpSession {
                     return Err(TcpSessionError::Client(error));
                 }
                 Ok(SessionEvent::HeartbeatAcknowledged { acknowledgement })
+            }
+            WireMessage::AudioMeters(meters) => {
+                self.validate_audio_meters(&meters)?;
+                Ok(SessionEvent::AudioMeters { meters })
             }
             WireMessage::DurableGap(gap) => {
                 let result = self.client.intake(WireMessage::DurableGap(gap.clone()));
@@ -1063,8 +1076,28 @@ impl TcpSession {
 
     fn transition_disconnect(&mut self) -> ReconnectBackoff {
         self.pending_diagnostics = None;
+        self.last_audio_meter_sequence = None;
         self.connection.take();
         self.client.transport_disconnected()
+    }
+
+    fn validate_audio_meters(
+        &mut self,
+        meters: &AudioMetersMessage,
+    ) -> Result<(), TcpSessionError> {
+        let valid_identity = self
+            .client
+            .session()
+            .is_some_and(|session| session.server == meters.server);
+        let valid_sequence = self
+            .last_audio_meter_sequence
+            .is_none_or(|sequence| meters.sequence > sequence);
+        if !valid_identity || !valid_sequence {
+            self.transition_disconnect();
+            return Err(TcpSessionError::UnexpectedMessage);
+        }
+        self.last_audio_meter_sequence = Some(meters.sequence);
+        Ok(())
     }
 }
 

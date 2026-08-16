@@ -74,6 +74,9 @@ point-in-time control diagnostics and does not mutate engine or durable state.
 It is not telemetry, health, or readiness, and RC-015 remains planned.
 Protocol 2.14 adds the ordered configured output ID/name roster required for
 exact overlay-output inclusion controls; it does not prove output delivery.
+Protocol 2.15 defines bounded fixed-point Master and per-input meter records;
+`fm-client` validates identity and monotonic sequence without changing the
+durable cursor. The daemon does not publish these records yet.
 Protocol 2.12 retains the protocol 2.10 rule
 that the daemon acknowledges only a validated heartbeat with the session server identity, the exact client
 heartbeat sequence, and the server receive time. Studio accepts one expected
@@ -95,7 +98,7 @@ or transport-level production rate limits. Native and non-native raw TCP now
 share the bounded single-thread scheduler: an idle Viewer can receive live
 events while an Operator controls the show, and native mode remains limited to
 one peer. Native-media acceptance is not proven on this Mac. This is
-prerequisite transport infrastructure only; AU-001 meter protocol and Studio
+prerequisite transport infrastructure only; AU-001 daemon and Studio meter
 transport remain planned. It is not HTTP/WebSocket/service/media readiness or
 RC-008 completion. Expired raw TCP sessions are reclaimed.
 
@@ -225,7 +228,8 @@ and RMS readings in `InputId` order after delay, channel mapping, operator
 gates, gain, balance, and transition gain. Silent configured strips remain
 visible with zero readings. An opt-in allocation-free planar render API writes
 Master and per-input readings into exact-size caller-owned flat buffers without
-changing the existing native caller; no protocol or UI meter transport exists.
+changing the existing native caller. Protocol 2.15 and `fm-client` can carry a
+lossy meter sample, but the daemon does not publish it and Studio does not show it.
 Its bounded
 `ClockMappedAudioSynchronizer` is now connected to native `freemixd` local-file
 audio. The daemon accepts source rates such as 44.1 kHz and linearly resamples

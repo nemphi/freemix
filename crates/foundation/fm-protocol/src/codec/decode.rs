@@ -2,11 +2,12 @@ use core::{num::NonZeroU128, str::FromStr};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    CapabilityReportMessage, CapabilityReportSummary, CodecError, CommandMessage, CommandPayload,
-    CommandResult, DiagnosticsRequest, DiagnosticsResponse, DurableEventBatch, DurableGap,
-    EngineIdentity, ErrorMessage, EventCursor, EventMessage, EventPayload, FadeToBlackPosition,
-    FadeToBlackState, HandshakeOutcome, HandshakeRequest, HandshakeResponse,
-    HeartbeatAcknowledgementMessage, HeartbeatMessage, InputAudioStripStatus, ManualTransitionKind,
+    AudioMeterChannel, AudioMetersMessage, CapabilityReportMessage, CapabilityReportSummary,
+    CodecError, CommandMessage, CommandPayload, CommandResult, DiagnosticsRequest,
+    DiagnosticsResponse, DurableEventBatch, DurableGap, EngineIdentity, ErrorMessage, EventCursor,
+    EventMessage, EventPayload, FadeToBlackPosition, FadeToBlackState, HandshakeOutcome,
+    HandshakeRequest, HandshakeResponse, HeartbeatAcknowledgementMessage, HeartbeatMessage,
+    InputAudioMeters, InputAudioStripStatus, MAX_AUDIO_METER_CHANNELS, ManualTransitionKind,
     ManualTransitionPosition, ManualTransitionState, ManualTransitionStatus, OverlayStatus,
     ResumeCursor, RuntimeEventMessage, RuntimeFailureDisposition, RuntimeLifecycleEvent,
     ServerIdentity, SnapshotMessage, SnapshotReason, StingerAudioPolicy,
@@ -66,6 +67,7 @@ pub fn decode_line(line: &str) -> Result<WireMessage, CodecError> {
         "heartbeat_acknowledgement" => {
             WireMessage::HeartbeatAcknowledgement(decode_heartbeat_acknowledgement(&mut fields)?)
         }
+        "audio_meters" => WireMessage::AudioMeters(decode_audio_meters(&mut fields)?),
         "capability_report" => {
             WireMessage::CapabilityReport(decode_capability_report(&mut fields)?)
         }
@@ -1248,6 +1250,120 @@ fn decode_heartbeat_acknowledgement(
         heartbeat_sequence: fields.parse_required("heartbeat_sequence")?,
         received_at_ms: fields.parse_required("received_at_ms")?,
     })
+}
+
+fn decode_audio_meters(fields: &mut Fields) -> Result<AudioMetersMessage, CodecError> {
+    let server = decode_server_identity(fields)?;
+    let sequence = fields.parse_required("sequence")?;
+    let frame = fields.parse_required("frame")?;
+    let start_sample: u64 = fields.parse_required("start_sample")?;
+    let end_sample: u64 = fields.parse_required("end_sample")?;
+    let master_value = fields.required("master")?;
+    let master = decode_meter_channels(&master_value, "master")?;
+    if !(1..=MAX_AUDIO_METER_CHANNELS).contains(&master.len()) {
+        return Err(CodecError::InvalidField {
+            field: "master",
+            value: master_value,
+        });
+    }
+    if end_sample <= start_sample {
+        return Err(CodecError::InvalidField {
+            field: "end_sample",
+            value: end_sample.to_string(),
+        });
+    }
+    let inputs_value = fields.required("inputs")?;
+    let inputs = if inputs_value.is_empty() {
+        Vec::new()
+    } else {
+        let entries: Vec<_> = inputs_value.split(';').collect();
+        if entries.len() > MAX_LIST_ITEMS {
+            return Err(CodecError::TooManyItems("inputs"));
+        }
+        let mut previous = None;
+        entries
+            .into_iter()
+            .map(|entry| {
+                let (input, channels) =
+                    entry
+                        .split_once('~')
+                        .ok_or_else(|| CodecError::InvalidField {
+                            field: "inputs",
+                            value: inputs_value.clone(),
+                        })?;
+                let input = input
+                    .parse::<u128>()
+                    .ok()
+                    .and_then(core::num::NonZeroU128::new)
+                    .map(WireInputId::new)
+                    .ok_or_else(|| CodecError::InvalidField {
+                        field: "inputs",
+                        value: inputs_value.clone(),
+                    })?;
+                let channels = decode_meter_channels(channels, "inputs")?;
+                if channels.len() != master.len() || previous.is_some_and(|id| input.get() <= id) {
+                    return Err(CodecError::InvalidField {
+                        field: "inputs",
+                        value: inputs_value.clone(),
+                    });
+                }
+                previous = Some(input.get());
+                Ok(InputAudioMeters { input, channels })
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    Ok(AudioMetersMessage {
+        server,
+        sequence,
+        frame,
+        start_sample,
+        end_sample,
+        master,
+        inputs,
+    })
+}
+
+fn decode_meter_channels(
+    value: &str,
+    field: &'static str,
+) -> Result<Vec<AudioMeterChannel>, CodecError> {
+    let channels: Vec<_> = value.split(',').collect();
+    if value.is_empty() || channels.len() > MAX_AUDIO_METER_CHANNELS {
+        return Err(CodecError::InvalidField {
+            field,
+            value: value.to_owned(),
+        });
+    }
+    channels
+        .into_iter()
+        .map(|channel| {
+            let (peak, rms) = channel
+                .split_once(':')
+                .ok_or_else(|| CodecError::InvalidField {
+                    field,
+                    value: value.to_owned(),
+                })?;
+            let peak_millionths = peak.parse().map_err(|_| CodecError::InvalidField {
+                field,
+                value: value.to_owned(),
+            })?;
+            let rms_millionths = rms.parse().map_err(|_| CodecError::InvalidField {
+                field,
+                value: value.to_owned(),
+            })?;
+            let channel = AudioMeterChannel {
+                peak_millionths,
+                rms_millionths,
+            };
+            if !channel.is_valid() {
+                return Err(CodecError::InvalidField {
+                    field,
+                    value: value.to_owned(),
+                });
+            }
+            Ok(channel)
+        })
+        .collect()
 }
 
 fn decode_capability_report(fields: &mut Fields) -> Result<CapabilityReportMessage, CodecError> {

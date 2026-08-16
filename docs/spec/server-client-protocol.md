@@ -34,7 +34,7 @@ into control messages.
    replacement, restore, log compaction, or engine identity change forces a
    snapshot and a new cursor.
 
-The current Protocol 2.14 implementation uses bounded newline-delimited raw TCP.
+The current Protocol 2.15 implementation uses bounded newline-delimited raw TCP.
 Studio keeps one expected heartbeat sequence and waits for its matching
 acknowledgement within the bounded peer wait. EOF, timeout, wrong server
 identity, or wrong sequence enters the existing reconnect backoff. The server
@@ -129,6 +129,14 @@ Ephemeral streams include:
 - input/output health;
 - GPU/CPU/disk/network metrics;
 - pointer/hover previews and telestrator cursors.
+
+Protocol 2.15 defines `audio_meters` as a lossy, non-resumable record with
+server identity, an independent sequence, one native Program frame/sample
+interval, fixed-point linear Master levels, and fixed-point per-input levels in
+strict `InputId` order. Levels use millionths of linear full scale and can
+exceed unity. The codec validates only that the sample interval is positive;
+the native timeline owns frame/sample coherence. The record does not advance or
+carry a durable revision.
 
 Each telemetry class has requested cadence, aggregation, and maximum bandwidth.
 Slow clients receive coalesced latest data, never unbounded queues.

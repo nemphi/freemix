@@ -535,6 +535,7 @@ impl Client {
             | WireMessage::HandshakeRequest(_)
             | WireMessage::DurableEventBatch(_)
             | WireMessage::Heartbeat(_)
+            | WireMessage::AudioMeters(_)
             | WireMessage::CapabilityReport(_)
             | WireMessage::DiagnosticsRequest(_)
             | WireMessage::DiagnosticsResponse(_)

@@ -1,13 +1,14 @@
 use std::collections::BTreeSet;
 
 use crate::{
-    CapabilityReportMessage, CapabilityReportSummary, CommandMessage, CommandPayload,
-    CommandResult, DiagnosticsRequest, DiagnosticsResponse, DurableEventBatch, DurableGap,
-    EngineIdentity, ErrorMessage, EventCursor, EventMessage, EventPayload, FadeToBlackState,
-    HandshakeOutcome, HandshakeRequest, HandshakeResponse, HeartbeatAcknowledgementMessage,
-    HeartbeatMessage, InputAudioStripStatus, ManualTransitionKind, ManualTransitionStatus,
-    OverlayStatus, ResumeCursor, RuntimeEventMessage, RuntimeFailureDisposition,
-    RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage, SnapshotReason, StingerAudioPolicy,
+    AudioMeterChannel, AudioMetersMessage, CapabilityReportMessage, CapabilityReportSummary,
+    CommandMessage, CommandPayload, CommandResult, DiagnosticsRequest, DiagnosticsResponse,
+    DurableEventBatch, DurableGap, EngineIdentity, ErrorMessage, EventCursor, EventMessage,
+    EventPayload, FadeToBlackState, HandshakeOutcome, HandshakeRequest, HandshakeResponse,
+    HeartbeatAcknowledgementMessage, HeartbeatMessage, InputAudioStripStatus,
+    MAX_AUDIO_METER_CHANNELS, ManualTransitionKind, ManualTransitionStatus, OverlayStatus,
+    ResumeCursor, RuntimeEventMessage, RuntimeFailureDisposition, RuntimeLifecycleEvent,
+    ServerIdentity, SnapshotMessage, SnapshotReason, StingerAudioPolicy,
     StingerMissingMediaFallback, StingerReadiness, StingerStatus, StructuredError, WireMessage,
 };
 
@@ -43,6 +44,7 @@ pub fn encode_line(message: &WireMessage) -> Result<String, CodecError> {
         WireMessage::HeartbeatAcknowledgement(message) => {
             encode_heartbeat_acknowledgement(&mut record, message)?;
         }
+        WireMessage::AudioMeters(message) => encode_audio_meters(&mut record, message)?,
         WireMessage::CapabilityReport(message) => encode_capability_report(&mut record, message)?,
         WireMessage::DiagnosticsRequest(message) => {
             encode_diagnostics_request(&mut record, message)?
@@ -965,6 +967,80 @@ fn encode_heartbeat_acknowledgement(
     encode_server_identity(record, &message.server)?;
     record.field("heartbeat_sequence", message.heartbeat_sequence)?;
     record.field("received_at_ms", message.received_at_ms)
+}
+
+fn encode_audio_meters(
+    record: &mut Record,
+    message: &AudioMetersMessage,
+) -> Result<(), CodecError> {
+    let channels = message.master.len();
+    if !(1..=MAX_AUDIO_METER_CHANNELS).contains(&channels) {
+        return Err(CodecError::InvalidField {
+            field: "master",
+            value: channels.to_string(),
+        });
+    }
+    if message.end_sample <= message.start_sample {
+        return Err(CodecError::InvalidField {
+            field: "end_sample",
+            value: message.end_sample.to_string(),
+        });
+    }
+    let master = encode_meter_channels(&message.master, "master")?;
+    let mut previous = None;
+    let inputs = message
+        .inputs
+        .iter()
+        .map(|input| {
+            if input.channels.len() != channels
+                || previous.is_some_and(|id| input.input.get() <= id)
+            {
+                return Err(CodecError::InvalidField {
+                    field: "inputs",
+                    value: input.input.to_string(),
+                });
+            }
+            previous = Some(input.input.get());
+            Ok(format!(
+                "{}~{}",
+                input.input,
+                encode_meter_channels(&input.channels, "inputs")?
+            ))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if inputs.len() > super::MAX_LIST_ITEMS {
+        return Err(CodecError::TooManyItems("inputs"));
+    }
+    record.kind("audio_meters");
+    encode_server_identity(record, &message.server)?;
+    record.field("sequence", message.sequence)?;
+    record.field("frame", message.frame)?;
+    record.field("start_sample", message.start_sample)?;
+    record.field("end_sample", message.end_sample)?;
+    record.field_string("master", master)?;
+    record.field_string("inputs", inputs.join(";"))
+}
+
+fn encode_meter_channels(
+    channels: &[AudioMeterChannel],
+    field: &'static str,
+) -> Result<String, CodecError> {
+    channels
+        .iter()
+        .map(|channel| {
+            if !channel.is_valid() {
+                return Err(CodecError::InvalidField {
+                    field,
+                    value: channel.rms_millionths.to_string(),
+                });
+            }
+            Ok(format!(
+                "{}:{}",
+                channel.peak_millionths, channel.rms_millionths
+            ))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(|channels| channels.join(","))
 }
 
 fn encode_capability_report(

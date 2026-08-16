@@ -774,6 +774,41 @@ pub struct HeartbeatAcknowledgementMessage {
     pub received_at_ms: u64,
 }
 
+/// Fixed-point scale for linear audio meter levels.
+pub const AUDIO_METER_LEVEL_SCALE: u32 = 1_000_000;
+/// Largest channel count in one audio meter layout.
+pub const MAX_AUDIO_METER_CHANNELS: usize = 32;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AudioMeterChannel {
+    pub peak_millionths: u32,
+    pub rms_millionths: u32,
+}
+
+impl AudioMeterChannel {
+    pub(crate) const fn is_valid(self) -> bool {
+        self.rms_millionths <= self.peak_millionths
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InputAudioMeters {
+    pub input: WireInputId,
+    pub channels: Vec<AudioMeterChannel>,
+}
+
+/// Lossy, non-resumable audio meter sample for one native Program interval.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AudioMetersMessage {
+    pub server: ServerIdentity,
+    pub sequence: u64,
+    pub frame: u64,
+    pub start_sample: u64,
+    pub end_sample: u64,
+    pub master: Vec<AudioMeterChannel>,
+    pub inputs: Vec<InputAudioMeters>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CapabilityReportSummary {
     pub digest: String,
@@ -823,6 +858,7 @@ pub enum WireMessage {
     RuntimeEvent(RuntimeEventMessage),
     Heartbeat(HeartbeatMessage),
     HeartbeatAcknowledgement(HeartbeatAcknowledgementMessage),
+    AudioMeters(AudioMetersMessage),
     CapabilityReport(CapabilityReportMessage),
     DiagnosticsRequest(DiagnosticsRequest),
     DiagnosticsResponse(DiagnosticsResponse),
