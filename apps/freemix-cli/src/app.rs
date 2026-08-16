@@ -91,6 +91,20 @@ pub fn run(command: Command) -> AppResult<()> {
         } => {
             add_scene_input(&path, input_id(input)?, scene_id(scene)?, name)?;
         }
+        Command::SceneBackground {
+            path,
+            scene,
+            red,
+            green,
+            blue,
+            alpha,
+        } => {
+            set_scene_background(
+                &path,
+                scene_id(scene)?,
+                ModelRgba8::new(red, green, blue, alpha),
+            )?;
+        }
         Command::SceneLayerAdd {
             path,
             scene,
@@ -1352,6 +1366,25 @@ fn add_scene_layer(
     Ok(())
 }
 
+fn set_scene_background(path: &Path, scene: SceneId, background: ModelRgba8) -> AppResult<()> {
+    let store = ProjectStore::new(path)?;
+    let stored = load_stored_project(path)?;
+    let mut project = stored.project().clone();
+    project.set_scene_background(scene, background)?;
+    let configured = StoredProject::from_project_with_complete_runtime_state(
+        project,
+        stored.runtime_routing(),
+        stored.runtime_manual_transitions(),
+        stored.runtime_fade_to_black(),
+        stored.runtime_overlays().clone(),
+        stored.position(),
+        stored.idempotency_receipts().to_vec(),
+    )?;
+    store.save(&configured)?;
+    print_status(&load_engine(path)?);
+    Ok(())
+}
+
 fn remove_scene_layer(path: &Path, scene: SceneId, index: usize) -> AppResult<()> {
     let store = ProjectStore::new(path)?;
     let stored = load_stored_project(path)?;
@@ -2234,6 +2267,7 @@ Usage:
   freemix-cli new <show.freemix> [--name <name>]
   freemix-cli input-add <show.freemix> <nonzero-input-id> <name>
   freemix-cli scene-input-add <show.freemix> <nonzero-input-id> <nonzero-scene-id> <name>
+  freemix-cli scene-background <show.freemix> <scene-id> <premultiplied-red:0..=255> <premultiplied-green:0..=255> <premultiplied-blue:0..=255> <alpha:0..=255>
   freemix-cli scene-layer-add <show.freemix> <scene-id> <source-input-id> <z-order> <layer-name>
   freemix-cli scene-layer-remove <show.freemix> <scene-id> <zero-based-layer-index>
   freemix-cli scene-layer-z-order <show.freemix> <scene-id> <zero-based-layer-index> <signed-z-order>

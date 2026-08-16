@@ -1932,6 +1932,75 @@ fn local_scene_input_add_persists_empty_scene_without_routing() {
 }
 
 #[test]
+fn local_scene_background() {
+    let context = ContractContext::new();
+    assert_success(&invoke(&["new", context.project_path()]));
+    assert_success(&invoke(&[
+        "scene-input-add",
+        context.project_path(),
+        "3",
+        "7",
+        "Scene",
+    ]));
+    assert_success(&invoke(&[
+        "scene-layer-add",
+        context.project_path(),
+        "7",
+        "1",
+        "2",
+        "Layer",
+    ]));
+    let before = ProjectStore::new(&context.project).unwrap().load().unwrap();
+    let before_manifest = manifest(&context.project);
+    assert_success(&invoke(&[
+        "scene-background",
+        context.project_path(),
+        "7",
+        "16",
+        "8",
+        "4",
+        "16",
+    ]));
+    let after = ProjectStore::new(&context.project).unwrap().load().unwrap();
+    assert_eq!(after.runtime_routing(), before.runtime_routing());
+    assert_eq!(
+        after.runtime_manual_transitions(),
+        before.runtime_manual_transitions()
+    );
+    assert_eq!(
+        after.runtime_fade_to_black(),
+        before.runtime_fade_to_black()
+    );
+    assert_eq!(after.runtime_overlays(), before.runtime_overlays());
+    assert_eq!(after.position(), before.position());
+    assert_eq!(after.idempotency_receipts(), before.idempotency_receipts());
+    assert_eq!(after.project().inputs(), before.project().inputs());
+    assert_eq!(after.project().main_mix(), before.project().main_mix());
+    let mut expected_scenes = before.project().scenes().to_vec();
+    expected_scenes
+        .iter_mut()
+        .find(|scene| scene.id.get().get() == 7)
+        .unwrap()
+        .background = Rgba8::new(16, 8, 4, 16);
+    assert_eq!(after.project().scenes(), expected_scenes);
+    assert_eq!(after.project().scenes()[0].layers.len(), 1);
+    let unchanged = manifest(&context.project);
+    let invalid = invoke(&[
+        "scene-background",
+        context.project_path(),
+        "7",
+        "17",
+        "8",
+        "4",
+        "16",
+    ]);
+    assert_failure_contains(&invalid, "scene background must be premultiplied");
+    assert_eq!(manifest(&context.project), unchanged);
+    assert_ne!(unchanged, before_manifest);
+    fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
 fn local_scene_layer_add_persists_full_frame_layer() {
     let context = ContractContext::new();
     assert_success(&invoke(&["new", context.project_path()]));

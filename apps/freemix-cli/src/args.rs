@@ -82,6 +82,14 @@ pub enum Command {
         scene: u128,
         name: String,
     },
+    SceneBackground {
+        path: PathBuf,
+        scene: u128,
+        red: u8,
+        green: u8,
+        blue: u8,
+        alpha: u8,
+    },
     SceneLayerAdd {
         path: PathBuf,
         scene: u128,
@@ -558,6 +566,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
         "new" => parse_new(arguments),
         "input-add" => parse_input_add(arguments),
         "scene-input-add" => parse_scene_input_add(arguments),
+        "scene-background" => parse_scene_background(arguments),
         "scene-layer-add" => parse_scene_layer_add(arguments),
         "scene-layer-remove" => parse_scene_layer_remove(arguments),
         "scene-layer-z-order" => parse_scene_layer_z_order(arguments),
@@ -988,6 +997,38 @@ fn parse_scene_input_add(
         input,
         scene,
         name,
+    })
+}
+
+fn parse_scene_background(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Command, ArgsError> {
+    let path = required_path(&mut arguments, "project path")?;
+    let scene = number(&required(&mut arguments, "scene")?, "scene")?;
+    let red = bounded_u8(
+        &required(&mut arguments, "premultiplied red")?,
+        "premultiplied red",
+        255,
+    )?;
+    let green = bounded_u8(
+        &required(&mut arguments, "premultiplied green")?,
+        "premultiplied green",
+        255,
+    )?;
+    let blue = bounded_u8(
+        &required(&mut arguments, "premultiplied blue")?,
+        "premultiplied blue",
+        255,
+    )?;
+    let alpha = bounded_u8(&required(&mut arguments, "alpha")?, "alpha", 255)?;
+    reject_extra(&mut arguments)?;
+    Ok(Command::SceneBackground {
+        path,
+        scene,
+        red,
+        green,
+        blue,
+        alpha,
     })
 }
 

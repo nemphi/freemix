@@ -22,6 +22,12 @@ pub enum AddSceneLayerError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SetSceneBackgroundError {
+    UnknownScene(SceneId),
+    NotPremultiplied,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SceneLayerError {
     UnknownScene(SceneId),
     LayerIndexOutOfRange {
@@ -58,6 +64,17 @@ impl std::fmt::Display for AddSceneLayerError {
 }
 
 impl std::error::Error for AddSceneLayerError {}
+
+impl std::fmt::Display for SetSceneBackgroundError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownScene(scene) => write!(formatter, "unknown scene {scene}"),
+            Self::NotPremultiplied => formatter.write_str("scene background must be premultiplied"),
+        }
+    }
+}
+
+impl std::error::Error for SetSceneBackgroundError {}
 
 impl std::fmt::Display for ReplaceInputError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -306,6 +323,22 @@ impl Project {
 
     pub fn add_scene(&mut self, scene: Scene) {
         self.scenes.push(scene);
+    }
+
+    pub fn set_scene_background(
+        &mut self,
+        scene: SceneId,
+        background: Rgba8,
+    ) -> Result<(), SetSceneBackgroundError> {
+        if !background.is_premultiplied() {
+            return Err(SetSceneBackgroundError::NotPremultiplied);
+        }
+        self.scenes
+            .iter_mut()
+            .find(|candidate| candidate.id == scene)
+            .ok_or(SetSceneBackgroundError::UnknownScene(scene))?
+            .background = background;
+        Ok(())
     }
 
     pub fn add_layer_to_scene(
