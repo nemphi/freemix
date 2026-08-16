@@ -1,5 +1,5 @@
 use std::io;
-use std::net::{SocketAddr, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
 use fm_protocol::{CodecError, MAX_LINE_BYTES, WireMessage, decode_line, encode_line};
@@ -126,6 +126,7 @@ impl WebSocketConnection {
         self.socket
             .get_mut()
             .set_read_timeout(None)
+            .and_then(|()| self.socket.get_mut().set_write_timeout(None))
             .map_err(|_| WebSocketReceiveError::Transport)?;
         let result = self.receive_inner(None).map(|status| status.message);
         self.reset_timeouts(result)
@@ -154,6 +155,7 @@ impl WebSocketConnection {
                 self.socket
                     .get_mut()
                     .set_read_timeout(Some(timeout))
+                    .and_then(|()| self.socket.get_mut().set_write_timeout(Some(timeout)))
                     .map_err(|_| WebSocketReceiveError::Transport)?;
             }
             match self.socket.read() {
@@ -169,11 +171,15 @@ impl WebSocketConnection {
                 Ok(Message::Close(_)) => {
                     // tungstenite queued its automatic Close reply; flush it once.
                     if let Some(deadline) = deadline {
+                        let Some(timeout) = remaining(deadline) else {
+                            return Ok(ReceiveStatus {
+                                message: None,
+                                timed_out: false,
+                            });
+                        };
                         self.socket
                             .get_mut()
-                            .set_write_timeout(Some(nonzero(
-                                remaining(deadline).unwrap_or_default(),
-                            )))
+                            .set_write_timeout(Some(timeout))
                             .map_err(|_| WebSocketReceiveError::Transport)?;
                     }
                     self.socket
@@ -234,7 +240,7 @@ impl WebSocketConnection {
     }
 
     pub(crate) fn shutdown(&mut self) {
-        let _ = self.socket.close(None);
+        let _ = self.socket.get_ref().shutdown(Shutdown::Both);
     }
 }
 
