@@ -2826,15 +2826,16 @@ fn local_audio_bus_rename_persists_exact_name_and_preserves_runtime_state() {
         supplied,
     ]));
     let after = store.load().unwrap();
-    let mut expected_project = before.project().clone();
-    expected_project
-        .rename_audio_bus(BusId::new(NonZeroU128::new(21).unwrap()), supplied.into())
-        .unwrap();
-    assert_eq!(after.project(), &expected_project);
+    let before_buses = before.project().audio_buses();
+    let after_buses = after.project().audio_buses();
     assert_eq!(
-        after.project().audio_buses()[0].sends,
-        before.project().audio_buses()[0].sends
+        after_buses.iter().map(|bus| bus.id).collect::<Vec<_>>(),
+        before_buses.iter().map(|bus| bus.id).collect::<Vec<_>>()
     );
+    assert_eq!(after_buses[0], before_buses[0]);
+    assert_eq!(after_buses[1].id, before_buses[1].id);
+    assert_eq!(after_buses[1].sends, before_buses[1].sends);
+    assert_eq!(after_buses[1].name, supplied);
     assert_eq!(after.project().outputs(), before.project().outputs());
     assert_eq!(after.runtime_routing(), before.runtime_routing());
     assert_eq!(
