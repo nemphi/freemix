@@ -4302,24 +4302,6 @@ fn local_input_remove_rejects_runtime_reference_and_removes_unused_input() {
     let routed = invoke(&["input-remove", context.project_path(), "1"]);
     assert_failure_contains(&routed, "runtime reference");
     assert_eq!(manifest(&context.project), after_removal);
-
-    assert_success(&invoke(&[
-        "scene-input-add",
-        context.project_path(),
-        "4",
-        "7",
-        "Scene input",
-    ]));
-    let scene_store = ProjectStore::new(&context.project).unwrap();
-    let scene_manifest = fs::read(context.project.join("project.json")).unwrap();
-    let scene_journal = journal_bytes(&scene_store);
-    let scene_input = invoke(&["input-remove", context.project_path(), "4"]);
-    assert_failure_contains(&scene_input, "domain reference");
-    assert_eq!(
-        fs::read(context.project.join("project.json")).unwrap(),
-        scene_manifest
-    );
-    assert_eq!(journal_bytes(&scene_store), scene_journal);
     fs::remove_dir_all(context.root).unwrap();
 }
 

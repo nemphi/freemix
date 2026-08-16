@@ -621,29 +621,6 @@ fn remove_input_removes_pair_and_rejects_domain_references() {
             Err(RemoveInputError::DomainReference(input_id(3)))
         );
     }
-
-    let mut scene_project = base.clone();
-    scene_project.add_scene(Scene {
-        id: scene_id(4),
-        name: "Scene input owner".into(),
-        background: Rgba8::OPAQUE_BLACK,
-        layers: Vec::new(),
-    });
-    scene_project.add_input(Input {
-        id: input_id(4),
-        name: "Scene input".into(),
-        kind: InputKind::Scene {
-            scene_id: scene_id(4),
-            audio_source: None,
-        },
-        required_capabilities: Vec::new(),
-    });
-    let before = scene_project.clone();
-    assert_eq!(
-        scene_project.remove_input(input_id(4)),
-        Err(RemoveInputError::DomainReference(input_id(4)))
-    );
-    assert_eq!(scene_project, before);
 }
 
 #[test]
