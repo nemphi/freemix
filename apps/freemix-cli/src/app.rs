@@ -82,6 +82,7 @@ pub fn run(command: Command) -> AppResult<()> {
         Command::InputAdd { path, input, name } => {
             add_input(&path, input_id(input)?, name)?;
         }
+        Command::InputRemove { path, input } => remove_input(&path, input_id(input)?)?,
         Command::InputDuplicate {
             path,
             source,
@@ -1189,6 +1190,51 @@ fn add_input(path: &Path, input: InputId, name: String) -> AppResult<()> {
     Ok(())
 }
 
+fn remove_input(path: &Path, input: InputId) -> AppResult<()> {
+    let stored = load_stored_project(path)?;
+    let runtime = stored.runtime_routing();
+    let transitions = stored.runtime_manual_transitions();
+    let overlays = stored.runtime_overlays();
+    let referenced = [
+        runtime.desired_program_id,
+        runtime.realized_program_id,
+        runtime.desired_preview_id,
+        runtime.realized_preview_id,
+    ]
+    .into_iter()
+    .flatten()
+    .any(|candidate| candidate == input)
+        || [transitions.desired, transitions.realized]
+            .into_iter()
+            .flatten()
+            .any(|state| state.from_id == input || state.to_id == input)
+        || overlays
+            .desired
+            .iter()
+            .chain(overlays.realized.iter())
+            .any(|channel| {
+                channel.source == Some(input) || channel.queued_sources.contains(&input)
+            });
+    if referenced {
+        return Err(AppFailure(format!("cannot remove input {input}: runtime reference")).into());
+    }
+    let store = ProjectStore::new(path)?;
+    let mut project = stored.project().clone();
+    project.remove_input(input)?;
+    let configured = StoredProject::from_project_with_complete_runtime_state(
+        project,
+        stored.runtime_routing(),
+        transitions,
+        stored.runtime_fade_to_black(),
+        overlays.clone(),
+        stored.position(),
+        stored.idempotency_receipts().to_vec(),
+    )?;
+    store.save(&configured)?;
+    print_status(&load_engine(path)?);
+    Ok(())
+}
+
 fn duplicate_input(path: &Path, source: InputId, input: InputId, name: String) -> AppResult<()> {
     let stored = load_stored_project(path)?;
     let source_input = stored
@@ -1860,6 +1906,7 @@ FreeMix deterministic MVP
 Usage:
   freemix-cli new <show.freemix> [--name <name>]
   freemix-cli input-add <show.freemix> <nonzero-input-id> <name>
+  freemix-cli input-remove <show.freemix> <input-id>
   freemix-cli input-duplicate <show.freemix> <source-input-id> <new-nonzero-input-id> <new-name>
   freemix-cli status <show.freemix>
   freemix-cli audio-strip <show.freemix> <input> <gain-millidb:-96000..=24000> <balance-bp:-10000..=10000> <muted:on|off> <soloed:on|off> <follow-video:on|off> <delay-samples:0..=48000>

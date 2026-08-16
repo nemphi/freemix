@@ -5,6 +5,25 @@ use fm_types::{
 
 use crate::{ValidationError, validation::validate_project};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemoveInputError {
+    UnknownInput(InputId),
+    DomainReference(InputId),
+}
+
+impl std::fmt::Display for RemoveInputError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownInput(input) => write!(formatter, "unknown input {input}"),
+            Self::DomainReference(input) => {
+                write!(formatter, "input {input} has a domain reference")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RemoveInputError {}
+
 pub const CURRENT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(17);
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -131,6 +150,27 @@ impl Project {
             state: InputAudioStripState::default(),
         });
         self.inputs.push(input);
+    }
+
+    pub fn remove_input(&mut self, input: InputId) -> Result<(), RemoveInputError> {
+        if !self.inputs.iter().any(|candidate| candidate.id == input) {
+            return Err(RemoveInputError::UnknownInput(input));
+        }
+        let referenced = self.main_mix.is_some_and(|mix| {
+            mix.desired_program == input || mix.desired_preview == input
+        }) || self.stingers.iter().any(|stinger| stinger.media_input == input)
+            || self.scenes.iter().any(|scene| {
+                scene.layers.iter().any(|layer| layer.source == SourceRef::Input(input))
+            })
+            || self.inputs.iter().any(|candidate| {
+                matches!(candidate.kind, InputKind::Scene { audio_source: Some(source), .. } if source == input)
+            });
+        if referenced {
+            return Err(RemoveInputError::DomainReference(input));
+        }
+        self.inputs.retain(|candidate| candidate.id != input);
+        self.input_audio_strips.retain(|strip| strip.input != input);
+        Ok(())
     }
 
     /// Renames one input while preserving the exact supplied text.

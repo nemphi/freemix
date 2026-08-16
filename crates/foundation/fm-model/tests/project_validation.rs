@@ -3,10 +3,10 @@ use std::num::NonZeroU128;
 use fm_model::{
     AudioBus, BusSend, CURRENT_SCHEMA_VERSION, CropRect, EntityRef, Input, InputAudioStripState,
     InputBalanceBasisPoints, InputDelaySamples, InputGainMilliDb, InputKind, Layer, LayerGeometry,
-    MainMix, Output, OutputFormat, Project, ProjectSettings, RectMask, RestartPolicy, Rgba8,
-    Rotation, Scene, SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef,
-    StartupPolicy, StingerAudioPolicy, StingerConfig, StingerMissingMediaFallback,
-    StingerSlotNumber, ValidationErrorKind,
+    MainMix, Output, OutputFormat, Project, ProjectSettings, RectMask, RemoveInputError,
+    RestartPolicy, Rgba8, Rotation, Scene, SimulatedAudio, SimulatedInput, SimulatedVideo,
+    SolidColor, SourceRef, StartupPolicy, StingerAudioPolicy, StingerConfig,
+    StingerMissingMediaFallback, StingerSlotNumber, ValidationErrorKind,
 };
 use fm_types::{
     AudioFormat, BusId, ChannelLayout, ColorMetadata, FrameRate, InputId, MAX_INPUT_NAME_BYTES,
@@ -159,6 +159,72 @@ fn complete_simulated_production_is_valid() {
         project.settings().output_format().video.frame_rate,
         project.settings().frame_rate
     );
+}
+
+#[test]
+fn remove_input_removes_pair_and_rejects_domain_references() {
+    let mut base = Project::new(project_id(70), "Remove", settings());
+    for id in [1, 2, 3] {
+        base.add_input(Input {
+            id: input_id(id),
+            name: format!("Input {id}"),
+            kind: InputKind::Simulated(SimulatedInput::new(
+                SimulatedVideo::Bars,
+                SimulatedAudio::Silence,
+            )),
+            required_capabilities: Vec::new(),
+        });
+    }
+    let mut unused = base.clone();
+    unused.remove_input(input_id(3)).unwrap();
+    assert!(!unused.inputs().iter().any(|input| input.id == input_id(3)));
+    assert!(
+        !unused
+            .input_audio_strips()
+            .iter()
+            .any(|strip| strip.input == input_id(3))
+    );
+
+    let mut cases: Vec<Box<dyn FnOnce(&mut Project)>> = vec![
+        Box::new(|project| project.set_main_mix(MainMix::new(input_id(3), input_id(1)))),
+        Box::new(|project| {
+            project.add_stinger(StingerConfig::new(
+                StingerSlotNumber::new(1).unwrap(),
+                input_id(3),
+                false,
+                0,
+                StingerAudioPolicy::Muted,
+                StingerMissingMediaFallback::Cut,
+            ))
+        }),
+        Box::new(|project| {
+            project.add_scene(Scene {
+                id: scene_id(3),
+                name: "Scene".into(),
+                background: Rgba8::OPAQUE_BLACK,
+                layers: vec![layer("Input", SourceRef::Input(input_id(3)))],
+            })
+        }),
+        Box::new(|project| {
+            project.add_input(Input {
+                id: input_id(4),
+                name: "Scene input".into(),
+                kind: InputKind::Scene {
+                    scene_id: scene_id(3),
+                    audio_source: Some(input_id(3)),
+                },
+                required_capabilities: Vec::new(),
+            })
+        }),
+    ];
+    for configure in cases.drain(..) {
+        let mut project = base.clone();
+        configure(&mut project);
+        assert_eq!(
+            project.remove_input(input_id(3)),
+            Err(RemoveInputError::DomainReference(input_id(3)))
+        );
+    }
 }
 
 #[test]

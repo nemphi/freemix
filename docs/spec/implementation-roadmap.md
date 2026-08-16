@@ -271,8 +271,9 @@ uniqueness, then changes only the matching name at the durable revision. It also
 carries an authoritative full input reorder through the EditProject command and
 durable input-order event; the daemon persists that vector order and restores
 the order after restart. Studio now has a compact permission-gated rename editor.
-The local `input-add` and `input-duplicate` commands persist input state for the
-next project open only; they do not mutate a running daemon. The rename and
+The local `input-add`, `input-duplicate`, and `input-remove` commands persist
+input state for the next project open only; they do not mutate a running daemon.
+Live input lifecycle remains planned. The rename and
 reorder commands carry input identity; audio and routing state remain separate.
 Neither command applies an optimistic change or changes current switcher state.
 Studio exposes compact Up/Down controls
