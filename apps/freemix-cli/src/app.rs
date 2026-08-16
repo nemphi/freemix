@@ -1110,22 +1110,9 @@ pub fn run(command: Command) -> AppResult<()> {
 }
 
 fn rename_project(path: &Path, name: String) -> AppResult<()> {
-    let store = ProjectStore::new(path)?;
-    let stored = load_stored_project(path)?;
-    let mut project = stored.project().clone();
-    project.rename_project(name)?;
-    let renamed = StoredProject::from_project_with_complete_runtime_state(
-        project,
-        stored.runtime_routing(),
-        stored.runtime_manual_transitions(),
-        stored.runtime_fade_to_black(),
-        stored.runtime_overlays().clone(),
-        stored.position(),
-        stored.idempotency_receipts().to_vec(),
-    )?;
-    store.save(&renamed)?;
-    print_status(&load_engine(path)?);
-    Ok(())
+    update_project(path, |project| {
+        project.rename_project(name).map_err(Into::into)
+    })
 }
 
 fn default_project(name: String) -> AppResult<ProjectEngine> {
@@ -1443,7 +1430,7 @@ fn sync_input_names(project: &mut Project, show: &ShowState) -> AppResult<()> {
 }
 
 fn configure_stinger(path: &Path, config: StingerConfig) -> AppResult<()> {
-    update_stingers(path, |project| {
+    update_project(path, |project| {
         project.set_stinger_checked(config).map_err(Into::into)
     })
 }
@@ -2180,13 +2167,13 @@ fn replace_input_simulated(path: &Path, input: InputId) -> AppResult<()> {
 }
 
 fn remove_stinger(path: &Path, slot: StingerSlotNumber) -> AppResult<()> {
-    update_stingers(path, |project| {
+    update_project(path, |project| {
         let _ = project.remove_stinger(slot);
         Ok(())
     })
 }
 
-fn update_stingers(
+fn update_project(
     path: &Path,
     update: impl FnOnce(&mut Project) -> AppResult<()>,
 ) -> AppResult<()> {

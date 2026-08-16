@@ -2866,6 +2866,7 @@ fn project_rename_preserves_runtime_state_and_rejects_blank_name() {
         fs::read(context.project.join("project.json")).unwrap(),
         manifest_before
     );
+    assert_eq!(journal_bytes(&store), journal_before);
     fs::remove_dir_all(context.root).unwrap();
 }
 
