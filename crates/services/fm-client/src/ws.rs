@@ -11,6 +11,7 @@ use tungstenite::{
 };
 
 const READ_BUFFER_BYTES: usize = 8 * 1024;
+const HANDSHAKE_WAIT: Duration = Duration::from_millis(1);
 
 #[derive(Debug)]
 pub(crate) struct WebSocketConnection {
@@ -32,11 +33,6 @@ impl WebSocketConnection {
         stream
             .set_nodelay(true)
             .map_err(|_| "WebSocket connection failed")?;
-        let remaining = remaining(deadline).ok_or("WebSocket connection failed")?;
-        stream
-            .set_read_timeout(Some(remaining))
-            .and_then(|()| stream.set_write_timeout(Some(remaining)))
-            .map_err(|_| "WebSocket connection failed")?;
         let request = Request::builder()
             .uri(format!("ws://{address}/v1/control"))
             .header("Authorization", format!("Bearer {bearer_token}"))
@@ -48,16 +44,33 @@ impl WebSocketConnection {
         config.max_write_buffer_size = 2 * MAX_LINE_BYTES;
         config.max_message_size = Some(MAX_LINE_BYTES);
         config.max_frame_size = Some(MAX_LINE_BYTES);
-        let (socket, _) = client_with_config(request, stream, Some(config))
-            .map_err(|_: HandshakeError<_>| "WebSocket handshake failed")?;
-        let connection = Self { socket };
-        connection
-            .socket
-            .get_ref()
-            .set_read_timeout(None)
-            .and_then(|()| connection.socket.get_ref().set_write_timeout(None))
+        stream
+            .set_nonblocking(true)
             .map_err(|_| "WebSocket connection failed")?;
-        Ok(connection)
+        let _ = remaining(deadline).ok_or("WebSocket handshake failed")?;
+        let mut handshake = client_with_config(request, stream, Some(config));
+        let (socket, _) = loop {
+            match handshake {
+                Ok(result) => {
+                    let _ = remaining(deadline).ok_or("WebSocket handshake failed")?;
+                    break result;
+                }
+                Err(HandshakeError::Interrupted(mid)) => {
+                    let wait = remaining(deadline).ok_or("WebSocket handshake failed")?;
+                    std::thread::sleep(wait.min(HANDSHAKE_WAIT));
+                    let _ = remaining(deadline).ok_or("WebSocket handshake failed")?;
+                    handshake = mid.handshake();
+                }
+                Err(HandshakeError::Failure(_)) => return Err("WebSocket handshake failed"),
+            }
+        };
+        socket
+            .get_ref()
+            .set_nonblocking(false)
+            .and_then(|()| socket.get_ref().set_read_timeout(None))
+            .and_then(|()| socket.get_ref().set_write_timeout(None))
+            .map_err(|_| "WebSocket connection failed")?;
+        Ok(Self { socket })
     }
 
     pub(crate) fn send(&mut self, message: &WireMessage) -> Result<(), &'static str> {
