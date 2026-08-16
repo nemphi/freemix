@@ -4993,7 +4993,8 @@ fn local_input_replace_simulated_preserves_identity_and_runtime() {
         context.project_path(),
         "2",
     ]));
-    let after = ProjectStore::new(&context.project).unwrap().load().unwrap();
+    let store = ProjectStore::new(&context.project).unwrap();
+    let after = store.load().unwrap();
     let after_input = after
         .project()
         .inputs()
@@ -5027,11 +5028,13 @@ fn local_input_replace_simulated_preserves_identity_and_runtime() {
     ));
 
     let unchanged = manifest(&context.project);
+    let journal_before = journal_bytes(&store);
     assert_failure_contains(
         &invoke_bounded(&["input-replace-simulated", context.project_path(), "999"]),
         "unknown input 999",
     );
     assert_eq!(manifest(&context.project), unchanged);
+    assert_eq!(journal_bytes(&store), journal_before);
     fs::remove_dir_all(context.root).unwrap();
 }
 
