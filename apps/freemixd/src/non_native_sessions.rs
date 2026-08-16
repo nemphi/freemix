@@ -357,10 +357,7 @@ pub(super) fn run(
             }
         }
         if let Some(reason) = requested_daemon_shutdown(native.as_deref(), Some(process_shutdown)) {
-            if native.is_some()
-                && command_dispatched
-                && reason == DaemonShutdownReason::ProcessSignal
-            {
+            if command_dispatched && reason == DaemonShutdownReason::ProcessSignal {
                 shutdown_peers(&mut peers, control, ShutdownQueue::PreserveCommandResult);
                 return Ok(reason);
             }
