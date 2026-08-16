@@ -3362,6 +3362,142 @@ fn scene_rename_persists_exact_name_and_failures_preserve_manifest() {
 }
 
 #[test]
+fn local_scene_input_remove_is_atomic_across_input_and_scene() {
+    let context = ContractContext::new();
+    assert_success(&invoke_bounded(&["new", context.project_path()]));
+    assert_success(&invoke_bounded(&[
+        "input-add",
+        context.project_path(),
+        "3",
+        "Unrelated",
+    ]));
+    assert_success(&invoke_bounded(&[
+        "audio-strip",
+        context.project_path(),
+        "3",
+        "-1200",
+        "2500",
+        "on",
+        "off",
+        "off",
+        "480",
+    ]));
+    for (input, scene, name) in [("9", "9", "Keep"), ("10", "10", "Remove")] {
+        assert_success(&invoke_bounded(&[
+            "scene-input-add",
+            context.project_path(),
+            input,
+            scene,
+            name,
+        ]));
+    }
+
+    let store = ProjectStore::new(&context.project).unwrap();
+    let before = store.load().unwrap();
+    assert_success(&invoke_bounded(&[
+        "scene-input-remove",
+        context.project_path(),
+        "10",
+    ]));
+    let after = store.load().unwrap();
+    let removed_input = InputId::new(NonZeroU128::new(10).unwrap());
+    let removed_scene = SceneId::new(NonZeroU128::new(10).unwrap());
+    assert_eq!(
+        after.project().inputs(),
+        before
+            .project()
+            .inputs()
+            .iter()
+            .filter(|input| input.id != removed_input)
+            .cloned()
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        after.project().input_audio_strips(),
+        before
+            .project()
+            .input_audio_strips()
+            .iter()
+            .filter(|strip| strip.input != removed_input)
+            .cloned()
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        after.project().scenes(),
+        before
+            .project()
+            .scenes()
+            .iter()
+            .filter(|scene| scene.id != removed_scene)
+            .cloned()
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        after.project().schema_version(),
+        before.project().schema_version()
+    );
+    assert_eq!(after.project().id(), before.project().id());
+    assert_eq!(after.project().name(), before.project().name());
+    assert_eq!(after.project().settings(), before.project().settings());
+    assert_eq!(
+        after.project().audio_buses(),
+        before.project().audio_buses()
+    );
+    assert_eq!(after.project().outputs(), before.project().outputs());
+    assert_eq!(after.project().main_mix(), before.project().main_mix());
+    assert_eq!(after.project().stingers(), before.project().stingers());
+    assert_eq!(
+        after.project().restart_policy(),
+        before.project().restart_policy()
+    );
+    assert_eq!(after.runtime_routing(), before.runtime_routing());
+    assert_eq!(
+        after.runtime_manual_transitions(),
+        before.runtime_manual_transitions()
+    );
+    assert_eq!(
+        after.runtime_fade_to_black(),
+        before.runtime_fade_to_black()
+    );
+    assert_eq!(after.runtime_overlays(), before.runtime_overlays());
+    assert_eq!(after.position(), before.position());
+    assert_eq!(after.idempotency_receipts(), before.idempotency_receipts());
+
+    assert_success(&invoke_bounded(&[
+        "scene-input-add",
+        context.project_path(),
+        "11",
+        "11",
+        "Blocked",
+    ]));
+    assert_success(&invoke_bounded(&[
+        "scene-layer-add-scene",
+        context.project_path(),
+        "9",
+        "11",
+        "0",
+        "External reference",
+    ]));
+    let manifest_before = fs::read(context.project.join("project.json")).unwrap();
+    let journal_before = journal_bytes(&store);
+    let rejected = invoke_bounded(&["scene-input-remove", context.project_path(), "11"]);
+    assert_failure_contains(&rejected, "scene 9 layer references scene 11");
+    assert_eq!(
+        fs::read(context.project.join("project.json")).unwrap(),
+        manifest_before
+    );
+    assert_eq!(journal_bytes(&store), journal_before);
+    let non_scene = invoke_bounded(&["scene-input-remove", context.project_path(), "3"]);
+    assert_failure_contains(&non_scene, "input 3 is not a scene input");
+    assert_eq!(
+        fs::read(context.project.join("project.json")).unwrap(),
+        manifest_before
+    );
+    assert_eq!(journal_bytes(&store), journal_before);
+    fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
 fn local_scene_removal_preserves_runtime_and_rejects_references() {
     fn prepare(reference: Option<&str>) -> ContractContext {
         let context = ContractContext::new();

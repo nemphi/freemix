@@ -172,6 +172,10 @@ pub enum Command {
         path: PathBuf,
         scene_input: u128,
     },
+    SceneInputRemove {
+        path: PathBuf,
+        scene_input: u128,
+    },
     SceneBackground {
         path: PathBuf,
         scene: u128,
@@ -762,6 +766,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
         "scene-input-duplicate" => parse_scene_input_duplicate(arguments),
         "scene-input-audio-source" => parse_scene_input_audio_source(arguments),
         "scene-input-audio-source-clear" => parse_scene_input_audio_source_clear(arguments),
+        "scene-input-remove" => parse_scene_input_remove(arguments),
         "scene-background" => parse_scene_background(arguments),
         "scene-remove" => parse_scene_remove(arguments),
         "scene-rename" => parse_scene_rename(arguments),
@@ -1451,6 +1456,15 @@ fn parse_scene_input_audio_source_clear(
     let scene_input = number(&required(&mut arguments, "scene input")?, "scene input")?;
     reject_extra(&mut arguments)?;
     Ok(Command::SceneInputAudioSourceClear { path, scene_input })
+}
+
+fn parse_scene_input_remove(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Command, ArgsError> {
+    let path = required_path(&mut arguments, "project path")?;
+    let scene_input = number(&required(&mut arguments, "scene input")?, "scene input")?;
+    reject_extra(&mut arguments)?;
+    Ok(Command::SceneInputRemove { path, scene_input })
 }
 
 fn parse_scene_background(

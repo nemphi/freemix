@@ -310,6 +310,7 @@ metadata/composition authoring only. `scene-layer-copy` is next-open local cross
 `scene-remove` is local next-open scene removal only; it does not add cascade
 behavior, rendering, live editing, daemon/Studio/protocol mutation, output
 realization, or acceptance.
+`scene-input-remove` removes a local next-open Scene input and its linked Scene only when external references reject; it adds no cascade, live, or protocol acceptance, and IN-020/IN-026 remain planned.
 `scene-rename` preserves the exact supplied name, rejects blank names, and
 enforces case-insensitive uniqueness; it adds no daemon/Studio/protocol/live-session,
 render, or output behavior.

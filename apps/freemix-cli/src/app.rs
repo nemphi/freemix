@@ -208,6 +208,9 @@ pub fn run(command: Command) -> AppResult<()> {
         Command::SceneInputAudioSourceClear { path, scene_input } => {
             set_scene_input_audio_source(&path, input_id(scene_input)?, None)?;
         }
+        Command::SceneInputRemove { path, scene_input } => {
+            remove_scene_input(&path, input_id(scene_input)?)?;
+        }
         Command::SceneBackground {
             path,
             scene,
@@ -1791,6 +1794,23 @@ fn set_scene_input_audio_source(
     Ok(())
 }
 
+fn remove_scene_input(path: &Path, input: InputId) -> AppResult<()> {
+    update_project(path, |project| {
+        let selected = project
+            .inputs()
+            .iter()
+            .find(|candidate| candidate.id == input)
+            .ok_or_else(|| AppFailure(format!("unknown input {input}")))?;
+        let InputKind::Scene { scene_id, .. } = &selected.kind else {
+            return Err(AppFailure(format!("input {input} is not a scene input")).into());
+        };
+        let scene = *scene_id;
+        project.remove_input(input)?;
+        project.remove_scene(scene)?;
+        Ok(())
+    })
+}
+
 fn add_scene_layer(
     path: &Path,
     scene: SceneId,
@@ -3105,6 +3125,7 @@ Usage:
   freemix-cli scene-input-duplicate <show.freemix> <source-scene-id> <new-scene-id> <new-input-id> <scene-name> <input-name>
   freemix-cli scene-input-audio-source <show.freemix> <scene-input-id> <source-input-id>
   freemix-cli scene-input-audio-source-clear <show.freemix> <scene-input-id>
+  freemix-cli scene-input-remove <show.freemix> <scene-input-id>
   freemix-cli scene-background <show.freemix> <scene-id> <premultiplied-red:0..=255> <premultiplied-green:0..=255> <premultiplied-blue:0..=255> <alpha:0..=255>
   freemix-cli scene-remove <show.freemix> <existing-scene-id>
   freemix-cli scene-rename <show.freemix> <existing-scene-id> <scene-name>
