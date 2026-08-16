@@ -3363,12 +3363,12 @@ fn local_scene_background() {
         "scene-background",
         context.project_path(),
         "999",
-        "0",
-        "0",
-        "0",
-        "0",
+        "17",
+        "8",
+        "4",
+        "16",
     ]);
-    assert_failure_contains(&unknown, "unknown scene");
+    assert_failure_contains(&unknown, "unknown scene 999");
     assert_eq!(manifest(&context.project), unknown_manifest);
     assert_eq!(
         journal_bytes(&ProjectStore::new(&context.project).unwrap()),

@@ -896,14 +896,15 @@ impl Project {
         scene: SceneId,
         background: Rgba8,
     ) -> Result<(), SetSceneBackgroundError> {
+        let scene_index = self
+            .scenes
+            .iter()
+            .position(|candidate| candidate.id == scene)
+            .ok_or(SetSceneBackgroundError::UnknownScene(scene))?;
         if !background.is_premultiplied() {
             return Err(SetSceneBackgroundError::NotPremultiplied);
         }
-        self.scenes
-            .iter_mut()
-            .find(|candidate| candidate.id == scene)
-            .ok_or(SetSceneBackgroundError::UnknownScene(scene))?
-            .background = background;
+        self.scenes[scene_index].background = background;
         Ok(())
     }
 
