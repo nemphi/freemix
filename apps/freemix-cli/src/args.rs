@@ -76,6 +76,12 @@ pub enum Command {
         input: u128,
         name: String,
     },
+    InputDuplicate {
+        path: PathBuf,
+        source: u128,
+        input: u128,
+        name: String,
+    },
     Status {
         path: PathBuf,
     },
@@ -473,6 +479,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
     match command.as_str() {
         "new" => parse_new(arguments),
         "input-add" => parse_input_add(arguments),
+        "input-duplicate" => parse_input_duplicate(arguments),
         "status" => {
             let path = required_path(&mut arguments, "project path")?;
             reject_extra(&mut arguments)?;
@@ -876,6 +883,22 @@ fn parse_input_add(mut arguments: impl Iterator<Item = String>) -> Result<Comman
     let name = required(&mut arguments, "input name")?;
     reject_extra(&mut arguments)?;
     Ok(Command::InputAdd { path, input, name })
+}
+
+fn parse_input_duplicate(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Command, ArgsError> {
+    let path = required_path(&mut arguments, "project path")?;
+    let source = number(&required(&mut arguments, "source input")?, "source input")?;
+    let input = number(&required(&mut arguments, "input")?, "input")?;
+    let name = required(&mut arguments, "input name")?;
+    reject_extra(&mut arguments)?;
+    Ok(Command::InputDuplicate {
+        path,
+        source,
+        input,
+        name,
+    })
 }
 
 fn parse_local_timed_transition(

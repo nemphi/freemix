@@ -82,6 +82,12 @@ pub fn run(command: Command) -> AppResult<()> {
         Command::InputAdd { path, input, name } => {
             add_input(&path, input_id(input)?, name)?;
         }
+        Command::InputDuplicate {
+            path,
+            source,
+            input,
+            name,
+        } => duplicate_input(&path, input_id(source)?, input_id(input)?, name)?,
         Command::Status { path } => print_status(&load_engine(&path)?),
         Command::AudioStrip {
             path,
@@ -1183,6 +1189,43 @@ fn add_input(path: &Path, input: InputId, name: String) -> AppResult<()> {
     Ok(())
 }
 
+fn duplicate_input(path: &Path, source: InputId, input: InputId, name: String) -> AppResult<()> {
+    let stored = load_stored_project(path)?;
+    let source_input = stored
+        .project()
+        .inputs()
+        .iter()
+        .find(|candidate| candidate.id == source)
+        .ok_or_else(|| AppFailure(format!("unknown source input {source}")))?;
+    let source_strip = stored
+        .project()
+        .input_audio_strip(source)
+        .ok_or_else(|| AppFailure(format!("project is missing audio strip for input {source}")))?;
+    let store = ProjectStore::new(path)?;
+    let mut project = stored.project().clone();
+    project.add_input(Input {
+        id: input,
+        name,
+        kind: source_input.kind.clone(),
+        required_capabilities: source_input.required_capabilities.clone(),
+    });
+    if !project.set_input_audio_strip(input, source_strip) {
+        return Err(AppFailure(format!("project is missing audio strip for input {input}")).into());
+    }
+    let configured = StoredProject::from_project_with_complete_runtime_state(
+        project,
+        stored.runtime_routing(),
+        stored.runtime_manual_transitions(),
+        stored.runtime_fade_to_black(),
+        stored.runtime_overlays().clone(),
+        stored.position(),
+        stored.idempotency_receipts().to_vec(),
+    )?;
+    store.save(&configured)?;
+    print_status(&load_engine(path)?);
+    Ok(())
+}
+
 fn remove_stinger(path: &Path, slot: StingerSlotNumber) -> AppResult<()> {
     update_stingers(path, |project| {
         let _ = project.remove_stinger(slot);
@@ -1817,6 +1860,7 @@ FreeMix deterministic MVP
 Usage:
   freemix-cli new <show.freemix> [--name <name>]
   freemix-cli input-add <show.freemix> <nonzero-input-id> <name>
+  freemix-cli input-duplicate <show.freemix> <source-input-id> <new-nonzero-input-id> <new-name>
   freemix-cli status <show.freemix>
   freemix-cli audio-strip <show.freemix> <input> <gain-millidb:-96000..=24000> <balance-bp:-10000..=10000> <muted:on|off> <soloed:on|off> <follow-video:on|off> <delay-samples:0..=48000>
   freemix-cli rename <show.freemix> <input> <name> [--key <key>] [--expect <revision>]

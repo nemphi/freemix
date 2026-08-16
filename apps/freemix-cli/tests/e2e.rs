@@ -1849,6 +1849,52 @@ fn local_input_add_persists_default_simulated_strip() {
 }
 
 #[test]
+fn local_input_duplicate_copies_source_and_strip() {
+    let context = ContractContext::new();
+    assert_success(&invoke(&["new", context.project_path()]));
+    assert_success(&invoke(&[
+        "audio-strip",
+        context.project_path(),
+        "2",
+        "-1200",
+        "2500",
+        "on",
+        "off",
+        "off",
+        "480",
+    ]));
+
+    let duplicate = invoke(&[
+        "input-duplicate",
+        context.project_path(),
+        "2",
+        "3",
+        "Duplicated source",
+    ]);
+    assert_success(&duplicate);
+
+    let stored = ProjectStore::new(&context.project).unwrap().load().unwrap();
+    let inputs = stored.project().inputs();
+    assert_eq!(
+        inputs
+            .iter()
+            .map(|input| input.id.get().get())
+            .collect::<Vec<_>>(),
+        [1, 2, 3]
+    );
+    let source = &inputs[1];
+    let copy = &inputs[2];
+    assert_eq!(copy.name, "Duplicated source");
+    assert_eq!(copy.kind, source.kind);
+    assert_eq!(copy.required_capabilities, source.required_capabilities);
+    assert_eq!(
+        stored.project().input_audio_strip(copy.id),
+        stored.project().input_audio_strip(source.id)
+    );
+    fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
 fn local_manual_t_bar_holds_reverses_cancels_commits_and_survives_each_restart() {
     let context = ContractContext::new();
     assert_success(&invoke(&["new", context.project_path()]));
