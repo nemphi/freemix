@@ -5,7 +5,10 @@ use std::{
     num::NonZeroU128,
     path::{Path, PathBuf},
     process::{Child, Command as ProcessCommand, Stdio},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
     time::{Duration, Instant},
 };
 
@@ -89,33 +92,28 @@ impl Daemon {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let mut output = BufReader::new(stdout);
-        let mut line = String::new();
-        output.read_line(&mut line).unwrap();
+        let mut lines = read_startup_lines(&mut child, 2);
+        let line = lines.remove(0);
+        let web_line = lines.remove(0);
         let readiness = line.parse::<ReadinessRecord>().unwrap_or_else(|error| {
-            if !terminate_child(&mut child) {
-                panic!(
-                    "daemon did not become ready: {error}; stdout={line:?}; cleanup timed out after one second"
-                );
-            }
-            panic!(
-                "daemon did not become ready: {error}; stdout={line:?}, stderr={:?}",
-                child_stderr(&mut child)
-            );
+            startup_failure(
+                &mut child,
+                vec![line.clone(), web_line.clone()],
+                error.to_string(),
+                None,
+            )
         });
-        let mut web_line = String::new();
-        output.read_line(&mut web_line).unwrap();
         let web_address = web_line
             .strip_prefix("FREEMIXD_WEB_READY\tv=1\taddress=")
             .and_then(|line| line.strip_suffix('\n'))
             .and_then(|address| address.parse().ok())
             .unwrap_or_else(|| {
-                let stopped = terminate_child(&mut child);
-                panic!(
-                    "daemon did not publish exact web readiness: stdout={line:?}{web_line:?}; cleanup_stopped={stopped}; stderr={:?}",
-                    child_stderr(&mut child)
-                );
+                startup_failure(
+                    &mut child,
+                    vec![line, web_line],
+                    "invalid web readiness".into(),
+                    None,
+                )
             });
         (
             Self {
@@ -138,25 +136,11 @@ impl Daemon {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let mut output = BufReader::new(stdout);
-        let mut line = String::new();
-        output.read_line(&mut line).unwrap();
-        let readiness = line.parse::<ReadinessRecord>().unwrap_or_else(|error| {
-            if !terminate_child(&mut child) {
-                panic!(
-                    "daemon did not become ready: {error}; stdout={line:?}; cleanup timed out after one second"
-                );
-            }
-            let mut stderr = String::new();
-            child
-                .stderr
-                .take()
-                .unwrap()
-                .read_to_string(&mut stderr)
-                .unwrap();
-            panic!("daemon did not become ready: {error}; stdout={line:?}, stderr={stderr:?}");
-        });
+        let lines = read_startup_lines(&mut child, 1);
+        let readiness = match lines[0].parse::<ReadinessRecord>() {
+            Ok(readiness) => readiness,
+            Err(error) => startup_failure(&mut child, lines, error.to_string(), None),
+        };
         Self {
             child: Some(child),
             address: readiness.address,
@@ -221,6 +205,66 @@ fn terminate_child(child: &mut Child) -> bool {
             Ok(None) | Err(_) => return false,
         }
     }
+}
+
+fn read_startup_lines(child: &mut Child, count: usize) -> Vec<String> {
+    let stdout = child.stdout.take().unwrap();
+    let (sender, receiver) = mpsc::sync_channel::<std::io::Result<Option<String>>>(count);
+    let reader = std::thread::spawn(move || {
+        let mut output = BufReader::new(stdout);
+        for _ in 0..count {
+            let mut line = String::new();
+            let result = output
+                .read_line(&mut line)
+                .map(|read| (read != 0).then_some(line));
+            if sender.send(result).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut lines = Vec::with_capacity(count);
+    while lines.len() < count {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let result = match receiver.recv_timeout(remaining) {
+            Ok(result) => result,
+            Err(error) => startup_failure(child, lines, error.to_string(), Some(reader)),
+        };
+        match result {
+            Ok(Some(line)) => lines.push(line),
+            Ok(None) => {
+                startup_failure(
+                    child,
+                    lines,
+                    "daemon stdout closed before readiness".into(),
+                    Some(reader),
+                );
+            }
+            Err(error) => {
+                startup_failure(child, lines, error.to_string(), Some(reader));
+            }
+        }
+    }
+    if reader.join().is_err() {
+        startup_failure(child, lines, "startup stdout reader panicked".into(), None);
+    }
+    lines
+}
+
+fn startup_failure(
+    child: &mut Child,
+    stdout: Vec<String>,
+    failure: String,
+    reader: Option<std::thread::JoinHandle<()>>,
+) -> ! {
+    let stopped = terminate_child(child);
+    if stopped && let Some(reader) = reader {
+        let _ = reader.join();
+    }
+    let stderr = stopped.then(|| child_stderr(child));
+    panic!(
+        "daemon startup failed: {failure}; stdout={stdout:?}; cleanup_stopped={stopped}; stderr={stderr:?}"
+    );
 }
 
 fn terminate_after_wait_failure(child: &mut Child, failure: &str) -> ! {
@@ -1952,6 +1996,8 @@ fn websocket_control_is_authenticated_ordered_and_raw_compatible() {
         panic!("expected switcher runtime event");
     };
     assert_eq!(runtime.revision, 1);
+    assert_eq!(runtime.generation, 1);
+    assert_eq!(runtime.sequence, 1);
     assert!(matches!(
         runtime.event,
         RuntimeLifecycleEvent::Realized { domain, .. } if domain == "switcher"
@@ -1966,10 +2012,16 @@ fn websocket_control_is_authenticated_ordered_and_raw_compatible() {
         receive(&mut websocket),
         WireMessage::Error(error) if error.error.code == "server_shutting_down"
     ));
-    assert!(matches!(
-        websocket.read(),
-        Ok(tungstenite::Message::Close(_)) | Err(_)
-    ));
+    match websocket.read() {
+        Ok(tungstenite::Message::Close(_))
+        | Err(tungstenite::Error::ConnectionClosed)
+        | Err(tungstenite::Error::Protocol(
+            tungstenite::error::ProtocolError::ResetWithoutClosingHandshake,
+        )) => {}
+        Err(tungstenite::Error::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+        }
+        result => panic!("WebSocket did not terminate cleanly: {result:?}"),
+    }
     let deadline = Instant::now() + timeout;
     loop {
         match raw_session
