@@ -302,6 +302,10 @@ pub fn run(command: Command) -> AppResult<()> {
             let stored = load_stored_project(&path)?;
             print_audio_buses(stored.project());
         }
+        Command::Scenes { path } => {
+            let stored = load_stored_project(&path)?;
+            print_scenes(stored.project());
+        }
         Command::AssetAudit { path } => audit_assets(&path)?,
         Command::AudioStrip {
             path,
@@ -2509,6 +2513,22 @@ fn print_audio_buses(project: &Project) {
     }
 }
 
+fn print_scenes(project: &Project) {
+    for scene in project.scenes() {
+        let background = scene.background;
+        println!(
+            "scene id={} name={:?} background=rgba({},{},{},{}) layers={}",
+            scene.id,
+            scene.name,
+            background.red,
+            background.green,
+            background.blue,
+            background.alpha,
+            scene.layers.len(),
+        );
+    }
+}
+
 const fn input_kind_name(kind: &InputKind) -> &'static str {
     match kind {
         InputKind::Color => "color",
@@ -2690,6 +2710,7 @@ Usage:
   freemix-cli inputs <show.freemix>
   freemix-cli outputs <show.freemix>
   freemix-cli audio-buses <show.freemix>
+  freemix-cli scenes <show.freemix>
   freemix-cli asset-audit <show.freemix>
   freemix-cli audio-strip <show.freemix> <input> <gain-millidb:-96000..=24000> <balance-bp:-10000..=10000> <muted:on|off> <soloed:on|off> <follow-video:on|off> <delay-samples:0..=48000>
   freemix-cli rename <show.freemix> <input> <name> [--key <key>] [--expect <revision>]

@@ -242,6 +242,9 @@ pub enum Command {
     AudioBuses {
         path: PathBuf,
     },
+    Scenes {
+        path: PathBuf,
+    },
     AssetAudit {
         path: PathBuf,
     },
@@ -687,6 +690,11 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
             let path = required_path(&mut arguments, "project path")?;
             reject_extra(&mut arguments)?;
             Ok(Command::AudioBuses { path })
+        }
+        "scenes" => {
+            let path = required_path(&mut arguments, "project path")?;
+            reject_extra(&mut arguments)?;
+            Ok(Command::Scenes { path })
         }
         "asset-audit" => {
             let path = required_path(&mut arguments, "project path")?;

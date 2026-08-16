@@ -2249,7 +2249,7 @@ fn local_output_route_persists_existing_route_and_rejects_unknown_reference() {
         context.project_path(),
         "10",
         "10",
-        "Wide",
+        "Wide \"A\"",
     ]));
     assert_success(&invoke(&[
         "scene-input-add",
@@ -2369,6 +2369,15 @@ fn local_output_route_persists_existing_route_and_rejects_unknown_reference() {
         concat!(
             "output id=30 name=\"Program \\\"Main\\\"\" video_scene=11 video_scene_name=\"Close\" audio_bus=21 audio_bus_name=\"Aux \\\"A\\\"\" startup=stopped capabilities=[]\n",
             "output id=31 name=\"Auxiliary\" video_scene=11 video_scene_name=\"Close\" audio_bus=21 audio_bus_name=\"Aux \\\"A\\\"\" startup=stopped capabilities=[]"
+        )
+    );
+    let scenes = invoke(&["scenes", context.project_path()]);
+    assert_success(&scenes);
+    assert_eq!(
+        stdout(&scenes),
+        concat!(
+            "scene id=10 name=\"Wide \\\"A\\\"\" background=rgba(0,0,0,255) layers=0\n",
+            "scene id=11 name=\"Close\" background=rgba(0,0,0,255) layers=0",
         )
     );
 
