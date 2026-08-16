@@ -4969,15 +4969,82 @@ fn local_input_duplicate_copies_source_and_strip() {
 }
 
 #[test]
+fn local_input_replace_simulated_preserves_identity_and_runtime() {
+    let context = ContractContext::new();
+    assert_success(&invoke_bounded(&["new", context.project_path()]));
+    let before = ProjectStore::new(&context.project).unwrap().load().unwrap();
+    let input = InputId::new(NonZeroU128::new(2).unwrap());
+    let before_input = before
+        .project()
+        .inputs()
+        .iter()
+        .find(|candidate| candidate.id == input)
+        .unwrap();
+    assert!(matches!(
+        &before_input.kind,
+        InputKind::Simulated(SimulatedInput {
+            video: SimulatedVideo::Solid(_),
+            audio: SimulatedAudio::Sine { .. }
+        })
+    ));
+
+    assert_success(&invoke_bounded(&[
+        "input-replace-simulated",
+        context.project_path(),
+        "2",
+    ]));
+    let after = ProjectStore::new(&context.project).unwrap().load().unwrap();
+    let after_input = after
+        .project()
+        .inputs()
+        .iter()
+        .find(|candidate| candidate.id == input)
+        .unwrap();
+    assert_eq!(after_input.id, before_input.id);
+    assert_eq!(after_input.name, before_input.name);
+    assert_eq!(
+        after.project().input_audio_strip(input),
+        before.project().input_audio_strip(input)
+    );
+    assert_eq!(after.runtime_routing(), before.runtime_routing());
+    assert_eq!(
+        after.runtime_manual_transitions(),
+        before.runtime_manual_transitions()
+    );
+    assert_eq!(
+        after.runtime_fade_to_black(),
+        before.runtime_fade_to_black()
+    );
+    assert_eq!(after.runtime_overlays(), before.runtime_overlays());
+    assert_eq!(after.position(), before.position());
+    assert_eq!(after.idempotency_receipts(), before.idempotency_receipts());
+    assert!(matches!(
+        &after_input.kind,
+        InputKind::Simulated(SimulatedInput {
+            video: SimulatedVideo::Bars,
+            audio: SimulatedAudio::Silence
+        })
+    ));
+
+    let unchanged = manifest(&context.project);
+    assert_failure_contains(
+        &invoke_bounded(&["input-replace-simulated", context.project_path(), "999"]),
+        "unknown input 999",
+    );
+    assert_eq!(manifest(&context.project), unchanged);
+    fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
 fn local_input_replace_solid_preserves_identity_and_runtime() {
     let context = ContractContext::new();
-    assert_success(&invoke(&[
+    assert_success(&invoke_bounded(&[
         "new",
         context.project_path(),
         "--name",
         "Solid Replace Show",
     ]));
-    assert_success(&invoke(&[
+    assert_success(&invoke_bounded(&[
         "audio-strip",
         context.project_path(),
         "2",
@@ -4988,7 +5055,7 @@ fn local_input_replace_solid_preserves_identity_and_runtime() {
         "off",
         "480",
     ]));
-    assert_success(&invoke(&[
+    assert_success(&invoke_bounded(&[
         "tbar-start",
         context.project_path(),
         "fade",
@@ -5013,7 +5080,7 @@ fn local_input_replace_solid_preserves_identity_and_runtime() {
         })
     ));
 
-    assert_success(&invoke(&[
+    assert_success(&invoke_bounded(&[
         "input-replace-solid",
         context.project_path(),
         "2",
@@ -5093,7 +5160,7 @@ fn local_input_replace_solid_preserves_identity_and_runtime() {
     let store = ProjectStore::new(&context.project).unwrap();
     let journal_before = journal_bytes(&store);
     assert_failure_contains(
-        &invoke(&[
+        &invoke_bounded(&[
             "input-replace-solid",
             context.project_path(),
             "999",

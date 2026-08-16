@@ -307,6 +307,10 @@ pub enum Command {
         input: u128,
         name: String,
     },
+    InputReplaceSimulated {
+        path: PathBuf,
+        input: u128,
+    },
     InputReplaceSolid {
         path: PathBuf,
         input: u128,
@@ -774,6 +778,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
         "scene-layer-mask-clear" => parse_scene_layer_mask_clear(arguments),
         "input-remove" => parse_input_remove(arguments),
         "input-duplicate" => parse_input_duplicate(arguments),
+        "input-replace-simulated" => parse_input_replace_simulated(arguments),
         "input-replace-solid" => parse_input_replace_solid(arguments),
         "input-replace-media" => parse_input_replace_media(arguments),
         "status" => {
@@ -1802,6 +1807,15 @@ fn parse_input_duplicate(
         input,
         name,
     })
+}
+
+fn parse_input_replace_simulated(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Command, ArgsError> {
+    let path = required_path(&mut arguments, "project path")?;
+    let input = number(&required(&mut arguments, "input")?, "input")?;
+    reject_extra(&mut arguments)?;
+    Ok(Command::InputReplaceSimulated { path, input })
 }
 
 fn parse_input_replace_solid(
