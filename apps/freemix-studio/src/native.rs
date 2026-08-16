@@ -263,6 +263,27 @@ impl StudioApp {
         self.report_enqueue_error(error);
     }
 
+    fn check_worker_health(&mut self) {
+        let Some(worker) = self.worker.as_ref() else {
+            return;
+        };
+        if !worker.is_finished() {
+            return;
+        }
+        let worker = self.worker.take().expect("worker handle was just checked");
+        let failed = worker.join().is_err();
+        if !self.shutdown_sent {
+            self.updates.take();
+            if failed {
+                self.state = StudioUiState::new(StudioConnectionStatus::Failed);
+                self.state.error = Some("Studio worker panicked".to_owned());
+            } else if self.state.connection_status != StudioConnectionStatus::Failed {
+                self.state = StudioUiState::new(StudioConnectionStatus::Failed);
+                self.state.error = Some("Studio worker stopped unexpectedly".to_owned());
+            }
+        }
+    }
+
     fn send_shutdown(&mut self) {
         if !self.shutdown_sent {
             if let Some(requests) = &self.requests {
@@ -324,6 +345,7 @@ impl eframe::App for StudioApp {
                 self.state = state;
             }
         }
+        self.check_worker_health();
         self.drain_osc();
     }
 
@@ -2175,6 +2197,34 @@ mod tests {
         );
         drop(updates);
         assert!(!publisher.publish(StudioUiState::new(StudioConnectionStatus::Failed)));
+    }
+
+    #[test]
+    fn worker_panic_is_reported_without_blocking_live_ui() {
+        let worker = thread::spawn(|| panic!("test worker panic"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !worker.is_finished() {
+            assert!(std::time::Instant::now() < deadline);
+            thread::yield_now();
+        }
+        let mut app = StudioApp {
+            shell: StudioShell::default(),
+            state: StudioUiState::new(StudioConnectionStatus::Ready),
+            requests: None,
+            pending_intents: PendingIntents::new(),
+            updates: None,
+            worker: Some(worker),
+            shutdown_sent: false,
+            osc: None,
+            osc_rejected: 0,
+            osc_notice: None,
+        };
+
+        app.check_worker_health();
+
+        assert!(app.worker.is_none());
+        assert_eq!(app.state.connection_status, StudioConnectionStatus::Failed);
+        assert_eq!(app.state.error.as_deref(), Some("Studio worker panicked"));
     }
 
     #[test]
