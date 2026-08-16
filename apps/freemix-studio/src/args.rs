@@ -11,6 +11,7 @@ FreeMix Studio native control application
 Usage:
   freemix-studio --project <SHOW.FREEMIX> [OPTIONS] [--diagnose]
   freemix-studio --connect <ADDR> --project-id <ID> [OPTIONS] [--diagnose]
+  freemix-studio --web-connect <ADDR> --project-id <ID> --diagnose
   freemix-studio --help
   freemix-studio --version
 
@@ -27,7 +28,8 @@ Client options:
                          [default: operator; viewer with --diagnose]
   --max-restarts <COUNT> Maximum supervised daemon restarts [default: 3]
   --osc-listen <ADDR>    Receive OSC control on a loopback address and nonzero port
-  --diagnose             Run the one-shot TCP connection diagnostic instead of Studio
+  --web-connect <ADDR>   One-shot loopback WebSocket diagnostic address (with --diagnose)
+  --diagnose             Run the one-shot connection diagnostic instead of Studio
   -h, --help             Print help
   -V, --version          Print version";
 
@@ -37,6 +39,7 @@ pub enum Command {
     Version,
     Open(StudioConfig),
     Diagnose(StudioConfig),
+    WebDiagnose(StudioConfig),
 }
 
 /// Settings common to both runtime ownership modes.
@@ -97,6 +100,9 @@ pub enum ArgsError {
     NonLoopbackListen(SocketAddr),
     InvalidOscListen(SocketAddr),
     OscUnavailableInDiagnose,
+    WebConnectRequiresDiagnose,
+    WebConnectConflicting,
+    InvalidWebConnect(SocketAddr),
     UnknownArgument(String),
 }
 
@@ -141,6 +147,16 @@ impl fmt::Display for ArgsError {
             Self::OscUnavailableInDiagnose => {
                 formatter.write_str("--osc-listen cannot be used with --diagnose")
             }
+            Self::WebConnectRequiresDiagnose => {
+                formatter.write_str("--web-connect requires --diagnose")
+            }
+            Self::WebConnectConflicting => formatter.write_str(
+                "--web-connect cannot be used with --project, --connect, --daemon, or --listen",
+            ),
+            Self::InvalidWebConnect(address) => write!(
+                formatter,
+                "WebSocket address must be loopback with a nonzero port, got {address}"
+            ),
             Self::UnknownArgument(argument) => write!(formatter, "unknown argument `{argument}`"),
         }
     }
@@ -172,6 +188,7 @@ pub fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<Command
     let mut maximum_restarts = None;
     let mut osc_listen = None;
     let mut diagnose = None;
+    let mut web_connect = None;
     let mut arguments = arguments.into_iter();
     while let Some(option) = arguments.next() {
         match option.as_str() {
@@ -221,11 +238,35 @@ pub fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<Command
                 set_once(&mut osc_listen, address, "--osc-listen")?;
             }
             "--diagnose" => set_once(&mut diagnose, (), "--diagnose")?,
+            "--web-connect" => {
+                let value = required(&mut arguments, "--web-connect")?;
+                let address = socket_address("--web-connect", &value)?;
+                set_once(&mut web_connect, address, "--web-connect")?;
+            }
             _ => return Err(ArgsError::UnknownArgument(option)),
         }
     }
 
-    let connection = connection_config(project, daemon, listen, connect, project_id)?;
+    if web_connect.is_some() {
+        if diagnose.is_none() {
+            return Err(ArgsError::WebConnectRequiresDiagnose);
+        }
+        if project.is_some() || connect.is_some() || daemon.is_some() || listen.is_some() {
+            return Err(ArgsError::WebConnectConflicting);
+        }
+        let address = web_connect.expect("checked above");
+        if !address.ip().is_loopback() || address.port() == 0 {
+            return Err(ArgsError::InvalidWebConnect(address));
+        }
+    }
+    let connection = if let Some(address) = web_connect {
+        ConnectionConfig::Existing(ExistingConfig {
+            address,
+            expected_project_id: project_id.ok_or(ArgsError::MissingRequired("--project-id"))?,
+        })
+    } else {
+        connection_config(project, daemon, listen, connect, project_id)?
+    };
     if diagnose.is_some() && osc_listen.is_some() {
         return Err(ArgsError::OscUnavailableInDiagnose);
     }
@@ -248,7 +289,9 @@ pub fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<Command
         },
         osc_listen,
     };
-    Ok(if diagnose.is_some() {
+    Ok(if web_connect.is_some() {
+        Command::WebDiagnose(config)
+    } else if diagnose.is_some() {
         Command::Diagnose(config)
     } else {
         Command::Open(config)

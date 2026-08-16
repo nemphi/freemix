@@ -1353,6 +1353,7 @@ dependencies = [
  "fm-ui-egui",
  "fm-ui-model",
  "nix 0.27.1",
+ "tungstenite",
 ]
 
 [[package]]

@@ -226,6 +226,26 @@ impl StudioRuntime {
         )?)
     }
 
+    /// Connects and synchronizes through the loopback WebSocket control boundary.
+    pub fn connect_websocket_cancellable(
+        &mut self,
+        bearer_token: &str,
+        connect_timeout: Duration,
+        poll_interval: Duration,
+        cancelled: impl FnMut() -> bool,
+    ) -> Result<SessionEvent, StudioError> {
+        if let Some(supervisor) = &mut self.supervisor {
+            supervisor.poll()?;
+        }
+        Ok(self.session.connect_websocket_cancellable(
+            self.address(),
+            bearer_token,
+            connect_timeout,
+            poll_interval,
+            cancelled,
+        )?)
+    }
+
     /// Reconnects only after the caller reports that the client-selected backoff elapsed.
     /// If the owned daemon has exited, one bounded restart is performed first.
     ///

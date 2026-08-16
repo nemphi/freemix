@@ -1,7 +1,7 @@
 use std::{
     collections::VecDeque,
     fs,
-    io::{Read, Write},
+    io::{ErrorKind, Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     num::NonZeroU128,
     path::{Path, PathBuf},
@@ -28,6 +28,10 @@ use freemix_studio::{
     Command, ConnectionConfig, DaemonSupervisor, ExistingConfig, LifecycleState, ReadinessRecord,
     RestartPolicy, StudioConfig, StudioError, StudioRuntime, SupervisedConfig, SupervisorError,
     SupervisorState, parse_args,
+};
+use tungstenite::{
+    Message, accept_hdr,
+    handshake::server::{Request, Response},
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -196,6 +200,23 @@ fn spawn_server(run: impl FnOnce(TcpListener) + Send + 'static) -> (SocketAddr, 
     (address, thread::spawn(move || run(listener)))
 }
 
+fn accept_stream_until(listener: &TcpListener, deadline: Instant) -> TcpStream {
+    listener.set_nonblocking(true).unwrap();
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream.set_nonblocking(false).unwrap();
+                return stream;
+            }
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                assert!(Instant::now() < deadline, "timed out waiting for Studio");
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("cannot accept Studio: {error}"),
+        }
+    }
+}
+
 struct Peer {
     stream: TcpStream,
     decoder: LineDecoder,
@@ -217,20 +238,7 @@ impl Peer {
     }
 
     fn accept_until(listener: &TcpListener, deadline: Instant) -> Self {
-        listener.set_nonblocking(true).unwrap();
-        loop {
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    stream.set_nonblocking(false).unwrap();
-                    return Self::from_stream(stream);
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(Instant::now() < deadline, "timed out waiting for Studio");
-                    thread::sleep(Duration::from_millis(10));
-                }
-                Err(error) => panic!("cannot accept Studio: {error}"),
-            }
-        }
+        Self::from_stream(accept_stream_until(listener, deadline))
     }
 
     fn receive(&mut self) -> WireMessage {
@@ -509,15 +517,25 @@ fn diagnose_cleanup(mut child: Child, failure: impl std::fmt::Display) -> String
     }
 }
 
-fn run_diagnose(address: SocketAddr) -> Result<Output, String> {
+fn run_diagnose(address: SocketAddr, web_token: Option<&str>) -> Result<Output, String> {
+    let (connect_option, address_option) = if web_token.is_some() {
+        ("--web-connect", address.to_string())
+    } else {
+        ("--connect", address.to_string())
+    };
     let mut child = ProcessCommand::new(env!("CARGO_BIN_EXE_freemix-studio"))
         .args([
             "--diagnose",
-            "--connect",
-            &address.to_string(),
+            connect_option,
+            &address_option,
             "--project-id",
             &PROJECT_VALUE.to_string(),
         ])
+        .envs(
+            web_token
+                .into_iter()
+                .map(|token| ("FREEMIXD_WEB_TOKEN", token)),
+        )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -545,6 +563,46 @@ fn run_diagnose(address: SocketAddr) -> Result<Output, String> {
             }
         }
     }
+}
+
+fn websocket_message_until(
+    peer: &mut tungstenite::WebSocket<TcpStream>,
+    deadline: Instant,
+) -> Message {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(!remaining.is_zero(), "timed out reading WebSocket message");
+        peer.get_ref().set_read_timeout(Some(remaining)).unwrap();
+        match peer.read() {
+            Ok(Message::Ping(payload)) => {
+                peer.send(Message::Pong(payload)).unwrap();
+            }
+            Ok(Message::Pong(_)) => {}
+            Ok(Message::Text(line)) => {
+                assert!(line.ends_with('\n'), "WebSocket record missing newline");
+                return Message::Text(line);
+            }
+            Ok(message) => return message,
+            Err(tungstenite::Error::Io(error))
+                if matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) =>
+            {
+                panic!("timed out reading WebSocket message")
+            }
+            Err(error) => panic!("WebSocket read failed: {error:?}"),
+        }
+    }
+}
+
+fn websocket_send_line(
+    peer: &mut tungstenite::WebSocket<TcpStream>,
+    message: &WireMessage,
+    deadline: Instant,
+) {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    assert!(!remaining.is_zero(), "timed out writing WebSocket message");
+    peer.get_ref().set_write_timeout(Some(remaining)).unwrap();
+    peer.send(Message::Text(encode_line(message).unwrap().into()))
+        .unwrap();
 }
 
 fn receive_diagnose_heartbeat(peer: &mut Peer, deadline: Instant) -> HeartbeatMessage {
@@ -583,6 +641,110 @@ fn assert_diagnose_success(output: Result<Output, String>) {
         String::from_utf8(output.stdout).unwrap(),
         "liveness=ok sequence=1 received_at_ms=1234\ndiagnostics=v1 engine_id=engine-studio state_epoch=3 revision=5 retained_oldest=4 retained_newest=5 subscribers=1/8 retained_limit=64 subscriber_queue=16\n"
     );
+}
+
+#[test]
+fn websocket_diagnose_uses_current_session_contract() {
+    let token = "web-diagnostic-token-abcdefghijklmnopqrstuvwxyz-0123456789";
+    let (address, server_thread) = spawn_server(move |listener| {
+        let deadline = Instant::now() + CONNECT_TIMEOUT;
+        let stream = accept_stream_until(&listener, deadline);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        stream.set_read_timeout(Some(remaining)).unwrap();
+        stream.set_write_timeout(Some(remaining)).unwrap();
+        let callback = |request: &Request, response: Response| {
+            assert_eq!(request.uri().path(), "/v1/control");
+            let authorization = request
+                .headers()
+                .get("authorization")
+                .expect("missing authorization")
+                .to_str()
+                .expect("invalid authorization");
+            assert!(
+                authorization == format!("Bearer {token}"),
+                "authorization mismatch"
+            );
+            Ok(response)
+        };
+        let mut peer = accept_hdr(stream, callback).expect("WebSocket handshake failed");
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        peer.get_ref().set_write_timeout(Some(remaining)).unwrap();
+        peer.send(Message::Ping(Vec::new().into())).unwrap();
+        let line = match websocket_message_until(&mut peer, deadline) {
+            Message::Text(line) => line,
+            message => panic!("expected text record, got {message:?}"),
+        };
+        let WireMessage::HandshakeRequest(request) = fm_protocol::decode_line(&line).unwrap()
+        else {
+            panic!("expected handshake request")
+        };
+        assert_eq!(request.protocol, CURRENT_PROTOCOL_VERSION);
+        assert_eq!(request.desired_role, Role::Viewer);
+        let mut response = handshake(
+            project_id(),
+            4,
+            HandshakeOutcome::Snapshot {
+                reason: SnapshotReason::NoCursor,
+            },
+        );
+        response.granted_role = Role::Viewer;
+        response.permissions = vec!["view_status".to_owned()];
+        websocket_send_line(
+            &mut peer,
+            &WireMessage::HandshakeResponse(response),
+            deadline,
+        );
+        websocket_send_line(&mut peer, &WireMessage::Snapshot(snapshot(4)), deadline);
+        let line = match websocket_message_until(&mut peer, deadline) {
+            Message::Text(line) => line,
+            message => panic!("expected heartbeat text record, got {message:?}"),
+        };
+        let WireMessage::Heartbeat(heartbeat) = fm_protocol::decode_line(&line).unwrap() else {
+            panic!("expected heartbeat")
+        };
+        websocket_send_line(&mut peer, &WireMessage::Event(event(5)), deadline);
+        websocket_send_line(
+            &mut peer,
+            &WireMessage::HeartbeatAcknowledgement(HeartbeatAcknowledgementMessage {
+                server: heartbeat.server,
+                heartbeat_sequence: heartbeat.sequence,
+                received_at_ms: 1_234,
+            }),
+            deadline,
+        );
+        let line = match websocket_message_until(&mut peer, deadline) {
+            Message::Text(line) => line,
+            message => panic!("expected diagnostics text record, got {message:?}"),
+        };
+        let WireMessage::DiagnosticsRequest(request) = fm_protocol::decode_line(&line).unwrap()
+        else {
+            panic!("expected diagnostics request")
+        };
+        websocket_send_line(
+            &mut peer,
+            &WireMessage::DiagnosticsResponse(DiagnosticsResponse {
+                protocol: CURRENT_PROTOCOL_VERSION,
+                request_id: request.request_id,
+                engine: engine(),
+                current_revision: 5,
+                oldest_retained_revision: Some(4),
+                newest_retained_revision: Some(5),
+                subscriber_count: 1,
+                retained_events_limit: 64,
+                subscriber_limit: 8,
+                subscriber_queue_limit: 16,
+            }),
+            deadline,
+        );
+    });
+
+    let output = run_diagnose(address, Some(token));
+    let server = server_thread.join();
+    assert!(server.is_ok(), "WebSocket diagnostic server failed");
+    let output = output.unwrap();
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(token));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(token));
+    assert_diagnose_success(Ok(output));
 }
 
 #[test]
@@ -628,7 +790,7 @@ fn diagnose_reports_validated_heartbeat_and_control_diagnostics() {
         );
     });
 
-    let output = run_diagnose(address);
+    let output = run_diagnose(address, None);
     let server = server_thread.join();
     assert!(server.is_ok(), "Studio diagnostic server failed");
     assert_diagnose_success(output);
@@ -1024,6 +1186,55 @@ fn diagnose_flag_selects_one_shot_mode_and_rejects_duplicates() {
         parse_args(duplicate.map(str::to_owned)),
         Err(freemix_studio::ArgsError::DuplicateOption("--diagnose"))
     ));
+
+    let web = [
+        "--web-connect",
+        "127.0.0.1:9001",
+        "--project-id",
+        &PROJECT_VALUE.to_string(),
+        "--diagnose",
+    ];
+    assert!(matches!(
+        parse_args(web.map(str::to_owned)),
+        Ok(Command::WebDiagnose(StudioConfig {
+            connection: ConnectionConfig::Existing(ExistingConfig { address, expected_project_id }),
+            ..
+        })) if address == "127.0.0.1:9001".parse().unwrap() && expected_project_id == project_id()
+    ));
+    assert!(matches!(
+        parse_args(["--web-connect", "127.0.0.1:9001"].map(str::to_owned)),
+        Err(freemix_studio::ArgsError::WebConnectRequiresDiagnose)
+    ));
+    assert!(matches!(
+        parse_args(
+            [
+                "--web-connect",
+                "127.0.0.1:9001",
+                "--connect",
+                "127.0.0.1:9000",
+                "--project-id",
+                &PROJECT_VALUE.to_string(),
+                "--diagnose"
+            ]
+            .map(str::to_owned)
+        ),
+        Err(freemix_studio::ArgsError::WebConnectConflicting)
+    ));
+    for address in ["0.0.0.0:9001", "127.0.0.1:0"] {
+        assert!(matches!(
+            parse_args(
+                [
+                    "--web-connect",
+                    address,
+                    "--project-id",
+                    &PROJECT_VALUE.to_string(),
+                    "--diagnose"
+                ]
+                .map(str::to_owned)
+            ),
+            Err(freemix_studio::ArgsError::InvalidWebConnect(_))
+        ));
+    }
 }
 
 #[test]

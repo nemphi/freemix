@@ -8,7 +8,7 @@ rust-version.workspace = true
 [dependencies]
 command-group = "5.0.1"
 eframe = { version = "0.35.0", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11"] }
-fm-client = { path = "../../crates/services/fm-client", features = ["std-tcp"] }
+fm-client = { path = "../../crates/services/fm-client", features = ["std-websocket"] }
 fm-protocol = { path = "../../crates/foundation/fm-protocol" }
 fm-types = { path = "../../crates/foundation/fm-types" }
 fm-ui-egui = { path = "../../crates/ui/fm-ui-egui" }
@@ -16,6 +16,9 @@ fm-ui-model = { path = "../../crates/ui/fm-ui-model" }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.27.1", default-features = false, features = ["signal"] }
+
+[dev-dependencies]
+tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
 
 [lints]
 workspace = true
