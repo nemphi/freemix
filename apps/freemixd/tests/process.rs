@@ -209,42 +209,37 @@ fn terminate_child(child: &mut Child) -> bool {
 
 fn read_startup_lines(child: &mut Child, count: usize) -> Vec<String> {
     let stdout = child.stdout.take().unwrap();
-    let (sender, receiver) = mpsc::sync_channel::<std::io::Result<Option<String>>>(count);
+    let (sender, receiver) = mpsc::sync_channel::<std::io::Result<Vec<String>>>(1);
     let reader = std::thread::spawn(move || {
         let mut output = BufReader::new(stdout);
-        for _ in 0..count {
-            let mut line = String::new();
-            let result = output
-                .read_line(&mut line)
-                .map(|read| (read != 0).then_some(line));
-            if sender.send(result).is_err() {
-                break;
+        let result = (|| {
+            let mut lines = Vec::with_capacity(count);
+            for _ in 0..count {
+                let mut line = String::new();
+                let read = output.read_line(&mut line).map_err(|error| {
+                    std::io::Error::new(error.kind(), format!("{error}; stdout={lines:?}"))
+                })?;
+                if read == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!("stdout ended after {lines:?}"),
+                    ));
+                }
+                lines.push(line);
             }
-        }
+            Ok(lines)
+        })();
+        let _ = sender.send(result);
     });
     let deadline = Instant::now() + Duration::from_secs(1);
-    let mut lines = Vec::with_capacity(count);
-    while lines.len() < count {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let result = match receiver.recv_timeout(remaining) {
-            Ok(result) => result,
-            Err(error) => startup_failure(child, lines, error.to_string(), Some(reader)),
-        };
-        match result {
-            Ok(Some(line)) => lines.push(line),
-            Ok(None) => {
-                startup_failure(
-                    child,
-                    lines,
-                    "daemon stdout closed before readiness".into(),
-                    Some(reader),
-                );
-            }
-            Err(error) => {
-                startup_failure(child, lines, error.to_string(), Some(reader));
-            }
-        }
-    }
+    let result = match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(result) => result,
+        Err(error) => startup_failure(child, Vec::new(), error.to_string(), Some(reader)),
+    };
+    let lines = match result {
+        Ok(lines) => lines,
+        Err(error) => startup_failure(child, Vec::new(), error.to_string(), Some(reader)),
+    };
     if reader.join().is_err() {
         startup_failure(child, lines, "startup stdout reader panicked".into(), None);
     }
