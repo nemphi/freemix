@@ -1895,6 +1895,40 @@ fn local_input_duplicate_copies_source_and_strip() {
 }
 
 #[test]
+fn local_input_remove_rejects_runtime_reference_and_removes_unused_input() {
+    let context = ContractContext::new();
+    assert_success(&invoke(&["new", context.project_path()]));
+    assert_success(&invoke(&[
+        "input-add",
+        context.project_path(),
+        "3",
+        "Unused input",
+    ]));
+    assert_success(&invoke(&["input-remove", context.project_path(), "3"]));
+
+    let stored = ProjectStore::new(&context.project).unwrap().load().unwrap();
+    let removed = InputId::new(NonZeroU128::new(3).unwrap());
+    assert!(
+        !stored
+            .project()
+            .inputs()
+            .iter()
+            .any(|input| input.id == removed)
+    );
+    assert!(stored.project().input_audio_strip(removed).is_none());
+
+    let after_removal = manifest(&context.project);
+    let unknown = invoke(&["input-remove", context.project_path(), "3"]);
+    assert_failure_contains(&unknown, "unknown input 3");
+    assert_eq!(manifest(&context.project), after_removal);
+
+    let routed = invoke(&["input-remove", context.project_path(), "1"]);
+    assert_failure_contains(&routed, "runtime reference");
+    assert_eq!(manifest(&context.project), after_removal);
+    fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
 fn local_manual_t_bar_holds_reverses_cancels_commits_and_survives_each_restart() {
     let context = ContractContext::new();
     assert_success(&invoke(&["new", context.project_path()]));
