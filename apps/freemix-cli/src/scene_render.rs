@@ -2,21 +2,12 @@ use core::fmt;
 use std::collections::BTreeMap;
 
 use fm_compositor::{
-    CpuExecutionError, CpuSourceFrame, OutputTarget, PlanError, RectMask, Rotation, Scene,
-    SceneError, SourceId, SourceLayer, Transform, compile_scene, execute_cpu,
+    CompositionPlan, CpuExecutionError, CpuSourceFrame, OutputTarget, PlanError, RectMask,
+    Rotation, Scene, SceneError, SourceId, SourceLayer, Transform, compile_scene, execute_cpu,
 };
 use fm_model::{Input, InputKind, Project, SimulatedVideo, SourceRef};
 use fm_types::{InputId, SceneId};
 use fm_video::{CropRect, ImageFrame, Rgba8};
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum UnsupportedInputKind {
-    Color,
-    Media,
-    Device,
-    Network,
-    Scene,
-}
 
 #[derive(Debug)]
 pub(crate) enum SceneRenderError {
@@ -25,7 +16,6 @@ pub(crate) enum SceneRenderError {
     SceneSource(SceneId),
     UnsupportedInput {
         input: InputId,
-        kind: UnsupportedInputKind,
     },
     CropBoundsOverflow {
         layer: usize,
@@ -43,7 +33,6 @@ pub(crate) enum SceneRenderError {
         width: u32,
         height: u32,
     },
-    SourceTokenBounds,
     Scene(SceneError),
     Plan(PlanError),
     Source(fm_sim::RenderError),
@@ -56,10 +45,10 @@ impl fmt::Display for SceneRenderError {
             Self::UnknownScene(scene) => write!(formatter, "scene {scene} does not exist"),
             Self::UnknownInput(input) => write!(formatter, "input {input} does not exist"),
             Self::SceneSource(scene) => write!(formatter, "scene source {scene} is unsupported"),
-            Self::UnsupportedInput { input, kind } => {
+            Self::UnsupportedInput { input } => {
                 write!(
                     formatter,
-                    "input {input} has unsupported {kind:?} source kind"
+                    "input {input} is unsupported for scene rendering"
                 )
             }
             Self::CropBoundsOverflow { layer } => {
@@ -84,7 +73,6 @@ impl fmt::Display for SceneRenderError {
                 formatter,
                 "layer {layer} mask exceeds source bounds {width}x{height}"
             ),
-            Self::SourceTokenBounds => formatter.write_str("scene source token bounds exceeded"),
             Self::Scene(error) => error.fmt(formatter),
             Self::Plan(error) => error.fmt(formatter),
             Self::Source(error) => error.fmt(formatter),
@@ -124,6 +112,12 @@ pub(crate) fn render_scene(
         if !layer.enabled {
             continue;
         }
+        if composition.layers().len() == CompositionPlan::MAX_LAYERS {
+            return Err(SceneRenderError::Plan(PlanError::TooManyLayers {
+                actual: composition.layers().len() + 1,
+                maximum: CompositionPlan::MAX_LAYERS,
+            }));
+        }
         let input = input_for_layer(project, layer.source)?;
         validate_input(input)?;
         validate_bounds(
@@ -136,9 +130,7 @@ pub(crate) fn render_scene(
         let token = if let Some(token) = sources.get(&input.id) {
             *token
         } else {
-            let token = SourceId::new(
-                u64::try_from(sources.len()).map_err(|_| SceneRenderError::SourceTokenBounds)?,
-            );
+            let token = SourceId::new(sources.len() as u64);
             sources.insert(input.id, token);
             token
         };
@@ -183,18 +175,7 @@ fn validate_input(input: &Input) -> Result<(), SceneRenderError> {
     ) {
         return Ok(());
     }
-    let kind = match &input.kind {
-        InputKind::Color => UnsupportedInputKind::Color,
-        InputKind::Media { .. } => UnsupportedInputKind::Media,
-        InputKind::Device { .. } => UnsupportedInputKind::Device,
-        InputKind::Network { .. } => UnsupportedInputKind::Network,
-        InputKind::Scene { .. } => UnsupportedInputKind::Scene,
-        InputKind::Simulated(_) => unreachable!(),
-    };
-    Err(SceneRenderError::UnsupportedInput {
-        input: input.id,
-        kind,
-    })
+    Err(SceneRenderError::UnsupportedInput { input: input.id })
 }
 
 fn validate_bounds(
