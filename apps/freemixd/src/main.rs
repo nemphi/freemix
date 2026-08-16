@@ -3474,6 +3474,19 @@ fn serve_inner(
         ))
         .into());
     }
+    if let Some(address) = web_listen {
+        if !address.ip().is_loopback() {
+            return Err(AppFailure("--web-listen must use a loopback address".into()).into());
+        }
+        if once {
+            return Err(AppFailure("--web-listen cannot be combined with --once".into()).into());
+        }
+        if !matches!(&mode, NativeServeMode::Disabled) {
+            return Err(
+                AppFailure("--web-listen requires non-native simulated mode".into()).into(),
+            );
+        }
+    }
 
     let store = ProjectStore::new(path)?;
     let project = load_and_recover(&store)?;
@@ -5944,6 +5957,7 @@ mod tests {
             Command::Serve {
                 project: "show.freemix".into(),
                 listen: "127.0.0.1:9123".parse().unwrap(),
+                web_listen: None,
                 once: true,
                 native_media: false,
                 fullscreen_program: false,
@@ -5952,6 +5966,42 @@ mod tests {
                 record_program: None,
                 diagnostic_stop_after: None,
             }
+        );
+        let web = parse_args(strings(&[
+            "serve",
+            "show.freemix",
+            "--web-listen",
+            "127.0.0.1:9234",
+        ]))
+        .unwrap();
+        assert!(matches!(
+            web,
+            Command::Serve {
+                web_listen: Some(address),
+                once: false,
+                native_media: false,
+                ..
+            } if address == "127.0.0.1:9234".parse::<SocketAddr>().unwrap()
+        ));
+        assert!(
+            parse_args(strings(&[
+                "serve",
+                "show.freemix",
+                "--web-listen",
+                "127.0.0.1:9234",
+                "--once",
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse_args(strings(&[
+                "serve",
+                "show.freemix",
+                "--web-listen",
+                "127.0.0.1:9234",
+                "--native-media",
+            ]))
+            .is_err()
         );
     }
 

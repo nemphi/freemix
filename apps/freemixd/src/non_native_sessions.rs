@@ -432,7 +432,8 @@ pub(super) fn run(
 
 fn read_peer(peer: &mut Peer) -> bool {
     if let Transport::Web(web) = &mut peer.transport {
-        for _ in 0..INBOUND_CAPACITY {
+        let budget = INBOUND_CAPACITY.saturating_sub(peer.inbound.len());
+        for _ in 0..budget {
             match web.inbound.try_recv() {
                 Ok(message) => peer.inbound.push_back(message),
                 Err(TryRecvError::Empty) => return false,
@@ -756,27 +757,27 @@ fn write_peer(peer: &mut Peer) -> WriteOutcome {
         let OutboundWrite::Web(bytes) = &record.write else {
             unreachable!("web peers only queue web writes")
         };
+        if matches!(record.accounting, Accounting::Session) && !record.accounted {
+            let Ok(now) = now_millis() else {
+                return WriteOutcome::Failed;
+            };
+            if peer
+                .session
+                .as_mut()
+                .expect("session accounting has a session")
+                .queue_outbound(bytes.len(), now)
+                .is_err()
+            {
+                return WriteOutcome::Failed;
+            }
+            record.accounted = true;
+        }
         match web.outbound.try_send(bytes.clone()) {
             Ok(()) => {
                 record.channel_sent = true;
-                if matches!(record.accounting, Accounting::Session) && !record.accounted {
-                    let Ok(now) = now_millis() else {
-                        return WriteOutcome::Failed;
-                    };
-                    if peer
-                        .session
-                        .as_mut()
-                        .expect("session accounting has a session")
-                        .queue_outbound(bytes.len(), now)
-                        .is_err()
-                    {
-                        return WriteOutcome::Failed;
-                    }
-                    record.accounted = true;
-                }
                 WriteOutcome::Pending
             }
-            Err(TrySendError::Full(_)) => WriteOutcome::Pending,
+            Err(TrySendError::Full(_)) => WriteOutcome::Failed,
             Err(TrySendError::Disconnected(_)) => WriteOutcome::Failed,
         }
     } else {
