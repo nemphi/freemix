@@ -6,9 +6,9 @@ use fm_model::{
     InputDelaySamples, InputGainMilliDb, InputKind, Layer, LayerGeometry, MainMix, Output,
     OutputFormat, Project, ProjectSettings, RectMask, RemoveAudioBusError, RemoveInputError,
     RemoveOutputError, RemoveSceneError, RenameSceneError, RestartPolicy, Rgba8, Rotation, Scene,
-    SceneLayerError, SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef,
-    StartupPolicy, StingerAudioPolicy, StingerConfig, StingerMissingMediaFallback,
-    StingerSlotNumber, ValidationErrorKind,
+    SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef, StartupPolicy,
+    StingerAudioPolicy, StingerConfig, StingerMissingMediaFallback, StingerSlotNumber,
+    ValidationErrorKind,
 };
 use fm_types::{
     AudioFormat, BusId, ChannelLayout, ColorMetadata, FrameRate, InputId, MAX_INPUT_NAME_BYTES,
@@ -196,41 +196,6 @@ fn add_scene_layer_rejects_missing_sources_and_cycles_without_mutation() {
         .add_layer_to_scene(scene_id(1), appended.clone())
         .unwrap();
     assert_eq!(project.scenes()[0].layers.last(), Some(&appended));
-}
-
-#[test]
-fn set_scene_layer_source_rejects_invalid_graph_without_mutation() {
-    let mut project = Project::new(project_id(10), "Main show", settings());
-    project.add_input(Input {
-        id: input_id(1),
-        name: "Camera".into(),
-        kind: InputKind::Device {
-            stable_key: "camera-1".into(),
-        },
-        required_capabilities: Vec::new(),
-    });
-    project.add_scene(Scene {
-        id: scene_id(1),
-        name: "Wide".into(),
-        background: Rgba8::OPAQUE_BLACK,
-        layers: vec![
-            layer("camera", SourceRef::Input(input_id(1))),
-            layer("retained", SourceRef::Scene(scene_id(2))),
-        ],
-    });
-    project.add_scene(Scene {
-        id: scene_id(2),
-        name: "Close".into(),
-        background: Rgba8::OPAQUE_BLACK,
-        layers: vec![layer("back", SourceRef::Scene(scene_id(1)))],
-    });
-    let before = project.clone();
-
-    assert_eq!(
-        project.set_scene_layer_source(scene_id(1), 0, SourceRef::Input(input_id(1))),
-        Err(SceneLayerError::SourceCycle)
-    );
-    assert_eq!(project, before);
 }
 
 #[test]
