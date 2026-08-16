@@ -82,6 +82,27 @@ impl Daemon {
         Self::start_with_once(project, false)
     }
 
+    fn start_with_diagnostic_stop_after(project: &Path, duration: &str) -> Self {
+        let mut child = ProcessCommand::new(env!("CARGO_BIN_EXE_freemixd"))
+            .arg("serve")
+            .arg(project)
+            .args(["--diagnostic-stop-after", duration])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let lines = read_startup_lines(&mut child, 1);
+        let readiness = match lines[0].parse::<ReadinessRecord>() {
+            Ok(readiness) => readiness,
+            Err(error) => startup_failure(&mut child, lines, error.to_string(), None),
+        };
+        Self {
+            child: Some(child),
+            address: readiness.address,
+            project_id: readiness.project_id,
+        }
+    }
+
     fn start_web(project: &Path, token: &str) -> (Self, SocketAddr) {
         let mut child = ProcessCommand::new(env!("CARGO_BIN_EXE_freemixd"))
             .arg("serve")
@@ -531,6 +552,15 @@ fn daemon_acknowledges_only_valid_heartbeats() {
 
     drop(client);
     daemon.wait_success();
+}
+
+#[test]
+fn simulated_diagnostic_deadline_exits_cleanly() {
+    let directory = TestDirectory::new("simulated-diagnostic-deadline");
+    let project_path = directory.project_path();
+    create_project(&project_path);
+
+    Daemon::start_with_diagnostic_stop_after(&project_path, "50ms").wait_success();
 }
 
 #[test]

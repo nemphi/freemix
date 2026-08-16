@@ -95,7 +95,7 @@ requires the accepted revision's durable event and realized runtime event.
 Studio diagnose checks one bounded raw-TCP heartbeat acknowledgement and keeps
 waiting when validated durable or runtime state arrives first, then reports
 validated point-in-time control diagnostics. RC-015 remains planned.
-The default simulated daemon cooperatively stops after Unix SIGINT/SIGTERM or Windows Ctrl-C through bounded listener polling.
+The default simulated daemon cooperatively stops after Unix SIGINT/SIGTERM, Windows Ctrl-C, or a post-readiness `--diagnostic-stop-after` deadline through bounded listener polling; this does not complete RC-008 or RC-015.
 Simulated CLI PPM output uses same-directory write/sync/replace, not broader media or disk certification.
 Local CLI loads reject unapplied journal batches without recovering or mutating journal state; torn-final-only state remains readable.
 This is control-plane peer liveness. It is not service readiness, production

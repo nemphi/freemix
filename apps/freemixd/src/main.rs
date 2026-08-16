@@ -3194,11 +3194,6 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> AppResult<Command>
             if camera_helper.is_some() && !native_media {
                 return Err(AppFailure("--camera-helper requires --native-media".into()).into());
             }
-            if diagnostic_stop_after.is_some() && !native_media {
-                return Err(
-                    AppFailure("--diagnostic-stop-after requires --native-media".into()).into(),
-                );
-            }
             if diagnostic_stop_after.is_some() && once {
                 return Err(AppFailure(
                     "--diagnostic-stop-after cannot be combined with --once".into(),
@@ -3527,7 +3522,7 @@ fn serve_inner(
             )?)
         }
     };
-    let mut process_shutdown = Some(register_process_shutdown()?);
+    let mut process_shutdown = register_process_shutdown()?;
     let authority = control_server_identity(&control.borrow(), project_id);
     let mut durable = project;
     if let Some(path) = record_program {
@@ -3538,13 +3533,7 @@ fn serve_inner(
         let primed = native
             .as_mut()
             .expect("recording requires native state")
-            .prime_recorder(
-                &mut control.borrow_mut(),
-                &authority,
-                process_shutdown
-                    .as_ref()
-                    .expect("native state has a process shutdown signal"),
-            );
+            .prime_recorder(&mut control.borrow_mut(), &authority, &process_shutdown);
         match primed {
             Ok(true) => {}
             Ok(false) => {
@@ -3603,10 +3592,7 @@ fn serve_inner(
         web.start_accepting();
     }
     if let Some(duration) = diagnostic_stop_after {
-        process_shutdown
-            .as_mut()
-            .expect("diagnostic shutdown requires native state")
-            .set_diagnostic_deadline(duration)?;
+        process_shutdown.set_diagnostic_deadline(duration)?;
     }
 
     let session_result = non_native_sessions::run(
@@ -3618,9 +3604,7 @@ fn serve_inner(
         &principal,
         native.as_mut(),
         &authority,
-        process_shutdown
-            .as_ref()
-            .expect("server has a process shutdown signal"),
+        &process_shutdown,
         once,
         web_gateway.as_ref(),
     );
@@ -5414,7 +5398,7 @@ Native media is opt-in; without it the daemon uses simulated frame realization.\
 Program recording requires native media, an existing output parent, and a new final .mp4 file. Existing files are never overwritten.\n\
 Use --record-program=<path> when the output name begins with --. Recorder capability digests describe configured startup support; FREEMIXD_RECORDER reports runtime health.\n\
 macOS fullscreen display selection is a zero-based index ordered by physical position, then stable descriptive fields.\n\
---diagnostic-stop-after schedules cooperative headless native shutdown after readiness; accepted units are ms, s, m, and h up to 24h.\n\
+--diagnostic-stop-after schedules cooperative simulated or headless native shutdown after readiness; accepted units are ms, s, m, and h up to 24h.\n\
 --web-listen enables the loopback-only `/v1/control` WebSocket listener and requires FREEMIXD_WEB_TOKEN.\n\
 Native mode continues across client disconnects; close the Program window or press Escape for bounded shutdown."
     );
@@ -6125,7 +6109,6 @@ mod tests {
             parse_args(strings(&[
                 "serve",
                 "show.freemix",
-                "--native-media",
                 "--diagnostic-stop-after=10m",
             ]))
             .unwrap(),
@@ -6139,10 +6122,6 @@ mod tests {
     #[test]
     fn rejects_invalid_diagnostic_stop_options() {
         for (arguments, expected) in [
-            (
-                strings(&["serve", "show.freemix", "--diagnostic-stop-after", "1s"]),
-                "--diagnostic-stop-after requires --native-media",
-            ),
             (
                 strings(&[
                     "serve",
