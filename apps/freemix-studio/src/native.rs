@@ -25,6 +25,9 @@ use fm_ui_egui::{
 };
 use fm_ui_model::ClientView;
 
+#[cfg(test)]
+use fm_protocol::{AudioMeterChannel, AudioMetersMessage};
+
 use crate::osc::{OscAction, OscReceiver};
 use crate::{LifecycleState, StudioConfig, StudioRuntime};
 
@@ -769,8 +772,7 @@ fn run_worker(
     let mut next_heartbeat = Instant::now() + HEARTBEAT_INTERVAL;
     let mut keys = IdempotencyKeys::new(worker_nonce());
 
-    // Idle receive is unnecessary: the current single-client daemon has no
-    // unsolicited broadcasts. Active waits below remain cancellable.
+    // Poll requests before one bounded socket read so neither source starves.
     loop {
         if !recovery.active()
             && let Some(intent) = recovery.deferred_intents.pop_front()
@@ -783,6 +785,56 @@ fn run_worker(
                 publisher,
                 &mut recovery,
             ) {
+                break;
+            }
+            continue;
+        }
+        match requests.try_recv() {
+            Ok(WorkerRequest::Shutdown) | Err(TryRecvError::Disconnected) => break,
+            Ok(WorkerRequest::Intent(intent)) => {
+                if !recovery.defer_intent(&mut runtime, intent, publisher) {
+                    break;
+                }
+                continue;
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+        if !recovery.active()
+            && recovery.reconnect_wait.is_none()
+            && Instant::now() < next_heartbeat
+            && runtime.session().connection().is_some()
+        {
+            let publish = match runtime.receive_timeout(IO_POLL_INTERVAL) {
+                Ok(Some(
+                    SessionEvent::Event { .. }
+                    | SessionEvent::RuntimeEvent { .. }
+                    | SessionEvent::AudioMeters { .. },
+                )) => true,
+                Ok(Some(SessionEvent::Disconnected { cause, .. })) => {
+                    recovery.visible_error = Some(format!("Disconnected while idle: {cause:?}"));
+                    recovery.reconnect_wait = ReconnectWait::from_runtime(&runtime);
+                    true
+                }
+                Ok(Some(SessionEvent::DurableGap { .. })) => {
+                    recovery.realization_uncertain =
+                        runtime.session().client().model().view().is_some();
+                    recovery.reconnect_wait = ReconnectWait::from_runtime(&runtime);
+                    true
+                }
+                Ok(Some(other)) => {
+                    recovery.visible_error = Some(format!("Unexpected idle response: {other:?}"));
+                    true
+                }
+                Ok(None) => false,
+                Err(error) => {
+                    recovery.visible_error = Some(format!("Idle receive failed: {error}"));
+                    if is_recoverable_failure(&error) {
+                        recovery.reconnect_wait = ReconnectWait::from_runtime(&runtime);
+                    }
+                    true
+                }
+            };
+            if publish && !publish_recovery_runtime(&mut runtime, publisher, &recovery) {
                 break;
             }
             continue;
@@ -1104,16 +1156,32 @@ fn handle_heartbeat_timeout(
         let result = heartbeat
             .map_err(|error| worker_error("Heartbeat failed", &error))
             .and_then(|heartbeat| {
-                let event = runtime
-                    .receive_cancellable(IO_POLL_INTERVAL, || {
-                        shutdown = cancellation_requested(
-                            requests,
-                            &mut recovery.deferred_intents,
-                            &mut recovery.deferred_rejections,
-                        );
-                        shutdown || wait_started.elapsed() >= PEER_WAIT_TIMEOUT
-                    })
-                    .map_err(|error| worker_error("Heartbeat acknowledgement failed", &error))?;
+                let event = loop {
+                    let event = runtime
+                        .receive_cancellable(IO_POLL_INTERVAL, || {
+                            shutdown = cancellation_requested(
+                                requests,
+                                &mut recovery.deferred_intents,
+                                &mut recovery.deferred_rejections,
+                            );
+                            shutdown || wait_started.elapsed() >= PEER_WAIT_TIMEOUT
+                        })
+                        .map_err(|error| {
+                            worker_error("Heartbeat acknowledgement failed", &error)
+                        })?;
+                    if matches!(
+                        event,
+                        SessionEvent::AudioMeters { .. }
+                            | SessionEvent::Event { .. }
+                            | SessionEvent::RuntimeEvent { .. }
+                    ) {
+                        if !publish_recovery_runtime(runtime, publisher, recovery) {
+                            return Err(WorkerFailure::Fatal("Studio UI disconnected".to_owned()));
+                        }
+                        continue;
+                    }
+                    break event;
+                };
                 match event {
                     SessionEvent::HeartbeatAcknowledged { acknowledgement }
                         if acknowledgement.heartbeat_sequence == heartbeat.sequence =>
@@ -1273,17 +1341,22 @@ fn consume_command_sequence(
         .checked_add(PEER_WAIT_TIMEOUT)
         .expect("peer wait timeout must fit in Instant");
     let mut consumed = 0;
-    count_record(&mut consumed)?;
-    let result = match receive_command_event(
-        runtime,
-        requests,
-        deferred_intents,
-        deferred_rejections,
-        deadline,
-    )? {
-        SessionEvent::CommandResult { result, .. } => result,
-        other => return Err(unexpected_failure("command result", &other)),
+    let result = loop {
+        match receive_command_event(
+            runtime,
+            publication,
+            requests,
+            deferred_intents,
+            deferred_rejections,
+            deadline,
+            &mut consumed,
+        )? {
+            SessionEvent::CommandResult { result, intake } => break (result, intake),
+            SessionEvent::Event { .. } | SessionEvent::RuntimeEvent { .. } => continue,
+            other => return Err(unexpected_failure("command result", &other)),
+        }
     };
+    let (result, intake) = result;
     if result_id(&result) != command_id {
         return Err(WorkerFailure::Fatal(format!(
             "Unexpected command result ID {:?}; expected {command_id:?}",
@@ -1302,50 +1375,71 @@ fn consume_command_sequence(
         }
     };
     publication.update(runtime, *deferred_rejections)?;
-    if runtime
-        .session()
-        .client()
-        .last_applied_cursor()
-        .is_some_and(|cursor| cursor.revision >= accepted_revision)
+    // Snapshot recovery already carries realized state. Resume recovery keeps
+    // realization uncertain and forces a snapshot after this replay.
+    if matches!(intake, fm_client::Intake::DuplicateResult)
+        && runtime
+            .session()
+            .client()
+            .last_applied_cursor()
+            .is_some_and(|cursor| cursor.revision >= accepted_revision)
     {
         return Ok(());
     }
 
-    count_record(&mut consumed)?;
-    match receive_command_event(
-        runtime,
-        requests,
-        deferred_intents,
-        deferred_rejections,
-        deadline,
-    )? {
-        SessionEvent::Event { event, .. } if event.cursor.revision == accepted_revision => {}
-        SessionEvent::Event { event, .. } => {
-            return Err(WorkerFailure::Fatal(format!(
-                "Unexpected durable event revision {}; expected {accepted_revision}",
-                event.cursor.revision
-            )));
+    loop {
+        match receive_command_event(
+            runtime,
+            publication,
+            requests,
+            deferred_intents,
+            deferred_rejections,
+            deadline,
+            &mut consumed,
+        )? {
+            SessionEvent::Event { event, .. } if event.cursor.revision == accepted_revision => {
+                break;
+            }
+            SessionEvent::Event { event, .. } if event.cursor.revision < accepted_revision => {
+                continue;
+            }
+            SessionEvent::Event { event, .. } => {
+                return Err(WorkerFailure::Fatal(format!(
+                    "Unexpected durable event revision {}; expected {accepted_revision}",
+                    event.cursor.revision
+                )));
+            }
+            SessionEvent::RuntimeEvent { .. } => continue,
+            other => return Err(unexpected_failure("durable event", &other)),
         }
-        other => return Err(unexpected_failure("durable event", &other)),
     }
     publication.update(runtime, *deferred_rejections)?;
 
-    count_record(&mut consumed)?;
-    match receive_command_event(
-        runtime,
-        requests,
-        deferred_intents,
-        deferred_rejections,
-        deadline,
-    )? {
-        SessionEvent::RuntimeEvent { event, .. } if event.revision == accepted_revision => {}
-        SessionEvent::RuntimeEvent { event, .. } => {
-            return Err(WorkerFailure::Fatal(format!(
-                "Unexpected runtime event revision {}; expected {accepted_revision}",
-                event.revision
-            )));
+    loop {
+        match receive_command_event(
+            runtime,
+            publication,
+            requests,
+            deferred_intents,
+            deferred_rejections,
+            deadline,
+            &mut consumed,
+        )? {
+            SessionEvent::RuntimeEvent { event, .. } if event.revision == accepted_revision => {
+                break;
+            }
+            SessionEvent::RuntimeEvent { event, .. } if event.revision < accepted_revision => {
+                continue;
+            }
+            SessionEvent::RuntimeEvent { event, .. } => {
+                return Err(WorkerFailure::Fatal(format!(
+                    "Unexpected runtime event revision {}; expected {accepted_revision}",
+                    event.revision
+                )));
+            }
+            SessionEvent::Event { .. } => continue,
+            other => return Err(unexpected_failure("runtime event", &other)),
         }
-        other => return Err(unexpected_failure("runtime event", &other)),
     }
     publication.update(runtime, *deferred_rejections)?;
     Ok(())
@@ -1410,20 +1504,35 @@ fn count_record(consumed: &mut usize) -> Result<(), WorkerFailure> {
 
 fn receive_command_event(
     runtime: &mut StudioRuntime,
+    publication: CommandPublication<'_>,
     requests: &Receiver<WorkerRequest>,
     deferred_intents: &mut VecDeque<StudioIntent>,
     deferred_rejections: &mut usize,
     deadline: Instant,
+    consumed: &mut usize,
 ) -> Result<SessionEvent, WorkerFailure> {
     let mut shutdown = false;
-    let result = runtime.receive_cancellable(IO_POLL_INTERVAL, || {
-        shutdown = cancellation_requested(requests, deferred_intents, deferred_rejections);
-        shutdown || Instant::now() >= deadline
-    });
-    if shutdown {
-        Err(WorkerFailure::Shutdown)
-    } else {
-        result.map_err(|error| worker_error("Command response failed", &error))
+    loop {
+        let result = runtime.receive_cancellable(IO_POLL_INTERVAL, || {
+            shutdown = cancellation_requested(requests, deferred_intents, deferred_rejections);
+            shutdown || Instant::now() >= deadline
+        });
+        if shutdown {
+            return Err(WorkerFailure::Shutdown);
+        }
+        let event = result.map_err(|error| worker_error("Command response failed", &error))?;
+        if matches!(event, SessionEvent::AudioMeters { .. }) {
+            publication.update(runtime, *deferred_rejections)?;
+            continue;
+        }
+        count_record(consumed)?;
+        if matches!(
+            event,
+            SessionEvent::Event { .. } | SessionEvent::RuntimeEvent { .. }
+        ) {
+            publication.update(runtime, *deferred_rejections)?;
+        }
+        return Ok(event);
     }
 }
 
@@ -1700,6 +1809,9 @@ fn runtime_state(runtime: &mut StudioRuntime, error: Option<String>) -> StudioUi
         .with_edit_project_permission(can_edit_project);
     if connection_status == StudioConnectionStatus::Ready {
         state.view = client.model().view();
+        if state.view.is_some() {
+            state.audio_meters = runtime.session().latest_audio_meters().cloned();
+        }
     }
     state.pending_commands = client.model().pending_commands().len();
     state.error = error.or(lifecycle_error);
@@ -1850,6 +1962,18 @@ mod tests {
                 let WireMessage::Heartbeat(heartbeat) = decode_line(&line).unwrap() else {
                     panic!("expected heartbeat");
                 };
+                self.send(&WireMessage::AudioMeters(AudioMetersMessage {
+                    server: heartbeat.server.clone(),
+                    sequence: heartbeat.sequence,
+                    frame: 1,
+                    start_sample: 0,
+                    end_sample: 1,
+                    master: vec![AudioMeterChannel {
+                        peak_millionths: 500_000,
+                        rms_millionths: 250_000,
+                    }],
+                    inputs: Vec::new(),
+                }));
                 self.send(&WireMessage::HeartbeatAcknowledgement(
                     HeartbeatAcknowledgementMessage {
                         server: heartbeat.server,
@@ -2016,6 +2140,25 @@ mod tests {
                 .take()
                 .expect("notification has a current state");
             if state.connection_status == expected {
+                return;
+            }
+        }
+    }
+
+    fn receive_meter_state(updates: &StateUpdates) {
+        loop {
+            updates
+                .receiver
+                .recv_timeout(HEARTBEAT_TEST_TIMEOUT)
+                .unwrap();
+            let state = updates
+                .latest
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+                .unwrap();
+            if state.audio_meters.is_some() {
+                assert_eq!(state.connection_status, StudioConnectionStatus::Ready);
                 return;
             }
         }
@@ -2250,6 +2393,7 @@ mod tests {
         });
 
         receive_connection_state(&updates, StudioConnectionStatus::Ready);
+        receive_meter_state(&updates);
         let pid_path = directory.path("show.freemix.pid");
         let pid = fs::read_to_string(pid_path).unwrap();
         assert!(

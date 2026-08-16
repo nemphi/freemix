@@ -77,8 +77,9 @@ exact overlay-output inclusion controls; it does not prove output delivery.
 Protocol 2.15 defines bounded fixed-point Master and per-input meter records;
 `fm-client` validates identity and monotonic sequence without changing the
 durable cursor. Native `freemixd` publishes the latest completed frame to
-active Studio peers through one bounded, lossy scheduler slot. Studio does not
-display the records yet, and native-media acceptance is not proved.
+active Studio peers through one bounded, lossy scheduler slot. Studio consumes
+one validated latest record and displays compact fixed-point peak/RMS values;
+native-media acceptance is not proved.
 Protocol 2.12 retains the protocol 2.10 rule
 that the daemon acknowledges only a validated heartbeat with the session server identity, the exact client
 heartbeat sequence, and the server receive time. Studio accepts one expected
@@ -300,8 +301,9 @@ permission; the native worker resolves each move against the latest confirmed
 order and the daemon remains final authority. Live add/duplicate, input removal,
 categories, colors, pause, close, offline, relink, import, and the rest of
 IN-026 remain planned.
-Studio now has a compact permission-gated gain fader with exact milli-dB entry.
-There are still no audio meters in Studio, PFL, strip-name editor, strip groups,
+Studio now has a compact permission-gated gain fader with exact milli-dB entry
+and a latest-only compact peak/RMS meter display for Master and current inputs.
+There is still no PFL, strip-name editor, strip groups,
 bus
 sends, microphone automix, device-audio path,
 device-clock correction, native EQ/gate/compressor/limiter, or acceptance

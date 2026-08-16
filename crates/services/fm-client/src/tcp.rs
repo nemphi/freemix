@@ -444,6 +444,7 @@ pub struct TcpSession {
     sent_commands: VecDeque<String>,
     pending_diagnostics: Option<String>,
     last_audio_meter_sequence: Option<u64>,
+    latest_audio_meters: Option<AudioMetersMessage>,
 }
 
 impl TcpSession {
@@ -455,6 +456,7 @@ impl TcpSession {
             sent_commands: VecDeque::new(),
             pending_diagnostics: None,
             last_audio_meter_sequence: None,
+            latest_audio_meters: None,
         }
     }
 
@@ -476,6 +478,11 @@ impl TcpSession {
     #[must_use]
     pub fn in_flight_len(&self) -> usize {
         self.sent_commands.len()
+    }
+
+    #[must_use]
+    pub const fn latest_audio_meters(&self) -> Option<&AudioMetersMessage> {
+        self.latest_audio_meters.as_ref()
     }
 
     #[must_use]
@@ -710,6 +717,32 @@ impl TcpSession {
     pub fn receive(&mut self) -> Result<SessionEvent, TcpSessionError> {
         let message = self.read_wire()?;
         self.handle_received(message)
+    }
+
+    /// Waits for one event, returning `None` when the receive timeout elapsed.
+    pub fn receive_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<SessionEvent>, TcpSessionError> {
+        let connection = self
+            .connection
+            .as_mut()
+            .ok_or(TcpSessionError::NotConnected)?;
+        let status = match connection.receive_timeout(timeout) {
+            Ok(status) => status,
+            Err(TcpConnectionError::Io(error)) => {
+                return Err(self.disconnected(DisconnectCause::Io(error.kind())));
+            }
+            Err(TcpConnectionError::Codec(error)) => {
+                self.transition_disconnect();
+                return Err(TcpSessionError::Codec(error));
+            }
+        };
+        if status.timed_out {
+            Ok(None)
+        } else {
+            Ok(Some(self.handle_received(status.message)?))
+        }
     }
 
     /// Waits for one post-handshake event while polling for cancellation.
@@ -1077,6 +1110,7 @@ impl TcpSession {
     fn transition_disconnect(&mut self) -> ReconnectBackoff {
         self.pending_diagnostics = None;
         self.last_audio_meter_sequence = None;
+        self.latest_audio_meters = None;
         self.connection.take();
         self.client.transport_disconnected()
     }
@@ -1097,6 +1131,7 @@ impl TcpSession {
             return Err(TcpSessionError::UnexpectedMessage);
         }
         self.last_audio_meter_sequence = Some(meters.sequence);
+        self.latest_audio_meters = Some(meters.clone());
         Ok(())
     }
 }

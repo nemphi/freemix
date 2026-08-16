@@ -377,6 +377,14 @@ impl StudioRuntime {
         Ok(self.session.receive()?)
     }
 
+    /// Waits for one event, returning `None` on timeout.
+    pub fn receive_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<SessionEvent>, StudioError> {
+        Ok(self.session.receive_timeout(timeout)?)
+    }
+
     /// Waits for one session event while polling a caller-owned cancellation source.
     ///
     /// # Errors

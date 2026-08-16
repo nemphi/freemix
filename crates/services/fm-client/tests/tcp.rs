@@ -356,15 +356,24 @@ fn snapshot_heartbeat_command_result_and_events_preserve_wire_order() {
 
 #[test]
 fn audio_meters_are_ephemeral_and_strictly_ordered() {
-    let (address, server_thread) = spawn_server(|listener| {
+    let (release_tx, release_rx) = mpsc::channel();
+    let (address, server_thread) = spawn_server(move |listener| {
         let mut peer = Peer::accept(&listener);
         accept_snapshot(&mut peer, 4);
+        release_rx.recv().unwrap();
         peer.send(&WireMessage::AudioMeters(audio_meters(5)));
         peer.send(&WireMessage::AudioMeters(audio_meters(5)));
     });
 
     let mut session = TcpSession::new(client(4));
     session.connect(address, CONNECT_TIMEOUT).unwrap();
+    assert!(
+        session
+            .receive_timeout(Duration::from_millis(10))
+            .unwrap()
+            .is_none()
+    );
+    release_tx.send(()).unwrap();
     assert!(matches!(
         session.receive().unwrap(),
         SessionEvent::AudioMeters { meters } if meters.sequence == 5
@@ -378,6 +387,7 @@ fn audio_meters_are_ephemeral_and_strictly_ordered() {
         session.client().state(),
         ConnectionState::Backoff(_)
     ));
+    assert!(session.latest_audio_meters().is_none());
     server_thread.join().unwrap();
 }
 

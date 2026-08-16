@@ -8,8 +8,9 @@ use egui::{
     ScrollArea, Stroke, Ui, Vec2,
 };
 use fm_protocol::{
-    ManualTransitionKind, ManualTransitionPosition, OverlayBorderPreset, OverlayPositionPreset,
-    OverlayTransitionKind, StingerReadiness, WireOverlayChannelId, WireStingerSlotId,
+    AudioMeterChannel, AudioMetersMessage, ManualTransitionKind, ManualTransitionPosition,
+    OverlayBorderPreset, OverlayPositionPreset, OverlayTransitionKind, StingerReadiness,
+    WireOverlayChannelId, WireStingerSlotId,
 };
 use fm_types::MAX_INPUT_NAME_BYTES;
 use fm_types::{InputId, OutputId};
@@ -211,6 +212,7 @@ pub struct StudioUiState {
     pub external_notice: Option<String>,
     pub error: Option<String>,
     pub terminal_uncertainties: Vec<TerminalUncertaintyNotice>,
+    pub audio_meters: Option<AudioMetersMessage>,
 }
 
 impl StudioUiState {
@@ -229,6 +231,7 @@ impl StudioUiState {
             external_notice: None,
             error: None,
             terminal_uncertainties: Vec::new(),
+            audio_meters: None,
         }
     }
 
@@ -837,11 +840,58 @@ impl StudioShell {
                 draw_manual_transition(ui, state, manual_transition_controls, &mut intents);
                 ui.add_space(8.0);
                 draw_input_audio_strips(ui, state, &mut intents);
+                draw_audio_meters(ui, state);
                 ui.add_space(8.0);
                 self.draw_inputs(ui, state, &mut intents);
             });
         intents
     }
+}
+
+fn draw_audio_meters(ui: &mut Ui, state: &StudioUiState) {
+    let Some(meters) = state.audio_meters.as_ref() else {
+        if state.connection_status == StudioConnectionStatus::Ready && state.view.is_some() {
+            ui.label(
+                RichText::new("AUDIO METERS | UNAVAILABLE")
+                    .small()
+                    .color(MUTED),
+            );
+        }
+        return;
+    };
+    let Some(view) = state.view.as_ref() else {
+        return;
+    };
+    ui.horizontal_wrapped(|ui| {
+        meter_group(ui, "MIXER MASTER - PRE-STINGER/FTB", &meters.master);
+        for input in &meters.inputs {
+            if view.inputs.contains(&input.input.to_domain()) {
+                meter_group(
+                    ui,
+                    &label_for_input(view, input.input.to_domain()),
+                    &input.channels,
+                );
+            }
+        }
+    });
+}
+
+fn meter_group(ui: &mut Ui, label: &str, channels: &[AudioMeterChannel]) {
+    ui.vertical(|ui| {
+        ui.label(RichText::new(label).small().strong());
+        for (index, channel) in channels.iter().enumerate() {
+            ui.label(
+                RichText::new(format!(
+                    "{} P {:.3} R {:.3}",
+                    index + 1,
+                    f64::from(channel.peak_millionths) / 1_000_000.0,
+                    f64::from(channel.rms_millionths) / 1_000_000.0
+                ))
+                .small()
+                .color(MUTED),
+            );
+        }
+    });
 }
 
 fn draw_input_audio_strips(ui: &mut Ui, state: &StudioUiState, intents: &mut Vec<StudioIntent>) {
