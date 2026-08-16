@@ -2781,6 +2781,95 @@ fn local_audio_bus_send_editing_is_atomic() {
 }
 
 #[test]
+fn project_rename_preserves_runtime_state_and_rejects_blank_name() {
+    let context = ContractContext::new();
+    assert_success(&invoke_bounded(&[
+        "new",
+        context.project_path(),
+        "--name",
+        "Original Show",
+    ]));
+    assert_success(&invoke_bounded(&[
+        "tbar-start",
+        context.project_path(),
+        "fade",
+        "--key",
+        "project-rename-runtime",
+        "--expect",
+        "0",
+    ]));
+
+    let store = ProjectStore::new(&context.project).unwrap();
+    let before = store.load().unwrap();
+    let journal_before = journal_bytes(&store);
+    assert!(before.runtime_manual_transitions().desired.is_some());
+    assert!(before.position().revision > 0);
+    assert!(!before.idempotency_receipts().is_empty());
+
+    let supplied = "  Final \"Show\"  ";
+    assert_success(&invoke_bounded(&[
+        "project-rename",
+        context.project_path(),
+        supplied,
+    ]));
+    let after = store.load().unwrap();
+    assert_eq!(after.project().name(), supplied);
+    assert_eq!(
+        after.project().schema_version(),
+        before.project().schema_version()
+    );
+    assert_eq!(after.project().id(), before.project().id());
+    assert_eq!(after.project().settings(), before.project().settings());
+    assert_eq!(after.project().inputs(), before.project().inputs());
+    assert_eq!(
+        after.project().input_audio_strips(),
+        before.project().input_audio_strips()
+    );
+    assert_eq!(after.project().scenes(), before.project().scenes());
+    assert_eq!(
+        after.project().audio_buses(),
+        before.project().audio_buses()
+    );
+    assert_eq!(after.project().outputs(), before.project().outputs());
+    assert_eq!(after.project().main_mix(), before.project().main_mix());
+    assert_eq!(after.project().stingers(), before.project().stingers());
+    assert_eq!(
+        after.project().restart_policy(),
+        before.project().restart_policy()
+    );
+    assert_eq!(after.runtime_routing(), before.runtime_routing());
+    assert_eq!(
+        after.runtime_manual_transitions(),
+        before.runtime_manual_transitions()
+    );
+    assert_eq!(
+        after.runtime_fade_to_black(),
+        before.runtime_fade_to_black()
+    );
+    assert_eq!(after.runtime_overlays(), before.runtime_overlays());
+    assert_eq!(after.position(), before.position());
+    assert_eq!(after.idempotency_receipts(), before.idempotency_receipts());
+    assert_eq!(journal_bytes(&store), journal_before);
+
+    assert_success(&invoke_bounded(&[
+        "project-rename",
+        context.project_path(),
+        supplied,
+    ]));
+    assert_eq!(store.load().unwrap(), after);
+    assert_eq!(journal_bytes(&store), journal_before);
+
+    let manifest_before = fs::read(context.project.join("project.json")).unwrap();
+    let rejected = invoke_bounded(&["project-rename", context.project_path(), "   "]);
+    assert_failure_contains(&rejected, "project name must not be blank");
+    assert_eq!(
+        fs::read(context.project.join("project.json")).unwrap(),
+        manifest_before
+    );
+    fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
 fn local_audio_bus_rename_persists_exact_name_and_preserves_runtime_state() {
     let context = ContractContext::new();
     assert_success(&invoke_bounded(&["new", context.project_path()]));

@@ -314,6 +314,7 @@ realization, or acceptance.
 `scene-rename` preserves the exact supplied name, rejects blank names, and
 enforces case-insensitive uniqueness; it adds no daemon/Studio/protocol/live-session,
 render, or output behavior.
+`project-rename` is local next-open name metadata only; it does not affect project identity, runtime, protocol, or output behavior, and `RC-012`/`IN-026` remain planned.
 The rename and reorder commands carry input identity; audio and routing state
 remain separate.
 `media-input-add` and `media-input-relink` are local next-open media-input configuration footholds. They store strict

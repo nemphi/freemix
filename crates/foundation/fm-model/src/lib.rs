@@ -10,11 +10,11 @@ pub use project::{
     InputAudioStripState, InputBalanceBasisPoints, InputDelaySamples, InputGainMilliDb, InputKind,
     Layer, LayerGeometry, MainMix, Output, OutputFormat, Project, ProjectSettings, RectMask,
     RelinkMediaInputError, RemoveAudioBusError, RemoveInputError, RemoveOutputError,
-    RemoveSceneError, RenameAudioBusError, RenameOutputError, RenameSceneError, ReplaceInputError,
-    RestartPolicy, Rgba8, Rotation, Scene, SceneInputAudioSourceError, SceneLayerError,
-    SchemaVersion, SetOutputRouteError, SetOutputStartupError, SetSceneBackgroundError,
-    SetStingerError, SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef,
-    StartupPolicy, StingerAudioPolicy, StingerConfig, StingerMissingMediaFallback,
-    StingerSlotNumber,
+    RemoveSceneError, RenameAudioBusError, RenameOutputError, RenameProjectError, RenameSceneError,
+    ReplaceInputError, RestartPolicy, Rgba8, Rotation, Scene, SceneInputAudioSourceError,
+    SceneLayerError, SchemaVersion, SetOutputRouteError, SetOutputStartupError,
+    SetSceneBackgroundError, SetStingerError, SimulatedAudio, SimulatedInput, SimulatedVideo,
+    SolidColor, SourceRef, StartupPolicy, StingerAudioPolicy, StingerConfig,
+    StingerMissingMediaFallback, StingerSlotNumber,
 };
 pub use validation::{EntityRef, ValidationError, ValidationErrorKind};

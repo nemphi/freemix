@@ -73,6 +73,10 @@ pub enum Command {
         path: PathBuf,
         name: String,
     },
+    ProjectRename {
+        path: PathBuf,
+        name: String,
+    },
     InputAdd {
         path: PathBuf,
         input: u128,
@@ -695,6 +699,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
     };
     match command.as_str() {
         "new" => parse_new(arguments),
+        "project-rename" => parse_project_rename(arguments),
         "input-add" => parse_input_add(arguments),
         "simulated-solid-input-add" => parse_simulated_solid_input_add(arguments),
         "media-input-add" => parse_media_input_add(arguments),
@@ -1269,6 +1274,13 @@ fn parse_new(mut arguments: impl Iterator<Item = String>) -> Result<Command, Arg
         }
     }
     Ok(Command::New { path, name })
+}
+
+fn parse_project_rename(mut arguments: impl Iterator<Item = String>) -> Result<Command, ArgsError> {
+    let path = required_path(&mut arguments, "project path")?;
+    let name = nonblank(&mut arguments, "project name")?;
+    reject_extra(&mut arguments)?;
+    Ok(Command::ProjectRename { path, name })
 }
 
 fn parse_input_add(mut arguments: impl Iterator<Item = String>) -> Result<Command, ArgsError> {

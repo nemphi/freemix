@@ -81,6 +81,7 @@ pub fn run(command: Command) -> AppResult<()> {
             save_engine(&path, &project)?;
             print_status(&project);
         }
+        Command::ProjectRename { path, name } => rename_project(&path, name)?,
         Command::InputAdd { path, input, name } => {
             add_input(&path, input_id(input)?, name)?;
         }
@@ -1105,6 +1106,25 @@ pub fn run(command: Command) -> AppResult<()> {
         Command::Demo { path, output } => demo(&path, output.as_deref())?,
         Command::Help => print_help(),
     }
+    Ok(())
+}
+
+fn rename_project(path: &Path, name: String) -> AppResult<()> {
+    let store = ProjectStore::new(path)?;
+    let stored = load_stored_project(path)?;
+    let mut project = stored.project().clone();
+    project.rename_project(name)?;
+    let renamed = StoredProject::from_project_with_complete_runtime_state(
+        project,
+        stored.runtime_routing(),
+        stored.runtime_manual_transitions(),
+        stored.runtime_fade_to_black(),
+        stored.runtime_overlays().clone(),
+        stored.position(),
+        stored.idempotency_receipts().to_vec(),
+    )?;
+    store.save(&renamed)?;
+    print_status(&load_engine(path)?);
     Ok(())
 }
 
@@ -2973,6 +2993,7 @@ Usage:
   freemix-cli scene-layer-crop-clear <show.freemix> <scene-id> <zero-based-layer-index>
   freemix-cli scene-layer-mask <show.freemix> <scene-id> <zero-based-layer-index> <x> <y> <width> <height> <normal|inverted>
   freemix-cli scene-layer-mask-clear <show.freemix> <scene-id> <zero-based-layer-index>
+  freemix-cli project-rename <show.freemix> <name>
   freemix-cli input-remove <show.freemix> <input-id>
   freemix-cli input-duplicate <show.freemix> <source-input-id> <new-nonzero-input-id> <new-name>
   freemix-cli input-replace-simulated <show.freemix> <input-id>

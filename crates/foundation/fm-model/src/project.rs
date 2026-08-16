@@ -19,6 +19,11 @@ pub enum AddInputError {
     DuplicateName,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RenameProjectError {
+    EmptyName,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AudioBusSendError {
     UnknownSource(BusId),
@@ -79,6 +84,16 @@ impl std::fmt::Display for AddInputError {
 }
 
 impl std::error::Error for AddInputError {}
+
+impl std::fmt::Display for RenameProjectError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyName => formatter.write_str("project name must not be empty"),
+        }
+    }
+}
+
+impl std::error::Error for RenameProjectError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RemoveSceneError {
@@ -652,6 +667,19 @@ impl Project {
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Renames the project while preserving the exact supplied text.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RenameProjectError::EmptyName`] when the name is blank.
+    pub fn rename_project(&mut self, name: String) -> Result<(), RenameProjectError> {
+        if name.trim().is_empty() {
+            return Err(RenameProjectError::EmptyName);
+        }
+        self.name = name;
+        Ok(())
     }
 
     #[must_use]
