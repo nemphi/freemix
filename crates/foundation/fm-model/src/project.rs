@@ -440,14 +440,13 @@ impl Project {
             }
             SourceRef::Input(_) | SourceRef::Scene(_) => {}
         }
-        let previous_errors = self.validate().err().unwrap_or_default();
         let mut candidate = self.clone();
         candidate.scenes[scene_index].layers[index].source = source;
         if candidate.validate().err().is_some_and(|errors| {
             errors.iter().any(|error| {
                 error.kind == ValidationErrorKind::Cycle
-                    && !previous_errors.contains(error)
-                    && matches!(error.entity, Some(EntityRef::Scene(_)))
+                    && error.entity == Some(EntityRef::Scene(scene))
+                    && error.field == "layers.source"
             })
         }) {
             return Err(SceneLayerError::SourceCycle);

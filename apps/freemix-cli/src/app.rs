@@ -20,9 +20,9 @@ use fm_engine::{
 use fm_model::{
     CropRect, Input, InputAudioStripState, InputBalanceBasisPoints, InputDelaySamples,
     InputGainMilliDb, InputKind, Layer, LayerGeometry, MainMix, Project, ProjectSettings, RectMask,
-    Rgba8 as ModelRgba8, Rotation, Scene, SceneLayerError, SimulatedAudio, SimulatedInput,
-    SimulatedVideo, SolidColor, SourceRef, StingerAudioPolicy as ModelStingerAudioPolicy,
-    StingerConfig, StingerMissingMediaFallback, StingerSlotNumber,
+    Rgba8 as ModelRgba8, Rotation, Scene, SimulatedAudio, SimulatedInput, SimulatedVideo,
+    SolidColor, SourceRef, StingerAudioPolicy as ModelStingerAudioPolicy, StingerConfig,
+    StingerMissingMediaFallback, StingerSlotNumber,
 };
 use fm_persistence::{
     FadeToBlackState as PersistedFadeToBlackState, IdempotencyReceipt,
@@ -1432,22 +1432,10 @@ fn set_scene_layer_source(
     index: usize,
     source: SourceRef,
 ) -> AppResult<()> {
-    update_project(path, |project| {
-        project.set_scene_layer_source(scene, index, source)
-    })
-}
-
-fn update_project(
-    path: &Path,
-    update: impl FnOnce(&mut Project) -> Result<(), SceneLayerError>,
-) -> AppResult<()> {
     let store = ProjectStore::new(path)?;
     let stored = load_stored_project(path)?;
     let mut project = stored.project().clone();
-    update(&mut project).map_err(|error| -> Box<dyn Error> { Box::new(error) })?;
-    project
-        .validate()
-        .map_err(|errors| AppFailure(format!("project validation failed: {errors:?}")))?;
+    project.set_scene_layer_source(scene, index, source)?;
     let configured = StoredProject::from_project_with_complete_runtime_state(
         project,
         stored.runtime_routing(),

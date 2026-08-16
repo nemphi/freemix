@@ -2096,6 +2096,13 @@ fn local_scene_layer_source_reassignment() {
         "-2",
         "second",
     ]));
+    assert_success(&invoke(&[
+        "scene-layer-source-scene",
+        context.project_path(),
+        "9",
+        "1",
+        "8",
+    ]));
     let before = ProjectStore::new(&context.project).unwrap().load().unwrap();
     assert_success(&invoke(&[
         "scene-layer-source-scene",
@@ -2124,41 +2131,30 @@ fn local_scene_layer_source_reassignment() {
     assert_eq!(after.runtime_overlays(), before.runtime_overlays());
     assert_eq!(after.position(), before.position());
     assert_eq!(after.idempotency_receipts(), before.idempotency_receipts());
-    assert_eq!(after.project().inputs(), before.project().inputs());
-    assert_eq!(after.project().main_mix(), before.project().main_mix());
-    assert_eq!(
-        after
-            .project()
-            .scenes()
-            .iter()
-            .map(|scene| scene.id)
-            .collect::<Vec<_>>(),
-        before
-            .project()
-            .scenes()
-            .iter()
-            .map(|scene| scene.id)
-            .collect::<Vec<_>>()
-    );
+    let scene_id = |value| fm_types::SceneId::new(NonZeroU128::new(value).unwrap());
+    let mut normalized = after.project().clone();
+    normalized
+        .set_scene_layer_source(
+            scene_id(9),
+            0,
+            SourceRef::Input(InputId::new(NonZeroU128::new(1).unwrap())),
+        )
+        .unwrap();
+    normalized
+        .set_scene_layer_source(scene_id(9), 1, SourceRef::Scene(scene_id(8)))
+        .unwrap();
+    assert_eq!(&normalized, before.project());
     let target = after
         .project()
         .scenes()
         .iter()
-        .find(|scene| scene.id.get().get() == 9)
+        .find(|scene| scene.id == scene_id(9))
         .unwrap();
-    let before_target = before
-        .project()
-        .scenes()
-        .iter()
-        .find(|scene| scene.id.get().get() == 9)
-        .unwrap();
-    assert_eq!(target.name, before_target.name);
-    assert_eq!(target.background, before_target.background);
-    let mut expected_layers = before_target.layers.clone();
-    expected_layers[0].source =
-        SourceRef::Scene(fm_types::SceneId::new(NonZeroU128::new(7).unwrap()));
-    expected_layers[1].source = SourceRef::Input(InputId::new(NonZeroU128::new(2).unwrap()));
-    assert_eq!(target.layers, expected_layers);
+    assert_eq!(target.layers[0].source, SourceRef::Scene(scene_id(7)));
+    assert_eq!(
+        target.layers[1].source,
+        SourceRef::Input(InputId::new(NonZeroU128::new(2).unwrap()))
+    );
     assert_success(&invoke(&[
         "scene-layer-add",
         context.project_path(),
