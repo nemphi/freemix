@@ -27,44 +27,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Help => println!("{HELP}"),
         Command::Version => println!("freemix-studio {}", env!("CARGO_PKG_VERSION")),
         Command::Open(config) => launch_native(config)?,
-        Command::Diagnose(config) => diagnose(config, None)?,
-        Command::WebDiagnose(config) => {
-            let token = env::var("FREEMIXD_WEB_TOKEN")
-                .ok()
-                .filter(|token| !token.is_empty())
-                .ok_or_else(|| diagnostic_failure("WebSocket diagnostic unavailable"))?;
-            diagnose(config, Some(&token))?;
-        }
+        Command::Diagnose(config) => diagnose(config)?,
     }
     Ok(())
 }
 
-fn diagnose(
-    config: freemix_studio::StudioConfig,
-    web_token: Option<&str>,
-) -> Result<(), io::Error> {
+fn diagnose(config: freemix_studio::StudioConfig) -> Result<(), io::Error> {
     let deadline = Instant::now() + CONNECT_TIMEOUT;
     let mut runtime = StudioRuntime::new_cancellable(config, DIAGNOSE_POLL_INTERVAL, || {
         Instant::now() >= deadline
     })
     .map_err(diagnostic_failure)?;
-    match web_token {
-        Some(token) => runtime
-            .connect_websocket_cancellable(
-                token,
-                deadline.saturating_duration_since(Instant::now()),
-                DIAGNOSE_POLL_INTERVAL,
-                || Instant::now() >= deadline,
-            )
-            .map_err(diagnostic_failure)?,
-        None => runtime
-            .connect_cancellable(
-                deadline.saturating_duration_since(Instant::now()),
-                DIAGNOSE_POLL_INTERVAL,
-                || Instant::now() >= deadline,
-            )
-            .map_err(diagnostic_failure)?,
-    };
+    runtime
+        .connect_cancellable(
+            deadline.saturating_duration_since(Instant::now()),
+            DIAGNOSE_POLL_INTERVAL,
+            || Instant::now() >= deadline,
+        )
+        .map_err(diagnostic_failure)?;
     let sent_at_ms: u64 = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(diagnostic_failure)?

@@ -11,7 +11,7 @@ FreeMix Studio native control application
 Usage:
   freemix-studio --project <SHOW.FREEMIX> [OPTIONS] [--diagnose]
   freemix-studio --connect <ADDR> --project-id <ID> [OPTIONS] [--diagnose]
-  freemix-studio --web-connect <ADDR> --project-id <ID> --diagnose
+  freemix-studio --web-connect <ADDR> --project-id <ID> [--diagnose]
   freemix-studio --help
   freemix-studio --version
 
@@ -28,7 +28,7 @@ Client options:
                          [default: operator; viewer with --diagnose]
   --max-restarts <COUNT> Maximum supervised daemon restarts [default: 3]
   --osc-listen <ADDR>    Receive OSC control on a loopback address and nonzero port
-  --web-connect <ADDR>   One-shot loopback WebSocket diagnostic address (with --diagnose)
+  --web-connect <ADDR>   Connect to an existing loopback WebSocket daemon
   --diagnose             Run the one-shot connection diagnostic instead of Studio
   -h, --help             Print help
   -V, --version          Print version";
@@ -39,7 +39,12 @@ pub enum Command {
     Version,
     Open(StudioConfig),
     Diagnose(StudioConfig),
-    WebDiagnose(StudioConfig),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ControlTransport {
+    Tcp,
+    WebSocket,
 }
 
 /// Settings common to both runtime ownership modes.
@@ -50,6 +55,7 @@ pub struct StudioConfig {
     pub desired_role: Role,
     pub restart_policy: RestartPolicy,
     pub osc_listen: Option<SocketAddr>,
+    pub transport: ControlTransport,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -100,7 +106,6 @@ pub enum ArgsError {
     NonLoopbackListen(SocketAddr),
     InvalidOscListen(SocketAddr),
     OscUnavailableInDiagnose,
-    WebConnectRequiresDiagnose,
     WebConnectConflicting,
     InvalidWebConnect(SocketAddr),
     UnknownArgument(String),
@@ -146,9 +151,6 @@ impl fmt::Display for ArgsError {
             ),
             Self::OscUnavailableInDiagnose => {
                 formatter.write_str("--osc-listen cannot be used with --diagnose")
-            }
-            Self::WebConnectRequiresDiagnose => {
-                formatter.write_str("--web-connect requires --diagnose")
             }
             Self::WebConnectConflicting => formatter.write_str(
                 "--web-connect cannot be used with --project, --connect, --daemon, or --listen",
@@ -248,9 +250,6 @@ pub fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<Command
     }
 
     if web_connect.is_some() {
-        if diagnose.is_none() {
-            return Err(ArgsError::WebConnectRequiresDiagnose);
-        }
         if project.is_some() || connect.is_some() || daemon.is_some() || listen.is_some() {
             return Err(ArgsError::WebConnectConflicting);
         }
@@ -288,10 +287,13 @@ pub fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<Command
             maximum_restarts: maximum_restarts.unwrap_or(3),
         },
         osc_listen,
+        transport: if web_connect.is_some() {
+            ControlTransport::WebSocket
+        } else {
+            ControlTransport::Tcp
+        },
     };
-    Ok(if web_connect.is_some() {
-        Command::WebDiagnose(config)
-    } else if diagnose.is_some() {
+    Ok(if diagnose.is_some() {
         Command::Diagnose(config)
     } else {
         Command::Open(config)

@@ -1,4 +1,4 @@
-use std::{error::Error, fmt, net::SocketAddr, time::Duration};
+use std::{env, error::Error, fmt, net::SocketAddr, time::Duration};
 
 use fm_client::{
     Client, ConnectionState, ReconnectBackoff, SessionEvent, TcpSession, TcpSessionError,
@@ -6,8 +6,8 @@ use fm_client::{
 use fm_protocol::{CommandMessage, CommandPayload, HeartbeatMessage};
 
 use crate::{
-    ConnectionConfig, DaemonSupervisor, ReadinessRecord, StudioConfig, SupervisorError,
-    SupervisorState, native_client_config,
+    ConnectionConfig, ControlTransport, DaemonSupervisor, ReadinessRecord, StudioConfig,
+    SupervisorError, SupervisorState, native_client_config,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -35,6 +35,7 @@ pub enum StudioError {
         supplied: Duration,
     },
     NoSupervisedDaemon,
+    MissingWebSocketToken,
 }
 
 impl fmt::Display for StudioError {
@@ -50,6 +51,9 @@ impl fmt::Display for StudioError {
             Self::NoSupervisedDaemon => {
                 formatter.write_str("runtime does not own a supervised daemon")
             }
+            Self::MissingWebSocketToken => {
+                formatter.write_str("FREEMIXD_WEB_TOKEN is missing or empty")
+            }
         }
     }
 }
@@ -60,7 +64,9 @@ impl Error for StudioError {
             Self::Supervisor(error) => Some(error),
             Self::Client(error) => Some(error),
             Self::Session(error) => Some(error),
-            Self::BackoffNotElapsed { .. } | Self::NoSupervisedDaemon => None,
+            Self::BackoffNotElapsed { .. }
+            | Self::NoSupervisedDaemon
+            | Self::MissingWebSocketToken => None,
         }
     }
 }
@@ -89,6 +95,7 @@ pub struct StudioRuntime {
     supervisor: Option<DaemonSupervisor>,
     address: SocketAddr,
     session: TcpSession,
+    transport: ControlTransport,
 }
 
 impl StudioRuntime {
@@ -111,6 +118,7 @@ impl StudioRuntime {
         poll_interval: Duration,
         cancelled: impl FnMut() -> bool,
     ) -> Result<Self, StudioError> {
+        let transport = config.transport;
         let (supervisor, address, project_id) = match config.connection {
             ConnectionConfig::Supervised(supervised) => {
                 let supervisor = DaemonSupervisor::launch_cancellable(
@@ -137,6 +145,7 @@ impl StudioRuntime {
             supervisor,
             address,
             session: TcpSession::new(client),
+            transport,
         })
     }
 
@@ -201,7 +210,7 @@ impl StudioRuntime {
         if let Some(supervisor) = &mut self.supervisor {
             supervisor.poll()?;
         }
-        Ok(self.session.connect(self.address(), connect_timeout)?)
+        self.connect_transport(connect_timeout, Duration::from_millis(50), || false)
     }
 
     /// Connects and synchronizes while polling a caller-owned cancellation source.
@@ -218,32 +227,42 @@ impl StudioRuntime {
         if let Some(supervisor) = &mut self.supervisor {
             supervisor.poll()?;
         }
-        Ok(self.session.connect_cancellable(
-            self.address(),
-            connect_timeout,
-            poll_interval,
-            cancelled,
-        )?)
+        self.connect_transport(connect_timeout, poll_interval, cancelled)
     }
 
-    /// Connects and synchronizes through the loopback WebSocket control boundary.
-    pub fn connect_websocket_cancellable(
+    fn connect_transport(
         &mut self,
-        bearer_token: &str,
         connect_timeout: Duration,
         poll_interval: Duration,
-        cancelled: impl FnMut() -> bool,
+        mut cancelled: impl FnMut() -> bool,
     ) -> Result<SessionEvent, StudioError> {
         if let Some(supervisor) = &mut self.supervisor {
             supervisor.poll()?;
         }
-        Ok(self.session.connect_websocket_cancellable(
-            self.address(),
-            bearer_token,
-            connect_timeout,
-            poll_interval,
-            cancelled,
-        )?)
+        Ok(match self.transport {
+            ControlTransport::Tcp if poll_interval.is_zero() => {
+                self.session.connect(self.address(), connect_timeout)?
+            }
+            ControlTransport::Tcp => self.session.connect_cancellable(
+                self.address(),
+                connect_timeout,
+                poll_interval,
+                cancelled,
+            )?,
+            ControlTransport::WebSocket => {
+                let token = env::var("FREEMIXD_WEB_TOKEN")
+                    .ok()
+                    .filter(|token| !token.is_empty())
+                    .ok_or(StudioError::MissingWebSocketToken)?;
+                self.session.connect_websocket_cancellable(
+                    self.address(),
+                    &token,
+                    connect_timeout,
+                    poll_interval,
+                    &mut cancelled,
+                )?
+            }
+        })
     }
 
     /// Reconnects only after the caller reports that the client-selected backoff elapsed.

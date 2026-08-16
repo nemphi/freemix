@@ -824,7 +824,7 @@ fn run_worker(
         if !recovery.active()
             && recovery.reconnect_wait.is_none()
             && Instant::now() < next_heartbeat
-            && runtime.session().connection().is_some()
+            && runtime.session().is_connected()
         {
             let publish = match runtime.receive_timeout(IO_POLL_INTERVAL) {
                 Ok(Some(
@@ -2254,6 +2254,7 @@ mod tests {
                 maximum_restarts: 0,
             },
             osc_listen: None,
+            transport: crate::ControlTransport::Tcp,
         })
         .unwrap();
         runtime.connect(HEARTBEAT_TEST_TIMEOUT).unwrap();
@@ -2436,6 +2437,7 @@ mod tests {
                         maximum_restarts: 1,
                     },
                     osc_listen: None,
+                    transport: crate::ControlTransport::Tcp,
                 },
                 &request_receiver,
                 &publisher,

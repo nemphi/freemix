@@ -6,7 +6,10 @@ use std::{
     num::NonZeroU128,
     path::{Path, PathBuf},
     process::{Child, Command as ProcessCommand, Output, Stdio},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Mutex, MutexGuard, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -23,11 +26,11 @@ use fm_protocol::{
     OverlayStatus, ProtocolVersion, Role, RuntimeEventMessage, RuntimeLifecycleEvent,
     ServerIdentity, SnapshotMessage, SnapshotReason, WireInputId, WireMessage, encode_line,
 };
-use fm_types::ProjectId;
+use fm_types::{InputId, ProjectId};
 use freemix_studio::{
-    Command, ConnectionConfig, DaemonSupervisor, ExistingConfig, LifecycleState, ReadinessRecord,
-    RestartPolicy, StudioConfig, StudioError, StudioRuntime, SupervisedConfig, SupervisorError,
-    SupervisorState, parse_args,
+    Command, ConnectionConfig, ControlTransport, DaemonSupervisor, ExistingConfig, LifecycleState,
+    ReadinessRecord, RestartPolicy, StudioConfig, StudioError, StudioRuntime, SupervisedConfig,
+    SupervisorError, SupervisorState, parse_args,
 };
 use tungstenite::{
     Message, accept_hdr,
@@ -38,6 +41,19 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const DIAGNOSE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
 const PROJECT_VALUE: u128 = 18_446_744_073_709_551_657;
 static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+struct WebTokenGuard {
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl WebTokenGuard {
+    fn set(token: &str) -> Self {
+        let lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        assert_eq!(std::env::var("FREEMIXD_WEB_TOKEN").as_deref(), Ok(token));
+        Self { _lock: lock }
+    }
+}
 
 fn project_id() -> ProjectId {
     ProjectId::new(NonZeroU128::new(PROJECT_VALUE).unwrap())
@@ -45,6 +61,10 @@ fn project_id() -> ProjectId {
 
 fn input(value: u128) -> WireInputId {
     WireInputId::new(NonZeroU128::new(value).unwrap())
+}
+
+fn model_input(value: u128) -> InputId {
+    InputId::new(NonZeroU128::new(value).unwrap())
 }
 
 fn input_statuses() -> Vec<fm_protocol::InputStatus> {
@@ -191,6 +211,7 @@ fn existing_config(address: SocketAddr, expected_project_id: ProjectId) -> Studi
         desired_role: Role::Operator,
         restart_policy: RestartPolicy::default(),
         osc_listen: None,
+        transport: ControlTransport::Tcp,
     }
 }
 
@@ -749,6 +770,150 @@ fn websocket_diagnose_uses_current_session_contract() {
 }
 
 #[test]
+fn web_open_runtime_uses_websocket_transport() {
+    let token = "web-open-token-abcdefghijklmnopqrstuvwxyz-0123456789";
+    let _token_guard = WebTokenGuard::set(token);
+    let (address, server_thread) = spawn_server(move |listener| {
+        let deadline = Instant::now() + CONNECT_TIMEOUT;
+        let stream = accept_stream_until(&listener, deadline);
+        let callback = |request: &Request, response: Response| {
+            assert_eq!(request.uri().path(), "/v1/control");
+            assert_eq!(
+                request
+                    .headers()
+                    .get("authorization")
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                format!("Bearer {token}")
+            );
+            Ok(response)
+        };
+        let mut peer = accept_hdr(stream, callback).expect("WebSocket handshake failed");
+        let Message::Text(line) = websocket_message_until(&mut peer, deadline) else {
+            panic!("expected handshake text")
+        };
+        let WireMessage::HandshakeRequest(request) = fm_protocol::decode_line(&line).unwrap()
+        else {
+            panic!("expected handshake request")
+        };
+        assert_eq!(request.protocol, CURRENT_PROTOCOL_VERSION);
+        websocket_send_line(
+            &mut peer,
+            &WireMessage::HandshakeResponse(handshake(
+                project_id(),
+                4,
+                HandshakeOutcome::Snapshot {
+                    reason: SnapshotReason::NoCursor,
+                },
+            )),
+            deadline,
+        );
+        websocket_send_line(&mut peer, &WireMessage::Snapshot(snapshot(4)), deadline);
+        let Message::Text(line) = websocket_message_until(&mut peer, deadline) else {
+            panic!("expected command text")
+        };
+        let WireMessage::Command(command) = fm_protocol::decode_line(&line).unwrap() else {
+            panic!("expected command")
+        };
+        assert_eq!(command.payload, CommandPayload::Cut);
+        websocket_send_line(
+            &mut peer,
+            &WireMessage::CommandResult(CommandResult::Accepted {
+                id: command.id,
+                revision: 5,
+                scheduled_frame: Some(9),
+            }),
+            deadline,
+        );
+        websocket_send_line(&mut peer, &WireMessage::Event(event(5)), deadline);
+        websocket_send_line(
+            &mut peer,
+            &WireMessage::RuntimeEvent(runtime_event(5)),
+            deadline,
+        );
+    });
+
+    let Command::Open(config) = parse_args(
+        [
+            "--web-connect",
+            &address.to_string(),
+            "--project-id",
+            &PROJECT_VALUE.to_string(),
+        ]
+        .map(str::to_owned),
+    )
+    .unwrap() else {
+        panic!("expected normal Open command")
+    };
+    assert_eq!(config.transport, ControlTransport::WebSocket);
+    let mut runtime = StudioRuntime::new(config).unwrap();
+    assert_eq!(
+        runtime.connect(CONNECT_TIMEOUT).unwrap(),
+        SessionEvent::Connected {
+            mode: SyncMode::Snapshot
+        }
+    );
+    let command = runtime
+        .queue_command(CommandPayload::Cut, "web-cut", Some(4), None)
+        .unwrap();
+    assert_eq!(runtime.flush().unwrap(), 1);
+    assert!(matches!(
+        runtime.receive().unwrap(),
+        SessionEvent::CommandResult {
+            intake: Intake::ResultReconciled,
+            ..
+        }
+    ));
+    assert!(matches!(
+        runtime
+            .session()
+            .client()
+            .command(&command.id)
+            .unwrap()
+            .status,
+        CommandStatus::Completed(CommandResult::Accepted { revision: 5, .. })
+    ));
+    assert!(matches!(
+        runtime.receive().unwrap(),
+        SessionEvent::Event {
+            intake: Intake::EventApplied,
+            ..
+        }
+    ));
+    assert_eq!(
+        runtime
+            .session()
+            .client()
+            .last_applied_cursor()
+            .unwrap()
+            .revision,
+        5
+    );
+    assert_eq!(
+        runtime
+            .session()
+            .client()
+            .model()
+            .state()
+            .unwrap()
+            .switcher()
+            .desired
+            .program,
+        model_input(2)
+    );
+    assert!(matches!(
+        runtime.receive().unwrap(),
+        SessionEvent::RuntimeEvent {
+            intake: Intake::RuntimeEventObserved,
+            ..
+        }
+    ));
+    assert!(runtime.session().is_connected());
+    server_thread.join().unwrap();
+}
+
+#[test]
 fn diagnose_reports_validated_heartbeat_and_control_diagnostics() {
     let (address, server_thread) = spawn_server(|listener| {
         let deadline = Instant::now() + CONNECT_TIMEOUT;
@@ -1197,14 +1362,25 @@ fn diagnose_flag_selects_one_shot_mode_and_rejects_duplicates() {
     ];
     assert!(matches!(
         parse_args(web.map(str::to_owned)),
-        Ok(Command::WebDiagnose(StudioConfig {
+        Ok(Command::Diagnose(StudioConfig {
             connection: ConnectionConfig::Existing(ExistingConfig { address, expected_project_id }),
             ..
         })) if address == "127.0.0.1:9001".parse().unwrap() && expected_project_id == project_id()
     ));
     assert!(matches!(
-        parse_args(["--web-connect", "127.0.0.1:9001"].map(str::to_owned)),
-        Err(freemix_studio::ArgsError::WebConnectRequiresDiagnose)
+        parse_args(
+            [
+                "--web-connect",
+                "127.0.0.1:9001",
+                "--project-id",
+                &PROJECT_VALUE.to_string()
+            ]
+            .map(str::to_owned),
+        ),
+        Ok(Command::Open(StudioConfig {
+            transport: ControlTransport::WebSocket,
+            ..
+        }))
     ));
     assert!(matches!(
         parse_args(
