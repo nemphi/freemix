@@ -2244,6 +2244,14 @@ fn local_scene_layer_crop_set_and_clear_preserves_project_state() {
         "4",
         "Layer",
     ]));
+    assert_success(&invoke(&[
+        "scene-layer-add",
+        context.project_path(),
+        "7",
+        "2",
+        "5",
+        "Other layer",
+    ]));
     let before = ProjectStore::new(&context.project_path())
         .unwrap()
         .load()
@@ -2308,7 +2316,7 @@ fn local_scene_layer_crop_set_and_clear_preserves_project_state() {
             "0",
             "10",
             "20",
-            "0",
+            "2000",
             "480",
         ]),
         "domain project failed validation",
