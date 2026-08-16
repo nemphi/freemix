@@ -2210,6 +2210,8 @@ Usage:
   freemix-cli scene-layer-geometry <show.freemix> <scene-id> <zero-based-layer-index> <x> <y> <width> <height> <rotation:0|90|180|270>
   freemix-cli scene-layer-crop <show.freemix> <scene-id> <zero-based-layer-index> <x> <y> <width> <height>
   freemix-cli scene-layer-crop-clear <show.freemix> <scene-id> <zero-based-layer-index>
+  freemix-cli scene-layer-mask <show.freemix> <scene-id> <zero-based-layer-index> <x> <y> <width> <height> <normal|inverted>
+  freemix-cli scene-layer-mask-clear <show.freemix> <scene-id> <zero-based-layer-index>
   freemix-cli input-remove <show.freemix> <input-id>
   freemix-cli input-duplicate <show.freemix> <source-input-id> <new-nonzero-input-id> <new-name>
   freemix-cli input-replace-simulated <show.freemix> <input-id>
