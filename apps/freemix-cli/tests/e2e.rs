@@ -11,10 +11,10 @@ use std::{
 };
 
 use fm_model::{
-    InputKind, LayerGeometry, RectMask, Rgba8, Rotation, SimulatedAudio, SimulatedInput,
-    SimulatedVideo, SourceRef,
+    AudioBus, InputKind, LayerGeometry, Output as ModelOutput, RectMask, Rgba8, Rotation, Scene,
+    SimulatedAudio, SimulatedInput, SimulatedVideo, SourceRef, StartupPolicy,
 };
-use fm_persistence::{MutationBatch, ProjectStore};
+use fm_persistence::{MutationBatch, ProjectStore, StoredProject};
 use fm_protocol::{
     CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, ClientType, CommandMessage, CommandPayload,
     CommandResult, EngineIdentity, EventCursor, EventMessage, EventPayload, HandshakeOutcome,
@@ -22,7 +22,7 @@ use fm_protocol::{
     RuntimeEventMessage, RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage, SnapshotReason,
     WireInputId, WireMessage, decode_line, encode_line,
 };
-use fm_types::InputId;
+use fm_types::{BusId, InputId, OutputId, SceneId};
 
 static TEST_ROOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -1848,6 +1848,86 @@ fn local_input_add_persists_default_simulated_strip() {
     let duplicate = invoke(&["input-add", context.project_path(), "3", "Other"]);
     assert_failure_contains(&duplicate, "domain project failed validation");
     assert_eq!(manifest(&context.project), before_duplicate);
+    fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
+fn local_output_route_persists_existing_route_and_rejects_unknown_reference() {
+    let context = ContractContext::new();
+    assert_success(&invoke(&["new", context.project_path()]));
+    let store = ProjectStore::new(&context.project).unwrap();
+    let initial = store.load().unwrap();
+    let mut project = initial.project().clone();
+    let scene_wide = SceneId::new(NonZeroU128::new(10).unwrap());
+    let scene_close = SceneId::new(NonZeroU128::new(11).unwrap());
+    let bus_master = BusId::new(NonZeroU128::new(20).unwrap());
+    let bus_aux = BusId::new(NonZeroU128::new(21).unwrap());
+    let output_id = OutputId::new(NonZeroU128::new(30).unwrap());
+    for (id, name) in [(scene_wide, "Wide"), (scene_close, "Close")] {
+        project.add_scene(Scene {
+            id,
+            name: name.into(),
+            background: Rgba8::OPAQUE_BLACK,
+            layers: Vec::new(),
+        });
+    }
+    for (id, name) in [(bus_master, "Master"), (bus_aux, "Aux")] {
+        project.add_audio_bus(AudioBus {
+            id,
+            name: name.into(),
+            sends: Vec::new(),
+        });
+    }
+    project.add_output(ModelOutput {
+        id: output_id,
+        name: "Program".into(),
+        video_source: scene_wide,
+        audio_source: bus_master,
+        startup: StartupPolicy::ReconcileDesiredState,
+        required_capabilities: vec!["output.test".into()],
+    });
+    let configured = StoredProject::from_project_with_complete_runtime_state(
+        project,
+        initial.runtime_routing(),
+        initial.runtime_manual_transitions(),
+        initial.runtime_fade_to_black(),
+        initial.runtime_overlays().clone(),
+        initial.position(),
+        initial.idempotency_receipts().to_vec(),
+    )
+    .unwrap();
+    store.save(&configured).unwrap();
+    let before = store.load().unwrap();
+    let mut expected_project = before.project().clone();
+    expected_project
+        .set_output_route(output_id, scene_close, bus_aux)
+        .unwrap();
+
+    let changed = invoke(&["output-route", context.project_path(), "30", "11", "21"]);
+    assert_success(&changed);
+    let after = store.load().unwrap();
+    assert_eq!(after.project(), &expected_project);
+    assert_eq!(after.runtime_routing(), before.runtime_routing());
+    assert_eq!(
+        after.runtime_manual_transitions(),
+        before.runtime_manual_transitions()
+    );
+    assert_eq!(
+        after.runtime_fade_to_black(),
+        before.runtime_fade_to_black()
+    );
+    assert_eq!(after.runtime_overlays(), before.runtime_overlays());
+    assert_eq!(after.position(), before.position());
+    assert_eq!(after.idempotency_receipts(), before.idempotency_receipts());
+    assert_success(&invoke(&["status", context.project_path()]));
+
+    let unchanged_manifest = fs::read(context.project.join("project.json")).unwrap();
+    let rejected = invoke(&["output-route", context.project_path(), "30", "999", "21"]);
+    assert_failure_contains(&rejected, "unknown scene 999");
+    assert_eq!(
+        fs::read(context.project.join("project.json")).unwrap(),
+        unchanged_manifest
+    );
     fs::remove_dir_all(context.root).unwrap();
 }
 

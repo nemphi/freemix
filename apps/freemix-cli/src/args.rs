@@ -76,6 +76,12 @@ pub enum Command {
         input: u128,
         name: String,
     },
+    OutputRoute {
+        path: PathBuf,
+        output: u128,
+        scene: u128,
+        bus: u128,
+    },
     SceneInputAdd {
         path: PathBuf,
         input: u128,
@@ -592,6 +598,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
     match command.as_str() {
         "new" => parse_new(arguments),
         "input-add" => parse_input_add(arguments),
+        "output-route" => parse_output_route(arguments),
         "scene-input-add" => parse_scene_input_add(arguments),
         "scene-input-audio-source" => parse_scene_input_audio_source(arguments),
         "scene-input-audio-source-clear" => parse_scene_input_audio_source_clear(arguments),
@@ -720,6 +727,20 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
         "help" | "--help" | "-h" => Ok(Command::Help),
         _ => Err(ArgsError::UnknownCommand(command)),
     }
+}
+
+fn parse_output_route(mut arguments: impl Iterator<Item = String>) -> Result<Command, ArgsError> {
+    let path = required_path(&mut arguments, "project path")?;
+    let output = number(&required(&mut arguments, "output")?, "output")?;
+    let scene = number(&required(&mut arguments, "scene")?, "scene")?;
+    let bus = number(&required(&mut arguments, "bus")?, "bus")?;
+    reject_extra(&mut arguments)?;
+    Ok(Command::OutputRoute {
+        path,
+        output,
+        scene,
+        bus,
+    })
 }
 
 fn parse_audio_strip(mut arguments: impl Iterator<Item = String>) -> Result<Command, ArgsError> {

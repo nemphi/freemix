@@ -17,6 +17,13 @@ pub enum ReplaceInputError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SetOutputRouteError {
+    UnknownOutput(OutputId),
+    UnknownScene(SceneId),
+    UnknownBus(BusId),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AddSceneLayerError {
     UnknownScene(SceneId),
 }
@@ -116,6 +123,18 @@ impl std::fmt::Display for ReplaceInputError {
 }
 
 impl std::error::Error for ReplaceInputError {}
+
+impl std::fmt::Display for SetOutputRouteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownOutput(output) => write!(formatter, "unknown output {output}"),
+            Self::UnknownScene(scene) => write!(formatter, "unknown scene {scene}"),
+            Self::UnknownBus(bus) => write!(formatter, "unknown audio bus {bus}"),
+        }
+    }
+}
+
+impl std::error::Error for SetOutputRouteError {}
 
 impl std::fmt::Display for RemoveInputError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -586,6 +605,28 @@ impl Project {
 
     pub fn add_output(&mut self, output: Output) {
         self.outputs.push(output);
+    }
+
+    pub fn set_output_route(
+        &mut self,
+        output: OutputId,
+        scene: SceneId,
+        bus: BusId,
+    ) -> Result<(), SetOutputRouteError> {
+        let output_index = self
+            .outputs
+            .iter()
+            .position(|candidate| candidate.id == output)
+            .ok_or(SetOutputRouteError::UnknownOutput(output))?;
+        if !self.scenes.iter().any(|candidate| candidate.id == scene) {
+            return Err(SetOutputRouteError::UnknownScene(scene));
+        }
+        if !self.audio_buses.iter().any(|candidate| candidate.id == bus) {
+            return Err(SetOutputRouteError::UnknownBus(bus));
+        }
+        self.outputs[output_index].video_source = scene;
+        self.outputs[output_index].audio_source = bus;
+        Ok(())
     }
 
     pub fn set_main_mix(&mut self, main_mix: MainMix) {

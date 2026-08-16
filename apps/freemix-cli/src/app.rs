@@ -39,7 +39,7 @@ use fm_switcher::{
     StingerSlotId, SwitcherState, TBarPosition, TBarState, TransitionKind,
 };
 use fm_types::{
-    AudioFormat, ChannelLayout, ColorMetadata, FrameRate, InputId, OutputId, PixelFormat,
+    AudioFormat, BusId, ChannelLayout, ColorMetadata, FrameRate, InputId, OutputId, PixelFormat,
     ProjectId, SampleFormat, SampleRate, ScanMode, SceneId, VideoDimensions, VideoFormat,
 };
 use fm_video::write_ppm;
@@ -82,6 +82,14 @@ pub fn run(command: Command) -> AppResult<()> {
         }
         Command::InputAdd { path, input, name } => {
             add_input(&path, input_id(input)?, name)?;
+        }
+        Command::OutputRoute {
+            path,
+            output,
+            scene,
+            bus,
+        } => {
+            set_output_route(&path, output_id(output)?, scene_id(scene)?, bus_id(bus)?)?;
         }
         Command::SceneInputAdd {
             path,
@@ -1363,6 +1371,25 @@ fn add_scene_input(path: &Path, input: InputId, scene: SceneId, name: String) ->
     Ok(())
 }
 
+fn set_output_route(path: &Path, output: OutputId, scene: SceneId, bus: BusId) -> AppResult<()> {
+    let store = ProjectStore::new(path)?;
+    let stored = load_stored_project(path)?;
+    let mut project = stored.project().clone();
+    project.set_output_route(output, scene, bus)?;
+    let configured = StoredProject::from_project_with_complete_runtime_state(
+        project,
+        stored.runtime_routing(),
+        stored.runtime_manual_transitions(),
+        stored.runtime_fade_to_black(),
+        stored.runtime_overlays().clone(),
+        stored.position(),
+        stored.idempotency_receipts().to_vec(),
+    )?;
+    store.save(&configured)?;
+    print_status(&load_engine(path)?);
+    Ok(())
+}
+
 fn set_scene_input_audio_source(
     path: &Path,
     scene_input: InputId,
@@ -2414,6 +2441,7 @@ FreeMix deterministic MVP
 Usage:
   freemix-cli new <show.freemix> [--name <name>]
   freemix-cli input-add <show.freemix> <nonzero-input-id> <name>
+  freemix-cli output-route <preconfigured-show.freemix> <existing-output-id> <existing-scene-id> <existing-bus-id>
   freemix-cli scene-input-add <show.freemix> <nonzero-input-id> <nonzero-scene-id> <name>
   freemix-cli scene-input-audio-source <show.freemix> <scene-input-id> <source-input-id>
   freemix-cli scene-input-audio-source-clear <show.freemix> <scene-input-id>
@@ -2688,6 +2716,12 @@ fn output_id(value: u128) -> AppResult<OutputId> {
     NonZeroU128::new(value)
         .map(OutputId::new)
         .ok_or_else(|| AppFailure("output ID must be nonzero".into()).into())
+}
+
+fn bus_id(value: u128) -> AppResult<BusId> {
+    NonZeroU128::new(value)
+        .map(BusId::new)
+        .ok_or_else(|| AppFailure("bus ID must be nonzero".into()).into())
 }
 
 fn required_routing(value: Option<InputId>, field: &'static str) -> AppResult<InputId> {

@@ -628,6 +628,51 @@ fn scene_input_missing_scene_and_audio_references_are_reported() {
 }
 
 #[test]
+fn output_route_changes_only_sources_after_validating_all_references() {
+    let mut project = valid_project();
+    project.add_scene(Scene {
+        id: scene_id(2),
+        name: "Close".into(),
+        background: Rgba8::OPAQUE_BLACK,
+        layers: Vec::new(),
+    });
+    project.add_audio_bus(AudioBus {
+        id: bus_id(2),
+        name: "Aux".into(),
+        sends: Vec::new(),
+    });
+    let before = project.outputs().to_vec();
+    project
+        .set_output_route(output_id(1), scene_id(2), bus_id(2))
+        .unwrap();
+    assert_eq!(project.outputs()[0].id, before[0].id);
+    assert_eq!(project.outputs()[0].name, before[0].name);
+    assert_eq!(project.outputs()[0].startup, before[0].startup);
+    assert_eq!(
+        project.outputs()[0].required_capabilities,
+        before[0].required_capabilities
+    );
+    assert_eq!(project.outputs()[0].video_source, scene_id(2));
+    assert_eq!(project.outputs()[0].audio_source, bus_id(2));
+
+    let unchanged = project.outputs().to_vec();
+    assert!(matches!(
+        project.set_output_route(output_id(99), scene_id(99), bus_id(99)),
+        Err(fm_model::SetOutputRouteError::UnknownOutput(output)) if output == output_id(99)
+    ));
+    assert_eq!(project.outputs(), unchanged);
+    assert!(matches!(
+        project.set_output_route(output_id(1), scene_id(99), bus_id(2)),
+        Err(fm_model::SetOutputRouteError::UnknownScene(scene)) if scene == scene_id(99)
+    ));
+    assert!(matches!(
+        project.set_output_route(output_id(1), scene_id(2), bus_id(99)),
+        Err(fm_model::SetOutputRouteError::UnknownBus(bus)) if bus == bus_id(99)
+    ));
+    assert_eq!(project.outputs(), unchanged);
+}
+
+#[test]
 fn scene_composition_value_bounds_and_premultiplication_are_validated() {
     let mut project = Project::new(project_id(10), "Bounds", settings());
     project.add_input(Input {
