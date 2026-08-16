@@ -1424,12 +1424,12 @@ fn add_input_with_kind(
     let store = ProjectStore::new(path)?;
     let stored = load_stored_project(path)?;
     let mut project = stored.project().clone();
-    project.add_input(Input {
+    project.add_input_checked(Input {
         id: input,
         name,
         kind,
         required_capabilities: Vec::new(),
-    });
+    })?;
     let configured = StoredProject::from_project_with_complete_runtime_state(
         project,
         stored.runtime_routing(),
@@ -1983,12 +1983,12 @@ fn duplicate_input(path: &Path, source: InputId, input: InputId, name: String) -
         .ok_or_else(|| AppFailure(format!("project is missing audio strip for input {source}")))?;
     let store = ProjectStore::new(path)?;
     let mut project = stored.project().clone();
-    project.add_input(Input {
+    project.add_input_checked(Input {
         id: input,
         name,
         kind: source_input.kind.clone(),
         required_capabilities: source_input.required_capabilities.clone(),
-    });
+    })?;
     if !project.set_input_audio_strip(input, source_strip) {
         return Err(AppFailure(format!("project is missing audio strip for input {input}")).into());
     }

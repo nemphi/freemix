@@ -12,6 +12,31 @@ pub enum RemoveInputError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AddInputError {
+    DuplicateId(InputId),
+    EmptyName,
+    NameTooLong,
+    DuplicateName,
+}
+
+impl std::fmt::Display for AddInputError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DuplicateId(input) => write!(formatter, "input {input} already exists"),
+            Self::EmptyName => formatter.write_str("input name must not be empty"),
+            Self::NameTooLong => write!(
+                formatter,
+                "input name must not exceed {} bytes",
+                fm_types::MAX_INPUT_NAME_BYTES
+            ),
+            Self::DuplicateName => formatter.write_str("input name is already in use"),
+        }
+    }
+}
+
+impl std::error::Error for AddInputError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RemoveSceneError {
     UnknownScene(SceneId),
     InputReference { input: InputId, scene: SceneId },
@@ -583,6 +608,27 @@ impl Project {
             state: InputAudioStripState::default(),
         });
         self.inputs.push(input);
+    }
+
+    pub fn add_input_checked(&mut self, input: Input) -> Result<(), AddInputError> {
+        if self.inputs.iter().any(|candidate| candidate.id == input.id) {
+            return Err(AddInputError::DuplicateId(input.id));
+        }
+        validate_input_name(&input.name).map_err(|error| match error {
+            fm_types::RenameInputError::EmptyName => AddInputError::EmptyName,
+            fm_types::RenameInputError::NameTooLong => AddInputError::NameTooLong,
+            fm_types::RenameInputError::UnknownInput(_)
+            | fm_types::RenameInputError::DuplicateName => unreachable!(),
+        })?;
+        if self
+            .inputs
+            .iter()
+            .any(|candidate| candidate.name == input.name)
+        {
+            return Err(AddInputError::DuplicateName);
+        }
+        self.add_input(input);
+        Ok(())
     }
 
     pub fn remove_input(&mut self, input: InputId) -> Result<(), RemoveInputError> {

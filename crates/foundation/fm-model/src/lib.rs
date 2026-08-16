@@ -2,6 +2,7 @@ mod cycles;
 mod project;
 mod validation;
 
+pub use project::AddInputError;
 pub use project::{
     AddAudioBusError, AddOutputError, AddSceneInputError, AddSceneLayerError, AudioBus, BusSend,
     CURRENT_SCHEMA_VERSION, CropRect, DuplicateSceneInputError, Input, InputAudioStrip,

@@ -1,14 +1,14 @@
 use std::num::NonZeroU128;
 
 use fm_model::{
-    AddSceneInputError, AddSceneLayerError, AudioBus, BusSend, CURRENT_SCHEMA_VERSION, CropRect,
-    DuplicateSceneInputError, EntityRef, Input, InputAudioStripState, InputBalanceBasisPoints,
-    InputDelaySamples, InputGainMilliDb, InputKind, Layer, LayerGeometry, MainMix, Output,
-    OutputFormat, Project, ProjectSettings, RectMask, RemoveAudioBusError, RemoveInputError,
-    RemoveOutputError, RemoveSceneError, RenameSceneError, RestartPolicy, Rgba8, Rotation, Scene,
-    SceneLayerError, SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef,
-    StartupPolicy, StingerAudioPolicy, StingerConfig, StingerMissingMediaFallback,
-    StingerSlotNumber, ValidationErrorKind,
+    AddInputError, AddSceneInputError, AddSceneLayerError, AudioBus, BusSend,
+    CURRENT_SCHEMA_VERSION, CropRect, DuplicateSceneInputError, EntityRef, Input,
+    InputAudioStripState, InputBalanceBasisPoints, InputDelaySamples, InputGainMilliDb, InputKind,
+    Layer, LayerGeometry, MainMix, Output, OutputFormat, Project, ProjectSettings, RectMask,
+    RemoveAudioBusError, RemoveInputError, RemoveOutputError, RemoveSceneError, RenameSceneError,
+    RestartPolicy, Rgba8, Rotation, Scene, SceneLayerError, SimulatedAudio, SimulatedInput,
+    SimulatedVideo, SolidColor, SourceRef, StartupPolicy, StingerAudioPolicy, StingerConfig,
+    StingerMissingMediaFallback, StingerSlotNumber, ValidationErrorKind,
 };
 use fm_types::{
     AudioFormat, BusId, ChannelLayout, ColorMetadata, FrameRate, InputId, MAX_INPUT_NAME_BYTES,
@@ -613,6 +613,53 @@ fn remove_input_removes_pair_and_rejects_domain_references() {
             project.remove_input(input_id(3)),
             Err(RemoveInputError::DomainReference(input_id(3)))
         );
+    }
+}
+
+#[test]
+fn add_input_checked_is_atomic_and_preserves_exact_name() {
+    let mut project = valid_project();
+    let candidate = |id: u128, name: &str| Input {
+        id: input_id(id),
+        name: name.into(),
+        kind: InputKind::Simulated(SimulatedInput::new(
+            SimulatedVideo::Bars,
+            SimulatedAudio::Silence,
+        )),
+        required_capabilities: Vec::new(),
+    };
+    project
+        .add_input_checked(candidate(2, "Exact  name  "))
+        .unwrap();
+    assert_eq!(project.inputs()[1].name, "Exact  name  ");
+    assert_eq!(
+        project.input_audio_strip(input_id(2)),
+        Some(Default::default())
+    );
+    assert_eq!(
+        project
+            .inputs()
+            .iter()
+            .map(|input| input.id)
+            .collect::<Vec<_>>(),
+        vec![input_id(1), input_id(2)]
+    );
+    project.add_input_checked(candidate(3, "camera")).unwrap();
+    for (input, error) in [
+        (
+            candidate(1, "Other"),
+            AddInputError::DuplicateId(input_id(1)),
+        ),
+        (candidate(4, "   "), AddInputError::EmptyName),
+        (
+            candidate(4, &"x".repeat(MAX_INPUT_NAME_BYTES + 1)),
+            AddInputError::NameTooLong,
+        ),
+        (candidate(4, "Exact  name  "), AddInputError::DuplicateName),
+    ] {
+        let before = project.clone();
+        assert_eq!(project.add_input_checked(input), Err(error));
+        assert_eq!(project, before);
     }
 }
 

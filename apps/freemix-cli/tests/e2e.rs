@@ -1844,10 +1844,27 @@ fn local_input_add_persists_default_simulated_strip() {
         Default::default()
     );
 
-    let before_duplicate = manifest(&context.project);
+    assert_success(&invoke(&[
+        "input-duplicate",
+        context.project_path(),
+        "3",
+        "4",
+        "Copied input",
+    ]));
+    let store = ProjectStore::new(&context.project).unwrap();
+    let manifest_path = context.project.join("project.json");
+    let before_failure = fs::read(&manifest_path).unwrap();
+    let journal_before_failure = journal_bytes(&store);
+
     let duplicate = invoke(&["input-add", context.project_path(), "3", "Other"]);
-    assert_failure_contains(&duplicate, "domain project failed validation");
-    assert_eq!(manifest(&context.project), before_duplicate);
+    assert_failure_contains(&duplicate, "input 3 already exists");
+    assert_eq!(fs::read(&manifest_path).unwrap(), before_failure);
+    assert_eq!(journal_bytes(&store), journal_before_failure);
+
+    let duplicate_name = invoke(&["input-duplicate", context.project_path(), "3", "5", name]);
+    assert_failure_contains(&duplicate_name, "input name is already in use");
+    assert_eq!(fs::read(&manifest_path).unwrap(), before_failure);
+    assert_eq!(journal_bytes(&store), journal_before_failure);
     fs::remove_dir_all(context.root).unwrap();
 }
 
