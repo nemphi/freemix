@@ -2226,6 +2226,100 @@ fn local_scene_layer_geometry_preserves_other_layer_state() {
 }
 
 #[test]
+fn local_scene_layer_z_order_preserves_vector_and_runtime() {
+    let context = ContractContext::new();
+    assert_success(&invoke(&["new", context.project_path()]));
+    assert_success(&invoke(&[
+        "scene-input-add",
+        context.project_path(),
+        "3",
+        "7",
+        "Scene",
+    ]));
+    for (z_order, name) in [(4, "First"), (9, "Second")] {
+        assert_success(&invoke(&[
+            "scene-layer-add",
+            context.project_path(),
+            "7",
+            "1",
+            &z_order.to_string(),
+            name,
+        ]));
+    }
+    let before = ProjectStore::new(&context.project_path())
+        .unwrap()
+        .load()
+        .unwrap();
+    let before_scene = before.project().scenes().last().unwrap();
+    let before_runtime = (
+        before.runtime_routing(),
+        before.runtime_manual_transitions(),
+        before.runtime_fade_to_black(),
+        before.runtime_overlays(),
+        before.position(),
+        before.idempotency_receipts(),
+    );
+    assert_success(&invoke(&[
+        "scene-layer-z-order",
+        context.project_path(),
+        "7",
+        "1",
+        &i32::MIN.to_string(),
+    ]));
+    let after = ProjectStore::new(&context.project_path())
+        .unwrap()
+        .load()
+        .unwrap();
+    assert_eq!(
+        (
+            after.runtime_routing(),
+            after.runtime_manual_transitions(),
+            after.runtime_fade_to_black(),
+            after.runtime_overlays(),
+            after.position(),
+            after.idempotency_receipts(),
+        ),
+        before_runtime
+    );
+    let after_scene = after.project().scenes().last().unwrap();
+    let mut expected_layers = before_scene.layers.clone();
+    expected_layers[1].z_order = i32::MIN;
+    assert_eq!(after_scene.layers, expected_layers);
+
+    assert_success(&invoke(&[
+        "scene-layer-z-order",
+        context.project_path(),
+        "7",
+        "1",
+        "4",
+    ]));
+    let repeated = ProjectStore::new(&context.project_path())
+        .unwrap()
+        .load()
+        .unwrap();
+    assert_eq!(
+        (
+            repeated.runtime_routing(),
+            repeated.runtime_manual_transitions(),
+            repeated.runtime_fade_to_black(),
+            repeated.runtime_overlays(),
+            repeated.position(),
+            repeated.idempotency_receipts(),
+        ),
+        before_runtime
+    );
+    let repeated_scene = repeated.project().scenes().last().unwrap();
+    assert_eq!(repeated_scene.layers[0], before_scene.layers[0]);
+    assert_eq!(repeated_scene.layers[1].name, before_scene.layers[1].name);
+    assert_eq!(
+        repeated_scene.layers[1].source,
+        before_scene.layers[1].source
+    );
+    assert_eq!(repeated_scene.layers[1].z_order, 4);
+    fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
 fn local_scene_layer_crop_set_and_clear_preserves_project_state() {
     let context = ContractContext::new();
     assert_success(&invoke(&["new", context.project_path()]));

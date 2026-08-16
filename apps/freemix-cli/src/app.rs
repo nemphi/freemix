@@ -101,6 +101,12 @@ pub fn run(command: Command) -> AppResult<()> {
         Command::SceneLayerRemove { path, scene, index } => {
             remove_scene_layer(&path, scene_id(scene)?, index)?
         }
+        Command::SceneLayerZOrder {
+            path,
+            scene,
+            index,
+            z_order,
+        } => set_scene_layer_z_order(&path, scene_id(scene)?, index, z_order)?,
         Command::SceneLayerAppearance {
             path,
             scene,
@@ -1365,6 +1371,30 @@ fn remove_scene_layer(path: &Path, scene: SceneId, index: usize) -> AppResult<()
     Ok(())
 }
 
+fn set_scene_layer_z_order(
+    path: &Path,
+    scene: SceneId,
+    index: usize,
+    z_order: i32,
+) -> AppResult<()> {
+    let store = ProjectStore::new(path)?;
+    let stored = load_stored_project(path)?;
+    let mut project = stored.project().clone();
+    project.set_scene_layer_z_order(scene, index, z_order)?;
+    let configured = StoredProject::from_project_with_complete_runtime_state(
+        project,
+        stored.runtime_routing(),
+        stored.runtime_manual_transitions(),
+        stored.runtime_fade_to_black(),
+        stored.runtime_overlays().clone(),
+        stored.position(),
+        stored.idempotency_receipts().to_vec(),
+    )?;
+    store.save(&configured)?;
+    print_status(&load_engine(path)?);
+    Ok(())
+}
+
 fn set_scene_layer_appearance(
     path: &Path,
     scene: SceneId,
@@ -2206,6 +2236,7 @@ Usage:
   freemix-cli scene-input-add <show.freemix> <nonzero-input-id> <nonzero-scene-id> <name>
   freemix-cli scene-layer-add <show.freemix> <scene-id> <source-input-id> <z-order> <layer-name>
   freemix-cli scene-layer-remove <show.freemix> <scene-id> <zero-based-layer-index>
+  freemix-cli scene-layer-z-order <show.freemix> <scene-id> <zero-based-layer-index> <signed-z-order>
   freemix-cli scene-layer-appearance <show.freemix> <scene-id> <zero-based-layer-index> <enabled:on|off> <opacity:0..=255>
   freemix-cli scene-layer-geometry <show.freemix> <scene-id> <zero-based-layer-index> <x> <y> <width> <height> <rotation:0|90|180|270>
   freemix-cli scene-layer-crop <show.freemix> <scene-id> <zero-based-layer-index> <x> <y> <width> <height>

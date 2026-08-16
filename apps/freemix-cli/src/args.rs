@@ -94,6 +94,12 @@ pub enum Command {
         scene: u128,
         index: usize,
     },
+    SceneLayerZOrder {
+        path: PathBuf,
+        scene: u128,
+        index: usize,
+        z_order: i32,
+    },
     SceneLayerAppearance {
         path: PathBuf,
         scene: u128,
@@ -554,6 +560,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
         "scene-input-add" => parse_scene_input_add(arguments),
         "scene-layer-add" => parse_scene_layer_add(arguments),
         "scene-layer-remove" => parse_scene_layer_remove(arguments),
+        "scene-layer-z-order" => parse_scene_layer_z_order(arguments),
         "scene-layer-appearance" => parse_scene_layer_appearance(arguments),
         "scene-layer-geometry" => parse_scene_layer_geometry(arguments),
         "scene-layer-crop" => parse_scene_layer_crop(arguments),
@@ -1010,6 +1017,22 @@ fn parse_scene_layer_remove(
     let index = number(&required(&mut arguments, "layer index")?, "layer index")?;
     reject_extra(&mut arguments)?;
     Ok(Command::SceneLayerRemove { path, scene, index })
+}
+
+fn parse_scene_layer_z_order(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Command, ArgsError> {
+    let path = required_path(&mut arguments, "project path")?;
+    let scene = number(&required(&mut arguments, "scene")?, "scene")?;
+    let index = number(&required(&mut arguments, "layer index")?, "layer index")?;
+    let z_order = number(&required(&mut arguments, "z-order")?, "z-order")?;
+    reject_extra(&mut arguments)?;
+    Ok(Command::SceneLayerZOrder {
+        path,
+        scene,
+        index,
+        z_order,
+    })
 }
 
 fn parse_scene_layer_appearance(

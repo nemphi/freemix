@@ -342,6 +342,30 @@ impl Project {
         Ok(target.layers.remove(index))
     }
 
+    pub fn set_scene_layer_z_order(
+        &mut self,
+        scene: SceneId,
+        index: usize,
+        z_order: i32,
+    ) -> Result<(), SceneLayerError> {
+        let target = self
+            .scenes
+            .iter_mut()
+            .find(|candidate| candidate.id == scene)
+            .ok_or(SceneLayerError::UnknownScene(scene))?;
+        let length = target.layers.len();
+        let layer = target
+            .layers
+            .get_mut(index)
+            .ok_or(SceneLayerError::LayerIndexOutOfRange {
+                scene,
+                index,
+                length,
+            })?;
+        layer.z_order = z_order;
+        Ok(())
+    }
+
     pub fn set_scene_layer_appearance(
         &mut self,
         scene: SceneId,
