@@ -10,7 +10,10 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use fm_model::{InputKind, Rgba8, SimulatedAudio, SimulatedInput, SimulatedVideo};
+use fm_model::{
+    InputKind, LayerGeometry, Rgba8, Rotation, SimulatedAudio, SimulatedInput, SimulatedVideo,
+    SourceRef,
+};
 use fm_persistence::ProjectStore;
 use fm_protocol::{
     CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, ClientType, CommandMessage, CommandPayload,
@@ -1925,6 +1928,76 @@ fn local_scene_input_add_persists_empty_scene_without_routing() {
     let duplicate = invoke(&["scene-input-add", context.project_path(), "3", "8", "Other"]);
     assert_failure_contains(&duplicate, "domain project failed validation");
     assert_eq!(manifest(&context.project), before_duplicate);
+    fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
+fn local_scene_layer_add_persists_full_frame_layer() {
+    let context = ContractContext::new();
+    assert_success(&invoke(&["new", context.project_path()]));
+    assert_success(&invoke(&[
+        "scene-input-add",
+        context.project_path(),
+        "3",
+        "7",
+        "Scene",
+    ]));
+    let before = ProjectStore::new(&context.project).unwrap().load().unwrap();
+    let name = "  Full frame layer  ";
+    assert_success(&invoke(&[
+        "scene-layer-add",
+        context.project_path(),
+        "7",
+        "1",
+        "-4",
+        name,
+    ]));
+    let after = ProjectStore::new(&context.project).unwrap().load().unwrap();
+    assert_eq!(after.runtime_routing(), before.runtime_routing());
+    assert_eq!(
+        after.runtime_manual_transitions(),
+        before.runtime_manual_transitions()
+    );
+    assert_eq!(
+        after.runtime_fade_to_black(),
+        before.runtime_fade_to_black()
+    );
+    assert_eq!(after.runtime_overlays(), before.runtime_overlays());
+    assert_eq!(after.position(), before.position());
+    assert_eq!(after.idempotency_receipts(), before.idempotency_receipts());
+    let scene = after
+        .project()
+        .scenes()
+        .iter()
+        .find(|scene| scene.id.get().get() == 7)
+        .unwrap();
+    assert_eq!(scene.layers.len(), 1);
+    let layer = &scene.layers[0];
+    assert_eq!(layer.name, name);
+    assert_eq!(
+        layer.source,
+        SourceRef::Input(InputId::new(NonZeroU128::new(1).unwrap()))
+    );
+    assert!(layer.enabled);
+    assert_eq!(
+        layer.geometry,
+        LayerGeometry::new(0, 0, 1_920, 1_080, Rotation::Deg0)
+    );
+    assert_eq!(layer.crop, None);
+    assert_eq!(layer.mask, None);
+    assert_eq!(layer.opacity, u8::MAX);
+    assert_eq!(layer.z_order, -4);
+    let before_unknown = manifest(&context.project);
+    let unknown = invoke(&[
+        "scene-layer-add",
+        context.project_path(),
+        "99",
+        "1",
+        "2",
+        "other",
+    ]);
+    assert_failure_contains(&unknown, "unknown scene");
+    assert_eq!(manifest(&context.project), before_unknown);
     fs::remove_dir_all(context.root).unwrap();
 }
 

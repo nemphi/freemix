@@ -16,6 +16,21 @@ pub enum ReplaceInputError {
     UnknownInput(InputId),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AddSceneLayerError {
+    UnknownScene(SceneId),
+}
+
+impl std::fmt::Display for AddSceneLayerError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownScene(scene) => write!(formatter, "unknown scene {scene}"),
+        }
+    }
+}
+
+impl std::error::Error for AddSceneLayerError {}
+
 impl std::fmt::Display for ReplaceInputError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -263,6 +278,20 @@ impl Project {
 
     pub fn add_scene(&mut self, scene: Scene) {
         self.scenes.push(scene);
+    }
+
+    pub fn add_layer_to_scene(
+        &mut self,
+        scene: SceneId,
+        layer: Layer,
+    ) -> Result<(), AddSceneLayerError> {
+        self.scenes
+            .iter_mut()
+            .find(|candidate| candidate.id == scene)
+            .ok_or(AddSceneLayerError::UnknownScene(scene))?
+            .layers
+            .push(layer);
+        Ok(())
     }
 
     pub fn add_audio_bus(&mut self, bus: AudioBus) {

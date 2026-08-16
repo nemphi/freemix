@@ -19,9 +19,10 @@ use fm_engine::{
 };
 use fm_model::{
     Input, InputAudioStripState, InputBalanceBasisPoints, InputDelaySamples, InputGainMilliDb,
-    InputKind, MainMix, Project, ProjectSettings, Rgba8 as ModelRgba8, Scene, SimulatedAudio,
-    SimulatedInput, SimulatedVideo, SolidColor, StingerAudioPolicy as ModelStingerAudioPolicy,
-    StingerConfig, StingerMissingMediaFallback, StingerSlotNumber,
+    InputKind, Layer, LayerGeometry, MainMix, Project, ProjectSettings, Rgba8 as ModelRgba8,
+    Rotation, Scene, SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef,
+    StingerAudioPolicy as ModelStingerAudioPolicy, StingerConfig, StingerMissingMediaFallback,
+    StingerSlotNumber,
 };
 use fm_persistence::{
     FadeToBlackState as PersistedFadeToBlackState, IdempotencyReceipt,
@@ -90,6 +91,13 @@ pub fn run(command: Command) -> AppResult<()> {
         } => {
             add_scene_input(&path, input_id(input)?, scene_id(scene)?, name)?;
         }
+        Command::SceneLayerAdd {
+            path,
+            scene,
+            source,
+            z_order,
+            name,
+        } => add_scene_layer(&path, scene_id(scene)?, input_id(source)?, z_order, name)?,
         Command::InputRemove { path, input } => remove_input(&path, input_id(input)?)?,
         Command::InputDuplicate {
             path,
@@ -1234,6 +1242,50 @@ fn add_scene_input(path: &Path, input: InputId, scene: SceneId, name: String) ->
     Ok(())
 }
 
+fn add_scene_layer(
+    path: &Path,
+    scene: SceneId,
+    source: InputId,
+    z_order: i32,
+    name: String,
+) -> AppResult<()> {
+    let store = ProjectStore::new(path)?;
+    let stored = load_stored_project(path)?;
+    let mut project = stored.project().clone();
+    let dimensions = project.settings().video.dimensions;
+    project.add_layer_to_scene(
+        scene,
+        Layer {
+            name,
+            source: SourceRef::Input(source),
+            enabled: true,
+            geometry: LayerGeometry::new(
+                0,
+                0,
+                dimensions.width(),
+                dimensions.height(),
+                Rotation::Deg0,
+            ),
+            crop: None,
+            mask: None,
+            opacity: u8::MAX,
+            z_order,
+        },
+    )?;
+    let configured = StoredProject::from_project_with_complete_runtime_state(
+        project,
+        stored.runtime_routing(),
+        stored.runtime_manual_transitions(),
+        stored.runtime_fade_to_black(),
+        stored.runtime_overlays().clone(),
+        stored.position(),
+        stored.idempotency_receipts().to_vec(),
+    )?;
+    store.save(&configured)?;
+    print_status(&load_engine(path)?);
+    Ok(())
+}
+
 fn remove_input(path: &Path, input: InputId) -> AppResult<()> {
     let stored = load_stored_project(path)?;
     let runtime = stored.runtime_routing();
@@ -1976,6 +2028,7 @@ Usage:
   freemix-cli new <show.freemix> [--name <name>]
   freemix-cli input-add <show.freemix> <nonzero-input-id> <name>
   freemix-cli scene-input-add <show.freemix> <nonzero-input-id> <nonzero-scene-id> <name>
+  freemix-cli scene-layer-add <show.freemix> <scene-id> <source-input-id> <z-order> <layer-name>
   freemix-cli input-remove <show.freemix> <input-id>
   freemix-cli input-duplicate <show.freemix> <source-input-id> <new-nonzero-input-id> <new-name>
   freemix-cli input-replace-simulated <show.freemix> <input-id>

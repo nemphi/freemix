@@ -274,7 +274,8 @@ the order after restart. Studio now has a compact permission-gated rename editor
 The local `input-add`, `scene-input-add`, `input-duplicate`, `input-remove`, and
 `input-replace-simulated` commands persist input state for the next project open
 only. `scene-input-add` creates an empty opaque-black scene with no layers and no
-audio source. Live lifecycle, local scene rendering, and general relink/import
+audio source, and `scene-layer-add` is the local next-open full-frame layer
+foothold; local scene rendering, live editing, keys, masks, effects, and IN-020
 remain planned.
 The rename and reorder commands carry input identity; audio and routing state
 remain separate.
