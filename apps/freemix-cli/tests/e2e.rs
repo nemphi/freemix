@@ -3824,6 +3824,7 @@ fn local_scene_layer_add_scene_persists_exact_source() {
     run(&["new", path]);
     run(&["scene-input-add", path, "10", "10", "Source"]);
     run(&["scene-input-add", path, "11", "11", "Target"]);
+    run(&["scene-layer-add", path, "11", "1", "-4", "  Input layer  "]);
     run(&[
         "scene-layer-add-scene",
         path,
@@ -3842,19 +3843,34 @@ fn local_scene_layer_add_scene_persists_exact_source() {
         .find(|scene| scene.id == scene_id(11))
         .unwrap();
     assert_eq!(target.id, scene_id(11));
-    assert_eq!(target.layers.len(), 1);
-    let layer = &target.layers[0];
-    assert_eq!(layer.source, SourceRef::Scene(scene_id(10)));
-    assert_eq!(layer.name, "  Source scene  ");
-    assert!(layer.enabled);
+    assert_eq!(target.layers.len(), 2);
+    let input_layer = &target.layers[0];
     assert_eq!(
-        layer.geometry,
+        input_layer.source,
+        SourceRef::Input(InputId::new(NonZeroU128::new(1).unwrap()))
+    );
+    assert_eq!(input_layer.name, "  Input layer  ");
+    assert!(input_layer.enabled);
+    assert_eq!(
+        input_layer.geometry,
         LayerGeometry::new(0, 0, 1_920, 1_080, Rotation::Deg0)
     );
-    assert_eq!(layer.crop, None);
-    assert_eq!(layer.mask, None);
-    assert_eq!(layer.opacity, u8::MAX);
-    assert_eq!(layer.z_order, -4);
+    assert_eq!(input_layer.crop, None);
+    assert_eq!(input_layer.mask, None);
+    assert_eq!(input_layer.opacity, u8::MAX);
+    assert_eq!(input_layer.z_order, -4);
+    let scene_layer = &target.layers[1];
+    assert_eq!(scene_layer.source, SourceRef::Scene(scene_id(10)));
+    assert_eq!(scene_layer.name, "  Source scene  ");
+    assert!(scene_layer.enabled);
+    assert_eq!(
+        scene_layer.geometry,
+        LayerGeometry::new(0, 0, 1_920, 1_080, Rotation::Deg0)
+    );
+    assert_eq!(scene_layer.crop, None);
+    assert_eq!(scene_layer.mask, None);
+    assert_eq!(scene_layer.opacity, u8::MAX);
+    assert_eq!(scene_layer.z_order, -4);
     let before_self_reference = fs::read(context.project.join("project.json")).unwrap();
     let rejected = invoke_bounded(&["scene-layer-add-scene", path, "11", "11", "0", "Self"]);
     assert_failure_contains(&rejected, "cycle");
