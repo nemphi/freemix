@@ -1322,6 +1322,7 @@ dependencies = [
  "fm-client",
  "fm-clock",
  "fm-command",
+ "fm-compositor",
  "fm-engine",
  "fm-model",
  "fm-persistence",
