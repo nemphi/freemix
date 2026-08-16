@@ -2016,6 +2016,138 @@ fn local_media_input_add_persists_offline_asset_contract() {
 }
 
 #[test]
+fn local_media_input_relink_preserves_identity_and_runtime() {
+    let context = ContractContext::new();
+    assert_success(&invoke(&["new", context.project_path()]));
+    assert_success(&invoke(&[
+        "media-input-add",
+        context.project_path(),
+        "9",
+        "Media  input ",
+        "asset://missing/old.ppm",
+    ]));
+    assert_success(&invoke(&[
+        "input-add",
+        context.project_path(),
+        "3",
+        "Other",
+    ]));
+    let store = ProjectStore::new(&context.project).unwrap();
+    let before = store.load().unwrap();
+    let before_input = before
+        .project()
+        .inputs()
+        .iter()
+        .find(|input| input.id == InputId::new(NonZeroU128::new(9).unwrap()))
+        .unwrap()
+        .clone();
+    let before_status = invoke(&["status", context.project_path()]);
+    assert_success(&before_status);
+
+    let relinked = invoke(&[
+        "media-input-relink",
+        context.project_path(),
+        "9",
+        "asset://missing/new.ppm",
+    ]);
+    assert_success(&relinked);
+    let after = store.load().unwrap();
+    let after_input = after
+        .project()
+        .inputs()
+        .iter()
+        .find(|input| input.id == before_input.id)
+        .unwrap();
+    assert_eq!(after_input.id, before_input.id);
+    assert_eq!(after_input.name, before_input.name);
+    assert_eq!(
+        after_input.required_capabilities,
+        before_input.required_capabilities
+    );
+    assert!(matches!(
+        &after_input.kind,
+        InputKind::Media { asset_uri } if asset_uri == "asset://missing/new.ppm"
+    ));
+    assert_eq!(
+        after
+            .project()
+            .inputs()
+            .iter()
+            .map(|input| input.id)
+            .collect::<Vec<_>>(),
+        before
+            .project()
+            .inputs()
+            .iter()
+            .map(|input| input.id)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        after.project().input_audio_strip(before_input.id),
+        before.project().input_audio_strip(before_input.id)
+    );
+    assert_eq!(after.position(), before.position());
+    assert_eq!(after.runtime_routing(), before.runtime_routing());
+    assert_eq!(
+        after.runtime_manual_transitions(),
+        before.runtime_manual_transitions()
+    );
+    assert_eq!(
+        after.runtime_fade_to_black(),
+        before.runtime_fade_to_black()
+    );
+    assert_eq!(after.runtime_overlays(), before.runtime_overlays());
+    assert_eq!(after.idempotency_receipts(), before.idempotency_receipts());
+    let status = invoke(&["status", context.project_path()]);
+    assert_success(&status);
+    assert_eq!(stdout(&status), stdout(&before_status));
+    let audit = invoke(&["asset-audit", context.project_path()]);
+    assert!(!audit.status.success());
+    assert_eq!(stdout(&audit), "input=9 reason=missing-asset");
+
+    for (command, message) in [
+        (
+            vec![
+                "media-input-relink",
+                context.project_path(),
+                "9",
+                "not-an-asset",
+            ],
+            "invalid project asset URI",
+        ),
+        (
+            vec![
+                "media-input-relink",
+                context.project_path(),
+                "99",
+                "asset://missing/x.ppm",
+            ],
+            "unknown input",
+        ),
+        (
+            vec![
+                "media-input-relink",
+                context.project_path(),
+                "3",
+                "asset://missing/x.ppm",
+            ],
+            "not a media input",
+        ),
+    ] {
+        let manifest = fs::read(context.project.join("project.json")).unwrap();
+        let journal = journal_bytes(&store);
+        let failure = invoke(&command);
+        assert_failure_contains(&failure, message);
+        assert_eq!(
+            fs::read(context.project.join("project.json")).unwrap(),
+            manifest
+        );
+        assert_eq!(journal_bytes(&store), journal);
+    }
+    fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
 fn local_asset_audit_reports_stable_issues_without_mutation() {
     let context = ContractContext::new();
     assert_success(&invoke(&["new", context.project_path()]));

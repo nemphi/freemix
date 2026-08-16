@@ -17,6 +17,12 @@ pub enum ReplaceInputError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RelinkMediaInputError {
+    UnknownInput(InputId),
+    NotMediaInput(InputId),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SetOutputRouteError {
     UnknownOutput(OutputId),
     UnknownScene(SceneId),
@@ -137,6 +143,17 @@ impl std::fmt::Display for ReplaceInputError {
 }
 
 impl std::error::Error for ReplaceInputError {}
+
+impl std::fmt::Display for RelinkMediaInputError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownInput(input) => write!(formatter, "unknown input {input}"),
+            Self::NotMediaInput(input) => write!(formatter, "input {input} is not a media input"),
+        }
+    }
+}
+
+impl std::error::Error for RelinkMediaInputError {}
 
 impl std::fmt::Display for SetOutputRouteError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -374,6 +391,26 @@ impl Project {
             .ok_or(ReplaceInputError::UnknownInput(input))?;
         candidate.kind = kind;
         candidate.required_capabilities = required_capabilities;
+        Ok(())
+    }
+
+    pub fn relink_media_input(
+        &mut self,
+        input: InputId,
+        asset_uri: String,
+    ) -> Result<(), RelinkMediaInputError> {
+        let index = self
+            .inputs
+            .iter()
+            .position(|candidate| candidate.id == input)
+            .ok_or(RelinkMediaInputError::UnknownInput(input))?;
+        if !matches!(self.inputs[index].kind, InputKind::Media { .. }) {
+            return Err(RelinkMediaInputError::NotMediaInput(input));
+        }
+        let InputKind::Media { asset_uri: current } = &mut self.inputs[index].kind else {
+            unreachable!("media input kind was validated above");
+        };
+        *current = asset_uri;
         Ok(())
     }
 

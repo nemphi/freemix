@@ -91,6 +91,11 @@ pub enum Command {
         name: String,
         asset_uri: String,
     },
+    MediaInputRelink {
+        path: PathBuf,
+        input: u128,
+        asset_uri: String,
+    },
     AudioBusAdd {
         path: PathBuf,
         bus: u128,
@@ -633,6 +638,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
         "input-add" => parse_input_add(arguments),
         "simulated-solid-input-add" => parse_simulated_solid_input_add(arguments),
         "media-input-add" => parse_media_input_add(arguments),
+        "media-input-relink" => parse_media_input_relink(arguments),
         "audio-bus-add" => parse_audio_bus_add(arguments),
         "output-add" => parse_output_add(arguments),
         "output-route" => parse_output_route(arguments),
@@ -1151,6 +1157,20 @@ fn parse_media_input_add(
         path,
         input,
         name,
+        asset_uri,
+    })
+}
+
+fn parse_media_input_relink(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Command, ArgsError> {
+    let path = required_path(&mut arguments, "project path")?;
+    let input = number(&required(&mut arguments, "input")?, "input")?;
+    let asset_uri = required(&mut arguments, "asset URI")?;
+    reject_extra(&mut arguments)?;
+    Ok(Command::MediaInputRelink {
+        path,
+        input,
         asset_uri,
     })
 }

@@ -115,6 +115,14 @@ pub fn run(command: Command) -> AppResult<()> {
                 InputKind::Media { asset_uri },
             )?;
         }
+        Command::MediaInputRelink {
+            path,
+            input,
+            asset_uri,
+        } => {
+            validate_asset_uri(&asset_uri)?;
+            relink_media_input(&path, input_id(input)?, asset_uri)?;
+        }
         Command::AudioBusAdd { path, bus, name } => {
             add_audio_bus(&path, bus_id(bus)?, name)?;
         }
@@ -1405,6 +1413,24 @@ fn add_input_with_kind(
     Ok(())
 }
 
+fn relink_media_input(path: &Path, input: InputId, asset_uri: String) -> AppResult<()> {
+    let stored = load_stored_project(path)?;
+    let mut project = stored.project().clone();
+    project.relink_media_input(input, asset_uri)?;
+    let configured = StoredProject::from_project_with_complete_runtime_state(
+        project,
+        stored.runtime_routing(),
+        stored.runtime_manual_transitions(),
+        stored.runtime_fade_to_black(),
+        stored.runtime_overlays().clone(),
+        stored.position(),
+        stored.idempotency_receipts().to_vec(),
+    )?;
+    ProjectStore::new(path)?.save(&configured)?;
+    print_status(&load_engine(path)?);
+    Ok(())
+}
+
 fn add_scene_input(path: &Path, input: InputId, scene: SceneId, name: String) -> AppResult<()> {
     let store = ProjectStore::new(path)?;
     let stored = load_stored_project(path)?;
@@ -2618,6 +2644,7 @@ Usage:
   freemix-cli input-add <show.freemix> <nonzero-input-id> <name>
   freemix-cli simulated-solid-input-add <show.freemix> <nonzero-input-id> <name> <red:0..=255> <green:0..=255> <blue:0..=255> <alpha:0..=255>
   freemix-cli media-input-add <show.freemix> <nonzero-input-id> <name> <asset://key>
+  freemix-cli media-input-relink <show.freemix> <existing-media-input-id> <asset://key>
   freemix-cli audio-bus-add <show.freemix> <nonzero-bus-id> <name>
   freemix-cli output-add <show.freemix> <nonzero-output-id> <nonzero-scene-id> <nonzero-bus-id> <name>
   freemix-cli output-route <show.freemix> <existing-output-id> <existing-scene-id> <existing-bus-id>

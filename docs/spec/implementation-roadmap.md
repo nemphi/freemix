@@ -297,8 +297,8 @@ footholds; local scene rendering, live editing, feathered and non-rectangular
 masks, effects, and IN-020 remain planned.
 The rename and reorder commands carry input identity; audio and routing state
 remain separate.
-`media-input-add` is a local next-open media-input configuration foothold. It stores a strict
-`asset://` URI without requiring the asset to exist; native decode, live add/relink,
+`media-input-add` and `media-input-relink` are local next-open media-input configuration footholds. They store strict
+`asset://` URIs without requiring the assets to exist; native decode, live add/relink,
 offline lifecycle, batch import, Studio, remote acceptance, and IN-008/IN-026 remain planned.
 `simulated-solid-input-add` is a local next-open simulated solid configuration foothold with
 straight RGBA bytes; live add, Studio/remote control, native acceptance, and IN-008/IN-026 remain planned.
