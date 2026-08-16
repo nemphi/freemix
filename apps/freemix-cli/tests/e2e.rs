@@ -2620,6 +2620,50 @@ fn local_output_route_persists_existing_route_and_rejects_unknown_reference() {
 }
 
 #[test]
+fn local_audio_bus_send_editing_is_atomic() {
+    let context = ContractContext::new();
+    assert_success(&invoke(&["new", context.project_path()]));
+    for (id, name) in [("20", "Master"), ("21", "Aux")] {
+        assert_success(&invoke(&[
+            "audio-bus-add",
+            context.project_path(),
+            id,
+            name,
+        ]));
+    }
+    let edit = |command, source, destination| {
+        assert_success(&invoke(&[
+            command,
+            context.project_path(),
+            source,
+            destination,
+        ]));
+    };
+    let assert_inventory = |expected| {
+        let inventory = invoke(&["audio-buses", context.project_path()]);
+        assert_success(&inventory);
+        assert_eq!(stdout(&inventory), expected);
+    };
+    edit("audio-bus-send-add", "20", "21");
+    assert_inventory(
+        "audio_bus id=20 name=\"Master\" sends=[21]\naudio_bus id=21 name=\"Aux\" sends=[]",
+    );
+    edit("audio-bus-send-remove", "20", "21");
+    assert_inventory(
+        "audio_bus id=20 name=\"Master\" sends=[]\naudio_bus id=21 name=\"Aux\" sends=[]",
+    );
+    edit("audio-bus-send-add", "20", "21");
+    let before_cycle = fs::read(context.project.join("project.json")).unwrap();
+    let rejected = invoke(&["audio-bus-send-add", context.project_path(), "21", "20"]);
+    assert_failure_contains(&rejected, "audio bus send would create a cycle");
+    assert_eq!(
+        fs::read(context.project.join("project.json")).unwrap(),
+        before_cycle
+    );
+    fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
 fn local_inputs_reports_ordered_inventory() {
     let context = ContractContext::new();
     assert_success(&invoke(&["new", context.project_path()]));

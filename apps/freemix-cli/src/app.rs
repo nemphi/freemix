@@ -129,6 +129,12 @@ pub fn run(command: Command) -> AppResult<()> {
         Command::AudioBusRemove { path, bus } => {
             remove_audio_bus(&path, bus_id(bus)?)?;
         }
+        Command::AudioBusSend {
+            path,
+            source,
+            destination,
+            add,
+        } => update_audio_bus_send(&path, bus_id(source)?, bus_id(destination)?, add)?,
         Command::OutputAdd {
             path,
             output,
@@ -1536,6 +1542,33 @@ fn add_audio_bus(path: &Path, bus: BusId, name: String) -> AppResult<()> {
     Ok(())
 }
 
+fn update_audio_bus_send(
+    path: &Path,
+    source: BusId,
+    destination: BusId,
+    add: bool,
+) -> AppResult<()> {
+    let stored = load_stored_project(path)?;
+    let mut project = stored.project().clone();
+    if add {
+        project.add_audio_bus_send(source, destination)?;
+    } else {
+        project.remove_audio_bus_send(source, destination)?;
+    }
+    let configured = StoredProject::from_project_with_complete_runtime_state(
+        project,
+        stored.runtime_routing(),
+        stored.runtime_manual_transitions(),
+        stored.runtime_fade_to_black(),
+        stored.runtime_overlays().clone(),
+        stored.position(),
+        stored.idempotency_receipts().to_vec(),
+    )?;
+    ProjectStore::new(path)?.save(&configured)?;
+    print_status(&load_engine(path)?);
+    Ok(())
+}
+
 fn add_output(
     path: &Path,
     output: OutputId,
@@ -2820,6 +2853,8 @@ Usage:
   freemix-cli media-input-relink <show.freemix> <existing-media-input-id> <asset://key>
   freemix-cli audio-bus-add <show.freemix> <nonzero-bus-id> <name>
   freemix-cli audio-bus-remove <show.freemix> <existing-bus-id>
+  freemix-cli audio-bus-send-add <show.freemix> <source-bus-id> <destination-bus-id>
+  freemix-cli audio-bus-send-remove <show.freemix> <source-bus-id> <destination-bus-id>
   freemix-cli output-add <show.freemix> <nonzero-output-id> <nonzero-scene-id> <nonzero-bus-id> <name>
   freemix-cli output-route <show.freemix> <existing-output-id> <existing-scene-id> <existing-bus-id>
   freemix-cli output-remove <show.freemix> <existing-output-id>

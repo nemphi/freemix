@@ -19,6 +19,35 @@ pub enum AddInputError {
     DuplicateName,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AudioBusSendError {
+    UnknownSource(BusId),
+    UnknownDestination(BusId),
+    SelfSend(BusId),
+    DuplicateSend,
+    MissingSend,
+    Cycle,
+    InvalidProject(Vec<ValidationError>),
+}
+
+impl std::fmt::Display for AudioBusSendError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownSource(source) => write!(formatter, "unknown source audio bus {source}"),
+            Self::UnknownDestination(destination) => {
+                write!(formatter, "unknown destination audio bus {destination}")
+            }
+            Self::SelfSend(bus) => write!(formatter, "audio bus {bus} cannot send to itself"),
+            Self::DuplicateSend => formatter.write_str("audio bus send already exists"),
+            Self::MissingSend => formatter.write_str("audio bus send does not exist"),
+            Self::Cycle => formatter.write_str("audio bus send would create a cycle"),
+            Self::InvalidProject(_) => formatter.write_str("domain project failed validation"),
+        }
+    }
+}
+
+impl std::error::Error for AudioBusSendError {}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SetStingerError {
     UnknownInput(InputId),
@@ -1234,6 +1263,71 @@ impl Project {
             return Err(AddAudioBusError::DuplicateName);
         }
         self.audio_buses.push(bus);
+        Ok(())
+    }
+
+    pub fn add_audio_bus_send(
+        &mut self,
+        source: BusId,
+        destination: BusId,
+    ) -> Result<(), AudioBusSendError> {
+        let source_index = self
+            .audio_buses
+            .iter()
+            .position(|bus| bus.id == source)
+            .ok_or(AudioBusSendError::UnknownSource(source))?;
+        if !self.audio_buses.iter().any(|bus| bus.id == destination) {
+            return Err(AudioBusSendError::UnknownDestination(destination));
+        }
+        if source == destination {
+            return Err(AudioBusSendError::SelfSend(source));
+        }
+        if self.audio_buses[source_index]
+            .sends
+            .iter()
+            .any(|send| send.destination == destination)
+        {
+            return Err(AudioBusSendError::DuplicateSend);
+        }
+
+        self.audio_buses[source_index]
+            .sends
+            .push(BusSend { destination });
+        if let Err(errors) = self.validate() {
+            self.audio_buses[source_index].sends.pop();
+            if errors
+                .iter()
+                .any(|error| error.kind == ValidationErrorKind::Cycle)
+            {
+                return Err(AudioBusSendError::Cycle);
+            }
+            return Err(AudioBusSendError::InvalidProject(errors));
+        }
+        Ok(())
+    }
+
+    pub fn remove_audio_bus_send(
+        &mut self,
+        source: BusId,
+        destination: BusId,
+    ) -> Result<(), AudioBusSendError> {
+        let source_index = self
+            .audio_buses
+            .iter()
+            .position(|bus| bus.id == source)
+            .ok_or(AudioBusSendError::UnknownSource(source))?;
+        if !self.audio_buses.iter().any(|bus| bus.id == destination) {
+            return Err(AudioBusSendError::UnknownDestination(destination));
+        }
+        if source == destination {
+            return Err(AudioBusSendError::SelfSend(source));
+        }
+        let sends = &mut self.audio_buses[source_index].sends;
+        let send_index = sends
+            .iter()
+            .position(|send| send.destination == destination)
+            .ok_or(AudioBusSendError::MissingSend)?;
+        sends.remove(send_index);
         Ok(())
     }
 
