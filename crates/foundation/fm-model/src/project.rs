@@ -221,6 +221,10 @@ pub enum SceneLayerError {
         scene: SceneId,
         index: usize,
     },
+    InvalidMask {
+        scene: SceneId,
+        index: usize,
+    },
     CropWouldInvalidateMask {
         scene: SceneId,
         index: usize,
@@ -269,6 +273,9 @@ impl std::fmt::Display for SceneLayerError {
             ),
             Self::InvalidCrop { scene, index } => {
                 write!(formatter, "invalid crop for layer {index} in scene {scene}")
+            }
+            Self::InvalidMask { scene, index } => {
+                write!(formatter, "invalid mask for layer {index} in scene {scene}")
             }
             Self::CropWouldInvalidateMask { scene, index } => write!(
                 formatter,
@@ -1074,21 +1081,46 @@ impl Project {
         index: usize,
         mask: Option<RectMask>,
     ) -> Result<(), SceneLayerError> {
-        let target = self
+        let scene_index = self
             .scenes
-            .iter_mut()
-            .find(|candidate| candidate.id == scene)
+            .iter()
+            .position(|candidate| candidate.id == scene)
             .ok_or(SceneLayerError::UnknownScene(scene))?;
+        let target = &self.scenes[scene_index];
         let length = target.layers.len();
         let layer = target
             .layers
-            .get_mut(index)
+            .get(index)
             .ok_or(SceneLayerError::LayerIndexOutOfRange {
                 scene,
                 index,
                 length,
             })?;
-        layer.mask = mask;
+        if let Some(mask) = mask {
+            let (width, height) = layer.crop.map_or_else(
+                || {
+                    (
+                        self.settings.video.dimensions.width(),
+                        self.settings.video.dimensions.height(),
+                    )
+                },
+                |crop| (crop.width, crop.height),
+            );
+            if mask.width == 0
+                || mask.height == 0
+                || mask
+                    .x
+                    .checked_add(mask.width)
+                    .is_none_or(|right| right > width)
+                || mask
+                    .y
+                    .checked_add(mask.height)
+                    .is_none_or(|bottom| bottom > height)
+            {
+                return Err(SceneLayerError::InvalidMask { scene, index });
+            }
+        }
+        self.scenes[scene_index].layers[index].mask = mask;
         Ok(())
     }
 

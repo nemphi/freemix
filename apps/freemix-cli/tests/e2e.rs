@@ -3963,7 +3963,7 @@ fn local_scene_layer_crop_checked_preserves_manifest_and_journal() {
 }
 
 #[test]
-fn local_scene_layer_mask_set_and_clear_preserves_project_state() {
+fn local_scene_layer_mask_checked_preserves_manifest_and_journal() {
     let context = ContractContext::new();
     assert_success(&invoke(&["new", context.project_path()]));
     assert_success(&invoke(&[
@@ -4056,6 +4056,8 @@ fn local_scene_layer_mask_set_and_clear_preserves_project_state() {
     );
 
     let before_invalid = manifest(&context.project);
+    let store = ProjectStore::new(&context.project_path()).unwrap();
+    let journal_before_invalid = journal_bytes(&store);
     assert_failure_contains(
         &invoke(&[
             "scene-layer-mask",
@@ -4068,9 +4070,10 @@ fn local_scene_layer_mask_set_and_clear_preserves_project_state() {
             "1",
             "normal",
         ]),
-        "domain project failed validation",
+        "invalid mask for layer 0 in scene 7",
     );
     assert_eq!(manifest(&context.project), before_invalid);
+    assert_eq!(journal_bytes(&store), journal_before_invalid);
     fs::remove_dir_all(context.root).unwrap();
 }
 

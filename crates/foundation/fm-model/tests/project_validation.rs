@@ -153,6 +153,47 @@ fn scene_layer_crop_checked_validation_is_atomic_and_mask_aware() {
     assert_eq!(project.scenes()[0].layers[0].crop, None);
 }
 
+#[test]
+fn scene_layer_mask_checked_validation_is_atomic_and_crop_aware() {
+    let scene = scene_id(1);
+    let mut project = valid_project();
+    let before = project.clone();
+    for (mask, error) in [
+        (
+            RectMask::new(0, 0, 0, 1),
+            SceneLayerError::InvalidMask { scene, index: 0 },
+        ),
+        (
+            RectMask::new(1_900, 0, 21, 1),
+            SceneLayerError::InvalidMask { scene, index: 0 },
+        ),
+        (
+            RectMask::new(u32::MAX, 0, 1, 1),
+            SceneLayerError::InvalidMask { scene, index: 0 },
+        ),
+    ] {
+        assert_eq!(
+            project.set_scene_layer_mask(scene, 0, Some(mask)),
+            Err(error)
+        );
+        assert_eq!(project, before);
+    }
+    project
+        .set_scene_layer_crop(scene, 0, Some(CropRect::new(100, 100, 640, 480)))
+        .unwrap();
+    let before_crop_failure = project.clone();
+    assert_eq!(
+        project.set_scene_layer_mask(scene, 0, Some(RectMask::new(639, 0, 2, 1))),
+        Err(SceneLayerError::InvalidMask { scene, index: 0 })
+    );
+    assert_eq!(project, before_crop_failure);
+    project
+        .set_scene_layer_mask(scene, 0, Some(RectMask::new(0, 0, 640, 480)))
+        .unwrap();
+    project.set_scene_layer_mask(scene, 0, None).unwrap();
+    assert_eq!(project.scenes()[0].layers[0].mask, None);
+}
+
 fn simulated_project() -> Project {
     let output_format = OutputFormat {
         video: settings().video,
