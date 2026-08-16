@@ -471,15 +471,9 @@ impl Transport {
         match self {
             Self::Tcp(connection) => connection.send_cancellable(message, wait),
             #[cfg(feature = "std-websocket")]
-            Self::WebSocket(connection) => {
-                if (wait.cancelled)() {
-                    return Ok(false);
-                }
-                connection
-                    .send(message)
-                    .map(|()| true)
-                    .map_err(TcpConnectionError::WebSocket)
-            }
+            Self::WebSocket(connection) => connection
+                .send_cancellable(message, wait.interval, wait.cancelled)
+                .map_err(TcpConnectionError::WebSocket),
         }
     }
     fn flush_cancellable(
@@ -489,15 +483,9 @@ impl Transport {
         match self {
             Self::Tcp(connection) => connection.flush_cancellable(wait),
             #[cfg(feature = "std-websocket")]
-            Self::WebSocket(connection) => {
-                if (wait.cancelled)() {
-                    return Ok(false);
-                }
-                connection
-                    .flush()
-                    .map(|()| true)
-                    .map_err(TcpConnectionError::WebSocket)
-            }
+            Self::WebSocket(connection) => connection
+                .flush_cancellable(wait.interval, wait.cancelled)
+                .map_err(TcpConnectionError::WebSocket),
         }
     }
     fn send(&mut self, message: &WireMessage) -> Result<(), TcpConnectionError> {
@@ -527,9 +515,6 @@ impl Transport {
                 WebSocketReceiveError::Protocol => {
                     TcpConnectionError::WebSocket("WebSocket message type or framing is invalid")
                 }
-                WebSocketReceiveError::TimedOut => {
-                    TcpConnectionError::Io(io::Error::from(io::ErrorKind::TimedOut))
-                }
                 WebSocketReceiveError::Transport => {
                     TcpConnectionError::WebSocket("WebSocket read failed")
                 }
@@ -547,9 +532,6 @@ impl Transport {
                     WebSocketReceiveError::Protocol => TcpConnectionError::WebSocket(
                         "WebSocket message type or framing is invalid",
                     ),
-                    WebSocketReceiveError::TimedOut => {
-                        TcpConnectionError::Io(io::Error::from(io::ErrorKind::TimedOut))
-                    }
                     WebSocketReceiveError::Transport => {
                         TcpConnectionError::WebSocket("WebSocket read failed")
                     }
@@ -663,7 +645,7 @@ impl TcpSession {
         } else {
             Some(
                 WebSocketConnection::connect(address, bearer_token, connect_timeout)
-                    .map_err(|error| TcpSessionError::Client(ClientError::InvalidConfig(error)))?,
+                    .map_err(TcpConnectionError::WebSocket),
             )
         };
         if cancelled() {
@@ -676,6 +658,7 @@ impl TcpSession {
             interval: poll_interval,
             cancelled: &mut cancelled,
         };
+        let connection = self.connection_result(connection)?;
         self.finish_connect(Transport::WebSocket(connection), Some(&mut wait))
     }
 
@@ -730,9 +713,8 @@ impl TcpSession {
             }
             Err(TcpConnectionError::Codec(error)) => Err(self.codec_error(error)),
             #[cfg(feature = "std-websocket")]
-            Err(TcpConnectionError::WebSocket(error)) => {
-                self.transition_disconnect();
-                Err(TcpSessionError::Client(ClientError::InvalidConfig(error)))
+            Err(TcpConnectionError::WebSocket(_error)) => {
+                Err(self.disconnected(DisconnectCause::Io(io::ErrorKind::Other)))
             }
         }
     }
@@ -909,9 +891,8 @@ impl TcpSession {
                 return Err(TcpSessionError::Codec(error));
             }
             #[cfg(feature = "std-websocket")]
-            Err(TcpConnectionError::WebSocket(error)) => {
-                self.transition_disconnect();
-                return Err(TcpSessionError::Client(ClientError::InvalidConfig(error)));
+            Err(TcpConnectionError::WebSocket(_error)) => {
+                return Err(self.disconnected(DisconnectCause::Io(io::ErrorKind::Other)));
             }
         };
         if status.timed_out {
@@ -1146,9 +1127,8 @@ impl TcpSession {
             }
             Err(TcpConnectionError::Codec(error)) => Err(self.codec_error(error)),
             #[cfg(feature = "std-websocket")]
-            Err(TcpConnectionError::WebSocket(error)) => {
-                self.transition_disconnect();
-                Err(TcpSessionError::Client(ClientError::InvalidConfig(error)))
+            Err(TcpConnectionError::WebSocket(_error)) => {
+                Err(self.disconnected(DisconnectCause::Io(io::ErrorKind::Other)))
             }
         }
     }
@@ -1173,9 +1153,8 @@ impl TcpSession {
             }
             Err(TcpConnectionError::Codec(error)) => Err(self.codec_error(error)),
             #[cfg(feature = "std-websocket")]
-            Err(TcpConnectionError::WebSocket(error)) => {
-                self.transition_disconnect();
-                Err(TcpSessionError::Client(ClientError::InvalidConfig(error)))
+            Err(TcpConnectionError::WebSocket(_error)) => {
+                Err(self.disconnected(DisconnectCause::Io(io::ErrorKind::Other)))
             }
         }
     }
@@ -1215,9 +1194,8 @@ impl TcpSession {
                         Err(TcpSessionError::Codec(error))
                     }
                     #[cfg(feature = "std-websocket")]
-                    Err(TcpConnectionError::WebSocket(error)) => {
-                        self.transition_disconnect();
-                        Err(TcpSessionError::Client(ClientError::InvalidConfig(error)))
+                    Err(TcpConnectionError::WebSocket(_error)) => {
+                        Err(self.disconnected(DisconnectCause::Io(io::ErrorKind::Other)))
                     }
                 };
             };
@@ -1240,9 +1218,8 @@ impl TcpSession {
                     return Err(TcpSessionError::Codec(error));
                 }
                 #[cfg(feature = "std-websocket")]
-                Err(TcpConnectionError::WebSocket(error)) => {
-                    self.transition_disconnect();
-                    return Err(TcpSessionError::Client(ClientError::InvalidConfig(error)));
+                Err(TcpConnectionError::WebSocket(_error)) => {
+                    return Err(self.disconnected(DisconnectCause::Io(io::ErrorKind::Other)));
                 }
             }
         }

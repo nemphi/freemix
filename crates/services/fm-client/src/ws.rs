@@ -1,6 +1,6 @@
 use std::io;
 use std::net::{SocketAddr, TcpStream};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fm_protocol::{CodecError, MAX_LINE_BYTES, WireMessage, decode_line, encode_line};
 use tungstenite::{
@@ -21,17 +21,21 @@ impl WebSocketConnection {
     pub(crate) fn connect(
         address: SocketAddr,
         bearer_token: &str,
-        connect_timeout: Duration,
+        timeout: Duration,
     ) -> Result<Self, &'static str> {
         validate(address, bearer_token)?;
-        let stream = TcpStream::connect_timeout(&address, connect_timeout)
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or("WebSocket connection failed")?;
+        let stream = TcpStream::connect_timeout(&address, timeout)
             .map_err(|_| "WebSocket connection failed")?;
         stream
             .set_nodelay(true)
             .map_err(|_| "WebSocket connection failed")?;
+        let remaining = remaining(deadline).ok_or("WebSocket connection failed")?;
         stream
-            .set_read_timeout(Some(connect_timeout))
-            .and_then(|()| stream.set_write_timeout(Some(connect_timeout)))
+            .set_read_timeout(Some(remaining))
+            .and_then(|()| stream.set_write_timeout(Some(remaining)))
             .map_err(|_| "WebSocket connection failed")?;
         let request = Request::builder()
             .uri(format!("ws://{address}/v1/control"))
@@ -46,12 +50,14 @@ impl WebSocketConnection {
         config.max_frame_size = Some(MAX_LINE_BYTES);
         let (socket, _) = client_with_config(request, stream, Some(config))
             .map_err(|_: HandshakeError<_>| "WebSocket handshake failed")?;
-        socket
+        let connection = Self { socket };
+        connection
+            .socket
             .get_ref()
             .set_read_timeout(None)
-            .and_then(|()| socket.get_ref().set_write_timeout(None))
+            .and_then(|()| connection.socket.get_ref().set_write_timeout(None))
             .map_err(|_| "WebSocket connection failed")?;
-        Ok(Self { socket })
+        Ok(connection)
     }
 
     pub(crate) fn send(&mut self, message: &WireMessage) -> Result<(), &'static str> {
@@ -61,23 +67,122 @@ impl WebSocketConnection {
             .map_err(|_| "WebSocket write failed")
     }
 
+    pub(crate) fn send_cancellable(
+        &mut self,
+        message: &WireMessage,
+        interval: Duration,
+        cancelled: &mut dyn FnMut() -> bool,
+    ) -> Result<bool, &'static str> {
+        let line = encode_line(message).map_err(|_| "WebSocket protocol encoding failed")?;
+        let result = if cancelled() {
+            Ok(false)
+        } else {
+            self.socket
+                .get_mut()
+                .set_write_timeout(Some(nonzero(interval)))
+                .map_err(|_| "WebSocket write setup failed")?;
+            // Do not retry: a partial WebSocket frame makes replay unsafe.
+            self.socket
+                .write(Message::text(line))
+                .map(|_| true)
+                .map_err(|_| "WebSocket write failed")
+        };
+        self.reset_write_timeout(result)
+    }
+
     pub(crate) fn flush(&mut self) -> Result<(), &'static str> {
         self.socket.flush().map_err(|_| "WebSocket flush failed")
     }
 
+    pub(crate) fn flush_cancellable(
+        &mut self,
+        interval: Duration,
+        cancelled: &mut dyn FnMut() -> bool,
+    ) -> Result<bool, &'static str> {
+        let result = loop {
+            if cancelled() {
+                break Ok(false);
+            }
+            self.socket
+                .get_mut()
+                .set_write_timeout(Some(nonzero(interval)))
+                .map_err(|_| "WebSocket flush setup failed")?;
+            match self.socket.flush() {
+                Ok(()) => break Ok(true),
+                Err(tungstenite::Error::Io(error))
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::Interrupted
+                    ) => {}
+                Err(_) => break Err("WebSocket flush failed"),
+            }
+        };
+        self.reset_write_timeout(result)
+    }
+
     pub(crate) fn receive(&mut self) -> Result<Option<WireMessage>, WebSocketReceiveError> {
+        self.socket
+            .get_mut()
+            .set_read_timeout(None)
+            .map_err(|_| WebSocketReceiveError::Transport)?;
+        let result = self.receive_inner(None).map(|status| status.message);
+        self.reset_timeouts(result)
+    }
+
+    pub(crate) fn receive_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<ReceiveStatus, WebSocketReceiveError> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or(WebSocketReceiveError::Transport)?;
+        let result = self.receive_inner(Some(deadline));
+        self.reset_timeouts(result)
+    }
+
+    fn receive_inner(
+        &mut self,
+        deadline: Option<Instant>,
+    ) -> Result<ReceiveStatus, WebSocketReceiveError> {
         loop {
+            if let Some(deadline) = deadline {
+                let Some(timeout) = remaining(deadline) else {
+                    return Ok(ReceiveStatus::timed_out());
+                };
+                self.socket
+                    .get_mut()
+                    .set_read_timeout(Some(timeout))
+                    .map_err(|_| WebSocketReceiveError::Transport)?;
+            }
             match self.socket.read() {
                 Ok(Message::Text(text)) => {
                     return decode_line(text.as_ref())
-                        .map(Some)
+                        .map(|message| ReceiveStatus {
+                            message: Some(message),
+                            timed_out: false,
+                        })
                         .map_err(WebSocketReceiveError::Codec);
                 }
                 Ok(Message::Ping(_) | Message::Pong(_)) => continue,
-                Ok(Message::Close(frame)) => {
-                    let _ = self.socket.send(Message::Close(frame));
-                    let _ = self.socket.flush();
-                    return Ok(None);
+                Ok(Message::Close(_)) => {
+                    // tungstenite queued its automatic Close reply; flush it once.
+                    if let Some(deadline) = deadline {
+                        self.socket
+                            .get_mut()
+                            .set_write_timeout(Some(nonzero(
+                                remaining(deadline).unwrap_or_default(),
+                            )))
+                            .map_err(|_| WebSocketReceiveError::Transport)?;
+                    }
+                    self.socket
+                        .flush()
+                        .map_err(|_| WebSocketReceiveError::Transport)?;
+                    return Ok(ReceiveStatus {
+                        message: None,
+                        timed_out: false,
+                    });
                 }
                 Ok(Message::Binary(_) | Message::Frame(_)) => {
                     return Err(WebSocketReceiveError::Protocol);
@@ -85,7 +190,10 @@ impl WebSocketConnection {
                 Err(tungstenite::Error::Io(error))
                     if error.kind() == io::ErrorKind::UnexpectedEof =>
                 {
-                    return Ok(None);
+                    return Ok(ReceiveStatus {
+                        message: None,
+                        timed_out: false,
+                    });
                 }
                 Err(tungstenite::Error::Io(error))
                     if matches!(
@@ -93,47 +201,49 @@ impl WebSocketConnection {
                         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                     ) =>
                 {
-                    return Err(WebSocketReceiveError::TimedOut);
+                    return Ok(ReceiveStatus::timed_out());
                 }
                 Err(_) => return Err(WebSocketReceiveError::Transport),
             }
         }
     }
 
-    pub(crate) fn receive_timeout(
+    fn reset_write_timeout<T>(
         &mut self,
-        timeout: Duration,
-    ) -> Result<ReceiveStatus, WebSocketReceiveError> {
-        self.socket
-            .get_mut()
-            .set_read_timeout(Some(timeout))
-            .map_err(|_| WebSocketReceiveError::Transport)?;
-        let result = match self.receive() {
-            Ok(message) => Ok(ReceiveStatus {
-                message,
-                timed_out: false,
-            }),
-            Err(WebSocketReceiveError::Transport)
-                if self.socket.get_mut().set_read_timeout(None).is_ok() =>
-            {
-                Err(WebSocketReceiveError::Transport)
-            }
-            Err(error) => Err(error),
-        };
-        let reset = self.socket.get_mut().set_read_timeout(None);
+        result: Result<T, &'static str>,
+    ) -> Result<T, &'static str> {
+        let reset = self.socket.get_mut().set_write_timeout(None);
         match (result, reset) {
-            (Err(WebSocketReceiveError::TimedOut), _) => Ok(ReceiveStatus {
-                message: None,
-                timed_out: true,
-            }),
             (Err(error), _) => Err(error),
-            (Ok(_status), Err(_)) => Err(WebSocketReceiveError::Transport),
-            (Ok(status), Ok(())) => Ok(status),
+            (Ok(_), Err(_)) => Err("WebSocket write setup failed"),
+            (Ok(value), Ok(())) => Ok(value),
+        }
+    }
+
+    fn reset_timeouts<T>(
+        &mut self,
+        result: Result<T, WebSocketReceiveError>,
+    ) -> Result<T, WebSocketReceiveError> {
+        let read = self.socket.get_mut().set_read_timeout(None);
+        let write = self.socket.get_mut().set_write_timeout(None);
+        match (result, read, write) {
+            (Err(error), _, _) => Err(error),
+            (Ok(_), Err(_), _) | (Ok(_), _, Err(_)) => Err(WebSocketReceiveError::Transport),
+            (Ok(value), Ok(()), Ok(())) => Ok(value),
         }
     }
 
     pub(crate) fn shutdown(&mut self) {
         let _ = self.socket.close(None);
+    }
+}
+
+impl ReceiveStatus {
+    fn timed_out() -> Self {
+        Self {
+            message: None,
+            timed_out: true,
+        }
     }
 }
 
@@ -147,7 +257,6 @@ pub(crate) struct ReceiveStatus {
 pub(crate) enum WebSocketReceiveError {
     Codec(CodecError),
     Protocol,
-    TimedOut,
     Transport,
 }
 
@@ -159,4 +268,17 @@ pub(crate) fn validate(address: SocketAddr, token: &str) -> Result<(), &'static 
         return Err("WebSocket bearer token must be 32-256 ASCII graphic bytes");
     }
     Ok(())
+}
+
+fn remaining(deadline: Instant) -> Option<Duration> {
+    let duration = deadline.checked_duration_since(Instant::now())?;
+    (!duration.is_zero()).then_some(duration)
+}
+
+fn nonzero(duration: Duration) -> Duration {
+    if duration.is_zero() {
+        Duration::from_millis(1)
+    } else {
+        duration
+    }
 }
