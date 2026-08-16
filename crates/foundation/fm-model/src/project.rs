@@ -250,6 +250,13 @@ pub enum AddAudioBusError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RenameAudioBusError {
+    UnknownBus(BusId),
+    EmptyName,
+    DuplicateName,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AddOutputError {
     DuplicateId(OutputId),
     EmptyName,
@@ -463,6 +470,18 @@ impl std::fmt::Display for AddAudioBusError {
 }
 
 impl std::error::Error for AddAudioBusError {}
+
+impl std::fmt::Display for RenameAudioBusError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownBus(bus) => write!(formatter, "unknown audio bus {bus}"),
+            Self::EmptyName => formatter.write_str("audio bus name must not be empty"),
+            Self::DuplicateName => formatter.write_str("duplicate audio bus name"),
+        }
+    }
+}
+
+impl std::error::Error for RenameAudioBusError {}
 
 impl std::fmt::Display for AddOutputError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1297,6 +1316,33 @@ impl Project {
             return Err(AddAudioBusError::DuplicateName);
         }
         self.audio_buses.push(bus);
+        Ok(())
+    }
+
+    pub fn rename_audio_bus(
+        &mut self,
+        bus: BusId,
+        name: String,
+    ) -> Result<(), RenameAudioBusError> {
+        let index = self
+            .audio_buses
+            .iter()
+            .position(|candidate| candidate.id == bus)
+            .ok_or(RenameAudioBusError::UnknownBus(bus))?;
+        if name.trim().is_empty() {
+            return Err(RenameAudioBusError::EmptyName);
+        }
+        if self
+            .audio_buses
+            .iter()
+            .enumerate()
+            .any(|(candidate_index, candidate)| {
+                candidate_index != index && candidate.name.eq_ignore_ascii_case(&name)
+            })
+        {
+            return Err(RenameAudioBusError::DuplicateName);
+        }
+        self.audio_buses[index].name = name;
         Ok(())
     }
 

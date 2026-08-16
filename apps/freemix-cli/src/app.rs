@@ -126,6 +126,9 @@ pub fn run(command: Command) -> AppResult<()> {
         Command::AudioBusAdd { path, bus, name } => {
             add_audio_bus(&path, bus_id(bus)?, name)?;
         }
+        Command::AudioBusRename { path, bus, name } => {
+            rename_audio_bus(&path, bus_id(bus)?, name)?;
+        }
         Command::AudioBusRemove { path, bus } => {
             remove_audio_bus(&path, bus_id(bus)?)?;
         }
@@ -1550,6 +1553,25 @@ fn add_audio_bus(path: &Path, bus: BusId, name: String) -> AppResult<()> {
     Ok(())
 }
 
+fn rename_audio_bus(path: &Path, bus: BusId, name: String) -> AppResult<()> {
+    let store = ProjectStore::new(path)?;
+    let stored = load_stored_project(path)?;
+    let mut project = stored.project().clone();
+    project.rename_audio_bus(bus, name)?;
+    let configured = StoredProject::from_project_with_complete_runtime_state(
+        project,
+        stored.runtime_routing(),
+        stored.runtime_manual_transitions(),
+        stored.runtime_fade_to_black(),
+        stored.runtime_overlays().clone(),
+        stored.position(),
+        stored.idempotency_receipts().to_vec(),
+    )?;
+    store.save(&configured)?;
+    print_status(&load_engine(path)?);
+    Ok(())
+}
+
 fn update_audio_bus_send(
     path: &Path,
     source: BusId,
@@ -2898,6 +2920,7 @@ Usage:
   freemix-cli media-input-add <show.freemix> <nonzero-input-id> <name> <asset://key>
   freemix-cli media-input-relink <show.freemix> <existing-media-input-id> <asset://key>
   freemix-cli audio-bus-add <show.freemix> <nonzero-bus-id> <name>
+  freemix-cli audio-bus-rename <show.freemix> <existing-bus-id> <name>
   freemix-cli audio-bus-remove <show.freemix> <existing-bus-id>
   freemix-cli audio-bus-send-add <show.freemix> <source-bus-id> <destination-bus-id>
   freemix-cli audio-bus-send-remove <show.freemix> <source-bus-id> <destination-bus-id>

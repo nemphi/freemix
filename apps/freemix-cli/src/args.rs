@@ -103,6 +103,11 @@ pub enum Command {
         bus: u128,
         name: String,
     },
+    AudioBusRename {
+        path: PathBuf,
+        bus: u128,
+        name: String,
+    },
     AudioBusRemove {
         path: PathBuf,
         bus: u128,
@@ -689,6 +694,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
         "media-input-add" => parse_media_input_add(arguments),
         "media-input-relink" => parse_media_input_relink(arguments),
         "audio-bus-add" => parse_audio_bus_add(arguments),
+        "audio-bus-rename" => parse_audio_bus_rename(arguments),
         "audio-bus-remove" => parse_audio_bus_remove(arguments),
         "audio-bus-send-add" => parse_audio_bus_send(arguments, true),
         "audio-bus-send-remove" => parse_audio_bus_send(arguments, false),
@@ -900,6 +906,16 @@ fn parse_audio_bus_add(mut arguments: impl Iterator<Item = String>) -> Result<Co
     let name = nonblank(&mut arguments, "bus name")?;
     reject_extra(&mut arguments)?;
     Ok(Command::AudioBusAdd { path, bus, name })
+}
+
+fn parse_audio_bus_rename(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Command, ArgsError> {
+    let path = required_path(&mut arguments, "project path")?;
+    let bus = number(&required(&mut arguments, "bus")?, "bus")?;
+    let name = nonblank(&mut arguments, "bus name")?;
+    reject_extra(&mut arguments)?;
+    Ok(Command::AudioBusRename { path, bus, name })
 }
 
 fn parse_audio_bus_remove(

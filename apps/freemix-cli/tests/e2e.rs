@@ -2781,6 +2781,100 @@ fn local_audio_bus_send_editing_is_atomic() {
 }
 
 #[test]
+fn local_audio_bus_rename_persists_exact_name_and_preserves_runtime_state() {
+    let context = ContractContext::new();
+    assert_success(&invoke_bounded(&["new", context.project_path()]));
+    for (id, name) in [("20", "Master"), ("21", "Return")] {
+        assert_success(&invoke_bounded(&[
+            "audio-bus-add",
+            context.project_path(),
+            id,
+            name,
+        ]));
+    }
+    assert_success(&invoke_bounded(&[
+        "audio-bus-send-add",
+        context.project_path(),
+        "20",
+        "21",
+    ]));
+    assert_success(&invoke_bounded(&[
+        "scene-input-add",
+        context.project_path(),
+        "10",
+        "10",
+        "Program",
+    ]));
+    for (output, bus, name) in [("30", "20", "Primary"), ("31", "21", "Return")] {
+        assert_success(&invoke_bounded(&[
+            "output-add",
+            context.project_path(),
+            output,
+            "10",
+            bus,
+            name,
+        ]));
+    }
+
+    let store = ProjectStore::new(&context.project).unwrap();
+    let before = store.load().unwrap();
+    let supplied = "  Aux \"Return\"  ";
+    assert_success(&invoke_bounded(&[
+        "audio-bus-rename",
+        context.project_path(),
+        "21",
+        supplied,
+    ]));
+    let after = store.load().unwrap();
+    let mut expected_project = before.project().clone();
+    expected_project
+        .rename_audio_bus(BusId::new(NonZeroU128::new(21).unwrap()), supplied.into())
+        .unwrap();
+    assert_eq!(after.project(), &expected_project);
+    assert_eq!(
+        after.project().audio_buses()[0].sends,
+        before.project().audio_buses()[0].sends
+    );
+    assert_eq!(after.project().outputs(), before.project().outputs());
+    assert_eq!(after.runtime_routing(), before.runtime_routing());
+    assert_eq!(
+        after.runtime_manual_transitions(),
+        before.runtime_manual_transitions()
+    );
+    assert_eq!(
+        after.runtime_fade_to_black(),
+        before.runtime_fade_to_black()
+    );
+    assert_eq!(after.runtime_overlays(), before.runtime_overlays());
+    assert_eq!(after.position(), before.position());
+    assert_eq!(after.idempotency_receipts(), before.idempotency_receipts());
+
+    let buses = invoke_bounded(&["audio-buses", context.project_path()]);
+    assert_success(&buses);
+    assert!(stdout(&buses).contains("audio_bus id=21 name=\"  Aux \\\"Return\\\"  \""));
+    let outputs = invoke_bounded(&["outputs", context.project_path()]);
+    assert_success(&outputs);
+    assert!(stdout(&outputs).contains("audio_bus=21 audio_bus_name=\"  Aux \\\"Return\\\"  \""));
+
+    assert_success(&invoke_bounded(&[
+        "audio-bus-rename",
+        context.project_path(),
+        "21",
+        supplied,
+    ]));
+    assert_eq!(store.load().unwrap(), after);
+
+    let manifest_before = fs::read(context.project.join("project.json")).unwrap();
+    let rejected = invoke_bounded(&["audio-bus-rename", context.project_path(), "21", "mAsTeR"]);
+    assert_failure_contains(&rejected, "duplicate audio bus name");
+    assert_eq!(
+        fs::read(context.project.join("project.json")).unwrap(),
+        manifest_before
+    );
+    fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
 fn local_inputs_reports_ordered_inventory() {
     let context = ContractContext::new();
     assert_success(&invoke(&["new", context.project_path()]));

@@ -332,9 +332,9 @@ Studio now has a compact permission-gated gain fader with exact milli-dB entry
 and a latest-only compact peak/RMS meter display for Master and current inputs.
 There is still no PFL, strip-name editor, strip groups, microphone automix,
 device-audio path, device-clock correction, native EQ/gate/compressor/limiter,
-or acceptance evidence. Local offline audio-bus send authoring persists
-exact-current configuration only; native audio/DSP/output/mix-minus realization
-does not exist, and `AU-002` plus its acceptance remain planned. Phase 2 item 7
+or acceptance evidence. Local offline audio-bus send authoring and rename are
+next-open configuration only; they do not change IDs, sends, output routes,
+runtime state, or live audio, and `AU-002` remains planned. Phase 2 item 7
 is partial, Phase 3 item 3 is partial, and
 `AU-001`/`AU-007` remain planned.
 
