@@ -4,9 +4,8 @@ use std::time::{Duration, Instant};
 
 use fm_protocol::{CodecError, MAX_LINE_BYTES, WireMessage, decode_line, encode_line};
 use tungstenite::{
-    client::client_with_config,
+    client::{IntoClientRequest, client_with_config},
     handshake::HandshakeError,
-    http::Request,
     protocol::{Message, WebSocket, WebSocketConfig},
 };
 
@@ -33,11 +32,15 @@ impl WebSocketConnection {
         stream
             .set_nodelay(true)
             .map_err(|_| "WebSocket connection failed")?;
-        let request = Request::builder()
-            .uri(format!("ws://{address}/v1/control"))
-            .header("Authorization", format!("Bearer {bearer_token}"))
-            .body(())
+        let mut request = format!("ws://{address}/v1/control")
+            .into_client_request()
             .map_err(|_| "WebSocket handshake failed")?;
+        request.headers_mut().insert(
+            "Authorization",
+            format!("Bearer {bearer_token}")
+                .parse()
+                .map_err(|_| "WebSocket handshake failed")?,
+        );
         let mut config = WebSocketConfig::default();
         config.read_buffer_size = READ_BUFFER_BYTES;
         config.write_buffer_size = READ_BUFFER_BYTES;
