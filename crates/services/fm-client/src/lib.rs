@@ -2,6 +2,8 @@
 
 #[cfg(feature = "std-tcp")]
 mod tcp;
+#[cfg(feature = "std-websocket")]
+mod ws;
 
 #[cfg(feature = "std-tcp")]
 pub use tcp::{

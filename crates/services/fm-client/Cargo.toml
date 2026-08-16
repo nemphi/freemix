@@ -8,12 +8,14 @@ rust-version.workspace = true
 [features]
 default = []
 std-tcp = []
+std-websocket = ["std-tcp", "dep:tungstenite", "tungstenite/handshake"]
 
 [dependencies]
 fm-command = { path = "../../foundation/fm-command" }
 fm-protocol = { path = "../../foundation/fm-protocol" }
 fm-types = { path = "../../foundation/fm-types" }
 fm-ui-model = { path = "../../ui/fm-ui-model" }
+tungstenite = { version = "0.30.0", default-features = false, optional = true }
 
 [lints]
 workspace = true

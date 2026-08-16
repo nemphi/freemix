@@ -870,6 +870,7 @@ dependencies = [
  "fm-protocol",
  "fm-types",
  "fm-ui-model",
+ "tungstenite",
 ]
 
 [[package]]

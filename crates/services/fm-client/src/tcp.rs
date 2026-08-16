@@ -11,6 +11,8 @@ use fm_protocol::{
     WireMessage, encode_line,
 };
 
+#[cfg(feature = "std-websocket")]
+use crate::ws::{WebSocketConnection, WebSocketReceiveError, validate as validate_websocket};
 use crate::{Client, ClientError, Intake, Outbound, ReconnectBackoff, SyncMode};
 
 const READ_BUFFER_BYTES: usize = 8 * 1024;
@@ -31,6 +33,8 @@ struct PollCancellation<'a> {
 pub enum TcpConnectionError {
     Io(io::Error),
     Codec(CodecError),
+    #[cfg(feature = "std-websocket")]
+    WebSocket(&'static str),
 }
 
 impl fmt::Display for TcpConnectionError {
@@ -38,6 +42,8 @@ impl fmt::Display for TcpConnectionError {
         match self {
             Self::Io(error) => error.fmt(formatter),
             Self::Codec(error) => error.fmt(formatter),
+            #[cfg(feature = "std-websocket")]
+            Self::WebSocket(error) => formatter.write_str(error),
         }
     }
 }
@@ -47,6 +53,8 @@ impl std::error::Error for TcpConnectionError {
         match self {
             Self::Io(error) => Some(error),
             Self::Codec(error) => Some(error),
+            #[cfg(feature = "std-websocket")]
+            Self::WebSocket(_) => None,
         }
     }
 }
@@ -440,11 +448,125 @@ impl From<ClientError> for TcpSessionError {
 #[derive(Debug)]
 pub struct TcpSession {
     client: Client,
-    connection: Option<TcpConnection>,
+    connection: Option<Transport>,
     sent_commands: VecDeque<String>,
     pending_diagnostics: Option<String>,
     last_audio_meter_sequence: Option<u64>,
     latest_audio_meters: Option<AudioMetersMessage>,
+}
+
+#[derive(Debug)]
+enum Transport {
+    Tcp(TcpConnection),
+    #[cfg(feature = "std-websocket")]
+    WebSocket(WebSocketConnection),
+}
+
+impl Transport {
+    fn send_cancellable(
+        &mut self,
+        message: &WireMessage,
+        wait: &mut PollCancellation<'_>,
+    ) -> Result<bool, TcpConnectionError> {
+        match self {
+            Self::Tcp(connection) => connection.send_cancellable(message, wait),
+            #[cfg(feature = "std-websocket")]
+            Self::WebSocket(connection) => {
+                if (wait.cancelled)() {
+                    return Ok(false);
+                }
+                connection
+                    .send(message)
+                    .map(|()| true)
+                    .map_err(TcpConnectionError::WebSocket)
+            }
+        }
+    }
+    fn flush_cancellable(
+        &mut self,
+        wait: &mut PollCancellation<'_>,
+    ) -> Result<bool, TcpConnectionError> {
+        match self {
+            Self::Tcp(connection) => connection.flush_cancellable(wait),
+            #[cfg(feature = "std-websocket")]
+            Self::WebSocket(connection) => {
+                if (wait.cancelled)() {
+                    return Ok(false);
+                }
+                connection
+                    .flush()
+                    .map(|()| true)
+                    .map_err(TcpConnectionError::WebSocket)
+            }
+        }
+    }
+    fn send(&mut self, message: &WireMessage) -> Result<(), TcpConnectionError> {
+        match self {
+            Self::Tcp(connection) => connection.send(message),
+            #[cfg(feature = "std-websocket")]
+            Self::WebSocket(connection) => connection
+                .send(message)
+                .map_err(TcpConnectionError::WebSocket),
+        }
+    }
+    fn flush(&mut self) -> Result<(), TcpConnectionError> {
+        match self {
+            Self::Tcp(connection) => connection.flush(),
+            #[cfg(feature = "std-websocket")]
+            Self::WebSocket(connection) => {
+                connection.flush().map_err(TcpConnectionError::WebSocket)
+            }
+        }
+    }
+    fn receive(&mut self) -> Result<Option<WireMessage>, TcpConnectionError> {
+        match self {
+            Self::Tcp(connection) => connection.receive(),
+            #[cfg(feature = "std-websocket")]
+            Self::WebSocket(connection) => connection.receive().map_err(|error| match error {
+                WebSocketReceiveError::Codec(error) => TcpConnectionError::Codec(error),
+                WebSocketReceiveError::Protocol => {
+                    TcpConnectionError::WebSocket("WebSocket message type or framing is invalid")
+                }
+                WebSocketReceiveError::TimedOut => {
+                    TcpConnectionError::Io(io::Error::from(io::ErrorKind::TimedOut))
+                }
+                WebSocketReceiveError::Transport => {
+                    TcpConnectionError::WebSocket("WebSocket read failed")
+                }
+            }),
+        }
+    }
+    fn receive_timeout(&mut self, timeout: Duration) -> Result<ReceiveStatus, TcpConnectionError> {
+        match self {
+            Self::Tcp(connection) => connection.receive_timeout(timeout),
+            #[cfg(feature = "std-websocket")]
+            Self::WebSocket(connection) => connection
+                .receive_timeout(timeout)
+                .map_err(|error| match error {
+                    WebSocketReceiveError::Codec(error) => TcpConnectionError::Codec(error),
+                    WebSocketReceiveError::Protocol => TcpConnectionError::WebSocket(
+                        "WebSocket message type or framing is invalid",
+                    ),
+                    WebSocketReceiveError::TimedOut => {
+                        TcpConnectionError::Io(io::Error::from(io::ErrorKind::TimedOut))
+                    }
+                    WebSocketReceiveError::Transport => {
+                        TcpConnectionError::WebSocket("WebSocket read failed")
+                    }
+                })
+                .map(|status| ReceiveStatus {
+                    message: status.message,
+                    timed_out: status.timed_out,
+                }),
+        }
+    }
+    fn shutdown(&mut self) {
+        match self {
+            Self::Tcp(connection) => connection.shutdown(),
+            #[cfg(feature = "std-websocket")]
+            Self::WebSocket(connection) => connection.shutdown(),
+        }
+    }
 }
 
 impl TcpSession {
@@ -472,7 +594,15 @@ impl TcpSession {
 
     #[must_use]
     pub const fn connection(&self) -> Option<&TcpConnection> {
-        self.connection.as_ref()
+        match self.connection.as_ref() {
+            Some(Transport::Tcp(connection)) => Some(connection),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn is_connected(&self) -> bool {
+        self.connection.is_some()
     }
 
     #[must_use]
@@ -513,7 +643,40 @@ impl TcpSession {
         self.prepare_connect()?;
         let connection =
             self.connection_result(TcpConnection::connect(address, connect_timeout))?;
-        self.finish_connect(connection, None)
+        self.finish_connect(Transport::Tcp(connection), None)
+    }
+
+    #[cfg(feature = "std-websocket")]
+    pub fn connect_websocket_cancellable(
+        &mut self,
+        address: SocketAddr,
+        bearer_token: &str,
+        connect_timeout: Duration,
+        poll_interval: Duration,
+        mut cancelled: impl FnMut() -> bool,
+    ) -> Result<SessionEvent, TcpSessionError> {
+        validate_websocket(address, bearer_token)
+            .map_err(|error| TcpSessionError::Client(ClientError::InvalidConfig(error)))?;
+        self.prepare_connect()?;
+        let connection = if cancelled() {
+            None
+        } else {
+            Some(
+                WebSocketConnection::connect(address, bearer_token, connect_timeout)
+                    .map_err(|error| TcpSessionError::Client(ClientError::InvalidConfig(error)))?,
+            )
+        };
+        if cancelled() {
+            return Err(self.cancelled());
+        }
+        let Some(connection) = connection else {
+            return Err(self.cancelled());
+        };
+        let mut wait = PollCancellation {
+            interval: poll_interval,
+            cancelled: &mut cancelled,
+        };
+        self.finish_connect(Transport::WebSocket(connection), Some(&mut wait))
     }
 
     /// Connects and synchronizes while polling for caller-requested cancellation.
@@ -545,7 +708,7 @@ impl TcpSession {
             interval: poll_interval,
             cancelled: &mut cancelled,
         };
-        self.finish_connect(connection, Some(&mut wait))
+        self.finish_connect(Transport::Tcp(connection), Some(&mut wait))
     }
 
     fn prepare_connect(&mut self) -> Result<(), TcpSessionError> {
@@ -566,12 +729,17 @@ impl TcpSession {
                 Err(self.disconnected(DisconnectCause::Io(error.kind())))
             }
             Err(TcpConnectionError::Codec(error)) => Err(self.codec_error(error)),
+            #[cfg(feature = "std-websocket")]
+            Err(TcpConnectionError::WebSocket(error)) => {
+                self.transition_disconnect();
+                Err(TcpSessionError::Client(ClientError::InvalidConfig(error)))
+            }
         }
     }
 
     fn finish_connect(
         &mut self,
-        connection: TcpConnection,
+        connection: Transport,
         mut wait: Option<&mut PollCancellation<'_>>,
     ) -> Result<SessionEvent, TcpSessionError> {
         self.connection = Some(connection);
@@ -731,11 +899,19 @@ impl TcpSession {
         let status = match connection.receive_timeout(timeout) {
             Ok(status) => status,
             Err(TcpConnectionError::Io(error)) => {
+                if error.kind() == io::ErrorKind::TimedOut {
+                    return Ok(None);
+                }
                 return Err(self.disconnected(DisconnectCause::Io(error.kind())));
             }
             Err(TcpConnectionError::Codec(error)) => {
                 self.transition_disconnect();
                 return Err(TcpSessionError::Codec(error));
+            }
+            #[cfg(feature = "std-websocket")]
+            Err(TcpConnectionError::WebSocket(error)) => {
+                self.transition_disconnect();
+                return Err(TcpSessionError::Client(ClientError::InvalidConfig(error)));
             }
         };
         if status.timed_out {
@@ -925,7 +1101,7 @@ impl TcpSession {
 
     /// Closes an established session and enters backoff once.
     pub fn disconnect(&mut self) -> Option<ReconnectBackoff> {
-        self.connection.as_ref()?.shutdown();
+        self.connection.as_mut()?.shutdown();
         Some(self.transition_disconnect())
     }
 
@@ -969,6 +1145,11 @@ impl TcpSession {
                 Err(self.disconnected(DisconnectCause::Io(error.kind())))
             }
             Err(TcpConnectionError::Codec(error)) => Err(self.codec_error(error)),
+            #[cfg(feature = "std-websocket")]
+            Err(TcpConnectionError::WebSocket(error)) => {
+                self.transition_disconnect();
+                Err(TcpSessionError::Client(ClientError::InvalidConfig(error)))
+            }
         }
     }
 
@@ -991,6 +1172,11 @@ impl TcpSession {
                 Err(self.disconnected(DisconnectCause::Io(error.kind())))
             }
             Err(TcpConnectionError::Codec(error)) => Err(self.codec_error(error)),
+            #[cfg(feature = "std-websocket")]
+            Err(TcpConnectionError::WebSocket(error)) => {
+                self.transition_disconnect();
+                Err(TcpSessionError::Client(ClientError::InvalidConfig(error)))
+            }
         }
     }
 
@@ -1019,11 +1205,19 @@ impl TcpSession {
                 return match result {
                     Ok(message) => Ok(message),
                     Err(TcpConnectionError::Io(error)) => {
+                        if error.kind() == io::ErrorKind::TimedOut {
+                            return Ok(None);
+                        }
                         Err(self.disconnected(DisconnectCause::Io(error.kind())))
                     }
                     Err(TcpConnectionError::Codec(error)) => {
                         self.transition_disconnect();
                         Err(TcpSessionError::Codec(error))
+                    }
+                    #[cfg(feature = "std-websocket")]
+                    Err(TcpConnectionError::WebSocket(error)) => {
+                        self.transition_disconnect();
+                        Err(TcpSessionError::Client(ClientError::InvalidConfig(error)))
                     }
                 };
             };
@@ -1036,11 +1230,19 @@ impl TcpSession {
                     timed_out: true, ..
                 }) => {}
                 Err(TcpConnectionError::Io(error)) => {
+                    if error.kind() == io::ErrorKind::TimedOut {
+                        continue;
+                    }
                     return Err(self.disconnected(DisconnectCause::Io(error.kind())));
                 }
                 Err(TcpConnectionError::Codec(error)) => {
                     self.transition_disconnect();
                     return Err(TcpSessionError::Codec(error));
+                }
+                #[cfg(feature = "std-websocket")]
+                Err(TcpConnectionError::WebSocket(error)) => {
+                    self.transition_disconnect();
+                    return Err(TcpSessionError::Client(ClientError::InvalidConfig(error)));
                 }
             }
         }
@@ -1072,7 +1274,7 @@ impl TcpSession {
             self.client.state(),
             crate::ConnectionState::ProtocolMismatch { .. }
         ) {
-            if let Some(connection) = self.connection.take() {
+            if let Some(mut connection) = self.connection.take() {
                 connection.shutdown();
             }
             return TcpSessionError::Client(error);
@@ -1090,7 +1292,7 @@ impl TcpSession {
     }
 
     fn codec_error(&mut self, error: CodecError) -> TcpSessionError {
-        if let Some(connection) = self.connection.as_ref() {
+        if let Some(connection) = self.connection.as_mut() {
             connection.shutdown();
         }
         self.transition_disconnect();
