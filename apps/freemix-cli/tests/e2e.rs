@@ -5084,16 +5084,6 @@ fn local_input_replace_media_preserves_identity_and_runtime() {
         .iter()
         .find(|candidate| candidate.id == input)
         .unwrap();
-    let mut expected_project = before.project().clone();
-    expected_project
-        .replace_input_source(
-            input,
-            InputKind::Media {
-                asset_uri: "asset://clip.ppm".into(),
-            },
-            Vec::new(),
-        )
-        .unwrap();
 
     assert_success(&invoke_bounded(&[
         "input-replace-media",
@@ -5110,12 +5100,19 @@ fn local_input_replace_media_preserves_identity_and_runtime() {
         .unwrap();
     assert_eq!(after_input.id, before_input.id);
     assert_eq!(after_input.name, before_input.name);
-    assert!(matches!(
-        &after_input.kind,
-        InputKind::Media { asset_uri } if asset_uri == "asset://clip.ppm"
-    ));
+    assert_eq!(
+        after_input.kind,
+        InputKind::Media {
+            asset_uri: "asset://clip.ppm".into(),
+        }
+    );
     assert!(after_input.required_capabilities.is_empty());
-    assert_eq!(after.project(), &expected_project);
+    assert_eq!(
+        after.project().schema_version(),
+        before.project().schema_version()
+    );
+    assert_eq!(after.project().id(), before.project().id());
+    assert_eq!(after.project().settings(), before.project().settings());
     assert_eq!(
         after
             .project()
@@ -5131,8 +5128,34 @@ fn local_input_replace_media_preserves_identity_and_runtime() {
             .collect::<Vec<_>>()
     );
     assert_eq!(
-        after.project().input_audio_strip(input),
-        before.project().input_audio_strip(input)
+        after
+            .project()
+            .inputs()
+            .iter()
+            .filter(|candidate| candidate.id != input)
+            .collect::<Vec<_>>(),
+        before
+            .project()
+            .inputs()
+            .iter()
+            .filter(|candidate| candidate.id != input)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        after.project().input_audio_strips(),
+        before.project().input_audio_strips()
+    );
+    assert_eq!(after.project().scenes(), before.project().scenes());
+    assert_eq!(
+        after.project().audio_buses(),
+        before.project().audio_buses()
+    );
+    assert_eq!(after.project().outputs(), before.project().outputs());
+    assert_eq!(after.project().main_mix(), before.project().main_mix());
+    assert_eq!(after.project().stingers(), before.project().stingers());
+    assert_eq!(
+        after.project().restart_policy(),
+        before.project().restart_policy()
     );
     assert_eq!(after.runtime_routing(), before.runtime_routing());
     assert_eq!(
