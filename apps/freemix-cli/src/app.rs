@@ -225,6 +225,10 @@ pub fn run(command: Command) -> AppResult<()> {
             replace_input_simulated(&path, input_id(input)?)?
         }
         Command::Status { path } => print_status(&load_engine(&path)?),
+        Command::Inputs { path } => {
+            let stored = load_stored_project(&path)?;
+            print_inputs(stored.project());
+        }
         Command::AudioStrip {
             path,
             input,
@@ -2208,6 +2212,42 @@ fn print_status(project: &ProjectEngine) {
     );
 }
 
+fn print_inputs(project: &Project) {
+    for input in project.inputs() {
+        let strip = project.input_audio_strip(input.id).map_or_else(
+            || "unavailable".to_owned(),
+            |state| {
+                format!(
+                    "gain_mdb={},balance_bp={},delay_samples={},muted={},soloed={},follow_video={}",
+                    state.gain.get(),
+                    state.balance.get(),
+                    state.delay_samples.get(),
+                    state.muted,
+                    state.soloed,
+                    state.follow_video,
+                )
+            },
+        );
+        println!(
+            "input id={} name={:?} kind={} strip={strip}",
+            input.id,
+            input.name,
+            input_kind_name(&input.kind),
+        );
+    }
+}
+
+const fn input_kind_name(kind: &InputKind) -> &'static str {
+    match kind {
+        InputKind::Color => "color",
+        InputKind::Media { .. } => "media",
+        InputKind::Device { .. } => "device",
+        InputKind::Network { .. } => "network",
+        InputKind::Scene { .. } => "scene",
+        InputKind::Simulated(_) => "simulated",
+    }
+}
+
 fn format_audio_strips(project: &Project) -> String {
     let strips = project
         .input_audio_strips()
@@ -2368,6 +2408,7 @@ Usage:
   freemix-cli input-duplicate <show.freemix> <source-input-id> <new-nonzero-input-id> <new-name>
   freemix-cli input-replace-simulated <show.freemix> <input-id>
   freemix-cli status <show.freemix>
+  freemix-cli inputs <show.freemix>
   freemix-cli audio-strip <show.freemix> <input> <gain-millidb:-96000..=24000> <balance-bp:-10000..=10000> <muted:on|off> <soloed:on|off> <follow-video:on|off> <delay-samples:0..=48000>
   freemix-cli rename <show.freemix> <input> <name> [--key <key>] [--expect <revision>]
   freemix-cli input-reorder <show.freemix> <input> [<input>...] [--key <key>] [--expect <revision>]

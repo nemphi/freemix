@@ -192,6 +192,9 @@ pub enum Command {
     Status {
         path: PathBuf,
     },
+    Inputs {
+        path: PathBuf,
+    },
     AudioStrip {
         path: PathBuf,
         input: u128,
@@ -608,6 +611,11 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
             let path = required_path(&mut arguments, "project path")?;
             reject_extra(&mut arguments)?;
             Ok(Command::Status { path })
+        }
+        "inputs" => {
+            let path = required_path(&mut arguments, "project path")?;
+            reject_extra(&mut arguments)?;
+            Ok(Command::Inputs { path })
         }
         "audio-strip" => parse_audio_strip(arguments),
         "rename" => parse_rename(arguments),

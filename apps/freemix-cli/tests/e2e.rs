@@ -1852,6 +1852,31 @@ fn local_input_add_persists_default_simulated_strip() {
 }
 
 #[test]
+fn local_inputs_reports_ordered_inventory() {
+    let context = ContractContext::new();
+    assert_success(&invoke(&["new", context.project_path()]));
+    assert_success(&invoke(&[
+        "input-add",
+        context.project_path(),
+        "3",
+        "Aux \"B\"",
+    ]));
+
+    let inventory = invoke(&["inputs", context.project_path()]);
+    assert_success(&inventory);
+    assert_eq!(
+        stdout(&inventory),
+        concat!(
+            "input id=1 name=\"Input 1\" kind=simulated strip=gain_mdb=0,balance_bp=0,delay_samples=0,muted=false,soloed=false,follow_video=true\n",
+            "input id=2 name=\"Input 2\" kind=simulated strip=gain_mdb=0,balance_bp=0,delay_samples=0,muted=false,soloed=false,follow_video=true\n",
+            "input id=3 name=\"Aux \\\"B\\\"\" kind=simulated strip=gain_mdb=0,balance_bp=0,delay_samples=0,muted=false,soloed=false,follow_video=true",
+        )
+    );
+
+    fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
 fn local_scene_input_add_persists_empty_scene_without_routing() {
     let context = ContractContext::new();
     assert_success(&invoke(&["new", context.project_path()]));
