@@ -103,7 +103,12 @@ events while an Operator controls the show, and native mode remains limited to
 one peer. Native-media acceptance is not proven on this Mac. This is
 prerequisite transport infrastructure only; AU-001 daemon and Studio meter
 transport remain planned. It is not HTTP/WebSocket/service/media readiness or
-RC-008 completion. Expired raw TCP sessions are reclaimed.
+RC-008 completion. Expired raw TCP sessions are reclaimed. Phase 1 also
+contains an optional loopback-only WebSocket control listener at `/v1/control`,
+gated by `FREEMIXD_WEB_TOKEN`; it relays exact-current wire records through the
+same bounded scheduler and admits at most one Web peer. This is transport
+groundwork only: Web peers do not receive audio meters, and RC-008 remains
+planned until process and browser acceptance evidence exists.
 
 ## 4. Phase 2 — GPU playback switcher (10–14 weeks)
 

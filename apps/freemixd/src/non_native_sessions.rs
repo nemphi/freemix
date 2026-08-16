@@ -2,7 +2,11 @@ use std::{
     collections::VecDeque,
     io::Read,
     net::{TcpListener, TcpStream},
-    sync::mpsc::TryRecvError,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{Receiver, SyncSender, TryRecvError, TrySendError},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -26,6 +30,7 @@ use super::{
     requested_daemon_shutdown, server_identity, shutdown_message, structured_session_error,
 };
 use crate::latest_record::LatestRecord;
+use crate::web::{WebEvent, WebGateway};
 
 const MAX_PEERS: usize = 2;
 const INBOUND_CAPACITY: usize = 8;
@@ -47,14 +52,46 @@ enum Accounting {
 }
 
 struct Outbound {
-    write: PendingWrite,
+    write: OutboundWrite,
     accounting: Accounting,
     handshake_response: bool,
+    accounted: bool,
+    channel_sent: bool,
+}
+
+enum OutboundWrite {
+    Raw(PendingWrite),
+    Web(Vec<u8>),
+}
+
+struct WebTransport {
+    inbound: Receiver<WireMessage>,
+    outbound: SyncSender<Vec<u8>>,
+    acknowledgements: Receiver<()>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Drop for WebTransport {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+    }
+}
+
+enum Transport {
+    Raw(TcpStream),
+    Web(WebTransport),
+}
+
+impl Transport {
+    fn is_web(&self) -> bool {
+        matches!(self, Self::Web(_))
+    }
 }
 
 struct Peer {
     id: u64,
-    stream: TcpStream,
+    transport: Transport,
+    principal: Principal,
     decoder: LineDecoder,
     inbound: VecDeque<WireMessage>,
     handshake_deadline: Instant,
@@ -70,11 +107,17 @@ struct Peer {
 }
 
 impl Peer {
-    fn new(id: u64, stream: TcpStream, handshake_timeout: Duration) -> Option<Self> {
+    fn new(
+        id: u64,
+        transport: Transport,
+        principal: Principal,
+        handshake_timeout: Duration,
+    ) -> Option<Self> {
         let handshake_deadline = Instant::now().checked_add(handshake_timeout)?;
         Some(Self {
             id,
-            stream,
+            transport,
+            principal,
             decoder: LineDecoder::new(),
             inbound: VecDeque::new(),
             handshake_deadline,
@@ -95,17 +138,24 @@ impl Peer {
             return Err(());
         }
         let bytes = encode_line(message).map_err(|_| ())?.into_bytes();
-        if matches!(accounting, Accounting::Session) {
+        let byte_len = bytes.len();
+        let (write, accounted) = match &self.transport {
+            Transport::Raw(_) => (OutboundWrite::Raw(PendingWrite::new(bytes)), true),
+            Transport::Web(_) => (OutboundWrite::Web(bytes), false),
+        };
+        if matches!(accounting, Accounting::Session) && accounted {
             self.session
                 .as_mut()
                 .ok_or(())?
-                .queue_outbound(bytes.len(), now_millis().map_err(|_| ())?)
+                .queue_outbound(byte_len, now_millis().map_err(|_| ())?)
                 .map_err(|_| ())?;
         }
         self.outbound.push_back(Outbound {
-            write: PendingWrite::new(bytes),
+            write,
             accounting,
             handshake_response: matches!(message, WireMessage::HandshakeResponse(_)),
+            accounted,
+            channel_sent: false,
         });
         Ok(())
     }
@@ -135,11 +185,10 @@ impl Peer {
     }
 
     fn replace_outbound_for_shutdown(&mut self) {
-        let retained = usize::from(
-            self.outbound
-                .front()
-                .is_some_and(|record| record.write.started()),
-        );
+        let retained = usize::from(self.outbound.front().is_some_and(|record| {
+            record.channel_sent
+                || matches!(&record.write, OutboundWrite::Raw(write) if write.started())
+        }));
         while self.outbound.len() > retained {
             self.discard_outbound(self.outbound.len() - 1);
         }
@@ -147,7 +196,7 @@ impl Peer {
 
     fn discard_outbound(&mut self, index: usize) {
         if let Some(record) = self.outbound.remove(index) {
-            if matches!(record.accounting, Accounting::Session) {
+            if record.accounted && matches!(record.accounting, Accounting::Session) {
                 let _ = self
                     .session
                     .as_mut()
@@ -169,6 +218,7 @@ pub(super) fn run(
     authority: &ServerIdentity,
     process_shutdown: &ProcessShutdown,
     once: bool,
+    web: Option<&WebGateway>,
 ) -> AppResult<DaemonShutdownReason> {
     let handshake_timeout =
         Duration::from_millis(server.config().session_limits.heartbeat_timeout_ms);
@@ -180,7 +230,6 @@ pub(super) fn run(
         server,
         control,
         store,
-        principal,
         process_shutdown,
     };
     let mut native = native;
@@ -190,11 +239,59 @@ pub(super) fn run(
             return Ok(shutdown_for_reason(reason, &mut peers, control));
         }
 
-        if once_peer.is_none() && (!once || peers.is_empty()) && peers.len() < peer_limit {
+        if let Some(web) = web {
+            loop {
+                let event = match web.try_event() {
+                    Ok(Some(event)) => event,
+                    Ok(None) => break,
+                    Err(()) => break,
+                };
+                match event {
+                    WebEvent::Connected(connection)
+                        if !peers.iter().any(|peer| peer.transport.is_web()) =>
+                    {
+                        let web_principal = Principal::authenticated(
+                            fm_auth::UserId::new("web-token").expect("stable web user is valid"),
+                            fm_auth::SessionId::new(format!("web-{next_peer_id}"))
+                                .expect("scheduler web session id is valid"),
+                            [fm_auth::Role::Admin],
+                        );
+                        let transport = Transport::Web(WebTransport {
+                            inbound: connection.inbound,
+                            outbound: connection.outbound,
+                            acknowledgements: connection.acknowledgements,
+                            cancel: connection.cancel,
+                        });
+                        let Some(peer) = Peer::new(
+                            next_peer_id,
+                            transport,
+                            web_principal,
+                            handshake_timeout.min(Duration::from_millis(500)),
+                        ) else {
+                            close_all(&mut peers, control);
+                            return Err("handshake deadline exceeds Instant range".into());
+                        };
+                        next_peer_id = next_peer_id.wrapping_add(1);
+                        peers.push(peer);
+                    }
+                    WebEvent::Connected(connection) => {
+                        connection.cancel.store(true, Ordering::Release);
+                    }
+                }
+            }
+        }
+
+        if once_peer.is_none() && (!once || peers.is_empty()) && raw_peer_count(&peers) < peer_limit
+        {
             match listener.accept() {
                 Ok((stream, _)) => {
                     if stream.set_nonblocking(true).is_ok() && stream.set_nodelay(true).is_ok() {
-                        let Some(peer) = Peer::new(next_peer_id, stream, handshake_timeout) else {
+                        let Some(peer) = Peer::new(
+                            next_peer_id,
+                            Transport::Raw(stream),
+                            principal.clone(),
+                            handshake_timeout,
+                        ) else {
                             close_all(&mut peers, control);
                             return Err("handshake deadline exceeds Instant range".into());
                         };
@@ -334,8 +431,21 @@ pub(super) fn run(
 }
 
 fn read_peer(peer: &mut Peer) -> bool {
+    if let Transport::Web(web) = &mut peer.transport {
+        for _ in 0..INBOUND_CAPACITY {
+            match web.inbound.try_recv() {
+                Ok(message) => peer.inbound.push_back(message),
+                Err(TryRecvError::Empty) => return false,
+                Err(TryRecvError::Disconnected) => return true,
+            }
+        }
+        return false;
+    }
     let mut chunk = [0_u8; 8 * 1024];
-    match peer.stream.read(&mut chunk) {
+    let Transport::Raw(stream) = &mut peer.transport else {
+        unreachable!("web transport returned above")
+    };
+    match stream.read(&mut chunk) {
         Ok(0) => {
             let decoder = std::mem::replace(&mut peer.decoder, LineDecoder::new());
             let _ = decoder.finish();
@@ -362,6 +472,13 @@ fn read_peer(peer: &mut Peer) -> bool {
     }
 }
 
+fn raw_peer_count(peers: &[Peer]) -> usize {
+    peers
+        .iter()
+        .filter(|peer| matches!(peer.transport, Transport::Raw(_)))
+        .count()
+}
+
 enum DispatchError {
     Peer,
     Daemon(Box<dyn std::error::Error>),
@@ -377,7 +494,6 @@ struct Runtime<'a> {
     server: &'a Server<ControlHandle>,
     control: &'a SharedControl,
     store: &'a ProjectStore,
-    principal: &'a Principal,
     process_shutdown: &'a ProcessShutdown,
 }
 
@@ -399,7 +515,7 @@ impl Runtime<'_> {
                     self.control,
                     self.store,
                     durable,
-                    self.principal,
+                    &peer.principal,
                     peer.identity
                         .as_ref()
                         .expect("active peers have identities"),
@@ -495,7 +611,7 @@ impl Runtime<'_> {
         let (hello, outcome) = current_handshake(&request, self.control, project_id);
         let handshake = match self.server.handshake(
             &hello,
-            self.principal,
+            &peer.principal,
             now_millis().map_err(DispatchError::Daemon)?,
         ) {
             Ok(handshake) => handshake,
@@ -558,7 +674,7 @@ impl Runtime<'_> {
         peer.session = Some(handshake.session);
         peer.identity = Some(identity);
         peer.subscription = Some(subscription);
-        peer.audio_meters = request.client_type == ClientType::Studio;
+        peer.audio_meters = !peer.transport.is_web() && request.client_type == ClientType::Studio;
         if peer
             .queue(
                 &WireMessage::HandshakeResponse(response),
@@ -623,29 +739,80 @@ enum WriteOutcome {
 }
 
 fn write_peer(peer: &mut Peer) -> WriteOutcome {
-    if peer.latest_meter.started() {
-        return write_meter(peer);
-    }
-    let Some(record) = peer.outbound.front_mut() else {
-        return write_meter(peer);
-    };
-    let complete = match record.write.write_once(&mut peer.stream) {
-        Ok(complete) => complete,
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
-            ) =>
-        {
+    if peer.transport.is_web() {
+        let Some(record) = peer.outbound.front_mut() else {
             return WriteOutcome::Pending;
+        };
+        let Transport::Web(web) = &mut peer.transport else {
+            unreachable!("web transport checked above")
+        };
+        if record.channel_sent {
+            match web.acknowledgements.try_recv() {
+                Ok(()) => return finish_outbound(peer),
+                Err(TryRecvError::Empty) => return WriteOutcome::Pending,
+                Err(TryRecvError::Disconnected) => return WriteOutcome::Failed,
+            }
         }
-        Err(_) => return WriteOutcome::Failed,
-    };
-    if !complete {
-        return WriteOutcome::Pending;
+        let OutboundWrite::Web(bytes) = &record.write else {
+            unreachable!("web peers only queue web writes")
+        };
+        match web.outbound.try_send(bytes.clone()) {
+            Ok(()) => {
+                record.channel_sent = true;
+                if matches!(record.accounting, Accounting::Session) && !record.accounted {
+                    let Ok(now) = now_millis() else {
+                        return WriteOutcome::Failed;
+                    };
+                    if peer
+                        .session
+                        .as_mut()
+                        .expect("session accounting has a session")
+                        .queue_outbound(bytes.len(), now)
+                        .is_err()
+                    {
+                        return WriteOutcome::Failed;
+                    }
+                    record.accounted = true;
+                }
+                WriteOutcome::Pending
+            }
+            Err(TrySendError::Full(_)) => WriteOutcome::Pending,
+            Err(TrySendError::Disconnected(_)) => WriteOutcome::Failed,
+        }
+    } else {
+        if peer.latest_meter.started() {
+            return write_meter(peer);
+        }
+        let Some(record) = peer.outbound.front_mut() else {
+            return write_meter(peer);
+        };
+        let Transport::Raw(stream) = &mut peer.transport else {
+            unreachable!("raw transport checked above")
+        };
+        let complete = match &mut record.write {
+            OutboundWrite::Raw(write) => write.write_once(stream),
+            OutboundWrite::Web(_) => unreachable!("raw peers only queue raw writes"),
+        };
+        match complete {
+            Ok(true) => finish_outbound(peer),
+            Ok(false) => WriteOutcome::Pending,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                WriteOutcome::Pending
+            }
+            Err(_) => WriteOutcome::Failed,
+        }
     }
+}
+
+fn finish_outbound(peer: &mut Peer) -> WriteOutcome {
     let record = peer.outbound.pop_front().expect("written record exists");
-    if matches!(record.accounting, Accounting::Session)
+    if record.accounted
+        && matches!(record.accounting, Accounting::Session)
         && peer
             .session
             .as_mut()
@@ -664,7 +831,10 @@ fn write_peer(peer: &mut Peer) -> WriteOutcome {
 }
 
 fn write_meter(peer: &mut Peer) -> WriteOutcome {
-    match peer.latest_meter.write_once(&mut peer.stream) {
+    let Transport::Raw(stream) = &mut peer.transport else {
+        return WriteOutcome::Failed;
+    };
+    match peer.latest_meter.write_once(stream) {
         Ok(()) => WriteOutcome::Pending,
         Err(error)
             if matches!(
@@ -721,9 +891,13 @@ fn shutdown_peers(peers: &mut Vec<Peer>, control: &SharedControl, queue: Shutdow
     let deadline = Instant::now() + CLIENT_WRITE_TIMEOUT;
     while !peers.is_empty() && Instant::now() < deadline {
         for index in (0..peers.len()).rev() {
-            if !matches!(write_peer(&mut peers[index]), WriteOutcome::Pending)
-                || peers[index].outbound.is_empty()
-            {
+            let outcome = write_peer(&mut peers[index]);
+            let complete = if peers[index].transport.is_web() {
+                matches!(outcome, WriteOutcome::Failed) || peers[index].outbound.is_empty()
+            } else {
+                !matches!(outcome, WriteOutcome::Pending) || peers[index].outbound.is_empty()
+            };
+            if complete {
                 close_peer(peers.swap_remove(index), control);
             }
         }

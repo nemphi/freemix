@@ -85,6 +85,7 @@ mod non_native_sessions;
 mod program_surface;
 #[cfg(feature = "native-media")]
 mod stinger_mutation;
+mod web;
 
 #[cfg(feature = "native-media")]
 use fm_codec_ffmpeg::{
@@ -3000,6 +3001,7 @@ enum Command {
     Serve {
         project: PathBuf,
         listen: SocketAddr,
+        web_listen: Option<SocketAddr>,
         once: bool,
         native_media: bool,
         fullscreen_program: bool,
@@ -3041,6 +3043,7 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> AppResult<Command>
                 .map(PathBuf::from)
                 .ok_or_else(|| AppFailure("missing project path".into()))?;
             let mut listen = DEFAULT_LISTEN.parse()?;
+            let mut web_listen: Option<SocketAddr> = None;
             let mut once = false;
             let mut native_media = false;
             let mut fullscreen_program = false;
@@ -3079,6 +3082,15 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> AppResult<Command>
                     diagnostic_stop_after = Some(parse_diagnostic_duration(value)?);
                     continue;
                 }
+                if let Some(value) = option.strip_prefix("--web-listen=") {
+                    if web_listen.is_some() {
+                        return Err(AppFailure("duplicate option `--web-listen`".into()).into());
+                    }
+                    web_listen = Some(value.parse().map_err(|error| {
+                        AppFailure(format!("invalid web listen address: {error}"))
+                    })?);
+                    continue;
+                }
                 match option.as_str() {
                     "--listen" => {
                         listen = arguments
@@ -3088,6 +3100,17 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> AppResult<Command>
                             .map_err(|error| {
                                 AppFailure(format!("invalid listen address: {error}"))
                             })?;
+                    }
+                    "--web-listen" => {
+                        if web_listen.is_some() {
+                            return Err(AppFailure("duplicate option `--web-listen`".into()).into());
+                        }
+                        let value = arguments
+                            .next()
+                            .ok_or_else(|| AppFailure("missing value for --web-listen".into()))?;
+                        web_listen = Some(value.parse().map_err(|error| {
+                            AppFailure(format!("invalid web listen address: {error}"))
+                        })?);
                     }
                     "--once" => once = true,
                     "--native-media" if native_media => {
@@ -3188,9 +3211,28 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> AppResult<Command>
                 )
                 .into());
             }
+            if let Some(address) = web_listen {
+                if !address.ip().is_loopback() {
+                    return Err(
+                        AppFailure("--web-listen must use a loopback address".into()).into(),
+                    );
+                }
+                if once {
+                    return Err(
+                        AppFailure("--web-listen cannot be combined with --once".into()).into(),
+                    );
+                }
+                if native_media {
+                    return Err(AppFailure(
+                        "--web-listen cannot be combined with --native-media".into(),
+                    )
+                    .into());
+                }
+            }
             Ok(Command::Serve {
                 project,
                 listen,
+                web_listen,
                 once,
                 native_media,
                 fullscreen_program,
@@ -3269,6 +3311,7 @@ fn run(command: Command) -> AppResult<()> {
         Command::Serve {
             project,
             listen,
+            web_listen,
             once,
             native_media,
             fullscreen_program,
@@ -3292,6 +3335,7 @@ fn run(command: Command) -> AppResult<()> {
                     listen,
                     once,
                     native_media,
+                    web_listen,
                     camera_helper,
                     record_program,
                     diagnostic_stop_after,
@@ -3365,6 +3409,7 @@ fn serve(
     listen: SocketAddr,
     once: bool,
     native_media: bool,
+    web_listen: Option<SocketAddr>,
     camera_helper: Option<PathBuf>,
     record_program: Option<PathBuf>,
     diagnostic_stop_after: Option<Duration>,
@@ -3372,6 +3417,7 @@ fn serve(
     serve_inner(
         path,
         listen,
+        web_listen,
         once,
         if native_media {
             NativeServeMode::Headless { camera_helper }
@@ -3398,6 +3444,7 @@ fn serve_program_worker(
     serve_inner(
         path,
         listen,
+        None,
         once,
         NativeServeMode::Program(Box::new(ProgramServeSetup {
             context,
@@ -3414,6 +3461,7 @@ fn serve_program_worker(
 fn serve_inner(
     path: &Path,
     listen: SocketAddr,
+    web_listen: Option<SocketAddr>,
     once: bool,
     mode: NativeServeMode,
     record_program: Option<PathBuf>,
@@ -3519,17 +3567,28 @@ fn serve_inner(
         capabilities_digest,
     );
     let mut server = Server::new(config, ControlHandle(Rc::clone(&control)))?;
-    server.mark_ready()?;
-
     let principal = development_principal()?;
     let listener = TcpListener::bind(listen)?;
     listener.set_nonblocking(true)?;
+    let web_gateway = if let Some(address) = web_listen {
+        let web_listener = TcpListener::bind(address)?;
+        web_listener.set_nonblocking(true)?;
+        Some(web::WebGateway::bind(web_listener)?)
+    } else {
+        None
+    };
+    server.mark_ready()?;
     let readiness = ReadinessRecord {
         address: listener.local_addr()?,
         project_id,
     };
     println!("{readiness}");
     std::io::stdout().flush()?;
+    if let Some(web) = web_gateway.as_ref() {
+        println!("FREEMIXD_WEB_READY\tv=1\taddress={}", web.address());
+        std::io::stdout().flush()?;
+        web.start_accepting();
+    }
     if let Some(duration) = diagnostic_stop_after {
         process_shutdown
             .as_mut()
@@ -3537,7 +3596,7 @@ fn serve_inner(
             .set_diagnostic_deadline(duration)?;
     }
 
-    let _shutdown_reason = non_native_sessions::run(
+    let session_result = non_native_sessions::run(
         listener,
         &server,
         &control,
@@ -3550,7 +3609,13 @@ fn serve_inner(
             .as_ref()
             .expect("server has a process shutdown signal"),
         once,
-    )?;
+        web_gateway.as_ref(),
+    );
+    let gateway_result = web_gateway.map(web::WebGateway::shutdown);
+    let _shutdown_reason = session_result?;
+    if let Some(result) = gateway_result {
+        result?;
+    }
     if native.is_some() {
         checkpoint_native(&control, &store, &mut durable)?;
     }
@@ -5330,13 +5395,14 @@ fn now_millis() -> AppResult<u64> {
 fn print_help() {
     println!(
         "FreeMix headless production daemon\n\n\
-Usage:\n  freemixd serve <show.freemix> [--listen 127.0.0.1:0] [--once] [--native-media [--camera-helper PATH]] [--record-program output.mp4] [--diagnostic-stop-after 10m] [--fullscreen-program [--fullscreen-display 0]]\n  freemixd help\n  freemixd --version\n\n\
+Usage:\n  freemixd serve <show.freemix> [--listen 127.0.0.1:0] [--web-listen 127.0.0.1:0] [--once] [--native-media [--camera-helper PATH]] [--record-program output.mp4] [--diagnostic-stop-after 10m] [--fullscreen-program [--fullscreen-display 0]]\n  freemixd help\n  freemixd --version\n\n\
 Native media is opt-in; without it the daemon uses simulated frame realization.\n\
 --camera-helper overrides the developer AVFoundation helper path for exact macOS Device inputs; it never requests permission.\n\
 Program recording requires native media, an existing output parent, and a new final .mp4 file. Existing files are never overwritten.\n\
 Use --record-program=<path> when the output name begins with --. Recorder capability digests describe configured startup support; FREEMIXD_RECORDER reports runtime health.\n\
 macOS fullscreen display selection is a zero-based index ordered by physical position, then stable descriptive fields.\n\
 --diagnostic-stop-after schedules cooperative headless native shutdown after readiness; accepted units are ms, s, m, and h up to 24h.\n\
+--web-listen enables the loopback-only `/v1/control` WebSocket listener and requires FREEMIXD_WEB_TOKEN.\n\
 Native mode continues across client disconnects; close the Program window or press Escape for bounded shutdown."
     );
 }

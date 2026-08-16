@@ -48,6 +48,7 @@ fm-protocol = { path = "../../crates/foundation/fm-protocol" }
 fm-server = { path = "../../crates/services/fm-server" }
 fm-switcher = { path = "../../crates/features/fm-switcher" }
 fm-types = { path = "../../crates/foundation/fm-types" }
+tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 fm-io-api = { path = "../../crates/io/fm-io-api", optional = true }
