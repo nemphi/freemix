@@ -2121,24 +2121,18 @@ fn local_scene_layer_appearance_preserves_layer_identity() {
         .unwrap()
         .load()
         .unwrap();
+    assert_eq!(after.runtime_routing(), before.runtime_routing());
     assert_eq!(
-        (
-            after.runtime_routing(),
-            after.runtime_manual_transitions(),
-            after.runtime_fade_to_black(),
-            after.runtime_overlays(),
-            after.position(),
-            after.idempotency_receipts(),
-        ),
-        (
-            before.runtime_routing(),
-            before.runtime_manual_transitions(),
-            before.runtime_fade_to_black(),
-            before.runtime_overlays(),
-            before.position(),
-            before.idempotency_receipts(),
-        )
+        after.runtime_manual_transitions(),
+        before.runtime_manual_transitions()
     );
+    assert_eq!(
+        after.runtime_fade_to_black(),
+        before.runtime_fade_to_black()
+    );
+    assert_eq!(after.runtime_overlays(), before.runtime_overlays());
+    assert_eq!(after.position(), before.position());
+    assert_eq!(after.idempotency_receipts(), before.idempotency_receipts());
     let after_scene = after
         .project()
         .scenes()
@@ -2162,6 +2156,86 @@ fn local_scene_layer_appearance_preserves_layer_identity() {
         "opacity must be in 0..=255",
     );
     assert_eq!(manifest(&context.project), before_invalid);
+    fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
+fn local_scene_layer_geometry_preserves_other_layer_state() {
+    let context = ContractContext::new();
+    assert_success(&invoke(&["new", context.project_path()]));
+    assert_success(&invoke(&[
+        "scene-input-add",
+        context.project_path(),
+        "3",
+        "7",
+        "Scene",
+    ]));
+    for (z_order, name) in [(4, "First"), (9, "Second")] {
+        assert_success(&invoke(&[
+            "scene-layer-add",
+            context.project_path(),
+            "7",
+            "1",
+            &z_order.to_string(),
+            name,
+        ]));
+    }
+    let before = ProjectStore::new(&context.project_path())
+        .unwrap()
+        .load()
+        .unwrap();
+    assert_success(&invoke(&[
+        "scene-layer-geometry",
+        context.project_path(),
+        "7",
+        "1",
+        "-12",
+        "34",
+        "640",
+        "480",
+        "270",
+    ]));
+    let after = ProjectStore::new(&context.project_path())
+        .unwrap()
+        .load()
+        .unwrap();
+    assert_eq!(
+        (
+            after.runtime_routing(),
+            after.runtime_manual_transitions(),
+            after.runtime_fade_to_black(),
+            after.runtime_overlays(),
+            after.position(),
+            after.idempotency_receipts(),
+        ),
+        (
+            before.runtime_routing(),
+            before.runtime_manual_transitions(),
+            before.runtime_fade_to_black(),
+            before.runtime_overlays(),
+            before.position(),
+            before.idempotency_receipts(),
+        )
+    );
+    let before_scene = before.project().scenes().last().unwrap();
+    let after_scene = after.project().scenes().last().unwrap();
+    let mut expected_layers = before_scene.layers.clone();
+    expected_layers[1].geometry = LayerGeometry::new(-12, 34, 640, 480, Rotation::Deg270);
+    assert_eq!(after_scene.layers, expected_layers);
+    assert_failure_contains(
+        &invoke(&[
+            "scene-layer-geometry",
+            context.project_path(),
+            "7",
+            "1",
+            "0",
+            "0",
+            "1",
+            "1",
+            "45",
+        ]),
+        "invalid rotation",
+    );
     fs::remove_dir_all(context.root).unwrap();
 }
 

@@ -101,6 +101,16 @@ pub enum Command {
         enabled: bool,
         opacity: u8,
     },
+    SceneLayerGeometry {
+        path: PathBuf,
+        scene: u128,
+        index: usize,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        rotation: u16,
+    },
     InputRemove {
         path: PathBuf,
         input: u128,
@@ -516,6 +526,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
         "scene-layer-add" => parse_scene_layer_add(arguments),
         "scene-layer-remove" => parse_scene_layer_remove(arguments),
         "scene-layer-appearance" => parse_scene_layer_appearance(arguments),
+        "scene-layer-geometry" => parse_scene_layer_geometry(arguments),
         "input-remove" => parse_input_remove(arguments),
         "input-duplicate" => parse_input_duplicate(arguments),
         "input-replace-simulated" => parse_input_replace_simulated(arguments),
@@ -983,6 +994,36 @@ fn parse_scene_layer_appearance(
         index,
         enabled,
         opacity,
+    })
+}
+
+fn parse_scene_layer_geometry(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Command, ArgsError> {
+    let path = required_path(&mut arguments, "project path")?;
+    let scene = number(&required(&mut arguments, "scene")?, "scene")?;
+    let index = number(&required(&mut arguments, "layer index")?, "layer index")?;
+    let x = number(&required(&mut arguments, "x")?, "x")?;
+    let y = number(&required(&mut arguments, "y")?, "y")?;
+    let width = number(&required(&mut arguments, "width")?, "width")?;
+    let height = number(&required(&mut arguments, "height")?, "height")?;
+    let rotation = number::<u16>(&required(&mut arguments, "rotation")?, "rotation")?;
+    if !matches!(rotation, 0 | 90 | 180 | 270) {
+        return Err(ArgsError::InvalidChoice {
+            field: "rotation",
+            value: rotation.to_string(),
+        });
+    }
+    reject_extra(&mut arguments)?;
+    Ok(Command::SceneLayerGeometry {
+        path,
+        scene,
+        index,
+        x,
+        y,
+        width,
+        height,
+        rotation,
     })
 }
 

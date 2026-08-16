@@ -108,6 +108,21 @@ pub fn run(command: Command) -> AppResult<()> {
             enabled,
             opacity,
         } => set_scene_layer_appearance(&path, scene_id(scene)?, index, enabled, opacity)?,
+        Command::SceneLayerGeometry {
+            path,
+            scene,
+            index,
+            x,
+            y,
+            width,
+            height,
+            rotation,
+        } => set_scene_layer_geometry(
+            &path,
+            scene_id(scene)?,
+            index,
+            LayerGeometry::new(x, y, width, height, cli_rotation(rotation)),
+        )?,
         Command::InputRemove { path, input } => remove_input(&path, input_id(input)?)?,
         Command::InputDuplicate {
             path,
@@ -1340,6 +1355,30 @@ fn set_scene_layer_appearance(
     Ok(())
 }
 
+fn set_scene_layer_geometry(
+    path: &Path,
+    scene: SceneId,
+    index: usize,
+    geometry: LayerGeometry,
+) -> AppResult<()> {
+    let store = ProjectStore::new(path)?;
+    let stored = load_stored_project(path)?;
+    let mut project = stored.project().clone();
+    project.set_scene_layer_geometry(scene, index, geometry)?;
+    let configured = StoredProject::from_project_with_complete_runtime_state(
+        project,
+        stored.runtime_routing(),
+        stored.runtime_manual_transitions(),
+        stored.runtime_fade_to_black(),
+        stored.runtime_overlays().clone(),
+        stored.position(),
+        stored.idempotency_receipts().to_vec(),
+    )?;
+    store.save(&configured)?;
+    print_status(&load_engine(path)?);
+    Ok(())
+}
+
 fn remove_input(path: &Path, input: InputId) -> AppResult<()> {
     let stored = load_stored_project(path)?;
     let runtime = stored.runtime_routing();
@@ -2085,6 +2124,7 @@ Usage:
   freemix-cli scene-layer-add <show.freemix> <scene-id> <source-input-id> <z-order> <layer-name>
   freemix-cli scene-layer-remove <show.freemix> <scene-id> <zero-based-layer-index>
   freemix-cli scene-layer-appearance <show.freemix> <scene-id> <zero-based-layer-index> <enabled:on|off> <opacity:0..=255>
+  freemix-cli scene-layer-geometry <show.freemix> <scene-id> <zero-based-layer-index> <x> <y> <width> <height> <rotation:0|90|180|270>
   freemix-cli input-remove <show.freemix> <input-id>
   freemix-cli input-duplicate <show.freemix> <source-input-id> <new-nonzero-input-id> <new-name>
   freemix-cli input-replace-simulated <show.freemix> <input-id>
@@ -2266,6 +2306,16 @@ const fn model_stinger_audio_policy(policy: CliStingerAudioPolicy) -> ModelSting
         CliStingerAudioPolicy::Muted => ModelStingerAudioPolicy::Muted,
         CliStingerAudioPolicy::StingerOnly => ModelStingerAudioPolicy::StingerOnly,
         CliStingerAudioPolicy::MixWithProgram => ModelStingerAudioPolicy::MixWithProgram,
+    }
+}
+
+fn cli_rotation(rotation: u16) -> Rotation {
+    match rotation {
+        0 => Rotation::Deg0,
+        90 => Rotation::Deg90,
+        180 => Rotation::Deg180,
+        270 => Rotation::Deg270,
+        _ => unreachable!("CLI parser validates rotations"),
     }
 }
 

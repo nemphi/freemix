@@ -368,6 +368,30 @@ impl Project {
         Ok(())
     }
 
+    pub fn set_scene_layer_geometry(
+        &mut self,
+        scene: SceneId,
+        index: usize,
+        geometry: LayerGeometry,
+    ) -> Result<(), SceneLayerError> {
+        let target = self
+            .scenes
+            .iter_mut()
+            .find(|candidate| candidate.id == scene)
+            .ok_or(SceneLayerError::UnknownScene(scene))?;
+        let length = target.layers.len();
+        let layer = target
+            .layers
+            .get_mut(index)
+            .ok_or(SceneLayerError::LayerIndexOutOfRange {
+                scene,
+                index,
+                length,
+            })?;
+        layer.geometry = geometry;
+        Ok(())
+    }
+
     pub fn add_audio_bus(&mut self, bus: AudioBus) {
         self.audio_buses.push(bus);
     }
