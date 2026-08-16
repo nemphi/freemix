@@ -6,10 +6,7 @@ use std::{
     num::NonZeroU128,
     path::{Path, PathBuf},
     process::{Child, Command as ProcessCommand, Output, Stdio},
-    sync::{
-        Mutex, MutexGuard, OnceLock,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::atomic::{AtomicU64, Ordering},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -41,19 +38,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const DIAGNOSE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
 const PROJECT_VALUE: u128 = 18_446_744_073_709_551_657;
 static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-struct WebTokenGuard {
-    _lock: MutexGuard<'static, ()>,
-}
-
-impl WebTokenGuard {
-    fn set(token: &str) -> Self {
-        let lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
-        assert_eq!(std::env::var("FREEMIXD_WEB_TOKEN").as_deref(), Ok(token));
-        Self { _lock: lock }
-    }
-}
+const WEB_OPEN_CHILD_MARKER: &str = "FREEMIX_STUDIO_WEB_OPEN_CHILD";
 
 fn project_id() -> ProjectId {
     ProjectId::new(NonZeroU128::new(PROJECT_VALUE).unwrap())
@@ -219,6 +204,42 @@ fn spawn_server(run: impl FnOnce(TcpListener) + Send + 'static) -> (SocketAddr, 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     (address, thread::spawn(move || run(listener)))
+}
+
+fn remaining(deadline: Instant) -> Duration {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    assert!(!remaining.is_zero(), "scenario deadline elapsed");
+    remaining
+}
+
+fn receive_until(runtime: &mut StudioRuntime, deadline: Instant, message: &str) -> SessionEvent {
+    runtime
+        .receive_timeout(remaining(deadline))
+        .unwrap()
+        .unwrap_or_else(|| panic!("timed out waiting for {message}"))
+}
+
+fn assert_web_child_success(mut child: Child, token: &str, deadline: Instant) {
+    let cleanup = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break false,
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) | Err(_) => break true,
+        }
+    };
+    if cleanup {
+        let _ = terminate_child(&mut child);
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(token));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(token));
+    assert!(
+        !cleanup,
+        "WebSocket test child did not exit before deadline"
+    );
+    assert!(output.status.success(), "WebSocket test child failed");
 }
 
 fn accept_stream_until(listener: &TcpListener, deadline: Instant) -> TcpStream {
@@ -772,21 +793,37 @@ fn websocket_diagnose_uses_current_session_contract() {
 #[test]
 fn web_open_runtime_uses_websocket_transport() {
     let token = "web-open-token-abcdefghijklmnopqrstuvwxyz-0123456789";
-    let _token_guard = WebTokenGuard::set(token);
+    if std::env::var_os(WEB_OPEN_CHILD_MARKER).is_none() {
+        let child = ProcessCommand::new(std::env::current_exe().unwrap())
+            .args([
+                "web_open_runtime_uses_websocket_transport",
+                "--exact",
+                "--nocapture",
+            ])
+            .env(WEB_OPEN_CHILD_MARKER, "1")
+            .env("FREEMIXD_WEB_TOKEN", token)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        assert_web_child_success(child, token, Instant::now() + CONNECT_TIMEOUT);
+        return;
+    }
+    let deadline = Instant::now() + CONNECT_TIMEOUT;
     let (address, server_thread) = spawn_server(move |listener| {
-        let deadline = Instant::now() + CONNECT_TIMEOUT;
         let stream = accept_stream_until(&listener, deadline);
+        stream.set_read_timeout(Some(remaining(deadline))).unwrap();
+        stream.set_write_timeout(Some(remaining(deadline))).unwrap();
         let callback = |request: &Request, response: Response| {
             assert_eq!(request.uri().path(), "/v1/control");
-            assert_eq!(
-                request
-                    .headers()
-                    .get("authorization")
-                    .unwrap()
-                    .to_str()
-                    .unwrap(),
-                format!("Bearer {token}")
-            );
+            let authorization = request
+                .headers()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok());
+            let expected_authorization = format!("Bearer {token}");
+            if authorization != Some(expected_authorization.as_str()) {
+                panic!("authorization mismatch");
+            }
             Ok(response)
         };
         let mut peer = accept_hdr(stream, callback).expect("WebSocket handshake failed");
@@ -849,7 +886,7 @@ fn web_open_runtime_uses_websocket_transport() {
     assert_eq!(config.transport, ControlTransport::WebSocket);
     let mut runtime = StudioRuntime::new(config).unwrap();
     assert_eq!(
-        runtime.connect(CONNECT_TIMEOUT).unwrap(),
+        runtime.connect(remaining(deadline)).unwrap(),
         SessionEvent::Connected {
             mode: SyncMode::Snapshot
         }
@@ -859,7 +896,7 @@ fn web_open_runtime_uses_websocket_transport() {
         .unwrap();
     assert_eq!(runtime.flush().unwrap(), 1);
     assert!(matches!(
-        runtime.receive().unwrap(),
+        receive_until(&mut runtime, deadline, "command result"),
         SessionEvent::CommandResult {
             intake: Intake::ResultReconciled,
             ..
@@ -875,7 +912,7 @@ fn web_open_runtime_uses_websocket_transport() {
         CommandStatus::Completed(CommandResult::Accepted { revision: 5, .. })
     ));
     assert!(matches!(
-        runtime.receive().unwrap(),
+        receive_until(&mut runtime, deadline, "durable event"),
         SessionEvent::Event {
             intake: Intake::EventApplied,
             ..
@@ -903,7 +940,7 @@ fn web_open_runtime_uses_websocket_transport() {
         model_input(2)
     );
     assert!(matches!(
-        runtime.receive().unwrap(),
+        receive_until(&mut runtime, deadline, "runtime event"),
         SessionEvent::RuntimeEvent {
             intake: Intake::RuntimeEventObserved,
             ..
@@ -911,6 +948,10 @@ fn web_open_runtime_uses_websocket_transport() {
     ));
     assert!(runtime.session().is_connected());
     server_thread.join().unwrap();
+    assert!(
+        Instant::now() <= deadline,
+        "WebSocket scenario exceeded deadline"
+    );
 }
 
 #[test]

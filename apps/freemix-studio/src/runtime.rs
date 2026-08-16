@@ -210,7 +210,7 @@ impl StudioRuntime {
         if let Some(supervisor) = &mut self.supervisor {
             supervisor.poll()?;
         }
-        self.connect_transport(connect_timeout, Duration::from_millis(50), || false)
+        self.connect_transport(connect_timeout, Duration::from_millis(50), || false, false)
     }
 
     /// Connects and synchronizes while polling a caller-owned cancellation source.
@@ -227,7 +227,7 @@ impl StudioRuntime {
         if let Some(supervisor) = &mut self.supervisor {
             supervisor.poll()?;
         }
-        self.connect_transport(connect_timeout, poll_interval, cancelled)
+        self.connect_transport(connect_timeout, poll_interval, cancelled, true)
     }
 
     fn connect_transport(
@@ -235,20 +235,16 @@ impl StudioRuntime {
         connect_timeout: Duration,
         poll_interval: Duration,
         mut cancelled: impl FnMut() -> bool,
+        cancellable_tcp: bool,
     ) -> Result<SessionEvent, StudioError> {
-        if let Some(supervisor) = &mut self.supervisor {
-            supervisor.poll()?;
-        }
         Ok(match self.transport {
-            ControlTransport::Tcp if poll_interval.is_zero() => {
-                self.session.connect(self.address(), connect_timeout)?
-            }
-            ControlTransport::Tcp => self.session.connect_cancellable(
+            ControlTransport::Tcp if cancellable_tcp => self.session.connect_cancellable(
                 self.address(),
                 connect_timeout,
                 poll_interval,
                 cancelled,
             )?,
+            ControlTransport::Tcp => self.session.connect(self.address(), connect_timeout)?,
             ControlTransport::WebSocket => {
                 let token = env::var("FREEMIXD_WEB_TOKEN")
                     .ok()
@@ -258,7 +254,11 @@ impl StudioRuntime {
                     self.address(),
                     &token,
                     connect_timeout,
-                    poll_interval,
+                    if cancellable_tcp {
+                        poll_interval
+                    } else {
+                        Duration::from_millis(50)
+                    },
                     &mut cancelled,
                 )?
             }
