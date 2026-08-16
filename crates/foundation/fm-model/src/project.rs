@@ -40,6 +40,31 @@ pub enum SceneLayerError {
     SourceCycle,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SceneInputAudioSourceError {
+    MissingTargetInput(InputId),
+    NonSceneTargetInput(InputId),
+    MissingSourceInput(InputId),
+    SourceCycle,
+}
+
+impl std::fmt::Display for SceneInputAudioSourceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingTargetInput(input) => write!(formatter, "missing target input {input}"),
+            Self::NonSceneTargetInput(input) => {
+                write!(formatter, "target input {input} is not a scene input")
+            }
+            Self::MissingSourceInput(input) => write!(formatter, "missing source input {input}"),
+            Self::SourceCycle => {
+                formatter.write_str("scene input audio source would create a cycle")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SceneInputAudioSourceError {}
+
 impl std::fmt::Display for SceneLayerError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -622,6 +647,54 @@ impl Project {
         } else {
             Err(errors)
         }
+    }
+
+    pub fn set_scene_input_audio_source(
+        &mut self,
+        scene_input: InputId,
+        audio_source: Option<InputId>,
+    ) -> Result<(), SceneInputAudioSourceError> {
+        let target = self
+            .inputs
+            .iter()
+            .find(|input| input.id == scene_input)
+            .ok_or(SceneInputAudioSourceError::MissingTargetInput(scene_input))?;
+        if !matches!(target.kind, InputKind::Scene { .. }) {
+            return Err(SceneInputAudioSourceError::NonSceneTargetInput(scene_input));
+        }
+        if let Some(source) = audio_source
+            && !self.inputs.iter().any(|input| input.id == source)
+        {
+            return Err(SceneInputAudioSourceError::MissingSourceInput(source));
+        }
+        let mut candidate = self.clone();
+        let target = candidate
+            .inputs
+            .iter_mut()
+            .find(|input| input.id == scene_input)
+            .expect("validated target input exists in candidate");
+        let InputKind::Scene {
+            audio_source: current,
+            ..
+        } = &mut target.kind
+        else {
+            unreachable!("validated target input is a scene input");
+        };
+        *current = audio_source;
+        if candidate.validate().is_err_and(|errors| {
+            errors.iter().any(|error| {
+                error.entity == Some(EntityRef::Input(scene_input))
+                    && error.field == "kind.scene.audio_source"
+                    && matches!(
+                        error.kind,
+                        ValidationErrorKind::SelfReference | ValidationErrorKind::Cycle
+                    )
+            })
+        }) {
+            return Err(SceneInputAudioSourceError::SourceCycle);
+        }
+        *self = candidate;
+        Ok(())
     }
 }
 

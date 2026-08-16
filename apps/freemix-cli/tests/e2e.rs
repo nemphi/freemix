@@ -1932,6 +1932,73 @@ fn local_scene_input_add_persists_empty_scene_without_routing() {
 }
 
 #[test]
+fn local_scene_input_audio_source() {
+    let context = ContractContext::new();
+    assert_success(&invoke(&["new", context.project_path()]));
+    for (input, scene, name) in [("3", "7", "A"), ("4", "8", "B")] {
+        assert_success(&invoke(&[
+            "scene-input-add",
+            context.project_path(),
+            input,
+            scene,
+            name,
+        ]));
+    }
+    let before = ProjectStore::new(&context.project).unwrap().load().unwrap();
+    assert_success(&invoke(&[
+        "scene-input-audio-source",
+        context.project_path(),
+        "3",
+        "1",
+    ]));
+    let assigned = ProjectStore::new(&context.project).unwrap().load().unwrap();
+    assert!(matches!(
+        assigned.project().inputs().iter().find(|input| input.id.get().get() == 3).unwrap().kind,
+        InputKind::Scene { audio_source: Some(source), .. } if source.get().get() == 1
+    ));
+    let mut normalized = assigned.project().clone();
+    normalized
+        .set_scene_input_audio_source(InputId::new(NonZeroU128::new(3).unwrap()), None)
+        .unwrap();
+    assert_eq!(&normalized, before.project());
+    assert_eq!(assigned.runtime_routing(), before.runtime_routing());
+    assert_eq!(
+        assigned.runtime_manual_transitions(),
+        before.runtime_manual_transitions()
+    );
+    assert_eq!(
+        assigned.runtime_fade_to_black(),
+        before.runtime_fade_to_black()
+    );
+    assert_eq!(assigned.runtime_overlays(), before.runtime_overlays());
+    assert_eq!(assigned.position(), before.position());
+    assert_eq!(
+        assigned.idempotency_receipts(),
+        before.idempotency_receipts()
+    );
+
+    assert_success(&invoke(&[
+        "scene-input-audio-source-clear",
+        context.project_path(),
+        "3",
+    ]));
+    let cleared = ProjectStore::new(&context.project).unwrap().load().unwrap();
+    assert_eq!(cleared.project(), before.project());
+
+    assert_success(&invoke(&[
+        "scene-input-audio-source",
+        context.project_path(),
+        "3",
+        "4",
+    ]));
+    let cycle_manifest = manifest(&context.project);
+    let cycle = invoke(&["scene-input-audio-source", context.project_path(), "4", "3"]);
+    assert_failure_contains(&cycle, "audio source would create a cycle");
+    assert_eq!(manifest(&context.project), cycle_manifest);
+    fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
 fn local_scene_background() {
     let context = ContractContext::new();
     assert_success(&invoke(&["new", context.project_path()]));

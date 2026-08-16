@@ -274,7 +274,8 @@ the order after restart. Studio now has a compact permission-gated rename editor
 The local `input-add`, `scene-input-add`, `input-duplicate`, `input-remove`, and
 `input-replace-simulated` commands persist input state for the next project open
 only. `scene-input-add` creates an empty opaque-black scene with no layers and no
-audio source. `scene-layer-add`, `scene-layer-remove`, `scene-layer-appearance`,
+audio source. `scene-input-audio-source` and `scene-input-audio-source-clear`
+persist the scene input audio route. `scene-layer-add`, `scene-layer-remove`, `scene-layer-appearance`,
 `scene-layer-geometry`, `scene-layer-crop`, `scene-layer-crop-clear`,
 `scene-layer-mask`, `scene-layer-mask-clear`, `scene-layer-z-order`, and
 `scene-background` (premultiplied RGBA), `scene-layer-source-input`, and

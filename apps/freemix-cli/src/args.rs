@@ -82,6 +82,15 @@ pub enum Command {
         scene: u128,
         name: String,
     },
+    SceneInputAudioSource {
+        path: PathBuf,
+        scene_input: u128,
+        audio_source: u128,
+    },
+    SceneInputAudioSourceClear {
+        path: PathBuf,
+        scene_input: u128,
+    },
     SceneBackground {
         path: PathBuf,
         scene: u128,
@@ -578,6 +587,8 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
         "new" => parse_new(arguments),
         "input-add" => parse_input_add(arguments),
         "scene-input-add" => parse_scene_input_add(arguments),
+        "scene-input-audio-source" => parse_scene_input_audio_source(arguments),
+        "scene-input-audio-source-clear" => parse_scene_input_audio_source_clear(arguments),
         "scene-background" => parse_scene_background(arguments),
         "scene-layer-add" => parse_scene_layer_add(arguments),
         "scene-layer-remove" => parse_scene_layer_remove(arguments),
@@ -1012,6 +1023,29 @@ fn parse_scene_input_add(
         scene,
         name,
     })
+}
+
+fn parse_scene_input_audio_source(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Command, ArgsError> {
+    let path = required_path(&mut arguments, "project path")?;
+    let scene_input = number(&required(&mut arguments, "scene input")?, "scene input")?;
+    let audio_source = number(&required(&mut arguments, "source input")?, "source input")?;
+    reject_extra(&mut arguments)?;
+    Ok(Command::SceneInputAudioSource {
+        path,
+        scene_input,
+        audio_source,
+    })
+}
+
+fn parse_scene_input_audio_source_clear(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Command, ArgsError> {
+    let path = required_path(&mut arguments, "project path")?;
+    let scene_input = number(&required(&mut arguments, "scene input")?, "scene input")?;
+    reject_extra(&mut arguments)?;
+    Ok(Command::SceneInputAudioSourceClear { path, scene_input })
 }
 
 fn parse_scene_background(

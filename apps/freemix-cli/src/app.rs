@@ -91,6 +91,20 @@ pub fn run(command: Command) -> AppResult<()> {
         } => {
             add_scene_input(&path, input_id(input)?, scene_id(scene)?, name)?;
         }
+        Command::SceneInputAudioSource {
+            path,
+            scene_input,
+            audio_source,
+        } => {
+            set_scene_input_audio_source(
+                &path,
+                input_id(scene_input)?,
+                Some(input_id(audio_source)?),
+            )?;
+        }
+        Command::SceneInputAudioSourceClear { path, scene_input } => {
+            set_scene_input_audio_source(&path, input_id(scene_input)?, None)?;
+        }
         Command::SceneBackground {
             path,
             scene,
@@ -1344,6 +1358,29 @@ fn add_scene_input(path: &Path, input: InputId, scene: SceneId, name: String) ->
     Ok(())
 }
 
+fn set_scene_input_audio_source(
+    path: &Path,
+    scene_input: InputId,
+    audio_source: Option<InputId>,
+) -> AppResult<()> {
+    let store = ProjectStore::new(path)?;
+    let stored = load_stored_project(path)?;
+    let mut project = stored.project().clone();
+    project.set_scene_input_audio_source(scene_input, audio_source)?;
+    let configured = StoredProject::from_project_with_complete_runtime_state(
+        project,
+        stored.runtime_routing(),
+        stored.runtime_manual_transitions(),
+        stored.runtime_fade_to_black(),
+        stored.runtime_overlays().clone(),
+        stored.position(),
+        stored.idempotency_receipts().to_vec(),
+    )?;
+    store.save(&configured)?;
+    print_status(&load_engine(path)?);
+    Ok(())
+}
+
 fn add_scene_layer(
     path: &Path,
     scene: SceneId,
@@ -2313,6 +2350,8 @@ Usage:
   freemix-cli new <show.freemix> [--name <name>]
   freemix-cli input-add <show.freemix> <nonzero-input-id> <name>
   freemix-cli scene-input-add <show.freemix> <nonzero-input-id> <nonzero-scene-id> <name>
+  freemix-cli scene-input-audio-source <show.freemix> <scene-input-id> <source-input-id>
+  freemix-cli scene-input-audio-source-clear <show.freemix> <scene-input-id>
   freemix-cli scene-background <show.freemix> <scene-id> <premultiplied-red:0..=255> <premultiplied-green:0..=255> <premultiplied-blue:0..=255> <alpha:0..=255>
   freemix-cli scene-layer-add <show.freemix> <scene-id> <source-input-id> <z-order> <layer-name>
   freemix-cli scene-layer-remove <show.freemix> <scene-id> <zero-based-layer-index>
