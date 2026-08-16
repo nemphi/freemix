@@ -318,6 +318,7 @@ pub enum SetSceneBackgroundError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SceneLayerError {
     UnknownScene(SceneId),
+    SameScene(SceneId),
     LayerIndexOutOfRange {
         scene: SceneId,
         index: usize,
@@ -374,6 +375,9 @@ impl std::fmt::Display for SceneLayerError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnknownScene(scene) => write!(formatter, "unknown scene {scene}"),
+            Self::SameScene(scene) => {
+                write!(formatter, "source and target scenes must differ: {scene}")
+            }
             Self::LayerIndexOutOfRange {
                 scene,
                 index,
@@ -1147,6 +1151,53 @@ impl Project {
         }
         layer.name = name;
         self.add_layer_to_scene(scene, layer)
+            .map_err(|error| match error {
+                AddSceneLayerError::UnknownScene(scene) => SceneLayerError::UnknownScene(scene),
+                AddSceneLayerError::EmptyName => SceneLayerError::EmptyName,
+                AddSceneLayerError::MissingInput(input) => SceneLayerError::MissingInput(input),
+                AddSceneLayerError::MissingScene(scene) => SceneLayerError::MissingScene(scene),
+                AddSceneLayerError::SourceCycle => SceneLayerError::SourceCycle,
+            })
+    }
+
+    pub fn copy_scene_layer(
+        &mut self,
+        source_scene: SceneId,
+        index: usize,
+        target_scene: SceneId,
+        name: String,
+    ) -> Result<(), SceneLayerError> {
+        let source = self
+            .scenes
+            .iter()
+            .find(|candidate| candidate.id == source_scene)
+            .ok_or(SceneLayerError::UnknownScene(source_scene))?;
+        let length = source.layers.len();
+        let mut layer =
+            source
+                .layers
+                .get(index)
+                .cloned()
+                .ok_or(SceneLayerError::LayerIndexOutOfRange {
+                    scene: source_scene,
+                    index,
+                    length,
+                })?;
+        if !self
+            .scenes
+            .iter()
+            .any(|candidate| candidate.id == target_scene)
+        {
+            return Err(SceneLayerError::UnknownScene(target_scene));
+        }
+        if source_scene == target_scene {
+            return Err(SceneLayerError::SameScene(source_scene));
+        }
+        if name.trim().is_empty() {
+            return Err(SceneLayerError::EmptyName);
+        }
+        layer.name = name;
+        self.add_layer_to_scene(target_scene, layer)
             .map_err(|error| match error {
                 AddSceneLayerError::UnknownScene(scene) => SceneLayerError::UnknownScene(scene),
                 AddSceneLayerError::EmptyName => SceneLayerError::EmptyName,

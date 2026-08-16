@@ -4105,6 +4105,99 @@ fn local_scene_layer_duplicate_copies_configured_layer() {
 }
 
 #[test]
+fn local_scene_layer_copy_preserves_configured_layer_and_rejects_cycle() {
+    let context = ContractContext::new();
+    let path = context.project_path();
+    let run = |arguments: &[&str]| assert_success(&invoke_bounded(arguments));
+    run(&["new", path]);
+    run(&["scene-input-add", path, "10", "10", "Source"]);
+    run(&["scene-input-add", path, "11", "11", "Target"]);
+    run(&["scene-layer-add", path, "10", "1", "-4", "Original"]);
+    run(&["scene-layer-appearance", path, "10", "0", "off", "96"]);
+    run(&[
+        "scene-layer-geometry",
+        path,
+        "10",
+        "0",
+        "-12",
+        "34",
+        "640",
+        "480",
+        "270",
+    ]);
+    run(&[
+        "scene-layer-crop",
+        path,
+        "10",
+        "0",
+        "10",
+        "20",
+        "600",
+        "400",
+    ]);
+    run(&[
+        "scene-layer-mask",
+        path,
+        "10",
+        "0",
+        "20",
+        "30",
+        "500",
+        "300",
+        "inverted",
+    ]);
+    for name in ["First", "Second"] {
+        run(&["scene-layer-add", path, "11", "1", "4", name]);
+    }
+    run(&[
+        "tbar-start",
+        path,
+        "slide",
+        "--key",
+        "scene-layer-copy-runtime",
+        "--expect",
+        "0",
+    ]);
+
+    let store = ProjectStore::new(&context.project).unwrap();
+    let before = store.load().unwrap();
+    run(&["scene-layer-copy", path, "10", "0", "11", "  Copied  "]);
+    let after = store.load().unwrap();
+    assert_eq!(
+        after.runtime_manual_transitions(),
+        before.runtime_manual_transitions()
+    );
+    let source_before = &before.project().scenes()[0].layers;
+    let target_before = &before.project().scenes()[1].layers;
+    assert_eq!(&after.project().scenes()[0].layers, source_before);
+    let mut copied = source_before[0].clone();
+    copied.name = "  Copied  ".into();
+    assert_eq!(
+        &after.project().scenes()[1].layers,
+        &[target_before[0].clone(), target_before[1].clone(), copied]
+    );
+
+    run(&[
+        "scene-layer-add-scene",
+        path,
+        "10",
+        "11",
+        "0",
+        "Target source",
+    ]);
+    let manifest_before = fs::read(context.project.join("project.json")).unwrap();
+    let journal_before = journal_bytes(&store);
+    let rejected = invoke_bounded(&["scene-layer-copy", path, "10", "1", "11", "Rejected"]);
+    assert_failure_contains(&rejected, "scene layer source would create a cycle");
+    assert_eq!(
+        fs::read(context.project.join("project.json")).unwrap(),
+        manifest_before
+    );
+    assert_eq!(journal_bytes(&store), journal_before);
+    fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
 fn local_scene_layer_move_changes_only_stable_tie_order() {
     let context = ContractContext::new();
     let path = context.project_path();
