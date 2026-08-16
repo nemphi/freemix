@@ -329,7 +329,20 @@ impl Session {
     ///
     /// Returns an accounting error if the queue is empty.
     pub fn outbound_delivered(&mut self) -> Result<usize, SessionError> {
-        let Some(bytes) = self.outbound_sizes.pop_front() else {
+        self.release_outbound(0)
+    }
+
+    /// Releases one discarded outbound message by queue index.
+    ///
+    /// # Errors
+    ///
+    /// Returns an accounting error if the index is not queued.
+    pub fn discard_outbound(&mut self, index: usize) -> Result<usize, SessionError> {
+        self.release_outbound(index)
+    }
+
+    fn release_outbound(&mut self, index: usize) -> Result<usize, SessionError> {
+        let Some(bytes) = self.outbound_sizes.remove(index) else {
             return Err(SessionError::NoQueuedOutboundMessage);
         };
         self.accounting.outbound_messages_queued -= 1;

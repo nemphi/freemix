@@ -461,6 +461,25 @@ fn outbound_message_rate_limit_is_retryable() {
 }
 
 #[test]
+fn discarded_outbound_message_releases_its_exact_bytes() {
+    let server = ready_server(config());
+    let mut session = server
+        .handshake(&hello(Role::Viewer, None), &principal(AuthRole::Viewer), 0)
+        .unwrap()
+        .session;
+
+    session.queue_outbound(3, 0).unwrap();
+    session.queue_outbound(5, 0).unwrap();
+    session.queue_outbound(2, 0).unwrap();
+
+    assert_eq!(session.discard_outbound(1).unwrap(), 5);
+    assert_eq!(session.accounting().outbound_messages_queued, 2);
+    assert_eq!(session.accounting().outbound_bytes_queued, 5);
+    assert_eq!(session.outbound_delivered().unwrap(), 3);
+    assert_eq!(session.outbound_delivered().unwrap(), 2);
+}
+
+#[test]
 fn health_and_readiness_have_stable_lifecycle_states() {
     let mut server = Server::new(config(), control()).unwrap();
     assert_eq!(server.status().health(), HealthState::Healthy);

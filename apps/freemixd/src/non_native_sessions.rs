@@ -123,13 +123,24 @@ impl Peer {
         Ok(())
     }
 
-    fn clear_outbound_accounting(&mut self) {
-        while let Some(record) = self.outbound.pop_front() {
+    fn replace_outbound_for_shutdown(&mut self) {
+        let retained = usize::from(
+            self.outbound
+                .front()
+                .is_some_and(|record| record.write.started()),
+        );
+        while self.outbound.len() > retained {
+            self.discard_outbound(self.outbound.len() - 1);
+        }
+    }
+
+    fn discard_outbound(&mut self, index: usize) {
+        if let Some(record) = self.outbound.remove(index) {
             if matches!(record.accounting, Accounting::Session) {
                 let _ = self
                     .session
                     .as_mut()
-                    .and_then(|session| session.outbound_delivered().ok());
+                    .and_then(|session| session.discard_outbound(index).ok());
             }
         }
     }
@@ -215,6 +226,7 @@ pub(super) fn run(
         }
 
         let mut live_budget = vec![LIVE_EVENTS_PER_PASS; peers.len()];
+        let mut command_dispatched = false;
         for index in 0..peers.len() {
             if close[index] {
                 continue;
@@ -226,18 +238,29 @@ pub(super) fn run(
             let Some(message) = message else {
                 continue;
             };
+            let is_command = matches!(message, WireMessage::Command(_));
             match runtime.dispatch(&mut peers[index], message, durable, native.as_deref_mut()) {
-                Ok(()) => {}
+                Ok(()) => command_dispatched |= is_command,
                 Err(DispatchError::Peer) => close[index] = true,
                 Err(DispatchError::Daemon(error)) => {
-                    shutdown_peers(&mut peers, control);
+                    shutdown_peers(&mut peers, control, ShutdownQueue::Replace);
                     return Err(error);
                 }
             }
         }
+        if let Some(reason) = requested_daemon_shutdown(native.as_deref(), Some(process_shutdown)) {
+            if native.is_some()
+                && command_dispatched
+                && reason == DaemonShutdownReason::ProcessSignal
+            {
+                shutdown_peers(&mut peers, control, ShutdownQueue::PreserveCommandResult);
+                return Ok(reason);
+            }
+            return Ok(shutdown_for_reason(reason, &mut peers, control));
+        }
         if let Some(native) = native.as_deref_mut() {
             if let Err(error) = native.tick_if_due(&mut control.borrow_mut(), authority) {
-                shutdown_peers(&mut peers, control);
+                shutdown_peers(&mut peers, control, ShutdownQueue::Replace);
                 return Err(error);
             }
         }
@@ -622,7 +645,12 @@ fn write_peer(peer: &mut Peer) -> WriteOutcome {
     }
 }
 
-fn shutdown_peers(peers: &mut Vec<Peer>, control: &SharedControl) {
+enum ShutdownQueue {
+    Replace,
+    PreserveCommandResult,
+}
+
+fn shutdown_peers(peers: &mut Vec<Peer>, control: &SharedControl, queue: ShutdownQueue) {
     for index in (0..peers.len()).rev() {
         if peers[index].session.is_none() || !peers[index].handshake_written {
             close_peer(peers.swap_remove(index), control);
@@ -632,7 +660,12 @@ fn shutdown_peers(peers: &mut Vec<Peer>, control: &SharedControl) {
         return;
     }
     for peer in peers.iter_mut() {
-        peer.clear_outbound_accounting();
+        if matches!(queue, ShutdownQueue::Replace) {
+            peer.replace_outbound_for_shutdown();
+        } else if peer.outbound.len() == OUTBOUND_CAPACITY {
+            // The front can be partially written, and the back is the command result.
+            peer.discard_outbound(peer.outbound.len() - 2);
+        }
         peer.initial_sync.clear();
         peer.inbound.clear();
         let notice = shutdown_message();
@@ -670,7 +703,9 @@ fn shutdown_for_reason(
     control: &SharedControl,
 ) -> DaemonShutdownReason {
     match reason {
-        DaemonShutdownReason::ProcessSignal => shutdown_peers(peers, control),
+        DaemonShutdownReason::ProcessSignal => {
+            shutdown_peers(peers, control, ShutdownQueue::Replace)
+        }
         DaemonShutdownReason::ProgramSurface => close_all(peers, control),
         DaemonShutdownReason::Once => unreachable!("once is handled below"),
     }

@@ -1,11 +1,10 @@
 use std::{
     cell::RefCell,
-    collections::VecDeque,
     convert::Infallible,
     error::Error,
     fmt,
-    io::{Read, Write},
-    net::{SocketAddr, TcpListener, TcpStream},
+    io::Write,
+    net::{SocketAddr, TcpListener},
     num::NonZeroU128,
     path::{Path, PathBuf},
     process::ExitCode,
@@ -14,9 +13,13 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering as AtomicOrdering},
     },
-    thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(any(test, feature = "native-media"))]
+use std::thread;
+#[cfg(test)]
+use std::{collections::VecDeque, io::Read, net::TcpStream};
 
 #[cfg(feature = "native-media")]
 use std::fs::{self, File, OpenOptions};
@@ -54,13 +57,14 @@ use fm_persistence::{
     RuntimeRouting, StoredProject,
 };
 use fm_protocol::{
-    CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, CodecError, CommandMessage, CommandPayload,
+    CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, CommandMessage, CommandPayload,
     CommandResult, DiagnosticsRequest, DiagnosticsResponse, ErrorMessage, EventCursor,
-    EventMessage, HandshakeOutcome as ProtocolHandshakeOutcome, HandshakeRequest,
-    HandshakeResponse, HeartbeatAcknowledgementMessage, HeartbeatMessage, LineDecoder,
-    ProtocolVersion, ResumeCursor, RuntimeEventMessage, ServerHello, ServerIdentity,
-    StructuredError, WireMessage, choose_handshake_outcome, encode_line,
+    HandshakeOutcome as ProtocolHandshakeOutcome, HandshakeRequest, HandshakeResponse,
+    HeartbeatMessage, ProtocolVersion, ResumeCursor, RuntimeEventMessage, ServerHello,
+    ServerIdentity, StructuredError, WireMessage, choose_handshake_outcome, encode_line,
 };
+#[cfg(test)]
+use fm_protocol::{CodecError, EventMessage, HeartbeatAcknowledgementMessage, LineDecoder};
 use fm_server::{
     AuthenticationMode, ControlPlane, DisconnectReason, HandshakeError, Heartbeat, InitialSync,
     Server, ServerConfig, ServerMode, Session, SessionError, SyncPayload,
@@ -224,6 +228,7 @@ enum DaemonShutdownReason {
     ProgramSurface,
 }
 
+#[cfg(test)]
 #[derive(Eq, PartialEq)]
 enum OnceClientOutcome {
     Unserved,
@@ -3663,12 +3668,14 @@ fn model_audio_strip_state(state: EngineInputAudioStripState) -> InputAudioStrip
     }
 }
 
+#[cfg(test)]
 fn configure_client_socket(stream: &TcpStream) -> std::io::Result<()> {
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(CLIENT_READ_POLL_INTERVAL))?;
     stream.set_write_timeout(Some(CLIENT_WRITE_TIMEOUT))
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn handle_client(
     stream: TcpStream,
@@ -3835,12 +3842,14 @@ fn handle_client(
     Ok(())
 }
 
+#[cfg(test)]
 enum ClientRead {
     Message(WireMessage),
     Closed,
     DaemonShutdown(DaemonShutdownReason),
 }
 
+#[cfg(test)]
 fn read_client_message(
     reader: &mut MessageReader,
     control: &SharedControl,
@@ -4050,6 +4059,7 @@ fn record_heartbeat(
     Ok(received_at_ms)
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn process_command(
     writer: &mut TcpStream,
@@ -4090,7 +4100,9 @@ fn process_command(
 
 struct CommandDelivery {
     result: CommandResult,
+    #[cfg(test)]
     events: Vec<EventMessage>,
+    #[cfg(test)]
     runtime_events: Vec<RuntimeEventMessage>,
 }
 
@@ -4116,7 +4128,9 @@ fn execute_session_command(
         );
         return Ok(CommandDelivery {
             result,
+            #[cfg(test)]
             events: Vec::new(),
+            #[cfg(test)]
             runtime_events: Vec::new(),
         });
     }
@@ -4142,7 +4156,9 @@ fn execute_session_command(
                         session.command_completed()?;
                         return Ok(CommandDelivery {
                             result: failure.result,
+                            #[cfg(test)]
                             events: Vec::new(),
+                            #[cfg(test)]
                             runtime_events: failure.runtime_events,
                         });
                     }
@@ -4181,13 +4197,15 @@ fn execute_session_command(
     session.command_completed()?;
     let DurableExecution {
         submission,
-        runtime_events,
+        runtime_events: _runtime_events,
     } = execution;
 
     Ok(CommandDelivery {
         result: submission.output.result,
+        #[cfg(test)]
         events: submission.output.events,
-        runtime_events,
+        #[cfg(test)]
+        runtime_events: _runtime_events,
     })
 }
 
@@ -4215,6 +4233,7 @@ fn native_stinger_preflight_rejection(
 
 struct NativeMutationFailure {
     result: CommandResult,
+    #[cfg(test)]
     runtime_events: Vec<RuntimeEventMessage>,
 }
 
@@ -4285,6 +4304,7 @@ fn execute_native_stinger_mutation(
                     command,
                     control.diagnostics().current_revision,
                 ),
+                #[cfg(test)]
                 runtime_events: preflight_runtime_events,
             }));
         }
@@ -4339,6 +4359,7 @@ fn execute_native_stinger_mutation(
                 command,
                 control.diagnostics().current_revision,
             ),
+            #[cfg(test)]
             runtime_events: preflight_runtime_events,
         }));
     }
@@ -4973,6 +4994,7 @@ fn structured_session_error(error: &SessionError) -> StructuredError {
     }
 }
 
+#[cfg(test)]
 fn write_session_message(
     writer: &mut TcpStream,
     session: &mut Session,
@@ -4985,6 +5007,7 @@ fn write_session_message(
     Ok(())
 }
 
+#[cfg(test)]
 fn write_session_error(
     writer: &mut TcpStream,
     session: &mut Session,
@@ -4994,6 +5017,7 @@ fn write_session_error(
     write_session_message(writer, session, &error_message(code, message))
 }
 
+#[cfg(test)]
 fn write_error(writer: &mut TcpStream, code: &str, message: &str) -> AppResult<()> {
     write_message(writer, &error_message(code, message))
 }
@@ -5024,12 +5048,14 @@ fn shutdown_message() -> WireMessage {
     })
 }
 
+#[cfg(test)]
 fn write_message(writer: &mut TcpStream, message: &WireMessage) -> AppResult<()> {
     let line = encode_line(message)?;
     write_client_bytes(writer, line.as_bytes())?;
     Ok(())
 }
 
+#[cfg(test)]
 fn write_client_bytes(writer: &mut TcpStream, bytes: &[u8]) -> AppResult<()> {
     let mut pending = PendingWrite::new(bytes.to_vec());
     while !pending.write_once(writer).map_err(client_write_error)? {}
@@ -5056,8 +5082,13 @@ impl PendingWrite {
         self.offset += written;
         Ok(self.offset == self.bytes.len())
     }
+
+    fn started(&self) -> bool {
+        self.offset != 0
+    }
 }
 
+#[cfg(test)]
 fn client_write_error(error: std::io::Error) -> Box<dyn Error> {
     if matches!(
         error.kind(),
@@ -5115,12 +5146,14 @@ fn handshake_code(error: &HandshakeError<Infallible>) -> &'static str {
     }
 }
 
+#[cfg(test)]
 struct MessageReader {
     stream: TcpStream,
     decoder: LineDecoder,
     pending: VecDeque<WireMessage>,
 }
 
+#[cfg(test)]
 impl MessageReader {
     fn new(stream: TcpStream) -> Self {
         Self {
@@ -5176,6 +5209,7 @@ impl MessageReader {
     }
 }
 
+#[cfg(test)]
 fn is_client_disconnect(error: &(dyn Error + 'static)) -> bool {
     if error.downcast_ref::<ClientWriteTimeout>().is_some() {
         return true;
@@ -5192,6 +5226,7 @@ fn is_client_disconnect(error: &(dyn Error + 'static)) -> bool {
     error.source().is_some_and(is_client_disconnect)
 }
 
+#[cfg(test)]
 fn is_client_protocol_error(error: &(dyn Error + 'static)) -> bool {
     error.downcast_ref::<ClientProtocolError>().is_some()
 }
@@ -5246,26 +5281,32 @@ Native mode continues across client disconnects; close the Program window or pre
 #[derive(Debug)]
 struct AppFailure(String);
 
+#[cfg(test)]
 #[derive(Debug)]
 struct ClientWriteTimeout(std::io::ErrorKind);
 
+#[cfg(test)]
 #[derive(Debug)]
 struct ClientProtocolError(CodecError);
 
+#[cfg(test)]
 impl fmt::Display for ClientWriteTimeout {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "client write timed out: {:?}", self.0)
     }
 }
 
+#[cfg(test)]
 impl Error for ClientWriteTimeout {}
 
+#[cfg(test)]
 impl fmt::Display for ClientProtocolError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "client protocol error: {}", self.0)
     }
 }
 
+#[cfg(test)]
 impl Error for ClientProtocolError {}
 
 impl fmt::Display for AppFailure {
