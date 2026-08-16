@@ -284,7 +284,7 @@ uniqueness, then changes only the matching name at the durable revision. It also
 carries an authoritative full input reorder through the EditProject command and
 durable input-order event; the daemon persists that vector order and restores
 the order after restart. Studio now has a compact permission-gated rename editor.
-The local `input-add`, `media-input-add`, `scene-input-add`, `input-duplicate`, `input-remove`, and
+The local `input-add`, `simulated-solid-input-add`, `media-input-add`, `scene-input-add`, `input-duplicate`, `input-remove`, and
 `input-replace-simulated` commands persist input state for the next project open
 only. `scene-input-add` creates an empty opaque-black scene with no layers and no
 audio source. `scene-input-audio-source` and `scene-input-audio-source-clear`
@@ -300,6 +300,8 @@ remain separate.
 `media-input-add` is a local next-open media-input configuration foothold. It stores a strict
 `asset://` URI without requiring the asset to exist; native decode, live add/relink,
 offline lifecycle, batch import, Studio, remote acceptance, and IN-008/IN-026 remain planned.
+`simulated-solid-input-add` is a local next-open simulated solid configuration foothold with
+straight RGBA bytes; live add, Studio/remote control, native acceptance, and IN-008/IN-026 remain planned.
 Neither command applies an optimistic change or changes current switcher state.
 Studio exposes compact Up/Down controls
 for one-step reorder, gated by the current Ready session and EditProject

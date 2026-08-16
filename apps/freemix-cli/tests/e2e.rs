@@ -12,7 +12,7 @@ use std::{
 
 use fm_model::{
     InputKind, LayerGeometry, RectMask, Rgba8, Rotation, SimulatedAudio, SimulatedInput,
-    SimulatedVideo, SourceRef, StartupPolicy,
+    SimulatedVideo, SolidColor, SourceRef, StartupPolicy,
 };
 use fm_persistence::{MutationBatch, ProjectStore, StoredProject};
 use fm_protocol::{
@@ -1848,6 +1848,78 @@ fn local_input_add_persists_default_simulated_strip() {
     let duplicate = invoke(&["input-add", context.project_path(), "3", "Other"]);
     assert_failure_contains(&duplicate, "domain project failed validation");
     assert_eq!(manifest(&context.project), before_duplicate);
+    fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
+fn local_simulated_solid_input_add_persists_exact_rgba() {
+    let context = ContractContext::new();
+    assert_success(&invoke(&["new", context.project_path()]));
+    let store = ProjectStore::new(&context.project).unwrap();
+    let before = store.load().unwrap();
+    let name = "Solid  input ";
+    assert_success(&invoke(&[
+        "simulated-solid-input-add",
+        context.project_path(),
+        "3",
+        name,
+        "1",
+        "127",
+        "254",
+        "0",
+    ]));
+
+    let after = store.load().unwrap();
+    let input = after
+        .project()
+        .inputs()
+        .iter()
+        .find(|input| input.id == InputId::new(NonZeroU128::new(3).unwrap()))
+        .unwrap();
+    assert_eq!(input.name, name);
+    assert_eq!(input.required_capabilities, Vec::<String>::new());
+    assert!(matches!(
+        &input.kind,
+        InputKind::Simulated(simulated)
+            if simulated.video == SimulatedVideo::Solid(SolidColor::new(1, 127, 254, 0))
+                && simulated.audio == SimulatedAudio::Silence
+    ));
+    assert_eq!(
+        after.project().input_audio_strip(input.id).unwrap(),
+        Default::default()
+    );
+    assert_eq!(after.position(), before.position());
+    assert_eq!(after.runtime_routing(), before.runtime_routing());
+    assert_eq!(
+        after.runtime_manual_transitions(),
+        before.runtime_manual_transitions()
+    );
+    assert_eq!(
+        after.runtime_fade_to_black(),
+        before.runtime_fade_to_black()
+    );
+    assert_eq!(after.runtime_overlays(), before.runtime_overlays());
+    assert_eq!(after.idempotency_receipts(), before.idempotency_receipts());
+    assert_success(&invoke(&["status", context.project_path()]));
+
+    let manifest_before_failure = fs::read(context.project.join("project.json")).unwrap();
+    let journal_before_failure = journal_bytes(&store);
+    let invalid = invoke(&[
+        "simulated-solid-input-add",
+        context.project_path(),
+        "4",
+        "Invalid",
+        "256",
+        "0",
+        "0",
+        "255",
+    ]);
+    assert_failure_contains(&invalid, "red must be in 0..=255, got 256");
+    assert_eq!(
+        fs::read(context.project.join("project.json")).unwrap(),
+        manifest_before_failure
+    );
+    assert_eq!(journal_bytes(&store), journal_before_failure);
     fs::remove_dir_all(context.root).unwrap();
 }
 

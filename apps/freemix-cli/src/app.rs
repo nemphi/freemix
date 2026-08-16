@@ -84,6 +84,23 @@ pub fn run(command: Command) -> AppResult<()> {
         Command::InputAdd { path, input, name } => {
             add_input(&path, input_id(input)?, name)?;
         }
+        Command::SimulatedSolidInputAdd {
+            path,
+            input,
+            name,
+            red,
+            green,
+            blue,
+            alpha,
+        } => add_input_with_kind(
+            &path,
+            input_id(input)?,
+            name,
+            InputKind::Simulated(SimulatedInput::new(
+                SimulatedVideo::Solid(SolidColor::new(red, green, blue, alpha)),
+                SimulatedAudio::Silence,
+            )),
+        )?,
         Command::MediaInputAdd {
             path,
             input,
@@ -2599,6 +2616,7 @@ FreeMix deterministic MVP
 Usage:
   freemix-cli new <show.freemix> [--name <name>]
   freemix-cli input-add <show.freemix> <nonzero-input-id> <name>
+  freemix-cli simulated-solid-input-add <show.freemix> <nonzero-input-id> <name> <red:0..=255> <green:0..=255> <blue:0..=255> <alpha:0..=255>
   freemix-cli media-input-add <show.freemix> <nonzero-input-id> <name> <asset://key>
   freemix-cli audio-bus-add <show.freemix> <nonzero-bus-id> <name>
   freemix-cli output-add <show.freemix> <nonzero-output-id> <nonzero-scene-id> <nonzero-bus-id> <name>

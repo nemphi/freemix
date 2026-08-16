@@ -76,6 +76,15 @@ pub enum Command {
         input: u128,
         name: String,
     },
+    SimulatedSolidInputAdd {
+        path: PathBuf,
+        input: u128,
+        name: String,
+        red: u8,
+        green: u8,
+        blue: u8,
+        alpha: u8,
+    },
     MediaInputAdd {
         path: PathBuf,
         input: u128,
@@ -622,6 +631,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
     match command.as_str() {
         "new" => parse_new(arguments),
         "input-add" => parse_input_add(arguments),
+        "simulated-solid-input-add" => parse_simulated_solid_input_add(arguments),
         "media-input-add" => parse_media_input_add(arguments),
         "audio-bus-add" => parse_audio_bus_add(arguments),
         "output-add" => parse_output_add(arguments),
@@ -1105,6 +1115,28 @@ fn parse_input_add(mut arguments: impl Iterator<Item = String>) -> Result<Comman
     let name = required(&mut arguments, "input name")?;
     reject_extra(&mut arguments)?;
     Ok(Command::InputAdd { path, input, name })
+}
+
+fn parse_simulated_solid_input_add(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Command, ArgsError> {
+    let path = required_path(&mut arguments, "project path")?;
+    let input = number(&required(&mut arguments, "input")?, "input")?;
+    let name = nonblank(&mut arguments, "input name")?;
+    let red = bounded_u8(&required(&mut arguments, "red")?, "red", u8::MAX)?;
+    let green = bounded_u8(&required(&mut arguments, "green")?, "green", u8::MAX)?;
+    let blue = bounded_u8(&required(&mut arguments, "blue")?, "blue", u8::MAX)?;
+    let alpha = bounded_u8(&required(&mut arguments, "alpha")?, "alpha", u8::MAX)?;
+    reject_extra(&mut arguments)?;
+    Ok(Command::SimulatedSolidInputAdd {
+        path,
+        input,
+        name,
+        red,
+        green,
+        blue,
+        alpha,
+    })
 }
 
 fn parse_media_input_add(
