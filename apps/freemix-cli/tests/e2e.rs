@@ -2002,6 +2002,88 @@ fn local_scene_layer_add_persists_full_frame_layer() {
 }
 
 #[test]
+fn local_scene_layer_remove_preserves_remaining_order() {
+    let context = ContractContext::new();
+    assert_success(&invoke(&["new", context.project_path()]));
+    assert_success(&invoke(&[
+        "scene-input-add",
+        context.project_path(),
+        "3",
+        "7",
+        "Scene",
+    ]));
+    assert_success(&invoke(&[
+        "scene-layer-add",
+        context.project_path(),
+        "7",
+        "1",
+        "4",
+        "First",
+    ]));
+    assert_success(&invoke(&[
+        "scene-layer-add",
+        context.project_path(),
+        "7",
+        "1",
+        "9",
+        "Second",
+    ]));
+    let before = ProjectStore::new(&context.project_path())
+        .unwrap()
+        .load()
+        .unwrap();
+    assert_success(&invoke(&[
+        "scene-layer-remove",
+        context.project_path(),
+        "7",
+        "0",
+    ]));
+    let after = ProjectStore::new(&context.project_path())
+        .unwrap()
+        .load()
+        .unwrap();
+    assert_eq!(after.runtime_routing(), before.runtime_routing());
+    assert_eq!(
+        after.runtime_manual_transitions(),
+        before.runtime_manual_transitions()
+    );
+    assert_eq!(
+        after.runtime_fade_to_black(),
+        before.runtime_fade_to_black()
+    );
+    assert_eq!(after.runtime_overlays(), before.runtime_overlays());
+    assert_eq!(after.position(), before.position());
+    assert_eq!(after.idempotency_receipts(), before.idempotency_receipts());
+    let scene = after
+        .project()
+        .scenes()
+        .iter()
+        .find(|scene| scene.id.get().get() == 7)
+        .unwrap();
+    assert_eq!(scene.layers.len(), 1);
+    let layer = &scene.layers[0];
+    assert_eq!(layer.name, "Second");
+    assert_eq!(
+        layer.source,
+        SourceRef::Input(InputId::new(NonZeroU128::new(1).unwrap()))
+    );
+    assert!(layer.enabled);
+    assert_eq!(
+        layer.geometry,
+        LayerGeometry::new(0, 0, 1_920, 1_080, Rotation::Deg0)
+    );
+    assert_eq!(layer.crop, None);
+    assert_eq!(layer.mask, None);
+    assert_eq!(layer.opacity, u8::MAX);
+    assert_eq!(layer.z_order, 9);
+    let before_out_of_range = manifest(&context.project);
+    let out_of_range = invoke(&["scene-layer-remove", context.project_path(), "7", "1"]);
+    assert_failure_contains(&out_of_range, "out of range");
+    assert_eq!(manifest(&context.project), before_out_of_range);
+    fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
 fn local_input_duplicate_copies_source_and_strip() {
     let context = ContractContext::new();
     assert_success(&invoke(&["new", context.project_path()]));

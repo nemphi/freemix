@@ -21,6 +21,34 @@ pub enum AddSceneLayerError {
     UnknownScene(SceneId),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemoveSceneLayerError {
+    UnknownScene(SceneId),
+    LayerIndexOutOfRange {
+        scene: SceneId,
+        index: usize,
+        length: usize,
+    },
+}
+
+impl std::fmt::Display for RemoveSceneLayerError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownScene(scene) => write!(formatter, "unknown scene {scene}"),
+            Self::LayerIndexOutOfRange {
+                scene,
+                index,
+                length,
+            } => write!(
+                formatter,
+                "layer index {index} out of range for scene {scene} with {length} layers"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RemoveSceneLayerError {}
+
 impl std::fmt::Display for AddSceneLayerError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -292,6 +320,26 @@ impl Project {
             .layers
             .push(layer);
         Ok(())
+    }
+
+    pub fn remove_layer_from_scene(
+        &mut self,
+        scene: SceneId,
+        index: usize,
+    ) -> Result<Layer, RemoveSceneLayerError> {
+        let target = self
+            .scenes
+            .iter_mut()
+            .find(|candidate| candidate.id == scene)
+            .ok_or(RemoveSceneLayerError::UnknownScene(scene))?;
+        if index >= target.layers.len() {
+            return Err(RemoveSceneLayerError::LayerIndexOutOfRange {
+                scene,
+                index,
+                length: target.layers.len(),
+            });
+        }
+        Ok(target.layers.remove(index))
     }
 
     pub fn add_audio_bus(&mut self, bus: AudioBus) {

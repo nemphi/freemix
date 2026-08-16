@@ -89,6 +89,11 @@ pub enum Command {
         z_order: i32,
         name: String,
     },
+    SceneLayerRemove {
+        path: PathBuf,
+        scene: u128,
+        index: usize,
+    },
     InputRemove {
         path: PathBuf,
         input: u128,
@@ -502,6 +507,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
         "input-add" => parse_input_add(arguments),
         "scene-input-add" => parse_scene_input_add(arguments),
         "scene-layer-add" => parse_scene_layer_add(arguments),
+        "scene-layer-remove" => parse_scene_layer_remove(arguments),
         "input-remove" => parse_input_remove(arguments),
         "input-duplicate" => parse_input_duplicate(arguments),
         "input-replace-simulated" => parse_input_replace_simulated(arguments),
@@ -942,6 +948,16 @@ fn parse_scene_layer_add(
         z_order,
         name,
     })
+}
+
+fn parse_scene_layer_remove(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Command, ArgsError> {
+    let path = required_path(&mut arguments, "project path")?;
+    let scene = number(&required(&mut arguments, "scene")?, "scene")?;
+    let index = number(&required(&mut arguments, "layer index")?, "layer index")?;
+    reject_extra(&mut arguments)?;
+    Ok(Command::SceneLayerRemove { path, scene, index })
 }
 
 fn parse_input_remove(mut arguments: impl Iterator<Item = String>) -> Result<Command, ArgsError> {

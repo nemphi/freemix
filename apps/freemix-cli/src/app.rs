@@ -98,6 +98,9 @@ pub fn run(command: Command) -> AppResult<()> {
             z_order,
             name,
         } => add_scene_layer(&path, scene_id(scene)?, input_id(source)?, z_order, name)?,
+        Command::SceneLayerRemove { path, scene, index } => {
+            remove_scene_layer(&path, scene_id(scene)?, index)?
+        }
         Command::InputRemove { path, input } => remove_input(&path, input_id(input)?)?,
         Command::InputDuplicate {
             path,
@@ -1286,6 +1289,25 @@ fn add_scene_layer(
     Ok(())
 }
 
+fn remove_scene_layer(path: &Path, scene: SceneId, index: usize) -> AppResult<()> {
+    let store = ProjectStore::new(path)?;
+    let stored = load_stored_project(path)?;
+    let mut project = stored.project().clone();
+    project.remove_layer_from_scene(scene, index)?;
+    let configured = StoredProject::from_project_with_complete_runtime_state(
+        project,
+        stored.runtime_routing(),
+        stored.runtime_manual_transitions(),
+        stored.runtime_fade_to_black(),
+        stored.runtime_overlays().clone(),
+        stored.position(),
+        stored.idempotency_receipts().to_vec(),
+    )?;
+    store.save(&configured)?;
+    print_status(&load_engine(path)?);
+    Ok(())
+}
+
 fn remove_input(path: &Path, input: InputId) -> AppResult<()> {
     let stored = load_stored_project(path)?;
     let runtime = stored.runtime_routing();
@@ -2029,6 +2051,7 @@ Usage:
   freemix-cli input-add <show.freemix> <nonzero-input-id> <name>
   freemix-cli scene-input-add <show.freemix> <nonzero-input-id> <nonzero-scene-id> <name>
   freemix-cli scene-layer-add <show.freemix> <scene-id> <source-input-id> <z-order> <layer-name>
+  freemix-cli scene-layer-remove <show.freemix> <scene-id> <zero-based-layer-index>
   freemix-cli input-remove <show.freemix> <input-id>
   freemix-cli input-duplicate <show.freemix> <source-input-id> <new-nonzero-input-id> <new-name>
   freemix-cli input-replace-simulated <show.freemix> <input-id>
