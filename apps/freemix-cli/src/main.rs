@@ -1,6 +1,7 @@
 mod app;
 mod args;
 mod remote;
+mod scene_render;
 
 use std::process::ExitCode;
 
