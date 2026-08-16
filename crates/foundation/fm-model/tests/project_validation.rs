@@ -407,10 +407,12 @@ fn add_scene_input_is_atomic_and_uses_current_name_contract() {
         required_capabilities: Vec::new(),
     });
     let expected = invalid.validate().unwrap_err();
+    let before = invalid.clone();
     assert_eq!(
         invalid.add_scene_input_checked(scene_id(9), "New".into(), input_id(10), "New".into()),
         Err(InvalidProject(expected))
     );
+    assert_eq!(invalid, before);
 }
 
 #[test]

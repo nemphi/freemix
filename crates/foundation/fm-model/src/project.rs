@@ -51,17 +51,6 @@ pub enum AddSceneInputError {
     InvalidProject(Vec<ValidationError>),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum NewSceneInputError {
-    DuplicateSceneId(SceneId),
-    DuplicateInputId(InputId),
-    EmptySceneName,
-    DuplicateSceneName,
-    EmptyInputName,
-    InputNameTooLong,
-    DuplicateInputName,
-}
-
 impl Project {
     fn validate_new_scene_input(
         &self,
@@ -69,63 +58,52 @@ impl Project {
         scene_name: &str,
         input: InputId,
         input_name: &str,
-    ) -> Result<(), NewSceneInputError> {
+    ) -> Result<(), AddSceneInputError> {
         if self.scenes.iter().any(|candidate| candidate.id == scene) {
-            return Err(NewSceneInputError::DuplicateSceneId(scene));
+            return Err(AddSceneInputError::DuplicateSceneId(scene));
         }
         if self.inputs.iter().any(|candidate| candidate.id == input) {
-            return Err(NewSceneInputError::DuplicateInputId(input));
+            return Err(AddSceneInputError::DuplicateInputId(input));
         }
         if scene_name.trim().is_empty() {
-            return Err(NewSceneInputError::EmptySceneName);
+            return Err(AddSceneInputError::EmptySceneName);
         }
         if self
             .scenes
             .iter()
             .any(|candidate| candidate.name.eq_ignore_ascii_case(scene_name))
         {
-            return Err(NewSceneInputError::DuplicateSceneName);
+            return Err(AddSceneInputError::DuplicateSceneName);
         }
         if input_name.trim().is_empty() {
-            return Err(NewSceneInputError::EmptyInputName);
+            return Err(AddSceneInputError::EmptyInputName);
         }
         if input_name.len() > fm_types::MAX_INPUT_NAME_BYTES {
-            return Err(NewSceneInputError::InputNameTooLong);
+            return Err(AddSceneInputError::InputNameTooLong);
         }
         if self
             .inputs
             .iter()
             .any(|candidate| candidate.name == input_name)
         {
-            return Err(NewSceneInputError::DuplicateInputName);
+            return Err(AddSceneInputError::DuplicateInputName);
         }
         Ok(())
     }
 }
 
-macro_rules! map_new_scene_input_error {
-    ($error:expr, $target:ident) => {
-        match $error {
-            NewSceneInputError::DuplicateSceneId(value) => $target::DuplicateSceneId(value),
-            NewSceneInputError::DuplicateInputId(value) => $target::DuplicateInputId(value),
-            NewSceneInputError::EmptySceneName => $target::EmptySceneName,
-            NewSceneInputError::DuplicateSceneName => $target::DuplicateSceneName,
-            NewSceneInputError::EmptyInputName => $target::EmptyInputName,
-            NewSceneInputError::InputNameTooLong => $target::InputNameTooLong,
-            NewSceneInputError::DuplicateInputName => $target::DuplicateInputName,
+impl From<AddSceneInputError> for DuplicateSceneInputError {
+    fn from(error: AddSceneInputError) -> Self {
+        match error {
+            AddSceneInputError::DuplicateSceneId(value) => Self::DuplicateSceneId(value),
+            AddSceneInputError::DuplicateInputId(value) => Self::DuplicateInputId(value),
+            AddSceneInputError::EmptySceneName => Self::EmptySceneName,
+            AddSceneInputError::DuplicateSceneName => Self::DuplicateSceneName,
+            AddSceneInputError::EmptyInputName => Self::EmptyInputName,
+            AddSceneInputError::InputNameTooLong => Self::InputNameTooLong,
+            AddSceneInputError::DuplicateInputName => Self::DuplicateInputName,
+            AddSceneInputError::InvalidProject(errors) => Self::InvalidProject(errors),
         }
-    };
-}
-
-impl From<NewSceneInputError> for AddSceneInputError {
-    fn from(error: NewSceneInputError) -> Self {
-        map_new_scene_input_error!(error, AddSceneInputError)
-    }
-}
-
-impl From<NewSceneInputError> for DuplicateSceneInputError {
-    fn from(error: NewSceneInputError) -> Self {
-        map_new_scene_input_error!(error, DuplicateSceneInputError)
     }
 }
 

@@ -2670,10 +2670,40 @@ fn local_scene_input_add_persists_empty_scene_without_routing() {
 
     let before_duplicate = manifest(&context.project);
     let store = ProjectStore::new(&context.project).unwrap();
+    let stored_before_duplicate = store.load().unwrap();
     let journal_before_duplicate = journal_bytes(&store);
     let duplicate = invoke(&["scene-input-add", context.project_path(), "3", "8", "Other"]);
     assert_failure_contains(&duplicate, "input 3 already exists");
     assert_eq!(manifest(&context.project), before_duplicate);
+    let stored_after_duplicate = store.load().unwrap();
+    assert_eq!(
+        stored_after_duplicate.project(),
+        stored_before_duplicate.project()
+    );
+    assert_eq!(
+        stored_after_duplicate.runtime_routing(),
+        stored_before_duplicate.runtime_routing()
+    );
+    assert_eq!(
+        stored_after_duplicate.runtime_manual_transitions(),
+        stored_before_duplicate.runtime_manual_transitions()
+    );
+    assert_eq!(
+        stored_after_duplicate.runtime_fade_to_black(),
+        stored_before_duplicate.runtime_fade_to_black()
+    );
+    assert_eq!(
+        stored_after_duplicate.runtime_overlays(),
+        stored_before_duplicate.runtime_overlays()
+    );
+    assert_eq!(
+        stored_after_duplicate.position(),
+        stored_before_duplicate.position()
+    );
+    assert_eq!(
+        stored_after_duplicate.idempotency_receipts(),
+        stored_before_duplicate.idempotency_receipts()
+    );
     assert_eq!(journal_bytes(&store), journal_before_duplicate);
     fs::remove_dir_all(context.root).unwrap();
 }
