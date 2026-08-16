@@ -311,6 +311,11 @@ pub enum Command {
         path: PathBuf,
         input: u128,
     },
+    InputReplaceMedia {
+        path: PathBuf,
+        input: u128,
+        asset_uri: String,
+    },
     Status {
         path: PathBuf,
     },
@@ -766,6 +771,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
         "input-remove" => parse_input_remove(arguments),
         "input-duplicate" => parse_input_duplicate(arguments),
         "input-replace-simulated" => parse_input_replace_simulated(arguments),
+        "input-replace-media" => parse_input_replace_media(arguments),
         "status" => {
             let path = required_path(&mut arguments, "project path")?;
             reject_extra(&mut arguments)?;
@@ -1801,6 +1807,20 @@ fn parse_input_replace_simulated(
     let input = number(&required(&mut arguments, "input")?, "input")?;
     reject_extra(&mut arguments)?;
     Ok(Command::InputReplaceSimulated { path, input })
+}
+
+fn parse_input_replace_media(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Command, ArgsError> {
+    let path = required_path(&mut arguments, "project path")?;
+    let input = number(&required(&mut arguments, "input")?, "input")?;
+    let asset_uri = required(&mut arguments, "asset URI")?;
+    reject_extra(&mut arguments)?;
+    Ok(Command::InputReplaceMedia {
+        path,
+        input,
+        asset_uri,
+    })
 }
 
 fn parse_local_timed_transition(

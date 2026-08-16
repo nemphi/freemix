@@ -379,6 +379,14 @@ pub fn run(command: Command) -> AppResult<()> {
         Command::InputReplaceSimulated { path, input } => {
             replace_input_simulated(&path, input_id(input)?)?
         }
+        Command::InputReplaceMedia {
+            path,
+            input,
+            asset_uri,
+        } => {
+            validate_asset_uri(&asset_uri)?;
+            replace_input_media(&path, input_id(input)?, asset_uri)?;
+        }
         Command::Status { path } => print_status(&load_engine(&path)?),
         Command::JournalRecover { path } => recover_journal(&path)?,
         Command::Inputs { path } => {
@@ -2234,6 +2242,14 @@ fn replace_input_simulated(path: &Path, input: InputId) -> AppResult<()> {
     Ok(())
 }
 
+fn replace_input_media(path: &Path, input: InputId, asset_uri: String) -> AppResult<()> {
+    update_project(path, |project| {
+        project
+            .replace_input_source(input, InputKind::Media { asset_uri }, Vec::new())
+            .map_err(Into::into)
+    })
+}
+
 fn remove_stinger(path: &Path, slot: StingerSlotNumber) -> AppResult<()> {
     update_project(path, |project| {
         let _ = project.remove_stinger(slot);
@@ -3055,6 +3071,7 @@ Usage:
   freemix-cli input-remove <show.freemix> <input-id>
   freemix-cli input-duplicate <show.freemix> <source-input-id> <new-nonzero-input-id> <new-name>
   freemix-cli input-replace-simulated <show.freemix> <input-id>
+  freemix-cli input-replace-media <show.freemix> <input-id> <asset://key>
   freemix-cli status <show.freemix>
   freemix-cli journal-recover <show.freemix>
   freemix-cli inputs <show.freemix>
