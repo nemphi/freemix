@@ -24,6 +24,7 @@ use fm_model::{
     SolidColor, SourceRef, StartupPolicy, StingerAudioPolicy as ModelStingerAudioPolicy,
     StingerConfig, StingerMissingMediaFallback, StingerSlotNumber,
 };
+use fm_persistence::validate_asset_uri;
 use fm_persistence::{
     FadeToBlackState as PersistedFadeToBlackState, IdempotencyReceipt,
     ManualTransitionKind as PersistedManualTransitionKind,
@@ -82,6 +83,20 @@ pub fn run(command: Command) -> AppResult<()> {
         }
         Command::InputAdd { path, input, name } => {
             add_input(&path, input_id(input)?, name)?;
+        }
+        Command::MediaInputAdd {
+            path,
+            input,
+            name,
+            asset_uri,
+        } => {
+            validate_asset_uri(&asset_uri)?;
+            add_input_with_kind(
+                &path,
+                input_id(input)?,
+                name,
+                InputKind::Media { asset_uri },
+            )?;
         }
         Command::AudioBusAdd { path, bus, name } => {
             add_audio_bus(&path, bus_id(bus)?, name)?;
@@ -1333,16 +1348,30 @@ fn configure_stinger(path: &Path, config: StingerConfig) -> AppResult<()> {
 }
 
 fn add_input(path: &Path, input: InputId, name: String) -> AppResult<()> {
+    add_input_with_kind(
+        path,
+        input,
+        name,
+        InputKind::Simulated(SimulatedInput::new(
+            SimulatedVideo::Bars,
+            SimulatedAudio::Silence,
+        )),
+    )
+}
+
+fn add_input_with_kind(
+    path: &Path,
+    input: InputId,
+    name: String,
+    kind: InputKind,
+) -> AppResult<()> {
     let store = ProjectStore::new(path)?;
     let stored = load_stored_project(path)?;
     let mut project = stored.project().clone();
     project.add_input(Input {
         id: input,
         name,
-        kind: InputKind::Simulated(SimulatedInput::new(
-            SimulatedVideo::Bars,
-            SimulatedAudio::Silence,
-        )),
+        kind,
         required_capabilities: Vec::new(),
     });
     let configured = StoredProject::from_project_with_complete_runtime_state(
@@ -2570,6 +2599,7 @@ FreeMix deterministic MVP
 Usage:
   freemix-cli new <show.freemix> [--name <name>]
   freemix-cli input-add <show.freemix> <nonzero-input-id> <name>
+  freemix-cli media-input-add <show.freemix> <nonzero-input-id> <name> <asset://key>
   freemix-cli audio-bus-add <show.freemix> <nonzero-bus-id> <name>
   freemix-cli output-add <show.freemix> <nonzero-output-id> <nonzero-scene-id> <nonzero-bus-id> <name>
   freemix-cli output-route <show.freemix> <existing-output-id> <existing-scene-id> <existing-bus-id>

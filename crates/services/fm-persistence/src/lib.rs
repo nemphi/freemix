@@ -6,7 +6,7 @@ mod json;
 mod model;
 mod store;
 
-pub use asset::{AssetAuditIssue, AssetAuditReason, AssetResolveError};
+pub use asset::{AssetAuditIssue, AssetAuditReason, AssetResolveError, validate_asset_uri};
 pub use journal::{
     CompactionReport, JournalError, JournalScan, MAX_JOURNAL_RECORD_BYTES, MutationBatch,
 };

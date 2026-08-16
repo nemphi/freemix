@@ -27,7 +27,7 @@ impl ProjectStore {
     /// the resolved target escapes the assets directory, or the target is not a
     /// regular file.
     pub fn resolve_asset_uri(&self, uri: &str) -> Result<PathBuf, AssetResolveError> {
-        let key = validate_asset_uri(uri)?;
+        let key = asset_uri_key(uri)?;
         let assets_root = fs::canonicalize(self.assets_root())
             .map_err(AssetResolveError::AssetsRootUnavailable)?;
         if !fs::metadata(&assets_root)
@@ -105,7 +105,12 @@ pub enum AssetAuditReason {
     NotRegularFile,
 }
 
-fn validate_asset_uri(uri: &str) -> Result<&str, AssetResolveError> {
+/// Validates the strict syntax of a project `asset://` URI without filesystem access.
+pub fn validate_asset_uri(uri: &str) -> Result<(), AssetResolveError> {
+    asset_uri_key(uri).map(|_| ())
+}
+
+fn asset_uri_key(uri: &str) -> Result<&str, AssetResolveError> {
     if uri.len() > MAX_ASSET_URI_BYTES {
         return Err(AssetResolveError::InvalidUri);
     }

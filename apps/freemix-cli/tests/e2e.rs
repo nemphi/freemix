@@ -1852,6 +1852,98 @@ fn local_input_add_persists_default_simulated_strip() {
 }
 
 #[test]
+fn local_media_input_add_persists_offline_asset_contract() {
+    let context = ContractContext::new();
+    assert_success(&invoke(&["new", context.project_path()]));
+    let store = ProjectStore::new(&context.project).unwrap();
+    let before = store.load().unwrap();
+    assert_success(&invoke(&[
+        "media-input-add",
+        context.project_path(),
+        "9",
+        "Media  input ",
+        "asset://missing/video.ppm",
+    ]));
+    let after = store.load().unwrap();
+    let input = after
+        .project()
+        .inputs()
+        .iter()
+        .find(|input| input.id == InputId::new(NonZeroU128::new(9).unwrap()))
+        .unwrap();
+    assert_eq!(input.name, "Media  input ");
+    assert!(matches!(
+        &input.kind,
+        InputKind::Media { asset_uri } if asset_uri == "asset://missing/video.ppm"
+    ));
+    assert!(input.required_capabilities.is_empty());
+    assert_eq!(
+        after.project().input_audio_strip(input.id).unwrap(),
+        Default::default()
+    );
+    assert_eq!(after.position(), before.position());
+    assert_eq!(after.runtime_routing(), before.runtime_routing());
+    assert_eq!(
+        after.runtime_manual_transitions(),
+        before.runtime_manual_transitions()
+    );
+    assert_eq!(
+        after.runtime_fade_to_black(),
+        before.runtime_fade_to_black()
+    );
+    assert_eq!(after.runtime_overlays(), before.runtime_overlays());
+    assert_eq!(after.idempotency_receipts(), before.idempotency_receipts());
+
+    let audit = invoke(&["asset-audit", context.project_path()]);
+    assert!(!audit.status.success());
+    assert_eq!(stdout(&audit), "input=9 reason=missing-asset");
+
+    let manifest_before_failure = fs::read(context.project.join("project.json")).unwrap();
+    let journal_before_failure = journal_bytes(&store);
+    let invalid = invoke(&[
+        "media-input-add",
+        context.project_path(),
+        "10",
+        "Invalid",
+        "not-an-asset",
+    ]);
+    assert_failure_contains(&invalid, "invalid project asset URI");
+    assert_eq!(
+        fs::read(context.project.join("project.json")).unwrap(),
+        manifest_before_failure
+    );
+    assert_eq!(journal_bytes(&store), journal_before_failure);
+
+    let duplicate_id = invoke(&[
+        "media-input-add",
+        context.project_path(),
+        "9",
+        "Other",
+        "asset://other.ppm",
+    ]);
+    assert_failure_contains(&duplicate_id, "domain project failed validation");
+    assert_eq!(
+        fs::read(context.project.join("project.json")).unwrap(),
+        manifest_before_failure
+    );
+    assert_eq!(journal_bytes(&store), journal_before_failure);
+    let duplicate_name = invoke(&[
+        "media-input-add",
+        context.project_path(),
+        "10",
+        "Media  input ",
+        "asset://other.ppm",
+    ]);
+    assert_failure_contains(&duplicate_name, "domain project failed validation");
+    assert_eq!(
+        fs::read(context.project.join("project.json")).unwrap(),
+        manifest_before_failure
+    );
+    assert_eq!(journal_bytes(&store), journal_before_failure);
+    fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
 fn local_asset_audit_reports_stable_issues_without_mutation() {
     let context = ContractContext::new();
     assert_success(&invoke(&["new", context.project_path()]));
