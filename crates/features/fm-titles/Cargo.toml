@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+ab_glyph = "0.2.32"
 fm-types = { path = "../../foundation/fm-types" }
 fm-video = { path = "../../media/fm-video" }
 
