@@ -2268,7 +2268,7 @@ fn local_output_route_persists_existing_route_and_rejects_unknown_reference() {
         "audio-bus-add",
         context.project_path(),
         "21",
-        "Aux",
+        "Aux \"A\"",
     ]));
     assert_success(&invoke(&[
         "output-add",
@@ -2299,7 +2299,7 @@ fn local_output_route_persists_existing_route_and_rejects_unknown_reference() {
         before.project().audio_buses()[1].id,
         BusId::new(NonZeroU128::new(21).unwrap())
     );
-    assert_eq!(before.project().audio_buses()[1].name, "Aux");
+    assert_eq!(before.project().audio_buses()[1].name, "Aux \"A\"");
     assert!(before.project().audio_buses()[1].sends.is_empty());
     assert_eq!(before.project().outputs().len(), 2);
     assert_eq!(
@@ -2353,13 +2353,22 @@ fn local_output_route_persists_existing_route_and_rejects_unknown_reference() {
     assert_eq!(after.position(), before.position());
     assert_eq!(after.idempotency_receipts(), before.idempotency_receipts());
     assert_success(&invoke(&["status", context.project_path()]));
+    let audio_buses = invoke(&["audio-buses", context.project_path()]);
+    assert_success(&audio_buses);
+    assert_eq!(
+        stdout(&audio_buses),
+        concat!(
+            "audio_bus id=20 name=\"Master\" sends=[]\n",
+            "audio_bus id=21 name=\"Aux \\\"A\\\"\" sends=[]"
+        )
+    );
     let outputs = invoke(&["outputs", context.project_path()]);
     assert_success(&outputs);
     assert_eq!(
         stdout(&outputs),
         concat!(
-            "output id=30 name=\"Program \\\"Main\\\"\" video_scene=11 video_scene_name=\"Close\" audio_bus=21 audio_bus_name=\"Aux\" startup=stopped capabilities=[]\n",
-            "output id=31 name=\"Auxiliary\" video_scene=11 video_scene_name=\"Close\" audio_bus=21 audio_bus_name=\"Aux\" startup=stopped capabilities=[]"
+            "output id=30 name=\"Program \\\"Main\\\"\" video_scene=11 video_scene_name=\"Close\" audio_bus=21 audio_bus_name=\"Aux \\\"A\\\"\" startup=stopped capabilities=[]\n",
+            "output id=31 name=\"Auxiliary\" video_scene=11 video_scene_name=\"Close\" audio_bus=21 audio_bus_name=\"Aux \\\"A\\\"\" startup=stopped capabilities=[]"
         )
     );
 

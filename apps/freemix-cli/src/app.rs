@@ -298,6 +298,10 @@ pub fn run(command: Command) -> AppResult<()> {
             let stored = load_stored_project(&path)?;
             print_outputs(stored.project());
         }
+        Command::AudioBuses { path } => {
+            let stored = load_stored_project(&path)?;
+            print_audio_buses(stored.project());
+        }
         Command::AssetAudit { path } => audit_assets(&path)?,
         Command::AudioStrip {
             path,
@@ -2490,6 +2494,21 @@ fn print_outputs(project: &Project) {
     }
 }
 
+fn print_audio_buses(project: &Project) {
+    for bus in project.audio_buses() {
+        let sends = bus
+            .sends
+            .iter()
+            .map(|send| send.destination.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        println!(
+            "audio_bus id={} name={:?} sends=[{sends}]",
+            bus.id, bus.name,
+        );
+    }
+}
+
 const fn input_kind_name(kind: &InputKind) -> &'static str {
     match kind {
         InputKind::Color => "color",
@@ -2670,6 +2689,7 @@ Usage:
   freemix-cli journal-recover <show.freemix>
   freemix-cli inputs <show.freemix>
   freemix-cli outputs <show.freemix>
+  freemix-cli audio-buses <show.freemix>
   freemix-cli asset-audit <show.freemix>
   freemix-cli audio-strip <show.freemix> <input> <gain-millidb:-96000..=24000> <balance-bp:-10000..=10000> <muted:on|off> <soloed:on|off> <follow-video:on|off> <delay-samples:0..=48000>
   freemix-cli rename <show.freemix> <input> <name> [--key <key>] [--expect <revision>]
