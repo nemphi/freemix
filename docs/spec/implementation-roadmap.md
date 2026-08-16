@@ -298,8 +298,7 @@ carries an authoritative full input reorder through the EditProject command and
 durable input-order event; the daemon persists that vector order and restores
 the order after restart. Studio now has a compact permission-gated rename editor.
 The local `input-add`, `simulated-solid-input-add`, `media-input-add`, `scene-input-add`, `scene-input-duplicate`, `input-duplicate`, `input-remove`, and
-`input-replace-simulated` commands persist input state for the next project open
-only. `scene-input-add` creates an empty opaque-black scene with no layers and no
+`input-replace-solid` commands persist deterministic input state for the next project open only; `input-replace-solid` has no live, native, protocol, or IN-026 acceptance. `scene-input-add` creates an empty opaque-black scene with no layers and no
 audio source. `scene-input-audio-source` and `scene-input-audio-source-clear`
 persist the scene input audio route. `scene-layer-add`, `scene-layer-remove`, `scene-layer-duplicate`, `scene-layer-copy`, `scene-layer-rename`, `scene-layer-appearance`,
 `scene-layer-geometry`, `scene-layer-crop`, `scene-layer-crop-clear`,

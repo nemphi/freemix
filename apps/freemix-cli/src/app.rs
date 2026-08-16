@@ -376,9 +376,18 @@ pub fn run(command: Command) -> AppResult<()> {
             input,
             name,
         } => duplicate_input(&path, input_id(source)?, input_id(input)?, name)?,
-        Command::InputReplaceSimulated { path, input } => {
-            replace_input_simulated(&path, input_id(input)?)?
-        }
+        Command::InputReplaceSolid {
+            path,
+            input,
+            red,
+            green,
+            blue,
+            alpha,
+        } => replace_input_solid(
+            &path,
+            input_id(input)?,
+            SolidColor::new(red, green, blue, alpha),
+        )?,
         Command::InputReplaceMedia {
             path,
             input,
@@ -2217,29 +2226,19 @@ fn duplicate_input(path: &Path, source: InputId, input: InputId, name: String) -
     Ok(())
 }
 
-fn replace_input_simulated(path: &Path, input: InputId) -> AppResult<()> {
-    let stored = load_stored_project(path)?;
-    let mut project = stored.project().clone();
-    project.replace_input_source(
-        input,
-        InputKind::Simulated(SimulatedInput::new(
-            SimulatedVideo::Bars,
-            SimulatedAudio::Silence,
-        )),
-        Vec::new(),
-    )?;
-    let configured = StoredProject::from_project_with_complete_runtime_state(
-        project,
-        stored.runtime_routing(),
-        stored.runtime_manual_transitions(),
-        stored.runtime_fade_to_black(),
-        stored.runtime_overlays().clone(),
-        stored.position(),
-        stored.idempotency_receipts().to_vec(),
-    )?;
-    ProjectStore::new(path)?.save(&configured)?;
-    print_status(&load_engine(path)?);
-    Ok(())
+fn replace_input_solid(path: &Path, input: InputId, color: SolidColor) -> AppResult<()> {
+    update_project(path, |project| {
+        project
+            .replace_input_source(
+                input,
+                InputKind::Simulated(SimulatedInput::new(
+                    SimulatedVideo::Solid(color),
+                    SimulatedAudio::Silence,
+                )),
+                Vec::new(),
+            )
+            .map_err(Into::into)
+    })
 }
 
 fn replace_input_media(path: &Path, input: InputId, asset_uri: String) -> AppResult<()> {
@@ -3070,7 +3069,7 @@ Usage:
   freemix-cli project-rename <show.freemix> <name>
   freemix-cli input-remove <show.freemix> <input-id>
   freemix-cli input-duplicate <show.freemix> <source-input-id> <new-nonzero-input-id> <new-name>
-  freemix-cli input-replace-simulated <show.freemix> <input-id>
+  freemix-cli input-replace-solid <show.freemix> <input-id> <red:0..=255> <green:0..=255> <blue:0..=255> <alpha:0..=255>
   freemix-cli input-replace-media <show.freemix> <input-id> <asset://key>
   freemix-cli status <show.freemix>
   freemix-cli journal-recover <show.freemix>

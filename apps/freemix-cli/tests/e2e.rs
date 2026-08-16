@@ -4969,9 +4969,34 @@ fn local_input_duplicate_copies_source_and_strip() {
 }
 
 #[test]
-fn local_input_replace_simulated_preserves_identity_and_runtime() {
+fn local_input_replace_solid_preserves_identity_and_runtime() {
     let context = ContractContext::new();
-    assert_success(&invoke(&["new", context.project_path()]));
+    assert_success(&invoke(&[
+        "new",
+        context.project_path(),
+        "--name",
+        "Solid Replace Show",
+    ]));
+    assert_success(&invoke(&[
+        "audio-strip",
+        context.project_path(),
+        "2",
+        "-1200",
+        "2500",
+        "on",
+        "off",
+        "off",
+        "480",
+    ]));
+    assert_success(&invoke(&[
+        "tbar-start",
+        context.project_path(),
+        "fade",
+        "--key",
+        "replace-solid-runtime",
+        "--expect",
+        "1",
+    ]));
     let before = ProjectStore::new(&context.project).unwrap().load().unwrap();
     let input = InputId::new(NonZeroU128::new(2).unwrap());
     let before_input = before
@@ -4989,9 +5014,13 @@ fn local_input_replace_simulated_preserves_identity_and_runtime() {
     ));
 
     assert_success(&invoke(&[
-        "input-replace-simulated",
+        "input-replace-solid",
         context.project_path(),
         "2",
+        "1",
+        "127",
+        "254",
+        "0",
     ]));
     let after = ProjectStore::new(&context.project).unwrap().load().unwrap();
     let after_input = after
@@ -5002,6 +5031,21 @@ fn local_input_replace_simulated_preserves_identity_and_runtime() {
         .unwrap();
     assert_eq!(after_input.id, before_input.id);
     assert_eq!(after_input.name, before_input.name);
+    assert_eq!(after_input.required_capabilities, Vec::<String>::new());
+    assert_eq!(
+        after_input.kind,
+        InputKind::Simulated(SimulatedInput::new(
+            SimulatedVideo::Solid(SolidColor::new(1, 127, 254, 0)),
+            SimulatedAudio::Silence,
+        ))
+    );
+    assert_eq!(
+        after.project().schema_version(),
+        before.project().schema_version()
+    );
+    assert_eq!(after.project().id(), before.project().id());
+    assert_eq!(after.project().name(), before.project().name());
+    assert_eq!(after.project().settings(), before.project().settings());
     assert_eq!(
         after
             .project()
@@ -5017,8 +5061,20 @@ fn local_input_replace_simulated_preserves_identity_and_runtime() {
             .collect::<Vec<_>>()
     );
     assert_eq!(
-        after.project().input_audio_strip(input),
-        before.project().input_audio_strip(input)
+        after.project().input_audio_strips(),
+        before.project().input_audio_strips()
+    );
+    assert_eq!(after.project().scenes(), before.project().scenes());
+    assert_eq!(
+        after.project().audio_buses(),
+        before.project().audio_buses()
+    );
+    assert_eq!(after.project().outputs(), before.project().outputs());
+    assert_eq!(after.project().main_mix(), before.project().main_mix());
+    assert_eq!(after.project().stingers(), before.project().stingers());
+    assert_eq!(
+        after.project().restart_policy(),
+        before.project().restart_policy()
     );
     assert_eq!(after.runtime_routing(), before.runtime_routing());
     assert_eq!(
@@ -5032,20 +5088,24 @@ fn local_input_replace_simulated_preserves_identity_and_runtime() {
     assert_eq!(after.runtime_overlays(), before.runtime_overlays());
     assert_eq!(after.position(), before.position());
     assert_eq!(after.idempotency_receipts(), before.idempotency_receipts());
-    assert!(matches!(
-        &after_input.kind,
-        InputKind::Simulated(SimulatedInput {
-            video: SimulatedVideo::Bars,
-            audio: SimulatedAudio::Silence
-        })
-    ));
 
     let unchanged = manifest(&context.project);
+    let store = ProjectStore::new(&context.project).unwrap();
+    let journal_before = journal_bytes(&store);
     assert_failure_contains(
-        &invoke(&["input-replace-simulated", context.project_path(), "999"]),
+        &invoke(&[
+            "input-replace-solid",
+            context.project_path(),
+            "999",
+            "1",
+            "127",
+            "254",
+            "0",
+        ]),
         "unknown input 999",
     );
     assert_eq!(manifest(&context.project), unchanged);
+    assert_eq!(journal_bytes(&store), journal_before);
     fs::remove_dir_all(context.root).unwrap();
 }
 

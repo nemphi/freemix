@@ -307,9 +307,13 @@ pub enum Command {
         input: u128,
         name: String,
     },
-    InputReplaceSimulated {
+    InputReplaceSolid {
         path: PathBuf,
         input: u128,
+        red: u8,
+        green: u8,
+        blue: u8,
+        alpha: u8,
     },
     InputReplaceMedia {
         path: PathBuf,
@@ -770,7 +774,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
         "scene-layer-mask-clear" => parse_scene_layer_mask_clear(arguments),
         "input-remove" => parse_input_remove(arguments),
         "input-duplicate" => parse_input_duplicate(arguments),
-        "input-replace-simulated" => parse_input_replace_simulated(arguments),
+        "input-replace-solid" => parse_input_replace_solid(arguments),
         "input-replace-media" => parse_input_replace_media(arguments),
         "status" => {
             let path = required_path(&mut arguments, "project path")?;
@@ -1800,13 +1804,24 @@ fn parse_input_duplicate(
     })
 }
 
-fn parse_input_replace_simulated(
+fn parse_input_replace_solid(
     mut arguments: impl Iterator<Item = String>,
 ) -> Result<Command, ArgsError> {
     let path = required_path(&mut arguments, "project path")?;
     let input = number(&required(&mut arguments, "input")?, "input")?;
+    let red = bounded_u8(&required(&mut arguments, "red")?, "red", u8::MAX)?;
+    let green = bounded_u8(&required(&mut arguments, "green")?, "green", u8::MAX)?;
+    let blue = bounded_u8(&required(&mut arguments, "blue")?, "blue", u8::MAX)?;
+    let alpha = bounded_u8(&required(&mut arguments, "alpha")?, "alpha", u8::MAX)?;
     reject_extra(&mut arguments)?;
-    Ok(Command::InputReplaceSimulated { path, input })
+    Ok(Command::InputReplaceSolid {
+        path,
+        input,
+        red,
+        green,
+        blue,
+        alpha,
+    })
 }
 
 fn parse_input_replace_media(
