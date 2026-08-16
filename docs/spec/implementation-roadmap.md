@@ -301,14 +301,14 @@ The local `input-add`, `simulated-solid-input-add`, `media-input-add`, `scene-in
 `input-replace-simulated` commands persist input state for the next project open
 only. `scene-input-add` creates an empty opaque-black scene with no layers and no
 audio source. `scene-input-audio-source` and `scene-input-audio-source-clear`
-persist the scene input audio route. `scene-layer-add`, `scene-layer-remove`, `scene-layer-rename`, `scene-layer-appearance`,
+persist the scene input audio route. `scene-layer-add`, `scene-layer-remove`, `scene-layer-duplicate`, `scene-layer-rename`, `scene-layer-appearance`,
 `scene-layer-geometry`, `scene-layer-crop`, `scene-layer-crop-clear`,
 `scene-layer-mask`, `scene-layer-mask-clear`, `scene-layer-z-order`, and
 `scene-background` (premultiplied RGBA), `scene-layer-source-input`,
-`scene-layer-source-scene`, and `scene-layer-add-scene` are local next-open
-layer-editing footholds only; direct scene composition rejects missing or cyclic
-sources and adds no render, live, or protocol acceptance; `SW-004` remains
-planned.
+`scene-layer-source-scene`, and `scene-layer-add-scene` are next-open local
+metadata/composition authoring only: direct scene composition rejects missing or
+cyclic sources, adds no render or live acceptance, and leaves `IN-020` and
+`SW-006` planned.
 `scene-remove` is local next-open scene removal only; it does not add cascade
 behavior, rendering, live editing, daemon/Studio/protocol mutation, output
 realization, or acceptance.

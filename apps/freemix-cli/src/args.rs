@@ -208,6 +208,12 @@ pub enum Command {
         scene: u128,
         index: usize,
     },
+    SceneLayerDuplicate {
+        path: PathBuf,
+        scene: u128,
+        index: usize,
+        name: String,
+    },
     SceneLayerRename {
         path: PathBuf,
         scene: u128,
@@ -731,6 +737,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
         "scene-layer-add" => parse_scene_layer_add(arguments),
         "scene-layer-add-scene" => parse_scene_layer_add_scene(arguments),
         "scene-layer-remove" => parse_scene_layer_remove(arguments),
+        "scene-layer-duplicate" => parse_scene_layer_duplicate(arguments),
         "scene-layer-rename" => parse_scene_layer_rename(arguments),
         "scene-layer-source-input" => parse_scene_layer_source_input(arguments),
         "scene-layer-source-scene" => parse_scene_layer_source_scene(arguments),
@@ -1501,6 +1508,22 @@ fn parse_scene_layer_remove(
     let index = number(&required(&mut arguments, "layer index")?, "layer index")?;
     reject_extra(&mut arguments)?;
     Ok(Command::SceneLayerRemove { path, scene, index })
+}
+
+fn parse_scene_layer_duplicate(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Command, ArgsError> {
+    let path = required_path(&mut arguments, "project path")?;
+    let scene = number(&required(&mut arguments, "scene")?, "scene")?;
+    let index = number(&required(&mut arguments, "layer index")?, "layer index")?;
+    let name = nonblank(&mut arguments, "layer name")?;
+    reject_extra(&mut arguments)?;
+    Ok(Command::SceneLayerDuplicate {
+        path,
+        scene,
+        index,
+        name,
+    })
 }
 
 fn parse_scene_layer_rename(

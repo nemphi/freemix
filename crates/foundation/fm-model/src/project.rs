@@ -1087,6 +1087,42 @@ impl Project {
         Ok(target.layers.remove(index))
     }
 
+    pub fn duplicate_scene_layer(
+        &mut self,
+        scene: SceneId,
+        index: usize,
+        name: String,
+    ) -> Result<(), SceneLayerError> {
+        let target = self
+            .scenes
+            .iter()
+            .find(|candidate| candidate.id == scene)
+            .ok_or(SceneLayerError::UnknownScene(scene))?;
+        let length = target.layers.len();
+        let mut layer =
+            target
+                .layers
+                .get(index)
+                .cloned()
+                .ok_or(SceneLayerError::LayerIndexOutOfRange {
+                    scene,
+                    index,
+                    length,
+                })?;
+        if name.trim().is_empty() {
+            return Err(SceneLayerError::EmptyName);
+        }
+        layer.name = name;
+        self.add_layer_to_scene(scene, layer)
+            .map_err(|error| match error {
+                AddSceneLayerError::UnknownScene(scene) => SceneLayerError::UnknownScene(scene),
+                AddSceneLayerError::EmptyName => SceneLayerError::EmptyName,
+                AddSceneLayerError::MissingInput(input) => SceneLayerError::MissingInput(input),
+                AddSceneLayerError::MissingScene(scene) => SceneLayerError::MissingScene(scene),
+                AddSceneLayerError::SourceCycle => SceneLayerError::SourceCycle,
+            })
+    }
+
     pub fn set_scene_layer_z_order(
         &mut self,
         scene: SceneId,

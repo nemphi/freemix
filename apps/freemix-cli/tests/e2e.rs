@@ -4022,6 +4022,89 @@ fn local_scene_layer_rename_persists_exact_name_and_rejects_invalid_target() {
 }
 
 #[test]
+fn local_scene_layer_duplicate_copies_configured_layer() {
+    let context = ContractContext::new();
+    let path = context.project_path();
+    let run = |arguments: &[&str]| assert_success(&invoke_bounded(arguments));
+    run(&["new", path]);
+    run(&["scene-input-add", path, "3", "7", "Scene"]);
+    run(&["scene-layer-add", path, "7", "1", "-4", "Original"]);
+    run(&["scene-layer-appearance", path, "7", "0", "off", "96"]);
+    run(&[
+        "scene-layer-geometry",
+        path,
+        "7",
+        "0",
+        "-12",
+        "34",
+        "640",
+        "480",
+        "270",
+    ]);
+    run(&["scene-layer-crop", path, "7", "0", "10", "20", "600", "400"]);
+    run(&[
+        "scene-layer-mask",
+        path,
+        "7",
+        "0",
+        "20",
+        "30",
+        "500",
+        "300",
+        "inverted",
+    ]);
+    run(&[
+        "tbar-start",
+        path,
+        "slide",
+        "--key",
+        "scene-layer-duplicate-runtime",
+        "--expect",
+        "0",
+    ]);
+
+    let store = ProjectStore::new(&context.project).unwrap();
+    let before = store.load().unwrap();
+    run(&["scene-layer-duplicate", path, "7", "0", "  Duplicate  "]);
+    let after = store.load().unwrap();
+    assert_eq!(
+        (
+            after.runtime_routing(),
+            after.runtime_manual_transitions(),
+            after.runtime_fade_to_black(),
+            after.runtime_overlays(),
+            after.position(),
+            after.idempotency_receipts(),
+        ),
+        (
+            before.runtime_routing(),
+            before.runtime_manual_transitions(),
+            before.runtime_fade_to_black(),
+            before.runtime_overlays(),
+            before.position(),
+            before.idempotency_receipts(),
+        )
+    );
+    let before_layer = &before.project().scenes()[0].layers[0];
+    let after_layers = &after.project().scenes()[0].layers;
+    let mut expected_duplicate = before_layer.clone();
+    expected_duplicate.name = "  Duplicate  ".into();
+    assert_eq!(after_layers, &[before_layer.clone(), expected_duplicate]);
+
+    let manifest_before = fs::read(context.project.join("project.json")).unwrap();
+    let rejected = invoke_bounded(&["scene-layer-duplicate", path, "7", "2", "Rejected"]);
+    assert_failure_contains(
+        &rejected,
+        "layer index 2 out of range for scene 7 with 2 layers",
+    );
+    assert_eq!(
+        fs::read(context.project.join("project.json")).unwrap(),
+        manifest_before
+    );
+    fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
 fn local_scene_layer_source_reassignment() {
     let context = ContractContext::new();
     assert_success(&invoke(&["new", context.project_path()]));

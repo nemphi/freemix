@@ -253,6 +253,12 @@ pub fn run(command: Command) -> AppResult<()> {
         Command::SceneLayerRemove { path, scene, index } => {
             remove_scene_layer(&path, scene_id(scene)?, index)?
         }
+        Command::SceneLayerDuplicate {
+            path,
+            scene,
+            index,
+            name,
+        } => duplicate_scene_layer(&path, scene_id(scene)?, index, name)?,
         Command::SceneLayerRename {
             path,
             scene,
@@ -1849,6 +1855,14 @@ fn remove_scene_layer(path: &Path, scene: SceneId, index: usize) -> AppResult<()
     store.save(&configured)?;
     print_status(&load_engine(path)?);
     Ok(())
+}
+
+fn duplicate_scene_layer(path: &Path, scene: SceneId, index: usize, name: String) -> AppResult<()> {
+    update_project(path, |project| {
+        project
+            .duplicate_scene_layer(scene, index, name)
+            .map_err(Into::into)
+    })
 }
 
 fn rename_scene_layer(path: &Path, scene: SceneId, index: usize, name: String) -> AppResult<()> {
