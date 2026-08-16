@@ -12,6 +12,14 @@ pub enum RemoveInputError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemoveSceneError {
+    UnknownScene(SceneId),
+    InputReference { input: InputId, scene: SceneId },
+    LayerReference { owner: SceneId, source: SceneId },
+    OutputReference { output: OutputId, scene: SceneId },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplaceInputError {
     UnknownInput(InputId),
 }
@@ -248,6 +256,25 @@ impl std::fmt::Display for RemoveInputError {
 }
 
 impl std::error::Error for RemoveInputError {}
+
+impl std::fmt::Display for RemoveSceneError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownScene(scene) => write!(formatter, "unknown scene {scene}"),
+            Self::InputReference { input, scene } => {
+                write!(formatter, "input {input} references scene {scene}")
+            }
+            Self::LayerReference { owner, source } => {
+                write!(formatter, "scene {owner} layer references scene {source}")
+            }
+            Self::OutputReference { output, scene } => {
+                write!(formatter, "output {output} references scene {scene}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RemoveSceneError {}
 
 pub const CURRENT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(17);
 
@@ -493,6 +520,36 @@ impl Project {
 
     pub fn add_scene(&mut self, scene: Scene) {
         self.scenes.push(scene);
+    }
+
+    pub fn remove_scene(&mut self, scene: SceneId) -> Result<(), RemoveSceneError> {
+        if !self.scenes.iter().any(|candidate| candidate.id == scene) {
+            return Err(RemoveSceneError::UnknownScene(scene));
+        }
+        if let Some(input) = self.inputs.iter().find_map(|input| {
+            matches!(input.kind, InputKind::Scene { scene_id, .. } if scene_id == scene)
+                .then_some(input.id)
+        }) {
+            return Err(RemoveSceneError::InputReference { input, scene });
+        }
+        if let Some((owner, source)) = self.scenes.iter().find_map(|owner| {
+            owner.layers.iter().find_map(|layer| {
+                matches!(layer.source, SourceRef::Scene(source) if source == scene)
+                    .then_some((owner.id, scene))
+            })
+        }) {
+            return Err(RemoveSceneError::LayerReference { owner, source });
+        }
+        if let Some(output) = self
+            .outputs
+            .iter()
+            .find(|output| output.video_source == scene)
+            .map(|output| output.id)
+        {
+            return Err(RemoveSceneError::OutputReference { output, scene });
+        }
+        self.scenes.retain(|candidate| candidate.id != scene);
+        Ok(())
     }
 
     pub fn set_scene_background(

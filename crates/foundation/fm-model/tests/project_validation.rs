@@ -4,9 +4,10 @@ use fm_model::{
     AudioBus, BusSend, CURRENT_SCHEMA_VERSION, CropRect, EntityRef, Input, InputAudioStripState,
     InputBalanceBasisPoints, InputDelaySamples, InputGainMilliDb, InputKind, Layer, LayerGeometry,
     MainMix, Output, OutputFormat, Project, ProjectSettings, RectMask, RemoveAudioBusError,
-    RemoveInputError, RemoveOutputError, RestartPolicy, Rgba8, Rotation, Scene, SimulatedAudio,
-    SimulatedInput, SimulatedVideo, SolidColor, SourceRef, StartupPolicy, StingerAudioPolicy,
-    StingerConfig, StingerMissingMediaFallback, StingerSlotNumber, ValidationErrorKind,
+    RemoveInputError, RemoveOutputError, RemoveSceneError, RestartPolicy, Rgba8, Rotation, Scene,
+    SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef, StartupPolicy,
+    StingerAudioPolicy, StingerConfig, StingerMissingMediaFallback, StingerSlotNumber,
+    ValidationErrorKind,
 };
 use fm_types::{
     AudioFormat, BusId, ChannelLayout, ColorMetadata, FrameRate, InputId, MAX_INPUT_NAME_BYTES,
@@ -748,6 +749,86 @@ fn scene_input_missing_scene_and_audio_references_are_reported() {
     assert!(errors.iter().any(|error| {
         error.kind == ValidationErrorKind::MissingReference(EntityRef::Input(input_id(98)))
     }));
+}
+
+#[test]
+fn scene_removal_checks_references_in_order_without_mutation() {
+    let mut project = valid_project();
+    project.add_scene(Scene {
+        id: scene_id(2),
+        name: "Close".into(),
+        background: Rgba8::OPAQUE_BLACK,
+        layers: Vec::new(),
+    });
+    project.add_scene(Scene {
+        id: scene_id(3),
+        name: "Wide 2".into(),
+        background: Rgba8::OPAQUE_BLACK,
+        layers: vec![layer("Close", SourceRef::Scene(scene_id(2)))],
+    });
+    project.add_input(Input {
+        id: input_id(2),
+        name: "Close input".into(),
+        kind: InputKind::Scene {
+            scene_id: scene_id(2),
+            audio_source: None,
+        },
+        required_capabilities: Vec::new(),
+    });
+    project
+        .set_output_route(output_id(1), scene_id(2), bus_id(1))
+        .unwrap();
+    let original = project.clone();
+    assert_eq!(
+        project.remove_scene(scene_id(2)),
+        Err(RemoveSceneError::InputReference {
+            input: input_id(2),
+            scene: scene_id(2)
+        })
+    );
+    assert_eq!(project, original);
+    project.remove_input(input_id(2)).unwrap();
+    assert_eq!(
+        project.remove_scene(scene_id(2)),
+        Err(RemoveSceneError::LayerReference {
+            owner: scene_id(3),
+            source: scene_id(2)
+        })
+    );
+    assert_eq!(
+        project
+            .scenes()
+            .iter()
+            .map(|scene| scene.id)
+            .collect::<Vec<_>>(),
+        vec![scene_id(1), scene_id(2), scene_id(3)]
+    );
+    project
+        .set_scene_layer_source(scene_id(3), 0, SourceRef::Input(input_id(1)))
+        .unwrap();
+    assert_eq!(
+        project.remove_scene(scene_id(2)),
+        Err(RemoveSceneError::OutputReference {
+            output: output_id(1),
+            scene: scene_id(2)
+        })
+    );
+    project
+        .set_output_route(output_id(1), scene_id(1), bus_id(1))
+        .unwrap();
+    project.remove_scene(scene_id(2)).unwrap();
+    assert_eq!(
+        project
+            .scenes()
+            .iter()
+            .map(|scene| scene.id)
+            .collect::<Vec<_>>(),
+        vec![scene_id(1), scene_id(3)]
+    );
+    assert_eq!(
+        project.remove_scene(scene_id(99)),
+        Err(RemoveSceneError::UnknownScene(scene_id(99)))
+    );
 }
 
 #[test]

@@ -295,6 +295,9 @@ persist the scene input audio route. `scene-layer-add`, `scene-layer-remove`, `s
 `scene-layer-source-scene` are local next-open layer-editing
 footholds; local scene rendering, live editing, feathered and non-rectangular
 masks, effects, and IN-020 remain planned.
+`scene-remove` is local next-open scene removal only; it does not add cascade
+behavior, rendering, live editing, daemon/Studio/protocol mutation, output
+realization, or acceptance.
 The rename and reorder commands carry input identity; audio and routing state
 remain separate.
 `media-input-add` and `media-input-relink` are local next-open media-input configuration footholds. They store strict
