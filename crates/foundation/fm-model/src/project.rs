@@ -440,9 +440,11 @@ impl Project {
             }
             SourceRef::Input(_) | SourceRef::Scene(_) => {}
         }
-        let mut candidate = self.clone();
-        candidate.scenes[scene_index].layers[index].source = source;
-        if candidate.validate().err().is_some_and(|errors| {
+        let mut cycle_probe = self.clone();
+        cycle_probe.scenes[scene_index].layers[index].source = source;
+        cycle_probe.scenes[scene_index].layers =
+            vec![cycle_probe.scenes[scene_index].layers[index].clone()];
+        if cycle_probe.validate().err().is_some_and(|errors| {
             errors.iter().any(|error| {
                 error.kind == ValidationErrorKind::Cycle
                     && error.entity == Some(EntityRef::Scene(scene))
