@@ -217,6 +217,14 @@ pub enum SceneLayerError {
         index: usize,
         length: usize,
     },
+    InvalidCrop {
+        scene: SceneId,
+        index: usize,
+    },
+    CropWouldInvalidateMask {
+        scene: SceneId,
+        index: usize,
+    },
     MissingInput(InputId),
     MissingScene(SceneId),
     SourceCycle,
@@ -258,6 +266,13 @@ impl std::fmt::Display for SceneLayerError {
             } => write!(
                 formatter,
                 "layer index {index} out of range for scene {scene} with {length} layers"
+            ),
+            Self::InvalidCrop { scene, index } => {
+                write!(formatter, "invalid crop for layer {index} in scene {scene}")
+            }
+            Self::CropWouldInvalidateMask { scene, index } => write!(
+                formatter,
+                "crop would invalidate the mask for layer {index} in scene {scene}"
             ),
             Self::MissingInput(input) => write!(formatter, "missing source input {input}"),
             Self::MissingScene(scene) => write!(formatter, "missing source scene {scene}"),
@@ -1004,21 +1019,52 @@ impl Project {
         index: usize,
         crop: Option<CropRect>,
     ) -> Result<(), SceneLayerError> {
-        let target = self
+        let scene_index = self
             .scenes
-            .iter_mut()
-            .find(|candidate| candidate.id == scene)
+            .iter()
+            .position(|candidate| candidate.id == scene)
             .ok_or(SceneLayerError::UnknownScene(scene))?;
+        let target = &self.scenes[scene_index];
         let length = target.layers.len();
         let layer = target
             .layers
-            .get_mut(index)
+            .get(index)
             .ok_or(SceneLayerError::LayerIndexOutOfRange {
                 scene,
                 index,
                 length,
             })?;
-        layer.crop = crop;
+        if let Some(crop) = crop {
+            let dimensions = self.settings.video.dimensions;
+            if crop.width == 0
+                || crop.height == 0
+                || crop
+                    .x
+                    .checked_add(crop.width)
+                    .is_none_or(|right| right > dimensions.width())
+                || crop
+                    .y
+                    .checked_add(crop.height)
+                    .is_none_or(|bottom| bottom > dimensions.height())
+            {
+                return Err(SceneLayerError::InvalidCrop { scene, index });
+            }
+            if layer.mask.is_some_and(|mask| {
+                mask.width == 0
+                    || mask.height == 0
+                    || mask
+                        .x
+                        .checked_add(mask.width)
+                        .is_none_or(|right| right > crop.width)
+                    || mask
+                        .y
+                        .checked_add(mask.height)
+                        .is_none_or(|bottom| bottom > crop.height)
+            }) {
+                return Err(SceneLayerError::CropWouldInvalidateMask { scene, index });
+            }
+        }
+        self.scenes[scene_index].layers[index].crop = crop;
         Ok(())
     }
 

@@ -3860,7 +3860,7 @@ fn local_scene_layer_z_order_preserves_vector_and_runtime() {
 }
 
 #[test]
-fn local_scene_layer_crop_set_and_clear_preserves_project_state() {
+fn local_scene_layer_crop_checked_preserves_manifest_and_journal() {
     let context = ContractContext::new();
     assert_success(&invoke(&["new", context.project_path()]));
     assert_success(&invoke(&[
@@ -3942,6 +3942,8 @@ fn local_scene_layer_crop_set_and_clear_preserves_project_state() {
     );
 
     let before_invalid = manifest(&context.project);
+    let store = ProjectStore::new(&context.project_path()).unwrap();
+    let journal_before_invalid = journal_bytes(&store);
     assert_failure_contains(
         &invoke(&[
             "scene-layer-crop",
@@ -3953,9 +3955,10 @@ fn local_scene_layer_crop_set_and_clear_preserves_project_state() {
             "2000",
             "480",
         ]),
-        "domain project failed validation",
+        "invalid crop for layer 0 in scene 7",
     );
     assert_eq!(manifest(&context.project), before_invalid);
+    assert_eq!(journal_bytes(&store), journal_before_invalid);
     fs::remove_dir_all(context.root).unwrap();
 }
 

@@ -6,9 +6,9 @@ use fm_model::{
     InputDelaySamples, InputGainMilliDb, InputKind, Layer, LayerGeometry, MainMix, Output,
     OutputFormat, Project, ProjectSettings, RectMask, RemoveAudioBusError, RemoveInputError,
     RemoveOutputError, RemoveSceneError, RenameSceneError, RestartPolicy, Rgba8, Rotation, Scene,
-    SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef, StartupPolicy,
-    StingerAudioPolicy, StingerConfig, StingerMissingMediaFallback, StingerSlotNumber,
-    ValidationErrorKind,
+    SceneLayerError, SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef,
+    StartupPolicy, StingerAudioPolicy, StingerConfig, StingerMissingMediaFallback,
+    StingerSlotNumber, ValidationErrorKind,
 };
 use fm_types::{
     AudioFormat, BusId, ChannelLayout, ColorMetadata, FrameRate, InputId, MAX_INPUT_NAME_BYTES,
@@ -102,6 +102,55 @@ fn valid_project() -> Project {
         required_capabilities: vec!["gpu.compositor.wgpu".into()],
     });
     project
+}
+
+#[test]
+fn scene_layer_crop_checked_validation_is_atomic_and_mask_aware() {
+    let scene = scene_id(1);
+    let mut project = valid_project();
+    project
+        .set_scene_layer_crop(scene, 0, Some(CropRect::new(0, 0, 1920, 1080)))
+        .unwrap();
+    project
+        .set_scene_layer_mask(scene, 0, Some(RectMask::new(10, 20, 100, 100)))
+        .unwrap();
+    let before = project.clone();
+
+    for (crop, error) in [
+        (
+            CropRect::new(0, 0, 0, 10),
+            SceneLayerError::InvalidCrop { scene, index: 0 },
+        ),
+        (
+            CropRect::new(1900, 0, 21, 10),
+            SceneLayerError::InvalidCrop { scene, index: 0 },
+        ),
+        (
+            CropRect::new(u32::MAX, 0, 1, 10),
+            SceneLayerError::InvalidCrop { scene, index: 0 },
+        ),
+        (
+            CropRect::new(0, 0, 20, 20),
+            SceneLayerError::CropWouldInvalidateMask { scene, index: 0 },
+        ),
+    ] {
+        assert_eq!(
+            project.set_scene_layer_crop(scene, 0, Some(crop)),
+            Err(error)
+        );
+        assert_eq!(project, before);
+        assert_eq!(project.scenes()[0].layers, before.scenes()[0].layers);
+    }
+
+    project
+        .set_scene_layer_crop(scene, 0, Some(CropRect::new(100, 100, 640, 480)))
+        .unwrap();
+    assert_eq!(
+        project.scenes()[0].layers[0].crop,
+        Some(CropRect::new(100, 100, 640, 480))
+    );
+    project.set_scene_layer_crop(scene, 0, None).unwrap();
+    assert_eq!(project.scenes()[0].layers[0].crop, None);
 }
 
 fn simulated_project() -> Project {
