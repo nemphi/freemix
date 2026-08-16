@@ -5360,6 +5360,11 @@ fn local_input_replace_scene_preserves_identity_and_rejects_cycle() {
         .unwrap();
 
     run(&["input-replace-scene", path, "2", "7"]);
+    let inventory = invoke_bounded(&["inputs", path]);
+    assert_success(&inventory);
+    assert!(stdout(&inventory).lines().any(|line| {
+        line == "input id=2 name=\"Input 2\" kind=scene scene_id=7 audio_source=none strip=gain_mdb=-1200,balance_bp=2500,delay_samples=480,muted=true,soloed=false,follow_video=false"
+    }));
     let after = store.load().unwrap();
     let after_input = after
         .project()

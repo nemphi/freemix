@@ -2842,6 +2842,16 @@ fn print_status(project: &ProjectEngine) {
 
 fn print_inputs(project: &Project) {
     for input in project.inputs() {
+        let scene = match &input.kind {
+            InputKind::Scene {
+                scene_id,
+                audio_source,
+            } => format!(
+                " scene_id={scene_id} audio_source={}",
+                audio_source.map_or_else(|| "none".to_owned(), |input| input.to_string()),
+            ),
+            _ => String::new(),
+        };
         let strip = project.input_audio_strip(input.id).map_or_else(
             || "unavailable".to_owned(),
             |state| {
@@ -2857,10 +2867,11 @@ fn print_inputs(project: &Project) {
             },
         );
         println!(
-            "input id={} name={:?} kind={} strip={strip}",
+            "input id={} name={:?} kind={}{} strip={strip}",
             input.id,
             input.name,
             input_kind_name(&input.kind),
+            scene,
         );
     }
 }
