@@ -2817,6 +2817,15 @@ fn local_audio_bus_rename_persists_exact_name_and_preserves_runtime_state() {
     }
 
     let store = ProjectStore::new(&context.project).unwrap();
+    assert_success(&invoke_bounded(&[
+        "tbar-start",
+        context.project_path(),
+        "slide",
+        "--key",
+        "audio-bus-rename-runtime",
+        "--expect",
+        "0",
+    ]));
     let before = store.load().unwrap();
     let supplied = "  Aux \"Return\"  ";
     assert_success(&invoke_bounded(&[
