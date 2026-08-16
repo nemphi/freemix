@@ -1289,6 +1289,9 @@ impl Project {
         {
             return Err(AudioBusSendError::DuplicateSend);
         }
+        if let Err(errors) = self.validate() {
+            return Err(AudioBusSendError::InvalidProject(errors));
+        }
 
         self.audio_buses[source_index]
             .sends
