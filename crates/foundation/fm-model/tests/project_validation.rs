@@ -1,13 +1,13 @@
 use std::num::NonZeroU128;
 
 use fm_model::{
-    AudioBus, BusSend, CURRENT_SCHEMA_VERSION, CropRect, EntityRef, Input, InputAudioStripState,
-    InputBalanceBasisPoints, InputDelaySamples, InputGainMilliDb, InputKind, Layer, LayerGeometry,
-    MainMix, Output, OutputFormat, Project, ProjectSettings, RectMask, RemoveAudioBusError,
-    RemoveInputError, RemoveOutputError, RemoveSceneError, RenameSceneError, RestartPolicy, Rgba8,
-    Rotation, Scene, SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef,
-    StartupPolicy, StingerAudioPolicy, StingerConfig, StingerMissingMediaFallback,
-    StingerSlotNumber, ValidationErrorKind,
+    AudioBus, BusSend, CURRENT_SCHEMA_VERSION, CropRect, DuplicateSceneInputError, EntityRef,
+    Input, InputAudioStripState, InputBalanceBasisPoints, InputDelaySamples, InputGainMilliDb,
+    InputKind, Layer, LayerGeometry, MainMix, Output, OutputFormat, Project, ProjectSettings,
+    RectMask, RemoveAudioBusError, RemoveInputError, RemoveOutputError, RemoveSceneError,
+    RenameSceneError, RestartPolicy, Rgba8, Rotation, Scene, SimulatedAudio, SimulatedInput,
+    SimulatedVideo, SolidColor, SourceRef, StartupPolicy, StingerAudioPolicy, StingerConfig,
+    StingerMissingMediaFallback, StingerSlotNumber, ValidationErrorKind,
 };
 use fm_types::{
     AudioFormat, BusId, ChannelLayout, ColorMetadata, FrameRate, InputId, MAX_INPUT_NAME_BYTES,
@@ -174,6 +174,144 @@ fn rename_scene_preserves_exact_text_and_rejects_invalid_names_without_mutation(
     ] {
         let before = project.clone();
         assert_eq!(project.rename_scene(scene, name.into()), Err(error));
+        assert_eq!(project, before);
+    }
+}
+
+#[test]
+fn duplicate_scene_input_is_atomic_and_preserves_layer_fields() {
+    let mut project = Project::new(project_id(81), "Duplicate", settings());
+    project.add_input(Input {
+        id: input_id(1),
+        name: "Camera".into(),
+        kind: InputKind::Color,
+        required_capabilities: vec!["capture.camera".into()],
+    });
+    let source_layer = Layer {
+        name: "Inset".into(),
+        source: SourceRef::Input(input_id(1)),
+        enabled: false,
+        geometry: LayerGeometry::new(10, 20, 640, 360, Rotation::Deg90),
+        crop: Some(CropRect::new(100, 50, 300, 200)),
+        mask: Some(RectMask::new(20, 30, 100, 80).inverted(true)),
+        opacity: 200,
+        z_order: -3,
+    };
+    project.add_scene(Scene {
+        id: scene_id(1),
+        name: "Source".into(),
+        background: Rgba8::new(8, 4, 2, 16),
+        layers: vec![source_layer],
+    });
+    project
+        .duplicate_scene_input_checked(
+            scene_id(1),
+            scene_id(2),
+            "Shared".into(),
+            input_id(2),
+            "Shared".into(),
+        )
+        .unwrap();
+    let mut expected_scene = project.scenes()[0].clone();
+    expected_scene.id = scene_id(2);
+    expected_scene.name = "Shared".into();
+    assert_eq!(
+        project.scenes(),
+        &[project.scenes()[0].clone(), expected_scene]
+    );
+    assert_eq!(project.inputs()[1].id, input_id(2));
+    assert_eq!(project.inputs()[1].name, "Shared");
+    assert_eq!(
+        project.inputs()[1].kind,
+        InputKind::Scene {
+            scene_id: scene_id(2),
+            audio_source: None,
+        }
+    );
+    assert!(project.inputs()[1].required_capabilities.is_empty());
+    assert_eq!(
+        project.input_audio_strip(input_id(2)),
+        Some(Default::default())
+    );
+
+    let cases = [
+        (
+            scene_id(99),
+            scene_id(3),
+            input_id(3),
+            "New",
+            "New",
+            DuplicateSceneInputError::UnknownSourceScene(scene_id(99)),
+        ),
+        (
+            scene_id(1),
+            scene_id(1),
+            input_id(3),
+            "New",
+            "New",
+            DuplicateSceneInputError::DuplicateSceneId(scene_id(1)),
+        ),
+        (
+            scene_id(1),
+            scene_id(3),
+            input_id(1),
+            "New",
+            "New",
+            DuplicateSceneInputError::DuplicateInputId(input_id(1)),
+        ),
+        (
+            scene_id(1),
+            scene_id(3),
+            input_id(3),
+            " ",
+            "New",
+            DuplicateSceneInputError::EmptySceneName,
+        ),
+        (
+            scene_id(1),
+            scene_id(3),
+            input_id(3),
+            "source",
+            "New",
+            DuplicateSceneInputError::DuplicateSceneName,
+        ),
+        (
+            scene_id(1),
+            scene_id(3),
+            input_id(3),
+            "New",
+            "\t",
+            DuplicateSceneInputError::EmptyInputName,
+        ),
+        (
+            scene_id(1),
+            scene_id(3),
+            input_id(3),
+            "New",
+            &*"x".repeat(MAX_INPUT_NAME_BYTES + 1),
+            DuplicateSceneInputError::InputNameTooLong,
+        ),
+        (
+            scene_id(1),
+            scene_id(3),
+            input_id(3),
+            "New",
+            "Camera",
+            DuplicateSceneInputError::DuplicateInputName,
+        ),
+    ];
+    for (source, new_scene, new_input, scene_name, input_name, error) in cases {
+        let before = project.clone();
+        assert_eq!(
+            project.duplicate_scene_input_checked(
+                source,
+                new_scene,
+                scene_name.into(),
+                new_input,
+                input_name.into(),
+            ),
+            Err(error)
+        );
         assert_eq!(project, before);
     }
 }

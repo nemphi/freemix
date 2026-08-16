@@ -2676,6 +2676,184 @@ fn local_scene_input_add_persists_empty_scene_without_routing() {
 }
 
 #[test]
+fn local_scene_input_duplicate_persists_scene_pair_and_default_strip() {
+    let context = ContractContext::new();
+    assert_success(&invoke(&["new", context.project_path()]));
+    for args in [
+        vec![
+            "scene-input-add",
+            context.project_path(),
+            "10",
+            "10",
+            "Source",
+        ],
+        vec![
+            "scene-layer-add",
+            context.project_path(),
+            "10",
+            "1",
+            "2",
+            "Inset",
+        ],
+        vec![
+            "scene-layer-geometry",
+            context.project_path(),
+            "10",
+            "0",
+            "10",
+            "20",
+            "640",
+            "360",
+            "90",
+        ],
+        vec![
+            "scene-layer-appearance",
+            context.project_path(),
+            "10",
+            "0",
+            "off",
+            "200",
+        ],
+        vec![
+            "scene-layer-crop",
+            context.project_path(),
+            "10",
+            "0",
+            "100",
+            "50",
+            "300",
+            "200",
+        ],
+        vec![
+            "scene-layer-mask",
+            context.project_path(),
+            "10",
+            "0",
+            "20",
+            "30",
+            "100",
+            "80",
+            "inverted",
+        ],
+    ] {
+        assert_success(&invoke(&args));
+    }
+    assert_success(&invoke(&[
+        "scene-background",
+        context.project_path(),
+        "10",
+        "8",
+        "4",
+        "2",
+        "16",
+    ]));
+    assert_success(&invoke(&[
+        "audio-bus-add",
+        context.project_path(),
+        "20",
+        "Master",
+    ]));
+    assert_success(&invoke(&[
+        "output-add",
+        context.project_path(),
+        "30",
+        "10",
+        "20",
+        "Program",
+    ]));
+    assert_success(&invoke(&["tbar-start", context.project_path(), "fade"]));
+    assert_success(&invoke(&["tbar-position", context.project_path(), "5000"]));
+    assert_success(&invoke(&["ftb", context.project_path(), "black", "2"]));
+
+    let store = ProjectStore::new(&context.project).unwrap();
+    let before = store.load().unwrap();
+    let source_scene = before.project().scenes()[0].clone();
+    assert_success(&invoke(&[
+        "scene-input-duplicate",
+        context.project_path(),
+        "10",
+        "11",
+        "11",
+        "Copied Scene",
+        "Copied Input",
+    ]));
+    let after = store.load().unwrap();
+    let manifest_after = fs::read(context.project.join("project.json")).unwrap();
+    let journal_after = journal_bytes(&store);
+    let copied_scene = &after.project().scenes()[1];
+    let mut expected_scene = source_scene.clone();
+    expected_scene.id = SceneId::new(NonZeroU128::new(11).unwrap());
+    expected_scene.name = "Copied Scene".into();
+    assert_eq!(copied_scene, &expected_scene);
+    let copied_input = &after.project().inputs()[3];
+    assert_eq!(copied_input.id, InputId::new(NonZeroU128::new(11).unwrap()));
+    assert_eq!(copied_input.name, "Copied Input");
+    assert!(copied_input.required_capabilities.is_empty());
+    assert!(matches!(
+        copied_input.kind,
+        InputKind::Scene { scene_id, audio_source: None } if scene_id == expected_scene.id
+    ));
+    assert_eq!(
+        after.project().input_audio_strip(copied_input.id),
+        Some(Default::default())
+    );
+    assert_eq!(
+        after
+            .project()
+            .scenes()
+            .iter()
+            .map(|scene| scene.id.get().get())
+            .collect::<Vec<_>>(),
+        [10, 11]
+    );
+    assert_eq!(
+        after
+            .project()
+            .inputs()
+            .iter()
+            .map(|input| input.id.get().get())
+            .collect::<Vec<_>>(),
+        [1, 2, 10, 11]
+    );
+    assert_eq!(after.runtime_routing(), before.runtime_routing());
+    assert_eq!(
+        after.runtime_manual_transitions(),
+        before.runtime_manual_transitions()
+    );
+    assert_eq!(
+        after.runtime_fade_to_black(),
+        before.runtime_fade_to_black()
+    );
+    assert_eq!(after.runtime_overlays(), before.runtime_overlays());
+    assert_eq!(after.position(), before.position());
+    assert_eq!(after.idempotency_receipts(), before.idempotency_receipts());
+    let scenes = invoke(&["scenes", context.project_path()]);
+    assert_success(&scenes);
+    assert!(stdout(&scenes).contains("scene id=11 name=\"Copied Scene\""));
+    let inputs = invoke(&["inputs", context.project_path()]);
+    assert_success(&inputs);
+    assert!(stdout(&inputs).contains("input id=11 name=\"Copied Input\" kind=scene"));
+    assert!(status(&context.project).contains("AudioStrips=[1:"));
+
+    let rejected = invoke(&[
+        "scene-input-duplicate",
+        context.project_path(),
+        "99",
+        "12",
+        "12",
+        "Rejected Scene",
+        "Rejected Input",
+    ]);
+    assert_failure_contains(&rejected, "unknown source scene 99");
+    assert_eq!(
+        fs::read(context.project.join("project.json")).unwrap(),
+        manifest_after
+    );
+    assert_eq!(journal_bytes(&store), journal_after);
+    fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
 fn scene_rename_persists_exact_name_and_failures_preserve_manifest() {
     let context = ContractContext::new();
     assert_success(&invoke(&["new", context.project_path()]));
