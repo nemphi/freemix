@@ -11,8 +11,8 @@ use std::{
 };
 
 use fm_model::{
-    AudioBus, BusSend, InputKind, LayerGeometry, RectMask, Rgba8, Rotation, SimulatedAudio,
-    SimulatedInput, SimulatedVideo, SolidColor, SourceRef, StartupPolicy,
+    AudioBus, BusSend, Input, InputKind, LayerGeometry, RectMask, Rgba8, Rotation, Scene,
+    SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef, StartupPolicy,
 };
 use fm_persistence::{MutationBatch, ProjectStore, StoredProject};
 use fm_protocol::{
@@ -2673,6 +2673,197 @@ fn local_scene_input_add_persists_empty_scene_without_routing() {
     assert_failure_contains(&duplicate, "domain project failed validation");
     assert_eq!(manifest(&context.project), before_duplicate);
     fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
+fn local_scene_removal_preserves_runtime_and_rejects_references() {
+    fn prepare(reference: Option<&str>) -> ContractContext {
+        let context = ContractContext::new();
+        assert_success(&invoke(&["new", context.project_path()]));
+        for (input, scene, name) in [("10", "10", "Keep"), ("11", "11", "Other")] {
+            assert_success(&invoke(&[
+                "scene-input-add",
+                context.project_path(),
+                input,
+                scene,
+                name,
+            ]));
+        }
+        assert_success(&invoke(&[
+            "audio-bus-add",
+            context.project_path(),
+            "20",
+            "Master",
+        ]));
+        assert_success(&invoke(&[
+            "output-add",
+            context.project_path(),
+            "30",
+            "10",
+            "20",
+            "Program",
+        ]));
+        assert_success(&invoke(&[
+            "tbar-start",
+            context.project_path(),
+            "wipe",
+            "--key",
+            "scene-remove-tbar",
+            "--expect",
+            "0",
+        ]));
+        assert_success(&invoke(&[
+            "tbar-position",
+            context.project_path(),
+            "5000",
+            "--key",
+            "scene-remove-position",
+            "--expect",
+            "1",
+        ]));
+        assert_success(&invoke(&[
+            "ftb",
+            context.project_path(),
+            "black",
+            "2",
+            "--key",
+            "scene-remove-ftb",
+            "--expect",
+            "2",
+        ]));
+        assert_success(&invoke(&[
+            "overlay-output",
+            context.project_path(),
+            "1",
+            "30",
+            "true",
+        ]));
+
+        let store = ProjectStore::new(&context.project).unwrap();
+        let stored = store.load().unwrap();
+        let mut project = stored.project().clone();
+        project.add_scene(Scene {
+            id: SceneId::new(NonZeroU128::new(12).unwrap()),
+            name: "Target".into(),
+            background: Rgba8::OPAQUE_BLACK,
+            layers: Vec::new(),
+        });
+        if reference == Some("input") {
+            project.add_input(Input {
+                id: InputId::new(NonZeroU128::new(12).unwrap()),
+                name: "Target input".into(),
+                kind: InputKind::Scene {
+                    scene_id: SceneId::new(NonZeroU128::new(12).unwrap()),
+                    audio_source: None,
+                },
+                required_capabilities: Vec::new(),
+            });
+        }
+        let configured = StoredProject::from_project_with_complete_runtime_state(
+            project,
+            stored.runtime_routing(),
+            stored.runtime_manual_transitions(),
+            stored.runtime_fade_to_black(),
+            stored.runtime_overlays().clone(),
+            stored.position(),
+            stored.idempotency_receipts().to_vec(),
+        )
+        .unwrap();
+        store.save(&configured).unwrap();
+        match reference {
+            Some("layer") => {
+                assert_success(&invoke(&[
+                    "scene-layer-add",
+                    context.project_path(),
+                    "11",
+                    "10",
+                    "0",
+                    "Target layer",
+                ]));
+                assert_success(&invoke(&[
+                    "scene-layer-source-scene",
+                    context.project_path(),
+                    "11",
+                    "0",
+                    "12",
+                ]));
+            }
+            Some("output") => assert_success(&invoke(&[
+                "output-route",
+                context.project_path(),
+                "30",
+                "12",
+                "20",
+            ])),
+            _ => {}
+        }
+        context
+    }
+
+    let success_context = prepare(None);
+    let success_store = ProjectStore::new(&success_context.project).unwrap();
+    let before = success_store.load().unwrap();
+    let removed = invoke(&["scene-remove", success_context.project_path(), "12"]);
+    assert_success(&removed);
+    assert_success(&invoke(&["status", success_context.project_path()]));
+    let after = success_store.load().unwrap();
+    assert_eq!(
+        after
+            .project()
+            .scenes()
+            .iter()
+            .map(|scene| scene.id)
+            .collect::<Vec<_>>(),
+        [
+            SceneId::new(NonZeroU128::new(10).unwrap()),
+            SceneId::new(NonZeroU128::new(11).unwrap())
+        ]
+    );
+    let mut expected_project = before.project().clone();
+    expected_project
+        .remove_scene(SceneId::new(NonZeroU128::new(12).unwrap()))
+        .unwrap();
+    assert_eq!(after.project(), &expected_project);
+    assert_eq!(after.runtime_routing(), before.runtime_routing());
+    assert_eq!(
+        after.runtime_manual_transitions(),
+        before.runtime_manual_transitions()
+    );
+    assert_eq!(
+        after.runtime_fade_to_black(),
+        before.runtime_fade_to_black()
+    );
+    assert_eq!(after.runtime_overlays(), before.runtime_overlays());
+    assert_eq!(after.position(), before.position());
+    assert_eq!(after.idempotency_receipts(), before.idempotency_receipts());
+    let scenes = invoke(&["scenes", success_context.project_path()]);
+    assert_success(&scenes);
+    assert!(!stdout(&scenes).contains("id=12"));
+    fs::remove_dir_all(success_context.root).unwrap();
+
+    for (reference, expected) in [
+        ("input", "input 12 references scene 12"),
+        ("layer", "scene 11 layer references scene 12"),
+        ("output", "output 30 references scene 12"),
+        ("unknown", "unknown scene 99"),
+    ] {
+        let context = prepare((reference != "unknown").then_some(reference));
+        let store = ProjectStore::new(&context.project).unwrap();
+        let manifest_before = fs::read(context.project.join("project.json")).unwrap();
+        let journal_before = journal_bytes(&store);
+        let rejected = invoke(&[
+            "scene-remove",
+            context.project_path(),
+            if reference == "unknown" { "99" } else { "12" },
+        ]);
+        assert_failure_contains(&rejected, expected);
+        assert_eq!(
+            fs::read(context.project.join("project.json")).unwrap(),
+            manifest_before
+        );
+        assert_eq!(journal_bytes(&store), journal_before);
+        fs::remove_dir_all(context.root).unwrap();
+    }
 }
 
 #[test]
