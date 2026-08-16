@@ -2761,6 +2761,26 @@ fn local_scene_background() {
         "2",
         "Layer",
     ]));
+    assert_success(&invoke(&[
+        "audio-bus-add",
+        context.project_path(),
+        "20",
+        "Master",
+    ]));
+    assert_success(&invoke(&[
+        "audio-bus-add",
+        context.project_path(),
+        "21",
+        "Aux",
+    ]));
+    assert_success(&invoke(&[
+        "output-add",
+        context.project_path(),
+        "30",
+        "7",
+        "20",
+        "Program",
+    ]));
     let before = ProjectStore::new(&context.project).unwrap().load().unwrap();
     assert_success(&invoke(&[
         "scene-background",
@@ -2786,6 +2806,25 @@ fn local_scene_background() {
     assert_eq!(after.idempotency_receipts(), before.idempotency_receipts());
     assert_eq!(after.project().inputs(), before.project().inputs());
     assert_eq!(after.project().main_mix(), before.project().main_mix());
+    assert_eq!(
+        after.project().audio_buses(),
+        before.project().audio_buses()
+    );
+    assert_eq!(after.project().outputs(), before.project().outputs());
+    assert_eq!(
+        after
+            .project()
+            .scenes()
+            .iter()
+            .map(|scene| scene.id)
+            .collect::<Vec<_>>(),
+        before
+            .project()
+            .scenes()
+            .iter()
+            .map(|scene| scene.id)
+            .collect::<Vec<_>>()
+    );
     let mut expected_scenes = before.project().scenes().to_vec();
     expected_scenes
         .iter_mut()
@@ -2794,6 +2833,7 @@ fn local_scene_background() {
         .background = Rgba8::new(16, 8, 4, 16);
     assert_eq!(after.project().scenes(), expected_scenes);
     let unchanged = manifest(&context.project);
+    let journal_unchanged = journal_bytes(&ProjectStore::new(&context.project).unwrap());
     let invalid = invoke(&[
         "scene-background",
         context.project_path(),
@@ -2805,6 +2845,27 @@ fn local_scene_background() {
     ]);
     assert_failure_contains(&invalid, "scene background must be premultiplied");
     assert_eq!(manifest(&context.project), unchanged);
+    assert_eq!(
+        journal_bytes(&ProjectStore::new(&context.project).unwrap()),
+        journal_unchanged
+    );
+    let unknown_manifest = manifest(&context.project);
+    let unknown_journal = journal_bytes(&ProjectStore::new(&context.project).unwrap());
+    let unknown = invoke(&[
+        "scene-background",
+        context.project_path(),
+        "999",
+        "0",
+        "0",
+        "0",
+        "0",
+    ]);
+    assert_failure_contains(&unknown, "unknown scene");
+    assert_eq!(manifest(&context.project), unknown_manifest);
+    assert_eq!(
+        journal_bytes(&ProjectStore::new(&context.project).unwrap()),
+        unknown_journal
+    );
     fs::remove_dir_all(context.root).unwrap();
 }
 
