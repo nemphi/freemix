@@ -180,6 +180,8 @@ fn rename_scene_preserves_exact_text_and_rejects_invalid_names_without_mutation(
 
 #[test]
 fn duplicate_scene_input_is_atomic_and_preserves_layer_fields() {
+    use DuplicateSceneInputError::*;
+
     let mut project = Project::new(project_id(81), "Duplicate", settings());
     project.add_input(Input {
         id: input_id(1),
@@ -187,16 +189,13 @@ fn duplicate_scene_input_is_atomic_and_preserves_layer_fields() {
         kind: InputKind::Color,
         required_capabilities: vec!["capture.camera".into()],
     });
-    let source_layer = Layer {
-        name: "Inset".into(),
-        source: SourceRef::Input(input_id(1)),
-        enabled: false,
-        geometry: LayerGeometry::new(10, 20, 640, 360, Rotation::Deg90),
-        crop: Some(CropRect::new(100, 50, 300, 200)),
-        mask: Some(RectMask::new(20, 30, 100, 80).inverted(true)),
-        opacity: 200,
-        z_order: -3,
-    };
+    let mut source_layer = layer("Inset", SourceRef::Input(input_id(1)));
+    source_layer.enabled = false;
+    source_layer.geometry = LayerGeometry::new(10, 20, 640, 360, Rotation::Deg90);
+    source_layer.crop = Some(CropRect::new(100, 50, 300, 200));
+    source_layer.mask = Some(RectMask::new(20, 30, 100, 80).inverted(true));
+    source_layer.opacity = 200;
+    source_layer.z_order = -3;
     project.add_scene(Scene {
         id: scene_id(1),
         name: "Source".into(),
@@ -234,86 +233,42 @@ fn duplicate_scene_input_is_atomic_and_preserves_layer_fields() {
         Some(Default::default())
     );
 
-    let cases = [
-        (
-            scene_id(99),
-            scene_id(3),
-            input_id(3),
-            "New",
-            "New",
-            DuplicateSceneInputError::UnknownSourceScene(scene_id(99)),
-        ),
-        (
-            scene_id(1),
-            scene_id(1),
-            input_id(3),
-            "New",
-            "New",
-            DuplicateSceneInputError::DuplicateSceneId(scene_id(1)),
-        ),
-        (
-            scene_id(1),
-            scene_id(3),
-            input_id(1),
-            "New",
-            "New",
-            DuplicateSceneInputError::DuplicateInputId(input_id(1)),
-        ),
-        (
-            scene_id(1),
-            scene_id(3),
-            input_id(3),
-            " ",
-            "New",
-            DuplicateSceneInputError::EmptySceneName,
-        ),
-        (
-            scene_id(1),
-            scene_id(3),
-            input_id(3),
-            "source",
-            "New",
-            DuplicateSceneInputError::DuplicateSceneName,
-        ),
-        (
-            scene_id(1),
-            scene_id(3),
-            input_id(3),
-            "New",
-            "\t",
-            DuplicateSceneInputError::EmptyInputName,
-        ),
-        (
-            scene_id(1),
-            scene_id(3),
-            input_id(3),
-            "New",
-            &*"x".repeat(MAX_INPUT_NAME_BYTES + 1),
-            DuplicateSceneInputError::InputNameTooLong,
-        ),
-        (
-            scene_id(1),
-            scene_id(3),
-            input_id(3),
-            "New",
-            "Camera",
-            DuplicateSceneInputError::DuplicateInputName,
-        ),
-    ];
-    for (source, new_scene, new_input, scene_name, input_name, error) in cases {
+    let mut reject = |source: SceneId,
+                      new_scene: SceneId,
+                      new_input: InputId,
+                      scene_name: &str,
+                      input_name: &str,
+                      error: DuplicateSceneInputError| {
         let before = project.clone();
         assert_eq!(
             project.duplicate_scene_input_checked(
                 source,
                 new_scene,
-                scene_name.into(),
+                scene_name.to_owned(),
                 new_input,
-                input_name.into(),
+                input_name.to_owned(),
             ),
-            Err(error)
+            Err(error),
         );
         assert_eq!(project, before);
-    }
+    };
+    let (s1, s3, s99) = (scene_id(1), scene_id(3), scene_id(99));
+    let (i1, i3) = (input_id(1), input_id(3));
+    reject(s99, s3, i3, "New", "New", UnknownSourceScene(s99));
+    reject(s1, s1, i3, "New", "New", DuplicateSceneId(s1));
+    reject(s1, s3, i1, "New", "New", DuplicateInputId(i1));
+    reject(s1, s3, i3, " ", "New", EmptySceneName);
+    reject(s1, s3, i3, "source", "New", DuplicateSceneName);
+    reject(s1, s3, i3, "New", "\t", EmptyInputName);
+    reject(
+        s1,
+        s3,
+        i3,
+        "New",
+        &"x".repeat(MAX_INPUT_NAME_BYTES + 1),
+        InputNameTooLong,
+    );
+    reject(s1, s3, i3, "New", "Camera", DuplicateInputName);
 }
 
 #[test]
