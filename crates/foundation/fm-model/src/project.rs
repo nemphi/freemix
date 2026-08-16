@@ -259,6 +259,13 @@ pub enum AddOutputError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RenameOutputError {
+    UnknownOutput(OutputId),
+    EmptyName,
+    DuplicateName,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RemoveOutputError {
     UnknownOutput(OutputId),
 }
@@ -470,6 +477,18 @@ impl std::fmt::Display for AddOutputError {
 }
 
 impl std::error::Error for AddOutputError {}
+
+impl std::fmt::Display for RenameOutputError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownOutput(output) => write!(formatter, "unknown output {output}"),
+            Self::EmptyName => formatter.write_str("output name must not be empty"),
+            Self::DuplicateName => formatter.write_str("duplicate output name"),
+        }
+    }
+}
+
+impl std::error::Error for RenameOutputError {}
 
 impl std::fmt::Display for RemoveOutputError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1422,6 +1441,33 @@ impl Project {
             .find(|candidate| candidate.id == output)
             .ok_or(SetOutputStartupError::UnknownOutput(output))?;
         output.startup = startup;
+        Ok(())
+    }
+
+    pub fn rename_output(
+        &mut self,
+        output: OutputId,
+        name: String,
+    ) -> Result<(), RenameOutputError> {
+        let index = self
+            .outputs
+            .iter()
+            .position(|candidate| candidate.id == output)
+            .ok_or(RenameOutputError::UnknownOutput(output))?;
+        if name.trim().is_empty() {
+            return Err(RenameOutputError::EmptyName);
+        }
+        if self
+            .outputs
+            .iter()
+            .enumerate()
+            .any(|(candidate_index, candidate)| {
+                candidate_index != index && candidate.name.eq_ignore_ascii_case(&name)
+            })
+        {
+            return Err(RenameOutputError::DuplicateName);
+        }
+        self.outputs[index].name = name;
         Ok(())
     }
 

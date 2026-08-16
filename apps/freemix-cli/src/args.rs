@@ -126,6 +126,11 @@ pub enum Command {
         scene: u128,
         bus: u128,
     },
+    OutputRename {
+        path: PathBuf,
+        output: u128,
+        name: String,
+    },
     OutputStartup {
         path: PathBuf,
         output: u128,
@@ -690,6 +695,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
         "output-add" => parse_output_add(arguments),
         "output-remove" => parse_output_remove(arguments),
         "output-route" => parse_output_route(arguments),
+        "output-rename" => parse_output_rename(arguments),
         "output-startup" => parse_output_startup(arguments),
         "scene-input-add" => parse_scene_input_add(arguments),
         "scene-input-duplicate" => parse_scene_input_duplicate(arguments),
@@ -878,6 +884,14 @@ fn parse_output_startup(mut arguments: impl Iterator<Item = String>) -> Result<C
         output,
         startup,
     })
+}
+
+fn parse_output_rename(mut arguments: impl Iterator<Item = String>) -> Result<Command, ArgsError> {
+    let path = required_path(&mut arguments, "project path")?;
+    let output = number(&required(&mut arguments, "output")?, "output")?;
+    let name = nonblank(&mut arguments, "output name")?;
+    reject_extra(&mut arguments)?;
+    Ok(Command::OutputRename { path, output, name })
 }
 
 fn parse_audio_bus_add(mut arguments: impl Iterator<Item = String>) -> Result<Command, ArgsError> {

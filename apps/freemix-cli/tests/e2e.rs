@@ -2358,7 +2358,7 @@ fn local_output_startup_persists_selected_policy_and_rejects_unknown_output() {
 }
 
 #[test]
-fn local_output_route_persists_existing_route_and_rejects_unknown_reference() {
+fn local_output_editing_persists_routes_and_names_and_rejects_unknown_references() {
     let context = ContractContext::new();
     assert_success(&invoke(&["new", context.project_path()]));
     assert_success(&invoke(&[
@@ -2469,6 +2469,49 @@ fn local_output_route_persists_existing_route_and_rejects_unknown_reference() {
     assert_eq!(after.runtime_overlays(), before.runtime_overlays());
     assert_eq!(after.position(), before.position());
     assert_eq!(after.idempotency_receipts(), before.idempotency_receipts());
+    let supplied = "  Program Final  ";
+    let renamed = invoke_bounded(&["output-rename", context.project_path(), "30", supplied]);
+    assert_success(&renamed);
+    let renamed = store.load().unwrap();
+    let mut expected_project = after.project().clone();
+    expected_project
+        .rename_output(
+            OutputId::new(NonZeroU128::new(30).unwrap()),
+            supplied.into(),
+        )
+        .unwrap();
+    assert_eq!(renamed.project(), &expected_project);
+    assert_eq!(renamed.runtime_routing(), after.runtime_routing());
+    assert_eq!(
+        renamed.runtime_manual_transitions(),
+        after.runtime_manual_transitions()
+    );
+    assert_eq!(
+        renamed.runtime_fade_to_black(),
+        after.runtime_fade_to_black()
+    );
+    assert_eq!(renamed.runtime_overlays(), after.runtime_overlays());
+    assert_eq!(renamed.position(), after.position());
+    assert_eq!(renamed.idempotency_receipts(), after.idempotency_receipts());
+    let idempotent = invoke_bounded(&["output-rename", context.project_path(), "30", supplied]);
+    assert_success(&idempotent);
+    let idempotent = store.load().unwrap();
+    assert_eq!(idempotent.project(), renamed.project());
+    assert_eq!(idempotent.runtime_routing(), renamed.runtime_routing());
+    assert_eq!(
+        idempotent.runtime_manual_transitions(),
+        renamed.runtime_manual_transitions()
+    );
+    assert_eq!(
+        idempotent.runtime_fade_to_black(),
+        renamed.runtime_fade_to_black()
+    );
+    assert_eq!(idempotent.runtime_overlays(), renamed.runtime_overlays());
+    assert_eq!(idempotent.position(), renamed.position());
+    assert_eq!(
+        idempotent.idempotency_receipts(),
+        renamed.idempotency_receipts()
+    );
     assert_success(&invoke(&["status", context.project_path()]));
     let audio_buses = invoke(&["audio-buses", context.project_path()]);
     assert_success(&audio_buses);
@@ -2484,7 +2527,7 @@ fn local_output_route_persists_existing_route_and_rejects_unknown_reference() {
     assert_eq!(
         stdout(&outputs),
         concat!(
-            "output id=30 name=\"Program \\\"Main\\\"\" video_scene=11 video_scene_name=\"Close\" audio_bus=21 audio_bus_name=\"Aux \\\"A\\\"\" startup=stopped capabilities=[]\n",
+            "output id=30 name=\"  Program Final  \" video_scene=11 video_scene_name=\"Close\" audio_bus=21 audio_bus_name=\"Aux \\\"A\\\"\" startup=stopped capabilities=[]\n",
             "output id=31 name=\"Auxiliary\" video_scene=11 video_scene_name=\"Close\" audio_bus=21 audio_bus_name=\"Aux \\\"A\\\"\" startup=stopped capabilities=[]"
         )
     );
@@ -2499,6 +2542,12 @@ fn local_output_route_persists_existing_route_and_rejects_unknown_reference() {
     );
 
     let unchanged_manifest = fs::read(context.project.join("project.json")).unwrap();
+    let rejected = invoke_bounded(&["output-rename", context.project_path(), "30", "aUxIlIaRy"]);
+    assert_failure_contains(&rejected, "duplicate output name");
+    assert_eq!(
+        fs::read(context.project.join("project.json")).unwrap(),
+        unchanged_manifest
+    );
     let rejected = invoke(&["audio-bus-add", context.project_path(), "22", "mAsTeR"]);
     assert_failure_contains(&rejected, "duplicate audio bus name");
     assert_eq!(
@@ -2511,7 +2560,7 @@ fn local_output_route_persists_existing_route_and_rejects_unknown_reference() {
         "32",
         "10",
         "20",
-        "pRoGrAm \"Main\"",
+        "  pRoGrAm fInAl  ",
     ]);
     assert_failure_contains(&rejected, "duplicate output name");
     assert_eq!(
