@@ -2084,6 +2084,88 @@ fn local_scene_layer_remove_preserves_remaining_order() {
 }
 
 #[test]
+fn local_scene_layer_appearance_preserves_layer_identity() {
+    let context = ContractContext::new();
+    assert_success(&invoke(&["new", context.project_path()]));
+    assert_success(&invoke(&[
+        "scene-input-add",
+        context.project_path(),
+        "3",
+        "7",
+        "Scene",
+    ]));
+    for name in ["First", "Second"] {
+        assert_success(&invoke(&[
+            "scene-layer-add",
+            context.project_path(),
+            "7",
+            "1",
+            "4",
+            name,
+        ]));
+    }
+    let before = ProjectStore::new(&context.project_path())
+        .unwrap()
+        .load()
+        .unwrap();
+    let before_scene = before.project().scenes().last().unwrap().clone();
+    assert_success(&invoke(&[
+        "scene-layer-appearance",
+        context.project_path(),
+        "7",
+        "1",
+        "off",
+        "96",
+    ]));
+    let after = ProjectStore::new(&context.project_path())
+        .unwrap()
+        .load()
+        .unwrap();
+    assert_eq!(
+        (
+            after.runtime_routing(),
+            after.runtime_manual_transitions(),
+            after.runtime_fade_to_black(),
+            after.runtime_overlays(),
+            after.position(),
+            after.idempotency_receipts(),
+        ),
+        (
+            before.runtime_routing(),
+            before.runtime_manual_transitions(),
+            before.runtime_fade_to_black(),
+            before.runtime_overlays(),
+            before.position(),
+            before.idempotency_receipts(),
+        )
+    );
+    let after_scene = after
+        .project()
+        .scenes()
+        .iter()
+        .find(|scene| scene.id.get().get() == 7)
+        .unwrap();
+    let mut expected_layers = before_scene.layers;
+    expected_layers[1].enabled = false;
+    expected_layers[1].opacity = 96;
+    assert_eq!(after_scene.layers, expected_layers);
+    let before_invalid = manifest(&context.project);
+    assert_failure_contains(
+        &invoke(&[
+            "scene-layer-appearance",
+            context.project_path(),
+            "7",
+            "1",
+            "on",
+            "256",
+        ]),
+        "opacity must be in 0..=255",
+    );
+    assert_eq!(manifest(&context.project), before_invalid);
+    fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
 fn local_input_duplicate_copies_source_and_strip() {
     let context = ContractContext::new();
     assert_success(&invoke(&["new", context.project_path()]));

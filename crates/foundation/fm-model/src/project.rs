@@ -22,7 +22,7 @@ pub enum AddSceneLayerError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RemoveSceneLayerError {
+pub enum SceneLayerError {
     UnknownScene(SceneId),
     LayerIndexOutOfRange {
         scene: SceneId,
@@ -31,7 +31,7 @@ pub enum RemoveSceneLayerError {
     },
 }
 
-impl std::fmt::Display for RemoveSceneLayerError {
+impl std::fmt::Display for SceneLayerError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnknownScene(scene) => write!(formatter, "unknown scene {scene}"),
@@ -47,7 +47,7 @@ impl std::fmt::Display for RemoveSceneLayerError {
     }
 }
 
-impl std::error::Error for RemoveSceneLayerError {}
+impl std::error::Error for SceneLayerError {}
 
 impl std::fmt::Display for AddSceneLayerError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -326,20 +326,46 @@ impl Project {
         &mut self,
         scene: SceneId,
         index: usize,
-    ) -> Result<Layer, RemoveSceneLayerError> {
+    ) -> Result<Layer, SceneLayerError> {
         let target = self
             .scenes
             .iter_mut()
             .find(|candidate| candidate.id == scene)
-            .ok_or(RemoveSceneLayerError::UnknownScene(scene))?;
+            .ok_or(SceneLayerError::UnknownScene(scene))?;
         if index >= target.layers.len() {
-            return Err(RemoveSceneLayerError::LayerIndexOutOfRange {
+            return Err(SceneLayerError::LayerIndexOutOfRange {
                 scene,
                 index,
                 length: target.layers.len(),
             });
         }
         Ok(target.layers.remove(index))
+    }
+
+    pub fn set_scene_layer_appearance(
+        &mut self,
+        scene: SceneId,
+        index: usize,
+        enabled: bool,
+        opacity: u8,
+    ) -> Result<(), SceneLayerError> {
+        let scene_index = self
+            .scenes
+            .iter()
+            .position(|candidate| candidate.id == scene)
+            .ok_or(SceneLayerError::UnknownScene(scene))?;
+        let length = self.scenes[scene_index].layers.len();
+        if index >= length {
+            return Err(SceneLayerError::LayerIndexOutOfRange {
+                scene,
+                index,
+                length,
+            });
+        }
+        let layer = &mut self.scenes[scene_index].layers[index];
+        layer.enabled = enabled;
+        layer.opacity = opacity;
+        Ok(())
     }
 
     pub fn add_audio_bus(&mut self, bus: AudioBus) {

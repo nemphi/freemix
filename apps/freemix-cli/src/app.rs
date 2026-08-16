@@ -101,6 +101,13 @@ pub fn run(command: Command) -> AppResult<()> {
         Command::SceneLayerRemove { path, scene, index } => {
             remove_scene_layer(&path, scene_id(scene)?, index)?
         }
+        Command::SceneLayerAppearance {
+            path,
+            scene,
+            index,
+            enabled,
+            opacity,
+        } => set_scene_layer_appearance(&path, scene_id(scene)?, index, enabled, opacity)?,
         Command::InputRemove { path, input } => remove_input(&path, input_id(input)?)?,
         Command::InputDuplicate {
             path,
@@ -1308,6 +1315,31 @@ fn remove_scene_layer(path: &Path, scene: SceneId, index: usize) -> AppResult<()
     Ok(())
 }
 
+fn set_scene_layer_appearance(
+    path: &Path,
+    scene: SceneId,
+    index: usize,
+    enabled: bool,
+    opacity: u8,
+) -> AppResult<()> {
+    let store = ProjectStore::new(path)?;
+    let stored = load_stored_project(path)?;
+    let mut project = stored.project().clone();
+    project.set_scene_layer_appearance(scene, index, enabled, opacity)?;
+    let configured = StoredProject::from_project_with_complete_runtime_state(
+        project,
+        stored.runtime_routing(),
+        stored.runtime_manual_transitions(),
+        stored.runtime_fade_to_black(),
+        stored.runtime_overlays().clone(),
+        stored.position(),
+        stored.idempotency_receipts().to_vec(),
+    )?;
+    store.save(&configured)?;
+    print_status(&load_engine(path)?);
+    Ok(())
+}
+
 fn remove_input(path: &Path, input: InputId) -> AppResult<()> {
     let stored = load_stored_project(path)?;
     let runtime = stored.runtime_routing();
@@ -2052,6 +2084,7 @@ Usage:
   freemix-cli scene-input-add <show.freemix> <nonzero-input-id> <nonzero-scene-id> <name>
   freemix-cli scene-layer-add <show.freemix> <scene-id> <source-input-id> <z-order> <layer-name>
   freemix-cli scene-layer-remove <show.freemix> <scene-id> <zero-based-layer-index>
+  freemix-cli scene-layer-appearance <show.freemix> <scene-id> <zero-based-layer-index> <enabled:on|off> <opacity:0..=255>
   freemix-cli input-remove <show.freemix> <input-id>
   freemix-cli input-duplicate <show.freemix> <source-input-id> <new-nonzero-input-id> <new-name>
   freemix-cli input-replace-simulated <show.freemix> <input-id>

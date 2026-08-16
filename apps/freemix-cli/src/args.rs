@@ -94,6 +94,13 @@ pub enum Command {
         scene: u128,
         index: usize,
     },
+    SceneLayerAppearance {
+        path: PathBuf,
+        scene: u128,
+        index: usize,
+        enabled: bool,
+        opacity: u8,
+    },
     InputRemove {
         path: PathBuf,
         input: u128,
@@ -508,6 +515,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
         "scene-input-add" => parse_scene_input_add(arguments),
         "scene-layer-add" => parse_scene_layer_add(arguments),
         "scene-layer-remove" => parse_scene_layer_remove(arguments),
+        "scene-layer-appearance" => parse_scene_layer_appearance(arguments),
         "input-remove" => parse_input_remove(arguments),
         "input-duplicate" => parse_input_duplicate(arguments),
         "input-replace-simulated" => parse_input_replace_simulated(arguments),
@@ -958,6 +966,24 @@ fn parse_scene_layer_remove(
     let index = number(&required(&mut arguments, "layer index")?, "layer index")?;
     reject_extra(&mut arguments)?;
     Ok(Command::SceneLayerRemove { path, scene, index })
+}
+
+fn parse_scene_layer_appearance(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Command, ArgsError> {
+    let path = required_path(&mut arguments, "project path")?;
+    let scene = number(&required(&mut arguments, "scene")?, "scene")?;
+    let index = number(&required(&mut arguments, "layer index")?, "layer index")?;
+    let enabled = boolean_choice(&required(&mut arguments, "enabled")?, "enabled")?;
+    let opacity = bounded_u8(&required(&mut arguments, "opacity")?, "opacity", 255)?;
+    reject_extra(&mut arguments)?;
+    Ok(Command::SceneLayerAppearance {
+        path,
+        scene,
+        index,
+        enabled,
+        opacity,
+    })
 }
 
 fn parse_input_remove(mut arguments: impl Iterator<Item = String>) -> Result<Command, ArgsError> {
@@ -1452,6 +1478,19 @@ fn boolean_choice(value: &str, field: &'static str) -> Result<bool, ArgsError> {
             value: value.to_owned(),
         }),
     }
+}
+
+fn bounded_u8(value: &str, field: &'static str, maximum: u8) -> Result<u8, ArgsError> {
+    let parsed = number::<u16>(value, field)?;
+    if parsed > u16::from(maximum) {
+        return Err(ArgsError::OutOfRange {
+            field,
+            minimum: 0,
+            maximum: u16::from(maximum),
+            value: parsed,
+        });
+    }
+    Ok(u8::try_from(parsed).expect("validated bounded u8"))
 }
 
 fn socket_address(value: &str) -> Result<SocketAddr, ArgsError> {
