@@ -72,8 +72,9 @@ and deterministic model tests. Protocol 2.13 added one bounded, read-only
 control-plane diagnostics query, authorized by `ViewStatus`; it reports the
 point-in-time control diagnostics and does not mutate engine or durable state.
 It is not telemetry, health, or readiness, and RC-015 remains planned.
-Protocol 2.14 adds the ordered configured output ID/name roster required for
-exact overlay-output inclusion controls; it does not prove output delivery.
+The diagnostic client now reports the authoritative ordered input and configured
+output ID/name rosters from its validated snapshot. This is control inventory
+only, not output delivery or service readiness; RC-008 and RC-015 remain planned.
 Protocol 2.15 defines bounded fixed-point Master and per-input meter records;
 `fm-client` validates identity and monotonic sequence without changing the
 durable cursor. Native `freemixd` publishes the latest completed frame to

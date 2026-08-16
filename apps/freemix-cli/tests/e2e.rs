@@ -1002,7 +1002,7 @@ fn write_handshake_version_with_manual(
             revision,
             show_name: "Remote Contract".into(),
             inputs: input_statuses(),
-            outputs: Vec::new(),
+            outputs: output_statuses(),
             input_audio_strips: input_audio_strips(),
             desired_program: input(1),
             desired_preview: preview,
@@ -1211,6 +1211,16 @@ fn input_statuses() -> Vec<fm_protocol::InputStatus> {
         .collect()
 }
 
+fn output_statuses() -> Vec<fm_protocol::OutputStatus> {
+    [(30, "Program \"Main\""), (31, "Auxiliary")]
+        .into_iter()
+        .map(|(value, name)| fm_protocol::OutputStatus {
+            output: fm_protocol::WireOutputId::new(NonZeroU128::new(value).unwrap()),
+            name: name.into(),
+        })
+        .collect()
+}
+
 fn input_audio_strips() -> Vec<fm_protocol::InputAudioStripStatus> {
     [input(1), input(2)]
         .into_iter()
@@ -1232,7 +1242,11 @@ fn remote_commands_use_protocol_server() {
     let address = server.address();
     let initial = invoke(&["remote-status", &address]);
     assert_success(&initial);
-    assert_remote_status(&stdout(&initial), 0, 1, 1, 2, 2);
+    let initial_status = stdout(&initial);
+    assert_remote_status(&initial_status, 0, 1, 1, 2, 2);
+    assert!(initial_status.contains(
+        r#"Inputs=[1:"Camera",2:"Slides"] Outputs=[30:"Program \"Main\"",31:"Auxiliary"]"#
+    ));
 
     let preview = invoke(&[
         "remote-preview",

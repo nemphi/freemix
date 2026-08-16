@@ -373,7 +373,7 @@ impl Remote {
             .ok_or_else(|| RemoteFailure("remote project cursor is unavailable".into()))?;
         let switcher = state.switcher();
         println!(
-            "project_id={} show={:?} revision={} frame=unavailable Program(desired={}, realized={}) Preview(desired={}, realized={}) TBar(desired={}, realized={}) FTB(desired={}, realized={}) AudioStrips={} Overlays(desired={}, realized={})",
+            "project_id={} show={:?} revision={} frame=unavailable Program(desired={}, realized={}) Preview(desired={}, realized={}) TBar(desired={}, realized={}) FTB(desired={}, realized={}) AudioStrips={} Overlays(desired={}, realized={}) Inputs={} Outputs={}",
             self.project_id,
             state.show_name(),
             cursor.revision,
@@ -388,6 +388,8 @@ impl Remote {
             format_input_audio_strips(state),
             format_overlays(state.desired_overlays()),
             format_overlays(state.realized_overlays()),
+            format_input_roster(state),
+            format_output_roster(state),
         );
         Ok(())
     }
@@ -472,6 +474,30 @@ fn format_input_audio_strips(state: &fm_ui_model::ProjectState) -> String {
                     status.delay_samples
                 )
             })
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn format_input_roster(state: &fm_ui_model::ProjectState) -> String {
+    format!(
+        "[{}]",
+        state
+            .inputs()
+            .iter()
+            .map(|input| format!("{}:{:?}", input, state.input_name(*input).unwrap_or("")))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn format_output_roster(state: &fm_ui_model::ProjectState) -> String {
+    format!(
+        "[{}]",
+        state
+            .outputs()
+            .iter()
+            .map(|output| format!("{}:{:?}", output.output, output.name))
             .collect::<Vec<_>>()
             .join(",")
     )
