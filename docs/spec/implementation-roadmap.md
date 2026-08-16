@@ -319,7 +319,7 @@ remain separate.
 `media-input-add` and `media-input-relink` are local next-open media-input configuration footholds. They store strict
 `asset://` URIs without requiring the assets to exist; native decode, live add/relink,
 offline lifecycle, batch import, Studio, remote acceptance, and IN-008/IN-026 remain planned.
-`input-replace-media` is local next-open source replacement only; it does not require asset existence or add decode, live, or protocol acceptance, and IN-026 remains planned.
+`input-replace-media` and `input-replace-scene` are local next-open source replacement only; scene replacement uses an existing scene and rejects scene/input graph cycles. They add no live, render, or protocol acceptance, and IN-020/IN-026 remain planned.
 `simulated-solid-input-add` is a local next-open simulated solid configuration foothold with
 straight RGBA bytes; live add, Studio/remote control, native acceptance, and IN-008/IN-026 remain planned.
 Neither command applies an optimistic change or changes current switcher state.

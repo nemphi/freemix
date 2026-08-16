@@ -399,6 +399,9 @@ pub fn run(command: Command) -> AppResult<()> {
             validate_asset_uri(&asset_uri)?;
             replace_input_media(&path, input_id(input)?, asset_uri)?;
         }
+        Command::InputReplaceScene { path, input, scene } => {
+            replace_input_scene(&path, input_id(input)?, scene_id(scene)?)?
+        }
         Command::Status { path } => print_status(&load_engine(&path)?),
         Command::JournalRecover { path } => recover_journal(&path)?,
         Command::Inputs { path } => {
@@ -2277,6 +2280,21 @@ fn replace_input_media(path: &Path, input: InputId, asset_uri: String) -> AppRes
     })
 }
 
+fn replace_input_scene(path: &Path, input: InputId, scene: SceneId) -> AppResult<()> {
+    update_project(path, |project| {
+        project
+            .replace_input_source(
+                input,
+                InputKind::Scene {
+                    scene_id: scene,
+                    audio_source: None,
+                },
+                Vec::new(),
+            )
+            .map_err(Into::into)
+    })
+}
+
 fn remove_stinger(path: &Path, slot: StingerSlotNumber) -> AppResult<()> {
     update_project(path, |project| {
         let _ = project.remove_stinger(slot);
@@ -3100,6 +3118,7 @@ Usage:
   freemix-cli input-replace-simulated <show.freemix> <input-id>
   freemix-cli input-replace-solid <show.freemix> <input-id> <red:0..=255> <green:0..=255> <blue:0..=255> <alpha:0..=255>
   freemix-cli input-replace-media <show.freemix> <input-id> <asset://key>
+  freemix-cli input-replace-scene <show.freemix> <input-id> <existing-scene-id>
   freemix-cli status <show.freemix>
   freemix-cli journal-recover <show.freemix>
   freemix-cli inputs <show.freemix>

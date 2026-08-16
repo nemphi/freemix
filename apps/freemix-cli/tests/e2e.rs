@@ -5321,6 +5321,129 @@ fn local_input_replace_media_preserves_identity_and_runtime() {
 }
 
 #[test]
+fn local_input_replace_scene_preserves_identity_and_rejects_cycle() {
+    let context = ContractContext::new();
+    let path = context.project_path();
+    let run = |arguments: &[&str]| assert_success(&invoke_bounded(arguments));
+    run(&["new", path]);
+    run(&[
+        "audio-strip",
+        path,
+        "2",
+        "-1200",
+        "2500",
+        "on",
+        "off",
+        "off",
+        "480",
+    ]);
+    run(&[
+        "tbar-start",
+        path,
+        "fade",
+        "--key",
+        "replace-scene",
+        "--expect",
+        "1",
+    ]);
+    run(&["scene-input-add", path, "3", "7", "Source"]);
+
+    let store = ProjectStore::new(&context.project).unwrap();
+    let before = store.load().unwrap();
+    let input = InputId::new(NonZeroU128::new(2).unwrap());
+    let source = SceneId::new(NonZeroU128::new(7).unwrap());
+    let before_input = before
+        .project()
+        .inputs()
+        .iter()
+        .find(|candidate| candidate.id == input)
+        .unwrap();
+
+    run(&["input-replace-scene", path, "2", "7"]);
+    let after = store.load().unwrap();
+    let after_input = after
+        .project()
+        .inputs()
+        .iter()
+        .find(|candidate| candidate.id == input)
+        .unwrap();
+    assert_eq!(after_input.id, before_input.id);
+    assert_eq!(after_input.name, before_input.name);
+    assert_eq!(after_input.required_capabilities, Vec::<String>::new());
+    assert_eq!(
+        after_input.kind,
+        InputKind::Scene {
+            scene_id: source,
+            audio_source: None,
+        }
+    );
+    assert_eq!(
+        after.project().schema_version(),
+        before.project().schema_version()
+    );
+    assert_eq!(after.project().id(), before.project().id());
+    assert_eq!(after.project().name(), before.project().name());
+    assert_eq!(after.project().settings(), before.project().settings());
+    assert_eq!(
+        after
+            .project()
+            .inputs()
+            .iter()
+            .map(|candidate| candidate.id)
+            .collect::<Vec<_>>(),
+        before
+            .project()
+            .inputs()
+            .iter()
+            .map(|candidate| candidate.id)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        after.project().input_audio_strips(),
+        before.project().input_audio_strips()
+    );
+    assert_eq!(after.project().scenes(), before.project().scenes());
+    assert_eq!(
+        after.project().audio_buses(),
+        before.project().audio_buses()
+    );
+    assert_eq!(after.project().outputs(), before.project().outputs());
+    assert_eq!(after.project().main_mix(), before.project().main_mix());
+    assert_eq!(after.project().stingers(), before.project().stingers());
+    assert_eq!(
+        after.project().restart_policy(),
+        before.project().restart_policy()
+    );
+    assert_eq!(after.runtime_routing(), before.runtime_routing());
+    assert_eq!(
+        after.runtime_manual_transitions(),
+        before.runtime_manual_transitions()
+    );
+    assert_eq!(
+        after.runtime_fade_to_black(),
+        before.runtime_fade_to_black()
+    );
+    assert_eq!(after.runtime_overlays(), before.runtime_overlays());
+    assert_eq!(after.position(), before.position());
+    assert_eq!(after.idempotency_receipts(), before.idempotency_receipts());
+
+    run(&["scene-input-add", path, "4", "8", "Cycle"]);
+    run(&["scene-layer-add", path, "8", "2", "0", "Self reference"]);
+    let manifest_before = fs::read(context.project.join("project.json")).unwrap();
+    let journal_before = journal_bytes(&store);
+    assert_failure_contains(
+        &invoke_bounded(&["input-replace-scene", path, "2", "8"]),
+        "domain project failed validation",
+    );
+    assert_eq!(
+        fs::read(context.project.join("project.json")).unwrap(),
+        manifest_before
+    );
+    assert_eq!(journal_bytes(&store), journal_before);
+    fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
 fn local_input_remove_rejects_runtime_reference_and_removes_unused_input() {
     let context = ContractContext::new();
     assert_success(&invoke(&["new", context.project_path()]));

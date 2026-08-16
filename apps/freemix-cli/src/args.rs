@@ -324,6 +324,11 @@ pub enum Command {
         input: u128,
         asset_uri: String,
     },
+    InputReplaceScene {
+        path: PathBuf,
+        input: u128,
+        scene: u128,
+    },
     Status {
         path: PathBuf,
     },
@@ -781,6 +786,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
         "input-replace-simulated" => parse_input_replace_simulated(arguments),
         "input-replace-solid" => parse_input_replace_solid(arguments),
         "input-replace-media" => parse_input_replace_media(arguments),
+        "input-replace-scene" => parse_input_replace_scene(arguments),
         "status" => {
             let path = required_path(&mut arguments, "project path")?;
             reject_extra(&mut arguments)?;
@@ -1850,6 +1856,16 @@ fn parse_input_replace_media(
         input,
         asset_uri,
     })
+}
+
+fn parse_input_replace_scene(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Command, ArgsError> {
+    let path = required_path(&mut arguments, "project path")?;
+    let input = number(&required(&mut arguments, "input")?, "input")?;
+    let scene = number(&required(&mut arguments, "scene")?, "scene")?;
+    reject_extra(&mut arguments)?;
+    Ok(Command::InputReplaceScene { path, input, scene })
 }
 
 fn parse_local_timed_transition(
