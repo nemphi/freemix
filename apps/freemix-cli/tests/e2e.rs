@@ -3817,6 +3817,55 @@ fn local_scene_layer_add_persists_full_frame_layer() {
 }
 
 #[test]
+fn local_scene_layer_add_scene_persists_exact_source() {
+    let context = ContractContext::new();
+    let run = |arguments: &[&str]| assert_success(&invoke_bounded(arguments));
+    let path = context.project_path();
+    run(&["new", path]);
+    run(&["scene-input-add", path, "10", "10", "Source"]);
+    run(&["scene-input-add", path, "11", "11", "Target"]);
+    run(&[
+        "scene-layer-add-scene",
+        path,
+        "11",
+        "10",
+        "-4",
+        "  Source scene  ",
+    ]);
+
+    let stored = ProjectStore::new(&context.project).unwrap().load().unwrap();
+    let scene_id = |value| SceneId::new(NonZeroU128::new(value).unwrap());
+    let target = stored
+        .project()
+        .scenes()
+        .iter()
+        .find(|scene| scene.id == scene_id(11))
+        .unwrap();
+    assert_eq!(target.id, scene_id(11));
+    assert_eq!(target.layers.len(), 1);
+    let layer = &target.layers[0];
+    assert_eq!(layer.source, SourceRef::Scene(scene_id(10)));
+    assert_eq!(layer.name, "  Source scene  ");
+    assert!(layer.enabled);
+    assert_eq!(
+        layer.geometry,
+        LayerGeometry::new(0, 0, 1_920, 1_080, Rotation::Deg0)
+    );
+    assert_eq!(layer.crop, None);
+    assert_eq!(layer.mask, None);
+    assert_eq!(layer.opacity, u8::MAX);
+    assert_eq!(layer.z_order, -4);
+    let before_self_reference = fs::read(context.project.join("project.json")).unwrap();
+    let rejected = invoke_bounded(&["scene-layer-add-scene", path, "11", "11", "0", "Self"]);
+    assert_failure_contains(&rejected, "cycle");
+    assert_eq!(
+        fs::read(context.project.join("project.json")).unwrap(),
+        before_self_reference
+    );
+    fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
 fn local_scene_layer_add_rejects_missing_input_without_manifest_or_journal_change() {
     let context = ContractContext::new();
     let path = context.project_path();

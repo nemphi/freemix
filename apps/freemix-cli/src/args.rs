@@ -196,6 +196,13 @@ pub enum Command {
         z_order: i32,
         name: String,
     },
+    SceneLayerAddScene {
+        path: PathBuf,
+        scene: u128,
+        source_scene: u128,
+        z_order: i32,
+        name: String,
+    },
     SceneLayerRemove {
         path: PathBuf,
         scene: u128,
@@ -722,6 +729,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
         "scene-remove" => parse_scene_remove(arguments),
         "scene-rename" => parse_scene_rename(arguments),
         "scene-layer-add" => parse_scene_layer_add(arguments),
+        "scene-layer-add-scene" => parse_scene_layer_add_scene(arguments),
         "scene-layer-remove" => parse_scene_layer_remove(arguments),
         "scene-layer-rename" => parse_scene_layer_rename(arguments),
         "scene-layer-source-input" => parse_scene_layer_source_input(arguments),
@@ -1462,6 +1470,24 @@ fn parse_scene_layer_add(
         path,
         scene,
         source,
+        z_order,
+        name,
+    })
+}
+
+fn parse_scene_layer_add_scene(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Command, ArgsError> {
+    let path = required_path(&mut arguments, "project path")?;
+    let scene = number(&required(&mut arguments, "scene")?, "scene")?;
+    let source_scene = number(&required(&mut arguments, "source scene")?, "source scene")?;
+    let z_order = number(&required(&mut arguments, "z-order")?, "z-order")?;
+    let name = nonblank(&mut arguments, "layer name")?;
+    reject_extra(&mut arguments)?;
+    Ok(Command::SceneLayerAddScene {
+        path,
+        scene,
+        source_scene,
         z_order,
         name,
     })

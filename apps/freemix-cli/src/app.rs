@@ -230,7 +230,26 @@ pub fn run(command: Command) -> AppResult<()> {
             source,
             z_order,
             name,
-        } => add_scene_layer(&path, scene_id(scene)?, input_id(source)?, z_order, name)?,
+        } => add_scene_layer(
+            &path,
+            scene_id(scene)?,
+            SourceRef::Input(input_id(source)?),
+            z_order,
+            name,
+        )?,
+        Command::SceneLayerAddScene {
+            path,
+            scene,
+            source_scene,
+            z_order,
+            name,
+        } => add_scene_layer(
+            &path,
+            scene_id(scene)?,
+            SourceRef::Scene(scene_id(source_scene)?),
+            z_order,
+            name,
+        )?,
         Command::SceneLayerRemove { path, scene, index } => {
             remove_scene_layer(&path, scene_id(scene)?, index)?
         }
@@ -1727,45 +1746,34 @@ fn set_scene_input_audio_source(
 fn add_scene_layer(
     path: &Path,
     scene: SceneId,
-    source: InputId,
+    source: SourceRef,
     z_order: i32,
     name: String,
 ) -> AppResult<()> {
-    let store = ProjectStore::new(path)?;
-    let stored = load_stored_project(path)?;
-    let mut project = stored.project().clone();
-    let dimensions = project.settings().video.dimensions;
-    project.add_layer_to_scene(
-        scene,
-        Layer {
-            name,
-            source: SourceRef::Input(source),
-            enabled: true,
-            geometry: LayerGeometry::new(
-                0,
-                0,
-                dimensions.width(),
-                dimensions.height(),
-                Rotation::Deg0,
-            ),
-            crop: None,
-            mask: None,
-            opacity: u8::MAX,
-            z_order,
-        },
-    )?;
-    let configured = StoredProject::from_project_with_complete_runtime_state(
-        project,
-        stored.runtime_routing(),
-        stored.runtime_manual_transitions(),
-        stored.runtime_fade_to_black(),
-        stored.runtime_overlays().clone(),
-        stored.position(),
-        stored.idempotency_receipts().to_vec(),
-    )?;
-    store.save(&configured)?;
-    print_status(&load_engine(path)?);
-    Ok(())
+    update_project(path, |project| {
+        let dimensions = project.settings().video.dimensions;
+        project
+            .add_layer_to_scene(
+                scene,
+                Layer {
+                    name,
+                    source,
+                    enabled: true,
+                    geometry: LayerGeometry::new(
+                        0,
+                        0,
+                        dimensions.width(),
+                        dimensions.height(),
+                        Rotation::Deg0,
+                    ),
+                    crop: None,
+                    mask: None,
+                    opacity: u8::MAX,
+                    z_order,
+                },
+            )
+            .map_err(Into::into)
+    })
 }
 
 fn set_scene_background(path: &Path, scene: SceneId, background: ModelRgba8) -> AppResult<()> {
@@ -2969,6 +2977,7 @@ Usage:
   freemix-cli scene-remove <show.freemix> <existing-scene-id>
   freemix-cli scene-rename <show.freemix> <existing-scene-id> <scene-name>
   freemix-cli scene-layer-add <show.freemix> <scene-id> <source-input-id> <z-order> <layer-name>
+  freemix-cli scene-layer-add-scene <show.freemix> <target-scene-id> <source-scene-id> <z-order> <layer-name>
   freemix-cli scene-layer-remove <show.freemix> <scene-id> <zero-based-layer-index>
   freemix-cli scene-layer-rename <show.freemix> <scene-id> <zero-based-layer-index> <name>
   freemix-cli scene-layer-source-input <show.freemix> <scene-id> <zero-based-layer-index> <input-id>

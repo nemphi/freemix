@@ -304,10 +304,11 @@ audio source. `scene-input-audio-source` and `scene-input-audio-source-clear`
 persist the scene input audio route. `scene-layer-add`, `scene-layer-remove`, `scene-layer-rename`, `scene-layer-appearance`,
 `scene-layer-geometry`, `scene-layer-crop`, `scene-layer-crop-clear`,
 `scene-layer-mask`, `scene-layer-mask-clear`, `scene-layer-z-order`, and
-`scene-background` (premultiplied RGBA), `scene-layer-source-input`, and
-`scene-layer-source-scene` are local next-open layer-editing
-footholds; local scene rendering, live editing, feathered and non-rectangular
-masks, effects, and IN-020 remain planned.
+`scene-background` (premultiplied RGBA), `scene-layer-source-input`,
+`scene-layer-source-scene`, and `scene-layer-add-scene` are local next-open
+layer-editing footholds only; direct scene composition rejects missing or cyclic
+sources and adds no render, live, or protocol acceptance; `SW-004` remains
+planned.
 `scene-remove` is local next-open scene removal only; it does not add cascade
 behavior, rendering, live editing, daemon/Studio/protocol mutation, output
 realization, or acceptance.
