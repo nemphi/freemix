@@ -220,6 +220,9 @@ pub enum RemoveAudioBusError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AddSceneLayerError {
     UnknownScene(SceneId),
+    MissingInput(InputId),
+    MissingScene(SceneId),
+    SourceCycle,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -291,6 +294,9 @@ impl std::fmt::Display for AddSceneLayerError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnknownScene(scene) => write!(formatter, "unknown scene {scene}"),
+            Self::MissingInput(input) => write!(formatter, "missing source input {input}"),
+            Self::MissingScene(scene) => write!(formatter, "missing source scene {scene}"),
+            Self::SourceCycle => formatter.write_str("scene layer source would create a cycle"),
         }
     }
 }
@@ -829,12 +835,42 @@ impl Project {
         scene: SceneId,
         layer: Layer,
     ) -> Result<(), AddSceneLayerError> {
-        self.scenes
-            .iter_mut()
-            .find(|candidate| candidate.id == scene)
-            .ok_or(AddSceneLayerError::UnknownScene(scene))?
-            .layers
-            .push(layer);
+        let scene_index = self
+            .scenes
+            .iter()
+            .position(|candidate| candidate.id == scene)
+            .ok_or(AddSceneLayerError::UnknownScene(scene))?;
+        match layer.source {
+            SourceRef::Input(input)
+                if !self.inputs.iter().any(|candidate| candidate.id == input) =>
+            {
+                return Err(AddSceneLayerError::MissingInput(input));
+            }
+            SourceRef::Scene(source_scene)
+                if !self
+                    .scenes
+                    .iter()
+                    .any(|candidate| candidate.id == source_scene) =>
+            {
+                return Err(AddSceneLayerError::MissingScene(source_scene));
+            }
+            SourceRef::Input(_) | SourceRef::Scene(_) => {}
+        }
+        let mut candidate = self.clone();
+        candidate.scenes[scene_index].layers.push(layer);
+        if candidate.validate().is_err_and(|errors| {
+            errors.iter().any(|error| {
+                error.entity == Some(EntityRef::Scene(scene))
+                    && error.field == "layers.source"
+                    && matches!(
+                        error.kind,
+                        ValidationErrorKind::SelfReference | ValidationErrorKind::Cycle
+                    )
+            })
+        }) {
+            return Err(AddSceneLayerError::SourceCycle);
+        }
+        *self = candidate;
         Ok(())
     }
 

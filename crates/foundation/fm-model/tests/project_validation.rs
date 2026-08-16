@@ -1,7 +1,7 @@
 use std::num::NonZeroU128;
 
 use fm_model::{
-    AddSceneInputError, AudioBus, BusSend, CURRENT_SCHEMA_VERSION, CropRect,
+    AddSceneInputError, AddSceneLayerError, AudioBus, BusSend, CURRENT_SCHEMA_VERSION, CropRect,
     DuplicateSceneInputError, EntityRef, Input, InputAudioStripState, InputBalanceBasisPoints,
     InputDelaySamples, InputGainMilliDb, InputKind, Layer, LayerGeometry, MainMix, Output,
     OutputFormat, Project, ProjectSettings, RectMask, RemoveAudioBusError, RemoveInputError,
@@ -142,6 +142,60 @@ fn simulated_project() -> Project {
 #[test]
 fn coherent_project_is_valid() {
     assert_eq!(valid_project().validate(), Ok(()));
+}
+
+#[test]
+fn add_scene_layer_rejects_missing_sources_and_cycles_without_mutation() {
+    let mut project = valid_project();
+    for (source, error) in [
+        (
+            SourceRef::Input(input_id(99)),
+            AddSceneLayerError::MissingInput(input_id(99)),
+        ),
+        (
+            SourceRef::Scene(scene_id(99)),
+            AddSceneLayerError::MissingScene(scene_id(99)),
+        ),
+        (
+            SourceRef::Scene(scene_id(1)),
+            AddSceneLayerError::SourceCycle,
+        ),
+    ] {
+        let before = project.clone();
+        assert_eq!(
+            project.add_layer_to_scene(scene_id(1), layer("rejected", source)),
+            Err(error)
+        );
+        assert_eq!(project, before);
+    }
+
+    project.add_scene(Scene {
+        id: scene_id(2),
+        name: "Nested".into(),
+        background: Rgba8::OPAQUE_BLACK,
+        layers: vec![layer("back", SourceRef::Scene(scene_id(1)))],
+    });
+    project.add_input(Input {
+        id: input_id(2),
+        name: "Nested input".into(),
+        kind: InputKind::Scene {
+            scene_id: scene_id(2),
+            audio_source: None,
+        },
+        required_capabilities: Vec::new(),
+    });
+    let before = project.clone();
+    assert_eq!(
+        project.add_layer_to_scene(scene_id(1), layer("cross", SourceRef::Input(input_id(2)))),
+        Err(AddSceneLayerError::SourceCycle)
+    );
+    assert_eq!(project, before);
+
+    let appended = layer("accepted", SourceRef::Input(input_id(1)));
+    project
+        .add_layer_to_scene(scene_id(1), appended.clone())
+        .unwrap();
+    assert_eq!(project.scenes()[0].layers.last(), Some(&appended));
 }
 
 #[test]

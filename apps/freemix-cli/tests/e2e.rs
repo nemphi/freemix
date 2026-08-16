@@ -3383,6 +3383,26 @@ fn local_scene_layer_add_persists_full_frame_layer() {
 }
 
 #[test]
+fn local_scene_layer_add_rejects_missing_input_without_manifest_or_journal_change() {
+    let context = ContractContext::new();
+    let path = context.project_path();
+    assert_success(&invoke(&["new", path]));
+    assert_success(&invoke(&["scene-input-add", path, "10", "7", "Scene"]));
+    let store = ProjectStore::new(&context.project).unwrap();
+    let manifest_before = fs::read(context.project.join("project.json")).unwrap();
+    let journal_before = journal_bytes(&store);
+
+    let rejected = invoke(&["scene-layer-add", path, "7", "99", "0", "Missing"]);
+    assert_failure_contains(&rejected, "error: missing source input 99");
+    assert_eq!(
+        fs::read(context.project.join("project.json")).unwrap(),
+        manifest_before
+    );
+    assert_eq!(journal_bytes(&store), journal_before);
+    fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
 fn local_scene_layer_source_reassignment() {
     let context = ContractContext::new();
     assert_success(&invoke(&["new", context.project_path()]));
