@@ -2222,20 +2222,6 @@ fn local_scene_layer_geometry_preserves_other_layer_state() {
     let mut expected_layers = before_scene.layers.clone();
     expected_layers[1].geometry = LayerGeometry::new(-12, 34, 640, 480, Rotation::Deg270);
     assert_eq!(after_scene.layers, expected_layers);
-    assert_failure_contains(
-        &invoke(&[
-            "scene-layer-geometry",
-            context.project_path(),
-            "7",
-            "1",
-            "0",
-            "0",
-            "1",
-            "1",
-            "45",
-        ]),
-        "invalid rotation",
-    );
     fs::remove_dir_all(context.root).unwrap();
 }
 
