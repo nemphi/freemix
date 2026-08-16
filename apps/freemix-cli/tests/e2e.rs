@@ -2688,8 +2688,100 @@ fn scene_rename_persists_exact_name_and_failures_preserve_manifest() {
             name,
         ]));
     }
+    assert_success(&invoke(&[
+        "scene-layer-add",
+        context.project_path(),
+        "10",
+        "1",
+        "2",
+        "Camera layer",
+    ]));
+    assert_success(&invoke(&[
+        "scene-layer-geometry",
+        context.project_path(),
+        "10",
+        "0",
+        "10",
+        "20",
+        "640",
+        "360",
+        "90",
+    ]));
+    assert_success(&invoke(&[
+        "scene-layer-appearance",
+        context.project_path(),
+        "10",
+        "0",
+        "off",
+        "200",
+    ]));
+    assert_success(&invoke(&[
+        "scene-background",
+        context.project_path(),
+        "10",
+        "16",
+        "8",
+        "4",
+        "16",
+    ]));
+    assert_success(&invoke(&[
+        "audio-bus-add",
+        context.project_path(),
+        "20",
+        "Master",
+    ]));
+    assert_success(&invoke(&[
+        "output-add",
+        context.project_path(),
+        "30",
+        "10",
+        "20",
+        "Program",
+    ]));
+    assert_success(&invoke(&["preview", context.project_path(), "2"]));
+    assert_success(&invoke(&["cut", context.project_path()]));
+    assert_success(&invoke(&["tbar-start", context.project_path(), "fade"]));
+    assert_success(&invoke(&["tbar-position", context.project_path(), "5000"]));
+    assert_success(&invoke(&["ftb", context.project_path(), "black", "2"]));
+    assert_success(&invoke(&[
+        "overlay-transition",
+        context.project_path(),
+        "1",
+        "fade",
+        "3",
+    ]));
+    assert_success(&invoke(&[
+        "overlay-appearance",
+        context.project_path(),
+        "1",
+        "top-left",
+        "thick-white",
+    ]));
+    assert_success(&invoke(&["overlay-take", context.project_path(), "1", "1"]));
+    assert_success(&invoke(&[
+        "overlay-output",
+        context.project_path(),
+        "1",
+        "30",
+        "true",
+    ]));
     let store = ProjectStore::new(&context.project).unwrap();
     let before = store.load().unwrap();
+    assert_ne!(before.project().scenes()[0].background, Rgba8::OPAQUE_BLACK);
+    assert_eq!(before.project().scenes()[0].layers.len(), 1);
+    assert!(!before.project().audio_buses().is_empty());
+    assert!(!before.project().outputs().is_empty());
+    assert!(before.runtime_routing().desired_program_id.is_some());
+    assert!(before.runtime_manual_transitions().desired.is_some());
+    assert!(before.runtime_fade_to_black().desired.target_active);
+    assert!(before.runtime_overlays().desired[0].source.is_some());
+    assert!(
+        !before.runtime_overlays().desired[0]
+            .included_outputs
+            .is_empty()
+    );
+    assert!(before.position().revision > 0);
+    assert!(!before.idempotency_receipts().is_empty());
     let manifest_before = fs::read(context.project.join("project.json")).unwrap();
     let journal_before = journal_bytes(&store);
     for (scene, name, expected) in [
