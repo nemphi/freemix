@@ -156,7 +156,12 @@ fn relay(
             }
             Ok(Message::Binary(_)) => return,
             Ok(Message::Ping(_) | Message::Pong(_)) => {}
-            Ok(Message::Close(_)) => return,
+            Ok(Message::Close(_)) => {
+                if websocket.flush().is_err() {
+                    return;
+                }
+                return;
+            }
             Ok(Message::Frame(_)) => return,
             Err(WebSocketError::Io(error))
                 if matches!(
