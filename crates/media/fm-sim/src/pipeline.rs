@@ -90,14 +90,14 @@ impl SimulatedPipeline {
         frame_number: u64,
         program: ProgramFrame,
     ) -> Result<ImageFrame, RenderError> {
-        let primary = self.render_input(program.primary, frame_number)?;
+        let primary = self.render_source(program.primary, frame_number)?;
         let Some(secondary) = program
             .secondary
             .filter(|secondary| *secondary != program.primary)
         else {
             return Ok(primary);
         };
-        let secondary = self.render_input(secondary, frame_number)?;
+        let secondary = self.render_source(secondary, frame_number)?;
         match program.transition_kind {
             Some(TransitionKind::Fade | TransitionKind::AlphaFade) => Ok(crossfade(
                 &primary,
@@ -128,7 +128,17 @@ impl SimulatedPipeline {
         }
     }
 
-    fn render_input(&self, input: InputId, frame_number: u64) -> Result<ImageFrame, RenderError> {
+    /// Renders a registered source for a frame number.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RenderError::MissingSource`] when the input is not registered,
+    /// or a structured video error when generation fails.
+    pub fn render_source(
+        &self,
+        input: InputId,
+        frame_number: u64,
+    ) -> Result<ImageFrame, RenderError> {
         let source = self
             .sources
             .get(&input)
