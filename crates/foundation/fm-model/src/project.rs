@@ -3,7 +3,7 @@ use fm_types::{
     SceneId, VideoFormat, validate_input_name, validate_input_order,
 };
 
-use crate::{ValidationError, validation::validate_project};
+use crate::{EntityRef, ValidationError, ValidationErrorKind, validation::validate_project};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RemoveInputError {
@@ -35,6 +35,9 @@ pub enum SceneLayerError {
         index: usize,
         length: usize,
     },
+    MissingInput(InputId),
+    MissingScene(SceneId),
+    SourceCycle,
 }
 
 impl std::fmt::Display for SceneLayerError {
@@ -49,6 +52,9 @@ impl std::fmt::Display for SceneLayerError {
                 formatter,
                 "layer index {index} out of range for scene {scene} with {length} layers"
             ),
+            Self::MissingInput(input) => write!(formatter, "missing source input {input}"),
+            Self::MissingScene(scene) => write!(formatter, "missing source scene {scene}"),
+            Self::SourceCycle => formatter.write_str("scene layer source would create a cycle"),
         }
     }
 }
@@ -396,6 +402,57 @@ impl Project {
                 length,
             })?;
         layer.z_order = z_order;
+        Ok(())
+    }
+
+    pub fn set_scene_layer_source(
+        &mut self,
+        scene: SceneId,
+        index: usize,
+        source: SourceRef,
+    ) -> Result<(), SceneLayerError> {
+        let scene_index = self
+            .scenes
+            .iter()
+            .position(|candidate| candidate.id == scene)
+            .ok_or(SceneLayerError::UnknownScene(scene))?;
+        let length = self.scenes[scene_index].layers.len();
+        if index >= length {
+            return Err(SceneLayerError::LayerIndexOutOfRange {
+                scene,
+                index,
+                length,
+            });
+        }
+        match source {
+            SourceRef::Input(input)
+                if !self.inputs.iter().any(|candidate| candidate.id == input) =>
+            {
+                return Err(SceneLayerError::MissingInput(input));
+            }
+            SourceRef::Scene(source_scene)
+                if !self
+                    .scenes
+                    .iter()
+                    .any(|candidate| candidate.id == source_scene) =>
+            {
+                return Err(SceneLayerError::MissingScene(source_scene));
+            }
+            SourceRef::Input(_) | SourceRef::Scene(_) => {}
+        }
+        let previous_errors = self.validate().err().unwrap_or_default();
+        let mut candidate = self.clone();
+        candidate.scenes[scene_index].layers[index].source = source;
+        if candidate.validate().err().is_some_and(|errors| {
+            errors.iter().any(|error| {
+                error.kind == ValidationErrorKind::Cycle
+                    && !previous_errors.contains(error)
+                    && matches!(error.entity, Some(EntityRef::Scene(_)))
+            })
+        }) {
+            return Err(SceneLayerError::SourceCycle);
+        }
+        self.scenes[scene_index].layers[index].source = source;
         Ok(())
     }
 

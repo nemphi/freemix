@@ -277,7 +277,8 @@ only. `scene-input-add` creates an empty opaque-black scene with no layers and n
 audio source. `scene-layer-add`, `scene-layer-remove`, `scene-layer-appearance`,
 `scene-layer-geometry`, `scene-layer-crop`, `scene-layer-crop-clear`,
 `scene-layer-mask`, `scene-layer-mask-clear`, `scene-layer-z-order`, and
-`scene-background` (premultiplied RGBA) are local next-open layer-editing
+`scene-background` (premultiplied RGBA), `scene-layer-source-input`, and
+`scene-layer-source-scene` are local next-open layer-editing
 footholds; local scene rendering, live editing, feathered and non-rectangular
 masks, effects, and IN-020 remain planned.
 The rename and reorder commands carry input identity; audio and routing state

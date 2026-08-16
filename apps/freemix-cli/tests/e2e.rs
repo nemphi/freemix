@@ -2068,6 +2068,124 @@ fn local_scene_layer_add_persists_full_frame_layer() {
 }
 
 #[test]
+fn local_scene_layer_source_reassignment() {
+    let context = ContractContext::new();
+    assert_success(&invoke(&["new", context.project_path()]));
+    for (input, scene, name) in [("3", "7", "A"), ("4", "8", "B"), ("5", "9", "Target")] {
+        assert_success(&invoke(&[
+            "scene-input-add",
+            context.project_path(),
+            input,
+            scene,
+            name,
+        ]));
+    }
+    assert_success(&invoke(&[
+        "scene-layer-add",
+        context.project_path(),
+        "9",
+        "1",
+        "4",
+        "first",
+    ]));
+    assert_success(&invoke(&[
+        "scene-layer-add",
+        context.project_path(),
+        "9",
+        "2",
+        "-2",
+        "second",
+    ]));
+    let before = ProjectStore::new(&context.project).unwrap().load().unwrap();
+    assert_success(&invoke(&[
+        "scene-layer-source-scene",
+        context.project_path(),
+        "9",
+        "0",
+        "7",
+    ]));
+    assert_success(&invoke(&[
+        "scene-layer-source-input",
+        context.project_path(),
+        "9",
+        "1",
+        "2",
+    ]));
+    let after = ProjectStore::new(&context.project).unwrap().load().unwrap();
+    assert_eq!(after.runtime_routing(), before.runtime_routing());
+    assert_eq!(
+        after.runtime_manual_transitions(),
+        before.runtime_manual_transitions()
+    );
+    assert_eq!(
+        after.runtime_fade_to_black(),
+        before.runtime_fade_to_black()
+    );
+    assert_eq!(after.runtime_overlays(), before.runtime_overlays());
+    assert_eq!(after.position(), before.position());
+    assert_eq!(after.idempotency_receipts(), before.idempotency_receipts());
+    assert_eq!(after.project().inputs(), before.project().inputs());
+    assert_eq!(after.project().main_mix(), before.project().main_mix());
+    assert_eq!(
+        after
+            .project()
+            .scenes()
+            .iter()
+            .map(|scene| scene.id)
+            .collect::<Vec<_>>(),
+        before
+            .project()
+            .scenes()
+            .iter()
+            .map(|scene| scene.id)
+            .collect::<Vec<_>>()
+    );
+    let target = after
+        .project()
+        .scenes()
+        .iter()
+        .find(|scene| scene.id.get().get() == 9)
+        .unwrap();
+    let before_target = before
+        .project()
+        .scenes()
+        .iter()
+        .find(|scene| scene.id.get().get() == 9)
+        .unwrap();
+    assert_eq!(target.name, before_target.name);
+    assert_eq!(target.background, before_target.background);
+    let mut expected_layers = before_target.layers.clone();
+    expected_layers[0].source =
+        SourceRef::Scene(fm_types::SceneId::new(NonZeroU128::new(7).unwrap()));
+    expected_layers[1].source = SourceRef::Input(InputId::new(NonZeroU128::new(2).unwrap()));
+    assert_eq!(target.layers, expected_layers);
+    assert_success(&invoke(&[
+        "scene-layer-add",
+        context.project_path(),
+        "7",
+        "1",
+        "0",
+        "nested",
+    ]));
+    let before_cycle = fs::read(context.project.join("project.json")).unwrap();
+    assert_failure_contains(
+        &invoke(&[
+            "scene-layer-source-input",
+            context.project_path(),
+            "7",
+            "0",
+            "3",
+        ]),
+        "cycle",
+    );
+    assert_eq!(
+        fs::read(context.project.join("project.json")).unwrap(),
+        before_cycle
+    );
+    fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
 fn local_scene_layer_remove_preserves_remaining_order() {
     let context = ContractContext::new();
     assert_success(&invoke(&["new", context.project_path()]));

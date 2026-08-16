@@ -20,9 +20,9 @@ use fm_engine::{
 use fm_model::{
     CropRect, Input, InputAudioStripState, InputBalanceBasisPoints, InputDelaySamples,
     InputGainMilliDb, InputKind, Layer, LayerGeometry, MainMix, Project, ProjectSettings, RectMask,
-    Rgba8 as ModelRgba8, Rotation, Scene, SimulatedAudio, SimulatedInput, SimulatedVideo,
-    SolidColor, SourceRef, StingerAudioPolicy as ModelStingerAudioPolicy, StingerConfig,
-    StingerMissingMediaFallback, StingerSlotNumber,
+    Rgba8 as ModelRgba8, Rotation, Scene, SceneLayerError, SimulatedAudio, SimulatedInput,
+    SimulatedVideo, SolidColor, SourceRef, StingerAudioPolicy as ModelStingerAudioPolicy,
+    StingerConfig, StingerMissingMediaFallback, StingerSlotNumber,
 };
 use fm_persistence::{
     FadeToBlackState as PersistedFadeToBlackState, IdempotencyReceipt,
@@ -115,6 +115,28 @@ pub fn run(command: Command) -> AppResult<()> {
         Command::SceneLayerRemove { path, scene, index } => {
             remove_scene_layer(&path, scene_id(scene)?, index)?
         }
+        Command::SceneLayerSourceInput {
+            path,
+            scene,
+            index,
+            input,
+        } => set_scene_layer_source(
+            &path,
+            scene_id(scene)?,
+            index,
+            SourceRef::Input(input_id(input)?),
+        )?,
+        Command::SceneLayerSourceScene {
+            path,
+            scene,
+            index,
+            source_scene,
+        } => set_scene_layer_source(
+            &path,
+            scene_id(scene)?,
+            index,
+            SourceRef::Scene(scene_id(source_scene)?),
+        )?,
         Command::SceneLayerZOrder {
             path,
             scene,
@@ -1404,6 +1426,42 @@ fn remove_scene_layer(path: &Path, scene: SceneId, index: usize) -> AppResult<()
     Ok(())
 }
 
+fn set_scene_layer_source(
+    path: &Path,
+    scene: SceneId,
+    index: usize,
+    source: SourceRef,
+) -> AppResult<()> {
+    update_project(path, |project| {
+        project.set_scene_layer_source(scene, index, source)
+    })
+}
+
+fn update_project(
+    path: &Path,
+    update: impl FnOnce(&mut Project) -> Result<(), SceneLayerError>,
+) -> AppResult<()> {
+    let store = ProjectStore::new(path)?;
+    let stored = load_stored_project(path)?;
+    let mut project = stored.project().clone();
+    update(&mut project).map_err(|error| -> Box<dyn Error> { Box::new(error) })?;
+    project
+        .validate()
+        .map_err(|errors| AppFailure(format!("project validation failed: {errors:?}")))?;
+    let configured = StoredProject::from_project_with_complete_runtime_state(
+        project,
+        stored.runtime_routing(),
+        stored.runtime_manual_transitions(),
+        stored.runtime_fade_to_black(),
+        stored.runtime_overlays().clone(),
+        stored.position(),
+        stored.idempotency_receipts().to_vec(),
+    )?;
+    store.save(&configured)?;
+    print_status(&load_engine(path)?);
+    Ok(())
+}
+
 fn set_scene_layer_z_order(
     path: &Path,
     scene: SceneId,
@@ -2270,6 +2328,8 @@ Usage:
   freemix-cli scene-background <show.freemix> <scene-id> <premultiplied-red:0..=255> <premultiplied-green:0..=255> <premultiplied-blue:0..=255> <alpha:0..=255>
   freemix-cli scene-layer-add <show.freemix> <scene-id> <source-input-id> <z-order> <layer-name>
   freemix-cli scene-layer-remove <show.freemix> <scene-id> <zero-based-layer-index>
+  freemix-cli scene-layer-source-input <show.freemix> <scene-id> <zero-based-layer-index> <input-id>
+  freemix-cli scene-layer-source-scene <show.freemix> <scene-id> <zero-based-layer-index> <source-scene-id>
   freemix-cli scene-layer-z-order <show.freemix> <scene-id> <zero-based-layer-index> <signed-z-order>
   freemix-cli scene-layer-appearance <show.freemix> <scene-id> <zero-based-layer-index> <enabled:on|off> <opacity:0..=255>
   freemix-cli scene-layer-geometry <show.freemix> <scene-id> <zero-based-layer-index> <x> <y> <width> <height> <rotation:0|90|180|270>

@@ -102,6 +102,18 @@ pub enum Command {
         scene: u128,
         index: usize,
     },
+    SceneLayerSourceInput {
+        path: PathBuf,
+        scene: u128,
+        index: usize,
+        input: u128,
+    },
+    SceneLayerSourceScene {
+        path: PathBuf,
+        scene: u128,
+        index: usize,
+        source_scene: u128,
+    },
     SceneLayerZOrder {
         path: PathBuf,
         scene: u128,
@@ -569,6 +581,8 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
         "scene-background" => parse_scene_background(arguments),
         "scene-layer-add" => parse_scene_layer_add(arguments),
         "scene-layer-remove" => parse_scene_layer_remove(arguments),
+        "scene-layer-source-input" => parse_scene_layer_source_input(arguments),
+        "scene-layer-source-scene" => parse_scene_layer_source_scene(arguments),
         "scene-layer-z-order" => parse_scene_layer_z_order(arguments),
         "scene-layer-appearance" => parse_scene_layer_appearance(arguments),
         "scene-layer-geometry" => parse_scene_layer_geometry(arguments),
@@ -1058,6 +1072,38 @@ fn parse_scene_layer_remove(
     let index = number(&required(&mut arguments, "layer index")?, "layer index")?;
     reject_extra(&mut arguments)?;
     Ok(Command::SceneLayerRemove { path, scene, index })
+}
+
+fn parse_scene_layer_source_input(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Command, ArgsError> {
+    let path = required_path(&mut arguments, "project path")?;
+    let scene = number(&required(&mut arguments, "scene")?, "scene")?;
+    let index = number(&required(&mut arguments, "layer index")?, "layer index")?;
+    let input = number(&required(&mut arguments, "input")?, "input")?;
+    reject_extra(&mut arguments)?;
+    Ok(Command::SceneLayerSourceInput {
+        path,
+        scene,
+        index,
+        input,
+    })
+}
+
+fn parse_scene_layer_source_scene(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Command, ArgsError> {
+    let path = required_path(&mut arguments, "project path")?;
+    let scene = number(&required(&mut arguments, "scene")?, "scene")?;
+    let index = number(&required(&mut arguments, "layer index")?, "layer index")?;
+    let source_scene = number(&required(&mut arguments, "source scene")?, "source scene")?;
+    reject_extra(&mut arguments)?;
+    Ok(Command::SceneLayerSourceScene {
+        path,
+        scene,
+        index,
+        source_scene,
+    })
 }
 
 fn parse_scene_layer_z_order(
