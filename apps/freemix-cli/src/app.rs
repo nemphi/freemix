@@ -238,6 +238,7 @@ pub fn run(command: Command) -> AppResult<()> {
             let stored = load_stored_project(&path)?;
             print_inputs(stored.project());
         }
+        Command::AssetAudit { path } => audit_assets(&path)?,
         Command::AudioStrip {
             path,
             input,
@@ -2102,6 +2103,30 @@ fn load_stored_project(path: &Path) -> AppResult<StoredProject> {
     Ok(project)
 }
 
+fn audit_assets(path: &Path) -> AppResult<()> {
+    let stored = load_stored_project(path)?;
+    let store = ProjectStore::new(path)?;
+    let issues = store.audit_assets(&stored);
+    for issue in &issues {
+        println!(
+            "input={} reason={}",
+            issue.input_id,
+            match issue.reason {
+                fm_persistence::AssetAuditReason::InvalidUri => "invalid-uri",
+                fm_persistence::AssetAuditReason::MissingAsset => "missing-asset",
+                fm_persistence::AssetAuditReason::OutsideAssetsRoot => "outside-assets-root",
+                fm_persistence::AssetAuditReason::NotRegularFile => "not-regular-file",
+            }
+        );
+    }
+    if issues.is_empty() {
+        println!("asset-audit: clean");
+        Ok(())
+    } else {
+        Err(AppFailure(format!("asset audit found {} issue(s)", issues.len())).into())
+    }
+}
+
 fn recover_journal(path: &Path) -> AppResult<()> {
     let store = ProjectStore::new(path)?;
     let scan = store.scan_journal()?;
@@ -2463,6 +2488,7 @@ Usage:
   freemix-cli status <show.freemix>
   freemix-cli journal-recover <show.freemix>
   freemix-cli inputs <show.freemix>
+  freemix-cli asset-audit <show.freemix>
   freemix-cli audio-strip <show.freemix> <input> <gain-millidb:-96000..=24000> <balance-bp:-10000..=10000> <muted:on|off> <soloed:on|off> <follow-video:on|off> <delay-samples:0..=48000>
   freemix-cli rename <show.freemix> <input> <name> [--key <key>] [--expect <revision>]
   freemix-cli input-reorder <show.freemix> <input> [<input>...] [--key <key>] [--expect <revision>]

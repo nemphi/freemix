@@ -1852,6 +1852,99 @@ fn local_input_add_persists_default_simulated_strip() {
 }
 
 #[test]
+fn local_asset_audit_reports_stable_issues_without_mutation() {
+    let context = ContractContext::new();
+    assert_success(&invoke(&["new", context.project_path()]));
+    let store = ProjectStore::new(&context.project).unwrap();
+    let initial = store.load().unwrap();
+    let mut project = initial.project().clone();
+    project.add_input(fm_model::Input {
+        id: InputId::new(NonZeroU128::new(20).unwrap()),
+        name: "Missing".into(),
+        kind: InputKind::Media {
+            asset_uri: "asset://missing.ppm".into(),
+        },
+        required_capabilities: Vec::new(),
+    });
+    project.add_input(fm_model::Input {
+        id: InputId::new(NonZeroU128::new(10).unwrap()),
+        name: "Invalid".into(),
+        kind: InputKind::Media {
+            asset_uri: "not-an-asset".into(),
+        },
+        required_capabilities: Vec::new(),
+    });
+    let stored = StoredProject::from_project_with_complete_runtime_state(
+        project,
+        initial.runtime_routing(),
+        initial.runtime_manual_transitions(),
+        initial.runtime_fade_to_black(),
+        initial.runtime_overlays().clone(),
+        initial.position(),
+        initial.idempotency_receipts().to_vec(),
+    )
+    .unwrap();
+    store.save(&stored).unwrap();
+    let manifest_before = fs::read(context.project.join("project.json")).unwrap();
+    let journal_before = journal_bytes(&store);
+
+    let issues = invoke(&["asset-audit", context.project_path()]);
+    assert!(!issues.status.success());
+    assert_eq!(
+        String::from_utf8(issues.stdout.clone()).unwrap(),
+        "input=10 reason=invalid-uri\ninput=20 reason=missing-asset\n"
+    );
+    let output = String::from_utf8_lossy(&issues.stdout);
+    assert!(!output.contains("asset://"));
+    assert!(!output.contains(context.project_path()));
+    assert_eq!(
+        fs::read(context.project.join("project.json")).unwrap(),
+        manifest_before
+    );
+    assert_eq!(journal_bytes(&store), journal_before);
+
+    fs::create_dir_all(store.assets_root()).unwrap();
+    fs::write(store.assets_root().join("missing.ppm"), b"tiny").unwrap();
+    let mut fixed = store.load().unwrap().project().clone();
+    fixed
+        .replace_input_source(
+            InputId::new(NonZeroU128::new(10).unwrap()),
+            InputKind::Media {
+                asset_uri: "asset://missing.ppm".into(),
+            },
+            Vec::new(),
+        )
+        .unwrap();
+    let fixed = StoredProject::from_project_with_complete_runtime_state(
+        fixed,
+        stored.runtime_routing(),
+        stored.runtime_manual_transitions(),
+        stored.runtime_fade_to_black(),
+        stored.runtime_overlays().clone(),
+        stored.position(),
+        stored.idempotency_receipts().to_vec(),
+    )
+    .unwrap();
+    store.save(&fixed).unwrap();
+    let clean = invoke(&["asset-audit", context.project_path()]);
+    assert_success(&clean);
+    assert_eq!(stdout(&clean), "asset-audit: clean");
+    fs::remove_dir_all(context.root).unwrap();
+}
+
+fn journal_bytes(store: &ProjectStore) -> Vec<(PathBuf, Vec<u8>)> {
+    fs::read_dir(store.journal_path())
+        .ok()
+        .into_iter()
+        .flatten()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            (path.clone(), fs::read(path).unwrap())
+        })
+        .collect()
+}
+
+#[test]
 fn local_output_route_persists_existing_route_and_rejects_unknown_reference() {
     let context = ContractContext::new();
     assert_success(&invoke(&["new", context.project_path()]));
