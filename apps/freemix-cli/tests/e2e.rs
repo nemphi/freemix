@@ -3705,7 +3705,7 @@ fn local_scene_layer_appearance_preserves_layer_identity() {
 }
 
 #[test]
-fn local_scene_layer_geometry_preserves_other_layer_state() {
+fn local_scene_layer_geometry_rejects_invalid_values_without_persistence() {
     let context = ContractContext::new();
     assert_success(&invoke(&["new", context.project_path()]));
     assert_success(&invoke(&[
@@ -3729,6 +3729,30 @@ fn local_scene_layer_geometry_preserves_other_layer_state() {
         .unwrap()
         .load()
         .unwrap();
+    let manifest_before_failure = fs::read(context.project.join("project.json")).unwrap();
+    let journal_before_failure = journal_bytes(&ProjectStore::new(&context.project).unwrap());
+    for (width, height) in [("0", "480"), ("640", "8193")] {
+        let invalid = invoke(&[
+            "scene-layer-geometry",
+            context.project_path(),
+            "7",
+            "1",
+            "-12",
+            "34",
+            width,
+            height,
+            "270",
+        ]);
+        assert_failure_contains(&invalid, "invalid geometry for layer 1 in scene 7");
+        assert_eq!(
+            fs::read(context.project.join("project.json")).unwrap(),
+            manifest_before_failure
+        );
+        assert_eq!(
+            journal_bytes(&ProjectStore::new(&context.project).unwrap()),
+            journal_before_failure
+        );
+    }
     assert_success(&invoke(&[
         "scene-layer-geometry",
         context.project_path(),

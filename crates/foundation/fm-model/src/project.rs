@@ -217,6 +217,10 @@ pub enum SceneLayerError {
         index: usize,
         length: usize,
     },
+    InvalidGeometry {
+        scene: SceneId,
+        index: usize,
+    },
     InvalidCrop {
         scene: SceneId,
         index: usize,
@@ -271,6 +275,12 @@ impl std::fmt::Display for SceneLayerError {
                 formatter,
                 "layer index {index} out of range for scene {scene} with {length} layers"
             ),
+            Self::InvalidGeometry { scene, index } => {
+                write!(
+                    formatter,
+                    "invalid geometry for layer {index} in scene {scene}"
+                )
+            }
             Self::InvalidCrop { scene, index } => {
                 write!(formatter, "invalid crop for layer {index} in scene {scene}")
             }
@@ -1002,21 +1012,27 @@ impl Project {
         index: usize,
         geometry: LayerGeometry,
     ) -> Result<(), SceneLayerError> {
-        let target = self
+        let scene_index = self
             .scenes
-            .iter_mut()
-            .find(|candidate| candidate.id == scene)
+            .iter()
+            .position(|candidate| candidate.id == scene)
             .ok_or(SceneLayerError::UnknownScene(scene))?;
-        let length = target.layers.len();
-        let layer = target
-            .layers
-            .get_mut(index)
-            .ok_or(SceneLayerError::LayerIndexOutOfRange {
+        let length = self.scenes[scene_index].layers.len();
+        if index >= length {
+            return Err(SceneLayerError::LayerIndexOutOfRange {
                 scene,
                 index,
                 length,
-            })?;
-        layer.geometry = geometry;
+            });
+        }
+        if geometry.width == 0
+            || geometry.height == 0
+            || geometry.width > ProjectSettings::MAX_VIDEO_WIDTH
+            || geometry.height > ProjectSettings::MAX_VIDEO_HEIGHT
+        {
+            return Err(SceneLayerError::InvalidGeometry { scene, index });
+        }
+        self.scenes[scene_index].layers[index].geometry = geometry;
         Ok(())
     }
 

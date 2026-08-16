@@ -194,6 +194,32 @@ fn scene_layer_mask_checked_validation_is_atomic_and_crop_aware() {
     assert_eq!(project.scenes()[0].layers[0].mask, None);
 }
 
+#[test]
+fn scene_layer_geometry_checked_validation_is_atomic() {
+    let scene = scene_id(1);
+    let mut project = valid_project();
+    let before = project.clone();
+    for (width, height) in [
+        (0, 100),
+        (100, 0),
+        (ProjectSettings::MAX_VIDEO_WIDTH + 1, 100),
+        (100, ProjectSettings::MAX_VIDEO_HEIGHT + 1),
+    ] {
+        let geometry = LayerGeometry::new(1, 2, width, height, Rotation::Deg90);
+        assert_eq!(
+            project.set_scene_layer_geometry(scene, 0, geometry),
+            Err(SceneLayerError::InvalidGeometry { scene, index: 0 })
+        );
+        assert_eq!(project, before);
+    }
+
+    let geometry = LayerGeometry::new(-12, 34, 640, 480, Rotation::Deg270);
+    project
+        .set_scene_layer_geometry(scene, 0, geometry)
+        .unwrap();
+    assert_eq!(project.scenes()[0].layers[0].geometry, geometry);
+}
+
 fn simulated_project() -> Project {
     let output_format = OutputFormat {
         video: settings().video,
