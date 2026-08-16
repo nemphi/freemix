@@ -11,8 +11,8 @@ use std::{
 };
 
 use fm_model::{
-    InputKind, LayerGeometry, Rgba8, Rotation, SimulatedAudio, SimulatedInput, SimulatedVideo,
-    SourceRef,
+    InputKind, LayerGeometry, RectMask, Rgba8, Rotation, SimulatedAudio, SimulatedInput,
+    SimulatedVideo, SourceRef,
 };
 use fm_persistence::ProjectStore;
 use fm_protocol::{
@@ -2318,6 +2318,118 @@ fn local_scene_layer_crop_set_and_clear_preserves_project_state() {
             "20",
             "2000",
             "480",
+        ]),
+        "domain project failed validation",
+    );
+    assert_eq!(manifest(&context.project), before_invalid);
+    fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
+fn local_scene_layer_mask_set_and_clear_preserves_project_state() {
+    let context = ContractContext::new();
+    assert_success(&invoke(&["new", context.project_path()]));
+    assert_success(&invoke(&[
+        "scene-input-add",
+        context.project_path(),
+        "3",
+        "7",
+        "Scene",
+    ]));
+    assert_success(&invoke(&[
+        "scene-layer-add",
+        context.project_path(),
+        "7",
+        "1",
+        "4",
+        "Layer",
+    ]));
+    assert_success(&invoke(&[
+        "scene-layer-add",
+        context.project_path(),
+        "7",
+        "2",
+        "5",
+        "Other layer",
+    ]));
+    assert_success(&invoke(&[
+        "scene-layer-crop",
+        context.project_path(),
+        "7",
+        "0",
+        "10",
+        "20",
+        "640",
+        "480",
+    ]));
+    let before = ProjectStore::new(&context.project_path())
+        .unwrap()
+        .load()
+        .unwrap();
+    assert_success(&invoke(&[
+        "scene-layer-mask",
+        context.project_path(),
+        "7",
+        "0",
+        "10",
+        "20",
+        "600",
+        "400",
+        "inverted",
+    ]));
+    let masked = ProjectStore::new(&context.project_path())
+        .unwrap()
+        .load()
+        .unwrap();
+    assert_eq!(
+        (
+            masked.runtime_routing(),
+            masked.runtime_manual_transitions(),
+            masked.runtime_fade_to_black(),
+            masked.runtime_overlays(),
+            masked.position(),
+            masked.idempotency_receipts(),
+        ),
+        (
+            before.runtime_routing(),
+            before.runtime_manual_transitions(),
+            before.runtime_fade_to_black(),
+            before.runtime_overlays(),
+            before.position(),
+            before.idempotency_receipts(),
+        )
+    );
+    let mut expected_layers = before.project().scenes()[0].layers.clone();
+    expected_layers[0].mask = Some(RectMask::new(10, 20, 600, 400).inverted(true));
+    assert_eq!(masked.project().scenes()[0].layers, expected_layers);
+
+    assert_success(&invoke(&[
+        "scene-layer-mask-clear",
+        context.project_path(),
+        "7",
+        "0",
+    ]));
+    let cleared = ProjectStore::new(&context.project_path())
+        .unwrap()
+        .load()
+        .unwrap();
+    assert_eq!(
+        cleared.project().scenes()[0].layers,
+        before.project().scenes()[0].layers
+    );
+
+    let before_invalid = manifest(&context.project);
+    assert_failure_contains(
+        &invoke(&[
+            "scene-layer-mask",
+            context.project_path(),
+            "7",
+            "0",
+            "640",
+            "0",
+            "1",
+            "1",
+            "normal",
         ]),
         "domain project failed validation",
     );

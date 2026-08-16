@@ -275,9 +275,10 @@ The local `input-add`, `scene-input-add`, `input-duplicate`, `input-remove`, and
 `input-replace-simulated` commands persist input state for the next project open
 only. `scene-input-add` creates an empty opaque-black scene with no layers and no
 audio source. `scene-layer-add`, `scene-layer-remove`, `scene-layer-appearance`,
-`scene-layer-geometry`, `scene-layer-crop`, and `scene-layer-crop-clear` are
-local next-open layer-editing footholds; local scene rendering, live editing,
-masks, effects, and IN-020 remain planned.
+`scene-layer-geometry`, `scene-layer-crop`, `scene-layer-crop-clear`,
+`scene-layer-mask`, and `scene-layer-mask-clear` are local next-open
+layer-editing footholds; local scene rendering, live editing, feathered and
+non-rectangular masks, effects, and IN-020 remain planned.
 The rename and reorder commands carry input identity; audio and routing state
 remain separate.
 Neither command applies an optimistic change or changes current switcher state.

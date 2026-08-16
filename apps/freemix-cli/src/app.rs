@@ -19,7 +19,7 @@ use fm_engine::{
 };
 use fm_model::{
     CropRect, Input, InputAudioStripState, InputBalanceBasisPoints, InputDelaySamples,
-    InputGainMilliDb, InputKind, Layer, LayerGeometry, MainMix, Project, ProjectSettings,
+    InputGainMilliDb, InputKind, Layer, LayerGeometry, MainMix, Project, ProjectSettings, RectMask,
     Rgba8 as ModelRgba8, Rotation, Scene, SimulatedAudio, SimulatedInput, SimulatedVideo,
     SolidColor, SourceRef, StingerAudioPolicy as ModelStingerAudioPolicy, StingerConfig,
     StingerMissingMediaFallback, StingerSlotNumber,
@@ -139,6 +139,24 @@ pub fn run(command: Command) -> AppResult<()> {
         )?,
         Command::SceneLayerCropClear { path, scene, index } => {
             set_scene_layer_crop(&path, scene_id(scene)?, index, None)?
+        }
+        Command::SceneLayerMask {
+            path,
+            scene,
+            index,
+            x,
+            y,
+            width,
+            height,
+            inverted,
+        } => set_scene_layer_mask(
+            &path,
+            scene_id(scene)?,
+            index,
+            Some(RectMask::new(x, y, width, height).inverted(inverted)),
+        )?,
+        Command::SceneLayerMaskClear { path, scene, index } => {
+            set_scene_layer_mask(&path, scene_id(scene)?, index, None)?
         }
         Command::InputRemove { path, input } => remove_input(&path, input_id(input)?)?,
         Command::InputDuplicate {
@@ -1406,6 +1424,30 @@ fn set_scene_layer_crop(
     let stored = load_stored_project(path)?;
     let mut project = stored.project().clone();
     project.set_scene_layer_crop(scene, index, crop)?;
+    let configured = StoredProject::from_project_with_complete_runtime_state(
+        project,
+        stored.runtime_routing(),
+        stored.runtime_manual_transitions(),
+        stored.runtime_fade_to_black(),
+        stored.runtime_overlays().clone(),
+        stored.position(),
+        stored.idempotency_receipts().to_vec(),
+    )?;
+    store.save(&configured)?;
+    print_status(&load_engine(path)?);
+    Ok(())
+}
+
+fn set_scene_layer_mask(
+    path: &Path,
+    scene: SceneId,
+    index: usize,
+    mask: Option<RectMask>,
+) -> AppResult<()> {
+    let store = ProjectStore::new(path)?;
+    let stored = load_stored_project(path)?;
+    let mut project = stored.project().clone();
+    project.set_scene_layer_mask(scene, index, mask)?;
     let configured = StoredProject::from_project_with_complete_runtime_state(
         project,
         stored.runtime_routing(),
