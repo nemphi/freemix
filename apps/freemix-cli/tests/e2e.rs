@@ -5112,6 +5112,7 @@ fn local_input_replace_media_preserves_identity_and_runtime() {
         before.project().schema_version()
     );
     assert_eq!(after.project().id(), before.project().id());
+    assert_eq!(after.project().name(), before.project().name());
     assert_eq!(after.project().settings(), before.project().settings());
     assert_eq!(
         after
@@ -5171,6 +5172,7 @@ fn local_input_replace_media_preserves_identity_and_runtime() {
     assert_eq!(after.idempotency_receipts(), before.idempotency_receipts());
 
     let manifest = fs::read(context.project.join("project.json")).unwrap();
+    let journal_before = journal_bytes(&store);
     assert_failure_contains(
         &invoke_bounded(&[
             "input-replace-media",
@@ -5184,6 +5186,7 @@ fn local_input_replace_media_preserves_identity_and_runtime() {
         fs::read(context.project.join("project.json")).unwrap(),
         manifest
     );
+    assert_eq!(journal_bytes(&store), journal_before);
     fs::remove_dir_all(context.root).unwrap();
 }
 
