@@ -136,7 +136,12 @@ interval, fixed-point linear Master levels, and fixed-point per-input levels in
 strict `InputId` order. Levels use millionths of linear full scale and can
 exceed unity. The codec validates only that the sample interval is positive;
 the native timeline owns frame/sample coherence. The record does not advance or
-carry a durable revision.
+carry a durable revision. Native `freemixd` publishes only completed mixer
+intervals to active Studio peers. Each peer retains at most the current partial
+record and one latest replacement. Control records have priority unless a meter
+record has already started, in which case that newline-delimited record finishes
+first. The Master reading is after strip processing and mixer clipping but
+before clip-local Stinger audio and Fade-to-Black.
 
 Each telemetry class has requested cadence, aggregation, and maximum bandwidth.
 Slow clients receive coalesced latest data, never unbounded queues.

@@ -23,7 +23,7 @@ use std::{
 
 use fm_audio::{
     AudioCadenceOrigin, AudioRenderPlan, AudioSilenceSpan, AudioSynchronizerLimits, Balance,
-    ChannelMapping, ClippingPolicy, ClockMappedAudioSynchronizer, InputState,
+    ChannelMapping, ChannelMeter, ClippingPolicy, ClockMappedAudioSynchronizer, InputState,
     MAX_CHANNEL_MAPPING_CHANNELS, MasterAudioInterval, MasterMixer, PlanarAudioSource, SourceGain,
 };
 use fm_clock::{
@@ -2241,6 +2241,21 @@ struct NativeAudioScratch {
     completed: Vec<NativeAudioDecodeResult>,
     validated: Vec<ValidatedCompletedAudioPage>,
     inputs: Vec<InputId>,
+    meter_inputs: Vec<InputId>,
+    master_meters: Vec<ChannelMeter>,
+    input_meters: Vec<ChannelMeter>,
+    meter_frame: Option<(u64, u64, u64)>,
+}
+
+/// Borrowed meter values for one completed native Master interval.
+pub struct NativeAudioMeters<'a> {
+    pub frame: u64,
+    pub start_sample: u64,
+    pub end_sample: u64,
+    pub channels: usize,
+    pub master: &'a [ChannelMeter],
+    pub inputs: &'a [InputId],
+    pub input_meters: &'a [ChannelMeter],
 }
 
 struct StagedAudioPadding {
@@ -2276,6 +2291,7 @@ impl NativeAudioScratch {
             })
             .collect();
         let source_count = sources.len();
+        let meter_inputs = sources.keys().copied().collect::<Vec<_>>();
         Self {
             rendered,
             mix: vec![vec![0.0; samples]; channels],
@@ -2287,6 +2303,10 @@ impl NativeAudioScratch {
             completed: Vec::with_capacity(source_count),
             validated: Vec::with_capacity(source_count),
             inputs: Vec::with_capacity(source_count),
+            master_meters: vec![ChannelMeter::default(); channels],
+            input_meters: vec![ChannelMeter::default(); source_count * channels],
+            meter_inputs,
+            meter_frame: None,
         }
     }
 }
@@ -2973,6 +2993,19 @@ impl NativeMasterRuntime {
                 .set_input_delay(input, delay)
                 .map_err(|_| NativeMasterError::BoundsExceeded)?;
         }
+        let channels = self.format.channels.channels().len();
+        self.scratch.meter_inputs.clear();
+        self.scratch
+            .meter_inputs
+            .extend(project.audio_strips.keys().copied());
+        self.scratch.input_meters.resize(
+            self.scratch
+                .meter_inputs
+                .len()
+                .checked_mul(channels)
+                .ok_or(NativeMasterError::BoundsExceeded)?,
+            ChannelMeter::default(),
+        );
         let source_count = self.sources.len();
         if self.scratch.plans.capacity() < source_count {
             self.scratch.plans.reserve(source_count);
@@ -2984,6 +3017,20 @@ impl NativeMasterRuntime {
             self.scratch.inputs.reserve(source_count);
         }
         Ok(())
+    }
+
+    /// Takes the latest completed native Master meter interval.
+    pub fn take_audio_meters(&mut self) -> Option<NativeAudioMeters<'_>> {
+        let (frame, start_sample, end_sample) = self.scratch.meter_frame.take()?;
+        Some(NativeAudioMeters {
+            frame,
+            start_sample,
+            end_sample,
+            channels: self.format.channels.channels().len(),
+            master: &self.scratch.master_meters,
+            inputs: &self.scratch.meter_inputs,
+            input_meters: &self.scratch.input_meters,
+        })
     }
 
     fn apply_project_audio_strips(
@@ -3782,6 +3829,8 @@ impl NativeMasterRuntime {
                 &self.scratch.rendered,
                 &mut self.scratch.mix,
                 self.format.sample_rate,
+                &mut self.scratch.master_meters,
+                &mut self.scratch.input_meters,
             )?;
         } else {
             let primary = planar_audio_submission(
@@ -3810,30 +3859,36 @@ impl NativeMasterRuntime {
                 .flatten();
             match (primary, secondary) {
                 (Some(primary), Some(secondary)) => {
-                    self.pending_mixer.mix_planar_timed_into(
+                    self.pending_mixer.mix_planar_timed_into_with_meters(
                         timing,
                         samples,
                         &[primary, secondary],
                         active_video_inputs,
                         &mut self.scratch.mix,
+                        &mut self.scratch.master_meters,
+                        &mut self.scratch.input_meters,
                     )?;
                 }
                 (Some(submission), None) | (None, Some(submission)) => {
-                    self.pending_mixer.mix_planar_timed_into(
+                    self.pending_mixer.mix_planar_timed_into_with_meters(
                         timing,
                         samples,
                         &[submission],
                         active_video_inputs,
                         &mut self.scratch.mix,
+                        &mut self.scratch.master_meters,
+                        &mut self.scratch.input_meters,
                     )?;
                 }
                 (None, None) => {
-                    self.pending_mixer.mix_planar_timed_into(
+                    self.pending_mixer.mix_planar_timed_into_with_meters(
                         timing,
                         samples,
                         &[],
                         active_video_inputs,
                         &mut self.scratch.mix,
+                        &mut self.scratch.master_meters,
+                        &mut self.scratch.input_meters,
                     )?;
                 }
             }
@@ -3916,6 +3971,7 @@ impl NativeMasterRuntime {
             .checked_add(1)
             .ok_or(NativeMasterError::BoundsExceeded)?;
         self.ready_frame = None;
+        self.scratch.meter_frame = Some((actual, start_sample, end_sample));
         Ok(block)
     }
 }
@@ -4669,6 +4725,8 @@ fn mix_project_audio_strips(
     rendered: &BTreeMap<InputId, Vec<Vec<f32>>>,
     output: &mut [Vec<f32>],
     sample_rate: fm_types::SampleRate,
+    master_meters: &mut [ChannelMeter],
+    input_meters: &mut [ChannelMeter],
 ) -> Result<(), NativeMasterError> {
     let mut first = None;
     for (&logical, route) in &project.audio_routes {
@@ -4689,7 +4747,15 @@ fn mix_project_audio_strips(
         }
     }
     let Some(first) = first else {
-        mixer.mix_planar_timed_into(timing, samples, &[], active_video_inputs, output)?;
+        mixer.mix_planar_timed_into_with_meters(
+            timing,
+            samples,
+            &[],
+            active_video_inputs,
+            output,
+            master_meters,
+            input_meters,
+        )?;
         return Ok(());
     };
 
@@ -4717,12 +4783,14 @@ fn mix_project_audio_strips(
         *slot = submission;
         submission_count += 1;
     }
-    mixer.mix_planar_timed_into(
+    mixer.mix_planar_timed_into_with_meters(
         timing,
         samples,
         &submissions[..submission_count],
         active_video_inputs,
         output,
+        master_meters,
+        input_meters,
     )?;
     Ok(())
 }

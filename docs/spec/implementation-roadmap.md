@@ -76,7 +76,9 @@ Protocol 2.14 adds the ordered configured output ID/name roster required for
 exact overlay-output inclusion controls; it does not prove output delivery.
 Protocol 2.15 defines bounded fixed-point Master and per-input meter records;
 `fm-client` validates identity and monotonic sequence without changing the
-durable cursor. The daemon does not publish these records yet.
+durable cursor. Native `freemixd` publishes the latest completed frame to
+active Studio peers through one bounded, lossy scheduler slot. Studio does not
+display the records yet, and native-media acceptance is not proved.
 Protocol 2.12 retains the protocol 2.10 rule
 that the daemon acknowledges only a validated heartbeat with the session server identity, the exact client
 heartbeat sequence, and the server receive time. Studio accepts one expected
@@ -228,8 +230,9 @@ and RMS readings in `InputId` order after delay, channel mapping, operator
 gates, gain, balance, and transition gain. Silent configured strips remain
 visible with zero readings. An opt-in allocation-free planar render API writes
 Master and per-input readings into exact-size caller-owned flat buffers without
-changing the existing native caller. Protocol 2.15 and `fm-client` can carry a
-lossy meter sample, but the daemon does not publish it and Studio does not show it.
+allocation in the mixer. The native daemon uses those buffers and publishes one
+latest-only Protocol 2.15 sample to active Studio peers. The Master reading is
+before clip-local Stinger audio and Fade-to-Black. Studio does not show it.
 Its bounded
 `ClockMappedAudioSynchronizer` is now connected to native `freemixd` local-file
 audio. The daemon accepts source rates such as 44.1 kHz and linearly resamples

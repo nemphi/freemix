@@ -56,10 +56,12 @@ use fm_persistence::{
     RuntimeOverlayChannel, RuntimeOverlayPosition, RuntimeOverlayTransition, RuntimeOverlays,
     RuntimeRouting, StoredProject,
 };
+#[cfg(feature = "native-media")]
+use fm_protocol::{AUDIO_METER_LEVEL_SCALE, AudioMeterChannel, InputAudioMeters, WireInputId};
 use fm_protocol::{
-    CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, CommandMessage, CommandPayload,
-    CommandResult, DiagnosticsRequest, DiagnosticsResponse, ErrorMessage, EventCursor,
-    HandshakeOutcome as ProtocolHandshakeOutcome, HandshakeRequest, HandshakeResponse,
+    AudioMetersMessage, CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, CommandMessage,
+    CommandPayload, CommandResult, DiagnosticsRequest, DiagnosticsResponse, ErrorMessage,
+    EventCursor, HandshakeOutcome as ProtocolHandshakeOutcome, HandshakeRequest, HandshakeResponse,
     HeartbeatMessage, ProtocolVersion, ResumeCursor, RuntimeEventMessage, ServerHello,
     ServerIdentity, StructuredError, WireMessage, choose_handshake_outcome, encode_line,
 };
@@ -77,6 +79,7 @@ use fm_switcher::{
 use fm_types::{InputId, ProjectId};
 use freemixd::ReadinessRecord;
 
+mod latest_record;
 mod non_native_sessions;
 #[cfg(feature = "macos-program-surface")]
 mod program_surface;
@@ -121,9 +124,9 @@ use fm_scheduler::{FrameNumber, FramePacer};
 use fm_sim::{Rgba8, SimulatedVideoSource, SourcePattern};
 #[cfg(feature = "native-media")]
 use freemixd::native_media::{
-    NativeAudioLimits, NativeMasterError, NativeMasterRuntime, NativeMediaRuntime,
-    NativeOutputFrame, NativeProgramReadback, NativeProjectLimits, NativeProjectPlan,
-    NativeResolvedSource, NativeSourceLimits, NativeSourceRenderError,
+    NativeAudioLimits, NativeAudioMeters, NativeMasterError, NativeMasterRuntime,
+    NativeMediaRuntime, NativeOutputFrame, NativeProgramReadback, NativeProjectLimits,
+    NativeProjectPlan, NativeResolvedSource, NativeSourceLimits, NativeSourceRenderError,
 };
 #[cfg(feature = "native-media")]
 use stinger_mutation::{NativeStingerMutation, NativeStingerRetirements};
@@ -132,13 +135,12 @@ const DEFAULT_LISTEN: &str = "127.0.0.1:0";
 const PROTOCOL_VERSION: ProtocolVersion = CURRENT_PROTOCOL_VERSION;
 const CAPABILITIES_DIGEST: &str = "phase1-simulated";
 const NATIVE_MEDIA_CAPABILITIES_DIGEST: &str =
-    "native-media-bounded-video-audio-master-camera-telemetry-v5";
+    "native-media-bounded-video-audio-master-meters-camera-telemetry-v6";
 const FULLSCREEN_PROGRAM_CAPABILITIES_DIGEST: &str =
-    "native-media-bounded-video-audio-master-camera-fullscreen-sdr-telemetry-v3";
+    "native-media-bounded-video-audio-master-meters-camera-fullscreen-sdr-telemetry-v4";
 const PROGRAM_RECORDER_CAPABILITIES_DIGEST: &str =
-    "native-media-bounded-video-audio-master-camera-record-program-telemetry-v3";
-const FULLSCREEN_PROGRAM_RECORDER_CAPABILITIES_DIGEST: &str =
-    "native-media-bounded-video-audio-master-camera-fullscreen-sdr-record-program-telemetry-v3";
+    "native-media-bounded-video-audio-master-meters-camera-record-program-telemetry-v4";
+const FULLSCREEN_PROGRAM_RECORDER_CAPABILITIES_DIGEST: &str = "native-media-bounded-video-audio-master-meters-camera-fullscreen-sdr-record-program-telemetry-v4";
 
 type AppResult<T> = Result<T, Box<dyn Error>>;
 type SharedControl = Rc<RefCell<ControlService<Policy>>>;
@@ -278,6 +280,8 @@ struct NativeDaemon {
     recorder: Option<NativeProgramRecorder>,
     telemetry: NativeRuntimeTelemetry,
     telemetry_emitted: bool,
+    audio_meter_sequence: u64,
+    pending_audio_meters: Option<AudioMetersMessage>,
     #[cfg(target_os = "macos")]
     cameras: NativeCameraInputs,
     #[cfg(target_os = "macos")]
@@ -1763,6 +1767,8 @@ impl NativeDaemon {
             recorder: None,
             telemetry,
             telemetry_emitted: false,
+            audio_meter_sequence: 0,
+            pending_audio_meters: None,
             #[cfg(target_os = "macos")]
             cameras: resolution.cameras,
             #[cfg(target_os = "macos")]
@@ -1842,6 +1848,10 @@ impl NativeDaemon {
     ) -> AppResult<()> {
         let _ = self.tick_if_due_collect(control, server)?;
         Ok(())
+    }
+
+    fn take_audio_meters(&mut self) -> Option<AudioMetersMessage> {
+        self.pending_audio_meters.take()
     }
 
     fn tick_if_due_collect(
@@ -1978,6 +1988,14 @@ impl NativeDaemon {
             audio = Some(block);
             Ok::<(), NativeRealizationError>(())
         })?;
+        if let Some(meters) = master.take_audio_meters() {
+            let sequence = self
+                .audio_meter_sequence
+                .checked_add(1)
+                .ok_or_else(|| AppFailure("audio meter sequence exhausted".into()))?;
+            self.pending_audio_meters = Some(audio_meters_message(server, sequence, meters));
+            self.audio_meter_sequence = sequence;
+        }
         self.install_stinger_mutation()?;
         self.projected_frame = None;
         self.pacer.advance()?;
@@ -2255,6 +2273,47 @@ fn validate_native_video_dimensions(
 }
 
 #[cfg(feature = "native-media")]
+fn audio_meters_message(
+    server: &ServerIdentity,
+    sequence: u64,
+    meters: NativeAudioMeters<'_>,
+) -> AudioMetersMessage {
+    AudioMetersMessage {
+        server: server.clone(),
+        sequence,
+        frame: meters.frame,
+        start_sample: meters.start_sample,
+        end_sample: meters.end_sample,
+        master: meters.master.iter().map(protocol_audio_meter).collect(),
+        inputs: meters
+            .inputs
+            .iter()
+            .zip(meters.input_meters.chunks_exact(meters.channels))
+            .map(|(&input, channels)| InputAudioMeters {
+                input: WireInputId::from_domain(input),
+                channels: channels.iter().map(protocol_audio_meter).collect(),
+            })
+            .collect(),
+    }
+}
+
+#[cfg(feature = "native-media")]
+fn protocol_audio_meter(meter: &fm_audio::ChannelMeter) -> AudioMeterChannel {
+    let peak_millionths = meter_level_millionths(meter.peak);
+    AudioMeterChannel {
+        peak_millionths,
+        rms_millionths: meter_level_millionths(meter.rms).min(peak_millionths),
+    }
+}
+
+#[cfg(feature = "native-media")]
+fn meter_level_millionths(level: f32) -> u32 {
+    (f64::from(level.max(0.0)) * f64::from(AUDIO_METER_LEVEL_SCALE))
+        .round()
+        .min(f64::from(u32::MAX)) as u32
+}
+
+#[cfg(feature = "native-media")]
 impl Drop for NativeDaemon {
     fn drop(&mut self) {
         if let Some(mutation) = self.pending_stinger_mutation.take() {
@@ -2311,6 +2370,10 @@ impl NativeDaemon {
         _server: &ServerIdentity,
     ) -> AppResult<()> {
         Err(AppFailure("native-media support was not compiled in".into()).into())
+    }
+
+    fn take_audio_meters(&mut self) -> Option<AudioMetersMessage> {
+        None
     }
 
     #[allow(clippy::unused_self)]

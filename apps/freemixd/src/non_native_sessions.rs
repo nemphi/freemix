@@ -11,9 +11,9 @@ use fm_auth::Principal;
 use fm_control::{LiveEvent, Subscription};
 use fm_persistence::{ProjectStore, StoredProject};
 use fm_protocol::{
-    ErrorMessage, HandshakeOutcome as ProtocolHandshakeOutcome, HandshakeResponse,
-    HeartbeatAcknowledgementMessage, LineDecoder, ServerIdentity, StructuredError, WireMessage,
-    encode_line,
+    AudioMetersMessage, ClientType, ErrorMessage, HandshakeOutcome as ProtocolHandshakeOutcome,
+    HandshakeResponse, HeartbeatAcknowledgementMessage, LineDecoder, ServerIdentity,
+    StructuredError, WireMessage, encode_line,
 };
 use fm_server::{Server, Session, SyncPayload};
 
@@ -25,6 +25,7 @@ use super::{
     reconciled_handshake_outcome, record_heartbeat, rejected_handshake_response,
     requested_daemon_shutdown, server_identity, shutdown_message, structured_session_error,
 };
+use crate::latest_record::LatestRecord;
 
 const MAX_PEERS: usize = 2;
 const INBOUND_CAPACITY: usize = 8;
@@ -64,6 +65,8 @@ struct Peer {
     subscription: Option<Subscription>,
     initial_sync: VecDeque<WireMessage>,
     outbound: VecDeque<Outbound>,
+    audio_meters: bool,
+    latest_meter: LatestRecord,
 }
 
 impl Peer {
@@ -82,6 +85,8 @@ impl Peer {
             subscription: None,
             initial_sync: VecDeque::new(),
             outbound: VecDeque::new(),
+            audio_meters: false,
+            latest_meter: LatestRecord::default(),
         })
     }
 
@@ -121,6 +126,12 @@ impl Peer {
         self.queue(message, Accounting::Raw)?;
         self.phase = Phase::Closing;
         Ok(())
+    }
+
+    fn replace_meter(&mut self, bytes: Vec<u8>) {
+        if self.audio_meters && self.phase == Phase::Active {
+            self.latest_meter.replace(bytes);
+        }
     }
 
     fn replace_outbound_for_shutdown(&mut self) {
@@ -262,6 +273,9 @@ pub(super) fn run(
             if let Err(error) = native.tick_if_due(&mut control.borrow_mut(), authority) {
                 shutdown_peers(&mut peers, control, ShutdownQueue::Replace);
                 return Err(error);
+            }
+            if let Some(meters) = native.take_audio_meters() {
+                publish_audio_meters(&mut peers, meters);
             }
         }
         if let Some(reason) = requested_daemon_shutdown(native.as_deref(), Some(process_shutdown)) {
@@ -544,6 +558,7 @@ impl Runtime<'_> {
         peer.session = Some(handshake.session);
         peer.identity = Some(identity);
         peer.subscription = Some(subscription);
+        peer.audio_meters = request.client_type == ClientType::Studio;
         if peer
             .queue(
                 &WireMessage::HandshakeResponse(response),
@@ -608,8 +623,11 @@ enum WriteOutcome {
 }
 
 fn write_peer(peer: &mut Peer) -> WriteOutcome {
+    if peer.latest_meter.started() {
+        return write_meter(peer);
+    }
     let Some(record) = peer.outbound.front_mut() else {
-        return WriteOutcome::Pending;
+        return write_meter(peer);
     };
     let complete = match record.write.write_once(&mut peer.stream) {
         Ok(complete) => complete,
@@ -645,6 +663,30 @@ fn write_peer(peer: &mut Peer) -> WriteOutcome {
     }
 }
 
+fn write_meter(peer: &mut Peer) -> WriteOutcome {
+    match peer.latest_meter.write_once(&mut peer.stream) {
+        Ok(()) => WriteOutcome::Pending,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+            ) =>
+        {
+            WriteOutcome::Pending
+        }
+        Err(_) => WriteOutcome::Failed,
+    }
+}
+
+fn publish_audio_meters(peers: &mut [Peer], meters: AudioMetersMessage) {
+    let Ok(bytes) = encode_line(&WireMessage::AudioMeters(meters)).map(String::into_bytes) else {
+        return;
+    };
+    for peer in peers {
+        peer.replace_meter(bytes.clone());
+    }
+}
+
 enum ShutdownQueue {
     Replace,
     PreserveCommandResult,
@@ -660,6 +702,7 @@ fn shutdown_peers(peers: &mut Vec<Peer>, control: &SharedControl, queue: Shutdow
         return;
     }
     for peer in peers.iter_mut() {
+        peer.latest_meter.discard_unstarted();
         if matches!(queue, ShutdownQueue::Replace) {
             peer.replace_outbound_for_shutdown();
         } else if peer.outbound.len() == OUTBOUND_CAPACITY {
