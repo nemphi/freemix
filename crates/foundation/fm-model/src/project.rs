@@ -211,12 +211,14 @@ pub enum SetOutputRouteError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AddAudioBusError {
     DuplicateId(BusId),
+    EmptyName,
     DuplicateName,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AddOutputError {
     DuplicateId(OutputId),
+    EmptyName,
     DuplicateName,
     UnknownScene(SceneId),
     UnknownBus(BusId),
@@ -401,6 +403,7 @@ impl std::fmt::Display for AddAudioBusError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::DuplicateId(id) => write!(formatter, "duplicate audio bus {id}"),
+            Self::EmptyName => formatter.write_str("audio bus name must not be empty"),
             Self::DuplicateName => formatter.write_str("duplicate audio bus name"),
         }
     }
@@ -412,6 +415,7 @@ impl std::fmt::Display for AddOutputError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::DuplicateId(id) => write!(formatter, "duplicate output {id}"),
+            Self::EmptyName => formatter.write_str("output name must not be empty"),
             Self::DuplicateName => formatter.write_str("duplicate output name"),
             Self::UnknownScene(scene) => write!(formatter, "unknown scene {scene}"),
             Self::UnknownBus(bus) => write!(formatter, "unknown audio bus {bus}"),
@@ -1213,6 +1217,9 @@ impl Project {
         {
             return Err(AddAudioBusError::DuplicateId(bus.id));
         }
+        if bus.name.trim().is_empty() {
+            return Err(AddAudioBusError::EmptyName);
+        }
         if self
             .audio_buses
             .iter()
@@ -1235,6 +1242,9 @@ impl Project {
             .any(|candidate| candidate.id == output.id)
         {
             return Err(AddOutputError::DuplicateId(output.id));
+        }
+        if output.name.trim().is_empty() {
+            return Err(AddOutputError::EmptyName);
         }
         if self
             .outputs

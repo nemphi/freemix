@@ -1311,6 +1311,15 @@ fn checked_output_creation_and_route_validate_references_without_mutation() {
             sends: Vec::new(),
         })
         .unwrap();
+    let before_empty_bus = project.clone();
+    let mut invalid_bus = project.audio_buses()[0].clone();
+    invalid_bus.id = bus_id(3);
+    invalid_bus.name = " \t ".into();
+    assert_eq!(
+        project.add_audio_bus_checked(invalid_bus),
+        Err(fm_model::AddAudioBusError::EmptyName)
+    );
+    assert_eq!(project, before_empty_bus);
     let buses_before_duplicate = project.audio_buses().to_vec();
     assert!(matches!(
         project.add_audio_bus_checked(AudioBus {
@@ -1331,6 +1340,15 @@ fn checked_output_creation_and_route_validate_references_without_mutation() {
             required_capabilities: Vec::new(),
         })
         .unwrap();
+    let before_empty_output = project.clone();
+    let mut invalid_output = project.outputs()[0].clone();
+    invalid_output.id = output_id(3);
+    invalid_output.name = " \n ".into();
+    assert_eq!(
+        project.add_output_checked(invalid_output),
+        Err(fm_model::AddOutputError::EmptyName)
+    );
+    assert_eq!(project, before_empty_output);
     let outputs_before_duplicate = project.outputs().to_vec();
     assert!(matches!(
         project.add_output_checked(Output {
