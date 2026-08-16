@@ -271,15 +271,16 @@ uniqueness, then changes only the matching name at the durable revision. It also
 carries an authoritative full input reorder through the EditProject command and
 durable input-order event; the daemon persists that vector order and restores
 the order after restart. Studio now has a compact permission-gated rename editor.
-The local `input-add` and `input-duplicate` commands persist input state for the next project open
-only; IN-026 and the other input lifecycle gaps remain planned. Both commands carry
-input identity; audio and routing state remain separate. Neither command applies
-an optimistic change or changes current switcher state. Studio exposes compact
-Up/Down controls
+The local `input-add` and `input-duplicate` commands persist input state for the
+next project open only; they do not mutate a running daemon. The rename and
+reorder commands carry input identity; audio and routing state remain separate.
+Neither command applies an optimistic change or changes current switcher state.
+Studio exposes compact Up/Down controls
 for one-step reorder, gated by the current Ready session and EditProject
 permission; the native worker resolves each move against the latest confirmed
-order and the daemon remains final authority. Input add/remove, duplicate,
-categories, colors, pause, close, offline, relink, and import remain planned.
+order and the daemon remains final authority. Live add/duplicate, input removal,
+categories, colors, pause, close, offline, relink, import, and the rest of
+IN-026 remain planned.
 Studio now has a compact permission-gated gain fader with exact milli-dB entry.
 There are still no audio meters in Studio, PFL, strip-name editor, strip groups,
 bus
