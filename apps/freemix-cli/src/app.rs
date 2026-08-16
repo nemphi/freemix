@@ -19,9 +19,9 @@ use fm_engine::{
 };
 use fm_model::{
     Input, InputAudioStripState, InputBalanceBasisPoints, InputDelaySamples, InputGainMilliDb,
-    InputKind, MainMix, Project, ProjectSettings, SimulatedAudio, SimulatedInput, SimulatedVideo,
-    SolidColor, StingerAudioPolicy as ModelStingerAudioPolicy, StingerConfig,
-    StingerMissingMediaFallback, StingerSlotNumber,
+    InputKind, MainMix, Project, ProjectSettings, Rgba8 as ModelRgba8, Scene, SimulatedAudio,
+    SimulatedInput, SimulatedVideo, SolidColor, StingerAudioPolicy as ModelStingerAudioPolicy,
+    StingerConfig, StingerMissingMediaFallback, StingerSlotNumber,
 };
 use fm_persistence::{
     FadeToBlackState as PersistedFadeToBlackState, IdempotencyReceipt,
@@ -39,7 +39,7 @@ use fm_switcher::{
 };
 use fm_types::{
     AudioFormat, ChannelLayout, ColorMetadata, FrameRate, InputId, OutputId, PixelFormat,
-    ProjectId, SampleFormat, SampleRate, ScanMode, VideoDimensions, VideoFormat,
+    ProjectId, SampleFormat, SampleRate, ScanMode, SceneId, VideoDimensions, VideoFormat,
 };
 use fm_video::write_ppm;
 
@@ -81,6 +81,14 @@ pub fn run(command: Command) -> AppResult<()> {
         }
         Command::InputAdd { path, input, name } => {
             add_input(&path, input_id(input)?, name)?;
+        }
+        Command::SceneInputAdd {
+            path,
+            input,
+            scene,
+            name,
+        } => {
+            add_scene_input(&path, input_id(input)?, scene_id(scene)?, name)?;
         }
         Command::InputRemove { path, input } => remove_input(&path, input_id(input)?)?,
         Command::InputDuplicate {
@@ -1193,6 +1201,39 @@ fn add_input(path: &Path, input: InputId, name: String) -> AppResult<()> {
     Ok(())
 }
 
+fn add_scene_input(path: &Path, input: InputId, scene: SceneId, name: String) -> AppResult<()> {
+    let store = ProjectStore::new(path)?;
+    let stored = load_stored_project(path)?;
+    let mut project = stored.project().clone();
+    project.add_scene(Scene {
+        id: scene,
+        name: name.clone(),
+        background: ModelRgba8::OPAQUE_BLACK,
+        layers: Vec::new(),
+    });
+    project.add_input(Input {
+        id: input,
+        name,
+        kind: InputKind::Scene {
+            scene_id: scene,
+            audio_source: None,
+        },
+        required_capabilities: Vec::new(),
+    });
+    let configured = StoredProject::from_project_with_complete_runtime_state(
+        project,
+        stored.runtime_routing(),
+        stored.runtime_manual_transitions(),
+        stored.runtime_fade_to_black(),
+        stored.runtime_overlays().clone(),
+        stored.position(),
+        stored.idempotency_receipts().to_vec(),
+    )?;
+    store.save(&configured)?;
+    print_status(&load_engine(path)?);
+    Ok(())
+}
+
 fn remove_input(path: &Path, input: InputId) -> AppResult<()> {
     let stored = load_stored_project(path)?;
     let runtime = stored.runtime_routing();
@@ -1934,6 +1975,7 @@ FreeMix deterministic MVP
 Usage:
   freemix-cli new <show.freemix> [--name <name>]
   freemix-cli input-add <show.freemix> <nonzero-input-id> <name>
+  freemix-cli scene-input-add <show.freemix> <nonzero-input-id> <nonzero-scene-id> <name>
   freemix-cli input-remove <show.freemix> <input-id>
   freemix-cli input-duplicate <show.freemix> <source-input-id> <new-nonzero-input-id> <new-name>
   freemix-cli input-replace-simulated <show.freemix> <input-id>
@@ -2169,6 +2211,12 @@ fn input_id(value: u128) -> AppResult<InputId> {
     NonZeroU128::new(value)
         .map(InputId::new)
         .ok_or_else(|| AppFailure("input ID must be nonzero".into()).into())
+}
+
+fn scene_id(value: u128) -> AppResult<SceneId> {
+    NonZeroU128::new(value)
+        .map(SceneId::new)
+        .ok_or_else(|| AppFailure("scene ID must be nonzero".into()).into())
 }
 
 fn output_id(value: u128) -> AppResult<OutputId> {

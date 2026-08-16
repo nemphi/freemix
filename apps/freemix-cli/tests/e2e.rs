@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use fm_model::{InputKind, SimulatedAudio, SimulatedInput, SimulatedVideo};
+use fm_model::{InputKind, Rgba8, SimulatedAudio, SimulatedInput, SimulatedVideo};
 use fm_persistence::ProjectStore;
 use fm_protocol::{
     CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, ClientType, CommandMessage, CommandPayload,
@@ -1843,6 +1843,86 @@ fn local_input_add_persists_default_simulated_strip() {
 
     let before_duplicate = manifest(&context.project);
     let duplicate = invoke(&["input-add", context.project_path(), "3", "Other"]);
+    assert_failure_contains(&duplicate, "domain project failed validation");
+    assert_eq!(manifest(&context.project), before_duplicate);
+    fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
+fn local_scene_input_add_persists_empty_scene_without_routing() {
+    let context = ContractContext::new();
+    assert_success(&invoke(&["new", context.project_path()]));
+    assert_success(&invoke(&[
+        "audio-strip",
+        context.project_path(),
+        "2",
+        "-1200",
+        "2500",
+        "on",
+        "off",
+        "off",
+        "480",
+    ]));
+    let before = ProjectStore::new(&context.project).unwrap().load().unwrap();
+    let name = "  Scene  input  ";
+    assert_success(&invoke(&[
+        "scene-input-add",
+        context.project_path(),
+        "3",
+        "7",
+        name,
+    ]));
+    let after = ProjectStore::new(&context.project).unwrap().load().unwrap();
+
+    assert_eq!(after.runtime_routing(), before.runtime_routing());
+    assert_eq!(
+        after.runtime_manual_transitions(),
+        before.runtime_manual_transitions()
+    );
+    assert_eq!(
+        after.runtime_fade_to_black(),
+        before.runtime_fade_to_black()
+    );
+    assert_eq!(after.runtime_overlays(), before.runtime_overlays());
+    assert_eq!(after.position(), before.position());
+    assert_eq!(after.idempotency_receipts(), before.idempotency_receipts());
+    assert_eq!(after.project().main_mix(), before.project().main_mix());
+    let scene = after.project().scenes().last().unwrap();
+    assert_eq!(scene.id.get().get(), 7);
+    assert_eq!(scene.name, name);
+    assert_eq!(scene.background, Rgba8::OPAQUE_BLACK);
+    assert!(scene.layers.is_empty());
+    let input = after.project().inputs().last().unwrap();
+    assert_eq!(input.id.get().get(), 3);
+    assert_eq!(input.name, name);
+    assert!(
+        matches!(input.kind, InputKind::Scene { scene_id, audio_source: None } if scene_id.get().get() == 7)
+    );
+    assert_eq!(
+        after.project().input_audio_strip(input.id).unwrap(),
+        Default::default()
+    );
+    assert_eq!(
+        after
+            .project()
+            .scenes()
+            .iter()
+            .map(|scene| scene.id.get().get())
+            .collect::<Vec<_>>(),
+        [7]
+    );
+    assert_eq!(
+        after
+            .project()
+            .inputs()
+            .iter()
+            .map(|input| input.id.get().get())
+            .collect::<Vec<_>>(),
+        [1, 2, 3]
+    );
+
+    let before_duplicate = manifest(&context.project);
+    let duplicate = invoke(&["scene-input-add", context.project_path(), "3", "8", "Other"]);
     assert_failure_contains(&duplicate, "domain project failed validation");
     assert_eq!(manifest(&context.project), before_duplicate);
     fs::remove_dir_all(context.root).unwrap();

@@ -76,6 +76,12 @@ pub enum Command {
         input: u128,
         name: String,
     },
+    SceneInputAdd {
+        path: PathBuf,
+        input: u128,
+        scene: u128,
+        name: String,
+    },
     InputRemove {
         path: PathBuf,
         input: u128,
@@ -487,6 +493,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
     match command.as_str() {
         "new" => parse_new(arguments),
         "input-add" => parse_input_add(arguments),
+        "scene-input-add" => parse_scene_input_add(arguments),
         "input-remove" => parse_input_remove(arguments),
         "input-duplicate" => parse_input_duplicate(arguments),
         "input-replace-simulated" => parse_input_replace_simulated(arguments),
@@ -893,6 +900,22 @@ fn parse_input_add(mut arguments: impl Iterator<Item = String>) -> Result<Comman
     let name = required(&mut arguments, "input name")?;
     reject_extra(&mut arguments)?;
     Ok(Command::InputAdd { path, input, name })
+}
+
+fn parse_scene_input_add(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Command, ArgsError> {
+    let path = required_path(&mut arguments, "project path")?;
+    let input = number(&required(&mut arguments, "input")?, "input")?;
+    let scene = number(&required(&mut arguments, "scene")?, "scene")?;
+    let name = required(&mut arguments, "input name")?;
+    reject_extra(&mut arguments)?;
+    Ok(Command::SceneInputAdd {
+        path,
+        input,
+        scene,
+        name,
+    })
 }
 
 fn parse_input_remove(mut arguments: impl Iterator<Item = String>) -> Result<Command, ArgsError> {
