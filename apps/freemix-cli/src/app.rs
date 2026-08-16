@@ -253,6 +253,12 @@ pub fn run(command: Command) -> AppResult<()> {
         Command::SceneLayerRemove { path, scene, index } => {
             remove_scene_layer(&path, scene_id(scene)?, index)?
         }
+        Command::SceneLayerMove {
+            path,
+            scene,
+            source_index,
+            destination_index,
+        } => move_scene_layer(&path, scene_id(scene)?, source_index, destination_index)?,
         Command::SceneLayerDuplicate {
             path,
             scene,
@@ -1857,6 +1863,19 @@ fn remove_scene_layer(path: &Path, scene: SceneId, index: usize) -> AppResult<()
     Ok(())
 }
 
+fn move_scene_layer(
+    path: &Path,
+    scene: SceneId,
+    source_index: usize,
+    destination_index: usize,
+) -> AppResult<()> {
+    update_project(path, |project| {
+        project
+            .move_scene_layer(scene, source_index, destination_index)
+            .map_err(Into::into)
+    })
+}
+
 fn duplicate_scene_layer(path: &Path, scene: SceneId, index: usize, name: String) -> AppResult<()> {
     update_project(path, |project| {
         project
@@ -2993,6 +3012,7 @@ Usage:
   freemix-cli scene-layer-add <show.freemix> <scene-id> <source-input-id> <z-order> <layer-name>
   freemix-cli scene-layer-add-scene <show.freemix> <target-scene-id> <source-scene-id> <z-order> <layer-name>
   freemix-cli scene-layer-remove <show.freemix> <scene-id> <zero-based-layer-index>
+  freemix-cli scene-layer-move <show.freemix> <scene-id> <source-zero-based-layer-index> <destination-zero-based-layer-index>
   freemix-cli scene-layer-rename <show.freemix> <scene-id> <zero-based-layer-index> <name>
   freemix-cli scene-layer-source-input <show.freemix> <scene-id> <zero-based-layer-index> <input-id>
   freemix-cli scene-layer-source-scene <show.freemix> <scene-id> <zero-based-layer-index> <source-scene-id>

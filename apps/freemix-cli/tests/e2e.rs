@@ -4105,6 +4105,62 @@ fn local_scene_layer_duplicate_copies_configured_layer() {
 }
 
 #[test]
+fn local_scene_layer_move_changes_only_stable_tie_order() {
+    let context = ContractContext::new();
+    let path = context.project_path();
+    let run = |arguments: &[&str]| assert_success(&invoke_bounded(arguments));
+    run(&["new", path]);
+    run(&["scene-input-add", path, "3", "7", "Scene"]);
+    for name in ["First", "Second"] {
+        run(&["scene-layer-add", path, "7", "1", "4", name]);
+    }
+    run(&["scene-layer-duplicate", path, "7", "1", "Third"]);
+
+    let store = ProjectStore::new(&context.project).unwrap();
+    let before = store.load().unwrap();
+    let before_runtime = (
+        before.runtime_routing(),
+        before.runtime_manual_transitions(),
+        before.runtime_fade_to_black(),
+        before.runtime_overlays(),
+        before.position(),
+        before.idempotency_receipts(),
+    );
+    let mut expected_layers = before.project().scenes()[0].layers.clone();
+    let moved = expected_layers.remove(2);
+    expected_layers.insert(0, moved);
+
+    run(&["scene-layer-move", path, "7", "2", "0"]);
+    let after = store.load().unwrap();
+    assert_eq!(after.project().scenes()[0].layers, expected_layers);
+    assert_eq!(
+        (
+            after.runtime_routing(),
+            after.runtime_manual_transitions(),
+            after.runtime_fade_to_black(),
+            after.runtime_overlays(),
+            after.position(),
+            after.idempotency_receipts(),
+        ),
+        before_runtime
+    );
+
+    let manifest_before = fs::read(context.project.join("project.json")).unwrap();
+    let journal_before = journal_bytes(&store);
+    let rejected = invoke_bounded(&["scene-layer-move", path, "7", "0", "3"]);
+    assert_failure_contains(
+        &rejected,
+        "layer index 3 out of range for scene 7 with 3 layers",
+    );
+    assert_eq!(
+        fs::read(context.project.join("project.json")).unwrap(),
+        manifest_before
+    );
+    assert_eq!(journal_bytes(&store), journal_before);
+    fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
 fn local_scene_layer_source_reassignment() {
     let context = ContractContext::new();
     assert_success(&invoke(&["new", context.project_path()]));

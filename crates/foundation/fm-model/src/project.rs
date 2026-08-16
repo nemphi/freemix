@@ -1087,6 +1087,39 @@ impl Project {
         Ok(target.layers.remove(index))
     }
 
+    pub fn move_scene_layer(
+        &mut self,
+        scene: SceneId,
+        source_index: usize,
+        destination_index: usize,
+    ) -> Result<(), SceneLayerError> {
+        let target = self
+            .scenes
+            .iter_mut()
+            .find(|candidate| candidate.id == scene)
+            .ok_or(SceneLayerError::UnknownScene(scene))?;
+        let length = target.layers.len();
+        if source_index >= length {
+            return Err(SceneLayerError::LayerIndexOutOfRange {
+                scene,
+                index: source_index,
+                length,
+            });
+        }
+        if destination_index >= length {
+            return Err(SceneLayerError::LayerIndexOutOfRange {
+                scene,
+                index: destination_index,
+                length,
+            });
+        }
+        if source_index != destination_index {
+            let layer = target.layers.remove(source_index);
+            target.layers.insert(destination_index, layer);
+        }
+        Ok(())
+    }
+
     pub fn duplicate_scene_layer(
         &mut self,
         scene: SceneId,

@@ -306,9 +306,9 @@ persist the scene input audio route. `scene-layer-add`, `scene-layer-remove`, `s
 `scene-layer-mask`, `scene-layer-mask-clear`, `scene-layer-z-order`, and
 `scene-background` (premultiplied RGBA), `scene-layer-source-input`,
 `scene-layer-source-scene`, and `scene-layer-add-scene` are next-open local
-metadata/composition authoring only: direct scene composition rejects missing or
-cyclic sources, adds no render or live acceptance, and leaves `IN-020` and
-`SW-006` planned.
+metadata/composition authoring only. `scene-layer-move` changes next-open layer
+vector tie-order only; it adds no render or live acceptance, and `IN-020`,
+`SW-004`, and `SW-006` remain planned.
 `scene-remove` is local next-open scene removal only; it does not add cascade
 behavior, rendering, live editing, daemon/Studio/protocol mutation, output
 realization, or acceptance.
