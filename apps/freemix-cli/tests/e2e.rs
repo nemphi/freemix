@@ -2290,6 +2290,74 @@ fn journal_bytes(store: &ProjectStore) -> Vec<(PathBuf, Vec<u8>)> {
 }
 
 #[test]
+fn local_output_startup_persists_selected_policy_and_rejects_unknown_output() {
+    let context = ContractContext::new();
+    assert_success(&invoke(&["new", context.project_path()]));
+    assert_success(&invoke(&[
+        "scene-input-add",
+        context.project_path(),
+        "10",
+        "10",
+        "Program",
+    ]));
+    assert_success(&invoke(&[
+        "audio-bus-add",
+        context.project_path(),
+        "20",
+        "Master",
+    ]));
+    for (output, name) in [("30", "Primary"), ("31", "Auxiliary")] {
+        assert_success(&invoke(&[
+            "output-add",
+            context.project_path(),
+            output,
+            "10",
+            "20",
+            name,
+        ]));
+    }
+
+    let store = ProjectStore::new(&context.project).unwrap();
+    let before = store.load().unwrap();
+    assert_success(&invoke(&[
+        "output-startup",
+        context.project_path(),
+        "30",
+        "reconcile-desired-state",
+    ]));
+    let after = store.load().unwrap();
+    assert_eq!(
+        after.project().outputs()[0].startup,
+        StartupPolicy::ReconcileDesiredState
+    );
+    assert_eq!(after.project().outputs()[1], before.project().outputs()[1]);
+    assert_eq!(after.runtime_routing(), before.runtime_routing());
+    assert_eq!(
+        after.runtime_manual_transitions(),
+        before.runtime_manual_transitions()
+    );
+    assert_eq!(
+        after.runtime_fade_to_black(),
+        before.runtime_fade_to_black()
+    );
+    assert_eq!(after.runtime_overlays(), before.runtime_overlays());
+    assert_eq!(after.position(), before.position());
+    assert_eq!(after.idempotency_receipts(), before.idempotency_receipts());
+    let outputs = invoke(&["outputs", context.project_path()]);
+    assert_success(&outputs);
+    assert!(stdout(&outputs).contains("output id=30 name=\"Primary\" video_scene=10 video_scene_name=\"Program\" audio_bus=20 audio_bus_name=\"Master\" startup=reconcile-desired-state capabilities=[]"));
+
+    let manifest_before = fs::read(context.project.join("project.json")).unwrap();
+    let unknown = invoke(&["output-startup", context.project_path(), "999", "stopped"]);
+    assert_failure_contains(&unknown, "unknown output 999");
+    assert_eq!(
+        fs::read(context.project.join("project.json")).unwrap(),
+        manifest_before
+    );
+    fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
 fn local_output_route_persists_existing_route_and_rejects_unknown_reference() {
     let context = ContractContext::new();
     assert_success(&invoke(&["new", context.project_path()]));

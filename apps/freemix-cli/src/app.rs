@@ -156,6 +156,11 @@ pub fn run(command: Command) -> AppResult<()> {
         } => {
             set_output_route(&path, output_id(output)?, scene_id(scene)?, bus_id(bus)?)?;
         }
+        Command::OutputStartup {
+            path,
+            output,
+            startup,
+        } => set_output_startup(&path, output_id(output)?, startup)?,
         Command::OutputRemove { path, output } => {
             remove_output(&path, output_id(output)?)?;
         }
@@ -1620,6 +1625,25 @@ fn set_output_route(path: &Path, output: OutputId, scene: SceneId, bus: BusId) -
     Ok(())
 }
 
+fn set_output_startup(path: &Path, output: OutputId, startup: StartupPolicy) -> AppResult<()> {
+    let store = ProjectStore::new(path)?;
+    let stored = load_stored_project(path)?;
+    let mut project = stored.project().clone();
+    project.set_output_startup(output, startup)?;
+    let configured = StoredProject::from_project_with_complete_runtime_state(
+        project,
+        stored.runtime_routing(),
+        stored.runtime_manual_transitions(),
+        stored.runtime_fade_to_black(),
+        stored.runtime_overlays().clone(),
+        stored.position(),
+        stored.idempotency_receipts().to_vec(),
+    )?;
+    store.save(&configured)?;
+    print_status(&load_engine(path)?);
+    Ok(())
+}
+
 fn set_scene_input_audio_source(
     path: &Path,
     scene_input: InputId,
@@ -2857,6 +2881,7 @@ Usage:
   freemix-cli audio-bus-send-remove <show.freemix> <source-bus-id> <destination-bus-id>
   freemix-cli output-add <show.freemix> <nonzero-output-id> <nonzero-scene-id> <nonzero-bus-id> <name>
   freemix-cli output-route <show.freemix> <existing-output-id> <existing-scene-id> <existing-bus-id>
+  freemix-cli output-startup <show.freemix> <existing-output-id> <stopped|reconcile-desired-state>
   freemix-cli output-remove <show.freemix> <existing-output-id>
   freemix-cli scene-input-add <show.freemix> <nonzero-input-id> <nonzero-scene-id> <name>
   freemix-cli scene-input-duplicate <show.freemix> <source-scene-id> <new-scene-id> <new-input-id> <scene-name> <input-name>

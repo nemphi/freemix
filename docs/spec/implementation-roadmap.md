@@ -152,9 +152,9 @@ described under Phase 3 item 4 instead of rejecting scene inputs. Feathered or
 non-rectangular masks, keys, effects, per-output realization, live
 edits/replanning, and cross-platform or hardware certification remain outside
 this item, so its parity rows remain planned; the bounded local CLI can
-construct, edit, and remove buses and outputs for the next-open project, while
-SW-012 remains planned for runtime output
-realization, clean feed/fullscreen/health/recovery, and live acceptance.
+construct, edit, and remove buses and outputs, including each output startup
+policy, for the next-open project only; SW-012 remains planned for runtime
+start/reconcile, output delivery, clean feed/fullscreen/health/recovery, and live acceptance.
 
 Current implementation boundary for item 5: `freemix-studio` opens a native
 `eframe`/wgpu shell by default with responsive Program/Preview monitor wells,

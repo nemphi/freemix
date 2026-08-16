@@ -238,6 +238,11 @@ pub enum SetOutputRouteError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SetOutputStartupError {
+    UnknownOutput(OutputId),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AddAudioBusError {
     DuplicateId(BusId),
     EmptyName,
@@ -429,6 +434,16 @@ impl std::fmt::Display for SetOutputRouteError {
 }
 
 impl std::error::Error for SetOutputRouteError {}
+
+impl std::fmt::Display for SetOutputStartupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownOutput(output) => write!(formatter, "unknown output {output}"),
+        }
+    }
+}
+
+impl std::error::Error for SetOutputStartupError {}
 
 impl std::fmt::Display for AddAudioBusError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1393,6 +1408,20 @@ impl Project {
         }
         self.outputs[output_index].video_source = scene;
         self.outputs[output_index].audio_source = bus;
+        Ok(())
+    }
+
+    pub fn set_output_startup(
+        &mut self,
+        output: OutputId,
+        startup: StartupPolicy,
+    ) -> Result<(), SetOutputStartupError> {
+        let output = self
+            .outputs
+            .iter_mut()
+            .find(|candidate| candidate.id == output)
+            .ok_or(SetOutputStartupError::UnknownOutput(output))?;
+        output.startup = startup;
         Ok(())
     }
 

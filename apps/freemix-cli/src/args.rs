@@ -1,5 +1,7 @@
 use std::{net::SocketAddr, path::PathBuf};
 
+use fm_model::StartupPolicy;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ManualTransitionKind {
     Fade,
@@ -123,6 +125,11 @@ pub enum Command {
         output: u128,
         scene: u128,
         bus: u128,
+    },
+    OutputStartup {
+        path: PathBuf,
+        output: u128,
+        startup: StartupPolicy,
     },
     OutputRemove {
         path: PathBuf,
@@ -683,6 +690,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
         "output-add" => parse_output_add(arguments),
         "output-remove" => parse_output_remove(arguments),
         "output-route" => parse_output_route(arguments),
+        "output-startup" => parse_output_startup(arguments),
         "scene-input-add" => parse_scene_input_add(arguments),
         "scene-input-duplicate" => parse_scene_input_duplicate(arguments),
         "scene-input-audio-source" => parse_scene_input_audio_source(arguments),
@@ -847,6 +855,28 @@ fn parse_output_route(mut arguments: impl Iterator<Item = String>) -> Result<Com
         output,
         scene,
         bus,
+    })
+}
+
+fn parse_output_startup(mut arguments: impl Iterator<Item = String>) -> Result<Command, ArgsError> {
+    let path = required_path(&mut arguments, "project path")?;
+    let output = number(&required(&mut arguments, "output")?, "output")?;
+    let value = required(&mut arguments, "startup policy")?;
+    let startup = match value.as_str() {
+        "stopped" => StartupPolicy::Stopped,
+        "reconcile-desired-state" => StartupPolicy::ReconcileDesiredState,
+        _ => {
+            return Err(ArgsError::InvalidChoice {
+                field: "startup policy",
+                value,
+            });
+        }
+    };
+    reject_extra(&mut arguments)?;
+    Ok(Command::OutputStartup {
+        path,
+        output,
+        startup,
     })
 }
 
