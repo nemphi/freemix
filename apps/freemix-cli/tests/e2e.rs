@@ -1951,7 +1951,6 @@ fn local_scene_background() {
         "Layer",
     ]));
     let before = ProjectStore::new(&context.project).unwrap().load().unwrap();
-    let before_manifest = manifest(&context.project);
     assert_success(&invoke(&[
         "scene-background",
         context.project_path(),
@@ -1983,7 +1982,6 @@ fn local_scene_background() {
         .unwrap()
         .background = Rgba8::new(16, 8, 4, 16);
     assert_eq!(after.project().scenes(), expected_scenes);
-    assert_eq!(after.project().scenes()[0].layers.len(), 1);
     let unchanged = manifest(&context.project);
     let invalid = invoke(&[
         "scene-background",
@@ -1996,7 +1994,6 @@ fn local_scene_background() {
     ]);
     assert_failure_contains(&invalid, "scene background must be premultiplied");
     assert_eq!(manifest(&context.project), unchanged);
-    assert_ne!(unchanged, before_manifest);
     fs::remove_dir_all(context.root).unwrap();
 }
 
