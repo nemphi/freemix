@@ -308,6 +308,7 @@ pub enum SceneLayerError {
         index: usize,
         length: usize,
     },
+    EmptyName,
     InvalidGeometry {
         scene: SceneId,
         index: usize,
@@ -366,6 +367,7 @@ impl std::fmt::Display for SceneLayerError {
                 formatter,
                 "layer index {index} out of range for scene {scene} with {length} layers"
             ),
+            Self::EmptyName => formatter.write_str("scene layer name must not be empty"),
             Self::InvalidGeometry { scene, index } => {
                 write!(
                     formatter,
@@ -1078,6 +1080,33 @@ impl Project {
                 length,
             })?;
         layer.z_order = z_order;
+        Ok(())
+    }
+
+    pub fn rename_scene_layer(
+        &mut self,
+        scene: SceneId,
+        index: usize,
+        name: String,
+    ) -> Result<(), SceneLayerError> {
+        let target = self
+            .scenes
+            .iter_mut()
+            .find(|candidate| candidate.id == scene)
+            .ok_or(SceneLayerError::UnknownScene(scene))?;
+        let length = target.layers.len();
+        let layer = target
+            .layers
+            .get_mut(index)
+            .ok_or(SceneLayerError::LayerIndexOutOfRange {
+                scene,
+                index,
+                length,
+            })?;
+        if name.trim().is_empty() {
+            return Err(SceneLayerError::EmptyName);
+        }
+        layer.name = name;
         Ok(())
     }
 

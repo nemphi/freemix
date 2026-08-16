@@ -11,7 +11,7 @@ use std::{
 };
 
 use fm_model::{
-    AudioBus, BusSend, Input, InputKind, LayerGeometry, RectMask, Rgba8, Rotation, Scene,
+    AudioBus, BusSend, Input, InputKind, Layer, LayerGeometry, RectMask, Rgba8, Rotation, Scene,
     SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef, StartupPolicy,
 };
 use fm_persistence::{MutationBatch, ProjectStore, StoredProject};
@@ -3751,6 +3751,117 @@ fn local_scene_layer_add_rejects_missing_input_without_manifest_or_journal_chang
         manifest_before
     );
     assert_eq!(journal_bytes(&store), journal_before);
+    fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
+fn local_scene_layer_rename_persists_exact_name_and_rejects_invalid_target() {
+    let context = ContractContext::new();
+    let run = |arguments: &[&str]| assert_success(&invoke_bounded(arguments));
+    run(&["new", context.project_path()]);
+    run(&["scene-input-add", context.project_path(), "3", "7", "Scene"]);
+    let store = ProjectStore::new(&context.project).unwrap();
+    let stored = store.load().unwrap();
+    let mut project = stored.project().clone();
+    project
+        .add_layer_to_scene(
+            SceneId::new(NonZeroU128::new(7).unwrap()),
+            Layer {
+                name: "Original".into(),
+                source: SourceRef::Input(InputId::new(NonZeroU128::new(1).unwrap())),
+                enabled: false,
+                geometry: LayerGeometry::new(-12, 34, 640, 480, Rotation::Deg270),
+                crop: Some(fm_model::CropRect::new(10, 20, 640, 480)),
+                mask: Some(RectMask::new(10, 20, 600, 400).inverted(true)),
+                opacity: 96,
+                z_order: 9,
+            },
+        )
+        .unwrap();
+    store
+        .save(
+            &StoredProject::from_project_with_complete_runtime_state(
+                project,
+                stored.runtime_routing(),
+                stored.runtime_manual_transitions(),
+                stored.runtime_fade_to_black(),
+                stored.runtime_overlays().clone(),
+                stored.position(),
+                stored.idempotency_receipts().to_vec(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    run(&[
+        "tbar-start",
+        context.project_path(),
+        "slide",
+        "--key",
+        "scene-layer-rename-runtime",
+        "--expect",
+        "0",
+    ]);
+
+    let before = store.load().unwrap();
+    assert!(before.runtime_manual_transitions().desired.is_some());
+    assert!(before.position().revision > 0);
+    assert!(!before.idempotency_receipts().is_empty());
+    let supplied = "  Exact layer  ";
+    run(&[
+        "scene-layer-rename",
+        context.project_path(),
+        "7",
+        "0",
+        supplied,
+    ]);
+    let after = store.load().unwrap();
+    let mut expected_layer = before.project().scenes()[0].layers[0].clone();
+    expected_layer.name = supplied.into();
+    assert_eq!(after.project().scenes()[0].layers[0], expected_layer);
+    let mut expected_project = before.project().clone();
+    expected_project
+        .rename_scene_layer(
+            SceneId::new(NonZeroU128::new(7).unwrap()),
+            0,
+            supplied.into(),
+        )
+        .unwrap();
+    assert_eq!(after.project(), &expected_project);
+    assert_eq!(
+        (
+            after.runtime_routing(),
+            after.runtime_manual_transitions(),
+            after.runtime_fade_to_black(),
+            after.runtime_overlays(),
+            after.position(),
+            after.idempotency_receipts(),
+        ),
+        (
+            before.runtime_routing(),
+            before.runtime_manual_transitions(),
+            before.runtime_fade_to_black(),
+            before.runtime_overlays(),
+            before.position(),
+            before.idempotency_receipts(),
+        )
+    );
+
+    let manifest_before = fs::read(context.project.join("project.json")).unwrap();
+    let rejected = invoke_bounded(&[
+        "scene-layer-rename",
+        context.project_path(),
+        "7",
+        "1",
+        "Rejected",
+    ]);
+    assert_failure_contains(
+        &rejected,
+        "layer index 1 out of range for scene 7 with 1 layers",
+    );
+    assert_eq!(
+        fs::read(context.project.join("project.json")).unwrap(),
+        manifest_before
+    );
     fs::remove_dir_all(context.root).unwrap();
 }
 

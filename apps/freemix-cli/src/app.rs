@@ -233,6 +233,12 @@ pub fn run(command: Command) -> AppResult<()> {
         Command::SceneLayerRemove { path, scene, index } => {
             remove_scene_layer(&path, scene_id(scene)?, index)?
         }
+        Command::SceneLayerRename {
+            path,
+            scene,
+            index,
+            name,
+        } => rename_scene_layer(&path, scene_id(scene)?, index, name)?,
         Command::SceneLayerSourceInput {
             path,
             scene,
@@ -1830,6 +1836,25 @@ fn remove_scene_layer(path: &Path, scene: SceneId, index: usize) -> AppResult<()
     Ok(())
 }
 
+fn rename_scene_layer(path: &Path, scene: SceneId, index: usize, name: String) -> AppResult<()> {
+    let store = ProjectStore::new(path)?;
+    let stored = load_stored_project(path)?;
+    let mut project = stored.project().clone();
+    project.rename_scene_layer(scene, index, name)?;
+    let configured = StoredProject::from_project_with_complete_runtime_state(
+        project,
+        stored.runtime_routing(),
+        stored.runtime_manual_transitions(),
+        stored.runtime_fade_to_black(),
+        stored.runtime_overlays().clone(),
+        stored.position(),
+        stored.idempotency_receipts().to_vec(),
+    )?;
+    store.save(&configured)?;
+    print_status(&load_engine(path)?);
+    Ok(())
+}
+
 fn set_scene_layer_source(
     path: &Path,
     scene: SceneId,
@@ -2938,6 +2963,7 @@ Usage:
   freemix-cli scene-rename <show.freemix> <existing-scene-id> <scene-name>
   freemix-cli scene-layer-add <show.freemix> <scene-id> <source-input-id> <z-order> <layer-name>
   freemix-cli scene-layer-remove <show.freemix> <scene-id> <zero-based-layer-index>
+  freemix-cli scene-layer-rename <show.freemix> <scene-id> <zero-based-layer-index> <name>
   freemix-cli scene-layer-source-input <show.freemix> <scene-id> <zero-based-layer-index> <input-id>
   freemix-cli scene-layer-source-scene <show.freemix> <scene-id> <zero-based-layer-index> <source-scene-id>
   freemix-cli scene-layer-z-order <show.freemix> <scene-id> <zero-based-layer-index> <signed-z-order>

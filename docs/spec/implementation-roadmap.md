@@ -301,7 +301,7 @@ The local `input-add`, `simulated-solid-input-add`, `media-input-add`, `scene-in
 `input-replace-simulated` commands persist input state for the next project open
 only. `scene-input-add` creates an empty opaque-black scene with no layers and no
 audio source. `scene-input-audio-source` and `scene-input-audio-source-clear`
-persist the scene input audio route. `scene-layer-add`, `scene-layer-remove`, `scene-layer-appearance`,
+persist the scene input audio route. `scene-layer-add`, `scene-layer-remove`, `scene-layer-rename`, `scene-layer-appearance`,
 `scene-layer-geometry`, `scene-layer-crop`, `scene-layer-crop-clear`,
 `scene-layer-mask`, `scene-layer-mask-clear`, `scene-layer-z-order`, and
 `scene-background` (premultiplied RGBA), `scene-layer-source-input`, and
