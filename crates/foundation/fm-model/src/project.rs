@@ -20,6 +20,13 @@ pub enum RemoveSceneError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RenameSceneError {
+    UnknownScene(SceneId),
+    EmptyName,
+    DuplicateName,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplaceInputError {
     UnknownInput(InputId),
 }
@@ -276,6 +283,18 @@ impl std::fmt::Display for RemoveSceneError {
 
 impl std::error::Error for RemoveSceneError {}
 
+impl std::fmt::Display for RenameSceneError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownScene(scene) => write!(formatter, "scene {scene} does not exist"),
+            Self::EmptyName => formatter.write_str("scene name must not be empty"),
+            Self::DuplicateName => formatter.write_str("scene name is already in use"),
+        }
+    }
+}
+
+impl std::error::Error for RenameSceneError {}
+
 pub const CURRENT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(17);
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -520,6 +539,29 @@ impl Project {
 
     pub fn add_scene(&mut self, scene: Scene) {
         self.scenes.push(scene);
+    }
+
+    pub fn rename_scene(&mut self, scene: SceneId, name: String) -> Result<(), RenameSceneError> {
+        let index = self
+            .scenes
+            .iter()
+            .position(|candidate| candidate.id == scene)
+            .ok_or(RenameSceneError::UnknownScene(scene))?;
+        if name.trim().is_empty() {
+            return Err(RenameSceneError::EmptyName);
+        }
+        if self
+            .scenes
+            .iter()
+            .enumerate()
+            .any(|(candidate_index, candidate)| {
+                candidate_index != index && candidate.name.eq_ignore_ascii_case(&name)
+            })
+        {
+            return Err(RenameSceneError::DuplicateName);
+        }
+        self.scenes[index].name = name;
+        Ok(())
     }
 
     pub fn remove_scene(&mut self, scene: SceneId) -> Result<(), RemoveSceneError> {

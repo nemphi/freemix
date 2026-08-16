@@ -2676,6 +2676,74 @@ fn local_scene_input_add_persists_empty_scene_without_routing() {
 }
 
 #[test]
+fn scene_rename_persists_exact_name_and_failures_preserve_manifest() {
+    let context = ContractContext::new();
+    assert_success(&invoke(&["new", context.project_path()]));
+    for (input, scene, name) in [("10", "10", "Wide"), ("11", "11", "Close")] {
+        assert_success(&invoke(&[
+            "scene-input-add",
+            context.project_path(),
+            input,
+            scene,
+            name,
+        ]));
+    }
+    let store = ProjectStore::new(&context.project).unwrap();
+    let before = store.load().unwrap();
+    let manifest_before = fs::read(context.project.join("project.json")).unwrap();
+    let journal_before = journal_bytes(&store);
+    for (scene, name, expected) in [
+        ("99", "Missing", "scene 99 does not exist"),
+        ("10", "close", "scene name is already in use"),
+    ] {
+        let rejected = invoke(&["scene-rename", context.project_path(), scene, name]);
+        assert_failure_contains(&rejected, expected);
+        assert_eq!(
+            fs::read(context.project.join("project.json")).unwrap(),
+            manifest_before
+        );
+        assert_eq!(journal_bytes(&store), journal_before);
+    }
+    let rejected = invoke(&["scene-rename", context.project_path(), "10", "   "]);
+    assert_failure_contains(&rejected, "scene name must not be blank");
+    assert_eq!(
+        fs::read(context.project.join("project.json")).unwrap(),
+        manifest_before
+    );
+    assert_eq!(journal_bytes(&store), journal_before);
+
+    let supplied = "  Exact scene  ";
+    assert_success(&invoke(&[
+        "scene-rename",
+        context.project_path(),
+        "10",
+        supplied,
+    ]));
+    let after = store.load().unwrap();
+    let mut expected_project = before.project().clone();
+    expected_project
+        .rename_scene(SceneId::new(NonZeroU128::new(10).unwrap()), supplied.into())
+        .unwrap();
+    assert_eq!(after.project(), &expected_project);
+    assert_eq!(after.runtime_routing(), before.runtime_routing());
+    assert_eq!(
+        after.runtime_manual_transitions(),
+        before.runtime_manual_transitions()
+    );
+    assert_eq!(
+        after.runtime_fade_to_black(),
+        before.runtime_fade_to_black()
+    );
+    assert_eq!(after.runtime_overlays(), before.runtime_overlays());
+    assert_eq!(after.position(), before.position());
+    assert_eq!(after.idempotency_receipts(), before.idempotency_receipts());
+    let scenes = invoke(&["scenes", context.project_path()]);
+    assert_success(&scenes);
+    assert!(stdout(&scenes).contains("name=\"  Exact scene  \""));
+    fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
 fn local_scene_removal_preserves_runtime_and_rejects_references() {
     fn prepare(reference: Option<&str>) -> ContractContext {
         let context = ContractContext::new();

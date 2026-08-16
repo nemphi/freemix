@@ -298,6 +298,9 @@ masks, effects, and IN-020 remain planned.
 `scene-remove` is local next-open scene removal only; it does not add cascade
 behavior, rendering, live editing, daemon/Studio/protocol mutation, output
 realization, or acceptance.
+`scene-rename` preserves the exact supplied name, rejects blank names, and
+enforces case-insensitive uniqueness; it adds no daemon/Studio/protocol/live-session,
+render, or output behavior.
 The rename and reorder commands carry input identity; audio and routing state
 remain separate.
 `media-input-add` and `media-input-relink` are local next-open media-input configuration footholds. They store strict

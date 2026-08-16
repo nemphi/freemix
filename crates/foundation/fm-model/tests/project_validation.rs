@@ -4,10 +4,10 @@ use fm_model::{
     AudioBus, BusSend, CURRENT_SCHEMA_VERSION, CropRect, EntityRef, Input, InputAudioStripState,
     InputBalanceBasisPoints, InputDelaySamples, InputGainMilliDb, InputKind, Layer, LayerGeometry,
     MainMix, Output, OutputFormat, Project, ProjectSettings, RectMask, RemoveAudioBusError,
-    RemoveInputError, RemoveOutputError, RemoveSceneError, RestartPolicy, Rgba8, Rotation, Scene,
-    SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef, StartupPolicy,
-    StingerAudioPolicy, StingerConfig, StingerMissingMediaFallback, StingerSlotNumber,
-    ValidationErrorKind,
+    RemoveInputError, RemoveOutputError, RemoveSceneError, RenameSceneError, RestartPolicy, Rgba8,
+    Rotation, Scene, SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef,
+    StartupPolicy, StingerAudioPolicy, StingerConfig, StingerMissingMediaFallback,
+    StingerSlotNumber, ValidationErrorKind,
 };
 use fm_types::{
     AudioFormat, BusId, ChannelLayout, ColorMetadata, FrameRate, InputId, MAX_INPUT_NAME_BYTES,
@@ -141,6 +141,41 @@ fn simulated_project() -> Project {
 #[test]
 fn coherent_project_is_valid() {
     assert_eq!(valid_project().validate(), Ok(()));
+}
+
+#[test]
+fn rename_scene_preserves_exact_text_and_rejects_invalid_names_without_mutation() {
+    let mut project = Project::new(project_id(80), "Rename", settings());
+    project.add_scene(Scene {
+        id: scene_id(1),
+        name: "Wide".into(),
+        background: Rgba8::OPAQUE_BLACK,
+        layers: Vec::new(),
+    });
+    project.add_scene(Scene {
+        id: scene_id(2),
+        name: "Close".into(),
+        background: Rgba8::OPAQUE_BLACK,
+        layers: Vec::new(),
+    });
+    project
+        .rename_scene(scene_id(1), "  Exact scene  ".into())
+        .unwrap();
+    assert_eq!(project.scenes()[0].name, "  Exact scene  ");
+
+    for (scene, name, error) in [
+        (
+            scene_id(99),
+            "Unused",
+            RenameSceneError::UnknownScene(scene_id(99)),
+        ),
+        (scene_id(1), " \t ", RenameSceneError::EmptyName),
+        (scene_id(1), "close", RenameSceneError::DuplicateName),
+    ] {
+        let before = project.clone();
+        assert_eq!(project.rename_scene(scene, name.into()), Err(error));
+        assert_eq!(project, before);
+    }
 }
 
 #[test]

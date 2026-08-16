@@ -190,6 +190,7 @@ pub fn run(command: Command) -> AppResult<()> {
             )?;
         }
         Command::SceneRemove { path, scene } => remove_scene(&path, scene_id(scene)?)?,
+        Command::SceneRename { path, scene, name } => rename_scene(&path, scene_id(scene)?, name)?,
         Command::SceneLayerAdd {
             path,
             scene,
@@ -1658,6 +1659,24 @@ fn remove_scene(path: &Path, scene: SceneId) -> AppResult<()> {
     Ok(())
 }
 
+fn rename_scene(path: &Path, scene: SceneId, name: String) -> AppResult<()> {
+    let stored = load_stored_project(path)?;
+    let mut project = stored.project().clone();
+    project.rename_scene(scene, name)?;
+    let configured = StoredProject::from_project_with_complete_runtime_state(
+        project,
+        stored.runtime_routing(),
+        stored.runtime_manual_transitions(),
+        stored.runtime_fade_to_black(),
+        stored.runtime_overlays().clone(),
+        stored.position(),
+        stored.idempotency_receipts().to_vec(),
+    )?;
+    ProjectStore::new(path)?.save(&configured)?;
+    print_status(&load_engine(path)?);
+    Ok(())
+}
+
 fn remove_scene_layer(path: &Path, scene: SceneId, index: usize) -> AppResult<()> {
     let store = ProjectStore::new(path)?;
     let stored = load_stored_project(path)?;
@@ -2772,6 +2791,7 @@ Usage:
   freemix-cli scene-input-audio-source-clear <show.freemix> <scene-input-id>
   freemix-cli scene-background <show.freemix> <scene-id> <premultiplied-red:0..=255> <premultiplied-green:0..=255> <premultiplied-blue:0..=255> <alpha:0..=255>
   freemix-cli scene-remove <show.freemix> <existing-scene-id>
+  freemix-cli scene-rename <show.freemix> <existing-scene-id> <scene-name>
   freemix-cli scene-layer-add <show.freemix> <scene-id> <source-input-id> <z-order> <layer-name>
   freemix-cli scene-layer-remove <show.freemix> <scene-id> <zero-based-layer-index>
   freemix-cli scene-layer-source-input <show.freemix> <scene-id> <zero-based-layer-index> <input-id>

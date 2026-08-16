@@ -149,6 +149,11 @@ pub enum Command {
         path: PathBuf,
         scene: u128,
     },
+    SceneRename {
+        path: PathBuf,
+        scene: u128,
+        name: String,
+    },
     SceneLayerAdd {
         path: PathBuf,
         scene: u128,
@@ -667,6 +672,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
         "scene-input-audio-source-clear" => parse_scene_input_audio_source_clear(arguments),
         "scene-background" => parse_scene_background(arguments),
         "scene-remove" => parse_scene_remove(arguments),
+        "scene-rename" => parse_scene_rename(arguments),
         "scene-layer-add" => parse_scene_layer_add(arguments),
         "scene-layer-remove" => parse_scene_layer_remove(arguments),
         "scene-layer-source-input" => parse_scene_layer_source_input(arguments),
@@ -1298,6 +1304,14 @@ fn parse_scene_remove(mut arguments: impl Iterator<Item = String>) -> Result<Com
     let scene = number(&required(&mut arguments, "scene")?, "scene")?;
     reject_extra(&mut arguments)?;
     Ok(Command::SceneRemove { path, scene })
+}
+
+fn parse_scene_rename(mut arguments: impl Iterator<Item = String>) -> Result<Command, ArgsError> {
+    let path = required_path(&mut arguments, "project path")?;
+    let scene = number(&required(&mut arguments, "scene")?, "scene")?;
+    let name = nonblank(&mut arguments, "scene name")?;
+    reject_extra(&mut arguments)?;
+    Ok(Command::SceneRename { path, scene, name })
 }
 
 fn parse_scene_layer_add(
