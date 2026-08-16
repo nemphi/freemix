@@ -662,6 +662,10 @@ impl Project {
             || self.scenes.iter().any(|scene| {
                 scene.layers.iter().any(|layer| layer.source == SourceRef::Input(input))
             })
+            || self
+                .inputs
+                .iter()
+                .any(|candidate| candidate.id == input && matches!(candidate.kind, InputKind::Scene { .. }))
             || self.inputs.iter().any(|candidate| {
                 matches!(candidate.kind, InputKind::Scene { audio_source: Some(source), .. } if source == input)
             });
