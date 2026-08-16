@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use fm_model::{InputKind, SimulatedAudio, SimulatedVideo};
+use fm_model::{InputKind, SimulatedAudio, SimulatedInput, SimulatedVideo};
 use fm_persistence::ProjectStore;
 use fm_protocol::{
     CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, ClientType, CommandMessage, CommandPayload,
@@ -1891,6 +1891,87 @@ fn local_input_duplicate_copies_source_and_strip() {
         stored.project().input_audio_strip(copy.id),
         stored.project().input_audio_strip(source.id)
     );
+    fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
+fn local_input_replace_simulated_preserves_identity_and_runtime() {
+    let context = ContractContext::new();
+    assert_success(&invoke(&["new", context.project_path()]));
+    let before = ProjectStore::new(&context.project).unwrap().load().unwrap();
+    let input = InputId::new(NonZeroU128::new(2).unwrap());
+    let before_input = before
+        .project()
+        .inputs()
+        .iter()
+        .find(|candidate| candidate.id == input)
+        .unwrap();
+    assert!(matches!(
+        &before_input.kind,
+        InputKind::Simulated(SimulatedInput {
+            video: SimulatedVideo::Solid(_),
+            audio: SimulatedAudio::Sine { .. }
+        })
+    ));
+
+    assert_success(&invoke(&[
+        "input-replace-simulated",
+        context.project_path(),
+        "2",
+    ]));
+    let after = ProjectStore::new(&context.project).unwrap().load().unwrap();
+    let after_input = after
+        .project()
+        .inputs()
+        .iter()
+        .find(|candidate| candidate.id == input)
+        .unwrap();
+    assert_eq!(after_input.id, before_input.id);
+    assert_eq!(after_input.name, before_input.name);
+    assert_eq!(
+        after
+            .project()
+            .inputs()
+            .iter()
+            .map(|candidate| candidate.id)
+            .collect::<Vec<_>>(),
+        before
+            .project()
+            .inputs()
+            .iter()
+            .map(|candidate| candidate.id)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        after.project().input_audio_strip(input),
+        before.project().input_audio_strip(input)
+    );
+    assert_eq!(after.runtime_routing(), before.runtime_routing());
+    assert_eq!(
+        after.runtime_manual_transitions(),
+        before.runtime_manual_transitions()
+    );
+    assert_eq!(
+        after.runtime_fade_to_black(),
+        before.runtime_fade_to_black()
+    );
+    assert_eq!(after.runtime_overlays(), before.runtime_overlays());
+    assert_eq!(after.position(), before.position());
+    assert_eq!(after.idempotency_receipts(), before.idempotency_receipts());
+    assert!(matches!(
+        &after_input.kind,
+        InputKind::Simulated(SimulatedInput {
+            video: SimulatedVideo::Bars,
+            audio: SimulatedAudio::Silence
+        })
+    ));
+
+    let unchanged = manifest(&context.project);
+    assert_failure_contains(
+        &invoke(&["input-replace-simulated", context.project_path(), "999"]),
+        "unknown input 999",
+    );
+    assert_eq!(manifest(&context.project), unchanged);
     fs::remove_dir_all(context.root).unwrap();
 }
 

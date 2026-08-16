@@ -89,6 +89,9 @@ pub fn run(command: Command) -> AppResult<()> {
             input,
             name,
         } => duplicate_input(&path, input_id(source)?, input_id(input)?, name)?,
+        Command::InputReplaceSimulated { path, input } => {
+            replace_input_simulated(&path, input_id(input)?)?
+        }
         Command::Status { path } => print_status(&load_engine(&path)?),
         Command::AudioStrip {
             path,
@@ -1272,6 +1275,31 @@ fn duplicate_input(path: &Path, source: InputId, input: InputId, name: String) -
     Ok(())
 }
 
+fn replace_input_simulated(path: &Path, input: InputId) -> AppResult<()> {
+    let stored = load_stored_project(path)?;
+    let mut project = stored.project().clone();
+    project.replace_input_source(
+        input,
+        InputKind::Simulated(SimulatedInput::new(
+            SimulatedVideo::Bars,
+            SimulatedAudio::Silence,
+        )),
+        Vec::new(),
+    )?;
+    let configured = StoredProject::from_project_with_complete_runtime_state(
+        project,
+        stored.runtime_routing(),
+        stored.runtime_manual_transitions(),
+        stored.runtime_fade_to_black(),
+        stored.runtime_overlays().clone(),
+        stored.position(),
+        stored.idempotency_receipts().to_vec(),
+    )?;
+    ProjectStore::new(path)?.save(&configured)?;
+    print_status(&load_engine(path)?);
+    Ok(())
+}
+
 fn remove_stinger(path: &Path, slot: StingerSlotNumber) -> AppResult<()> {
     update_stingers(path, |project| {
         let _ = project.remove_stinger(slot);
@@ -1908,6 +1936,7 @@ Usage:
   freemix-cli input-add <show.freemix> <nonzero-input-id> <name>
   freemix-cli input-remove <show.freemix> <input-id>
   freemix-cli input-duplicate <show.freemix> <source-input-id> <new-nonzero-input-id> <new-name>
+  freemix-cli input-replace-simulated <show.freemix> <input-id>
   freemix-cli status <show.freemix>
   freemix-cli audio-strip <show.freemix> <input> <gain-millidb:-96000..=24000> <balance-bp:-10000..=10000> <muted:on|off> <soloed:on|off> <follow-video:on|off> <delay-samples:0..=48000>
   freemix-cli rename <show.freemix> <input> <name> [--key <key>] [--expect <revision>]

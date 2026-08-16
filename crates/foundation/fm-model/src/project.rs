@@ -11,6 +11,21 @@ pub enum RemoveInputError {
     DomainReference(InputId),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReplaceInputError {
+    UnknownInput(InputId),
+}
+
+impl std::fmt::Display for ReplaceInputError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownInput(input) => write!(formatter, "unknown input {input}"),
+        }
+    }
+}
+
+impl std::error::Error for ReplaceInputError {}
+
 impl std::fmt::Display for RemoveInputError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -195,6 +210,22 @@ impl Project {
             return Err(RenameInputError::DuplicateName);
         }
         self.inputs[index].name = name;
+        Ok(())
+    }
+
+    pub fn replace_input_source(
+        &mut self,
+        input: InputId,
+        kind: InputKind,
+        required_capabilities: Vec<String>,
+    ) -> Result<(), ReplaceInputError> {
+        let candidate = self
+            .inputs
+            .iter_mut()
+            .find(|candidate| candidate.id == input)
+            .ok_or(ReplaceInputError::UnknownInput(input))?;
+        candidate.kind = kind;
+        candidate.required_capabilities = required_capabilities;
         Ok(())
     }
 
