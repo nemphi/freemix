@@ -14,7 +14,7 @@ use fm_model::{
     InputKind, LayerGeometry, RectMask, Rgba8, Rotation, SimulatedAudio, SimulatedInput,
     SimulatedVideo, SourceRef,
 };
-use fm_persistence::ProjectStore;
+use fm_persistence::{MutationBatch, ProjectStore};
 use fm_protocol::{
     CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, ClientType, CommandMessage, CommandPayload,
     CommandResult, EngineIdentity, EventCursor, EventMessage, EventPayload, HandshakeOutcome,
@@ -3669,6 +3669,72 @@ fn render_rejects_non_simulated_inputs_clearly() {
     );
     assert!(!image.exists());
 
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn journal_recover_removes_only_torn_final_record_and_refuses_valid_batch() {
+    let root = unique_test_root();
+    let torn_project = root.join("torn.freemix");
+    let valid_project = root.join("valid.freemix");
+    fs::create_dir_all(&root).unwrap();
+    assert_success(&invoke(&["new", torn_project.to_str().unwrap()]));
+    let torn_store = ProjectStore::new(&torn_project).unwrap();
+    torn_store
+        .append_batch(&MutationBatch::new(1, 0, 1, b"torn".to_vec()))
+        .unwrap();
+    let torn_record = torn_store.journal_path().join("00000000000000000001.batch");
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&torn_record)
+        .unwrap()
+        .set_len(12)
+        .unwrap();
+
+    let recovered = invoke(&["journal-recover", torn_project.to_str().unwrap()]);
+    assert_success(&recovered);
+    assert_eq!(
+        String::from_utf8_lossy(&recovered.stdout),
+        "journal recovered: checkpoint_sequence=0 checkpoint_revision=0 unapplied_batches=0\n"
+    );
+    assert!(!torn_record.exists());
+    assert_success(&invoke(&["status", torn_project.to_str().unwrap()]));
+
+    assert_success(&invoke(&["new", valid_project.to_str().unwrap()]));
+    let valid_store = ProjectStore::new(&valid_project).unwrap();
+    valid_store
+        .append_batch(&MutationBatch::new(1, 0, 1, b"valid".to_vec()))
+        .unwrap();
+    valid_store
+        .append_batch(&MutationBatch::new(2, 1, 2, b"torn".to_vec()))
+        .unwrap();
+    let valid_record = valid_store
+        .journal_path()
+        .join("00000000000000000001.batch");
+    let torn_record = valid_store
+        .journal_path()
+        .join("00000000000000000002.batch");
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&torn_record)
+        .unwrap()
+        .set_len(12)
+        .unwrap();
+    let valid_before = fs::read(&valid_record).unwrap();
+    let torn_before = fs::read(&torn_record).unwrap();
+    let manifest = fs::read(valid_project.join("project.json")).unwrap();
+
+    let refused = invoke(&["journal-recover", valid_project.to_str().unwrap()]);
+    assert_failure_contains(
+        &refused,
+        "journal recovery refused: 1 unapplied journal batch(es) remain; no batches were applied",
+    );
+    assert_eq!(fs::read(&valid_record).unwrap(), valid_before);
+    assert_eq!(fs::read(&torn_record).unwrap(), torn_before);
+    assert_eq!(
+        fs::read(valid_project.join("project.json")).unwrap(),
+        manifest
+    );
     fs::remove_dir_all(root).unwrap();
 }
 

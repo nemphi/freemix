@@ -192,6 +192,9 @@ pub enum Command {
     Status {
         path: PathBuf,
     },
+    JournalRecover {
+        path: PathBuf,
+    },
     Inputs {
         path: PathBuf,
     },
@@ -611,6 +614,11 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
             let path = required_path(&mut arguments, "project path")?;
             reject_extra(&mut arguments)?;
             Ok(Command::Status { path })
+        }
+        "journal-recover" => {
+            let path = required_path(&mut arguments, "project path")?;
+            reject_extra(&mut arguments)?;
+            Ok(Command::JournalRecover { path })
         }
         "inputs" => {
             let path = required_path(&mut arguments, "project path")?;

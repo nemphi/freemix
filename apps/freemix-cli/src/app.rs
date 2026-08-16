@@ -225,6 +225,7 @@ pub fn run(command: Command) -> AppResult<()> {
             replace_input_simulated(&path, input_id(input)?)?
         }
         Command::Status { path } => print_status(&load_engine(&path)?),
+        Command::JournalRecover { path } => recover_journal(&path)?,
         Command::Inputs { path } => {
             let stored = load_stored_project(&path)?;
             print_inputs(stored.project());
@@ -2074,6 +2075,30 @@ fn load_stored_project(path: &Path) -> AppResult<StoredProject> {
     Ok(project)
 }
 
+fn recover_journal(path: &Path) -> AppResult<()> {
+    let store = ProjectStore::new(path)?;
+    let scan = store.scan_journal()?;
+    reject_unapplied_journal_batches(scan.batches().len())?;
+    let recovered = store.recover_journal()?;
+    reject_unapplied_journal_batches(recovered.batches().len())?;
+    println!(
+        "journal recovered: checkpoint_sequence={} checkpoint_revision={} unapplied_batches=0",
+        recovered.checkpoint_sequence(),
+        recovered.checkpoint_revision(),
+    );
+    Ok(())
+}
+
+fn reject_unapplied_journal_batches(count: usize) -> AppResult<()> {
+    if count == 0 {
+        return Ok(());
+    }
+    Err(AppFailure(format!(
+        "journal recovery refused: {count} unapplied journal batch(es) remain; no batches were applied"
+    ))
+    .into())
+}
+
 fn render(path: &Path, output: &Path, width: u32, height: u32) -> AppResult<()> {
     let project = load_engine(path)?;
     let engine = &project.engine;
@@ -2408,6 +2433,7 @@ Usage:
   freemix-cli input-duplicate <show.freemix> <source-input-id> <new-nonzero-input-id> <new-name>
   freemix-cli input-replace-simulated <show.freemix> <input-id>
   freemix-cli status <show.freemix>
+  freemix-cli journal-recover <show.freemix>
   freemix-cli inputs <show.freemix>
   freemix-cli audio-strip <show.freemix> <input> <gain-millidb:-96000..=24000> <balance-bp:-10000..=10000> <muted:on|off> <soloed:on|off> <follow-video:on|off> <delay-samples:0..=48000>
   freemix-cli rename <show.freemix> <input> <name> [--key <key>] [--expect <revision>]
