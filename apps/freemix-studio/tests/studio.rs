@@ -212,34 +212,39 @@ fn remaining(deadline: Instant) -> Duration {
     remaining
 }
 
-fn receive_until(runtime: &mut StudioRuntime, deadline: Instant, message: &str) -> SessionEvent {
-    runtime
-        .receive_timeout(remaining(deadline))
-        .unwrap()
-        .unwrap_or_else(|| panic!("timed out waiting for {message}"))
-}
-
 fn assert_web_child_success(mut child: Child, token: &str, deadline: Instant) {
-    let cleanup = loop {
+    let failure = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break false,
+            Ok(Some(_)) => break None,
             Ok(None) if Instant::now() < deadline => {
                 thread::sleep(Duration::from_millis(10));
             }
-            Ok(None) | Err(_) => break true,
+            Ok(None) => break Some("WebSocket test child did not exit before deadline".to_owned()),
+            Err(error) => break Some(format!("cannot wait for WebSocket test child: {error}")),
         }
     };
-    if cleanup {
-        let _ = terminate_child(&mut child);
+    if let Some(failure) = failure {
+        if !terminate_child(&mut child) {
+            panic!("{failure}; cleanup_stopped=false");
+        }
+        let output = child.wait_with_output().unwrap_or_else(|error| {
+            panic!("{failure}; cleanup_stopped=true; cannot collect WebSocket test output: {error}")
+        });
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(token));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(token));
+        panic!(
+            "{failure}; cleanup_stopped=true; stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
     let output = child.wait_with_output().unwrap();
     assert!(!String::from_utf8_lossy(&output.stdout).contains(token));
     assert!(!String::from_utf8_lossy(&output.stderr).contains(token));
     assert!(
-        !cleanup,
-        "WebSocket test child did not exit before deadline"
+        output.status.success(),
+        "WebSocket test child failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    assert!(output.status.success(), "WebSocket test child failed");
 }
 
 fn accept_stream_until(listener: &TcpListener, deadline: Instant) -> TcpStream {
@@ -871,86 +876,106 @@ fn web_open_runtime_uses_websocket_transport() {
         );
     });
 
-    let Command::Open(config) = parse_args(
-        [
-            "--web-connect",
-            &address.to_string(),
-            "--project-id",
-            &PROJECT_VALUE.to_string(),
-        ]
-        .map(str::to_owned),
-    )
-    .unwrap() else {
-        panic!("expected normal Open command")
-    };
-    assert_eq!(config.transport, ControlTransport::WebSocket);
-    let mut runtime = StudioRuntime::new(config).unwrap();
-    assert_eq!(
-        runtime.connect(remaining(deadline)).unwrap(),
-        SessionEvent::Connected {
-            mode: SyncMode::Snapshot
-        }
-    );
-    let command = runtime
-        .queue_command(CommandPayload::Cut, "web-cut", Some(4), None)
-        .unwrap();
-    assert_eq!(runtime.flush().unwrap(), 1);
-    assert!(matches!(
-        receive_until(&mut runtime, deadline, "command result"),
-        SessionEvent::CommandResult {
-            intake: Intake::ResultReconciled,
-            ..
-        }
-    ));
-    assert!(matches!(
-        runtime
-            .session()
-            .client()
-            .command(&command.id)
-            .unwrap()
-            .status,
-        CommandStatus::Completed(CommandResult::Accepted { revision: 5, .. })
-    ));
-    assert!(matches!(
-        receive_until(&mut runtime, deadline, "durable event"),
-        SessionEvent::Event {
-            intake: Intake::EventApplied,
-            ..
-        }
-    ));
-    assert_eq!(
-        runtime
-            .session()
-            .client()
-            .last_applied_cursor()
-            .unwrap()
-            .revision,
-        5
-    );
-    assert_eq!(
-        runtime
-            .session()
-            .client()
-            .model()
-            .state()
-            .unwrap()
-            .switcher()
-            .desired
-            .program,
-        model_input(2)
-    );
-    assert!(matches!(
-        receive_until(&mut runtime, deadline, "runtime event"),
-        SessionEvent::RuntimeEvent {
-            intake: Intake::RuntimeEventObserved,
-            ..
-        }
-    ));
-    assert!(runtime.session().is_connected());
-    server_thread.join().unwrap();
+    let client = (|| -> Result<(), String> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let Command::Open(config) = parse_args(
+                [
+                    "--web-connect",
+                    &address.to_string(),
+                    "--project-id",
+                    &PROJECT_VALUE.to_string(),
+                ]
+                .map(str::to_owned),
+            )
+            .unwrap() else {
+                panic!("expected normal Open command")
+            };
+            assert_eq!(config.transport, ControlTransport::WebSocket);
+            let mut runtime = StudioRuntime::new(config).unwrap();
+            assert_eq!(
+                runtime.connect(remaining(deadline)).unwrap(),
+                SessionEvent::Connected {
+                    mode: SyncMode::Snapshot,
+                }
+            );
+            let command = runtime
+                .queue_command(CommandPayload::Cut, "web-cut", Some(4), None)
+                .unwrap();
+            assert_eq!(runtime.flush().unwrap(), 1);
+            assert!(matches!(
+                runtime
+                    .receive_timeout(remaining(deadline))
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("timed out waiting for command result")),
+                SessionEvent::CommandResult {
+                    intake: Intake::ResultReconciled,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                runtime
+                    .session()
+                    .client()
+                    .command(&command.id)
+                    .unwrap()
+                    .status,
+                CommandStatus::Completed(CommandResult::Accepted { revision: 5, .. })
+            ));
+            assert!(matches!(
+                runtime
+                    .receive_timeout(remaining(deadline))
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("timed out waiting for durable event")),
+                SessionEvent::Event {
+                    intake: Intake::EventApplied,
+                    ..
+                }
+            ));
+            assert_eq!(
+                runtime
+                    .session()
+                    .client()
+                    .last_applied_cursor()
+                    .unwrap()
+                    .revision,
+                5
+            );
+            assert_eq!(
+                runtime
+                    .session()
+                    .client()
+                    .model()
+                    .state()
+                    .unwrap()
+                    .switcher()
+                    .desired
+                    .program,
+                model_input(2)
+            );
+            assert!(matches!(
+                runtime
+                    .receive_timeout(remaining(deadline))
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("timed out waiting for runtime event")),
+                SessionEvent::RuntimeEvent {
+                    intake: Intake::RuntimeEventObserved,
+                    ..
+                }
+            ));
+            assert!(runtime.session().is_connected());
+            assert!(
+                Instant::now() <= deadline,
+                "WebSocket scenario exceeded deadline"
+            );
+        }))
+        .map_err(|_| "WebSocket client failed".to_owned())
+    })();
+    let server = server_thread
+        .join()
+        .map_err(|_| "WebSocket server failed".to_owned());
     assert!(
-        Instant::now() <= deadline,
-        "WebSocket scenario exceeded deadline"
+        client.is_ok() && server.is_ok(),
+        "WebSocket scenario failed: client={client:?}; server={server:?}"
     );
 }
 
