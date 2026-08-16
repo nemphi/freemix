@@ -126,6 +126,9 @@ pub fn run(command: Command) -> AppResult<()> {
         Command::AudioBusAdd { path, bus, name } => {
             add_audio_bus(&path, bus_id(bus)?, name)?;
         }
+        Command::AudioBusRemove { path, bus } => {
+            remove_audio_bus(&path, bus_id(bus)?)?;
+        }
         Command::OutputAdd {
             path,
             output,
@@ -146,6 +149,9 @@ pub fn run(command: Command) -> AppResult<()> {
             bus,
         } => {
             set_output_route(&path, output_id(output)?, scene_id(scene)?, bus_id(bus)?)?;
+        }
+        Command::OutputRemove { path, output } => {
+            remove_output(&path, output_id(output)?)?;
         }
         Command::SceneInputAdd {
             path,
@@ -1841,6 +1847,58 @@ fn remove_input(path: &Path, input: InputId) -> AppResult<()> {
     Ok(())
 }
 
+fn overlay_references_output(overlays: &RuntimeOverlays, output: OutputId) -> bool {
+    overlays
+        .desired
+        .iter()
+        .chain(overlays.realized.iter())
+        .any(|channel| channel.included_outputs.contains(&output))
+}
+
+fn remove_output(path: &Path, output: OutputId) -> AppResult<()> {
+    let stored = load_stored_project(path)?;
+    if overlay_references_output(stored.runtime_overlays(), output) {
+        return Err(AppFailure(format!(
+            "cannot remove output {output}: runtime overlay reference"
+        ))
+        .into());
+    }
+    let store = ProjectStore::new(path)?;
+    let mut project = stored.project().clone();
+    project.remove_output(output)?;
+    let configured = StoredProject::from_project_with_complete_runtime_state(
+        project,
+        stored.runtime_routing(),
+        stored.runtime_manual_transitions(),
+        stored.runtime_fade_to_black(),
+        stored.runtime_overlays().clone(),
+        stored.position(),
+        stored.idempotency_receipts().to_vec(),
+    )?;
+    store.save(&configured)?;
+    print_status(&load_engine(path)?);
+    Ok(())
+}
+
+fn remove_audio_bus(path: &Path, bus: BusId) -> AppResult<()> {
+    let stored = load_stored_project(path)?;
+    let store = ProjectStore::new(path)?;
+    let mut project = stored.project().clone();
+    project.remove_audio_bus(bus)?;
+    let configured = StoredProject::from_project_with_complete_runtime_state(
+        project,
+        stored.runtime_routing(),
+        stored.runtime_manual_transitions(),
+        stored.runtime_fade_to_black(),
+        stored.runtime_overlays().clone(),
+        stored.position(),
+        stored.idempotency_receipts().to_vec(),
+    )?;
+    store.save(&configured)?;
+    print_status(&load_engine(path)?);
+    Ok(())
+}
+
 fn duplicate_input(path: &Path, source: InputId, input: InputId, name: String) -> AppResult<()> {
     let stored = load_stored_project(path)?;
     let source_input = stored
@@ -2685,8 +2743,10 @@ Usage:
   freemix-cli media-input-add <show.freemix> <nonzero-input-id> <name> <asset://key>
   freemix-cli media-input-relink <show.freemix> <existing-media-input-id> <asset://key>
   freemix-cli audio-bus-add <show.freemix> <nonzero-bus-id> <name>
+  freemix-cli audio-bus-remove <show.freemix> <existing-bus-id>
   freemix-cli output-add <show.freemix> <nonzero-output-id> <nonzero-scene-id> <nonzero-bus-id> <name>
   freemix-cli output-route <show.freemix> <existing-output-id> <existing-scene-id> <existing-bus-id>
+  freemix-cli output-remove <show.freemix> <existing-output-id>
   freemix-cli scene-input-add <show.freemix> <nonzero-input-id> <nonzero-scene-id> <name>
   freemix-cli scene-input-audio-source <show.freemix> <scene-input-id> <source-input-id>
   freemix-cli scene-input-audio-source-clear <show.freemix> <scene-input-id>

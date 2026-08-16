@@ -11,8 +11,8 @@ use std::{
 };
 
 use fm_model::{
-    InputKind, LayerGeometry, RectMask, Rgba8, Rotation, SimulatedAudio, SimulatedInput,
-    SimulatedVideo, SolidColor, SourceRef, StartupPolicy,
+    AudioBus, BusSend, InputKind, LayerGeometry, RectMask, Rgba8, Rotation, SimulatedAudio,
+    SimulatedInput, SimulatedVideo, SolidColor, SourceRef, StartupPolicy,
 };
 use fm_persistence::{MutationBatch, ProjectStore, StoredProject};
 use fm_protocol::{
@@ -2428,6 +2428,145 @@ fn local_output_route_persists_existing_route_and_rejects_unknown_reference() {
         unchanged_manifest
     );
     assert_success(&invoke(&["status", context.project_path()]));
+
+    let assert_runtime_preserved = |actual: &StoredProject, expected: &StoredProject| {
+        assert_eq!(actual.runtime_routing(), expected.runtime_routing());
+        assert_eq!(
+            actual.runtime_manual_transitions(),
+            expected.runtime_manual_transitions()
+        );
+        assert_eq!(
+            actual.runtime_fade_to_black(),
+            expected.runtime_fade_to_black()
+        );
+        assert_eq!(actual.runtime_overlays(), expected.runtime_overlays());
+        assert_eq!(actual.position(), expected.position());
+        assert_eq!(
+            actual.idempotency_receipts(),
+            expected.idempotency_receipts()
+        );
+    };
+    let before_remove = store.load().unwrap();
+    assert_success(&invoke(&["output-remove", context.project_path(), "31"]));
+    let after_output_remove = store.load().unwrap();
+    assert_eq!(
+        after_output_remove
+            .project()
+            .outputs()
+            .iter()
+            .map(|output| output.id)
+            .collect::<Vec<_>>(),
+        vec![OutputId::new(NonZeroU128::new(30).unwrap())]
+    );
+    assert_runtime_preserved(&after_output_remove, &before_remove);
+    assert_success(&invoke(&["status", context.project_path()]));
+    assert_success(&invoke(&["output-remove", context.project_path(), "30"]));
+    assert_success(&invoke(&["audio-bus-remove", context.project_path(), "21"]));
+    let after_bus_remove = store.load().unwrap();
+    assert_eq!(after_bus_remove.project().outputs().len(), 0);
+    assert_eq!(
+        after_bus_remove
+            .project()
+            .audio_buses()
+            .iter()
+            .map(|bus| bus.id)
+            .collect::<Vec<_>>(),
+        vec![BusId::new(NonZeroU128::new(20).unwrap())]
+    );
+    assert_runtime_preserved(&after_bus_remove, &after_output_remove);
+    assert_success(&invoke(&["status", context.project_path()]));
+
+    assert_success(&invoke(&[
+        "audio-bus-add",
+        context.project_path(),
+        "30",
+        "Output-bound",
+    ]));
+    assert_success(&invoke(&[
+        "output-add",
+        context.project_path(),
+        "40",
+        "10",
+        "30",
+        "Bound",
+    ]));
+    let manifest_before = fs::read(context.project.join("project.json")).unwrap();
+    let journal_before = journal_bytes(&store);
+    let rejected = invoke(&["audio-bus-remove", context.project_path(), "30"]);
+    assert_failure_contains(&rejected, "used by output 40");
+    assert_eq!(
+        fs::read(context.project.join("project.json")).unwrap(),
+        manifest_before
+    );
+    assert_eq!(journal_bytes(&store), journal_before);
+
+    assert_success(&invoke(&[
+        "overlay-output",
+        context.project_path(),
+        "1",
+        "40",
+        "true",
+    ]));
+    let overlays = store.load().unwrap().runtime_overlays().clone();
+    assert!(overlays.desired.iter().any(|channel| {
+        channel
+            .included_outputs
+            .contains(&OutputId::new(NonZeroU128::new(40).unwrap()))
+    }));
+    assert!(overlays.realized.iter().any(|channel| {
+        channel
+            .included_outputs
+            .contains(&OutputId::new(NonZeroU128::new(40).unwrap()))
+    }));
+    let manifest_before = fs::read(context.project.join("project.json")).unwrap();
+    let journal_before = journal_bytes(&store);
+    let rejected = invoke(&["output-remove", context.project_path(), "40"]);
+    assert_failure_contains(&rejected, "runtime overlay reference");
+    assert_eq!(
+        fs::read(context.project.join("project.json")).unwrap(),
+        manifest_before
+    );
+    assert_eq!(journal_bytes(&store), journal_before);
+
+    let stored = store.load().unwrap();
+    let mut project = stored.project().clone();
+    project.add_audio_bus(AudioBus {
+        id: BusId::new(NonZeroU128::new(50).unwrap()),
+        name: "Send source".into(),
+        sends: vec![BusSend {
+            destination: BusId::new(NonZeroU128::new(51).unwrap()),
+        }],
+    });
+    project.add_audio_bus(AudioBus {
+        id: BusId::new(NonZeroU128::new(51).unwrap()),
+        name: "Send destination".into(),
+        sends: Vec::new(),
+    });
+    let configured = StoredProject::from_project_with_complete_runtime_state(
+        project,
+        stored.runtime_routing(),
+        stored.runtime_manual_transitions(),
+        stored.runtime_fade_to_black(),
+        stored.runtime_overlays().clone(),
+        stored.position(),
+        stored.idempotency_receipts().to_vec(),
+    )
+    .unwrap();
+    store.save(&configured).unwrap();
+    for (bus, expected) in [
+        ("50", "sends to audio bus 51"),
+        ("51", "sends to audio bus 51"),
+    ] {
+        let manifest_before = fs::read(context.project.join("project.json")).unwrap();
+        let journal_before = journal_bytes(&store);
+        let rejected = invoke(&["audio-bus-remove", context.project_path(), bus]);
+        assert_failure_contains(&rejected, expected);
+        assert_eq!(
+            fs::read(context.project.join("project.json")).unwrap(),
+            manifest_before
+        );
+        assert_eq!(journal_bytes(&store), journal_before);
+    }
     fs::remove_dir_all(context.root).unwrap();
 }
 

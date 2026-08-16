@@ -3,10 +3,10 @@ use std::num::NonZeroU128;
 use fm_model::{
     AudioBus, BusSend, CURRENT_SCHEMA_VERSION, CropRect, EntityRef, Input, InputAudioStripState,
     InputBalanceBasisPoints, InputDelaySamples, InputGainMilliDb, InputKind, Layer, LayerGeometry,
-    MainMix, Output, OutputFormat, Project, ProjectSettings, RectMask, RemoveInputError,
-    RestartPolicy, Rgba8, Rotation, Scene, SimulatedAudio, SimulatedInput, SimulatedVideo,
-    SolidColor, SourceRef, StartupPolicy, StingerAudioPolicy, StingerConfig,
-    StingerMissingMediaFallback, StingerSlotNumber, ValidationErrorKind,
+    MainMix, Output, OutputFormat, Project, ProjectSettings, RectMask, RemoveAudioBusError,
+    RemoveInputError, RemoveOutputError, RestartPolicy, Rgba8, Rotation, Scene, SimulatedAudio,
+    SimulatedInput, SimulatedVideo, SolidColor, SourceRef, StartupPolicy, StingerAudioPolicy,
+    StingerConfig, StingerMissingMediaFallback, StingerSlotNumber, ValidationErrorKind,
 };
 use fm_types::{
     AudioFormat, BusId, ChannelLayout, ColorMetadata, FrameRate, InputId, MAX_INPUT_NAME_BYTES,
@@ -225,6 +225,129 @@ fn remove_input_removes_pair_and_rejects_domain_references() {
             Err(RemoveInputError::DomainReference(input_id(3)))
         );
     }
+}
+
+#[test]
+fn remove_outputs_and_audio_buses_preserves_order_and_rejects_references() {
+    let mut base = valid_project();
+    base.add_audio_bus(AudioBus {
+        id: bus_id(2),
+        name: "Aux".into(),
+        sends: Vec::new(),
+    });
+    base.add_output(Output {
+        id: output_id(2),
+        name: "Auxiliary".into(),
+        video_source: scene_id(1),
+        audio_source: bus_id(2),
+        startup: StartupPolicy::Stopped,
+        required_capabilities: Vec::new(),
+    });
+
+    let mut unknown_output = base.clone();
+    let snapshot = unknown_output.clone();
+    assert_eq!(
+        unknown_output.remove_output(output_id(99)),
+        Err(RemoveOutputError::UnknownOutput(output_id(99)))
+    );
+    assert_eq!(unknown_output, snapshot);
+
+    let mut output = base.clone();
+    output.remove_output(output_id(1)).unwrap();
+    assert_eq!(
+        output
+            .outputs()
+            .iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>(),
+        vec![output_id(2)]
+    );
+
+    for (bus, expected) in [
+        (bus_id(99), RemoveAudioBusError::UnknownBus(bus_id(99))),
+        (
+            bus_id(1),
+            RemoveAudioBusError::OutputReference {
+                bus: bus_id(1),
+                output: output_id(1),
+            },
+        ),
+    ] {
+        let mut project = base.clone();
+        let snapshot = project.clone();
+        assert_eq!(project.remove_audio_bus(bus), Err(expected));
+        assert_eq!(project, snapshot);
+    }
+
+    let mut outgoing = valid_project();
+    outgoing.remove_output(output_id(1)).unwrap();
+    outgoing.add_audio_bus(AudioBus {
+        id: bus_id(2),
+        name: "Aux".into(),
+        sends: vec![BusSend {
+            destination: bus_id(3),
+        }],
+    });
+    outgoing.add_audio_bus(AudioBus {
+        id: bus_id(3),
+        name: "Record".into(),
+        sends: Vec::new(),
+    });
+    let snapshot = outgoing.clone();
+    assert_eq!(
+        outgoing.remove_audio_bus(bus_id(2)),
+        Err(RemoveAudioBusError::OutgoingSend {
+            bus: bus_id(2),
+            destination: bus_id(3),
+        })
+    );
+    assert_eq!(outgoing, snapshot);
+
+    let mut incoming = valid_project();
+    incoming.remove_output(output_id(1)).unwrap();
+    incoming.add_audio_bus(AudioBus {
+        id: bus_id(2),
+        name: "Aux".into(),
+        sends: vec![BusSend {
+            destination: bus_id(3),
+        }],
+    });
+    incoming.add_audio_bus(AudioBus {
+        id: bus_id(3),
+        name: "Record".into(),
+        sends: Vec::new(),
+    });
+    let snapshot = incoming.clone();
+    assert_eq!(
+        incoming.remove_audio_bus(bus_id(3)),
+        Err(RemoveAudioBusError::IncomingSend {
+            bus: bus_id(3),
+            source: bus_id(2),
+        })
+    );
+    assert_eq!(incoming, snapshot);
+
+    let mut ordered = valid_project();
+    ordered.remove_output(output_id(1)).unwrap();
+    ordered.add_audio_bus(AudioBus {
+        id: bus_id(2),
+        name: "Aux".into(),
+        sends: Vec::new(),
+    });
+    ordered.add_audio_bus(AudioBus {
+        id: bus_id(3),
+        name: "Record".into(),
+        sends: Vec::new(),
+    });
+    ordered.remove_audio_bus(bus_id(2)).unwrap();
+    assert_eq!(
+        ordered
+            .audio_buses()
+            .iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>(),
+        vec![bus_id(1), bus_id(3)]
+    );
 }
 
 #[test]

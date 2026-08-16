@@ -101,6 +101,10 @@ pub enum Command {
         bus: u128,
         name: String,
     },
+    AudioBusRemove {
+        path: PathBuf,
+        bus: u128,
+    },
     OutputAdd {
         path: PathBuf,
         output: u128,
@@ -113,6 +117,10 @@ pub enum Command {
         output: u128,
         scene: u128,
         bus: u128,
+    },
+    OutputRemove {
+        path: PathBuf,
+        output: u128,
     },
     SceneInputAdd {
         path: PathBuf,
@@ -646,7 +654,9 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
         "media-input-add" => parse_media_input_add(arguments),
         "media-input-relink" => parse_media_input_relink(arguments),
         "audio-bus-add" => parse_audio_bus_add(arguments),
+        "audio-bus-remove" => parse_audio_bus_remove(arguments),
         "output-add" => parse_output_add(arguments),
+        "output-remove" => parse_output_remove(arguments),
         "output-route" => parse_output_route(arguments),
         "scene-input-add" => parse_scene_input_add(arguments),
         "scene-input-audio-source" => parse_scene_input_audio_source(arguments),
@@ -820,6 +830,15 @@ fn parse_audio_bus_add(mut arguments: impl Iterator<Item = String>) -> Result<Co
     Ok(Command::AudioBusAdd { path, bus, name })
 }
 
+fn parse_audio_bus_remove(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Command, ArgsError> {
+    let path = required_path(&mut arguments, "project path")?;
+    let bus = number(&required(&mut arguments, "bus")?, "bus")?;
+    reject_extra(&mut arguments)?;
+    Ok(Command::AudioBusRemove { path, bus })
+}
+
 fn parse_output_add(mut arguments: impl Iterator<Item = String>) -> Result<Command, ArgsError> {
     let path = required_path(&mut arguments, "project path")?;
     let output = number(&required(&mut arguments, "output")?, "output")?;
@@ -834,6 +853,13 @@ fn parse_output_add(mut arguments: impl Iterator<Item = String>) -> Result<Comma
         bus,
         name,
     })
+}
+
+fn parse_output_remove(mut arguments: impl Iterator<Item = String>) -> Result<Command, ArgsError> {
+    let path = required_path(&mut arguments, "project path")?;
+    let output = number(&required(&mut arguments, "output")?, "output")?;
+    reject_extra(&mut arguments)?;
+    Ok(Command::OutputRemove { path, output })
 }
 
 fn parse_audio_strip(mut arguments: impl Iterator<Item = String>) -> Result<Command, ArgsError> {

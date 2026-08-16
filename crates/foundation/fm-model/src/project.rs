@@ -44,6 +44,19 @@ pub enum AddOutputError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemoveOutputError {
+    UnknownOutput(OutputId),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemoveAudioBusError {
+    UnknownBus(BusId),
+    OutputReference { bus: BusId, output: OutputId },
+    OutgoingSend { bus: BusId, destination: BusId },
+    IncomingSend { bus: BusId, source: BusId },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AddSceneLayerError {
     UnknownScene(SceneId),
 }
@@ -190,6 +203,38 @@ impl std::fmt::Display for AddOutputError {
 }
 
 impl std::error::Error for AddOutputError {}
+
+impl std::fmt::Display for RemoveOutputError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownOutput(output) => write!(formatter, "unknown output {output}"),
+        }
+    }
+}
+
+impl std::error::Error for RemoveOutputError {}
+
+impl std::fmt::Display for RemoveAudioBusError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownBus(bus) => write!(formatter, "unknown audio bus {bus}"),
+            Self::OutputReference { bus, output } => {
+                write!(formatter, "audio bus {bus} is used by output {output}")
+            }
+            Self::OutgoingSend { bus, destination } => {
+                write!(
+                    formatter,
+                    "audio bus {bus} sends to audio bus {destination}"
+                )
+            }
+            Self::IncomingSend { bus, source } => {
+                write!(formatter, "audio bus {source} sends to audio bus {bus}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RemoveAudioBusError {}
 
 impl std::fmt::Display for RemoveInputError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -753,6 +798,51 @@ impl Project {
         }
         self.outputs[output_index].video_source = scene;
         self.outputs[output_index].audio_source = bus;
+        Ok(())
+    }
+
+    pub fn remove_output(&mut self, output: OutputId) -> Result<(), RemoveOutputError> {
+        if !self.outputs.iter().any(|candidate| candidate.id == output) {
+            return Err(RemoveOutputError::UnknownOutput(output));
+        }
+        self.outputs.retain(|candidate| candidate.id != output);
+        Ok(())
+    }
+
+    pub fn remove_audio_bus(&mut self, bus: BusId) -> Result<(), RemoveAudioBusError> {
+        if !self.audio_buses.iter().any(|candidate| candidate.id == bus) {
+            return Err(RemoveAudioBusError::UnknownBus(bus));
+        }
+        if let Some(output) = self
+            .outputs
+            .iter()
+            .find(|output| output.audio_source == bus)
+        {
+            return Err(RemoveAudioBusError::OutputReference {
+                bus,
+                output: output.id,
+            });
+        }
+        if let Some(send) = self
+            .audio_buses
+            .iter()
+            .find(|candidate| candidate.id == bus)
+            .and_then(|candidate| candidate.sends.first())
+        {
+            return Err(RemoveAudioBusError::OutgoingSend {
+                bus,
+                destination: send.destination,
+            });
+        }
+        if let Some(source) = self.audio_buses.iter().find(|candidate| {
+            candidate.id != bus && candidate.sends.iter().any(|send| send.destination == bus)
+        }) {
+            return Err(RemoveAudioBusError::IncomingSend {
+                bus,
+                source: source.id,
+            });
+        }
+        self.audio_buses.retain(|candidate| candidate.id != bus);
         Ok(())
     }
 
