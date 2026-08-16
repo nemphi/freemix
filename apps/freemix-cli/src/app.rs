@@ -2727,12 +2727,55 @@ fn render(path: &Path, output: &Path, width: u32, height: u32) -> AppResult<()> 
     let engine = &project.engine;
     let mut pipeline = SimulatedPipeline::new(width, height)?;
     for input in project.project.inputs() {
-        pipeline.register(SimulatedSource::new(input.id, source_pattern(input)?))?;
+        if matches!(input.kind, InputKind::Simulated(_)) {
+            pipeline.register(SimulatedSource::new(input.id, source_pattern(input)?))?;
+        }
     }
-    let frame = pipeline.render(
-        engine.frame_cursor().get(),
-        engine.realized_switcher().program_frame(),
-    )?;
+    let program = engine.realized_switcher().program_frame();
+    if program.secondary.is_some()
+        && [Some(program.primary), program.secondary]
+            .into_iter()
+            .flatten()
+            .any(|input| is_scene_input(&project.project, input))
+    {
+        return Err(AppFailure(
+            "render does not support transitions with Scene input endpoints".into(),
+        )
+        .into());
+    }
+    let scene = project
+        .project
+        .inputs()
+        .iter()
+        .find(|input| input.id == program.primary)
+        .map(|input| &input.kind)
+        .and_then(|kind| match kind {
+            InputKind::Scene { scene_id, .. } => Some(*scene_id),
+            _ => None,
+        });
+    let frame = if let Some(scene) = scene {
+        crate::scene_render::render_scene(
+            &project.project,
+            scene,
+            &pipeline,
+            engine.frame_cursor().get(),
+        )?
+    } else {
+        for input in [Some(program.primary), program.secondary]
+            .into_iter()
+            .flatten()
+        {
+            if let Some(input) = project
+                .project
+                .inputs()
+                .iter()
+                .find(|candidate| candidate.id == input)
+            {
+                source_pattern(input)?;
+            }
+        }
+        pipeline.render(engine.frame_cursor().get(), program)?
+    };
     write_ppm_atomic(output, |file| write_ppm(&frame, file))?;
     println!(
         "rendered {}x{} Program input {} to {}",
@@ -2742,6 +2785,13 @@ fn render(path: &Path, output: &Path, width: u32, height: u32) -> AppResult<()> 
         output.display()
     );
     Ok(())
+}
+
+fn is_scene_input(project: &Project, input: InputId) -> bool {
+    project
+        .inputs()
+        .iter()
+        .any(|candidate| candidate.id == input && matches!(candidate.kind, InputKind::Scene { .. }))
 }
 
 fn write_ppm_atomic(

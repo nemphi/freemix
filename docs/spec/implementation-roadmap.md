@@ -306,7 +306,16 @@ persist the scene input audio route. `inputs` reports each Scene input's exact `
 `scene-layer-mask`, `scene-layer-mask-clear`, `scene-layer-z-order`, and
 `scene-background` (premultiplied RGBA), `scene-layer-source-input`,
 `scene-layer-source-scene`, and `scene-layer-add-scene` are next-open local
-metadata/composition authoring only. `scene-layer-copy` is next-open local cross-scene authoring only and rejects cycles; it adds no render or live acceptance, and `IN-020`/`SW-006` remain planned. `scene-layer-move` changes next-open layer vector tie-order only; `SW-004` remains planned.
+authoring commands. The offline CPU/PPM path renders a settled Scene Program
+from direct simulated layers only. It maps background, enabled layers,
+translation, scale, quarter rotation, crop, hard rectangular mask and invert,
+opacity, z-order, and layer vector tie-order. It rejects nested scenes,
+enabled non-simulated layers, and any transition with a Scene endpoint before
+PPM publication. It does not provide keys, effects, audio, output, live,
+native, or cross-platform certification. `scene-layer-copy` is next-open local
+cross-scene authoring only and rejects cycles; `IN-020` and `SW-006` remain
+planned. `scene-layer-move` changes next-open layer vector tie-order only;
+`SW-004` remains planned.
 `scene-remove` is local next-open scene removal only; it does not add cascade
 behavior, rendering, live editing, daemon/Studio/protocol mutation, output
 realization, or acceptance.

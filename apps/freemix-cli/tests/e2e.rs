@@ -6332,6 +6332,111 @@ fn render_rejects_non_simulated_inputs_clearly() {
 }
 
 #[test]
+fn local_scene_program_render_composes_supported_layers_and_rejects_unsupported_states() {
+    let root = unique_test_root();
+    let project = root.join("scene.freemix");
+    let image = root.join("scene.ppm");
+    let nested_image = root.join("nested.ppm");
+    let transition_image = root.join("transition.ppm");
+    fs::create_dir_all(&root).unwrap();
+    let path = project.to_str().unwrap();
+    macro_rules! apply {
+        ($arguments:expr) => {
+            assert_success(&invoke_bounded($arguments));
+        };
+    }
+
+    apply!(&["new", path]);
+    apply!(&["input-replace-simulated", path, "2"]);
+    apply!(&["scene-input-add", path, "3", "11", "Program Scene"]);
+    apply!(&["scene-background", path, "11", "10", "20", "30", "255"]);
+    apply!(&["scene-layer-add", path, "11", "1", "5", "Solid"]);
+    apply!(&[
+        "scene-layer-geometry",
+        path,
+        "11",
+        "0",
+        "1",
+        "1",
+        "2",
+        "2",
+        "0",
+    ]);
+    apply!(&["scene-layer-add", path, "11", "2", "5", "Bars"]);
+    apply!(&["scene-layer-appearance", path, "11", "1", "on", "128"]);
+    apply!(&[
+        "scene-layer-geometry",
+        path,
+        "11",
+        "1",
+        "1",
+        "1",
+        "2",
+        "2",
+        "90",
+    ]);
+    apply!(&["scene-layer-crop", path, "11", "1", "0", "0", "2", "2"]);
+    apply!(&[
+        "scene-layer-mask",
+        path,
+        "11",
+        "1",
+        "0",
+        "0",
+        "1",
+        "1",
+        "inverted",
+    ]);
+    apply!(&["preview", path, "3"]);
+    apply!(&["cut", path]);
+    apply!(&[
+        "render",
+        path,
+        image.to_str().unwrap(),
+        "--width",
+        "4",
+        "--height",
+        "4",
+    ]);
+
+    let bytes = fs::read(&image).unwrap();
+    let header = b"P6\n4 4\n255\n";
+    assert!(bytes.starts_with(header));
+    assert_eq!(
+        &bytes[header.len()..],
+        &[
+            10, 20, 30, 10, 20, 30, 10, 20, 30, 10, 20, 30, 10, 20, 30, 132, 171, 195, 73, 151,
+            199, 10, 20, 30, 10, 20, 30, 132, 171, 99, 132, 171, 99, 10, 20, 30, 10, 20, 30, 10,
+            20, 30, 10, 20, 30, 10, 20, 30,
+        ]
+    );
+
+    apply!(&["scene-input-add", path, "4", "12", "Nested"]);
+    apply!(&[
+        "scene-layer-add-scene",
+        path,
+        "11",
+        "12",
+        "6",
+        "Nested layer",
+    ]);
+    let nested = invoke_bounded(&["render", path, nested_image.to_str().unwrap()]);
+    assert_failure_contains(&nested, "scene source 12 is unsupported");
+    assert!(!nested_image.exists());
+
+    apply!(&["preview", path, "1"]);
+    apply!(&["tbar-start", path, "fade"]);
+    let transition = invoke_bounded(&["render", path, transition_image.to_str().unwrap()]);
+    assert_failure_contains(
+        &transition,
+        "render does not support transitions with Scene input endpoints",
+    );
+    assert!(!transition_image.exists());
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn journal_recover_removes_only_torn_final_record_and_refuses_valid_batch() {
     let root = unique_test_root();
     let torn_project = root.join("torn.freemix");
