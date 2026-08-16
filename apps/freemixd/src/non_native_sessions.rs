@@ -55,6 +55,7 @@ struct Outbound {
     write: OutboundWrite,
     accounting: Accounting,
     handshake_response: bool,
+    command_result: bool,
     accounted: bool,
     channel_sent: bool,
 }
@@ -154,6 +155,7 @@ impl Peer {
             write,
             accounting,
             handshake_response: matches!(message, WireMessage::HandshakeResponse(_)),
+            command_result: matches!(message, WireMessage::CommandResult(_)),
             accounted,
             channel_sent: false,
         });
@@ -192,6 +194,30 @@ impl Peer {
         while self.outbound.len() > retained {
             self.discard_outbound(self.outbound.len() - 1);
         }
+    }
+
+    fn preserve_outbound_for_shutdown(&mut self) {
+        if self.outbound.len() < OUTBOUND_CAPACITY {
+            return;
+        }
+        let Some(index) = self
+            .outbound
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, record)| {
+                (!record.command_result
+                    && !record.channel_sent
+                    && !matches!(
+                        &record.write,
+                        OutboundWrite::Raw(write) if write.started()
+                    ))
+                .then_some(index)
+            })
+        else {
+            return;
+        };
+        self.discard_outbound(index);
     }
 
     fn discard_outbound(&mut self, index: usize) {
@@ -334,7 +360,6 @@ pub(super) fn run(
         }
 
         let mut live_budget = vec![LIVE_EVENTS_PER_PASS; peers.len()];
-        let mut command_dispatched = false;
         for index in 0..peers.len() {
             if close[index] {
                 continue;
@@ -346,9 +371,8 @@ pub(super) fn run(
             let Some(message) = message else {
                 continue;
             };
-            let is_command = matches!(message, WireMessage::Command(_));
             match runtime.dispatch(&mut peers[index], message, durable, native.as_deref_mut()) {
-                Ok(()) => command_dispatched |= is_command,
+                Ok(()) => {}
                 Err(DispatchError::Peer) => close[index] = true,
                 Err(DispatchError::Daemon(error)) => {
                     shutdown_peers(&mut peers, control, ShutdownQueue::Replace);
@@ -357,10 +381,6 @@ pub(super) fn run(
             }
         }
         if let Some(reason) = requested_daemon_shutdown(native.as_deref(), Some(process_shutdown)) {
-            if command_dispatched && reason == DaemonShutdownReason::ProcessSignal {
-                shutdown_peers(&mut peers, control, ShutdownQueue::PreserveCommandResult);
-                return Ok(reason);
-            }
             return Ok(shutdown_for_reason(reason, &mut peers, control));
         }
         if let Some(native) = native.as_deref_mut() {
@@ -873,9 +893,8 @@ fn shutdown_peers(peers: &mut Vec<Peer>, control: &SharedControl, queue: Shutdow
         peer.latest_meter.discard_unstarted();
         if matches!(queue, ShutdownQueue::Replace) {
             peer.replace_outbound_for_shutdown();
-        } else if peer.outbound.len() == OUTBOUND_CAPACITY {
-            // The front can be partially written, and the back is the command result.
-            peer.discard_outbound(peer.outbound.len() - 2);
+        } else {
+            peer.preserve_outbound_for_shutdown();
         }
         peer.initial_sync.clear();
         peer.inbound.clear();
@@ -919,7 +938,15 @@ fn shutdown_for_reason(
 ) -> DaemonShutdownReason {
     match reason {
         DaemonShutdownReason::ProcessSignal => {
-            shutdown_peers(peers, control, ShutdownQueue::Replace)
+            let queue = if peers
+                .iter()
+                .any(|peer| peer.outbound.iter().any(|record| record.command_result))
+            {
+                ShutdownQueue::PreserveCommandResult
+            } else {
+                ShutdownQueue::Replace
+            };
+            shutdown_peers(peers, control, queue)
         }
         DaemonShutdownReason::ProgramSurface => close_all(peers, control),
         DaemonShutdownReason::Once => unreachable!("once is handled below"),
