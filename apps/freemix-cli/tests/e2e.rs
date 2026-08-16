@@ -2292,22 +2292,22 @@ fn journal_bytes(store: &ProjectStore) -> Vec<(PathBuf, Vec<u8>)> {
 #[test]
 fn local_output_startup_persists_selected_policy_and_rejects_unknown_output() {
     let context = ContractContext::new();
-    assert_success(&invoke(&["new", context.project_path()]));
-    assert_success(&invoke(&[
+    assert_success(&invoke_bounded(&["new", context.project_path()]));
+    assert_success(&invoke_bounded(&[
         "scene-input-add",
         context.project_path(),
         "10",
         "10",
         "Program",
     ]));
-    assert_success(&invoke(&[
+    assert_success(&invoke_bounded(&[
         "audio-bus-add",
         context.project_path(),
         "20",
         "Master",
     ]));
     for (output, name) in [("30", "Primary"), ("31", "Auxiliary")] {
-        assert_success(&invoke(&[
+        assert_success(&invoke_bounded(&[
             "output-add",
             context.project_path(),
             output,
@@ -2319,7 +2319,7 @@ fn local_output_startup_persists_selected_policy_and_rejects_unknown_output() {
 
     let store = ProjectStore::new(&context.project).unwrap();
     let before = store.load().unwrap();
-    assert_success(&invoke(&[
+    assert_success(&invoke_bounded(&[
         "output-startup",
         context.project_path(),
         "30",
@@ -2343,12 +2343,12 @@ fn local_output_startup_persists_selected_policy_and_rejects_unknown_output() {
     assert_eq!(after.runtime_overlays(), before.runtime_overlays());
     assert_eq!(after.position(), before.position());
     assert_eq!(after.idempotency_receipts(), before.idempotency_receipts());
-    let outputs = invoke(&["outputs", context.project_path()]);
+    let outputs = invoke_bounded(&["outputs", context.project_path()]);
     assert_success(&outputs);
     assert!(stdout(&outputs).contains("output id=30 name=\"Primary\" video_scene=10 video_scene_name=\"Program\" audio_bus=20 audio_bus_name=\"Master\" startup=reconcile-desired-state capabilities=[]"));
 
     let manifest_before = fs::read(context.project.join("project.json")).unwrap();
-    let unknown = invoke(&["output-startup", context.project_path(), "999", "stopped"]);
+    let unknown = invoke_bounded(&["output-startup", context.project_path(), "999", "stopped"]);
     assert_failure_contains(&unknown, "unknown output 999");
     assert_eq!(
         fs::read(context.project.join("project.json")).unwrap(),
