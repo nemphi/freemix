@@ -2309,13 +2309,8 @@ fn local_scene_layer_z_order_preserves_vector_and_runtime() {
         before_runtime
     );
     let repeated_scene = repeated.project().scenes().last().unwrap();
-    assert_eq!(repeated_scene.layers[0], before_scene.layers[0]);
-    assert_eq!(repeated_scene.layers[1].name, before_scene.layers[1].name);
-    assert_eq!(
-        repeated_scene.layers[1].source,
-        before_scene.layers[1].source
-    );
-    assert_eq!(repeated_scene.layers[1].z_order, 4);
+    expected_layers[1].z_order = 4;
+    assert_eq!(repeated_scene.layers, expected_layers);
     fs::remove_dir_all(context.root).unwrap();
 }
 
