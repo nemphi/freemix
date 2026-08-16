@@ -263,6 +263,13 @@ fn coherent_project_is_valid() {
 #[test]
 fn add_scene_layer_rejects_missing_sources_and_cycles_without_mutation() {
     let mut project = valid_project();
+    let before = project.clone();
+    assert_eq!(
+        project.add_layer_to_scene(scene_id(1), layer(" \t", SourceRef::Input(input_id(99)))),
+        Err(AddSceneLayerError::EmptyName)
+    );
+    assert_eq!(project, before);
+
     for (source, error) in [
         (
             SourceRef::Input(input_id(99)),

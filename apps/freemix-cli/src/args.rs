@@ -1350,7 +1350,7 @@ fn parse_scene_layer_add(
     let scene = number(&required(&mut arguments, "scene")?, "scene")?;
     let source = number(&required(&mut arguments, "source input")?, "source input")?;
     let z_order = number(&required(&mut arguments, "z-order")?, "z-order")?;
-    let name = required(&mut arguments, "layer name")?;
+    let name = nonblank(&mut arguments, "layer name")?;
     reject_extra(&mut arguments)?;
     Ok(Command::SceneLayerAdd {
         path,

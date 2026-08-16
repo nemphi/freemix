@@ -3464,6 +3464,14 @@ fn local_scene_layer_add_rejects_missing_input_without_manifest_or_journal_chang
         manifest_before
     );
     assert_eq!(journal_bytes(&store), journal_before);
+
+    let blank_name = invoke(&["scene-layer-add", path, "7", "7", "0", " \t"]);
+    assert_failure_contains(&blank_name, "error: layer name must not be blank");
+    assert_eq!(
+        fs::read(context.project.join("project.json")).unwrap(),
+        manifest_before
+    );
+    assert_eq!(journal_bytes(&store), journal_before);
     fs::remove_dir_all(context.root).unwrap();
 }
 

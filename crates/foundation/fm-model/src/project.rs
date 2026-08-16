@@ -240,6 +240,7 @@ pub enum RemoveAudioBusError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AddSceneLayerError {
     UnknownScene(SceneId),
+    EmptyName,
     MissingInput(InputId),
     MissingScene(SceneId),
     SourceCycle,
@@ -346,6 +347,7 @@ impl std::fmt::Display for AddSceneLayerError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnknownScene(scene) => write!(formatter, "unknown scene {scene}"),
+            Self::EmptyName => formatter.write_str("scene layer name must not be empty"),
             Self::MissingInput(input) => write!(formatter, "missing source input {input}"),
             Self::MissingScene(scene) => write!(formatter, "missing source scene {scene}"),
             Self::SourceCycle => formatter.write_str("scene layer source would create a cycle"),
@@ -915,6 +917,9 @@ impl Project {
             .iter()
             .position(|candidate| candidate.id == scene)
             .ok_or(AddSceneLayerError::UnknownScene(scene))?;
+        if layer.name.trim().is_empty() {
+            return Err(AddSceneLayerError::EmptyName);
+        }
         match layer.source {
             SourceRef::Input(input)
                 if !self.inputs.iter().any(|candidate| candidate.id == input) =>
