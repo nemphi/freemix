@@ -26,6 +26,41 @@ pub enum RenameSceneError {
     DuplicateName,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DuplicateSceneInputError {
+    UnknownSourceScene(SceneId),
+    DuplicateSceneId(SceneId),
+    DuplicateInputId(InputId),
+    EmptySceneName,
+    DuplicateSceneName,
+    EmptyInputName,
+    InputNameTooLong,
+    DuplicateInputName,
+    InvalidProject(Vec<ValidationError>),
+}
+
+impl std::fmt::Display for DuplicateSceneInputError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownSourceScene(scene) => write!(formatter, "unknown source scene {scene}"),
+            Self::DuplicateSceneId(scene) => write!(formatter, "scene {scene} already exists"),
+            Self::DuplicateInputId(input) => write!(formatter, "input {input} already exists"),
+            Self::EmptySceneName => formatter.write_str("scene name must not be empty"),
+            Self::DuplicateSceneName => formatter.write_str("scene name is already in use"),
+            Self::EmptyInputName => formatter.write_str("input name must not be empty"),
+            Self::InputNameTooLong => write!(
+                formatter,
+                "input name must not exceed {} bytes",
+                fm_types::MAX_INPUT_NAME_BYTES
+            ),
+            Self::DuplicateInputName => formatter.write_str("input name is already in use"),
+            Self::InvalidProject(errors) => write!(formatter, "invalid project ({})", errors.len()),
+        }
+    }
+}
+
+impl std::error::Error for DuplicateSceneInputError {}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplaceInputError {
     UnknownInput(InputId),
@@ -539,6 +574,65 @@ impl Project {
 
     pub fn add_scene(&mut self, scene: Scene) {
         self.scenes.push(scene);
+    }
+
+    pub fn duplicate_scene_input_checked(
+        &mut self,
+        source_scene: SceneId,
+        new_scene: SceneId,
+        scene_name: String,
+        new_input: InputId,
+        input_name: String,
+    ) -> Result<(), DuplicateSceneInputError> {
+        let source = self
+            .scenes
+            .iter()
+            .find(|scene| scene.id == source_scene)
+            .ok_or(DuplicateSceneInputError::UnknownSourceScene(source_scene))?;
+        if self.scenes.iter().any(|scene| scene.id == new_scene) {
+            return Err(DuplicateSceneInputError::DuplicateSceneId(new_scene));
+        }
+        if self.inputs.iter().any(|input| input.id == new_input) {
+            return Err(DuplicateSceneInputError::DuplicateInputId(new_input));
+        }
+        if scene_name.trim().is_empty() {
+            return Err(DuplicateSceneInputError::EmptySceneName);
+        }
+        if self
+            .scenes
+            .iter()
+            .any(|scene| scene.name.eq_ignore_ascii_case(&scene_name))
+        {
+            return Err(DuplicateSceneInputError::DuplicateSceneName);
+        }
+        if input_name.trim().is_empty() {
+            return Err(DuplicateSceneInputError::EmptyInputName);
+        }
+        if input_name.len() > fm_types::MAX_INPUT_NAME_BYTES {
+            return Err(DuplicateSceneInputError::InputNameTooLong);
+        }
+        if self.inputs.iter().any(|input| input.name == input_name) {
+            return Err(DuplicateSceneInputError::DuplicateInputName);
+        }
+        let mut candidate = self.clone();
+        let mut scene = source.clone();
+        scene.id = new_scene;
+        scene.name = scene_name;
+        candidate.scenes.push(scene);
+        candidate.add_input(Input {
+            id: new_input,
+            name: input_name,
+            kind: InputKind::Scene {
+                scene_id: new_scene,
+                audio_source: None,
+            },
+            required_capabilities: Vec::new(),
+        });
+        candidate
+            .validate()
+            .map_err(DuplicateSceneInputError::InvalidProject)?;
+        *self = candidate;
+        Ok(())
     }
 
     pub fn rename_scene(&mut self, scene: SceneId, name: String) -> Result<(), RenameSceneError> {

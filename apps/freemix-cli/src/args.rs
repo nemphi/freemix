@@ -128,6 +128,14 @@ pub enum Command {
         scene: u128,
         name: String,
     },
+    SceneInputDuplicate {
+        path: PathBuf,
+        source_scene: u128,
+        new_scene: u128,
+        new_input: u128,
+        scene_name: String,
+        input_name: String,
+    },
     SceneInputAudioSource {
         path: PathBuf,
         scene_input: u128,
@@ -668,6 +676,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
         "output-remove" => parse_output_remove(arguments),
         "output-route" => parse_output_route(arguments),
         "scene-input-add" => parse_scene_input_add(arguments),
+        "scene-input-duplicate" => parse_scene_input_duplicate(arguments),
         "scene-input-audio-source" => parse_scene_input_audio_source(arguments),
         "scene-input-audio-source-clear" => parse_scene_input_audio_source_clear(arguments),
         "scene-background" => parse_scene_background(arguments),
@@ -1241,6 +1250,26 @@ fn parse_scene_input_add(
         input,
         scene,
         name,
+    })
+}
+
+fn parse_scene_input_duplicate(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Command, ArgsError> {
+    let path = required_path(&mut arguments, "project path")?;
+    let source_scene = number(&required(&mut arguments, "source scene")?, "source scene")?;
+    let new_scene = number(&required(&mut arguments, "new scene")?, "new scene")?;
+    let new_input = number(&required(&mut arguments, "new input")?, "new input")?;
+    let scene_name = nonblank(&mut arguments, "scene name")?;
+    let input_name = nonblank(&mut arguments, "input name")?;
+    reject_extra(&mut arguments)?;
+    Ok(Command::SceneInputDuplicate {
+        path,
+        source_scene,
+        new_scene,
+        new_input,
+        scene_name,
+        input_name,
     })
 }
 

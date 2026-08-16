@@ -161,6 +161,21 @@ pub fn run(command: Command) -> AppResult<()> {
         } => {
             add_scene_input(&path, input_id(input)?, scene_id(scene)?, name)?;
         }
+        Command::SceneInputDuplicate {
+            path,
+            source_scene,
+            new_scene,
+            new_input,
+            scene_name,
+            input_name,
+        } => duplicate_scene_input(
+            &path,
+            scene_id(source_scene)?,
+            scene_id(new_scene)?,
+            input_id(new_input)?,
+            scene_name,
+            input_name,
+        )?,
         Command::SceneInputAudioSource {
             path,
             scene_input,
@@ -1480,6 +1495,37 @@ fn add_scene_input(path: &Path, input: InputId, scene: SceneId, name: String) ->
     Ok(())
 }
 
+fn duplicate_scene_input(
+    path: &Path,
+    source_scene: SceneId,
+    new_scene: SceneId,
+    new_input: InputId,
+    scene_name: String,
+    input_name: String,
+) -> AppResult<()> {
+    let stored = load_stored_project(path)?;
+    let mut project = stored.project().clone();
+    project.duplicate_scene_input_checked(
+        source_scene,
+        new_scene,
+        scene_name,
+        new_input,
+        input_name,
+    )?;
+    let configured = StoredProject::from_project_with_complete_runtime_state(
+        project,
+        stored.runtime_routing(),
+        stored.runtime_manual_transitions(),
+        stored.runtime_fade_to_black(),
+        stored.runtime_overlays().clone(),
+        stored.position(),
+        stored.idempotency_receipts().to_vec(),
+    )?;
+    ProjectStore::new(path)?.save(&configured)?;
+    print_status(&load_engine(path)?);
+    Ok(())
+}
+
 fn add_audio_bus(path: &Path, bus: BusId, name: String) -> AppResult<()> {
     let store = ProjectStore::new(path)?;
     let stored = load_stored_project(path)?;
@@ -2787,6 +2833,7 @@ Usage:
   freemix-cli output-route <show.freemix> <existing-output-id> <existing-scene-id> <existing-bus-id>
   freemix-cli output-remove <show.freemix> <existing-output-id>
   freemix-cli scene-input-add <show.freemix> <nonzero-input-id> <nonzero-scene-id> <name>
+  freemix-cli scene-input-duplicate <show.freemix> <source-scene-id> <new-scene-id> <new-input-id> <scene-name> <input-name>
   freemix-cli scene-input-audio-source <show.freemix> <scene-input-id> <source-input-id>
   freemix-cli scene-input-audio-source-clear <show.freemix> <scene-input-id>
   freemix-cli scene-background <show.freemix> <scene-id> <premultiplied-red:0..=255> <premultiplied-green:0..=255> <premultiplied-blue:0..=255> <alpha:0..=255>
