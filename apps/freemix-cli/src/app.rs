@@ -254,6 +254,10 @@ pub fn run(command: Command) -> AppResult<()> {
             let stored = load_stored_project(&path)?;
             print_inputs(stored.project());
         }
+        Command::Outputs { path } => {
+            let stored = load_stored_project(&path)?;
+            print_outputs(stored.project());
+        }
         Command::AssetAudit { path } => audit_assets(&path)?,
         Command::AudioStrip {
             path,
@@ -2385,6 +2389,35 @@ fn print_inputs(project: &Project) {
     }
 }
 
+fn print_outputs(project: &Project) {
+    for output in project.outputs() {
+        let scene = project
+            .scenes()
+            .iter()
+            .find(|scene| scene.id == output.video_source)
+            .expect("validated output scene reference");
+        let bus = project
+            .audio_buses()
+            .iter()
+            .find(|bus| bus.id == output.audio_source)
+            .expect("validated output audio bus reference");
+        let startup = match output.startup {
+            StartupPolicy::Stopped => "stopped",
+            StartupPolicy::ReconcileDesiredState => "reconcile-desired-state",
+        };
+        let capabilities = output
+            .required_capabilities
+            .iter()
+            .map(|capability| format!("{capability:?}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        println!(
+            "output id={} name={:?} video_scene={} video_scene_name={:?} audio_bus={} audio_bus_name={:?} startup={startup} capabilities=[{capabilities}]",
+            output.id, output.name, output.video_source, scene.name, output.audio_source, bus.name,
+        );
+    }
+}
+
 const fn input_kind_name(kind: &InputKind) -> &'static str {
     match kind {
         InputKind::Color => "color",
@@ -2561,6 +2594,7 @@ Usage:
   freemix-cli status <show.freemix>
   freemix-cli journal-recover <show.freemix>
   freemix-cli inputs <show.freemix>
+  freemix-cli outputs <show.freemix>
   freemix-cli asset-audit <show.freemix>
   freemix-cli audio-strip <show.freemix> <input> <gain-millidb:-96000..=24000> <balance-bp:-10000..=10000> <muted:on|off> <soloed:on|off> <follow-video:on|off> <delay-samples:0..=48000>
   freemix-cli rename <show.freemix> <input> <name> [--key <key>] [--expect <revision>]

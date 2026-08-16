@@ -1980,7 +1980,7 @@ fn local_output_route_persists_existing_route_and_rejects_unknown_reference() {
         "30",
         "10",
         "20",
-        "Program",
+        "Program \"Main\"",
     ]));
     assert_success(&invoke(&[
         "output-add",
@@ -2057,6 +2057,15 @@ fn local_output_route_persists_existing_route_and_rejects_unknown_reference() {
     assert_eq!(after.position(), before.position());
     assert_eq!(after.idempotency_receipts(), before.idempotency_receipts());
     assert_success(&invoke(&["status", context.project_path()]));
+    let outputs = invoke(&["outputs", context.project_path()]);
+    assert_success(&outputs);
+    assert_eq!(
+        stdout(&outputs),
+        concat!(
+            "output id=30 name=\"Program \\\"Main\\\"\" video_scene=11 video_scene_name=\"Close\" audio_bus=21 audio_bus_name=\"Aux\" startup=stopped capabilities=[]\n",
+            "output id=31 name=\"Auxiliary\" video_scene=11 video_scene_name=\"Close\" audio_bus=21 audio_bus_name=\"Aux\" startup=stopped capabilities=[]"
+        )
+    );
 
     let unchanged_manifest = fs::read(context.project.join("project.json")).unwrap();
     let rejected = invoke(&["audio-bus-add", context.project_path(), "22", "mAsTeR"]);
@@ -2071,7 +2080,7 @@ fn local_output_route_persists_existing_route_and_rejects_unknown_reference() {
         "32",
         "10",
         "20",
-        "pRoGrAm",
+        "pRoGrAm \"Main\"",
     ]);
     assert_failure_contains(&rejected, "duplicate output name");
     assert_eq!(
