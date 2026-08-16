@@ -230,6 +230,22 @@ pub enum SceneInputAudioSourceError {
     SourceCycle,
 }
 
+fn has_scene_layer_source_cycle(
+    validation: Result<(), Vec<ValidationError>>,
+    scene: SceneId,
+) -> bool {
+    validation.is_err_and(|errors| {
+        errors.iter().any(|error| {
+            error.entity == Some(EntityRef::Scene(scene))
+                && error.field == "layers.source"
+                && matches!(
+                    error.kind,
+                    ValidationErrorKind::SelfReference | ValidationErrorKind::Cycle
+                )
+        })
+    })
+}
+
 impl std::fmt::Display for SceneInputAudioSourceError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -836,16 +852,7 @@ impl Project {
         }
         let mut candidate = self.clone();
         candidate.scenes[scene_index].layers.push(layer);
-        if candidate.validate().is_err_and(|errors| {
-            errors.iter().any(|error| {
-                error.entity == Some(EntityRef::Scene(scene))
-                    && error.field == "layers.source"
-                    && matches!(
-                        error.kind,
-                        ValidationErrorKind::SelfReference | ValidationErrorKind::Cycle
-                    )
-            })
-        }) {
+        if has_scene_layer_source_cycle(candidate.validate(), scene) {
             return Err(AddSceneLayerError::SourceCycle);
         }
         *self = candidate;
@@ -931,20 +938,12 @@ impl Project {
             }
             SourceRef::Input(_) | SourceRef::Scene(_) => {}
         }
-        let mut cycle_probe = self.clone();
-        cycle_probe.scenes[scene_index].layers[index].source = source;
-        cycle_probe.scenes[scene_index].layers =
-            vec![cycle_probe.scenes[scene_index].layers[index].clone()];
-        if cycle_probe.validate().err().is_some_and(|errors| {
-            errors.iter().any(|error| {
-                error.kind == ValidationErrorKind::Cycle
-                    && error.entity == Some(EntityRef::Scene(scene))
-                    && error.field == "layers.source"
-            })
-        }) {
+        let mut candidate = self.clone();
+        candidate.scenes[scene_index].layers[index].source = source;
+        if has_scene_layer_source_cycle(candidate.validate(), scene) {
             return Err(SceneLayerError::SourceCycle);
         }
-        self.scenes[scene_index].layers[index].source = source;
+        *self = candidate;
         Ok(())
     }
 
