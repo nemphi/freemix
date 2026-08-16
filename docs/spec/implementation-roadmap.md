@@ -112,7 +112,10 @@ gated by `FREEMIXD_WEB_TOKEN`; it relays exact-current wire records through the
 same bounded scheduler and admits at most one Web peer. This is transport
 groundwork only: Web peers do not receive audio meters, and RC-008 remains
 planned until process and browser acceptance evidence exists.
-Native Studio one-shot diagnose now uses the same bounded loopback WebSocket transport and current-session validation; RC-008 remains planned, and this does not prove browser, TLS, production authentication, commands or general subscriptions, service/media readiness, or meters.
+Native Studio one-shot diagnose now uses the same bounded loopback WebSocket
+transport and current-session validation. RC-008 remains planned; this does not
+prove browser, TLS, production authentication, commands or general
+subscriptions, service/media readiness, or meters.
 
 ## 4. Phase 2 — GPU playback switcher (10–14 weeks)
 

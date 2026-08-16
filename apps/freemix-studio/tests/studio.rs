@@ -575,6 +575,7 @@ fn websocket_message_until(
         peer.get_ref().set_read_timeout(Some(remaining)).unwrap();
         match peer.read() {
             Ok(Message::Ping(payload)) => {
+                peer.get_ref().set_write_timeout(Some(remaining)).unwrap();
                 peer.send(Message::Pong(payload)).unwrap();
             }
             Ok(Message::Pong(_)) => {}
