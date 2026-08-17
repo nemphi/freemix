@@ -6,7 +6,8 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command as ProcessCommand, Stdio},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
     time::{Duration, Instant},
@@ -147,6 +148,17 @@ impl Daemon {
     }
 
     fn start_with_status(project: &Path, token: &str, once: bool) -> (Self, SocketAddr) {
+        Self::start_with_status_and_web(project, token, once, false)
+    }
+
+    /// `web` also starts the WebSocket gateway, whose bounded shutdown keeps the
+    /// daemon winding down long enough to observe a readiness transition.
+    fn start_with_status_and_web(
+        project: &Path,
+        token: &str,
+        once: bool,
+        web: bool,
+    ) -> (Self, SocketAddr) {
         let mut command = ProcessCommand::new(env!("CARGO_BIN_EXE_freemixd"));
         command
             .arg("serve")
@@ -156,14 +168,20 @@ impl Daemon {
         if once {
             command.arg("--once");
         }
+        if web {
+            command
+                .args(["--web-listen", "127.0.0.1:0"])
+                .env("FREEMIXD_WEB_TOKEN", token);
+        }
         let mut child = command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let mut lines = read_startup_lines(&mut child, 2);
+        let expected = if web { 3 } else { 2 };
+        let mut lines = read_startup_lines(&mut child, expected);
         let line = lines.remove(0);
-        let status_line = lines.remove(0);
+        let status_line = lines.pop().unwrap();
         let readiness = line.parse::<ReadinessRecord>().unwrap_or_else(|error| {
             startup_failure(
                 &mut child,
@@ -606,7 +624,13 @@ const STATUS_TOKEN: &str = "status-token-0123456789abcdef0123456789";
 /// wrote before closing. Write failures are tolerated so a rejected request
 /// still surfaces the daemon's response instead of a client-side panic.
 fn status_request(address: SocketAddr, request: &[u8]) -> String {
-    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(1)).unwrap();
+    try_status_request(address, request).unwrap()
+}
+
+/// The same request, tolerating a refused connection so a probe loop can keep
+/// running across a daemon that is on its way out.
+fn try_status_request(address: SocketAddr, request: &[u8]) -> Option<String> {
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(1)).ok()?;
     stream
         .set_write_timeout(Some(Duration::from_secs(2)))
         .unwrap();
@@ -617,7 +641,93 @@ fn status_request(address: SocketAddr, request: &[u8]) -> String {
     let _ = stream.flush();
     let mut response = Vec::new();
     let _ = stream.read_to_end(&mut response);
-    String::from_utf8_lossy(&response).into_owned()
+    Some(String::from_utf8_lossy(&response).into_owned())
+}
+
+/// Request shapes a supervisor or a scanner actually sends: a HEAD probe, an
+/// unsupported method, an absent route, a head past the cap, and a protected
+/// route probed without credentials.
+fn assert_status_request_shapes(status_address: SocketAddr) {
+    // HEAD-default supervisors get the same headers a GET would, and no body.
+    let probed = status_request(
+        status_address,
+        b"HEAD /healthz HTTP/1.1\r\nHost: status\r\n\r\n",
+    );
+    assert!(probed.starts_with("HTTP/1.1 200 OK\r\n"), "{probed}");
+    assert!(probed.contains("Content-Length: "), "{probed}");
+    assert!(!probed.contains("check=healthz"), "{probed}");
+
+    let unsupported = status_request(
+        status_address,
+        b"POST /healthz HTTP/1.1\r\nHost: status\r\n\r\n",
+    );
+    assert!(
+        unsupported.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"),
+        "{unsupported}"
+    );
+
+    let unknown = status_request(
+        status_address,
+        b"GET /metrics HTTP/1.1\r\nHost: status\r\n\r\n",
+    );
+    assert!(
+        unknown.starts_with("HTTP/1.1 404 Not Found\r\n"),
+        "{unknown}"
+    );
+
+    let mut oversized = String::from("GET /healthz HTTP/1.1\r\nHost: status\r\n");
+    while oversized.len() < 8 * 1024 {
+        oversized.push_str("X-Padding: 0123456789012345678901234567890123456789\r\n");
+    }
+    oversized.push_str("\r\n");
+    let rejected = status_request(status_address, oversized.as_bytes());
+    assert!(
+        rejected.starts_with("HTTP/1.1 413 Content Too Large\r\n"),
+        "{rejected}"
+    );
+    assert!(
+        rejected.contains("check=request\tstatus=too-large\tlimit_bytes=4096"),
+        "{rejected}"
+    );
+
+    // An unauthenticated caller must not be able to confirm the protected route
+    // exists by probing it with a method the route does not serve.
+    let probed_route = status_request(
+        status_address,
+        b"POST /v1/support-bundle HTTP/1.1\r\nHost: status\r\n\r\n",
+    );
+    assert!(
+        probed_route.starts_with("HTTP/1.1 401 Unauthorized\r\n"),
+        "{probed_route}"
+    );
+}
+
+/// RFC 7235 makes the scheme case-insensitive; the token itself stays exact.
+fn assert_bundle_authentication_scheme(status_address: SocketAddr) {
+    let lowercase_scheme = status_request(
+        status_address,
+        format!(
+            "GET /v1/support-bundle HTTP/1.1\r\nHost: status\r\nAuthorization: bEaReR   {STATUS_TOKEN}\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    assert!(
+        lowercase_scheme.starts_with("HTTP/1.1 200 OK\r\n"),
+        "{lowercase_scheme}"
+    );
+
+    let mixed_case_token = status_request(
+        status_address,
+        format!(
+            "GET /v1/support-bundle HTTP/1.1\r\nHost: status\r\nAuthorization: Bearer {}\r\n\r\n",
+            STATUS_TOKEN.to_uppercase()
+        )
+        .as_bytes(),
+    );
+    assert!(
+        mixed_case_token.starts_with("HTTP/1.1 401 Unauthorized\r\n"),
+        "{mixed_case_token}"
+    );
 }
 
 #[test]
@@ -650,14 +760,7 @@ fn status_listener_serves_health_readiness_and_guarded_support_bundle() {
         "{ready}"
     );
 
-    let unknown = status_request(
-        status_address,
-        b"GET /metrics HTTP/1.1\r\nHost: status\r\n\r\n",
-    );
-    assert!(
-        unknown.starts_with("HTTP/1.1 404 Not Found\r\n"),
-        "{unknown}"
-    );
+    assert_status_request_shapes(status_address);
 
     let anonymous = status_request(
         status_address,
@@ -691,6 +794,7 @@ fn status_listener_serves_health_readiness_and_guarded_support_bundle() {
         "{bundle}"
     );
     assert!(bundle.contains("\"schema\":\"fm-support-v1\""), "{bundle}");
+    assert_bundle_authentication_scheme(status_address);
     assert!(!bundle.contains(STATUS_TOKEN), "{bundle}");
     assert!(
         !bundle.contains(&project_path.display().to_string()),
@@ -701,39 +805,150 @@ fn status_listener_serves_health_readiness_and_guarded_support_bundle() {
     daemon.stop();
 }
 
+/// Liveness and readiness are answered by the accept thread, so connections
+/// that occupy the listener without ever sending a request must not be able to
+/// delay or fail a supervisor probe. Sixteen of forty probes failed here before
+/// the accept thread stopped handing probe sockets to the request workers.
 #[test]
-fn status_listener_rejects_oversized_requests_and_stops_with_the_daemon() {
-    let directory = TestDirectory::new("status-listener-bounds");
+fn status_listener_answers_probes_while_silent_connections_flood_it() {
+    const HELD: usize = 50;
+    const FLOOD_THREADS: usize = 4;
+    const PROBES: usize = 40;
+
+    let directory = TestDirectory::new("status-listener-flood");
     let project_path = directory.project_path();
     create_project(&project_path);
 
     let (daemon, status_address) = Daemon::start_with_status(&project_path, STATUS_TOKEN, true);
 
-    let mut oversized = String::from("GET /healthz HTTP/1.1\r\nHost: status\r\n");
-    while oversized.len() < 8 * 1024 {
-        oversized.push_str("X-Padding: 0123456789012345678901234567890123456789\r\n");
-    }
-    oversized.push_str("\r\n");
-    let rejected = status_request(status_address, oversized.as_bytes());
-    assert!(
-        rejected.starts_with("HTTP/1.1 413 Content Too Large\r\n"),
-        "{rejected}"
-    );
-    assert!(
-        rejected.contains("check=request\tstatus=too-large\tlimit_bytes=4096"),
-        "{rejected}"
-    );
+    let held: Vec<TcpStream> = (0..HELD)
+        .filter_map(|_| TcpStream::connect_timeout(&status_address, Duration::from_secs(1)).ok())
+        .collect();
+    assert_eq!(held.len(), HELD, "could not open the silent connections");
 
-    let health = status_request(
-        status_address,
-        b"GET /healthz HTTP/1.1\r\nHost: status\r\n\r\n",
+    let flooding = Arc::new(AtomicBool::new(true));
+    let threads: Vec<_> = (0..FLOOD_THREADS)
+        .map(|_| {
+            let flooding = Arc::clone(&flooding);
+            std::thread::spawn(move || {
+                let mut sockets = Vec::new();
+                while flooding.load(Ordering::Acquire) {
+                    if let Ok(socket) =
+                        TcpStream::connect_timeout(&status_address, Duration::from_secs(1))
+                    {
+                        sockets.push(socket);
+                    }
+                    if sockets.len() >= 16 {
+                        sockets.clear();
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            })
+        })
+        .collect();
+
+    let mut answered = 0_usize;
+    let mut slowest = Duration::ZERO;
+    let mut failure = String::new();
+    for _ in 0..PROBES {
+        let started = Instant::now();
+        let health = status_request(
+            status_address,
+            b"GET /healthz HTTP/1.1\r\nHost: status\r\n\r\n",
+        );
+        slowest = slowest.max(started.elapsed());
+        if health.starts_with("HTTP/1.1 200 OK\r\n") {
+            answered += 1;
+        } else if failure.is_empty() {
+            failure = health;
+        }
+    }
+
+    flooding.store(false, Ordering::Release);
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    drop(held);
+
+    assert_eq!(
+        answered, PROBES,
+        "flooded listener failed a probe: {failure}"
     );
-    assert!(health.starts_with("HTTP/1.1 200 OK\r\n"), "{health}");
+    assert!(
+        slowest < Duration::from_millis(250),
+        "slowest probe under flood took {slowest:?}"
+    );
 
     let mut client = daemon.connect();
     client.handshake(None);
     drop(client);
     daemon.wait_success();
+}
+
+/// The published readiness must track the daemon, not the value startup wrote.
+///
+/// SIGTERM moves the daemon from ready to draining while the status listener is
+/// still up, which is exactly the interval a supervisor has to be able to tell
+/// apart from a crash. The gateway is enabled so the daemon spends a bounded
+/// but measurable interval winding its other subsystems down; probing across
+/// the signal must observe `readiness=draining`, which a readiness frozen at
+/// startup never reports.
+#[cfg(unix)]
+#[test]
+fn readiness_reports_draining_after_a_cooperative_stop_request() {
+    let directory = TestDirectory::new("status-listener-draining");
+    let project_path = directory.project_path();
+    create_project(&project_path);
+
+    let (daemon, status_address) =
+        Daemon::start_with_status_and_web(&project_path, STATUS_TOKEN, false, true);
+    let ready = status_request(
+        status_address,
+        b"GET /readyz HTTP/1.1\r\nHost: status\r\n\r\n",
+    );
+    assert!(ready.contains("status=ready\treadiness=ready\t"), "{ready}");
+
+    let probing = Arc::new(AtomicBool::new(true));
+    let drained = Arc::new(AtomicBool::new(false));
+    let probes: Vec<_> = (0..8)
+        .map(|_| {
+            let probing = Arc::clone(&probing);
+            let drained = Arc::clone(&drained);
+            std::thread::spawn(move || {
+                while probing.load(Ordering::Acquire) {
+                    let Some(readiness) = try_status_request(
+                        status_address,
+                        b"GET /readyz HTTP/1.1\r\nHost: status\r\n\r\n",
+                    ) else {
+                        continue;
+                    };
+                    if readiness.contains("status=not-ready\treadiness=draining\t") {
+                        assert!(
+                            readiness.starts_with("HTTP/1.1 503 Service Unavailable\r\n"),
+                            "{readiness}"
+                        );
+                        drained.store(true, Ordering::Release);
+                    }
+                }
+            })
+        })
+        .collect();
+
+    let status = ProcessCommand::new("/bin/kill")
+        .args(["-TERM", &daemon.child.as_ref().unwrap().id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success(), "SIGTERM command failed: {status}");
+    daemon.wait_success();
+
+    probing.store(false, Ordering::Release);
+    for probe in probes {
+        probe.join().unwrap();
+    }
+    assert!(
+        drained.load(Ordering::Acquire),
+        "/readyz never reported the draining transition"
+    );
 }
 
 #[test]

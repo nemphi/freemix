@@ -2,14 +2,22 @@
 //!
 //! The listener owns a fixed set of threads and never touches engine, control,
 //! or render state. It answers probes from [`DaemonStatus`], an atomic snapshot
-//! the control loop publishes as it runs, so a probe can never block or slow
-//! the scheduler.
+//! the control loop republishes on every pass, so a probe can never block or
+//! slow the scheduler and can never read a value frozen at startup.
 //!
-//! Every bound is fixed at compile time: at most [`CONNECTION_WORKERS`] request
-//! threads plus one queued socket each, [`MAX_REQUEST_BYTES`] of request head,
+//! Liveness and readiness are answered by the accept thread itself. Both are a
+//! pure atomic read with no further I/O, so they must never queue behind
+//! anything: the accept thread reads request heads with non-blocking sockets
+//! and a fixed pending set, and hands work to a request thread only for the
+//! support bundle, the one route that costs real work. A flood of connections
+//! that send nothing therefore cannot starve a supervisor probe.
+//!
+//! Every bound is fixed at compile time: at most [`PENDING_CAPACITY`] sockets
+//! held by the accept thread, [`CONNECTION_WORKERS`] bundle threads plus one
+//! queued socket each, [`MAX_REQUEST_BYTES`] of request head,
 //! [`MAX_REQUEST_HEADERS`] headers, and a response no larger than the capped
-//! support bundle. Each socket phase carries its own deadline, which is what
-//! bounds how long [`StatusListener::shutdown`] can take to join.
+//! support bundle. Each phase carries its own deadline, which is what bounds
+//! how long [`StatusListener::shutdown`] can take to join.
 
 use std::{
     env,
@@ -41,9 +49,13 @@ const HEALTH_PATH: &str = "/healthz";
 const READY_PATH: &str = "/readyz";
 const BUNDLE_PATH: &str = "/v1/support-bundle";
 
-/// Request threads. One queued socket each caps the listener at four sockets.
+/// Support-bundle threads. One queued socket each caps bundle work at four.
 const CONNECTION_WORKERS: usize = 2;
 const WORKER_QUEUE_CAPACITY: usize = 1;
+/// Sockets the accept thread reads concurrently. A connection that sends
+/// nothing holds one of these for at most [`FIRST_BYTE_TIMEOUT`] and never
+/// holds a request thread at all.
+const PENDING_CAPACITY: usize = 64;
 const MAX_REQUEST_BYTES: usize = 4 * 1024;
 const MAX_REQUEST_HEADERS: usize = 32;
 const MAX_DRAIN_BYTES: usize = 16 * 1024;
@@ -51,15 +63,35 @@ const BUNDLE_MAX_BYTES: usize = 32 * 1024;
 const EVENT_CAPACITY: usize = 8;
 const METRIC_CAPACITY: usize = 8;
 
-const ACCEPT_POLL: Duration = Duration::from_millis(25);
+/// Accept-thread sleep while it holds no socket. Matched to the control loop's
+/// own poll interval so a probe is never accepted later than the daemon's
+/// scheduling quantum.
+const ACCEPT_POLL: Duration = Duration::from_millis(5);
+/// Accept-thread sleep while sockets are mid-head or mid-reply.
+const PENDING_POLL: Duration = Duration::from_millis(1);
+/// A connection that sends nothing is closed this fast so it cannot crowd the
+/// pending set and delay a supervisor probe behind it.
+const FIRST_BYTE_TIMEOUT: Duration = Duration::from_millis(50);
+/// Time allowed to finish a head once its first byte has arrived.
+const HEAD_DEADLINE: Duration = Duration::from_millis(250);
+/// Time allowed to push a reply the accept thread writes itself.
+const REPLY_DEADLINE: Duration = Duration::from_millis(250);
+
 const SOCKET_READ_TIMEOUT: Duration = Duration::from_millis(250);
 const SOCKET_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
-const REQUEST_DEADLINE: Duration = Duration::from_millis(500);
 const RESPONSE_DEADLINE: Duration = Duration::from_millis(500);
 const DRAIN_DEADLINE: Duration = Duration::from_millis(100);
 
 /// How long the control loop may go silent before liveness fails.
-const CONTROL_STALL_LIMIT_MILLIS: u64 = 10_000;
+///
+/// The loop polls at `CLIENT_READ_POLL_INTERVAL` (5 ms), so this is 150 passes
+/// and roughly 45 dropped frames at 60 fps: far beyond scheduling jitter or one
+/// slow pass, so a healthy daemon cannot be restarted by a supervisor watching
+/// this endpoint. It sits just above the 600 ms of silence after which the same
+/// loop declares a *client* dead, so by the time the daemon calls its own
+/// control loop stalled it has already stopped meeting the liveness budget it
+/// enforces on everyone else — the report is a fact, not a guess.
+const CONTROL_STALL_LIMIT_MILLIS: u64 = 750;
 
 const READINESS_STARTING: u8 = 0;
 const READINESS_READY: u8 = 1;
@@ -75,25 +107,31 @@ pub(super) struct DaemonStatus {
     beat_millis: AtomicU64,
     readiness: AtomicU8,
     health: AtomicU8,
+    draining: AtomicBool,
     ready_millis: AtomicU64,
     draining_millis: AtomicU64,
     served: AtomicU64,
     rejected: AtomicU64,
     in_flight: AtomicUsize,
+    live_workers: AtomicUsize,
 }
 
 impl DaemonStatus {
     pub(super) fn new() -> Arc<Self> {
         Arc::new(Self {
             started: Instant::now(),
-            beat_millis: AtomicU64::new(0),
+            // No beat has happened yet, so a probe that arrives before the
+            // control loop's first pass must read stalled, not live.
+            beat_millis: AtomicU64::new(UNSET_MILLIS),
             readiness: AtomicU8::new(READINESS_STARTING),
             health: AtomicU8::new(HEALTH_HEALTHY),
+            draining: AtomicBool::new(false),
             ready_millis: AtomicU64::new(UNSET_MILLIS),
             draining_millis: AtomicU64::new(UNSET_MILLIS),
             served: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
             in_flight: AtomicUsize::new(0),
+            live_workers: AtomicUsize::new(CONNECTION_WORKERS),
         })
     }
 
@@ -102,13 +140,17 @@ impl DaemonStatus {
     }
 
     /// Records that the control loop completed another pass. One clock read and
-    /// one relaxed-ordering store; the loop calls this several times per pass.
+    /// one release store; the loop calls this several times per pass.
     pub(super) fn beat(&self) {
         self.beat_millis
             .store(self.uptime_millis(), Ordering::Release);
     }
 
     /// Publishes the authoritative `fm-server` readiness and health states.
+    ///
+    /// The control loop calls this on every pass, so a daemon that degrades is
+    /// visible to a supervisor within one poll interval rather than being
+    /// frozen at whatever startup happened to publish.
     pub(super) fn publish(&self, status: ServiceStatus) {
         let readiness = match status.readiness() {
             ReadinessState::Starting => READINESS_STARTING,
@@ -129,20 +171,21 @@ impl DaemonStatus {
         }
     }
 
-    /// Moves a ready daemon to draining on the first cooperative stop request.
+    /// Latches the cooperative stop request.
+    ///
+    /// Draining is a process-level fact the republished server status must not
+    /// erase, so it is held beside the published state and folded in by
+    /// [`Self::snapshot`] rather than written over the published readiness.
     pub(super) fn begin_draining(&self) {
-        if self
-            .readiness
-            .compare_exchange(
-                READINESS_READY,
-                READINESS_DRAINING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-        {
+        if !self.draining.swap(true, Ordering::AcqRel) {
             self.stamp(&self.draining_millis);
         }
+    }
+
+    /// Records that a request thread is gone, so `/healthz` shows the loss now
+    /// instead of only at shutdown.
+    fn retire_workers(&self, live: usize) {
+        self.live_workers.store(live, Ordering::Release);
     }
 
     fn stamp(&self, slot: &AtomicU64) {
@@ -157,15 +200,23 @@ impl DaemonStatus {
     fn snapshot(&self) -> StatusSnapshot {
         let uptime_millis = self.uptime_millis();
         let beat_millis = self.beat_millis.load(Ordering::Acquire);
+        let published = match self.readiness.load(Ordering::Acquire) {
+            READINESS_READY => ReadinessState::Ready,
+            READINESS_DRAINING => ReadinessState::Draining,
+            READINESS_UNHEALTHY => ReadinessState::Unhealthy,
+            _ => ReadinessState::Starting,
+        };
         StatusSnapshot {
             uptime_millis,
-            beat_millis,
-            stalled: uptime_millis.saturating_sub(beat_millis) > CONTROL_STALL_LIMIT_MILLIS,
-            readiness: match self.readiness.load(Ordering::Acquire) {
-                READINESS_READY => ReadinessState::Ready,
-                READINESS_DRAINING => ReadinessState::Draining,
-                READINESS_UNHEALTHY => ReadinessState::Unhealthy,
-                _ => ReadinessState::Starting,
+            beat_millis: unset_to_none(beat_millis),
+            stalled: beat_millis == UNSET_MILLIS
+                || uptime_millis.saturating_sub(beat_millis) > CONTROL_STALL_LIMIT_MILLIS,
+            readiness: if self.draining.load(Ordering::Acquire)
+                && published == ReadinessState::Ready
+            {
+                ReadinessState::Draining
+            } else {
+                published
             },
             health: if self.health.load(Ordering::Acquire) == HEALTH_UNHEALTHY {
                 HealthState::Unhealthy
@@ -177,6 +228,7 @@ impl DaemonStatus {
             served: self.served.load(Ordering::Acquire),
             rejected: self.rejected.load(Ordering::Acquire),
             in_flight: self.in_flight.load(Ordering::Acquire),
+            live_workers: self.live_workers.load(Ordering::Acquire),
         }
     }
 }
@@ -189,9 +241,10 @@ const fn unset_to_none(millis: u64) -> Option<u64> {
     }
 }
 
+#[derive(Clone, Copy)]
 struct StatusSnapshot {
     uptime_millis: u64,
-    beat_millis: u64,
+    beat_millis: Option<u64>,
     stalled: bool,
     readiness: ReadinessState,
     health: HealthState,
@@ -200,6 +253,7 @@ struct StatusSnapshot {
     served: u64,
     rejected: u64,
     in_flight: usize,
+    live_workers: usize,
 }
 
 impl StatusSnapshot {
@@ -241,9 +295,7 @@ impl StatusToken {
     }
 
     fn matches(&self, authorization: Option<&[u8]>) -> bool {
-        let presented = authorization
-            .and_then(|value| value.strip_prefix(b"Bearer "))
-            .unwrap_or_default();
+        let presented = authorization.map(bearer_credentials).unwrap_or_default();
         let mut candidate = [0; TOKEN_MAX_BYTES];
         let copied = presented.len().min(TOKEN_MAX_BYTES);
         candidate[..copied].copy_from_slice(&presented[..copied]);
@@ -253,6 +305,26 @@ impl StatusToken {
         }
         difference == 0
     }
+}
+
+/// Extracts the credentials of a `Bearer` challenge.
+///
+/// RFC 7235 makes the scheme case-insensitive and allows more than one space
+/// before the credentials; the credentials themselves stay exact so the token
+/// comparison in [`StatusToken::matches`] remains byte-for-byte.
+fn bearer_credentials(authorization: &[u8]) -> &[u8] {
+    let Some(space) = authorization.iter().position(|byte| *byte == b' ') else {
+        return &[];
+    };
+    let (scheme, rest) = authorization.split_at(space);
+    if !scheme.eq_ignore_ascii_case(b"bearer") {
+        return &[];
+    }
+    let start = rest
+        .iter()
+        .position(|byte| *byte != b' ')
+        .unwrap_or(rest.len());
+    &rest[start..]
 }
 
 /// A bounded HTTP/1.1 listener serving liveness, readiness, and support state.
@@ -278,7 +350,6 @@ impl StatusListener {
         let listener = TcpListener::bind(address)?;
         listener.set_nonblocking(true)?;
         let bound = listener.local_addr()?;
-        status.beat();
 
         let cancel = Arc::new(AtomicBool::new(false));
         let mut senders = Vec::with_capacity(CONNECTION_WORKERS);
@@ -287,12 +358,10 @@ impl StatusListener {
             let (sender, receiver) = mpsc::sync_channel(WORKER_QUEUE_CAPACITY);
             let worker_cancel = Arc::clone(&cancel);
             let worker_status = Arc::clone(status);
-            let worker_token = Arc::clone(&token);
             match thread::Builder::new()
                 .name(format!("freemixd-status-{index}"))
-                .spawn(move || {
-                    worker_loop(&receiver, &worker_cancel, &worker_status, &worker_token);
-                }) {
+                .spawn(move || worker_loop(&receiver, &worker_cancel, &worker_status))
+            {
                 Ok(handle) => {
                     senders.push(sender);
                     threads.push(handle);
@@ -305,8 +374,9 @@ impl StatusListener {
         let accept_status = Arc::clone(status);
         match thread::Builder::new()
             .name("freemixd-status-accept".into())
-            .spawn(move || accept_loop(&listener, &senders, &accept_cancel, &accept_status))
-        {
+            .spawn(move || {
+                accept_loop(&listener, senders, &accept_cancel, &accept_status, &token);
+            }) {
             Ok(handle) => threads.insert(0, handle),
             Err(error) => return Err(stop_threads(&cancel, threads, error)),
         }
@@ -323,9 +393,15 @@ impl StatusListener {
 
     /// Stops accepting and joins every listener thread.
     ///
-    /// The join is bounded by construction: accept and queue waits poll at
-    /// [`ACCEPT_POLL`], and an in-flight request cannot outlive its request,
-    /// response, and drain deadlines.
+    /// The join is bounded, but the bound is a deadline *plus one socket
+    /// timeout per phase*, because a deadline is only re-checked between calls
+    /// and a blocking call can already be inside its own timeout. The accept
+    /// thread never blocks on a socket, so it costs at most one
+    /// [`ACCEPT_POLL`]. It is joined first, which drops the worker senders. A
+    /// request thread then costs at most one [`ACCEPT_POLL`] plus, if it is
+    /// mid-bundle, [`RESPONSE_DEADLINE`] + [`SOCKET_WRITE_TIMEOUT`] +
+    /// [`DRAIN_DEADLINE`] + [`SOCKET_READ_TIMEOUT`] — about 1.1 s worst case,
+    /// and a few tens of milliseconds in practice.
     ///
     /// # Errors
     ///
@@ -365,77 +441,322 @@ fn stop_threads(
     error.into()
 }
 
+/// A socket the accept thread owns while it reads a head or writes a reply.
+struct Pending {
+    stream: TcpStream,
+    head: Vec<u8>,
+    /// First-byte deadline until the peer speaks, then the head or reply
+    /// deadline.
+    deadline: Instant,
+    started: bool,
+    reply: Option<Outgoing>,
+}
+
+impl Pending {
+    fn reading(stream: TcpStream, now: Instant) -> Self {
+        Self {
+            stream,
+            head: Vec::new(),
+            deadline: now + FIRST_BYTE_TIMEOUT,
+            started: false,
+            reply: None,
+        }
+    }
+
+    fn replying(stream: TcpStream, response: &Response, now: Instant) -> Self {
+        Self {
+            stream,
+            head: Vec::new(),
+            deadline: now + REPLY_DEADLINE,
+            started: true,
+            reply: Some(Outgoing::new(response)),
+        }
+    }
+
+    fn answer(&mut self, response: &Response, status: &DaemonStatus, now: Instant) {
+        status.served.fetch_add(1, Ordering::AcqRel);
+        self.reply = Some(Outgoing::new(response));
+        self.deadline = now + REPLY_DEADLINE;
+    }
+}
+
+struct Outgoing {
+    bytes: Vec<u8>,
+    offset: usize,
+}
+
+impl Outgoing {
+    fn new(response: &Response) -> Self {
+        Self {
+            bytes: encode_response(response),
+            offset: 0,
+        }
+    }
+}
+
+/// A bundle request that has already been parsed and authorized.
+struct BundleJob {
+    stream: TcpStream,
+    snapshot: StatusSnapshot,
+}
+
+/// What the accept thread should do with a pending socket after one step.
+enum Step {
+    Hold,
+    Close,
+    Bundle,
+}
+
 fn accept_loop(
     listener: &TcpListener,
-    senders: &[SyncSender<TcpStream>],
-    cancel: &AtomicBool,
-    status: &DaemonStatus,
-) {
-    while !cancel.load(Ordering::Acquire) {
-        match listener.accept() {
-            Ok((stream, _)) => admit(stream, senders, status),
-            Err(error)
-                if matches!(error.kind(), ErrorKind::Interrupted | ErrorKind::WouldBlock) =>
-            {
-                thread::sleep(ACCEPT_POLL);
-            }
-            Err(_) => break,
-        }
-    }
-}
-
-/// Hands the socket to the first free worker, or rejects it outright.
-fn admit(stream: TcpStream, senders: &[SyncSender<TcpStream>], status: &DaemonStatus) {
-    let mut pending = stream;
-    for sender in senders {
-        match sender.try_send(pending) {
-            // Either the worker owns the socket now, or the worker is gone and
-            // the socket closes with the value this arm drops.
-            Ok(()) | Err(TrySendError::Disconnected(_)) => return,
-            Err(TrySendError::Full(returned)) => pending = returned,
-        }
-    }
-    status.rejected.fetch_add(1, Ordering::AcqRel);
-    if prepare(&mut pending).is_ok() {
-        let response = Response::busy();
-        write_response(&mut pending, &response);
-    }
-    let _ = pending.shutdown(Shutdown::Both);
-}
-
-fn worker_loop(
-    accepted: &Receiver<TcpStream>,
+    mut senders: Vec<SyncSender<BundleJob>>,
     cancel: &AtomicBool,
     status: &DaemonStatus,
     token: &StatusToken,
 ) {
+    let mut pending: Vec<Pending> = Vec::with_capacity(PENDING_CAPACITY);
     while !cancel.load(Ordering::Acquire) {
-        match accepted.recv_timeout(ACCEPT_POLL) {
-            Ok(mut stream) => {
+        let listening = accept_available(listener, &mut pending, status);
+        let progressed = advance_pending(&mut pending, &mut senders, status, token);
+        if !listening {
+            break;
+        }
+        if pending.is_empty() {
+            thread::sleep(ACCEPT_POLL);
+        } else if !progressed {
+            thread::sleep(PENDING_POLL);
+        }
+    }
+    for connection in pending {
+        close_pending(connection, status);
+    }
+}
+
+/// Fills the pending set from the accept queue. Returns false on a fatal error.
+///
+/// Nothing is admitted past [`PENDING_CAPACITY`]; the surplus waits in the
+/// kernel backlog, where it costs the listener nothing, until a slot frees.
+fn accept_available(
+    listener: &TcpListener,
+    pending: &mut Vec<Pending>,
+    status: &DaemonStatus,
+) -> bool {
+    while pending.len() < PENDING_CAPACITY {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                if stream.set_nonblocking(true).is_err() {
+                    let _ = stream.shutdown(Shutdown::Both);
+                    continue;
+                }
                 status.in_flight.fetch_add(1, Ordering::AcqRel);
-                serve_connection(&mut stream, status, token);
-                status.in_flight.fetch_sub(1, Ordering::AcqRel);
+                pending.push(Pending::reading(stream, Instant::now()));
             }
+            Err(error)
+                if matches!(error.kind(), ErrorKind::Interrupted | ErrorKind::WouldBlock) =>
+            {
+                return true;
+            }
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
+/// Advances every pending socket by one non-blocking step.
+fn advance_pending(
+    pending: &mut Vec<Pending>,
+    senders: &mut Vec<SyncSender<BundleJob>>,
+    status: &DaemonStatus,
+    token: &StatusToken,
+) -> bool {
+    let now = Instant::now();
+    let mut progressed = false;
+    let mut index = 0;
+    while index < pending.len() {
+        match advance_one(&mut pending[index], status, token, now, &mut progressed) {
+            Step::Hold => index += 1,
+            Step::Close => close_pending(pending.swap_remove(index), status),
+            Step::Bundle => {
+                let Pending { stream, .. } = pending.swap_remove(index);
+                let job = BundleJob {
+                    stream,
+                    snapshot: status.snapshot(),
+                };
+                if let Err(stream) = dispatch_bundle(job, senders, status) {
+                    status.rejected.fetch_add(1, Ordering::AcqRel);
+                    status.served.fetch_add(1, Ordering::AcqRel);
+                    pending.push(Pending::replying(stream, &Response::busy(), now));
+                }
+                progressed = true;
+            }
+        }
+    }
+    progressed
+}
+
+fn advance_one(
+    connection: &mut Pending,
+    status: &DaemonStatus,
+    token: &StatusToken,
+    now: Instant,
+    progressed: &mut bool,
+) -> Step {
+    if let Some(outgoing) = connection.reply.as_mut() {
+        return match push_reply(&mut connection.stream, outgoing) {
+            Progress::Done => {
+                *progressed = true;
+                Step::Close
+            }
+            Progress::Blocked if now < connection.deadline => Step::Hold,
+            Progress::Blocked | Progress::Failed => Step::Close,
+        };
+    }
+    let mut chunk = [0_u8; 1024];
+    match connection.stream.read(&mut chunk) {
+        Ok(0) => Step::Close,
+        Ok(read) => {
+            *progressed = true;
+            if !connection.started {
+                connection.started = true;
+                connection.deadline = now + HEAD_DEADLINE;
+            }
+            let room = MAX_REQUEST_BYTES.saturating_sub(connection.head.len());
+            connection.head.extend_from_slice(&chunk[..read.min(room)]);
+            classify(connection, status, token, now)
+        }
+        Err(error) if error.kind() == ErrorKind::Interrupted => Step::Hold,
+        Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+            if now >= connection.deadline {
+                connection.answer(&Response::request_timeout(), status, now);
+            }
+            Step::Hold
+        }
+        Err(_) => Step::Close,
+    }
+}
+
+/// Routes a head as soon as it is complete, or rejects one that never ends.
+fn classify(
+    connection: &mut Pending,
+    status: &DaemonStatus,
+    token: &StatusToken,
+    now: Instant,
+) -> Step {
+    if let Some(end) = connection
+        .head
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+    {
+        connection.head.truncate(end);
+        match route(&connection.head, status, token) {
+            Routed::Reply(response) => {
+                connection.answer(&response, status, now);
+                Step::Hold
+            }
+            Routed::Bundle => Step::Bundle,
+        }
+    } else if connection.head.len() >= MAX_REQUEST_BYTES {
+        connection.answer(&Response::request_too_large(), status, now);
+        Step::Hold
+    } else {
+        Step::Hold
+    }
+}
+
+/// Hands an authorized bundle request to a request thread.
+///
+/// A disconnected worker means that thread panicked. The connection is carried
+/// on to the next worker instead of being dropped into a dead channel, and the
+/// sender is retired so no later connection is offered to it either.
+fn dispatch_bundle(
+    job: BundleJob,
+    senders: &mut Vec<SyncSender<BundleJob>>,
+    status: &DaemonStatus,
+) -> Result<(), TcpStream> {
+    let mut job = job;
+    let mut index = 0;
+    while index < senders.len() {
+        match senders[index].try_send(job) {
+            Ok(()) => return Ok(()),
+            Err(TrySendError::Full(returned)) => {
+                job = returned;
+                index += 1;
+            }
+            Err(TrySendError::Disconnected(returned)) => {
+                job = returned;
+                senders.remove(index);
+                status.retire_workers(senders.len());
+            }
+        }
+    }
+    Err(job.stream)
+}
+
+enum Progress {
+    Done,
+    Blocked,
+    Failed,
+}
+
+fn push_reply(stream: &mut TcpStream, outgoing: &mut Outgoing) -> Progress {
+    while outgoing.offset < outgoing.bytes.len() {
+        match stream.write(&outgoing.bytes[outgoing.offset..]) {
+            Ok(0) => return Progress::Failed,
+            Ok(written) => outgoing.offset += written,
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                return Progress::Blocked;
+            }
+            Err(_) => return Progress::Failed,
+        }
+    }
+    Progress::Done
+}
+
+fn close_pending(mut connection: Pending, status: &DaemonStatus) {
+    drain_buffered(&mut connection.stream);
+    let _ = connection.stream.shutdown(Shutdown::Both);
+    status.in_flight.fetch_sub(1, Ordering::AcqRel);
+}
+
+/// Consumes what the peer already sent so the close is a FIN, not a reset.
+/// The socket is non-blocking here, so this cannot wait on anything.
+fn drain_buffered(stream: &mut TcpStream) {
+    let mut chunk = [0_u8; 1024];
+    let mut drained = 0;
+    while drained < MAX_DRAIN_BYTES {
+        match stream.read(&mut chunk) {
+            Ok(0) => return,
+            Ok(read) => drained += read,
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(_) => return,
+        }
+    }
+}
+
+fn worker_loop(jobs: &Receiver<BundleJob>, cancel: &AtomicBool, status: &DaemonStatus) {
+    while !cancel.load(Ordering::Acquire) {
+        match jobs.recv_timeout(ACCEPT_POLL) {
+            Ok(job) => serve_bundle(job, status),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
 }
 
-fn serve_connection(stream: &mut TcpStream, status: &DaemonStatus, token: &StatusToken) {
-    if prepare(stream).is_err() {
-        let _ = stream.shutdown(Shutdown::Both);
-        return;
+fn serve_bundle(job: BundleJob, status: &DaemonStatus) {
+    let BundleJob {
+        mut stream,
+        snapshot,
+    } = job;
+    if prepare(&mut stream).is_ok() {
+        let response = bundle_response(&snapshot);
+        status.served.fetch_add(1, Ordering::AcqRel);
+        write_response(&mut stream, &response);
+        drain(&mut stream);
     }
-    let mut head = Vec::with_capacity(1024);
-    let response = match read_head(stream, &mut head) {
-        Ok(()) => route(&head, status, token),
-        Err(response) => response,
-    };
-    status.served.fetch_add(1, Ordering::AcqRel);
-    write_response(stream, &response);
-    drain(stream);
     let _ = stream.shutdown(Shutdown::Both);
+    status.in_flight.fetch_sub(1, Ordering::AcqRel);
 }
 
 fn prepare(stream: &mut TcpStream) -> std::io::Result<()> {
@@ -444,37 +765,10 @@ fn prepare(stream: &mut TcpStream) -> std::io::Result<()> {
     stream.set_write_timeout(Some(SOCKET_WRITE_TIMEOUT))
 }
 
-/// Reads the request head, capping total bytes and total time.
-fn read_head(stream: &mut TcpStream, head: &mut Vec<u8>) -> Result<(), Response> {
-    let deadline = Instant::now() + REQUEST_DEADLINE;
-    let mut chunk = [0_u8; 1024];
-    loop {
-        if let Some(end) = head.windows(4).position(|window| window == b"\r\n\r\n") {
-            head.truncate(end);
-            return Ok(());
-        }
-        if head.len() >= MAX_REQUEST_BYTES {
-            return Err(Response::request_too_large());
-        }
-        if Instant::now() >= deadline {
-            return Err(Response::request_timeout());
-        }
-        match stream.read(&mut chunk) {
-            Ok(0) => return Err(Response::bad_request()),
-            Ok(read) => {
-                let room = MAX_REQUEST_BYTES - head.len();
-                head.extend_from_slice(&chunk[..read.min(room)]);
-            }
-            Err(error) if error.kind() == ErrorKind::Interrupted => {}
-            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                return Err(Response::request_timeout());
-            }
-            Err(_) => return Err(Response::bad_request()),
-        }
-    }
-}
-
 /// Consumes any request remainder so the close is graceful instead of a reset.
+///
+/// The deadline is only checked between reads, so the true bound is
+/// [`DRAIN_DEADLINE`] plus one [`SOCKET_READ_TIMEOUT`].
 fn drain(stream: &mut TcpStream) {
     let deadline = Instant::now() + DRAIN_DEADLINE;
     let mut chunk = [0_u8; 1024];
@@ -489,7 +783,7 @@ fn drain(stream: &mut TcpStream) {
     }
 }
 
-fn write_response(stream: &mut TcpStream, response: &Response) {
+fn encode_response(response: &Response) -> Vec<u8> {
     let mut head = String::with_capacity(256);
     let _ = write!(
         head,
@@ -502,27 +796,34 @@ fn write_response(stream: &mut TcpStream, response: &Response) {
         head.push_str("WWW-Authenticate: Bearer\r\n");
     }
     head.push_str("\r\n");
-    let deadline = Instant::now() + RESPONSE_DEADLINE;
-    if write_bounded(stream, head.as_bytes(), deadline) {
-        let _ = write_bounded(stream, response.body.as_bytes(), deadline);
+    let mut bytes = head.into_bytes();
+    // A HEAD reply carries the headers a GET would, and no body.
+    if !response.head_only {
+        bytes.extend_from_slice(response.body.as_bytes());
     }
-    let _ = stream.flush();
+    bytes
 }
 
-fn write_bounded(stream: &mut TcpStream, bytes: &[u8], deadline: Instant) -> bool {
+/// Writes a rendered response on a blocking socket.
+///
+/// The deadline is only checked between writes, so the true bound is
+/// [`RESPONSE_DEADLINE`] plus one [`SOCKET_WRITE_TIMEOUT`].
+fn write_response(stream: &mut TcpStream, response: &Response) {
+    let bytes = encode_response(response);
+    let deadline = Instant::now() + RESPONSE_DEADLINE;
     let mut offset = 0;
     while offset < bytes.len() {
         if Instant::now() >= deadline {
-            return false;
+            break;
         }
         match stream.write(&bytes[offset..]) {
-            Ok(0) => return false,
+            Ok(0) => break,
             Ok(written) => offset += written,
             Err(error) if error.kind() == ErrorKind::Interrupted => {}
-            Err(_) => return false,
+            Err(_) => break,
         }
     }
-    true
+    let _ = stream.flush();
 }
 
 struct RequestHead<'a> {
@@ -582,22 +883,48 @@ impl<'a> RequestHead<'a> {
     }
 }
 
-fn route(head: &[u8], status: &DaemonStatus, token: &StatusToken) -> Response {
+/// Either a reply the accept thread can write itself, or the one route that
+/// needs a request thread.
+enum Routed {
+    Reply(Response),
+    Bundle,
+}
+
+fn route(head: &[u8], status: &DaemonStatus, token: &StatusToken) -> Routed {
     let request = match RequestHead::parse(head) {
         Ok(request) => request,
-        Err(response) => return response,
+        Err(response) => return Routed::Reply(response),
     };
-    let known = matches!(request.path, HEALTH_PATH | READY_PATH | BUNDLE_PATH);
-    if known && request.method != "GET" {
-        return Response::method_not_allowed();
-    }
-    let snapshot = status.snapshot();
     match request.path {
-        HEALTH_PATH => health_response(&snapshot),
-        READY_PATH => ready_response(&snapshot),
-        BUNDLE_PATH if token.matches(request.authorization) => bundle_response(&snapshot),
-        BUNDLE_PATH => Response::unauthorized(),
-        _ => Response::not_found(),
+        HEALTH_PATH | READY_PATH => {
+            let Some(head_only) = probe_method(request.method) else {
+                return Routed::Reply(Response::method_not_allowed());
+            };
+            let snapshot = status.snapshot();
+            let response = if request.path == HEALTH_PATH {
+                health_response(&snapshot)
+            } else {
+                ready_response(&snapshot)
+            };
+            Routed::Reply(response.head_only(head_only))
+        }
+        // Authentication is evaluated before the method so an unauthenticated
+        // caller learns nothing from the shape of the rejection.
+        BUNDLE_PATH if !token.matches(request.authorization) => {
+            Routed::Reply(Response::unauthorized())
+        }
+        BUNDLE_PATH if request.method != "GET" => Routed::Reply(Response::method_not_allowed()),
+        BUNDLE_PATH => Routed::Bundle,
+        _ => Routed::Reply(Response::not_found()),
+    }
+}
+
+/// Maps a probe method to whether the reply is headers only.
+fn probe_method(method: &str) -> Option<bool> {
+    match method {
+        "GET" => Some(false),
+        "HEAD" => Some(true),
+        _ => None,
     }
 }
 
@@ -610,8 +937,12 @@ fn health_response(snapshot: &StatusSnapshot) -> Response {
         "live"
     };
     let body = format!(
-        "FREEMIXD_STATUS\tv=1\tcheck=healthz\tstatus={state}\tuptime_ms={}\tlast_beat_ms={}\n",
-        snapshot.uptime_millis, snapshot.beat_millis
+        "FREEMIXD_STATUS\tv=1\tcheck=healthz\tstatus={state}\tuptime_ms={}\tlast_beat_ms={}\tworkers={}/{CONNECTION_WORKERS}\n",
+        snapshot.uptime_millis,
+        snapshot
+            .beat_millis
+            .map_or_else(|| "none".to_owned(), |millis| millis.to_string()),
+        snapshot.live_workers
     );
     if snapshot.live() {
         Response::ok(body)
@@ -652,11 +983,16 @@ fn bundle_response(snapshot: &StatusSnapshot) -> Response {
         )
         .with_detail(snapshot.readiness.as_str()),
     );
+    let intact = snapshot.live_workers == CONNECTION_WORKERS;
     health.update(HealthCheck::new(
         "status-listener",
         true,
-        true,
-        ComponentHealth::Healthy,
+        intact,
+        if intact {
+            ComponentHealth::Healthy
+        } else {
+            ComponentHealth::Degraded
+        },
     ));
 
     let mut metrics = MetricStore::new(METRIC_CAPACITY);
@@ -737,6 +1073,7 @@ struct Response {
     status: u16,
     reason: &'static str,
     authenticate: bool,
+    head_only: bool,
     body: String,
 }
 
@@ -746,8 +1083,14 @@ impl Response {
             status,
             reason,
             authenticate: false,
+            head_only: false,
             body,
         }
+    }
+
+    fn head_only(mut self, head_only: bool) -> Self {
+        self.head_only = head_only;
+        self
     }
 
     fn ok(body: String) -> Self {
@@ -821,10 +1164,14 @@ impl Response {
         )
     }
 
+    /// Admission pressure, not ill health: 503 would tell a supervisor the
+    /// daemon is sick and invite a restart mid-show, so the bundle route says
+    /// "too many requests" instead. Liveness and readiness never take this
+    /// path — the accept thread answers them itself.
     fn busy() -> Self {
         Self::new(
-            503,
-            "Service Unavailable",
+            429,
+            "Too Many Requests",
             format!(
                 "FREEMIXD_STATUS\tv=1\tcheck=admission\tstatus=busy\tlimit={CONNECTION_WORKERS}\n"
             ),

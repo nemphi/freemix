@@ -69,7 +69,7 @@ use fm_protocol::{
 use fm_protocol::{CodecError, EventMessage, HeartbeatAcknowledgementMessage, LineDecoder};
 use fm_server::{
     AuthenticationMode, ControlPlane, DisconnectReason, HandshakeError, Heartbeat, InitialSync,
-    Server, ServerConfig, ServerMode, Session, SessionError, SyncPayload,
+    Server, ServerConfig, ServerMode, ServiceStatus, Session, SessionError, SyncPayload,
 };
 use fm_switcher::{
     MissingMediaFallback, OverlayBorderPreset, OverlayChannelId, OverlayChannelState,
@@ -177,9 +177,21 @@ struct ProcessShutdown {
     diagnostic_deadline: Option<Instant>,
     /// Snapshot published to the status listener; never read by the daemon.
     status: Arc<DaemonStatus>,
+    /// The authoritative `fm-server` status the control loop republishes on
+    /// every pass. The session loop only ever holds `&Server`, so the server
+    /// cannot change its own status while the loop runs; this is the value the
+    /// daemon knows, recorded by [`Self::observe_service`] at every point that
+    /// can move it.
+    service: ServiceStatus,
 }
 
 impl ProcessShutdown {
+    /// Records a new authoritative service status and publishes it at once.
+    fn observe_service(&mut self, service: ServiceStatus) {
+        self.service = service;
+        self.status.publish(service);
+    }
+
     fn requested(&self) -> bool {
         self.requested.load(AtomicOrdering::Acquire)
             || self
@@ -208,6 +220,7 @@ fn register_process_shutdown() -> AppResult<ProcessShutdown> {
         requested,
         diagnostic_deadline: None,
         status: DaemonStatus::new(),
+        service: ServiceStatus::new(),
     })
 }
 
@@ -220,6 +233,7 @@ fn register_process_shutdown() -> AppResult<ProcessShutdown> {
         requested,
         diagnostic_deadline: None,
         status: DaemonStatus::new(),
+        service: ServiceStatus::new(),
     })
 }
 
@@ -229,6 +243,7 @@ fn register_process_shutdown() -> AppResult<ProcessShutdown> {
         requested: Arc::new(AtomicBool::new(false)),
         diagnostic_deadline: None,
         status: DaemonStatus::new(),
+        service: ServiceStatus::new(),
     })
 }
 
@@ -253,7 +268,11 @@ fn requested_daemon_shutdown(
     process: Option<&ProcessShutdown>,
 ) -> Option<DaemonShutdownReason> {
     if let Some(process) = process {
+        // Two atomic stores next to the beat. Republishing keeps the health
+        // surface live: a degraded daemon shows up on `/healthz` within one
+        // poll interval instead of staying frozen at whatever startup wrote.
         process.status.beat();
+        process.status.publish(process.service);
     }
     let reason = if process.is_some_and(ProcessShutdown::requested) {
         Some(DaemonShutdownReason::ProcessSignal)
@@ -3660,7 +3679,7 @@ fn serve_inner(
         .map(|address| StatusListener::bind(address, &process_shutdown.status))
         .transpose()?;
     server.mark_ready()?;
-    process_shutdown.status.publish(server.status());
+    process_shutdown.observe_service(server.status());
     let readiness = ReadinessRecord {
         address: listener.local_addr()?,
         project_id,
