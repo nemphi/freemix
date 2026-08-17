@@ -16,18 +16,29 @@
 //! typed error is path- and key-free, and child stderr is redacted *before* it
 //! enters the bounded retention ring, so neither truncation nor a read split
 //! across chunk boundaries can expose a partial key. The key still appears in
-//! the child's argv; a same-user process able to read `/proc/<pid>/cmdline` is
+//! the child's argv, and on Linux `/proc/<pid>/cmdline` is mode 0444: unless
+//! the operating system is configured to hide it, **any** local user can read
+//! the key while the child runs, not merely a process running as the same user.
+//! This crate cannot close that hole. Containing it is an OS-level measure
+//! (`hidepid=2`, a PID namespace, or a dedicated unprivileged user) and lies
 //! outside this crate's isolation boundary, exactly as for the recorder's
 //! loopback input tokens.
 //!
-//! # Loss is explicit
+//! # Loss is explicit, and the media clock is not allowed to drift
 //!
 //! Admission is bounded by pair count and retained bytes. Every refusal or
 //! discard is classified and counted in [`StreamTelemetry`]; nothing is lost
 //! silently. Dropping or skipping a pair removes exactly one video frame and
-//! its matching audio span, so audio and video stay mutually aligned while the
-//! muxed media clock falls behind wall clock by the lost duration. Rate or
-//! clock resynchronization after loss is not implemented.
+//! its matching audio span, so audio and video stay mutually aligned. Because
+//! the child derives presentation timestamps from the *count* of raw frames and
+//! samples it receives, a pair that is simply omitted would also shorten the
+//! muxed timeline by one frame period and leave the stream permanently behind
+//! wall clock. The dispatcher therefore pads every gap in the dispatched
+//! sequence: it repeats the last delivered video frame and emits the matching
+//! span of silence, counted as `padded_pairs`. Residual divergence between the
+//! child's muxed media clock and wall clock is reported as
+//! [`StreamTelemetry::media_drift`] and, once it exceeds `no_progress_timeout`,
+//! becomes a terminal [`StreamFailure::NoProgress`].
 //!
 //! # Explicitly out of scope for this slice
 //!
@@ -53,6 +64,7 @@ use std::time::{Duration, Instant};
 use fm_frame::SequenceNumber;
 use fm_types::{Channel, ChannelLayout};
 
+use crate::record::PROBE_SIZE;
 pub use crate::record::{CleanupStatus, MediaInput, PairedFrame, RecordFormat};
 use crate::{Executable, UnavailableReason};
 
@@ -68,13 +80,20 @@ const PROGRESS_PENDING_BYTES: usize = 4 * 1024;
 const TOKEN_BYTES: usize = 32;
 const MAX_DESTINATION_BYTES: usize = 2 * 1024;
 const MIN_STREAM_KEY_BYTES: usize = 4;
-const MAX_ENQUEUE_TIMEOUT: Duration = Duration::from_secs(1);
 const REDACTED_KEY: &str = "****";
 const REDACTED_TOKEN: &[u8] = b"<input-token>";
 const STATS_PERIOD: &str = "0.25";
-/// Conservative upper bound on the private per-pair accounting overhead that
-/// [`PairedFrame::retained_bytes`] adds on top of the payload capacities.
-const PAIR_OVERHEAD_ALLOWANCE: usize = 1_024;
+/// Backlog each input writer may hold beyond the payload it is actively
+/// writing.
+///
+/// Zero (a rendezvous) is wrong: the dispatcher must be able to hand the child
+/// the next pair's audio while the previous pair's video is still draining into
+/// the socket, or the two inputs can only advance in lockstep with whichever
+/// one the child happens to be reading. Anything large is also wrong: a pair
+/// sitting in a writer channel is still accounted in `outstanding`, but
+/// [`OverflowPolicy`] can no longer recall it, so a deep writer channel would
+/// quietly move the sink's loss policy out of the caller's reach.
+const WRITER_BACKLOG: usize = 1;
 
 /// Why a destination URL was refused before any process was spawned.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -195,8 +214,12 @@ pub enum OverflowPolicy {
     /// Return the new pair to the caller, counted as a rejection.
     Reject,
     /// Discard the oldest still-queued pair and admit the new one, counted as
-    /// a drop. Pairs already handed to the input writers cannot be recalled,
-    /// so this degrades to [`OverflowPolicy::Reject`] once the queue is empty.
+    /// a drop. Exactly one pair is discarded per admission.
+    ///
+    /// Pairs already handed to the input writers are committed to the child and
+    /// cannot be recalled, so `max_outstanding_pairs` must leave room for at
+    /// least one pair to remain in the queue; a shallower queue is refused at
+    /// startup rather than silently behaving as [`OverflowPolicy::Reject`].
     DropOldest,
 }
 
@@ -205,8 +228,13 @@ pub enum OverflowPolicy {
 pub struct StreamLimits {
     pub max_outstanding_pairs: usize,
     pub max_retained_bytes: usize,
-    /// Upper bound on how long [`Streamer::enqueue`] may wait for space. Zero
-    /// makes enqueue fully nonblocking.
+    /// Upper bound on how long [`Streamer::enqueue`] may wait for space.
+    ///
+    /// Defaults to zero, which makes enqueue fully nonblocking, and may not
+    /// exceed one frame period: a live render thread must never wait on a
+    /// network sink for longer than the frame it is producing, because every
+    /// millisecond spent here is taken from the next frame's budget rather than
+    /// from the sink's.
     pub enqueue_timeout: Duration,
     /// Budget from the first dispatched pair to the first observed muxer
     /// progress, which is the child's proof that the destination opened. It is
@@ -215,7 +243,14 @@ pub struct StreamLimits {
     /// unresponsive destination on a sink that never sent a pair is bounded by
     /// `stop_timeout` instead.
     pub connect_timeout: Duration,
-    /// Budget for muxer progress while pairs are outstanding.
+    /// How far the child's muxed media clock may fall behind wall clock, and
+    /// how long the child may report nothing at all, before the sink is
+    /// declared dead.
+    ///
+    /// This is deliberately measured against the media clock rather than
+    /// against byte movement: a child that keeps encoding into its own buffers,
+    /// or that muxes slower than real time, is producing bytes while the stream
+    /// its viewers see is already broken.
     pub no_progress_timeout: Duration,
     pub stop_timeout: Duration,
     pub kill_timeout: Duration,
@@ -227,7 +262,7 @@ impl Default for StreamLimits {
         Self {
             max_outstanding_pairs: 4,
             max_retained_bytes: 256 * 1024 * 1024,
-            enqueue_timeout: Duration::from_millis(20),
+            enqueue_timeout: Duration::ZERO,
             connect_timeout: Duration::from_secs(10),
             no_progress_timeout: Duration::from_secs(5),
             stop_timeout: Duration::from_secs(15),
@@ -284,6 +319,13 @@ impl StreamConfig {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LimitsError {
     ZeroOutstandingPairs,
+    /// [`OverflowPolicy::DropOldest`] can only discard pairs still sitting in
+    /// the accounted queue. A queue this shallow would put every admitted pair
+    /// straight into a writer, where nothing can be recalled, so the policy
+    /// would silently behave as [`OverflowPolicy::Reject`].
+    OutstandingPairsTooFewToDropOldest {
+        required: usize,
+    },
     ZeroRetainedBytes,
     ZeroTimeout,
     EnqueueTimeoutTooLong,
@@ -291,7 +333,10 @@ pub enum LimitsError {
     StderrTooLarge,
     TimeoutOverflow,
     ByteCountOverflow,
-    RetainedBytesTooSmall { required: usize, maximum: usize },
+    RetainedBytesTooSmall {
+        required: usize,
+        maximum: usize,
+    },
     VideoBitrate,
     AudioBitrate,
     KeyframeInterval,
@@ -371,10 +416,18 @@ pub enum StreamFailure {
     ChildExited {
         status: Option<i32>,
     },
-    /// The destination never opened within `connect_timeout` of the first
-    /// dispatched pair.
-    ConnectTimeout,
-    /// The muxer stopped making progress while pairs were outstanding.
+    /// The child never opened the destination within `connect_timeout` of the
+    /// first dispatched pair. The child was alive and had media to send, so the
+    /// destination itself is the suspect.
+    DestinationTimeout,
+    /// The child never completed its HTTP request for this loopback input
+    /// within `connect_timeout`, so this input could never be written. Nothing
+    /// was attempted against the destination; the child is the suspect.
+    InputTimeout {
+        input: MediaInput,
+    },
+    /// The child's muxed media clock fell more than `no_progress_timeout`
+    /// behind wall clock, or the child stopped reporting progress entirely.
     NoProgress,
     Connect {
         input: MediaInput,
@@ -437,6 +490,8 @@ impl RejectionCounts {
 ///
 /// Accepted pairs satisfy
 /// `accepted = delivered + write_failed + dropped_oldest + discarded + outstanding`.
+/// `padded_pairs` is outside that identity: padding is synthesized by the sink,
+/// never accepted from the caller.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StreamTelemetry {
     pub state: StreamState,
@@ -453,14 +508,32 @@ pub struct StreamTelemetry {
     pub discarded_pairs: u64,
     /// Sequence numbers the producer skipped between accepted pairs.
     pub skipped_pairs: u64,
+    /// Pairs the sink synthesized to cover a gap in the dispatched sequence:
+    /// the previous video frame repeated plus the matching span of silence.
+    /// These keep the child's media clock on wall clock; they are not caller
+    /// media and are not counted as accepted or delivered.
+    pub padded_pairs: u64,
     pub rejected: RejectionCounts,
     pub outstanding_pairs: usize,
     pub peak_outstanding_pairs: usize,
     pub retained_bytes: usize,
     pub peak_retained_bytes: usize,
-    /// Bytes the child reports having muxed toward the destination.
-    pub sent_bytes: u64,
+    /// Bytes the child reports having handed to its FLV muxer (`total_size`).
+    ///
+    /// This is **not** a delivery receipt. The bytes counted here have been
+    /// written into the child's output pipeline; how many of them have reached
+    /// the destination depends on the child's muxer interleaving, its socket
+    /// send buffer, and the receiver's window, none of which are observable
+    /// from here. Use [`StreamTelemetry::media_drift`] to judge liveness.
+    pub muxed_bytes: u64,
     pub encoded_frames: u64,
+    /// The child's muxed media timestamp (`out_time_us`): how much media it has
+    /// written to the output so far.
+    pub muxed_media_time: Duration,
+    /// How far [`StreamTelemetry::muxed_media_time`] has fallen behind wall
+    /// clock since the destination opened. A healthy real-time sink holds this
+    /// near zero; sustained growth means viewers are rebuffering.
+    pub media_drift: Duration,
     /// Whether the destination was ever observed open.
     pub connected: bool,
     pub stderr_tail: String,
@@ -629,6 +702,7 @@ struct Shared {
     kill_requested: AtomicBool,
     aborting: AtomicBool,
     redactor: Redactor,
+    format: RecordFormat,
     limits: StreamLimits,
     overflow: OverflowPolicy,
     destination: String,
@@ -648,13 +722,25 @@ struct SharedData {
     dropped_oldest: u64,
     discarded: u64,
     skipped: u64,
+    padded: u64,
     rejected: RejectionCounts,
     outstanding: usize,
     peak_outstanding: usize,
     retained_bytes: usize,
     peak_retained_bytes: usize,
-    sent_bytes: u64,
+    muxed_bytes: u64,
     encoded_frames: u64,
+    /// Latest `out_time_us` the child reported, once it has reported a usable
+    /// one at all.
+    out_time: Option<Duration>,
+    /// Wall instant and media timestamp of the first usable `out_time_us`.
+    /// Drift is measured from here, so a slow startup is not charged to the
+    /// running stream.
+    media_baseline: Option<(Instant, Duration)>,
+    /// Smallest drift ever observed. A child that runs a constant pipeline
+    /// latency behind wall clock is healthy; only growth beyond its own best
+    /// alignment is a failure.
+    drift_floor: Option<Duration>,
     connected: bool,
     first_dispatch: Option<Instant>,
     last_progress: Option<Instant>,
@@ -667,6 +753,18 @@ impl SharedData {
     fn cancelling(&self) -> bool {
         self.shutdown
             .is_some_and(|shutdown| shutdown.mode == ShutdownMode::Cancel)
+    }
+
+    /// How far the child's muxed media clock has fallen behind wall clock as of
+    /// `now`, using the latest sample rather than the latest report, so a child
+    /// that has stopped reporting shows its drift growing in real time.
+    fn media_drift(&self, now: Instant) -> Option<Duration> {
+        let (wall_origin, media_origin) = self.media_baseline?;
+        let advanced = self.out_time?.saturating_sub(media_origin);
+        Some(
+            now.saturating_duration_since(wall_origin)
+                .saturating_sub(advanced),
+        )
     }
 }
 
@@ -692,13 +790,17 @@ impl Shared {
                 dropped_oldest: 0,
                 discarded: 0,
                 skipped: 0,
+                padded: 0,
                 rejected: RejectionCounts::default(),
                 outstanding: 0,
                 peak_outstanding: 0,
                 retained_bytes: 0,
                 peak_retained_bytes: 0,
-                sent_bytes: 0,
+                muxed_bytes: 0,
                 encoded_frames: 0,
+                out_time: None,
+                media_baseline: None,
+                drift_floor: None,
                 connected: false,
                 first_dispatch: None,
                 last_progress: None,
@@ -710,6 +812,7 @@ impl Shared {
             kill_requested: AtomicBool::new(false),
             aborting: AtomicBool::new(false),
             redactor,
+            format: format.clone(),
             limits,
             overflow,
             destination: destination.redacted.clone(),
@@ -788,7 +891,7 @@ impl Shared {
         match key.trim() {
             "total_size" => {
                 if let Ok(bytes) = value.parse::<u64>() {
-                    data.sent_bytes = data.sent_bytes.max(bytes);
+                    data.muxed_bytes = data.muxed_bytes.max(bytes);
                 }
             }
             "frame" => {
@@ -796,11 +899,29 @@ impl Shared {
                     data.encoded_frames = data.encoded_frames.max(frames);
                 }
             }
+            // Reported in microseconds, and `N/A` or negative until the child
+            // has actually muxed something.
+            "out_time_us" => {
+                if let Ok(micros) = value.parse::<i64>()
+                    && let Ok(micros) = u64::try_from(micros)
+                {
+                    let media = Duration::from_micros(micros);
+                    data.out_time = Some(data.out_time.map_or(media, |seen| seen.max(media)));
+                }
+            }
             // A progress block is only emitted once the child has opened every
             // output, so the first one proves the destination accepted us.
             "progress" => {
+                let now = Instant::now();
                 data.connected = true;
-                data.last_progress = Some(Instant::now());
+                data.last_progress = Some(now);
+                if let Some(media) = data.out_time {
+                    data.media_baseline.get_or_insert((now, media));
+                    if let Some(drift) = data.media_drift(now) {
+                        data.drift_floor =
+                            Some(data.drift_floor.map_or(drift, |floor| floor.min(drift)));
+                    }
+                }
             }
             _ => {}
         }
@@ -808,24 +929,39 @@ impl Shared {
 
     /// Returns true when a deadline just became the sticky failure and the
     /// child must be torn down.
+    ///
+    /// The no-progress deadline runs whenever the sink is connected and
+    /// streaming. It is deliberately *not* gated on there being outstanding
+    /// pairs: a producer that pauses is routine, and a dead destination that
+    /// happens to coincide with a paused producer is exactly the case a live
+    /// operator must be told about rather than shielded from.
     fn check_deadlines(&self) -> bool {
         let mut data = self.lock();
-        if data.frozen || data.failure.is_some() || data.shutdown.is_some() {
+        if data.frozen || data.failure.is_some() || data.cancelling() {
+            return false;
+        }
+        // A drain is still streaming while pairs remain to flush. Once nothing
+        // is outstanding the drain is only waiting for the child to finalize
+        // and exit, which `stop_timeout` bounds.
+        if data.shutdown.is_some() && data.outstanding == 0 {
             return false;
         }
         let now = Instant::now();
         let failure = if data.connected {
-            (data.outstanding > 0)
-                .then_some(data.last_progress)
-                .flatten()
-                .filter(|last| {
-                    now.saturating_duration_since(*last) > self.limits.no_progress_timeout
-                })
-                .map(|_| StreamFailure::NoProgress)
+            let silent = data.last_progress.is_some_and(|last| {
+                now.saturating_duration_since(last) > self.limits.no_progress_timeout
+            });
+            let diverged = match (data.media_drift(now), data.drift_floor) {
+                (Some(drift), Some(floor)) => {
+                    drift.saturating_sub(floor) > self.limits.no_progress_timeout
+                }
+                _ => false,
+            };
+            (silent || diverged).then_some(StreamFailure::NoProgress)
         } else {
             data.first_dispatch
                 .filter(|armed| now.saturating_duration_since(*armed) > self.limits.connect_timeout)
-                .map(|_| StreamFailure::ConnectTimeout)
+                .map(|_| StreamFailure::DestinationTimeout)
         };
         let Some(failure) = failure else {
             return false;
@@ -873,6 +1009,12 @@ impl Shared {
 
     fn telemetry_locked(&self, data: &SharedData) -> StreamTelemetry {
         let stderr = data.stderr.iter().copied().collect::<Vec<_>>();
+        // Once the child is gone the media clock cannot advance again, so drift
+        // is frozen at its last report rather than growing with wall clock.
+        let clock = match data.child {
+            Some(_) => data.last_progress.unwrap_or_else(Instant::now),
+            None => Instant::now(),
+        };
         StreamTelemetry {
             state: data.state,
             child: match data.child {
@@ -890,13 +1032,16 @@ impl Shared {
             dropped_oldest_pairs: data.dropped_oldest,
             discarded_pairs: data.discarded,
             skipped_pairs: data.skipped,
+            padded_pairs: data.padded,
             rejected: data.rejected,
             outstanding_pairs: data.outstanding,
             peak_outstanding_pairs: data.peak_outstanding,
             retained_bytes: data.retained_bytes,
             peak_retained_bytes: data.peak_retained_bytes,
-            sent_bytes: data.sent_bytes,
+            muxed_bytes: data.muxed_bytes,
             encoded_frames: data.encoded_frames,
+            muxed_media_time: data.out_time.unwrap_or_default(),
+            media_drift: data.media_drift(clock).unwrap_or_default(),
             connected: data.connected,
             // Retained stderr was redacted before storage; this is a second,
             // cheap pass in case a rule was added after a byte was retained.
@@ -942,17 +1087,30 @@ impl Completion {
     }
 }
 
+/// What one write consumes: a real pair's payload, or synthesized padding.
+enum Payload {
+    /// A pair's own video or audio bytes. Also used for padding video, where
+    /// the previously delivered pair is simply repeated.
+    Pair(Arc<PairedFrame>),
+    /// Padding audio: `length` bytes taken from a shared zero buffer, sized for
+    /// the exact sequence being padded.
+    Silence { zeros: Arc<Vec<u8>>, length: usize },
+}
+
 struct WritePart {
-    frame: Arc<PairedFrame>,
+    payload: Payload,
     input: MediaInput,
+    /// `None` for padding: synthesized pairs were never admitted, so they own
+    /// no share of `outstanding` or `retained_bytes`.
     completion: Option<Arc<Completion>>,
 }
 
 impl WritePart {
     fn bytes(&self) -> &[u8] {
-        match self.input {
-            MediaInput::Video => self.frame.rgba(),
-            MediaInput::Audio => self.frame.audio_f32le(),
+        match (&self.payload, self.input) {
+            (Payload::Pair(frame), MediaInput::Video) => frame.rgba(),
+            (Payload::Pair(frame), MediaInput::Audio) => frame.audio_f32le(),
+            (Payload::Silence { zeros, length }, _) => &zeros[..*length],
         }
     }
 
@@ -1005,8 +1163,13 @@ impl Streamer {
     /// explicitly whether child reaping may still be running.
     #[allow(clippy::too_many_lines)]
     pub fn start(config: StreamConfig) -> Result<Self, StartError> {
-        validate_limits(&config.format, config.limits, config.encoder)
-            .map_err(|error| StartError::complete(StartErrorKind::InvalidLimits(error)))?;
+        validate_limits(
+            &config.format,
+            config.limits,
+            config.overflow,
+            config.encoder,
+        )
+        .map_err(|error| StartError::complete(StartErrorKind::InvalidLimits(error)))?;
         let layout = flv_channel_layout(config.format.channel_layout())
             .ok_or_else(|| StartError::complete(StartErrorKind::UnsupportedChannelLayout))?;
         let executable = streamer_executable(config.ffmpeg.clone())?;
@@ -1139,11 +1302,11 @@ impl Streamer {
             data.state = StreamState::Streaming;
         }
 
-        // Rendezvous channels: the writers hold no backlog of their own, so
-        // every pair the child has not yet consumed stays in the accounted
-        // queue where the overflow policy can still act on it.
-        let (video_sender, video_receiver) = mpsc::sync_channel(0);
-        let (audio_sender, audio_receiver) = mpsc::sync_channel(0);
+        // A one-deep buffer, not a rendezvous: see `WRITER_BACKLOG`. Everything
+        // handed to a writer is still counted in `outstanding`, so the admission
+        // bound stays honest either way.
+        let (video_sender, video_receiver) = mpsc::sync_channel(WRITER_BACKLOG);
+        let (audio_sender, audio_receiver) = mpsc::sync_channel(WRITER_BACKLOG);
         let (connected, pending, pending_receiver) = match first_input {
             MediaInput::Video => ((video, first_stream, video_receiver), audio, audio_receiver),
             MediaInput::Audio => ((audio, first_stream, audio_receiver), video, video_receiver),
@@ -1198,9 +1361,11 @@ impl Streamer {
 
     /// Admits one pair, waiting at most `enqueue_timeout` for space.
     ///
-    /// Sequence numbers must strictly increase; gaps are accepted and counted
-    /// as `skipped_pairs`. Every refusal is counted by reason and returns the
-    /// pair to the caller.
+    /// This is called from the render thread, so it is nonblocking by default
+    /// and can never wait longer than one frame period. Sequence numbers must
+    /// strictly increase; gaps are accepted, counted as `skipped_pairs`, and
+    /// padded out to the child so the media clock keeps tracking wall clock.
+    /// Every refusal is counted by reason and returns the pair to the caller.
     ///
     /// # Errors
     ///
@@ -1208,6 +1373,7 @@ impl Streamer {
     pub fn enqueue(&mut self, frame: PairedFrame) -> Result<(), EnqueueError> {
         let deadline = Instant::now().checked_add(self.limits.enqueue_timeout);
         let bytes = frame.retained_bytes();
+        let mut evicted = false;
         let mut data = self.shared.lock();
         loop {
             if self.shared.kill_requested.load(Ordering::Acquire) {
@@ -1266,9 +1432,16 @@ impl Streamer {
                 self.shared.signal.notify_all();
                 return Ok(());
             }
+            // Exactly one eviction per admission: `DropOldest` trades the
+            // oldest pair for the newest one. A pair that still does not fit
+            // after that is over the per-pair budget the limits were validated
+            // against, and must be refused rather than allowed to drain the
+            // whole queue behind it.
             if self.shared.overflow == OverflowPolicy::DropOldest
+                && !evicted
                 && let Some(queued) = data.queue.pop_front()
             {
+                evicted = true;
                 data.outstanding = data.outstanding.saturating_sub(1);
                 data.retained_bytes = data.retained_bytes.saturating_sub(queued.bytes);
                 data.dropped_oldest = data.dropped_oldest.saturating_add(1);
@@ -1352,10 +1525,13 @@ impl Streamer {
         self.shared.discard_queue(data);
     }
 
+    /// Compares the whole format, not the payload byte counts.
+    ///
+    /// Byte counts are not a format: a 48x64 frame has exactly as many RGBA
+    /// bytes as a 64x48 one and would be muxed transposed, and mono at 96 kHz
+    /// has exactly as many audio bytes as stereo at 48 kHz.
     fn matches_format(&self, frame: &PairedFrame) -> bool {
-        frame.rgba().len() == self.format.rgba_bytes_per_frame()
-            && expected_audio_bytes(&self.format, frame.sequence())
-                .is_some_and(|bytes| bytes == frame.audio_f32le().len())
+        frame.format() == &self.format
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1535,30 +1711,49 @@ fn expected_audio_bytes(format: &RecordFormat, sequence: SequenceNumber) -> Opti
         .checked_mul(size_of::<f32>())
 }
 
-fn maximum_pair_bytes(format: &RecordFormat) -> Option<usize> {
-    let channels = format.channel_layout().channels().len();
+/// One frame period, rounded up.
+fn frame_period(format: &RecordFormat) -> Duration {
     let rate = format.frame_rate();
-    let samples = (u128::from(format.sample_rate().hertz()) * u128::from(rate.denominator()))
+    let nanos = u128::from(rate.denominator())
+        .saturating_mul(1_000_000_000)
         .div_ceil(u128::from(rate.numerator()));
-    let audio = usize::try_from(
-        samples
-            .checked_mul(u128::try_from(channels).ok()?)?
-            .checked_mul(4)?,
-    )
-    .ok()?;
-    format
-        .rgba_bytes_per_frame()
-        .checked_add(audio)?
-        .checked_add(PAIR_OVERHEAD_ALLOWANCE)
+    Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
 }
+
+/// How many pairs the dispatcher may synthesize to close one gap.
+///
+/// Padding restores the media clock at real time and no faster: the child
+/// consumes it at the cadence it was told the input runs at. A gap wider than
+/// the no-progress budget therefore cannot be closed by padding at all, because
+/// the sink is already failing by the time the padding would finish, so the
+/// burst is bounded there and the watchdog owns the rest.
+fn maximum_padding_pairs(format: &RecordFormat, no_progress: Duration) -> u64 {
+    let rate = format.frame_rate();
+    let pairs = no_progress
+        .as_nanos()
+        .saturating_mul(u128::from(rate.numerator()))
+        / u128::from(rate.denominator()).saturating_mul(1_000_000_000);
+    u64::try_from(pairs).unwrap_or(u64::MAX).max(1)
+}
+
+/// Pairs that are admitted but no longer recallable: one being written, up to
+/// `WRITER_BACKLOG` buffered for the writer, and one held by the dispatcher
+/// while it hands the previous one over.
+const COMMITTED_PAIRS: usize = WRITER_BACKLOG + 2;
 
 fn validate_limits(
     format: &RecordFormat,
     limits: StreamLimits,
+    overflow: OverflowPolicy,
     encoder: EncoderSettings,
 ) -> Result<(), LimitsError> {
     if limits.max_outstanding_pairs == 0 {
         return Err(LimitsError::ZeroOutstandingPairs);
+    }
+    if overflow == OverflowPolicy::DropOldest && limits.max_outstanding_pairs <= COMMITTED_PAIRS {
+        return Err(LimitsError::OutstandingPairsTooFewToDropOldest {
+            required: COMMITTED_PAIRS + 1,
+        });
     }
     if limits.max_retained_bytes == 0 {
         return Err(LimitsError::ZeroRetainedBytes);
@@ -1570,7 +1765,7 @@ fn validate_limits(
     {
         return Err(LimitsError::ZeroTimeout);
     }
-    if limits.enqueue_timeout > MAX_ENQUEUE_TIMEOUT {
+    if limits.enqueue_timeout > frame_period(format) {
         return Err(LimitsError::EnqueueTimeoutTooLong);
     }
     if limits.max_stderr_bytes == 0 {
@@ -1600,7 +1795,10 @@ fn validate_limits(
     if !(1..=10).contains(&encoder.keyframe_interval_seconds) {
         return Err(LimitsError::KeyframeInterval);
     }
-    let required = maximum_pair_bytes(format)
+    // Derived from `PairedFrame`'s own accounting rather than restated here, so
+    // adding a field to a pair cannot silently invalidate this budget.
+    let required = format
+        .maximum_pair_bytes()
         .and_then(|bytes| bytes.checked_mul(limits.max_outstanding_pairs))
         .ok_or(LimitsError::ByteCountOverflow)?;
     if required > limits.max_retained_bytes {
@@ -1896,10 +2094,16 @@ fn accept_http_until(
                     kind,
                 });
             }
-            Err(_) => return Err(StreamFailure::ConnectTimeout),
+            Err(_) => {
+                return Err(StreamFailure::InputTimeout {
+                    input: endpoint.input,
+                });
+            }
         }
     }
-    Err(StreamFailure::ConnectTimeout)
+    Err(StreamFailure::InputTimeout {
+        input: endpoint.input,
+    })
 }
 
 fn write_parts(
@@ -1918,8 +2122,12 @@ fn write_parts(
     }
 }
 
-/// Writes one payload, letting the supervising deadlines rather than a single
-/// socket timeout decide when a slow child has become a terminal failure.
+/// Writes one payload under the configured no-progress budget.
+///
+/// The socket's own timeout is kept short so cancellation is observed promptly,
+/// but a child that accepts nothing is a terminal failure after
+/// `no_progress_timeout`, not after `stop_timeout`: a wedged input writer would
+/// otherwise hold a graceful drain open for the entire stop budget.
 fn write_part(
     stream: &mut TcpStream,
     part: &WritePart,
@@ -1928,6 +2136,7 @@ fn write_part(
 ) -> bool {
     let bytes = part.bytes();
     let mut offset = 0;
+    let mut moved = Instant::now();
     while offset < bytes.len() {
         if shared.is_aborting() {
             return false;
@@ -1937,14 +2146,25 @@ fn write_part(
                 shared.fail_write(input, io::ErrorKind::WriteZero);
                 return false;
             }
-            Ok(count) => offset += count,
+            Ok(count) => {
+                offset += count;
+                moved = Instant::now();
+            }
             Err(error)
                 if matches!(
                     error.kind(),
                     io::ErrorKind::Interrupted
                         | io::ErrorKind::WouldBlock
                         | io::ErrorKind::TimedOut
-                ) => {}
+                ) =>
+            {
+                if Instant::now().saturating_duration_since(moved)
+                    > shared.limits.no_progress_timeout
+                {
+                    shared.fail_write(input, io::ErrorKind::TimedOut);
+                    return false;
+                }
+            }
             Err(error) => {
                 shared.fail_write(input, error.kind());
                 return false;
@@ -1952,6 +2172,102 @@ fn write_part(
         }
     }
     true
+}
+
+/// Hands one pair to both writers, and closes any gap in the dispatched
+/// sequence before it so the child's media clock keeps tracking wall clock.
+struct Dispatcher {
+    shared: Arc<Shared>,
+    video: mpsc::SyncSender<WritePart>,
+    audio: mpsc::SyncSender<WritePart>,
+    /// The last pair actually handed to the writers, repeated as padding video.
+    previous: Option<Arc<PairedFrame>>,
+    /// The sequence the next dispatched pair should carry if nothing is lost.
+    expected: Option<SequenceNumber>,
+    zeros: Arc<Vec<u8>>,
+    maximum_padding: u64,
+}
+
+impl Dispatcher {
+    /// Returns false once the dispatcher must stop.
+    fn send_pair(&mut self, video: WritePart, audio: WritePart) -> bool {
+        if let Err(error) = self.video.send(video) {
+            error.0.complete(false);
+            audio.complete(false);
+            self.shared
+                .fail(StreamFailure::DispatcherClosed(MediaInput::Video));
+            return false;
+        }
+        if let Err(error) = self.audio.send(audio) {
+            error.0.complete(false);
+            self.shared
+                .fail(StreamFailure::DispatcherClosed(MediaInput::Audio));
+            return false;
+        }
+        true
+    }
+
+    fn pad_to(&mut self, sequence: SequenceNumber) -> bool {
+        let (Some(previous), Some(expected)) = (self.previous.clone(), self.expected) else {
+            return true;
+        };
+        let gap = sequence.get().saturating_sub(expected.get());
+        for index in 0..gap.min(self.maximum_padding) {
+            if self.shared.is_aborting() {
+                return false;
+            }
+            let missing = SequenceNumber::new(expected.get().saturating_add(index));
+            let Some(length) = expected_audio_bytes(&self.shared.format, missing) else {
+                return true;
+            };
+            let repeat = WritePart {
+                payload: Payload::Pair(Arc::clone(&previous)),
+                input: MediaInput::Video,
+                completion: None,
+            };
+            let silence = WritePart {
+                payload: Payload::Silence {
+                    zeros: Arc::clone(&self.zeros),
+                    length: length.min(self.zeros.len()),
+                },
+                input: MediaInput::Audio,
+                completion: None,
+            };
+            if !self.send_pair(repeat, silence) {
+                return false;
+            }
+            let mut data = self.shared.lock();
+            data.padded = data.padded.saturating_add(1);
+        }
+        true
+    }
+
+    fn dispatch(&mut self, queued: Queued) -> bool {
+        let sequence = queued.frame.sequence();
+        if !self.pad_to(sequence) {
+            return false;
+        }
+        let completion = Arc::new(Completion {
+            shared: Arc::clone(&self.shared),
+            bytes: queued.bytes,
+            remaining: AtomicUsize::new(2),
+            successful: AtomicBool::new(true),
+        });
+        let frame = Arc::new(queued.frame);
+        let video = WritePart {
+            payload: Payload::Pair(Arc::clone(&frame)),
+            input: MediaInput::Video,
+            completion: Some(Arc::clone(&completion)),
+        };
+        let audio = WritePart {
+            payload: Payload::Pair(Arc::clone(&frame)),
+            input: MediaInput::Audio,
+            completion: Some(completion),
+        };
+        self.expected = sequence.checked_next();
+        self.previous = Some(frame);
+        self.send_pair(video, audio)
+    }
 }
 
 fn spawn_dispatcher(
@@ -1962,6 +2278,18 @@ fn spawn_dispatcher(
     thread::Builder::new()
         .name("fm-ffmpeg-stream-dispatcher".to_owned())
         .spawn(move || {
+            let zeros = vec![0_u8; shared.format.maximum_audio_bytes().unwrap_or_default()];
+            let maximum_padding =
+                maximum_padding_pairs(&shared.format, shared.limits.no_progress_timeout);
+            let mut dispatcher = Dispatcher {
+                shared: Arc::clone(&shared),
+                video,
+                audio,
+                previous: None,
+                expected: None,
+                zeros: Arc::new(zeros),
+                maximum_padding,
+            };
             loop {
                 let queued = {
                     let mut data = shared.lock();
@@ -1986,32 +2314,7 @@ fn spawn_dispatcher(
                         data = guard;
                     }
                 };
-                let completion = Arc::new(Completion {
-                    shared: Arc::clone(&shared),
-                    bytes: queued.bytes,
-                    remaining: AtomicUsize::new(2),
-                    successful: AtomicBool::new(true),
-                });
-                let frame = Arc::new(queued.frame);
-                let video_part = WritePart {
-                    frame: Arc::clone(&frame),
-                    input: MediaInput::Video,
-                    completion: Some(Arc::clone(&completion)),
-                };
-                let audio_part = WritePart {
-                    frame,
-                    input: MediaInput::Audio,
-                    completion: Some(completion),
-                };
-                if let Err(error) = video.send(video_part) {
-                    error.0.complete(false);
-                    audio_part.complete(false);
-                    shared.fail(StreamFailure::DispatcherClosed(MediaInput::Video));
-                    return;
-                }
-                if let Err(error) = audio.send(audio_part) {
-                    error.0.complete(false);
-                    shared.fail(StreamFailure::DispatcherClosed(MediaInput::Audio));
+                if !dispatcher.dispatch(queued) {
                     return;
                 }
             }
@@ -2375,6 +2678,16 @@ fn command_args(config: &StreamConfig, layout: &str, inputs: &Inputs<'_>) -> Vec
         format!("{}x{}", dimensions.width(), dimensions.height()),
         "-framerate".to_owned(),
         format!("{}/{}", rate.numerator(), rate.denominator()),
+        // Both raw inputs are fully described on this command line, so there is
+        // nothing left to probe. Without this the child spends `analyzeduration`
+        // (5s by default) collecting one input before it reads a byte of the
+        // other, while the pair writers can only advance in lockstep: the sink
+        // deadlocks at startup at every frame size that does not fit in a socket
+        // buffer, which is every real broadcast resolution.
+        "-probesize".to_owned(),
+        PROBE_SIZE.to_owned(),
+        "-analyzeduration".to_owned(),
+        "0".to_owned(),
         "-protocol_whitelist".to_owned(),
         "http,tcp".to_owned(),
         "-i".to_owned(),
@@ -2387,6 +2700,10 @@ fn command_args(config: &StreamConfig, layout: &str, inputs: &Inputs<'_>) -> Vec
         format.channel_layout().channels().len().to_string(),
         "-channel_layout".to_owned(),
         layout.to_owned(),
+        "-probesize".to_owned(),
+        PROBE_SIZE.to_owned(),
+        "-analyzeduration".to_owned(),
+        "0".to_owned(),
         "-protocol_whitelist".to_owned(),
         "http,tcp".to_owned(),
         "-i".to_owned(),
@@ -2564,20 +2881,64 @@ mod tests {
     fn limits_and_layouts_are_validated_before_any_spawn() {
         let format = format();
         let encoder = EncoderSettings::default();
+        let drop_oldest = OverflowPolicy::DropOldest;
         assert_eq!(
-            validate_limits(&format, StreamLimits::default(), encoder),
+            validate_limits(&format, StreamLimits::default(), drop_oldest, encoder),
             Ok(())
+        );
+        // One frame period at 30fps is 33.3ms; a render thread may not be asked
+        // to wait longer than the frame it is producing.
+        assert_eq!(
+            validate_limits(
+                &format,
+                StreamLimits {
+                    enqueue_timeout: Duration::from_millis(34),
+                    ..StreamLimits::default()
+                },
+                drop_oldest,
+                encoder
+            ),
+            Err(LimitsError::EnqueueTimeoutTooLong)
         );
         assert_eq!(
             validate_limits(
                 &format,
                 StreamLimits {
-                    enqueue_timeout: Duration::from_secs(30),
+                    enqueue_timeout: Duration::from_millis(33),
                     ..StreamLimits::default()
                 },
+                drop_oldest,
                 encoder
             ),
-            Err(LimitsError::EnqueueTimeoutTooLong)
+            Ok(())
+        );
+        // A queue with nothing recallable cannot honour `DropOldest`, but is
+        // perfectly usable with `Reject`.
+        assert_eq!(
+            validate_limits(
+                &format,
+                StreamLimits {
+                    max_outstanding_pairs: COMMITTED_PAIRS,
+                    ..StreamLimits::default()
+                },
+                drop_oldest,
+                encoder
+            ),
+            Err(LimitsError::OutstandingPairsTooFewToDropOldest {
+                required: COMMITTED_PAIRS + 1
+            })
+        );
+        assert_eq!(
+            validate_limits(
+                &format,
+                StreamLimits {
+                    max_outstanding_pairs: 1,
+                    ..StreamLimits::default()
+                },
+                OverflowPolicy::Reject,
+                encoder
+            ),
+            Ok(())
         );
         assert!(matches!(
             validate_limits(
@@ -2586,6 +2947,7 @@ mod tests {
                     max_retained_bytes: 1_024,
                     ..StreamLimits::default()
                 },
+                drop_oldest,
                 encoder
             ),
             Err(LimitsError::RetainedBytesTooSmall { .. })
@@ -2594,6 +2956,7 @@ mod tests {
             validate_limits(
                 &format,
                 StreamLimits::default(),
+                drop_oldest,
                 EncoderSettings {
                     video_bitrate_kbps: 0,
                     ..encoder
