@@ -38,7 +38,7 @@ use fm_types::{
     AudioFormat, BusId, ChannelLayout, ColorMetadata, FrameRate, InputId, OutputId, PixelFormat,
     ProjectId, SampleFormat, SampleRate, ScanMode, SceneId, VideoDimensions, VideoFormat,
 };
-use freemixd::ReadinessRecord;
+use freemixd::{ReadinessRecord, StatusReadinessRecord};
 
 static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const U64_MAX_ID: u128 = 18_446_744_073_709_551_615;
@@ -143,6 +143,52 @@ impl Daemon {
                 project_id: readiness.project_id,
             },
             web_address,
+        )
+    }
+
+    fn start_with_status(project: &Path, token: &str, once: bool) -> (Self, SocketAddr) {
+        let mut command = ProcessCommand::new(env!("CARGO_BIN_EXE_freemixd"));
+        command
+            .arg("serve")
+            .arg(project)
+            .args(["--listen", "127.0.0.1:0", "--status-listen", "127.0.0.1:0"])
+            .env("FREEMIXD_STATUS_TOKEN", token);
+        if once {
+            command.arg("--once");
+        }
+        let mut child = command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut lines = read_startup_lines(&mut child, 2);
+        let line = lines.remove(0);
+        let status_line = lines.remove(0);
+        let readiness = line.parse::<ReadinessRecord>().unwrap_or_else(|error| {
+            startup_failure(
+                &mut child,
+                vec![line.clone(), status_line.clone()],
+                error.to_string(),
+                None,
+            )
+        });
+        let status = status_line
+            .parse::<StatusReadinessRecord>()
+            .unwrap_or_else(|error| {
+                startup_failure(
+                    &mut child,
+                    vec![line.clone(), status_line.clone()],
+                    error.to_string(),
+                    None,
+                )
+            });
+        (
+            Self {
+                child: Some(child),
+                address: readiness.address,
+                project_id: readiness.project_id,
+            },
+            status.address,
         )
     }
 
@@ -550,6 +596,142 @@ fn daemon_acknowledges_only_valid_heartbeats() {
     };
     assert_eq!(acknowledgement.heartbeat_sequence, 3);
 
+    drop(client);
+    daemon.wait_success();
+}
+
+const STATUS_TOKEN: &str = "status-token-0123456789abcdef0123456789";
+
+/// Sends one raw HTTP/1.1 request and returns the whole response the listener
+/// wrote before closing. Write failures are tolerated so a rejected request
+/// still surfaces the daemon's response instead of a client-side panic.
+fn status_request(address: SocketAddr, request: &[u8]) -> String {
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(1)).unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let _ = stream.write_all(request);
+    let _ = stream.flush();
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response);
+    String::from_utf8_lossy(&response).into_owned()
+}
+
+#[test]
+fn status_listener_serves_health_readiness_and_guarded_support_bundle() {
+    let directory = TestDirectory::new("status-listener");
+    let project_path = directory.project_path();
+    create_project(&project_path);
+
+    let (daemon, status_address) = Daemon::start_with_status(&project_path, STATUS_TOKEN, false);
+
+    let health = status_request(
+        status_address,
+        b"GET /healthz HTTP/1.1\r\nHost: status\r\n\r\n",
+    );
+    assert!(health.starts_with("HTTP/1.1 200 OK\r\n"), "{health}");
+    assert!(
+        health.contains("FREEMIXD_STATUS\tv=1\tcheck=healthz\tstatus=live\t"),
+        "{health}"
+    );
+
+    let ready = status_request(
+        status_address,
+        b"GET /readyz HTTP/1.1\r\nHost: status\r\n\r\n",
+    );
+    assert!(ready.starts_with("HTTP/1.1 200 OK\r\n"), "{ready}");
+    assert!(
+        ready.contains(
+            "check=readyz\tstatus=ready\treadiness=ready\thealth=healthy\tliveness=live\t"
+        ),
+        "{ready}"
+    );
+
+    let unknown = status_request(
+        status_address,
+        b"GET /metrics HTTP/1.1\r\nHost: status\r\n\r\n",
+    );
+    assert!(
+        unknown.starts_with("HTTP/1.1 404 Not Found\r\n"),
+        "{unknown}"
+    );
+
+    let anonymous = status_request(
+        status_address,
+        b"GET /v1/support-bundle HTTP/1.1\r\nHost: status\r\n\r\n",
+    );
+    assert!(
+        anonymous.starts_with("HTTP/1.1 401 Unauthorized\r\n"),
+        "{anonymous}"
+    );
+    assert!(!anonymous.contains(STATUS_TOKEN), "{anonymous}");
+
+    let wrong = status_request(
+        status_address,
+        b"GET /v1/support-bundle HTTP/1.1\r\nHost: status\r\nAuthorization: Bearer status-token-0123456789abcdef012345678\r\n\r\n",
+    );
+    assert!(
+        wrong.starts_with("HTTP/1.1 401 Unauthorized\r\n"),
+        "{wrong}"
+    );
+
+    let bundle = status_request(
+        status_address,
+        format!(
+            "GET /v1/support-bundle HTTP/1.1\r\nHost: status\r\nAuthorization: Bearer {STATUS_TOKEN}\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    assert!(bundle.starts_with("HTTP/1.1 200 OK\r\n"), "{bundle}");
+    assert!(
+        bundle.contains("check=support-bundle\tstatus=ok\t"),
+        "{bundle}"
+    );
+    assert!(bundle.contains("\"schema\":\"fm-support-v1\""), "{bundle}");
+    assert!(!bundle.contains(STATUS_TOKEN), "{bundle}");
+    assert!(
+        !bundle.contains(&project_path.display().to_string()),
+        "{bundle}"
+    );
+    assert!(!bundle.contains(&status_address.to_string()), "{bundle}");
+
+    daemon.stop();
+}
+
+#[test]
+fn status_listener_rejects_oversized_requests_and_stops_with_the_daemon() {
+    let directory = TestDirectory::new("status-listener-bounds");
+    let project_path = directory.project_path();
+    create_project(&project_path);
+
+    let (daemon, status_address) = Daemon::start_with_status(&project_path, STATUS_TOKEN, true);
+
+    let mut oversized = String::from("GET /healthz HTTP/1.1\r\nHost: status\r\n");
+    while oversized.len() < 8 * 1024 {
+        oversized.push_str("X-Padding: 0123456789012345678901234567890123456789\r\n");
+    }
+    oversized.push_str("\r\n");
+    let rejected = status_request(status_address, oversized.as_bytes());
+    assert!(
+        rejected.starts_with("HTTP/1.1 413 Content Too Large\r\n"),
+        "{rejected}"
+    );
+    assert!(
+        rejected.contains("check=request\tstatus=too-large\tlimit_bytes=4096"),
+        "{rejected}"
+    );
+
+    let health = status_request(
+        status_address,
+        b"GET /healthz HTTP/1.1\r\nHost: status\r\n\r\n",
+    );
+    assert!(health.starts_with("HTTP/1.1 200 OK\r\n"), "{health}");
+
+    let mut client = daemon.connect();
+    client.handshake(None);
     drop(client);
     daemon.wait_success();
 }

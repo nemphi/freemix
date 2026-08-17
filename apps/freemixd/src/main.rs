@@ -77,15 +77,18 @@ use fm_switcher::{
     StingerSlotId, SwitcherState, TBarPosition, TBarState, TransitionKind,
 };
 use fm_types::{InputId, ProjectId};
-use freemixd::ReadinessRecord;
+use freemixd::{ReadinessRecord, StatusReadinessRecord};
 
 mod latest_record;
 mod non_native_sessions;
 #[cfg(feature = "macos-program-surface")]
 mod program_surface;
+mod status_listener;
 #[cfg(feature = "native-media")]
 mod stinger_mutation;
 mod web;
+
+use status_listener::{DaemonStatus, StatusListener};
 
 #[cfg(feature = "native-media")]
 use fm_codec_ffmpeg::{
@@ -172,6 +175,8 @@ const PROGRAM_CHECKPOINT_MARGIN: Duration = Duration::from_secs(5);
 struct ProcessShutdown {
     requested: Arc<AtomicBool>,
     diagnostic_deadline: Option<Instant>,
+    /// Snapshot published to the status listener; never read by the daemon.
+    status: Arc<DaemonStatus>,
 }
 
 impl ProcessShutdown {
@@ -202,6 +207,7 @@ fn register_process_shutdown() -> AppResult<ProcessShutdown> {
     Ok(ProcessShutdown {
         requested,
         diagnostic_deadline: None,
+        status: DaemonStatus::new(),
     })
 }
 
@@ -213,6 +219,7 @@ fn register_process_shutdown() -> AppResult<ProcessShutdown> {
     Ok(ProcessShutdown {
         requested,
         diagnostic_deadline: None,
+        status: DaemonStatus::new(),
     })
 }
 
@@ -221,6 +228,7 @@ fn register_process_shutdown() -> AppResult<ProcessShutdown> {
     Ok(ProcessShutdown {
         requested: Arc::new(AtomicBool::new(false)),
         diagnostic_deadline: None,
+        status: DaemonStatus::new(),
     })
 }
 
@@ -238,17 +246,28 @@ enum OnceClientOutcome {
     HandshakeResponseWritten,
 }
 
+/// Polled by every daemon loop, which makes it the control plane's liveness
+/// beat as well as its cooperative stop check.
 fn requested_daemon_shutdown(
     native: Option<&NativeDaemon>,
     process: Option<&ProcessShutdown>,
 ) -> Option<DaemonShutdownReason> {
-    if process.is_some_and(ProcessShutdown::requested) {
+    if let Some(process) = process {
+        process.status.beat();
+    }
+    let reason = if process.is_some_and(ProcessShutdown::requested) {
         Some(DaemonShutdownReason::ProcessSignal)
     } else if native.is_some_and(NativeDaemon::shutdown_requested) {
         Some(DaemonShutdownReason::ProgramSurface)
     } else {
         None
+    };
+    if reason.is_some()
+        && let Some(process) = process
+    {
+        process.status.begin_draining();
     }
+    reason
 }
 
 trait ProjectSaver {
@@ -3002,6 +3021,7 @@ enum Command {
         project: PathBuf,
         listen: SocketAddr,
         web_listen: Option<SocketAddr>,
+        status_listen: Option<SocketAddr>,
         once: bool,
         native_media: bool,
         fullscreen_program: bool,
@@ -3044,6 +3064,7 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> AppResult<Command>
                 .ok_or_else(|| AppFailure("missing project path".into()))?;
             let mut listen = DEFAULT_LISTEN.parse()?;
             let mut web_listen: Option<SocketAddr> = None;
+            let mut status_listen: Option<SocketAddr> = None;
             let mut once = false;
             let mut native_media = false;
             let mut fullscreen_program = false;
@@ -3091,6 +3112,15 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> AppResult<Command>
                     })?);
                     continue;
                 }
+                if let Some(value) = option.strip_prefix("--status-listen=") {
+                    if status_listen.is_some() {
+                        return Err(AppFailure("duplicate option `--status-listen`".into()).into());
+                    }
+                    status_listen = Some(value.parse().map_err(|error| {
+                        AppFailure(format!("invalid status listen address: {error}"))
+                    })?);
+                    continue;
+                }
                 match option.as_str() {
                     "--listen" => {
                         listen = arguments
@@ -3110,6 +3140,19 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> AppResult<Command>
                             .ok_or_else(|| AppFailure("missing value for --web-listen".into()))?;
                         web_listen = Some(value.parse().map_err(|error| {
                             AppFailure(format!("invalid web listen address: {error}"))
+                        })?);
+                    }
+                    "--status-listen" => {
+                        if status_listen.is_some() {
+                            return Err(
+                                AppFailure("duplicate option `--status-listen`".into()).into()
+                            );
+                        }
+                        let value = arguments.next().ok_or_else(|| {
+                            AppFailure("missing value for --status-listen".into())
+                        })?;
+                        status_listen = Some(value.parse().map_err(|error| {
+                            AppFailure(format!("invalid status listen address: {error}"))
                         })?);
                     }
                     "--once" => once = true,
@@ -3224,10 +3267,24 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> AppResult<Command>
                     .into());
                 }
             }
+            if let Some(address) = status_listen {
+                if !address.ip().is_loopback() {
+                    return Err(
+                        AppFailure("--status-listen must use a loopback address".into()).into(),
+                    );
+                }
+                if fullscreen_program {
+                    return Err(AppFailure(
+                        "--status-listen cannot be combined with --fullscreen-program".into(),
+                    )
+                    .into());
+                }
+            }
             Ok(Command::Serve {
                 project,
                 listen,
                 web_listen,
+                status_listen,
                 once,
                 native_media,
                 fullscreen_program,
@@ -3307,6 +3364,7 @@ fn run(command: Command) -> AppResult<()> {
             project,
             listen,
             web_listen,
+            status_listen,
             once,
             native_media,
             fullscreen_program,
@@ -3327,10 +3385,13 @@ fn run(command: Command) -> AppResult<()> {
             } else {
                 serve(
                     &project,
-                    listen,
+                    ServeListeners {
+                        listen,
+                        web_listen,
+                        status_listen,
+                    },
                     once,
                     native_media,
-                    web_listen,
                     camera_helper,
                     record_program,
                     diagnostic_stop_after,
@@ -3399,20 +3460,26 @@ struct ProgramServeSetup {
     camera_helper: Option<PathBuf>,
 }
 
+/// The daemon's bound sockets: control, optional web gateway, optional status.
+#[derive(Clone, Copy)]
+struct ServeListeners {
+    listen: SocketAddr,
+    web_listen: Option<SocketAddr>,
+    status_listen: Option<SocketAddr>,
+}
+
 fn serve(
     path: &Path,
-    listen: SocketAddr,
+    listeners: ServeListeners,
     once: bool,
     native_media: bool,
-    web_listen: Option<SocketAddr>,
     camera_helper: Option<PathBuf>,
     record_program: Option<PathBuf>,
     diagnostic_stop_after: Option<Duration>,
 ) -> AppResult<()> {
     serve_inner(
         path,
-        listen,
-        web_listen,
+        listeners,
         once,
         if native_media {
             NativeServeMode::Headless { camera_helper }
@@ -3438,8 +3505,11 @@ fn serve_program_worker(
 ) -> AppResult<()> {
     serve_inner(
         path,
-        listen,
-        None,
+        ServeListeners {
+            listen,
+            web_listen: None,
+            status_listen: None,
+        },
         once,
         NativeServeMode::Program(Box::new(ProgramServeSetup {
             context,
@@ -3455,13 +3525,17 @@ fn serve_program_worker(
 #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
 fn serve_inner(
     path: &Path,
-    listen: SocketAddr,
-    web_listen: Option<SocketAddr>,
+    listeners: ServeListeners,
     once: bool,
     mode: NativeServeMode,
     record_program: Option<PathBuf>,
     diagnostic_stop_after: Option<Duration>,
 ) -> AppResult<()> {
+    let ServeListeners {
+        listen,
+        web_listen,
+        status_listen,
+    } = listeners;
     if !listen.ip().is_loopback() {
         return Err(AppFailure(format!(
             "development mode requires a loopback listen address, got {}",
@@ -3481,6 +3555,9 @@ fn serve_inner(
                 AppFailure("--web-listen requires non-native simulated mode".into()).into(),
             );
         }
+    }
+    if status_listen.is_some_and(|address| !address.ip().is_loopback()) {
+        return Err(AppFailure("--status-listen must use a loopback address".into()).into());
     }
 
     let store = ProjectStore::new(path)?;
@@ -3579,7 +3656,11 @@ fn serve_inner(
     } else {
         None
     };
+    let operator_status = status_listen
+        .map(|address| StatusListener::bind(address, &process_shutdown.status))
+        .transpose()?;
     server.mark_ready()?;
+    process_shutdown.status.publish(server.status());
     let readiness = ReadinessRecord {
         address: listener.local_addr()?,
         project_id,
@@ -3590,6 +3671,15 @@ fn serve_inner(
         println!("FREEMIXD_WEB_READY\tv=1\taddress={}", web.address());
         std::io::stdout().flush()?;
         web.start_accepting();
+    }
+    if let Some(listener) = operator_status.as_ref() {
+        println!(
+            "{}",
+            StatusReadinessRecord {
+                address: listener.address()
+            }
+        );
+        std::io::stdout().flush()?;
     }
     if let Some(duration) = diagnostic_stop_after {
         process_shutdown.set_diagnostic_deadline(duration)?;
@@ -3608,9 +3698,14 @@ fn serve_inner(
         once,
         web_gateway.as_ref(),
     );
+    process_shutdown.status.begin_draining();
     let gateway_result = web_gateway.map(web::WebGateway::shutdown);
+    let status_result = operator_status.map(StatusListener::shutdown);
     let _shutdown_reason = session_result?;
     if let Some(result) = gateway_result {
+        result?;
+    }
+    if let Some(result) = status_result {
         result?;
     }
     if native.is_some() {
@@ -5392,7 +5487,7 @@ fn now_millis() -> AppResult<u64> {
 fn print_help() {
     println!(
         "FreeMix headless production daemon\n\n\
-Usage:\n  freemixd serve <show.freemix> [--listen 127.0.0.1:0] [--web-listen 127.0.0.1:0] [--once] [--native-media [--camera-helper PATH]] [--record-program output.mp4] [--diagnostic-stop-after 10m] [--fullscreen-program [--fullscreen-display 0]]\n  freemixd help\n  freemixd --version\n\n\
+Usage:\n  freemixd serve <show.freemix> [--listen 127.0.0.1:0] [--web-listen 127.0.0.1:0] [--status-listen 127.0.0.1:0] [--once] [--native-media [--camera-helper PATH]] [--record-program output.mp4] [--diagnostic-stop-after 10m] [--fullscreen-program [--fullscreen-display 0]]\n  freemixd help\n  freemixd --version\n\n\
 Native media is opt-in; without it the daemon uses simulated frame realization.\n\
 --camera-helper overrides the developer AVFoundation helper path for exact macOS Device inputs; it never requests permission.\n\
 Program recording requires native media, an existing output parent, and a new final .mp4 file. Existing files are never overwritten.\n\
@@ -5400,6 +5495,7 @@ Use --record-program=<path> when the output name begins with --. Recorder capabi
 macOS fullscreen display selection is a zero-based index ordered by physical position, then stable descriptive fields.\n\
 --diagnostic-stop-after schedules cooperative simulated or headless native shutdown after readiness; accepted units are ms, s, m, and h up to 24h.\n\
 --web-listen enables the loopback-only `/v1/control` WebSocket listener and requires FREEMIXD_WEB_TOKEN.\n\
+--status-listen enables the loopback-only operator status listener serving /healthz, /readyz, and the token-guarded /v1/support-bundle; it requires FREEMIXD_STATUS_TOKEN and is unavailable with --fullscreen-program.\n\
 Native mode continues across client disconnects; close the Program window or press Escape for bounded shutdown."
     );
 }
@@ -5942,6 +6038,7 @@ mod tests {
                 project: "show.freemix".into(),
                 listen: "127.0.0.1:9123".parse().unwrap(),
                 web_listen: None,
+                status_listen: None,
                 once: true,
                 native_media: false,
                 fullscreen_program: false,
