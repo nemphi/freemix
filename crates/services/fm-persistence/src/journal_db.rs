@@ -10,8 +10,13 @@
 //!
 //! - ordinary project inspection ([`crate::ProjectStore::load`]) never opens
 //!   the database, so reading a project is never blocked by a running daemon;
-//! - the database is opened lazily, used, and dropped inside a single journal
-//!   operation, so the lock window is as short as the work itself.
+//! - the process that serves the project opens it once
+//!   ([`crate::ProjectStore::open_journal_writer`]) and holds it for its whole
+//!   run, because opening rebuilds the write-ahead log index and doing that per
+//!   command makes every command cost what the whole show has cost so far.
+//!   Every other journal operation is a one-shot: it opens, works and drops,
+//!   so the lock window is as short as the work itself and offline access is
+//!   refused only while a server is actually running.
 //!
 //! A refused lock is [`JournalError::Locked`], distinct from
 //! [`JournalError::Database`], after a small bounded retry.
@@ -54,6 +59,14 @@ const SYNCHRONOUS_FULL: i64 = 2;
 /// `PRAGMA data_sync_retry` value that reports an fsync failure instead of
 /// aborting the process.
 const DATA_SYNC_RETRY_ON: i64 = 1;
+
+/// `PRAGMA temp_store` value that keeps scratch storage in memory.
+///
+/// Left at its default, turso puts its temp database in a fresh directory under
+/// `TMPDIR`, which is outside the bundle: a full or read-only `/tmp` would then
+/// refuse commands for a project stored on a healthy disk. Nothing here uses a
+/// temp table, so the scratch space costs nothing and belongs nowhere.
+const TEMP_STORE_MEMORY: i64 = 2;
 
 /// Attempts to acquire the exclusive file lock before reporting
 /// [`JournalError::Locked`].
@@ -258,6 +271,7 @@ impl JournalDatabase {
         // running show. Confirm both settings rather than assuming them.
         opened.set_pragma("synchronous", "FULL", SYNCHRONOUS_FULL, deadline)?;
         opened.set_pragma("data_sync_retry", "ON", DATA_SYNC_RETRY_ON, deadline)?;
+        opened.set_pragma("temp_store", "MEMORY", TEMP_STORE_MEMORY, deadline)?;
         Ok(opened)
     }
 

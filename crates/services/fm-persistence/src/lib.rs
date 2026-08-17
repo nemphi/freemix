@@ -9,8 +9,9 @@ mod store;
 
 pub use asset::{AssetAuditIssue, AssetAuditReason, AssetResolveError, validate_asset_uri};
 pub use journal::{
-    CompactionReport, JournalError, JournalObservation, JournalScan, MAX_JOURNAL_RECORD_BYTES,
-    MAX_UNAPPLIED_JOURNAL_BATCHES, MAX_UNAPPLIED_JOURNAL_BYTES, MutationBatch,
+    AbandonedJournal, CompactionReport, JournalError, JournalObservation, JournalScan,
+    JournalWriter, MAX_JOURNAL_RECORD_BYTES, MAX_UNAPPLIED_JOURNAL_BATCHES,
+    MAX_UNAPPLIED_JOURNAL_BYTES, MutationBatch,
 };
 pub use model::{
     CURRENT_SCHEMA_VERSION, FadeToBlackState, IdempotencyReceipt,

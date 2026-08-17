@@ -7,8 +7,15 @@ rust-version.workspace = true
 
 [dependencies]
 fm-codec-api = { path = "../fm-codec-api" }
+fm-codec-ffmpeg = { path = "../fm-codec-ffmpeg" }
 fm-frame = { path = "../../media/fm-frame" }
 fm-io-api = { path = "../fm-io-api" }
+
+# `RecordFormat` is supplied by the caller because building one needs
+# `fm_types::FrameRate`, which the library itself never names. The RTMP
+# transport tests do have to build one.
+[dev-dependencies]
+fm-types = { path = "../../foundation/fm-types" }
 
 [lints]
 workspace = true

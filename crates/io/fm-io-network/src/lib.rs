@@ -1,14 +1,18 @@
 //! Transport-neutral network output state, rendition planning, and HLS metadata.
 //!
-//! This crate deliberately performs no encoding and opens no sockets. Transport
-//! adapters implement [`TransportSink`]; the state machines in this crate own
-//! bounded queues, retries, telemetry, and failure isolation.
+//! The state machines here own bounded queues, retries, telemetry, and failure
+//! isolation, and they encode nothing and open nothing themselves: transport
+//! adapters implement [`TransportSink`]. [`rtmp`] is the one module that does
+//! open a transport, mapping that trait onto one bounded `FFmpeg` child per
+//! connection attempt so a live RTMP output gets the retry, backoff, and
+//! backup-endpoint behaviour modelled here on top of a real connection.
 
 mod config;
 mod hls;
 mod impairment;
 mod output;
 mod rendition;
+pub mod rtmp;
 
 pub use config::{
     ConfigError, CredentialReference, DestinationConfig, DestinationId, Endpoint, MAX_DESTINATIONS,

@@ -1,4 +1,6 @@
 use std::{
+    cell::RefCell,
+    collections::VecDeque,
     error::Error,
     fmt, fs,
     io::{self, Read as _},
@@ -58,6 +60,8 @@ const DELETE_CHECKPOINT_SQL: &str = "DELETE FROM journal_checkpoint";
 const INSERT_CHECKPOINT_SQL: &str = "INSERT INTO journal_checkpoint (id, sequence, revision, unapplied_bytes) \
      VALUES (1, ?1, ?2, ?3)";
 const DELETE_APPLIED_SQL: &str = "DELETE FROM journal_batch WHERE sequence <= ?1";
+const SELECT_UNVERIFIED_BATCHES_SQL: &str = "SELECT sequence, base_revision, revision, payload \
+     FROM journal_batch WHERE sequence > ?1 ORDER BY sequence ASC";
 const CHECKPOINT_LOG_SQL: &str = "PRAGMA wal_checkpoint(TRUNCATE)";
 
 /// Bytes of write-ahead log header that precede the first frame.
@@ -380,19 +384,107 @@ impl ProjectStore {
             )
             .map_err(StoreError::Journal)?;
         transaction.commit(&deadline).map_err(StoreError::Journal)?;
-        if scan
-            .observations
-            .iter()
-            .any(|observation| matches!(observation, JournalObservation::TornWriteAheadLog { .. }))
-        {
-            // Fold the log into the database and truncate it. The torn tail is
-            // reported by this recovery and then gone, instead of shadowing
-            // every later scan with damage that has already been dealt with.
-            database
-                .query(CHECKPOINT_LOG_SQL, Vec::new(), &deadline, |_| Ok(()))
-                .map_err(StoreError::Journal)?;
-        }
+        // Unconditionally, not only for a torn tail. A recovery is the one
+        // moment nothing is in flight, and a bundle that has served a show
+        // arrives here with a log holding every page every command ever
+        // touched: leaving it means the next show starts slower than the last
+        // one ended and never recovers. Truncating also erases a torn tail that
+        // this recovery has already reported, instead of shadowing every later
+        // scan with damage that has been dealt with.
+        truncate_write_ahead_log(&database, &deadline)?;
         Ok(scan)
+    }
+
+    /// Discards every batch the durable checkpoint does not cover.
+    ///
+    /// This is an operator's escape hatch, not a recovery path: the batches it
+    /// destroys are acknowledged commands, so it hands them back for the caller
+    /// to name before anything else happens to them. Their checksums are *not*
+    /// verified on the way out, because the reason to reach for this is usually
+    /// that one of them no longer verifies and every other path refuses the
+    /// bundle for it.
+    ///
+    /// The checkpoint row is republished at the manifest's revision, so a
+    /// journal abandoned in the middle of an interrupted checkpoint agrees with
+    /// the manifest afterwards and the next append continues above every
+    /// sequence ever written here.
+    ///
+    /// # Errors
+    ///
+    /// Returns a missing or malformed checkpoint, a size limit, a manifest,
+    /// database, lock, deadline, or filesystem error.
+    pub fn abandon_unapplied_batches(&self) -> Result<AbandonedJournal, StoreError> {
+        let deadline = Deadline::new("abandon_unapplied_batches");
+        let manifest_revision = self.load()?.position().revision;
+        let database = self.open_journal(&deadline)?;
+        let transaction = Transaction::begin(&database, &deadline).map_err(StoreError::Journal)?;
+        let checkpoint = read_checkpoint(&database, &deadline)?
+            .ok_or(StoreError::Journal(JournalError::MalformedCheckpoint))?;
+        let batches = read_unverified_batches(&database, checkpoint.sequence, &deadline)?;
+        let sequence = batches
+            .last()
+            .map_or(checkpoint.sequence, MutationBatch::sequence)
+            .max(checkpoint.sequence);
+        write_checkpoint(
+            &database,
+            Checkpoint {
+                sequence,
+                revision: manifest_revision,
+                unapplied_bytes: 0,
+            },
+            &deadline,
+        )?;
+        database
+            .execute(DELETE_APPLIED_SQL, vec![sql_u64(sequence)?], &deadline)
+            .map_err(StoreError::Journal)?;
+        transaction.commit(&deadline).map_err(StoreError::Journal)?;
+        truncate_write_ahead_log(&database, &deadline)?;
+        Ok(AbandonedJournal {
+            checkpoint_sequence: sequence,
+            batches,
+        })
+    }
+
+    /// Opens the journal for the life of the process that serves this project.
+    ///
+    /// Creates the journal when the project has never journalled, then
+    /// validates the schema, the durability pragmas and the recorded history
+    /// once and keeps the database open. See [`JournalWriter`] for why.
+    ///
+    /// # Errors
+    ///
+    /// Returns anything [`ProjectStore::scan_journal`] returns, plus the
+    /// creation errors of a project that has never journalled.
+    pub fn open_journal_writer(&self) -> Result<JournalWriter<'_>, StoreError> {
+        let deadline = Deadline::new("open_journal_writer");
+        let database = self.open_journal(&deadline)?;
+        let observations = self.probe_write_ahead_log()?;
+        let manifest_revision = self.load()?.position().revision;
+        let scan = Self::read_scan(&database, manifest_revision, observations, &deadline)?;
+        Ok(JournalWriter {
+            store: self,
+            database,
+            state: RefCell::new(WriterState {
+                checkpoint: Checkpoint {
+                    sequence: scan.checkpoint_sequence,
+                    revision: scan.checkpoint_revision,
+                    unapplied_bytes: retained_bytes(&scan.batches),
+                },
+                head_sequence: scan
+                    .batches
+                    .last()
+                    .map_or(scan.checkpoint_sequence, MutationBatch::sequence),
+                head_revision: scan
+                    .batches
+                    .last()
+                    .map_or(scan.checkpoint_revision, MutationBatch::revision),
+                unapplied: scan
+                    .batches
+                    .iter()
+                    .map(|batch| record_size(&batch.payload))
+                    .collect(),
+            }),
+        })
     }
 
     /// Durably saves a manifest, then advances the checkpoint and discards the
@@ -471,6 +563,10 @@ impl ProjectStore {
             )
             .map_err(StoreError::Journal)?;
         transaction.commit(&deadline).map_err(StoreError::Journal)?;
+        // The rows are gone, but their pages are still in the write-ahead log
+        // and stay there until something folds them back. A journal that
+        // compacts and never truncates grows for the life of the bundle.
+        truncate_write_ahead_log(&database, &deadline)?;
         Ok(CompactionReport {
             applied_through_sequence,
             removed_records: usize::try_from(removed).unwrap_or(usize::MAX),
@@ -705,6 +801,275 @@ impl ProjectStore {
             observations,
         })
     }
+}
+
+/// Everything [`ProjectStore::abandon_unapplied_batches`] destroyed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AbandonedJournal {
+    checkpoint_sequence: u64,
+    batches: Vec<MutationBatch>,
+}
+
+impl AbandonedJournal {
+    /// The sequence the journal is now checkpointed at.
+    #[must_use]
+    pub const fn checkpoint_sequence(&self) -> u64 {
+        self.checkpoint_sequence
+    }
+
+    /// The discarded batches, oldest first, exactly as they were stored.
+    #[must_use]
+    pub fn batches(&self) -> &[MutationBatch] {
+        &self.batches
+    }
+}
+
+/// A process's open, exclusive handle to a project's journal.
+///
+/// [`ProjectStore::append_batch`] opens a database, checks its schema and its
+/// durability pragmas, writes one row and closes it again. That is right for a
+/// one-shot offline write and wrong for the write that stands between an
+/// operator's cut and its acknowledgement: opening rebuilds the write-ahead log
+/// index, so the cost of a command grows with everything recorded before it and
+/// keeps growing for as long as the bundle is used. This module already states
+/// that the journal is a single-writer, process-owned resource; a writer is
+/// that ownership made explicit. It is opened once, its schema, pragmas and
+/// history are validated once, and it holds the exclusive lock for as long as
+/// it lives, so an append is a transaction and nothing else.
+pub struct JournalWriter<'store> {
+    store: &'store ProjectStore,
+    database: JournalDatabase,
+    state: RefCell<WriterState>,
+}
+
+/// What a writer knows about the journal it owns.
+///
+/// The writer is the journal's only writer, so what it last committed is what
+/// the journal holds: re-reading the checkpoint row and the head before every
+/// append would only confirm what this already says. It advances after a commit
+/// succeeds and never before, so a refused or failed write leaves it describing
+/// the durable state exactly as the rolled-back transaction does.
+struct WriterState {
+    checkpoint: Checkpoint,
+    head_sequence: u64,
+    head_revision: u64,
+    /// Record sizes of the batches above the checkpoint, oldest first.
+    unapplied: VecDeque<u64>,
+}
+
+/// What compacting through a sequence would leave behind.
+struct AppliedCheckpoint {
+    revision: u64,
+    retained_bytes: u64,
+    removed_records: usize,
+}
+
+impl WriterState {
+    /// The revision a retained `sequence` carries, and what compacting through
+    /// it would leave.
+    ///
+    /// Sequences increase by exactly one and every batch moves the revision by
+    /// exactly one — both enforced on the way in — so the revision at a
+    /// retained sequence follows from the checkpoint and there is nothing to
+    /// look up.
+    fn applied_checkpoint(&self, sequence: u64) -> Result<AppliedCheckpoint, StoreError> {
+        if sequence < self.checkpoint.sequence || sequence > self.head_sequence {
+            return Err(StoreError::Journal(JournalError::UnknownCheckpoint(
+                sequence,
+            )));
+        }
+        let applied = sequence - self.checkpoint.sequence;
+        let removed_records =
+            usize::try_from(applied).map_err(|_| StoreError::Journal(JournalError::SequenceOverflow))?;
+        Ok(AppliedCheckpoint {
+            revision: self
+                .checkpoint
+                .revision
+                .checked_add(applied)
+                .ok_or(StoreError::Journal(JournalError::SequenceOverflow))?,
+            retained_bytes: self
+                .unapplied
+                .iter()
+                .skip(removed_records)
+                .fold(0, |total, size| total.saturating_add(*size)),
+            removed_records,
+        })
+    }
+}
+
+impl JournalWriter<'_> {
+    /// The newest sequence this journal holds, applied or not.
+    #[must_use]
+    pub fn head_sequence(&self) -> u64 {
+        self.state.borrow().head_sequence
+    }
+
+    /// Appends one immutable checksummed mutation batch.
+    ///
+    /// The contract is [`ProjectStore::append_batch`]'s — sequences increase by
+    /// exactly one, `base_revision` must equal the preceding durable revision,
+    /// `revision` must be the next one, and the commit is durable before this
+    /// returns — and none of it re-reads the journal or re-checks the schema:
+    /// this writer owns the journal, so the head it validates against is the
+    /// one it last committed. A refused or failed batch leaves the journal and
+    /// this writer byte-for-byte unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns journal consistency, size-limit, database, lock, deadline, or
+    /// filesystem errors.
+    pub fn append_batch(&self, batch: &MutationBatch) -> Result<(), StoreError> {
+        let deadline = Deadline::new("append_batch");
+        let size = record_size(&batch.payload);
+        enforce_record_size(size)?;
+        let mut state = self.state.borrow_mut();
+        let expected_sequence = state
+            .head_sequence
+            .checked_add(1)
+            .ok_or(StoreError::Journal(JournalError::SequenceOverflow))?;
+        validate_batch(batch, expected_sequence, state.head_revision)?;
+        enforce_unapplied_limit(state.checkpoint.sequence, batch.sequence)?;
+        let unapplied_bytes = state.checkpoint.unapplied_bytes.saturating_add(size);
+        enforce_unapplied_bytes(unapplied_bytes)?;
+
+        let transaction =
+            Transaction::begin(&self.database, &deadline).map_err(StoreError::Journal)?;
+        self.database
+            .execute_prepared(
+                INSERT_BATCH_SQL,
+                vec![
+                    sql_u64(batch.sequence)?,
+                    sql_u64(batch.base_revision)?,
+                    sql_u64(batch.revision)?,
+                    Value::Blob(batch.payload.clone()),
+                    Value::Integer(i64::from(checksum(batch))),
+                ],
+                &deadline,
+            )
+            .map_err(StoreError::Journal)?;
+        self.database
+            .execute_prepared(
+                UPDATE_UNAPPLIED_BYTES_SQL,
+                vec![sql_u64(unapplied_bytes)?],
+                &deadline,
+            )
+            .map_err(StoreError::Journal)?;
+        transaction.commit(&deadline).map_err(StoreError::Journal)?;
+
+        state.checkpoint.unapplied_bytes = unapplied_bytes;
+        state.head_sequence = batch.sequence;
+        state.head_revision = batch.revision;
+        state.unapplied.push_back(size);
+        Ok(())
+    }
+
+    /// Durably saves a manifest, then advances the checkpoint, discards the
+    /// batches it includes and truncates the write-ahead log.
+    ///
+    /// The ordering and the crash windows are
+    /// [`ProjectStore::checkpoint_and_compact`]'s. The truncation is what keeps
+    /// the log — and therefore the cost of every later command — the same size
+    /// after ten thousand commands as after ten.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless `applied_through_sequence` is the current
+    /// checkpoint or a batch recorded after it and its revision is exactly the
+    /// manifest's, plus any database, lock, deadline, or filesystem error.
+    pub fn checkpoint_and_compact(
+        &self,
+        project: &StoredProject,
+        applied_through_sequence: u64,
+    ) -> Result<CompactionReport, StoreError> {
+        let deadline = Deadline::new("checkpoint_and_compact");
+        let mut state = self.state.borrow_mut();
+        let applied = state.applied_checkpoint(applied_through_sequence)?;
+        if project.position().revision != applied.revision {
+            return Err(StoreError::Journal(JournalError::CheckpointRevision {
+                sequence: applied_through_sequence,
+                expected: applied.revision,
+                found: project.position().revision,
+            }));
+        }
+        let checkpoint = Checkpoint {
+            sequence: applied_through_sequence,
+            revision: applied.revision,
+            unapplied_bytes: applied.retained_bytes,
+        };
+
+        self.store.save(project)?;
+        let transaction =
+            Transaction::begin(&self.database, &deadline).map_err(StoreError::Journal)?;
+        write_checkpoint(&self.database, checkpoint, &deadline)?;
+        let removed = self
+            .database
+            .execute(
+                DELETE_APPLIED_SQL,
+                vec![sql_u64(applied_through_sequence)?],
+                &deadline,
+            )
+            .map_err(StoreError::Journal)?;
+        transaction.commit(&deadline).map_err(StoreError::Journal)?;
+        state.checkpoint = checkpoint;
+        state.unapplied.drain(..applied.removed_records);
+        drop(state);
+
+        truncate_write_ahead_log(&self.database, &deadline)?;
+        Ok(CompactionReport {
+            applied_through_sequence,
+            removed_records: usize::try_from(removed).unwrap_or(usize::MAX),
+        })
+    }
+}
+
+/// Folds the write-ahead log back into the database and truncates it.
+///
+/// Compaction deletes rows; it does not shorten the log those deletions were
+/// written to. Without this the log is the one part of a bundle that only ever
+/// grows, and every journal open pays to rebuild its index.
+fn truncate_write_ahead_log(
+    database: &JournalDatabase,
+    deadline: &Deadline,
+) -> Result<(), StoreError> {
+    database
+        .query(CHECKPOINT_LOG_SQL, Vec::new(), deadline, |_| Ok(()))
+        .map(|_| ())
+        .map_err(StoreError::Journal)
+}
+
+/// Reads the batches above `checkpoint_sequence` without verifying them.
+///
+/// Only [`ProjectStore::abandon_unapplied_batches`] uses this: everything else
+/// must refuse a batch whose bytes no longer round-trip rather than return it.
+fn read_unverified_batches(
+    database: &JournalDatabase,
+    checkpoint_sequence: u64,
+    deadline: &Deadline,
+) -> Result<Vec<MutationBatch>, StoreError> {
+    let mut collected = 0_u64;
+    database
+        .query(
+            SELECT_UNVERIFIED_BATCHES_SQL,
+            vec![sql_u64(checkpoint_sequence)?],
+            deadline,
+            |row| {
+                let payload = column_blob(row, 3)?;
+                collected = collected.saturating_add(record_size(&payload));
+                if collected > MAX_UNAPPLIED_JOURNAL_BYTES {
+                    return Err(JournalError::UnappliedByteLimit {
+                        unapplied: collected,
+                        maximum: MAX_UNAPPLIED_JOURNAL_BYTES,
+                    });
+                }
+                Ok(MutationBatch {
+                    sequence: row_u64(row, 0)?,
+                    base_revision: row_u64(row, 1)?,
+                    revision: row_u64(row, 2)?,
+                    payload,
+                })
+            },
+        )
+        .map_err(StoreError::Journal)
 }
 
 impl JournalScan {

@@ -3041,6 +3041,7 @@ enum Command {
         camera_helper: Option<PathBuf>,
         record_program: Option<PathBuf>,
         diagnostic_stop_after: Option<Duration>,
+        recover_to_checkpoint: bool,
     },
     Help,
     Version,
@@ -3084,6 +3085,7 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> AppResult<Command>
             let mut camera_helper = None;
             let mut record_program = None;
             let mut diagnostic_stop_after = None;
+            let mut recover_to_checkpoint = false;
             while let Some(option) = arguments.next() {
                 if let Some(value) = option.strip_prefix("--record-program=") {
                     if record_program.is_some() {
@@ -3172,6 +3174,12 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> AppResult<Command>
                         return Err(AppFailure("duplicate option `--native-media`".into()).into());
                     }
                     "--native-media" => native_media = true,
+                    "--recover-to-checkpoint" if recover_to_checkpoint => {
+                        return Err(
+                            AppFailure("duplicate option `--recover-to-checkpoint`".into()).into(),
+                        );
+                    }
+                    "--recover-to-checkpoint" => recover_to_checkpoint = true,
                     "--fullscreen-program" if fullscreen_program => {
                         return Err(
                             AppFailure("duplicate option `--fullscreen-program`".into()).into()
@@ -3249,6 +3257,14 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> AppResult<Command>
             if camera_helper.is_some() && !native_media {
                 return Err(AppFailure("--camera-helper requires --native-media".into()).into());
             }
+            if recover_to_checkpoint && fullscreen_program {
+                return Err(AppFailure(
+                    "--recover-to-checkpoint cannot be combined with --fullscreen-program; \
+                     abandon the batches with one headless start, then start fullscreen"
+                        .into(),
+                )
+                .into());
+            }
             if diagnostic_stop_after.is_some() && once {
                 return Err(AppFailure(
                     "--diagnostic-stop-after cannot be combined with --once".into(),
@@ -3304,6 +3320,7 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> AppResult<Command>
                 camera_helper,
                 record_program,
                 diagnostic_stop_after,
+                recover_to_checkpoint,
             })
         }
         "help" | "--help" | "-h" => {
@@ -3384,6 +3401,7 @@ fn run(command: Command) -> AppResult<()> {
             camera_helper,
             record_program,
             diagnostic_stop_after,
+            recover_to_checkpoint,
         } => {
             if fullscreen_program {
                 run_fullscreen_program(
@@ -3395,7 +3413,7 @@ fn run(command: Command) -> AppResult<()> {
                     record_program,
                 )
             } else {
-                serve(
+                serve_inner(
                     &project,
                     ServeListeners {
                         listen,
@@ -3403,10 +3421,14 @@ fn run(command: Command) -> AppResult<()> {
                         status_listen,
                     },
                     once,
-                    native_media,
-                    camera_helper,
+                    if native_media {
+                        NativeServeMode::Headless { camera_helper }
+                    } else {
+                        NativeServeMode::Disabled
+                    },
                     record_program,
                     diagnostic_stop_after,
+                    recover_to_checkpoint,
                 )
             }
         }
@@ -3480,29 +3502,6 @@ struct ServeListeners {
     status_listen: Option<SocketAddr>,
 }
 
-fn serve(
-    path: &Path,
-    listeners: ServeListeners,
-    once: bool,
-    native_media: bool,
-    camera_helper: Option<PathBuf>,
-    record_program: Option<PathBuf>,
-    diagnostic_stop_after: Option<Duration>,
-) -> AppResult<()> {
-    serve_inner(
-        path,
-        listeners,
-        once,
-        if native_media {
-            NativeServeMode::Headless { camera_helper }
-        } else {
-            NativeServeMode::Disabled
-        },
-        record_program,
-        diagnostic_stop_after,
-    )
-}
-
 #[cfg(all(feature = "macos-program-surface", target_os = "macos"))]
 #[allow(clippy::too_many_arguments)]
 fn serve_program_worker(
@@ -3531,6 +3530,8 @@ fn serve_program_worker(
         })),
         record_program,
         None,
+        // `--recover-to-checkpoint` is refused with `--fullscreen-program`.
+        false,
     )
 }
 
@@ -3542,6 +3543,7 @@ fn serve_inner(
     mode: NativeServeMode,
     record_program: Option<PathBuf>,
     diagnostic_stop_after: Option<Duration>,
+    recover_to_checkpoint: bool,
 ) -> AppResult<()> {
     let ServeListeners {
         listen,
@@ -3573,11 +3575,11 @@ fn serve_inner(
     }
 
     let store = ProjectStore::new(path)?;
-    let RecoveredProject {
-        durable: project,
-        journal_head,
-    } = load_and_recover(&store)?;
-    let journal = DurableJournal::new(&store, journal_head);
+    let project = load_and_recover(&store, recover_to_checkpoint)?;
+    // Opened once and held for the run: this process is the journal's only
+    // writer, and reopening it per command is what made an accepted command
+    // cost what the whole show had cost so far.
+    let journal = DurableJournal::new(store.open_journal_writer()?);
     let project_id = project.project().id();
     let engine = restore_engine(&project)?;
     let identity = format!("project-{project_id}");
@@ -3765,13 +3767,6 @@ fn checkpoint_native(
     Ok(())
 }
 
-/// A project brought back to the exact state it held before the daemon stopped.
-struct RecoveredProject {
-    durable: StoredProject,
-    /// The journal sequence the project is now checkpointed at.
-    journal_head: u64,
-}
-
 /// Loads the manifest and replays whatever the journal recorded after it.
 ///
 /// The manifest is the last checkpointed state; every mutation accepted since
@@ -3783,22 +3778,25 @@ struct RecoveredProject {
 /// Opening also creates the journal when the project has never had one, so the
 /// daemon starts owning a journal whose checkpoint agrees with the manifest and
 /// the first command can be appended without re-reading it.
-fn load_and_recover(store: &ProjectStore) -> AppResult<RecoveredProject> {
+///
+/// `recover_to_checkpoint` abandons that history instead of replaying it. See
+/// [`abandon_to_checkpoint`].
+fn load_and_recover(store: &ProjectStore, recover_to_checkpoint: bool) -> AppResult<StoredProject> {
     let manifest = store.load()?;
+    if recover_to_checkpoint {
+        return abandon_to_checkpoint(store, manifest);
+    }
     let scan = store.recover_journal()?;
     for observation in scan.observations() {
         eprintln!("FREEMIXD_JOURNAL\tv=1\tobservation={observation}");
+    }
+    if scan.batches().is_empty() {
+        return Ok(manifest);
     }
     let journal_head = scan
         .batches()
         .last()
         .map_or_else(|| scan.checkpoint_sequence(), MutationBatch::sequence);
-    if scan.batches().is_empty() {
-        return Ok(RecoveredProject {
-            durable: manifest,
-            journal_head,
-        });
-    }
 
     let durable = replay_journal(&manifest, scan.batches())?;
     // Fold the replayed mutations into the manifest and discard them, so the
@@ -3811,10 +3809,42 @@ fn load_and_recover(store: &ProjectStore) -> AppResult<RecoveredProject> {
         manifest.position().revision,
         durable.position().revision
     );
-    Ok(RecoveredProject {
-        durable,
-        journal_head,
-    })
+    Ok(durable)
+}
+
+/// Throws away everything the journal recorded after the manifest.
+///
+/// Refusing a replay that does not reproduce what was acknowledged is right,
+/// and it leaves an operator minutes from air with a bundle that will not open.
+/// Deleting the journal directory was the only way back on air, and it discards
+/// the same work with no record that it ever existed. This is that act made
+/// deliberate and legible: it is asked for by name on the command line, and
+/// every batch it destroys is printed with its sequence, its revision and the
+/// command it carried — including the ones too damaged to decode — before the
+/// daemon serves anything.
+fn abandon_to_checkpoint(
+    store: &ProjectStore,
+    manifest: StoredProject,
+) -> AppResult<StoredProject> {
+    let abandoned = store.abandon_unapplied_batches()?;
+    for batch in abandoned.batches() {
+        let command = journal::decode_mutation(batch.payload()).map_or_else(
+            |error| format!("<unreadable: {error}>"),
+            |recorded| recorded.command.id,
+        );
+        eprintln!(
+            "FREEMIXD_JOURNAL\tv=1\tabandoned_batch={}\tbase_revision={}\trevision={}\tcommand={command}",
+            batch.sequence(),
+            batch.base_revision(),
+            batch.revision()
+        );
+    }
+    eprintln!(
+        "FREEMIXD_JOURNAL\tv=1\trecover_to_checkpoint=1\tabandoned_batches={}\tserving_revision={}",
+        abandoned.batches().len(),
+        manifest.position().revision
+    );
+    Ok(manifest)
 }
 
 /// Rebuilds the pre-crash state by re-running the recorded commands.
@@ -3826,9 +3856,13 @@ fn load_and_recover(store: &ProjectStore) -> AppResult<RecoveredProject> {
 /// an engine restored from the manifest, recording nothing and publishing to
 /// nobody.
 ///
-/// Every batch must land on exactly the revision it claims. A divergence means
-/// the replay is not the history the operator was acknowledged for, so it is
-/// reported instead of silently becoming the project's state.
+/// Every batch must land on exactly the position it recorded — not just its
+/// revision. A refused command advances no revision and a frame that elapsed
+/// between two commands advances no revision either, so the revision alone
+/// cannot see a replay whose frame cursor, clock or event stream came back
+/// different from the one the operator was acknowledged against. A divergence
+/// means the replay is not that history, so it is reported instead of silently
+/// becoming the project's state.
 fn replay_journal(manifest: &StoredProject, batches: &[MutationBatch]) -> AppResult<StoredProject> {
     let mut durable = manifest.clone();
     let project_id = durable.project().id();
@@ -3843,23 +3877,32 @@ fn replay_journal(manifest: &StoredProject, batches: &[MutationBatch]) -> AppRes
     let server = control_server_identity(&control, project_id);
     let principal = development_principal()?;
     for batch in batches {
-        let (command, now_millis) = journal::decode_mutation(batch.payload())?;
+        let recorded = journal::decode_mutation(batch.payload())?;
+        if recorded.position.revision != batch.revision() {
+            return Err(AppFailure(format!(
+                "journal batch {} claims revision {} but its record holds revision {}",
+                batch.sequence(),
+                batch.revision(),
+                recorded.position.revision
+            ))
+            .into());
+        }
         execute_durable_command(
             &mut control,
             &ReplayedMutations,
             &mut durable,
             &principal,
             &server,
-            &command,
-            now_millis,
+            &recorded.command,
+            recorded.submitted_at_millis,
         )?;
-        if durable.position().revision != batch.revision() {
+        if durable.position() != recorded.position {
             return Err(AppFailure(format!(
-                "journal batch {} replayed command `{}` to revision {} instead of {}",
+                "journal batch {} replayed command `{}` to {:?} instead of the acknowledged {:?}",
                 batch.sequence(),
-                command.id,
-                durable.position().revision,
-                batch.revision()
+                recorded.command.id,
+                durable.position(),
+                recorded.position
             ))
             .into());
         }
@@ -4598,7 +4641,21 @@ fn execute_native_stinger_mutation(
             command,
             &first_prepared.output().result,
         )?;
-        store.record(command, now_millis, durable, &updated)?;
+        // A durability failure refuses the command; it does not take the daemon
+        // down. Dropping the preparation abandons it without touching the
+        // engine, exactly as the simulated path does.
+        if let Err(error) = store.record(command, now_millis, durable, &updated) {
+            drop(first_prepared);
+            return Ok(Ok(DurableExecution {
+                submission: refuse_undurable(
+                    command,
+                    control.diagnostics().current_revision,
+                    updated.position().revision,
+                    error.as_ref(),
+                ),
+                runtime_events: Vec::new(),
+            }));
+        }
         let submission = first_prepared.commit()?;
         *durable = updated;
         return Ok(Ok(DurableExecution {
@@ -4660,7 +4717,18 @@ fn execute_native_stinger_mutation(
             command,
             &second_prepared.output().result,
         )?;
-        store.record(command, now_millis, durable, &updated)?;
+        if let Err(error) = store.record(command, now_millis, durable, &updated) {
+            drop(second_prepared);
+            return Ok(Ok(DurableExecution {
+                submission: refuse_undurable(
+                    command,
+                    control.diagnostics().current_revision,
+                    updated.position().revision,
+                    error.as_ref(),
+                ),
+                runtime_events: preflight_runtime_events,
+            }));
+        }
         let submission = second_prepared.commit()?;
         *durable = updated;
         return Ok(Ok(DurableExecution {
@@ -4693,7 +4761,21 @@ fn execute_native_stinger_mutation(
             runtime_events: preflight_runtime_events,
         }));
     }
-    store.record(command, now_millis, durable, &updated)?;
+    if let Err(error) = store.record(command, now_millis, durable, &updated) {
+        // The staged native resources are released with the preparation: the
+        // command was never applied, so retrying it prepares them again.
+        drop(second_prepared);
+        native.stinger_retirements.discard(mutation)?;
+        return Ok(Ok(DurableExecution {
+            submission: refuse_undurable(
+                command,
+                control.diagnostics().current_revision,
+                updated.position().revision,
+                error.as_ref(),
+            ),
+            runtime_events: preflight_runtime_events,
+        }));
+    }
     let submission = second_prepared.commit()?;
     native.stage_stinger_mutation(mutation);
     let runtime_events = match native.wait_and_tick(control, server, process_shutdown)? {
@@ -4727,6 +4809,24 @@ fn execute_native_stinger_mutation(
 struct DurableExecution {
     submission: CommandSubmission,
     runtime_events: Vec<RuntimeEventMessage>,
+}
+
+/// Refuses a command that could not be made durable, and says so.
+///
+/// Every command path answers a durability failure the same way, because it is
+/// the same failure: a full disk during a show must cost one refused command
+/// the operator can retry, never the daemon.
+fn refuse_undurable(
+    command: &CommandMessage,
+    current_revision: u64,
+    attempted_revision: u64,
+    error: &dyn Error,
+) -> CommandSubmission {
+    eprintln!(
+        "FREEMIXD_DURABILITY\tv=1\tcommand={}\trevision={attempted_revision}\terror={error}",
+        command.id
+    );
+    refused_submission(command, current_revision, error)
 }
 
 /// The answer to a command that could not be made durable.
@@ -5648,13 +5748,14 @@ fn now_millis() -> AppResult<u64> {
 fn print_help() {
     println!(
         "FreeMix headless production daemon\n\n\
-Usage:\n  freemixd serve <show.freemix> [--listen 127.0.0.1:0] [--web-listen 127.0.0.1:0] [--status-listen 127.0.0.1:0] [--once] [--native-media [--camera-helper PATH]] [--record-program output.mp4] [--diagnostic-stop-after 10m] [--fullscreen-program [--fullscreen-display 0]]\n  freemixd help\n  freemixd --version\n\n\
+Usage:\n  freemixd serve <show.freemix> [--listen 127.0.0.1:0] [--web-listen 127.0.0.1:0] [--status-listen 127.0.0.1:0] [--once] [--native-media [--camera-helper PATH]] [--record-program output.mp4] [--diagnostic-stop-after 10m] [--recover-to-checkpoint] [--fullscreen-program [--fullscreen-display 0]]\n  freemixd help\n  freemixd --version\n\n\
 Native media is opt-in; without it the daemon uses simulated frame realization.\n\
 --camera-helper overrides the developer AVFoundation helper path for exact macOS Device inputs; it never requests permission.\n\
 Program recording requires native media, an existing output parent, and a new final .mp4 file. Existing files are never overwritten.\n\
 Use --record-program=<path> when the output name begins with --. Recorder capability digests describe configured startup support; FREEMIXD_RECORDER reports runtime health.\n\
 macOS fullscreen display selection is a zero-based index ordered by physical position, then stable descriptive fields.\n\
 --diagnostic-stop-after schedules cooperative simulated or headless native shutdown after readiness; accepted units are ms, s, m, and h up to 24h.\n\
+--recover-to-checkpoint opens the project at its last checkpoint and permanently discards every acknowledged command the journal recorded after it, printing each abandoned sequence, revision and command id first. It loses work; use it only when a replay is refused and the show must go on. It is unavailable with --fullscreen-program.\n\
 --web-listen enables the loopback-only `/v1/control` WebSocket listener and requires FREEMIXD_WEB_TOKEN.\n\
 --status-listen enables the loopback-only operator status listener serving /healthz, /readyz, and the token-guarded /v1/support-bundle; it requires FREEMIXD_STATUS_TOKEN and is unavailable with --fullscreen-program.\n\
 Native mode continues across client disconnects; close the Program window or press Escape for bounded shutdown."

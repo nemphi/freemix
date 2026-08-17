@@ -1363,8 +1363,10 @@ name = "fm-io-network"
 version = "0.1.0"
 dependencies = [
  "fm-codec-api",
+ "fm-codec-ffmpeg",
  "fm-frame",
  "fm-io-api",
+ "fm-types",
 ]
 
 [[package]]
