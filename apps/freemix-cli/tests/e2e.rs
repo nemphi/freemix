@@ -6476,6 +6476,50 @@ fn journal_recover_reports_a_clean_journal_and_refuses_unapplied_batches() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// turso locks the journal database exclusively even to read it, so a process
+/// that opens it locks every other process out. Inspecting a project must
+/// therefore never open it: `status` has to work on a show whose journal is
+/// held by a running daemon, and concurrent readers must not lock each other
+/// out. The command that does own the journal reports the problem instead.
+#[test]
+fn status_reads_a_project_without_opening_its_journal() {
+    let root = unique_test_root();
+    fs::create_dir_all(&root).unwrap();
+    let path = root.join("show.freemix");
+    let project = path.to_str().unwrap();
+    assert_success(&invoke(&["new", project]));
+    assert_success(&invoke(&["journal-recover", project]));
+    assert!(path.join("journal").join("journal.db").is_file());
+
+    let concurrent: Vec<_> = (0..12)
+        .map(|_| {
+            Command::new(env!("CARGO_BIN_EXE_freemix-cli"))
+                .args(["status", project])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    for reader in concurrent {
+        assert_success(&reader.wait_with_output().unwrap());
+    }
+
+    // A journal database that cannot be opened at all proves the point: the
+    // manifest still reports, and only the journal command fails.
+    let database = path.join("journal").join("journal.db");
+    fs::remove_file(&database).unwrap();
+    fs::create_dir(&database).unwrap();
+    assert_success(&invoke(&["status", project]));
+    let refused = invoke(&["journal-recover", project]);
+    assert!(
+        !refused.status.success(),
+        "recovery must not report a clean journal it could not open"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
 fn invoke(arguments: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_freemix-cli"))
         .args(arguments)

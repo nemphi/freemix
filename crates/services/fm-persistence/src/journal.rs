@@ -1,4 +1,10 @@
-use std::{error::Error, fmt, fs, path::PathBuf, time::Duration};
+use std::{
+    error::Error,
+    fmt, fs,
+    io::{self, Read as _},
+    path::PathBuf,
+    time::Duration,
+};
 
 use turso::{Row, Value};
 
@@ -10,16 +16,22 @@ use crate::{
 
 const JOURNAL_DIRECTORY: &str = "journal";
 const DATABASE_NAME: &str = "journal.db";
+const WRITE_AHEAD_LOG_NAME: &str = "journal.db-wal";
+const SHARED_MEMORY_NAME: &str = "journal.db-shm";
 
 /// Bytes of fixed record overhead accounted against
 /// [`MAX_JOURNAL_RECORD_BYTES`]: sequence, base revision, revision, checksum.
 const RECORD_OVERHEAD_BYTES: u64 = 8 + 8 + 8 + 4;
 
+const CHECKPOINT_TABLE: &str = "journal_checkpoint";
+const BATCH_TABLE: &str = "journal_batch";
+
 const CREATE_SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS journal_checkpoint (
     id INTEGER PRIMARY KEY,
     sequence INTEGER NOT NULL,
-    revision INTEGER NOT NULL
+    revision INTEGER NOT NULL,
+    unapplied_bytes INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS journal_batch (
     sequence INTEGER PRIMARY KEY,
@@ -30,18 +42,30 @@ CREATE TABLE IF NOT EXISTS journal_batch (
 );
 ";
 
+const SELECT_TABLE_SQL: &str =
+    "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = ?1";
 const SELECT_CHECKPOINT_SQL: &str =
-    "SELECT sequence, revision FROM journal_checkpoint WHERE id = 1";
+    "SELECT sequence, revision, unapplied_bytes FROM journal_checkpoint WHERE id = 1";
 const SELECT_HEAD_SQL: &str =
     "SELECT sequence, revision FROM journal_batch ORDER BY sequence DESC LIMIT 1";
 const SELECT_BATCHES_SQL: &str = "SELECT sequence, base_revision, revision, payload, checksum \
      FROM journal_batch WHERE sequence > ?1 ORDER BY sequence ASC";
 const INSERT_BATCH_SQL: &str = "INSERT INTO journal_batch \
      (sequence, base_revision, revision, payload, checksum) VALUES (?1, ?2, ?3, ?4, ?5)";
+const UPDATE_UNAPPLIED_BYTES_SQL: &str =
+    "UPDATE journal_checkpoint SET unapplied_bytes = ?1 WHERE id = 1";
 const DELETE_CHECKPOINT_SQL: &str = "DELETE FROM journal_checkpoint";
-const INSERT_CHECKPOINT_SQL: &str =
-    "INSERT INTO journal_checkpoint (id, sequence, revision) VALUES (1, ?1, ?2)";
+const INSERT_CHECKPOINT_SQL: &str = "INSERT INTO journal_checkpoint (id, sequence, revision, unapplied_bytes) \
+     VALUES (1, ?1, ?2, ?3)";
 const DELETE_APPLIED_SQL: &str = "DELETE FROM journal_batch WHERE sequence <= ?1";
+const CHECKPOINT_LOG_SQL: &str = "PRAGMA wal_checkpoint(TRUNCATE)";
+
+/// Bytes of write-ahead log header that precede the first frame.
+const LOG_HEADER_BYTES: usize = 32;
+/// Bytes of frame header that precede each logged page.
+const LOG_FRAME_HEADER_BYTES: u64 = 24;
+/// Write-ahead log magic, native and byte-swapped checksum variants.
+const LOG_MAGIC: [u32; 2] = [0x377f_0682, 0x377f_0683];
 
 /// Maximum encoded mutation batch record size (1 MiB).
 pub const MAX_JOURNAL_RECORD_BYTES: u64 = 1024 * 1024;
@@ -50,6 +74,17 @@ pub const MAX_JOURNAL_RECORD_BYTES: u64 = 1024 * 1024;
 /// the journal head. Recovery must fit in memory, so a project that never
 /// checkpoints is refused rather than allowed to grow without bound.
 pub const MAX_UNAPPLIED_JOURNAL_BATCHES: u64 = 65_536;
+
+/// Maximum total size of the batches that may sit between the durable
+/// checkpoint and the journal head (128 MiB).
+///
+/// [`MAX_UNAPPLIED_JOURNAL_BATCHES`] alone bounds only how *many* records
+/// recovery collects, and each may be [`MAX_JOURNAL_RECORD_BYTES`] long: the
+/// count on its own permits 64 GiB in one `Vec`, which is an out-of-memory
+/// abort before a show rather than a bounded refusal. Both bounds are enforced
+/// when a batch is appended and again while recovery reads, so a journal that
+/// can be written can always be read back.
+pub const MAX_UNAPPLIED_JOURNAL_BYTES: u64 = 128 * 1024 * 1024;
 
 /// An immutable, passive mutation batch. Persistence never executes payloads.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -92,15 +127,53 @@ impl MutationBatch {
     }
 }
 
+/// Something a scan observed about the journal that is not part of its normal
+/// state and that an operator must be told about.
+///
+/// A scan that returns history the caller can trust still has to say what it
+/// had to reconcile to get there; silence would turn a damaged or interrupted
+/// journal into an ordinary short history.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JournalObservation {
+    /// The manifest is ahead of the durable checkpoint: a checkpoint was
+    /// interrupted after the manifest was saved and before the journal
+    /// recorded it. Batches through `sequence` are already applied and are not
+    /// returned as unapplied history.
+    IncompleteCheckpoint { sequence: u64, revision: u64 },
+    /// The write-ahead log does not end on a frame boundary, so its last
+    /// transaction was torn by a crash and the engine dropped it. History is
+    /// therefore shorter than what was written.
+    TornWriteAheadLog { bytes: u64, frame_bytes: u64 },
+}
+
+impl fmt::Display for JournalObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::IncompleteCheckpoint { sequence, revision } => write!(
+                formatter,
+                "checkpoint through sequence {sequence} (revision {revision}) was interrupted after the manifest was saved"
+            ),
+            Self::TornWriteAheadLog { bytes, frame_bytes } => write!(
+                formatter,
+                "write-ahead log is {bytes} bytes, which is not a whole number of {frame_bytes}-byte frames after its {LOG_HEADER_BYTES}-byte header: its final transaction was torn and dropped"
+            ),
+        }
+    }
+}
+
 /// Valid journal state discovered by a scan.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct JournalScan {
     checkpoint_sequence: u64,
     checkpoint_revision: u64,
     batches: Vec<MutationBatch>,
+    observations: Vec<JournalObservation>,
 }
 
 impl JournalScan {
+    /// Sequence through which the manifest is known to be durable. This is the
+    /// stored checkpoint unless a scan resolved an [`JournalObservation`], in
+    /// which case it is the resolved position and the observation says why.
     #[must_use]
     pub const fn checkpoint_sequence(&self) -> u64 {
         self.checkpoint_sequence
@@ -115,6 +188,22 @@ impl JournalScan {
     pub fn batches(&self) -> &[MutationBatch] {
         &self.batches
     }
+
+    /// Everything the scan had to reconcile or found damaged. Empty for an
+    /// undamaged journal.
+    #[must_use]
+    pub fn observations(&self) -> &[JournalObservation] {
+        &self.observations
+    }
+}
+
+/// The durable checkpoint row: the position the manifest is known to hold, plus
+/// the size of the batches recorded after it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Checkpoint {
+    sequence: u64,
+    revision: u64,
+    unapplied_bytes: u64,
 }
 
 /// Summary of a durable manifest checkpoint and journal compaction.
@@ -144,6 +233,11 @@ impl ProjectStore {
     }
 
     /// The embedded journal database file itself.
+    ///
+    /// The database is owned by whichever process has it open: turso locks it
+    /// exclusively even to read. Nothing outside this module opens it, and
+    /// [`ProjectStore::load`] never does, so inspecting a project is never
+    /// blocked by a running daemon.
     #[must_use]
     pub fn journal_database_path(&self) -> PathBuf {
         self.journal_path().join(DATABASE_NAME)
@@ -159,27 +253,39 @@ impl ProjectStore {
     /// this call returns. FNV-1a 32-bit is stored beside every row only to
     /// detect accidental corruption, not for security.
     ///
+    /// This is a write path, so it creates the journal when the project has
+    /// never journalled before, and it is refused while another process owns
+    /// the journal.
+    ///
     /// # Errors
     ///
-    /// Returns journal consistency, size-limit, manifest, database, deadline,
-    /// or filesystem errors.
+    /// Returns journal consistency, size-limit, manifest, database, lock,
+    /// deadline, or filesystem errors.
     pub fn append_batch(&self, batch: &MutationBatch) -> Result<(), StoreError> {
         let deadline = Deadline::new("append_batch");
         // Refuse an oversized record before creating or touching the journal.
-        enforce_record_size(record_size(&batch.payload))?;
+        let size = record_size(&batch.payload);
+        enforce_record_size(size)?;
         let database = self.open_journal(&deadline)?;
 
         let transaction = Transaction::begin(&database, &deadline).map_err(StoreError::Journal)?;
-        let (checkpoint_sequence, checkpoint_revision) = read_checkpoint(&database, &deadline)?
+        let checkpoint = read_checkpoint(&database, &deadline)?
             .ok_or(StoreError::Journal(JournalError::MalformedCheckpoint))?;
         let head = read_head(&database, &deadline)?;
-        let expected_sequence = head
-            .map_or(checkpoint_sequence, |(sequence, _)| sequence)
+        // A row that survives below the checkpoint must not set the expected
+        // sequence: `scan_journal` only ever returns rows above the checkpoint,
+        // so a batch acknowledged there would be durable but invisible.
+        let (base_sequence, base_revision) = match head {
+            Some((sequence, revision)) if sequence > checkpoint.sequence => (sequence, revision),
+            _ => (checkpoint.sequence, checkpoint.revision),
+        };
+        let expected_sequence = base_sequence
             .checked_add(1)
             .ok_or(StoreError::Journal(JournalError::SequenceOverflow))?;
-        let expected_revision = head.map_or(checkpoint_revision, |(_, revision)| revision);
-        validate_batch(batch, expected_sequence, expected_revision)?;
-        enforce_unapplied_limit(checkpoint_sequence, batch.sequence)?;
+        validate_batch(batch, expected_sequence, base_revision)?;
+        enforce_unapplied_limit(checkpoint.sequence, batch.sequence)?;
+        let unapplied_bytes = checkpoint.unapplied_bytes.saturating_add(size);
+        enforce_unapplied_bytes(unapplied_bytes)?;
 
         database
             .execute_prepared(
@@ -193,12 +299,14 @@ impl ProjectStore {
                 ],
                 &deadline,
             )
-            .map_err(|error| match error {
-                JournalError::Database { message, .. } if is_constraint_violation(&message) => {
-                    StoreError::Journal(JournalError::RecordExists(batch.sequence))
-                }
-                other => StoreError::Journal(other),
-            })?;
+            .map_err(StoreError::Journal)?;
+        database
+            .execute_prepared(
+                UPDATE_UNAPPLIED_BYTES_SQL,
+                vec![sql_u64(unapplied_bytes)?],
+                &deadline,
+            )
+            .map_err(StoreError::Journal)?;
         transaction.commit(&deadline).map_err(StoreError::Journal)?;
         Ok(())
     }
@@ -212,54 +320,79 @@ impl ProjectStore {
     /// a damaged journal never yields partial history. The manifest itself
     /// remains readable through [`ProjectStore::load`] in that case.
     ///
+    /// This is a read path: it creates nothing. An existing database whose
+    /// tables or checkpoint row are missing is damage, not an empty journal,
+    /// and is reported as such rather than laundered into "nothing to recover".
+    /// Whatever a scan has to reconcile is reported through
+    /// [`JournalScan::observations`].
+    ///
     /// # Errors
     ///
-    /// Returns an error for a missing or malformed checkpoint, a corrupt or
-    /// unreadable database, a checksum mismatch, a sequence or revision gap, a
-    /// deadline overrun, or a filesystem failure.
+    /// Returns an error for a missing database file whose write-ahead log
+    /// survives, missing tables, a missing or malformed checkpoint, a manifest
+    /// that disagrees with the journal, a corrupt or unreadable database, a
+    /// checksum mismatch, a sequence or revision gap, a size limit, a lock held
+    /// by another process, a deadline overrun, or a filesystem failure.
     pub fn scan_journal(&self) -> Result<JournalScan, StoreError> {
+        let manifest_revision = self.load()?.position().revision;
         let database_path = self.journal_database_path();
-        if !database_path.try_exists().map_err(StoreError::Io)? {
-            return Ok(JournalScan {
-                checkpoint_sequence: 0,
-                checkpoint_revision: self.load()?.position().revision,
-                batches: Vec::new(),
-            });
+        if !self.journal_is_initialised()? {
+            self.require_no_orphaned_log()?;
+            return Ok(JournalScan::empty(manifest_revision));
         }
         let deadline = Deadline::new("scan_journal");
         let database =
             JournalDatabase::open(&database_path, &deadline).map_err(StoreError::Journal)?;
-        database
-            .execute_batch(CREATE_SCHEMA_SQL, &deadline)
-            .map_err(StoreError::Journal)?;
-        self.read_scan(&database, &deadline)
+        let observations = self.probe_write_ahead_log()?;
+        Self::read_scan(&database, manifest_revision, observations, &deadline)
     }
 
     /// Brings the journal database to a consistent, writable state.
     ///
     /// Opening recovers the write-ahead log; this additionally creates the
-    /// journal when it is absent and discards any batch already covered by the
-    /// durable checkpoint.
+    /// journal when it is absent, resolves an interrupted checkpoint, discards
+    /// any batch the checkpoint already covers, and republishes the checkpoint
+    /// row so the next append continues from the manifest's revision. Anything
+    /// it had to reconcile is reported through [`JournalScan::observations`].
     ///
     /// # Errors
     ///
-    /// Returns any scan, database, deadline, or filesystem error without
+    /// Returns any scan, database, lock, deadline, or filesystem error without
     /// discarding unapplied batches.
     pub fn recover_journal(&self) -> Result<JournalScan, StoreError> {
         let deadline = Deadline::new("recover_journal");
         let database = self.open_journal(&deadline)?;
-        let (checkpoint_sequence, _) = read_checkpoint(&database, &deadline)?
-            .ok_or(StoreError::Journal(JournalError::MalformedCheckpoint))?;
+        let observations = self.probe_write_ahead_log()?;
+        let manifest_revision = self.load()?.position().revision;
+        let scan = Self::read_scan(&database, manifest_revision, observations, &deadline)?;
+        let resolved = Checkpoint {
+            sequence: scan.checkpoint_sequence,
+            revision: scan.checkpoint_revision,
+            unapplied_bytes: retained_bytes(&scan.batches),
+        };
         let transaction = Transaction::begin(&database, &deadline).map_err(StoreError::Journal)?;
+        write_checkpoint(&database, resolved, &deadline)?;
         database
             .execute(
                 DELETE_APPLIED_SQL,
-                vec![sql_u64(checkpoint_sequence)?],
+                vec![sql_u64(resolved.sequence)?],
                 &deadline,
             )
             .map_err(StoreError::Journal)?;
         transaction.commit(&deadline).map_err(StoreError::Journal)?;
-        self.read_scan(&database, &deadline)
+        if scan
+            .observations
+            .iter()
+            .any(|observation| matches!(observation, JournalObservation::TornWriteAheadLog { .. }))
+        {
+            // Fold the log into the database and truncate it. The torn tail is
+            // reported by this recovery and then gone, instead of shadowing
+            // every later scan with damage that has already been dealt with.
+            database
+                .query(CHECKPOINT_LOG_SQL, Vec::new(), &deadline, |_| Ok(()))
+                .map_err(StoreError::Journal)?;
+        }
+        Ok(scan)
     }
 
     /// Durably saves a manifest, then advances the checkpoint and discards the
@@ -268,14 +401,23 @@ impl ProjectStore {
     /// The manifest rename and directory sync complete before the checkpoint
     /// moves. Advancing the checkpoint and discarding the applied batches then
     /// happen inside a single database transaction, so that pair is
-    /// all-or-nothing: a crash either leaves the batches replayable against the
-    /// older checkpoint or leaves neither.
+    /// all-or-nothing.
+    ///
+    /// A crash between the two leaves the manifest at the new revision while
+    /// the checkpoint still names the old one and the applied batches are still
+    /// present. Those batches are *not* replayable against the older
+    /// checkpoint: applying them again would repeat mutations the manifest
+    /// already contains. A scan detects that window instead — the manifest
+    /// revision matches a retained batch — reports
+    /// [`JournalObservation::IncompleteCheckpoint`], and treats that batch as
+    /// the checkpoint, so recovery completes the interrupted checkpoint rather
+    /// than either app refusing to open the project.
     ///
     /// # Errors
     ///
     /// Returns an error unless `applied_through_sequence` exists (or is the
     /// current checkpoint) and its revision exactly matches the manifest, plus
-    /// any validation, database, deadline, or filesystem error.
+    /// any validation, database, lock, deadline, or filesystem error.
     pub fn checkpoint_and_compact(
         &self,
         project: &StoredProject,
@@ -283,7 +425,9 @@ impl ProjectStore {
     ) -> Result<CompactionReport, StoreError> {
         let deadline = Deadline::new("checkpoint_and_compact");
         let database = self.open_journal(&deadline)?;
-        let scan = self.read_scan(&database, &deadline)?;
+        let observations = self.probe_write_ahead_log()?;
+        let manifest_revision = self.load()?.position().revision;
+        let scan = Self::read_scan(&database, manifest_revision, observations, &deadline)?;
         let applied_revision = if applied_through_sequence == scan.checkpoint_sequence {
             scan.checkpoint_revision
         } else {
@@ -302,13 +446,21 @@ impl ProjectStore {
                 found: project.position().revision,
             }));
         }
+        let retained = retained_bytes(
+            scan.batches
+                .iter()
+                .filter(|batch| batch.sequence > applied_through_sequence),
+        );
 
         self.save(project)?;
         let transaction = Transaction::begin(&database, &deadline).map_err(StoreError::Journal)?;
         write_checkpoint(
             &database,
-            applied_through_sequence,
-            applied_revision,
+            Checkpoint {
+                sequence: applied_through_sequence,
+                revision: applied_revision,
+                unapplied_bytes: retained,
+            },
             &deadline,
         )?;
         let removed = database
@@ -326,78 +478,188 @@ impl ProjectStore {
     }
 
     /// Opens the journal, creating the directory, schema, and initial
-    /// checkpoint row when the project has never journalled before.
+    /// checkpoint row only when the project has never journalled before.
+    ///
+    /// This is the only path that creates anything, and even here creation is
+    /// confined to a journal that does not exist yet: an initialised database
+    /// whose schema has gone missing is damage, and recreating the schema over
+    /// it would report a clean journal where work was lost.
     fn open_journal(&self, deadline: &Deadline) -> Result<JournalDatabase, StoreError> {
-        let journal = self.journal_path();
         let database_path = self.journal_database_path();
-        let existed = database_path.try_exists().map_err(StoreError::Io)?;
+        if self.journal_is_initialised()? {
+            let database =
+                JournalDatabase::open(&database_path, deadline).map_err(StoreError::Journal)?;
+            require_table(&database, CHECKPOINT_TABLE, deadline)?;
+            require_table(&database, BATCH_TABLE, deadline)?;
+            return Ok(database);
+        }
+
+        self.require_no_orphaned_log()?;
         // Reading the manifest first keeps a missing project from leaving a
         // half-created journal directory behind.
-        let initial_revision = if existed {
-            None
-        } else {
-            Some(self.load()?.position().revision)
-        };
+        let revision = self.load()?.position().revision;
+        let journal = self.journal_path();
         if !journal.try_exists().map_err(StoreError::Io)? {
             fs::create_dir_all(&journal).map_err(StoreError::Io)?;
             sync_directory(self.root())?;
         }
-
         let database =
             JournalDatabase::open(&database_path, deadline).map_err(StoreError::Journal)?;
         database
             .execute_batch(CREATE_SCHEMA_SQL, deadline)
             .map_err(StoreError::Journal)?;
-        if read_checkpoint(&database, deadline)?.is_none() {
-            let revision = match initial_revision {
-                Some(revision) => revision,
-                None => self.load()?.position().revision,
-            };
-            let transaction =
-                Transaction::begin(&database, deadline).map_err(StoreError::Journal)?;
-            write_checkpoint(&database, 0, revision, deadline)?;
-            transaction.commit(deadline).map_err(StoreError::Journal)?;
-        }
-        if !existed {
-            // Make the new database file's directory entry durable too.
-            sync_directory(&journal)?;
-        }
+        let transaction = Transaction::begin(&database, deadline).map_err(StoreError::Journal)?;
+        write_checkpoint(
+            &database,
+            Checkpoint {
+                sequence: 0,
+                revision,
+                unapplied_bytes: 0,
+            },
+            deadline,
+        )?;
+        transaction.commit(deadline).map_err(StoreError::Journal)?;
+        // Make the new database file's directory entry durable too.
+        sync_directory(&journal)?;
         Ok(database)
     }
 
+    /// Whether a journal database has ever been written here.
+    ///
+    /// A zero-length file is an initialisation that crashed before its first
+    /// commit: nothing was ever recorded in it, so it may be initialised
+    /// again. Anything longer has held committed state.
+    fn journal_is_initialised(&self) -> Result<bool, StoreError> {
+        match fs::metadata(self.journal_database_path()) {
+            Ok(metadata) => Ok(metadata.len() > 0),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(StoreError::Io(error)),
+        }
+    }
+
+    /// Refuses a journal whose database file is gone or empty while its
+    /// write-ahead log or shared-memory sidecar survives. That is a deleted or
+    /// half-restored journal, not a project that has never journalled, and
+    /// initialising over it would report "nothing to recover" on top of lost
+    /// work.
+    fn require_no_orphaned_log(&self) -> Result<(), StoreError> {
+        let journal = self.journal_path();
+        for sidecar in [WRITE_AHEAD_LOG_NAME, SHARED_MEMORY_NAME] {
+            let path = journal.join(sidecar);
+            if path.try_exists().map_err(StoreError::Io)? {
+                return Err(StoreError::Journal(JournalError::MissingDatabase {
+                    database: self.journal_database_path(),
+                    sidecar: path,
+                }));
+            }
+        }
+        Ok(())
+    }
+
+    /// Reports a write-ahead log that does not end on a frame boundary.
+    ///
+    /// turso writes a 32-byte header followed by frames of
+    /// `24 + page_size` bytes and stops recovery at the last whole, checksummed
+    /// frame, so a crash mid-write silently shortens history. Measuring the
+    /// file is the one cheap witness of that: it runs while this process holds
+    /// the exclusive lock, so no other writer can be mid-frame. A tail lost on
+    /// an exact frame boundary leaves no trace here and is only caught when the
+    /// manifest depends on it.
+    fn probe_write_ahead_log(&self) -> Result<Vec<JournalObservation>, StoreError> {
+        let path = self.journal_path().join(WRITE_AHEAD_LOG_NAME);
+        let size = match fs::metadata(&path) {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(StoreError::Io(error)),
+        };
+        if size == 0 {
+            return Ok(Vec::new());
+        }
+        let header_bytes = LOG_HEADER_BYTES as u64;
+        if size < header_bytes {
+            return Ok(vec![JournalObservation::TornWriteAheadLog {
+                bytes: size,
+                frame_bytes: 0,
+            }]);
+        }
+        let mut header = [0_u8; LOG_HEADER_BYTES];
+        fs::File::open(&path)
+            .and_then(|mut file| file.read_exact(&mut header))
+            .map_err(StoreError::Io)?;
+        let magic = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+        let page_bytes = u64::from(u32::from_be_bytes([
+            header[8], header[9], header[10], header[11],
+        ]));
+        // An unrecognised header is not a torn tail; the database open reports
+        // whatever is actually wrong with it.
+        if !LOG_MAGIC.contains(&magic) || !(512..=65_536).contains(&page_bytes) {
+            return Ok(Vec::new());
+        }
+        let frame_bytes = LOG_FRAME_HEADER_BYTES + page_bytes;
+        if (size - header_bytes).is_multiple_of(frame_bytes) {
+            return Ok(Vec::new());
+        }
+        Ok(vec![JournalObservation::TornWriteAheadLog {
+            bytes: size,
+            frame_bytes,
+        }])
+    }
+
+    /// Reads the journal's state, reconciling it against the manifest.
+    ///
+    /// The manifest is the durable applied state and the journal is the
+    /// write-ahead record of what comes after it, so the checkpoint revision,
+    /// the manifest revision and the journal head must be ordered. Anything
+    /// else means one of them lost history, which is reported rather than
+    /// returned as a short but plausible-looking scan.
     fn read_scan(
-        &self,
         database: &JournalDatabase,
+        manifest_revision: u64,
+        mut observations: Vec<JournalObservation>,
         deadline: &Deadline,
     ) -> Result<JournalScan, StoreError> {
-        let head = read_head(database, deadline)?;
-        let Some((checkpoint_sequence, checkpoint_revision)) = read_checkpoint(database, deadline)?
-        else {
-            if head.is_some() {
-                return Err(StoreError::Journal(JournalError::MalformedCheckpoint));
-            }
-            return Ok(JournalScan {
-                checkpoint_sequence: 0,
-                checkpoint_revision: self.load()?.position().revision,
-                batches: Vec::new(),
-            });
-        };
-        if let Some((sequence, _)) = head {
-            enforce_unapplied_limit(checkpoint_sequence, sequence)?;
+        require_table(database, CHECKPOINT_TABLE, deadline)?;
+        require_table(database, BATCH_TABLE, deadline)?;
+        let checkpoint = read_checkpoint(database, deadline)?
+            .ok_or(StoreError::Journal(JournalError::MalformedCheckpoint))?;
+        if checkpoint.revision > manifest_revision {
+            return Err(StoreError::Journal(JournalError::ManifestBehindJournal {
+                manifest_revision,
+                checkpoint_revision: checkpoint.revision,
+            }));
         }
+        let head = read_head(database, deadline)?;
+        if let Some((sequence, _)) = head {
+            enforce_unapplied_limit(checkpoint.sequence, sequence)?;
+        }
+        enforce_unapplied_bytes(checkpoint.unapplied_bytes)?;
 
-        let batches = database
+        // The byte budget is enforced as rows arrive, so a journal that grew
+        // past it is refused instead of collected into memory first.
+        let mut collected = 0_u64;
+        let mut batches = database
             .query(
                 SELECT_BATCHES_SQL,
-                vec![sql_u64(checkpoint_sequence)?],
+                vec![sql_u64(checkpoint.sequence)?],
                 deadline,
-                decode_batch,
+                |row| {
+                    let batch = decode_batch(row)?;
+                    collected = collected.saturating_add(record_size(&batch.payload));
+                    if collected > MAX_UNAPPLIED_JOURNAL_BYTES {
+                        return Err(JournalError::UnappliedByteLimit {
+                            unapplied: collected,
+                            maximum: MAX_UNAPPLIED_JOURNAL_BYTES,
+                        });
+                    }
+                    Ok(batch)
+                },
             )
             .map_err(StoreError::Journal)?;
-        let mut expected_sequence = checkpoint_sequence
+        let mut expected_sequence = checkpoint
+            .sequence
             .checked_add(1)
             .ok_or(StoreError::Journal(JournalError::SequenceOverflow))?;
-        let mut expected_revision = checkpoint_revision;
+        let mut expected_revision = checkpoint.revision;
         for batch in &batches {
             validate_batch(batch, expected_sequence, expected_revision)?;
             expected_sequence = expected_sequence
@@ -405,11 +667,55 @@ impl ProjectStore {
                 .ok_or(StoreError::Journal(JournalError::SequenceOverflow))?;
             expected_revision = batch.revision;
         }
+
+        let mut resolved = checkpoint;
+        if manifest_revision > checkpoint.revision {
+            if batches.is_empty() {
+                // Nothing unapplied is recorded, so the journal cannot disagree
+                // with a manifest that moved on without it: the manifest is the
+                // durable state and the checkpoint row is merely stale.
+                resolved.revision = manifest_revision;
+            } else if let Some(applied) = batches
+                .iter()
+                .position(|batch| batch.revision == manifest_revision)
+            {
+                resolved = Checkpoint {
+                    sequence: batches[applied].sequence,
+                    revision: manifest_revision,
+                    unapplied_bytes: 0,
+                };
+                observations.push(JournalObservation::IncompleteCheckpoint {
+                    sequence: resolved.sequence,
+                    revision: resolved.revision,
+                });
+                batches.drain(..=applied);
+            } else {
+                // The manifest contains a revision the journal has no record
+                // of: the journal lost history the manifest depends on.
+                return Err(StoreError::Journal(JournalError::JournalBehindManifest {
+                    manifest_revision,
+                    journal_revision: expected_revision,
+                }));
+            }
+        }
         Ok(JournalScan {
-            checkpoint_sequence,
-            checkpoint_revision,
+            checkpoint_sequence: resolved.sequence,
+            checkpoint_revision: resolved.revision,
             batches,
+            observations,
         })
+    }
+}
+
+impl JournalScan {
+    /// A project that has never journalled: the manifest is the whole state.
+    const fn empty(manifest_revision: u64) -> Self {
+        Self {
+            checkpoint_sequence: 0,
+            checkpoint_revision: manifest_revision,
+            batches: Vec::new(),
+            observations: Vec::new(),
+        }
     }
 }
 
@@ -467,28 +773,58 @@ fn decode_batch(row: &Row) -> Result<MutationBatch, JournalError> {
     Ok(batch)
 }
 
+/// Refuses a database that is missing a table this journal defines.
+///
+/// Read paths never create the schema: an existing database without it has
+/// lost its schema, and creating it there would turn that damage into an
+/// empty, apparently healthy journal.
+fn require_table(
+    database: &JournalDatabase,
+    table: &'static str,
+    deadline: &Deadline,
+) -> Result<(), StoreError> {
+    let found = database
+        .query(
+            SELECT_TABLE_SQL,
+            vec![Value::Text(table.to_owned())],
+            deadline,
+            |row| column_integer(row, 0),
+        )
+        .map_err(StoreError::Journal)?
+        .first()
+        .copied()
+        .unwrap_or_default();
+    if found > 0 {
+        return Ok(());
+    }
+    Err(StoreError::Journal(JournalError::CorruptDatabase {
+        operation: deadline.operation(),
+        message: format!("table `{table}` is missing"),
+    }))
+}
+
 fn read_checkpoint(
     database: &JournalDatabase,
     deadline: &Deadline,
-) -> Result<Option<(u64, u64)>, StoreError> {
-    read_pair(database, SELECT_CHECKPOINT_SQL, Vec::new(), deadline)
+) -> Result<Option<Checkpoint>, StoreError> {
+    let rows = database
+        .query(SELECT_CHECKPOINT_SQL, Vec::new(), deadline, |row| {
+            Ok(Checkpoint {
+                sequence: row_u64(row, 0)?,
+                revision: row_u64(row, 1)?,
+                unapplied_bytes: row_u64(row, 2)?,
+            })
+        })
+        .map_err(StoreError::Journal)?;
+    Ok(rows.into_iter().next())
 }
 
 fn read_head(
     database: &JournalDatabase,
     deadline: &Deadline,
 ) -> Result<Option<(u64, u64)>, StoreError> {
-    read_pair(database, SELECT_HEAD_SQL, Vec::new(), deadline)
-}
-
-fn read_pair(
-    database: &JournalDatabase,
-    sql: &str,
-    parameters: Vec<Value>,
-    deadline: &Deadline,
-) -> Result<Option<(u64, u64)>, StoreError> {
     let rows = database
-        .query(sql, parameters, deadline, |row| {
+        .query(SELECT_HEAD_SQL, Vec::new(), deadline, |row| {
             Ok((row_u64(row, 0)?, row_u64(row, 1)?))
         })
         .map_err(StoreError::Journal)?;
@@ -497,8 +833,7 @@ fn read_pair(
 
 fn write_checkpoint(
     database: &JournalDatabase,
-    sequence: u64,
-    revision: u64,
+    checkpoint: Checkpoint,
     deadline: &Deadline,
 ) -> Result<(), StoreError> {
     database
@@ -507,11 +842,21 @@ fn write_checkpoint(
     database
         .execute(
             INSERT_CHECKPOINT_SQL,
-            vec![sql_u64(sequence)?, sql_u64(revision)?],
+            vec![
+                sql_u64(checkpoint.sequence)?,
+                sql_u64(checkpoint.revision)?,
+                sql_u64(checkpoint.unapplied_bytes)?,
+            ],
             deadline,
         )
         .map_err(StoreError::Journal)?;
     Ok(())
+}
+
+fn retained_bytes<'batch>(batches: impl IntoIterator<Item = &'batch MutationBatch>) -> u64 {
+    batches.into_iter().fold(0, |total, batch| {
+        total.saturating_add(record_size(&batch.payload))
+    })
 }
 
 fn row_u64(row: &Row, index: usize) -> Result<u64, JournalError> {
@@ -549,9 +894,14 @@ fn enforce_unapplied_limit(checkpoint_sequence: u64, head_sequence: u64) -> Resu
     Ok(())
 }
 
-fn is_constraint_violation(message: &str) -> bool {
-    message.to_ascii_lowercase().contains("unique")
-        || message.to_ascii_lowercase().contains("constraint")
+fn enforce_unapplied_bytes(unapplied: u64) -> Result<(), StoreError> {
+    if unapplied > MAX_UNAPPLIED_JOURNAL_BYTES {
+        return Err(StoreError::Journal(JournalError::UnappliedByteLimit {
+            unapplied,
+            maximum: MAX_UNAPPLIED_JOURNAL_BYTES,
+        }));
+    }
+    Ok(())
 }
 
 fn checksum(batch: &MutationBatch) -> u32 {
@@ -595,7 +945,21 @@ pub enum JournalError {
         index: usize,
     },
     MalformedCheckpoint,
-    RecordExists(u64),
+    /// The manifest holds a revision the journal has no record of.
+    JournalBehindManifest {
+        manifest_revision: u64,
+        journal_revision: u64,
+    },
+    /// The checkpoint claims the manifest holds work the manifest does not.
+    ManifestBehindJournal {
+        manifest_revision: u64,
+        checkpoint_revision: u64,
+    },
+    /// The database file is gone while a sidecar of it survives.
+    MissingDatabase {
+        database: PathBuf,
+        sidecar: PathBuf,
+    },
     UnknownCheckpoint(u64),
     CheckpointRevision {
         sequence: u64,
@@ -606,15 +970,31 @@ pub enum JournalError {
         unapplied: u64,
         maximum: u64,
     },
+    UnappliedByteLimit {
+        unapplied: u64,
+        maximum: u64,
+    },
     OutOfRange {
         value: u64,
     },
     SequenceOverflow,
     UnsupportedDatabasePath(PathBuf),
     DurabilityUnavailable {
+        pragma: &'static str,
         reported: Option<i64>,
     },
     CorruptDatabase {
+        operation: &'static str,
+        message: String,
+    },
+    /// Another process owns the journal database.
+    Locked {
+        operation: &'static str,
+        message: String,
+    },
+    /// The database refused a write that this module's own checks should have
+    /// refused first: an internal invariant, not an operator error.
+    Constraint {
         operation: &'static str,
         message: String,
     },
@@ -629,6 +1009,7 @@ pub enum JournalError {
 }
 
 impl fmt::Display for JournalError {
+    #[allow(clippy::too_many_lines)]
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::RecordTooLarge { size, maximum } => write!(
@@ -657,9 +1038,26 @@ impl fmt::Display for JournalError {
                 "journal database column {index} holds an unexpected value"
             ),
             Self::MalformedCheckpoint => formatter.write_str("malformed journal checkpoint"),
-            Self::RecordExists(sequence) => {
-                write!(formatter, "journal record {sequence} already exists")
-            }
+            Self::JournalBehindManifest {
+                manifest_revision,
+                journal_revision,
+            } => write!(
+                formatter,
+                "journal history ends at revision {journal_revision} but the manifest holds revision {manifest_revision}: the journal lost committed history"
+            ),
+            Self::ManifestBehindJournal {
+                manifest_revision,
+                checkpoint_revision,
+            } => write!(
+                formatter,
+                "journal checkpoint is at revision {checkpoint_revision} but the manifest holds revision {manifest_revision}: the manifest lost committed history"
+            ),
+            Self::MissingDatabase { database, sidecar } => write!(
+                formatter,
+                "journal database `{}` is missing while `{}` survives: the journal was deleted or restored incompletely",
+                database.display(),
+                sidecar.display()
+            ),
             Self::UnknownCheckpoint(sequence) => write!(
                 formatter,
                 "journal sequence {sequence} cannot be checkpointed"
@@ -676,6 +1074,10 @@ impl fmt::Display for JournalError {
                 formatter,
                 "journal holds {unapplied} unapplied batches, exceeding the {maximum} maximum; checkpoint the project"
             ),
+            Self::UnappliedByteLimit { unapplied, maximum } => write!(
+                formatter,
+                "journal holds {unapplied} unapplied bytes, exceeding the {maximum}-byte maximum; checkpoint the project"
+            ),
             Self::OutOfRange { value } => {
                 write!(
                     formatter,
@@ -688,14 +1090,22 @@ impl fmt::Display for JournalError {
                 "journal database path `{}` is not valid UTF-8",
                 path.display()
             ),
-            Self::DurabilityUnavailable { reported } => write!(
+            Self::DurabilityUnavailable { pragma, reported } => write!(
                 formatter,
-                "journal database would not commit synchronously (PRAGMA synchronous reported {})",
+                "journal database would not commit durably (PRAGMA {pragma} reported {})",
                 reported.map_or_else(|| "nothing".to_owned(), |value| value.to_string())
             ),
             Self::CorruptDatabase { operation, message } => write!(
                 formatter,
                 "journal database is corrupt during {operation}: {message}"
+            ),
+            Self::Locked { operation, message } => write!(
+                formatter,
+                "journal database is owned by another process during {operation}: a running freemixd normally holds it, and offline access is refused while it does; stop the daemon and retry ({message})"
+            ),
+            Self::Constraint { operation, message } => write!(
+                formatter,
+                "journal database refused a write during {operation}: {message}"
             ),
             Self::Database { operation, message } => {
                 write!(
@@ -849,10 +1259,21 @@ mod tests {
             .append_batch(&MutationBatch::new(2, 2, 3, b"two".to_vec()))
             .unwrap();
 
-        // Advance the checkpoint alone, as a crash before cleanup would leave it.
+        // Save the manifest and advance the checkpoint alone, as a crash before
+        // the cleanup that follows them would leave it.
+        store.save(&manifest(2)).unwrap();
         let deadline = Deadline::new("test");
         let database = JournalDatabase::open(&store.journal_database_path(), &deadline).unwrap();
-        write_checkpoint(&database, 1, 2, &deadline).unwrap();
+        write_checkpoint(
+            &database,
+            Checkpoint {
+                sequence: 1,
+                revision: 2,
+                unapplied_bytes: 0,
+            },
+            &deadline,
+        )
+        .unwrap();
         drop(database);
 
         let scan = store.scan_journal().unwrap();
@@ -864,5 +1285,266 @@ mod tests {
         assert_eq!(recovered.batches().len(), 1);
         assert_eq!(recovered.batches()[0].sequence(), 2);
         assert_eq!(store.scan_journal().unwrap().batches().len(), 1);
+    }
+
+    /// A journal whose write-ahead log was damaged must never be read as a
+    /// clean, empty journal, and the read path and the recovery path must say
+    /// the same thing about it. Creating the schema while reading turned
+    /// exactly this damage into "nothing to recover".
+    #[test]
+    fn a_damaged_write_ahead_log_is_never_read_as_a_clean_journal() {
+        let bundle = TestBundle::new("flipped-frame");
+        let store = bundle.store(0);
+        for sequence in 1..=5 {
+            store
+                .append_batch(&MutationBatch::new(
+                    sequence,
+                    sequence - 1,
+                    sequence,
+                    b"committed".to_vec(),
+                ))
+                .unwrap();
+        }
+
+        // Flip one bit inside the first logged frame.
+        let log = store.journal_path().join(WRITE_AHEAD_LOG_NAME);
+        let mut bytes = fs::read(&log).unwrap();
+        let frame = LOG_HEADER_BYTES + usize::try_from(LOG_FRAME_HEADER_BYTES).unwrap();
+        bytes[frame] ^= 0x01;
+        fs::write(&log, bytes).unwrap();
+
+        let scanned = store.scan_journal();
+        let recovered = store.recover_journal();
+        assert!(
+            scanned.is_err(),
+            "a damaged journal must not scan clean: {:?}",
+            scanned.map(|scan| scan.batches().len())
+        );
+        assert!(
+            recovered.is_err(),
+            "a damaged journal must not recover clean: {:?}",
+            recovered.map(|scan| scan.batches().len())
+        );
+        // The last consistent state stays readable through the manifest.
+        assert_eq!(store.load().unwrap().position().revision, 0);
+    }
+
+    /// Deleting or emptying the database while its write-ahead log survives is
+    /// a damaged journal, not a project that never journalled.
+    #[test]
+    fn a_database_deleted_under_its_log_is_reported() {
+        let bundle = TestBundle::new("orphan-log");
+        let store = bundle.store(0);
+        store
+            .append_batch(&MutationBatch::new(1, 0, 1, b"one".to_vec()))
+            .unwrap();
+        assert!(
+            store
+                .journal_path()
+                .join(WRITE_AHEAD_LOG_NAME)
+                .try_exists()
+                .unwrap()
+        );
+
+        for damage in [
+            |path: &PathBuf| fs::write(path, b"").unwrap(),
+            |path: &PathBuf| fs::remove_file(path).unwrap(),
+        ] {
+            damage(&store.journal_database_path());
+            assert!(matches!(
+                store.scan_journal(),
+                Err(StoreError::Journal(JournalError::MissingDatabase { .. }))
+            ));
+            assert!(matches!(
+                store.recover_journal(),
+                Err(StoreError::Journal(JournalError::MissingDatabase { .. }))
+            ));
+        }
+    }
+
+    /// Holding the journal database open must not stop anything from reading
+    /// the project: inspection never touches the journal, so a running daemon
+    /// never locks an operator out of the manifest.
+    #[test]
+    fn an_open_journal_database_does_not_block_loading_the_project() {
+        let bundle = TestBundle::new("open-while-loading");
+        let store = bundle.store(3);
+        store
+            .append_batch(&MutationBatch::new(1, 3, 4, b"one".to_vec()))
+            .unwrap();
+
+        let deadline = Deadline::new("test");
+        let held = JournalDatabase::open(&store.journal_database_path(), &deadline).unwrap();
+        assert_eq!(store.load().unwrap().position().revision, 3);
+        assert_eq!(
+            ProjectStore::new(store.root().to_path_buf())
+                .unwrap()
+                .load()
+                .unwrap()
+                .position()
+                .revision,
+            3
+        );
+        drop(held);
+    }
+
+    /// A crash between the manifest save and the checkpoint transaction leaves
+    /// the manifest ahead of the checkpoint. The batches it already contains
+    /// must not come back as unapplied history, and neither app may refuse the
+    /// project: recovery finishes the interrupted checkpoint.
+    #[test]
+    fn an_interrupted_checkpoint_is_reported_and_completed() {
+        let bundle = TestBundle::new("interrupted");
+        let store = bundle.store(4);
+        store
+            .append_batch(&MutationBatch::new(1, 4, 5, b"one".to_vec()))
+            .unwrap();
+        store
+            .append_batch(&MutationBatch::new(2, 5, 6, b"two".to_vec()))
+            .unwrap();
+        // `checkpoint_and_compact` saves the manifest first; crash here.
+        store.save(&manifest(5)).unwrap();
+
+        let scan = store.scan_journal().unwrap();
+        assert_eq!(
+            scan.observations(),
+            [JournalObservation::IncompleteCheckpoint {
+                sequence: 1,
+                revision: 5
+            }]
+        );
+        assert_eq!(scan.checkpoint_sequence(), 1);
+        assert_eq!(scan.checkpoint_revision(), 5);
+        let sequences: Vec<u64> = scan.batches().iter().map(MutationBatch::sequence).collect();
+        assert_eq!(sequences, vec![2]);
+
+        let recovered = store.recover_journal().unwrap();
+        assert_eq!(recovered.checkpoint_sequence(), 1);
+        assert_eq!(recovered.batches().len(), 1);
+        // The resolution is durable, so the next scan has nothing left to
+        // reconcile and the batch it already applied is gone.
+        let settled = store.scan_journal().unwrap();
+        assert!(settled.observations().is_empty());
+        assert_eq!(settled.checkpoint_sequence(), 1);
+        assert_eq!(settled.batches().len(), 1);
+    }
+
+    /// A journal whose history no longer reaches the manifest is reported
+    /// instead of returned as a short, healthy-looking scan.
+    #[test]
+    fn a_journal_behind_the_manifest_is_reported() {
+        let bundle = TestBundle::new("short-history");
+        let store = bundle.store(4);
+        store
+            .append_batch(&MutationBatch::new(1, 4, 5, b"one".to_vec()))
+            .unwrap();
+        store
+            .append_batch(&MutationBatch::new(2, 5, 6, b"two".to_vec()))
+            .unwrap();
+        store.save(&manifest(6)).unwrap();
+
+        // Lose the batch the manifest was saved for, as a torn write-ahead log
+        // tail does.
+        let deadline = Deadline::new("test");
+        let database = JournalDatabase::open(&store.journal_database_path(), &deadline).unwrap();
+        database
+            .execute(
+                "DELETE FROM journal_batch WHERE sequence = 2",
+                Vec::new(),
+                &deadline,
+            )
+            .unwrap();
+        drop(database);
+
+        assert!(matches!(
+            store.scan_journal(),
+            Err(StoreError::Journal(JournalError::JournalBehindManifest {
+                manifest_revision: 6,
+                journal_revision: 5
+            }))
+        ));
+    }
+
+    /// A write-ahead log that does not end on a frame boundary lost its final
+    /// transaction. The scan says so instead of returning the shortened
+    /// history in silence.
+    #[test]
+    fn a_torn_write_ahead_log_tail_is_reported() {
+        let bundle = TestBundle::new("torn-log");
+        let store = bundle.store(0);
+        for sequence in 1..=3 {
+            store
+                .append_batch(&MutationBatch::new(
+                    sequence,
+                    sequence - 1,
+                    sequence,
+                    b"payload".to_vec(),
+                ))
+                .unwrap();
+        }
+
+        let log = store.journal_path().join(WRITE_AHEAD_LOG_NAME);
+        let bytes = fs::metadata(&log).unwrap().len();
+        assert!(
+            bytes > LOG_HEADER_BYTES as u64,
+            "the log holds committed frames"
+        );
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&log)
+            .unwrap()
+            .set_len(bytes - 7)
+            .unwrap();
+
+        let observations = store.scan_journal().unwrap().observations().to_vec();
+        assert!(
+            observations.iter().any(|observation| matches!(
+                observation,
+                JournalObservation::TornWriteAheadLog { .. }
+            )),
+            "expected a torn log observation, got {observations:?}"
+        );
+        // Recovery rewrites the log from its header, so the damage is reported
+        // while it is there and not forever afterwards.
+        store.recover_journal().unwrap();
+        assert!(store.scan_journal().unwrap().observations().is_empty());
+    }
+
+    /// Recovery memory is bounded by bytes, not only by record count: the count
+    /// cap alone allows tens of gigabytes into one `Vec`.
+    #[test]
+    fn unapplied_batches_are_bounded_by_bytes() {
+        assert!(
+            MAX_UNAPPLIED_JOURNAL_BATCHES.saturating_mul(MAX_JOURNAL_RECORD_BYTES)
+                > MAX_UNAPPLIED_JOURNAL_BYTES,
+            "the count cap alone must not be the memory bound"
+        );
+        assert!(enforce_unapplied_bytes(MAX_UNAPPLIED_JOURNAL_BYTES).is_ok());
+        assert!(matches!(
+            enforce_unapplied_bytes(MAX_UNAPPLIED_JOURNAL_BYTES + 1),
+            Err(StoreError::Journal(JournalError::UnappliedByteLimit {
+                maximum: MAX_UNAPPLIED_JOURNAL_BYTES,
+                ..
+            }))
+        ));
+
+        // The bound is enforced against a running total the journal keeps, so
+        // an append is refused before the journal grows past what recovery can
+        // read back.
+        let bundle = TestBundle::new("byte-budget");
+        let store = bundle.store(0);
+        let payload = vec![0xd7_u8; 4096];
+        store
+            .append_batch(&MutationBatch::new(1, 0, 1, payload.clone()))
+            .unwrap();
+        store
+            .append_batch(&MutationBatch::new(2, 1, 2, payload.clone()))
+            .unwrap();
+
+        let deadline = Deadline::new("test");
+        let database = JournalDatabase::open(&store.journal_database_path(), &deadline).unwrap();
+        let checkpoint = read_checkpoint(&database, &deadline).unwrap().unwrap();
+        drop(database);
+        assert_eq!(checkpoint.unapplied_bytes, 2 * record_size(&payload));
     }
 }

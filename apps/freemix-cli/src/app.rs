@@ -405,22 +405,22 @@ pub fn run(command: Command) -> AppResult<()> {
         Command::InputReplaceScene { path, input, scene } => {
             replace_input_scene(&path, input_id(input)?, scene_id(scene)?)?
         }
-        Command::Status { path } => print_status(&load_engine(&path)?),
+        Command::Status { path } => print_status(&inspect_engine(&path)?),
         Command::JournalRecover { path } => recover_journal(&path)?,
         Command::Inputs { path } => {
-            let stored = load_stored_project(&path)?;
+            let stored = inspect_stored_project(&path)?;
             print_inputs(stored.project());
         }
         Command::Outputs { path } => {
-            let stored = load_stored_project(&path)?;
+            let stored = inspect_stored_project(&path)?;
             print_outputs(stored.project());
         }
         Command::AudioBuses { path } => {
-            let stored = load_stored_project(&path)?;
+            let stored = inspect_stored_project(&path)?;
             print_audio_buses(stored.project());
         }
         Command::Scenes { path } => {
-            let stored = load_stored_project(&path)?;
+            let stored = inspect_stored_project(&path)?;
             print_scenes(stored.project());
         }
         Command::AssetAudit { path } => audit_assets(&path)?,
@@ -2345,7 +2345,15 @@ fn update_project(
 }
 
 fn load_engine(path: &Path) -> AppResult<ProjectEngine> {
-    let stored = load_stored_project(path)?;
+    restore_project_engine(load_stored_project(path)?)
+}
+
+/// Restores an engine for reporting only, without opening the journal.
+fn inspect_engine(path: &Path) -> AppResult<ProjectEngine> {
+    restore_project_engine(inspect_stored_project(path)?)
+}
+
+fn restore_project_engine(stored: StoredProject) -> AppResult<ProjectEngine> {
     let project = stored.project().clone();
     let inputs = project
         .inputs()
@@ -2658,6 +2666,11 @@ fn restored_t_bar(state: PersistedManualTransitionState) -> AppResult<TBarState>
     ))
 }
 
+/// Loads a project that is about to be mutated.
+///
+/// This opens the journal database, which a running daemon owns exclusively:
+/// the mutation is refused while the daemon holds it, and refused again if
+/// batches the daemon recorded are still unapplied.
 fn load_stored_project(path: &Path) -> AppResult<StoredProject> {
     let store = ProjectStore::new(path)?;
     let project = store.load()?;
@@ -2674,8 +2687,17 @@ fn load_stored_project(path: &Path) -> AppResult<StoredProject> {
     Ok(project)
 }
 
+/// Reads a project without touching its journal.
+///
+/// The journal database is locked exclusively by whichever process has it
+/// open, so inspecting a project must never open it: reporting a show's state
+/// has to work while its daemon is running.
+fn inspect_stored_project(path: &Path) -> AppResult<StoredProject> {
+    Ok(ProjectStore::new(path)?.load()?)
+}
+
 fn audit_assets(path: &Path) -> AppResult<()> {
-    let stored = load_stored_project(path)?;
+    let stored = inspect_stored_project(path)?;
     let store = ProjectStore::new(path)?;
     let issues = store.audit_assets(&stored);
     for issue in &issues {
@@ -2704,6 +2726,9 @@ fn recover_journal(path: &Path) -> AppResult<()> {
     reject_unapplied_journal_batches(scan.batches().len())?;
     let recovered = store.recover_journal()?;
     reject_unapplied_journal_batches(recovered.batches().len())?;
+    for observation in recovered.observations() {
+        println!("journal observation: {observation}");
+    }
     println!(
         "journal recovered: checkpoint_sequence={} checkpoint_revision={} unapplied_batches=0",
         recovered.checkpoint_sequence(),
@@ -2723,7 +2748,7 @@ fn reject_unapplied_journal_batches(count: usize) -> AppResult<()> {
 }
 
 fn render(path: &Path, output: &Path, width: u32, height: u32) -> AppResult<()> {
-    let project = load_engine(path)?;
+    let project = inspect_engine(path)?;
     let engine = &project.engine;
     let mut pipeline = SimulatedPipeline::new(width, height)?;
     for input in project.project.inputs() {
