@@ -1446,6 +1446,26 @@ fn remote_input_rename_is_authorized_replicated_replay_safe_and_survives_restart
     drop(snapshot_client);
     daemon.stop();
 
+    // The daemon was killed, not stopped: these revisions live in the journal
+    // and only reach the manifest when the next daemon recovers them.
+    let daemon = Daemon::start(&project_path);
+    let mut restarted = daemon.connect();
+    let handshake = restarted.handshake_as(Role::Graphics, None);
+    assert_eq!(handshake.current_revision, 2);
+    let WireMessage::Snapshot(snapshot) = restarted.receive() else {
+        panic!("expected snapshot after restart");
+    };
+    assert_eq!(
+        snapshot
+            .inputs
+            .iter()
+            .map(|status| (status.input, status.name.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(input(2), "Input 2"), (input(1), "Camera Left")]
+    );
+    drop(restarted);
+    daemon.wait_success();
+
     let persisted = ProjectStore::new(&project_path).unwrap().load().unwrap();
     assert_eq!(persisted.position().revision, 2);
     assert_eq!(persisted.position().frames_rendered, 2);
@@ -1486,24 +1506,6 @@ fn remote_input_rename_is_authorized_replicated_replay_safe_and_survives_restart
             .get(),
         -2_000
     );
-
-    let daemon = Daemon::start(&project_path);
-    let mut restarted = daemon.connect();
-    let handshake = restarted.handshake_as(Role::Graphics, None);
-    assert_eq!(handshake.current_revision, 2);
-    let WireMessage::Snapshot(snapshot) = restarted.receive() else {
-        panic!("expected snapshot after restart");
-    };
-    assert_eq!(
-        snapshot
-            .inputs
-            .iter()
-            .map(|status| (status.input, status.name.as_str()))
-            .collect::<Vec<_>>(),
-        vec![(input(2), "Input 2"), (input(1), "Camera Left")]
-    );
-    drop(restarted);
-    daemon.wait_success();
 }
 
 #[test]
@@ -1607,6 +1609,277 @@ fn commands_survive_restart_resume_and_duplicate_replay() {
     daemon.wait_success();
 
     assert_eq!(store.load().unwrap(), persisted);
+}
+
+/// The whole point of the journal: a command the operator was told succeeded
+/// must survive `SIGKILL`.
+///
+/// The daemon is killed with the acknowledgement already in the client's hand
+/// and no chance to shut down, flush or checkpoint. The manifest is still at
+/// revision 0 at that instant, so nothing here can pass because a file happened
+/// to be written — the two revisions exist only as journal batches, and only
+/// recovery can bring them back.
+#[test]
+fn acknowledged_commands_survive_sigkill_before_any_checkpoint() {
+    let directory = TestDirectory::new("sigkill-durability");
+    let project_path = directory.project_path();
+    create_project(&project_path);
+    let store = ProjectStore::new(&project_path).unwrap();
+
+    let daemon = Daemon::start(&project_path);
+    let mut client = daemon.connect();
+    assert_eq!(client.handshake(None).current_revision, 0);
+    assert!(matches!(client.receive(), WireMessage::Snapshot(_)));
+
+    client.send(&command(
+        "killed-preview",
+        "killed-preview-key",
+        CommandPayload::SelectPreview { input: input(3) },
+    ));
+    assert!(matches!(
+        client.next_result(),
+        CommandResult::Accepted { revision: 1, .. }
+    ));
+    client.send(&command(
+        "killed-cut",
+        "killed-cut-key",
+        CommandPayload::Cut,
+    ));
+    assert!(matches!(
+        client.next_result(),
+        CommandResult::Accepted { revision: 2, .. }
+    ));
+
+    // Both acknowledgements are in hand. Kill the process outright.
+    daemon.stop();
+
+    // Nothing acknowledged is in the manifest, so the recovery below cannot be
+    // reading a per-command manifest rewrite.
+    assert_eq!(store.load().unwrap().position().revision, 0);
+    let crashed = store.scan_journal().unwrap();
+    assert_eq!(crashed.batches().len(), 2);
+    assert_eq!(crashed.checkpoint_sequence(), 0);
+    assert!(crashed.observations().is_empty());
+
+    let daemon = Daemon::start(&project_path);
+    let mut restarted = daemon.connect();
+    assert_eq!(restarted.handshake(None).current_revision, 2);
+    assert!(matches!(restarted.receive(), WireMessage::Snapshot(_)));
+    // The receipts came back too, so a client that retries after the crash is
+    // answered from the original acceptance instead of cutting the show again.
+    restarted.send(&command(
+        "killed-cut-retry",
+        "killed-cut-key",
+        CommandPayload::Cut,
+    ));
+    assert!(matches!(
+        restarted.next_result(),
+        CommandResult::Accepted {
+            id,
+            revision: 2,
+            ..
+        } if id == "killed-cut"
+    ));
+    drop(restarted);
+    daemon.wait_success();
+
+    let persisted = store.load().unwrap();
+    assert_eq!(persisted.position().revision, 2);
+    assert_eq!(persisted.idempotency_receipts().len(), 2);
+    // The cut swapped the preview selected at revision 1 onto program.
+    assert_eq!(
+        persisted.runtime_routing().realized_program_id,
+        Some(domain_input(3))
+    );
+    assert_eq!(
+        persisted.runtime_routing().desired_program_id,
+        Some(domain_input(3))
+    );
+}
+
+/// Checkpoints must bound journal growth on their own, and recovery must land
+/// on the exact state the daemon held, not merely a plausible one.
+///
+/// A run of `CHECKPOINTED_COMMANDS` commands is executed twice against
+/// identical projects: once stopped cleanly, once killed and recovered. The two
+/// projects must end byte-for-byte identical as `StoredProject` values —
+/// revision, event sequence, frames rendered, runtime generation, clock time,
+/// routing and every receipt.
+#[test]
+fn checkpoints_compact_the_journal_and_recovery_reproduces_the_exact_state() {
+    /// One more than the daemon's checkpoint interval, so a checkpoint is
+    /// forced mid-run without a clean shutdown.
+    const CHECKPOINTED_COMMANDS: u32 = 65;
+
+    fn cut_repeatedly(daemon: &Daemon, count: u32) {
+        let mut client = daemon.connect();
+        client.handshake(None);
+        assert!(matches!(client.receive(), WireMessage::Snapshot(_)));
+        for revision in 1..=count {
+            client.send(&command(
+                &format!("cut-{revision}"),
+                &format!("cut-key-{revision}"),
+                CommandPayload::Cut,
+            ));
+            match client.next_result() {
+                CommandResult::Accepted { revision: got, .. } => {
+                    assert_eq!(got, u64::from(revision));
+                }
+                CommandResult::Rejected { code, message, .. } => {
+                    panic!("command {revision} was rejected as {code}: {message}")
+                }
+            }
+        }
+    }
+
+    let directory = TestDirectory::new("checkpoint-clean");
+    let clean_path = directory.project_path();
+    create_project(&clean_path);
+    let clean_store = ProjectStore::new(&clean_path).unwrap();
+    let daemon = Daemon::start(&clean_path);
+    cut_repeatedly(&daemon, CHECKPOINTED_COMMANDS);
+    daemon.wait_success();
+    let clean = clean_store.load().unwrap();
+    assert_eq!(clean.position().revision, u64::from(CHECKPOINTED_COMMANDS));
+
+    let crash_directory = TestDirectory::new("checkpoint-crash");
+    let crash_path = crash_directory.project_path();
+    create_project(&crash_path);
+    let crash_store = ProjectStore::new(&crash_path).unwrap();
+    let daemon = Daemon::start(&crash_path);
+    cut_repeatedly(&daemon, CHECKPOINTED_COMMANDS);
+    daemon.stop();
+
+    // The bounded checkpoint fired mid-run: the manifest advanced without a
+    // clean shutdown, and only the commands after it were left to replay.
+    let crashed = crash_store.load().unwrap();
+    assert!(
+        crashed.position().revision > 0 && crashed.position().revision < clean.position().revision,
+        "a checkpoint must have advanced the manifest mid-run, found revision {}",
+        crashed.position().revision
+    );
+    let scan = crash_store.scan_journal().unwrap();
+    assert_eq!(scan.checkpoint_revision(), crashed.position().revision);
+    assert_eq!(
+        u64::from(CHECKPOINTED_COMMANDS) - crashed.position().revision,
+        scan.batches().len() as u64,
+        "every command after the checkpoint must still be in the journal"
+    );
+
+    let daemon = Daemon::start(&crash_path);
+    let mut client = daemon.connect();
+    assert_eq!(
+        client.handshake(None).current_revision,
+        u64::from(CHECKPOINTED_COMMANDS)
+    );
+    drop(client);
+    daemon.wait_success();
+
+    assert_eq!(crash_store.load().unwrap(), clean);
+    // Checkpointing discarded what it applied instead of retaining it forever.
+    let settled = crash_store.scan_journal().unwrap();
+    assert!(settled.batches().is_empty());
+    assert_eq!(
+        settled.checkpoint_revision(),
+        u64::from(CHECKPOINTED_COMMANDS)
+    );
+}
+
+/// Work that is not durable is never acknowledged.
+///
+/// The journal is made unusable underneath a running daemon — the specific
+/// fault stands in for a failing or full show disk. The commands that follow
+/// must come back refused and retryable, the daemon must stay up and keep
+/// serving, and no refused command may leave a trace: once the journal works
+/// again the next command takes the very next revision.
+#[test]
+fn a_command_that_cannot_be_journalled_is_refused_and_the_daemon_keeps_serving() {
+    let directory = TestDirectory::new("journal-append-failure");
+    let project_path = directory.project_path();
+    create_project(&project_path);
+    let journal = project_path.join("journal");
+
+    let daemon = Daemon::start_without_once(&project_path);
+    let mut client = daemon.connect();
+    client.handshake(None);
+    assert!(matches!(client.receive(), WireMessage::Snapshot(_)));
+    client.send(&command(
+        "durable-cut",
+        "durable-cut-key",
+        CommandPayload::Cut,
+    ));
+    assert!(matches!(
+        client.next_result(),
+        CommandResult::Accepted { revision: 1, .. }
+    ));
+
+    let saved: Vec<(PathBuf, Vec<u8>)> = fs::read_dir(&journal)
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            let bytes = fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect();
+    assert!(!saved.is_empty(), "the accepted command was journalled");
+    fs::remove_dir_all(&journal).unwrap();
+    fs::create_dir(&journal).unwrap();
+    fs::create_dir(journal.join("journal.db")).unwrap();
+
+    for id in ["refused-first", "refused-second"] {
+        client.send(&command(id, &format!("{id}-key"), CommandPayload::Cut));
+        match client.next_result() {
+            CommandResult::Rejected {
+                id: rejected,
+                code,
+                current_revision,
+                retryable,
+                ..
+            } => {
+                assert_eq!(rejected, id);
+                assert_eq!(code, "unavailable");
+                assert_eq!(current_revision, 1, "a refused command takes no revision");
+                assert!(retryable);
+            }
+            CommandResult::Accepted { revision, .. } => {
+                panic!("{id} must not be acknowledged, yet it took revision {revision}")
+            }
+        }
+    }
+
+    fs::remove_dir_all(&journal).unwrap();
+    fs::create_dir(&journal).unwrap();
+    for (path, bytes) in saved {
+        fs::write(path, bytes).unwrap();
+    }
+    client.send(&command(
+        "after-repair",
+        "after-repair-key",
+        CommandPayload::Cut,
+    ));
+    assert!(
+        matches!(
+            client.next_result(),
+            CommandResult::Accepted { revision: 2, .. }
+        ),
+        "the refused commands left no gap in the revision or the journal"
+    );
+    drop(client);
+    daemon.stop();
+
+    let store = ProjectStore::new(&project_path).unwrap();
+    let scan = store.scan_journal().unwrap();
+    assert_eq!(
+        scan.batches().len(),
+        2,
+        "only the accepted commands persist"
+    );
+    let daemon = Daemon::start(&project_path);
+    let mut restarted = daemon.connect();
+    assert_eq!(restarted.handshake(None).current_revision, 2);
+    drop(restarted);
+    daemon.wait_success();
+    assert_eq!(store.load().unwrap().position().revision, 2);
 }
 
 #[test]

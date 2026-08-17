@@ -35,7 +35,8 @@ use fm_command::{
     Rejection, RejectionCode, Revision, RuntimeGeneration, StateEpoch,
 };
 use fm_control::{
-    CommandSubmission, ControlLimits, ControlService, PrepareSubmitOutcome, ResumeDecision,
+    CommandSubmission, ControlLimits, ControlService, PrepareSubmitOutcome, ResultBeforeEvents,
+    ResumeDecision,
 };
 #[cfg(feature = "native-media")]
 use fm_engine::FrameResult;
@@ -51,10 +52,10 @@ use fm_model::{
 use fm_persistence::{
     FadeToBlackState as PersistedFadeToBlackState, IdempotencyReceipt,
     ManualTransitionKind as PersistedManualTransitionKind,
-    ManualTransitionState as PersistedManualTransitionState, ProjectPosition, ProjectStore,
-    ReceiptOutcome, RuntimeFadeToBlack, RuntimeManualTransitions, RuntimeOverlayBorder,
-    RuntimeOverlayChannel, RuntimeOverlayPosition, RuntimeOverlayTransition, RuntimeOverlays,
-    RuntimeRouting, StoredProject,
+    ManualTransitionState as PersistedManualTransitionState, MutationBatch, ProjectPosition,
+    ProjectStore, ReceiptOutcome, RuntimeFadeToBlack, RuntimeManualTransitions,
+    RuntimeOverlayBorder, RuntimeOverlayChannel, RuntimeOverlayPosition, RuntimeOverlayTransition,
+    RuntimeOverlays, RuntimeRouting, StoredProject,
 };
 #[cfg(feature = "native-media")]
 use fm_protocol::{AUDIO_METER_LEVEL_SCALE, AudioMeterChannel, InputAudioMeters, WireInputId};
@@ -79,6 +80,7 @@ use fm_switcher::{
 use fm_types::{InputId, ProjectId};
 use freemixd::{ReadinessRecord, StatusReadinessRecord};
 
+mod journal;
 mod latest_record;
 mod non_native_sessions;
 #[cfg(feature = "macos-program-surface")]
@@ -88,6 +90,7 @@ mod status_listener;
 mod stinger_mutation;
 mod web;
 
+use journal::{DurableJournal, DurableStore, ReplayedMutations};
 use status_listener::{DaemonStatus, StatusListener};
 
 #[cfg(feature = "native-media")]
@@ -287,16 +290,6 @@ fn requested_daemon_shutdown(
         process.status.begin_draining();
     }
     reason
-}
-
-trait ProjectSaver {
-    fn save(&self, project: &StoredProject) -> AppResult<()>;
-}
-
-impl ProjectSaver for ProjectStore {
-    fn save(&self, project: &StoredProject) -> AppResult<()> {
-        ProjectStore::save(self, project).map_err(Into::into)
-    }
 }
 
 #[cfg(feature = "native-media")]
@@ -3580,7 +3573,11 @@ fn serve_inner(
     }
 
     let store = ProjectStore::new(path)?;
-    let project = load_and_recover(&store)?;
+    let RecoveredProject {
+        durable: project,
+        journal_head,
+    } = load_and_recover(&store)?;
+    let journal = DurableJournal::new(&store, journal_head);
     let project_id = project.project().id();
     let engine = restore_engine(&project)?;
     let identity = format!("project-{project_id}");
@@ -3633,7 +3630,7 @@ fn serve_inner(
         match primed {
             Ok(true) => {}
             Ok(false) => {
-                checkpoint_native(&control, &store, &mut durable)?;
+                checkpoint_native(&control, &journal, &mut durable)?;
                 native
                     .as_mut()
                     .expect("recording requires native state")
@@ -3708,7 +3705,7 @@ fn serve_inner(
         listener,
         &server,
         &control,
-        &store,
+        &journal,
         &mut durable,
         &principal,
         native.as_mut(),
@@ -3728,7 +3725,12 @@ fn serve_inner(
         result?;
     }
     if native.is_some() {
-        checkpoint_native(&control, &store, &mut durable)?;
+        checkpoint_native(&control, &journal, &mut durable)?;
+    } else {
+        // A clean stop is the safest checkpoint there is: no command is in
+        // flight, so the manifest ends the run holding everything the journal
+        // recorded and the next start has nothing to replay.
+        journal.settle(&durable)?;
     }
     #[cfg(all(feature = "macos-program-surface", target_os = "macos"))]
     if fullscreen_active {
@@ -3752,28 +3754,117 @@ fn serve_inner(
 
 fn checkpoint_native(
     control: &SharedControl,
-    store: &ProjectStore,
+    store: &dyn DurableStore,
     durable: &mut StoredProject,
 ) -> AppResult<()> {
     let snapshot = control.borrow().idle_engine_snapshot()?;
     *durable = stored_project_checkpoint(durable, &snapshot)?;
-    store.save(durable)?;
+    // The idle snapshot advances the runtime position without advancing the
+    // revision, so it is not a mutation: it belongs in the manifest directly.
+    store.checkpoint(durable)?;
     Ok(())
 }
 
-fn load_and_recover(store: &ProjectStore) -> AppResult<StoredProject> {
-    let project = store.load()?;
-    if store.journal_path().try_exists()? {
-        let scan = store.recover_journal()?;
-        if !scan.batches().is_empty() {
-            return Err(AppFailure(
-                "project has unapplied journal batches that freemixd cannot safely interpret"
-                    .into(),
-            )
+/// A project brought back to the exact state it held before the daemon stopped.
+struct RecoveredProject {
+    durable: StoredProject,
+    /// The journal sequence the project is now checkpointed at.
+    journal_head: u64,
+}
+
+/// Loads the manifest and replays whatever the journal recorded after it.
+///
+/// The manifest is the last checkpointed state; every mutation accepted since
+/// then is in the journal. Recovery therefore loads the manifest, re-executes
+/// the recorded commands through the same path that first accepted them, and
+/// checkpoints the result, so the daemon opens at the revision the operator was
+/// last acknowledged at rather than at the last checkpoint.
+///
+/// Opening also creates the journal when the project has never had one, so the
+/// daemon starts owning a journal whose checkpoint agrees with the manifest and
+/// the first command can be appended without re-reading it.
+fn load_and_recover(store: &ProjectStore) -> AppResult<RecoveredProject> {
+    let manifest = store.load()?;
+    let scan = store.recover_journal()?;
+    for observation in scan.observations() {
+        eprintln!("FREEMIXD_JOURNAL\tv=1\tobservation={observation}");
+    }
+    let journal_head = scan
+        .batches()
+        .last()
+        .map_or_else(|| scan.checkpoint_sequence(), MutationBatch::sequence);
+    if scan.batches().is_empty() {
+        return Ok(RecoveredProject {
+            durable: manifest,
+            journal_head,
+        });
+    }
+
+    let durable = replay_journal(&manifest, scan.batches())?;
+    // Fold the replayed mutations into the manifest and discard them, so the
+    // next crash replays only what happened after this point and a second
+    // recovery of the same batches is impossible.
+    store.checkpoint_and_compact(&durable, journal_head)?;
+    eprintln!(
+        "FREEMIXD_JOURNAL\tv=1\trecovered_batches={}\tfrom_revision={}\tto_revision={}",
+        scan.batches().len(),
+        manifest.position().revision,
+        durable.position().revision
+    );
+    Ok(RecoveredProject {
+        durable,
+        journal_head,
+    })
+}
+
+/// Rebuilds the pre-crash state by re-running the recorded commands.
+///
+/// Nothing in this workspace applies an event to a project: the engine is
+/// command-sourced, so the only faithful way to reach the pre-crash state is
+/// the path that produced it. Each batch therefore carries the command and the
+/// instant it was submitted, and replay runs `execute_durable_command` against
+/// an engine restored from the manifest, recording nothing and publishing to
+/// nobody.
+///
+/// Every batch must land on exactly the revision it claims. A divergence means
+/// the replay is not the history the operator was acknowledged for, so it is
+/// reported instead of silently becoming the project's state.
+fn replay_journal(manifest: &StoredProject, batches: &[MutationBatch]) -> AppResult<StoredProject> {
+    let mut durable = manifest.clone();
+    let project_id = durable.project().id();
+    let identity = format!("project-{project_id}");
+    let mut control = ControlService::new(
+        restore_engine(&durable)?,
+        Policy::development(),
+        identity.clone(),
+        format!("{identity}-log"),
+        ControlLimits::default(),
+    );
+    let server = control_server_identity(&control, project_id);
+    let principal = development_principal()?;
+    for batch in batches {
+        let (command, now_millis) = journal::decode_mutation(batch.payload())?;
+        execute_durable_command(
+            &mut control,
+            &ReplayedMutations,
+            &mut durable,
+            &principal,
+            &server,
+            &command,
+            now_millis,
+        )?;
+        if durable.position().revision != batch.revision() {
+            return Err(AppFailure(format!(
+                "journal batch {} replayed command `{}` to revision {} instead of {}",
+                batch.sequence(),
+                command.id,
+                durable.position().revision,
+                batch.revision()
+            ))
             .into());
         }
     }
-    Ok(project)
+    Ok(durable)
 }
 
 fn restore_engine(project: &StoredProject) -> AppResult<Engine> {
@@ -3920,7 +4011,7 @@ fn handle_client(
     stream: TcpStream,
     server: &Server<ControlHandle>,
     control: &SharedControl,
-    store: &ProjectStore,
+    store: &dyn DurableStore,
     durable: &mut StoredProject,
     principal: &Principal,
     authority: &ServerIdentity,
@@ -4304,7 +4395,7 @@ fn process_command(
     writer: &mut TcpStream,
     session: &mut Session,
     control: &SharedControl,
-    store: &ProjectStore,
+    store: &dyn DurableStore,
     durable: &mut StoredProject,
     principal: &Principal,
     server: &ServerIdentity,
@@ -4349,7 +4440,7 @@ struct CommandDelivery {
 fn execute_session_command(
     session: &mut Session,
     control: &SharedControl,
-    store: &ProjectStore,
+    store: &dyn DurableStore,
     durable: &mut StoredProject,
     principal: &Principal,
     server: &ServerIdentity,
@@ -4480,7 +4571,7 @@ struct NativeMutationFailure {
 #[cfg(feature = "native-media")]
 fn execute_native_stinger_mutation(
     control: &mut ControlService<Policy>,
-    store: &ProjectStore,
+    store: &dyn DurableStore,
     durable: &mut StoredProject,
     principal: &Principal,
     server: &ServerIdentity,
@@ -4507,7 +4598,7 @@ fn execute_native_stinger_mutation(
             command,
             &first_prepared.output().result,
         )?;
-        store.save(&updated)?;
+        store.record(command, now_millis, durable, &updated)?;
         let submission = first_prepared.commit()?;
         *durable = updated;
         return Ok(Ok(DurableExecution {
@@ -4569,7 +4660,7 @@ fn execute_native_stinger_mutation(
             command,
             &second_prepared.output().result,
         )?;
-        store.save(&updated)?;
+        store.record(command, now_millis, durable, &updated)?;
         let submission = second_prepared.commit()?;
         *durable = updated;
         return Ok(Ok(DurableExecution {
@@ -4602,7 +4693,7 @@ fn execute_native_stinger_mutation(
             runtime_events: preflight_runtime_events,
         }));
     }
-    store.save(&updated)?;
+    store.record(command, now_millis, durable, &updated)?;
     let submission = second_prepared.commit()?;
     native.stage_stinger_mutation(mutation);
     let runtime_events = match native.wait_and_tick(control, server, process_shutdown)? {
@@ -4621,7 +4712,7 @@ fn execute_native_stinger_mutation(
 #[cfg(not(feature = "native-media"))]
 fn execute_native_stinger_mutation(
     _control: &mut ControlService<Policy>,
-    _store: &ProjectStore,
+    _store: &dyn DurableStore,
     _durable: &mut StoredProject,
     _principal: &Principal,
     _server: &ServerIdentity,
@@ -4638,10 +4729,40 @@ struct DurableExecution {
     runtime_events: Vec<RuntimeEventMessage>,
 }
 
+/// The answer to a command that could not be made durable.
+///
+/// It is refused, not failed: the engine never saw it, so retrying it is safe
+/// and the operator is told which command did not take effect instead of being
+/// told nothing or being told it succeeded.
+fn refused_submission(
+    command: &CommandMessage,
+    current_revision: u64,
+    error: &dyn Error,
+) -> CommandSubmission {
+    CommandSubmission {
+        output: ResultBeforeEvents {
+            result: CommandResult::Rejected {
+                id: command.id.clone(),
+                code: RejectionCode::Unavailable.as_str().to_owned(),
+                message: format!(
+                    "command was refused because it could not be made durable: {error}"
+                ),
+                fields: Vec::new(),
+                current_revision,
+                retryable: true,
+            },
+            events: Vec::new(),
+        },
+        replayed: false,
+        accepted: None,
+        subscriber_failures: Vec::new(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_durable_command(
     control: &mut ControlService<Policy>,
-    store: &dyn ProjectSaver,
+    store: &dyn DurableStore,
     durable: &mut StoredProject,
     principal: &Principal,
     server: &ServerIdentity,
@@ -4663,7 +4784,7 @@ fn execute_durable_command(
 #[allow(clippy::too_many_arguments)]
 fn execute_durable_command_with_ticks(
     control: &mut ControlService<Policy>,
-    store: &dyn ProjectSaver,
+    store: &dyn DurableStore,
     durable: &mut StoredProject,
     principal: &Principal,
     server: &ServerIdentity,
@@ -4693,7 +4814,28 @@ fn execute_durable_command_with_ticks(
     let projected = prepared.project(u64::from(ticks))?;
     let updated =
         stored_project_from_snapshot(durable, &projected, command, &prepared.output().result)?;
-    store.save(&updated)?;
+    // Durability comes first: the mutation survives a crash before the engine
+    // commits it, before its events are published, and before the acceptance is
+    // returned to the caller for acknowledgement.
+    if let Err(error) = store.record(command, now_millis, durable, &updated) {
+        // Nothing was made durable, so nothing may be acknowledged. Dropping
+        // the preparation abandons it without touching the engine: no revision,
+        // no receipt, no events, so the same command may simply be sent again.
+        drop(prepared);
+        eprintln!(
+            "FREEMIXD_DURABILITY\tv=1\tcommand={}\trevision={}\terror={error}",
+            command.id,
+            updated.position().revision
+        );
+        return Ok(DurableExecution {
+            submission: refused_submission(
+                command,
+                control.diagnostics().current_revision,
+                error.as_ref(),
+            ),
+            runtime_events: Vec::new(),
+        });
+    }
 
     let submission = prepared.commit()?;
     let mut runtime_events = Vec::new();
@@ -6000,8 +6142,18 @@ mod tests {
 
     struct FailingSaver;
 
-    impl ProjectSaver for FailingSaver {
-        fn save(&self, _project: &StoredProject) -> AppResult<()> {
+    impl DurableStore for FailingSaver {
+        fn record(
+            &self,
+            _command: &CommandMessage,
+            _now_millis: u64,
+            _previous: &StoredProject,
+            _updated: &StoredProject,
+        ) -> AppResult<()> {
+            Err(AppFailure("injected save failure".into()).into())
+        }
+
+        fn checkpoint(&self, _project: &StoredProject) -> AppResult<()> {
             Err(AppFailure("injected save failure".into()).into())
         }
     }
@@ -6011,10 +6163,27 @@ mod tests {
         saved: RefCell<Option<StoredProject>>,
     }
 
-    impl ProjectSaver for ObservingSaver<'_> {
-        fn save(&self, project: &StoredProject) -> AppResult<()> {
+    impl ObservingSaver<'_> {
+        fn observe(&self, project: &StoredProject) {
             assert_eq!(self.subscription.try_recv(), Err(TryRecvError::Empty));
             self.saved.replace(Some(project.clone()));
+        }
+    }
+
+    impl DurableStore for ObservingSaver<'_> {
+        fn record(
+            &self,
+            _command: &CommandMessage,
+            _now_millis: u64,
+            _previous: &StoredProject,
+            updated: &StoredProject,
+        ) -> AppResult<()> {
+            self.observe(updated);
+            Ok(())
+        }
+
+        fn checkpoint(&self, project: &StoredProject) -> AppResult<()> {
+            self.observe(project);
             Ok(())
         }
     }
@@ -6022,8 +6191,19 @@ mod tests {
     #[derive(Default)]
     struct CountingSaver(Cell<u32>);
 
-    impl ProjectSaver for CountingSaver {
-        fn save(&self, _project: &StoredProject) -> AppResult<()> {
+    impl DurableStore for CountingSaver {
+        fn record(
+            &self,
+            _command: &CommandMessage,
+            _now_millis: u64,
+            _previous: &StoredProject,
+            _updated: &StoredProject,
+        ) -> AppResult<()> {
+            self.0.set(self.0.get() + 1);
+            Ok(())
+        }
+
+        fn checkpoint(&self, _project: &StoredProject) -> AppResult<()> {
             self.0.set(self.0.get() + 1);
             Ok(())
         }
@@ -6031,10 +6211,26 @@ mod tests {
 
     struct CrashAfterSave<'a>(&'a ProjectStore);
 
-    impl ProjectSaver for CrashAfterSave<'_> {
-        fn save(&self, project: &StoredProject) -> AppResult<()> {
+    impl CrashAfterSave<'_> {
+        fn save_then_crash(&self, project: &StoredProject) -> AppResult<()> {
             ProjectStore::save(self.0, project)?;
             panic!("simulated crash after save");
+        }
+    }
+
+    impl DurableStore for CrashAfterSave<'_> {
+        fn record(
+            &self,
+            _command: &CommandMessage,
+            _now_millis: u64,
+            _previous: &StoredProject,
+            updated: &StoredProject,
+        ) -> AppResult<()> {
+            self.save_then_crash(updated)
+        }
+
+        fn checkpoint(&self, project: &StoredProject) -> AppResult<()> {
+            self.save_then_crash(project)
         }
     }
 
@@ -6783,6 +6979,7 @@ mod tests {
         let (expired_tx, expired_rx) = std::sync::mpsc::sync_channel(1);
         let server_thread = thread::spawn(move || {
             let store = ProjectStore::new(project_path).unwrap();
+            let journal = DurableJournal::new(&store, 0);
             let mut durable = test_project();
             let project_id = durable.project().id();
             let control = Rc::new(RefCell::new(test_control(&durable)));
@@ -6810,7 +7007,7 @@ mod tests {
                     stream,
                     &server,
                     &control,
-                    &store,
+                    &journal,
                     &mut durable,
                     &principal,
                     &authority,
@@ -6857,6 +7054,7 @@ mod tests {
         let (completed_tx, completed_rx) = std::sync::mpsc::sync_channel(1);
         let server_thread = thread::spawn(move || {
             let store = ProjectStore::new(project_path).unwrap();
+            let journal = DurableJournal::new(&store, 0);
             let mut durable = test_project();
             let project_id = durable.project().id();
             let control = Rc::new(RefCell::new(test_control(&durable)));
@@ -6880,7 +7078,7 @@ mod tests {
                 stream,
                 &server,
                 &control,
-                &store,
+                &journal,
                 &mut durable,
                 &principal,
                 &authority,
@@ -6899,7 +7097,7 @@ mod tests {
                 stream,
                 &server,
                 &control,
-                &store,
+                &journal,
                 &mut durable,
                 &principal,
                 &authority,
@@ -6961,6 +7159,7 @@ mod tests {
         let (expired_tx, expired_rx) = std::sync::mpsc::sync_channel(1);
         let server_thread = thread::spawn(move || {
             let store = ProjectStore::new(project_path).unwrap();
+            let journal = DurableJournal::new(&store, 0);
             let mut durable = test_project();
             let project_id = durable.project().id();
             let control = Rc::new(RefCell::new(test_control(&durable)));
@@ -6985,7 +7184,7 @@ mod tests {
                     stream,
                     &server,
                     &control,
-                    &store,
+                    &journal,
                     &mut durable,
                     &principal,
                     &authority,
@@ -7868,8 +8067,11 @@ mod tests {
         assert_eq!(host_deadline_offset(&pacer).unwrap().as_secs(), 1_001);
     }
 
+    /// A command that could not be made durable is refused, not acknowledged
+    /// and not half-applied: the engine keeps its revision, publishes nothing,
+    /// and installs no receipt, so the same command may simply be sent again.
     #[test]
-    fn failed_save_aborts_preparation_without_authority_or_output() {
+    fn a_command_that_cannot_be_made_durable_is_refused() {
         let mut durable = test_project();
         let initial_engine = restore_engine(&durable).unwrap().snapshot().unwrap();
         let mut control = test_control(&durable);
@@ -7879,7 +8081,7 @@ mod tests {
         let server = test_server(&control);
         let command = test_command("failed-save", "failed-save-key", CommandPayload::Cut);
 
-        let error = execute_durable_command(
+        let execution = execute_durable_command(
             &mut control,
             &FailingSaver,
             &mut durable,
@@ -7888,10 +8090,21 @@ mod tests {
             &command,
             0,
         )
-        .err()
-        .expect("save failure must not produce a command result");
+        .expect("a durability failure is refused, not propagated");
 
-        assert_eq!(error.to_string(), "injected save failure");
+        assert!(matches!(
+            &execution.submission.output.result,
+            CommandResult::Rejected {
+                code,
+                retryable: true,
+                current_revision: 0,
+                ..
+            } if code == "unavailable"
+        ));
+        assert!(execution.submission.output.events.is_empty());
+        assert!(execution.submission.accepted.is_none());
+        assert!(!execution.submission.replayed);
+        assert!(execution.runtime_events.is_empty());
         assert_eq!(durable, test_project());
         assert_eq!(control.diagnostics(), before_diagnostics);
         assert_eq!(control.snapshot(), &before_snapshot);
@@ -7906,7 +8119,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_manual_position_save_preserves_restart_state_and_retryability() {
+    fn a_refused_manual_position_preserves_restart_state_and_stays_retryable() {
         let mut durable = test_project();
         let mut control = test_control(&durable);
         let server = test_server(&control);
@@ -7936,7 +8149,7 @@ mod tests {
             },
         );
 
-        let error = execute_durable_command(
+        let refused = execute_durable_command(
             &mut control,
             &FailingSaver,
             &mut durable,
@@ -7945,10 +8158,12 @@ mod tests {
             &position_command,
             0,
         )
-        .err()
-        .expect("save failure must abort the manual position command");
+        .expect("a durability failure is refused, not propagated");
 
-        assert_eq!(error.to_string(), "injected save failure");
+        assert!(matches!(
+            &refused.submission.output.result,
+            CommandResult::Rejected { code, retryable: true, .. } if code == "unavailable"
+        ));
         assert_eq!(durable, before_durable);
         assert_eq!(control.idle_engine_snapshot().unwrap(), before_engine);
 
