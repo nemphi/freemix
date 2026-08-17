@@ -7,7 +7,7 @@ use fm_automation::{
     ScheduleSet, Shortcut, ShortcutError, ShortcutRegistry, ShortcutScope, TallySnapshot, Trigger,
     TriggerEngine, Value, ValueRange,
 };
-use fm_command::{IdempotencyKey, MAX_TRANSACTION_COMMANDS};
+use fm_command::MAX_TRANSACTION_COMMANDS;
 use fm_types::{InputId, MediaTimestamp};
 use std::num::NonZeroU128;
 
@@ -278,7 +278,7 @@ fn schedule_boundaries_are_inclusive_anchored_and_caller_driven() {
 }
 
 #[test]
-fn programmed_go_previews_orders_cancels_and_is_idempotent() {
+fn programmed_go_previews_orders_and_cancels_actions() {
     let source = input(7);
     let program = ProgrammedGo::new([
         GoAction::Intent(CommandIntent::discrete(TestCommand::Named("preview"))),
@@ -301,11 +301,9 @@ fn programmed_go_previews_orders_cancels_and_is_idempotent() {
         [0, 10, 15]
     );
 
-    let key = IdempotencyKey::new("go-1");
-    let first = engine.start(source, key.clone(), 100).unwrap();
-    let duplicate = engine.start(source, key, 999).unwrap();
-    assert_eq!(duplicate.run_id, first.run_id);
-    assert!(duplicate.replayed);
+    let first = engine.start(source, 100).unwrap();
+    assert_eq!(engine.program_len(), 1);
+    assert_eq!(engine.active_run_len(), 1);
     assert_eq!(engine.poll(100)[0].action.index, 0);
     assert_eq!(engine.poll(110)[0].action.index, 1);
     assert!(engine.cancel(first.run_id));

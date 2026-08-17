@@ -1,6 +1,6 @@
 use crate::CommandIntent;
 use core::fmt;
-use fm_command::{IdempotencyKey, MAX_TRANSACTION_COMMANDS};
+use fm_command::MAX_TRANSACTION_COMMANDS;
 use fm_scheduler::{ActionError, ActionId, ActionQueue, FrameNumber};
 use fm_types::InputId;
 use std::collections::{HashMap, HashSet};
@@ -81,7 +81,6 @@ struct PendingGo<C> {
 #[derive(Clone, Debug, PartialEq)]
 pub struct GoStart<C> {
     pub run_id: u64,
-    pub replayed: bool,
     pub preview: GoPreview<C>,
 }
 
@@ -134,7 +133,6 @@ pub struct GoEngine<C> {
     queue: ActionQueue<PendingGo<C>>,
     action_ids: HashMap<u64, Vec<ActionId>>,
     active: HashSet<u64>,
-    receipts: HashMap<IdempotencyKey, GoStart<C>>,
     next_run_id: u64,
 }
 
@@ -145,7 +143,6 @@ impl<C> Default for GoEngine<C> {
             queue: ActionQueue::default(),
             action_ids: HashMap::new(),
             active: HashSet::new(),
-            receipts: HashMap::new(),
             next_run_id: 0,
         }
     }
@@ -165,24 +162,17 @@ impl<C: Clone> GoEngine<C> {
         })
     }
 
-    /// Starts a programmed GO. Reusing an idempotency key returns the original
-    /// receipt and never schedules the edge-triggered actions again.
+    /// Starts a programmed GO at a caller-owned timestamp.
+    ///
+    /// Duplicate suppression is a command-layer concern: every action this run
+    /// emits is identified by its `(run_id, index)` pair, so the authority
+    /// deduplicates at the command envelope rather than here.
     ///
     /// # Errors
     ///
     /// Returns an error for unknown inputs, timestamp overflow, or exhausted
     /// scheduler/run identifiers.
-    pub fn start(
-        &mut self,
-        input: InputId,
-        idempotency_key: IdempotencyKey,
-        now_ms: u64,
-    ) -> Result<GoStart<C>, GoError> {
-        if let Some(receipt) = self.receipts.get(&idempotency_key) {
-            let mut replay = receipt.clone();
-            replay.replayed = true;
-            return Ok(replay);
-        }
+    pub fn start(&mut self, input: InputId, now_ms: u64) -> Result<GoStart<C>, GoError> {
         let preview = self.preview(input).ok_or(GoError::UnknownInput(input))?;
         let run_id = self
             .next_run_id
@@ -220,13 +210,7 @@ impl<C: Clone> GoEngine<C> {
         self.next_run_id = run_id;
         self.action_ids.insert(run_id, scheduled);
         self.active.insert(run_id);
-        let receipt = GoStart {
-            run_id,
-            replayed: false,
-            preview,
-        };
-        self.receipts.insert(idempotency_key, receipt.clone());
-        Ok(receipt)
+        Ok(GoStart { run_id, preview })
     }
 
     pub fn cancel(&mut self, run_id: u64) -> bool {
@@ -268,5 +252,22 @@ impl<C: Clone> GoEngine<C> {
     #[must_use]
     pub fn is_active(&self, run_id: u64) -> bool {
         self.active.contains(&run_id)
+    }
+
+    /// Number of inputs holding a programmed GO list.
+    #[must_use]
+    pub fn program_len(&self) -> usize {
+        self.programs.len()
+    }
+
+    #[must_use]
+    pub fn has_program(&self, input: InputId) -> bool {
+        self.programs.contains_key(&input)
+    }
+
+    /// Number of runs with actions still to fire.
+    #[must_use]
+    pub fn active_run_len(&self) -> usize {
+        self.active.len()
     }
 }

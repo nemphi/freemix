@@ -36,6 +36,32 @@ impl<C> CommandIntent<C> {
             command,
         }
     }
+
+    /// Rewrites the carried command while preserving its delivery class.
+    #[must_use]
+    pub fn map<D>(self, rewrite: impl FnOnce(C) -> D) -> CommandIntent<D> {
+        match self {
+            Self::Discrete(command) => CommandIntent::Discrete(rewrite(command)),
+            Self::Continuous { stream, command } => CommandIntent::Continuous {
+                stream,
+                command: rewrite(command),
+            },
+            Self::CommitContinuous { stream, command } => CommandIntent::CommitContinuous {
+                stream,
+                command: rewrite(command),
+            },
+        }
+    }
+
+    /// Returns the carried command, discarding its delivery class.
+    #[must_use]
+    pub fn into_command(self) -> C {
+        match self {
+            Self::Discrete(command)
+            | Self::Continuous { command, .. }
+            | Self::CommitContinuous { command, .. } => command,
+        }
+    }
 }
 
 /// Keeps edge-triggered commands separate while retaining only the newest

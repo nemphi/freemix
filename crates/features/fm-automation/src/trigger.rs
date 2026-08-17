@@ -229,6 +229,12 @@ impl<C: Clone> TriggerEngine<C> {
         count
     }
 
+    /// Number of registered triggers, for caller-enforced registration bounds.
+    #[must_use]
+    pub fn registered_len(&self) -> usize {
+        self.triggers.len()
+    }
+
     #[must_use]
     pub fn pending_len(&self) -> usize {
         self.pending.len()

@@ -15,6 +15,13 @@ use std::{
     },
 };
 
+mod automation;
+
+pub use automation::{
+    AutomationError, AutomationLimits, AutomationPlane, AutomationRefusal, AutomationRequest,
+    AutomationResource, AutomationSource, AutomationSubmission, AutomationTick,
+};
+
 use fm_auth::{AuthorizationDenial, CommandClass, Policy, Principal};
 use fm_command::{CommandReceipt, DurableEvent, IdempotencyKey, RejectionCode};
 use fm_engine::{
@@ -1146,44 +1153,9 @@ fn engine_command(payload: &CommandPayload) -> EngineCommand {
         CommandPayload::Zoom { duration_frames } => EngineCommand::Zoom {
             duration_frames: *duration_frames,
         },
-        CommandPayload::Stinger {
-            slot,
-            duration_frames,
-        } => EngineCommand::Stinger {
-            slot: fm_switcher::StingerSlotId::new(slot.number())
-                .expect("wire Stinger slots are bounded"),
-            duration_frames: *duration_frames,
-        },
-        CommandPayload::ConfigureStinger {
-            slot,
-            media_input,
-            preload,
-            cut_point_frames,
-            audio_policy,
-            missing_media_fallback,
-        } => EngineCommand::ConfigureStinger {
-            slot: StingerSlotId::new(slot.number()).expect("wire Stinger slots are bounded"),
-            descriptor: StingerDescriptor::new(
-                media_input.to_domain(),
-                *preload,
-                *cut_point_frames,
-                match audio_policy {
-                    ProtocolStingerAudioPolicy::Muted => StingerAudioPolicy::Muted,
-                    ProtocolStingerAudioPolicy::StingerOnly => StingerAudioPolicy::StingerOnly,
-                    ProtocolStingerAudioPolicy::MixWithProgram => {
-                        StingerAudioPolicy::MixWithProgram
-                    }
-                },
-                match missing_media_fallback {
-                    ProtocolStingerFallback::Cut => MissingMediaFallback::Cut,
-                    ProtocolStingerFallback::Fade => MissingMediaFallback::Fade,
-                    ProtocolStingerFallback::KeepProgram => MissingMediaFallback::KeepProgram,
-                },
-            ),
-        },
-        CommandPayload::RemoveStinger { slot } => EngineCommand::RemoveStinger {
-            slot: StingerSlotId::new(slot.number()).expect("wire Stinger slots are bounded"),
-        },
+        payload @ (CommandPayload::Stinger { .. }
+        | CommandPayload::ConfigureStinger { .. }
+        | CommandPayload::RemoveStinger { .. }) => stinger_engine_command(payload),
         payload @ (CommandPayload::TakeOverlay { .. }
         | CommandPayload::UpdateOverlay { .. }
         | CommandPayload::OverlayOff { .. }
@@ -1217,6 +1189,49 @@ fn engine_command(payload: &CommandPayload) -> EngineCommand {
         }
         CommandPayload::CommitManualTransition => EngineCommand::CommitManualTransition,
         CommandPayload::CancelManualTransition => EngineCommand::CancelManualTransition,
+    }
+}
+
+fn stinger_engine_command(payload: &CommandPayload) -> EngineCommand {
+    match payload {
+        CommandPayload::Stinger {
+            slot,
+            duration_frames,
+        } => EngineCommand::Stinger {
+            slot: StingerSlotId::new(slot.number()).expect("wire Stinger slots are bounded"),
+            duration_frames: *duration_frames,
+        },
+        CommandPayload::ConfigureStinger {
+            slot,
+            media_input,
+            preload,
+            cut_point_frames,
+            audio_policy,
+            missing_media_fallback,
+        } => EngineCommand::ConfigureStinger {
+            slot: StingerSlotId::new(slot.number()).expect("wire Stinger slots are bounded"),
+            descriptor: StingerDescriptor::new(
+                media_input.to_domain(),
+                *preload,
+                *cut_point_frames,
+                match audio_policy {
+                    ProtocolStingerAudioPolicy::Muted => StingerAudioPolicy::Muted,
+                    ProtocolStingerAudioPolicy::StingerOnly => StingerAudioPolicy::StingerOnly,
+                    ProtocolStingerAudioPolicy::MixWithProgram => {
+                        StingerAudioPolicy::MixWithProgram
+                    }
+                },
+                match missing_media_fallback {
+                    ProtocolStingerFallback::Cut => MissingMediaFallback::Cut,
+                    ProtocolStingerFallback::Fade => MissingMediaFallback::Fade,
+                    ProtocolStingerFallback::KeepProgram => MissingMediaFallback::KeepProgram,
+                },
+            ),
+        },
+        CommandPayload::RemoveStinger { slot } => EngineCommand::RemoveStinger {
+            slot: StingerSlotId::new(slot.number()).expect("wire Stinger slots are bounded"),
+        },
+        _ => unreachable!("only Stinger commands are delegated"),
     }
 }
 
