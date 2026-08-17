@@ -3,7 +3,7 @@ use core::fmt;
 use fm_scheduler::{ActionError, ActionId, ActionQueue, FrameNumber};
 use std::collections::HashMap;
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ScheduleId(String);
 
 impl ScheduleId {

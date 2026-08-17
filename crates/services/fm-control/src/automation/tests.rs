@@ -1,9 +1,9 @@
-use std::num::NonZeroU128;
+use std::{cell::RefCell, collections::BTreeMap, num::NonZeroU128, rc::Rc};
 
 use fm_auth::{Policy, Role, SessionId, UserId};
 use fm_automation::{
-    AutomationEvent, Chord, CommandIntent, ConditionContext, EventFilter, KeyStroke, Modifiers,
-    ScheduleKind, Shortcut, ShortcutScope, Trigger,
+    AutomationEvent, Chord, CommandIntent, ConditionContext, EventFilter, GoAction, KeyStroke,
+    Modifiers, ProgrammedGo, ScheduleId, ScheduleKind, Shortcut, ShortcutScope, Trigger,
 };
 use fm_clock::ClockDomainId;
 use fm_engine::{Engine, ShowState};
@@ -42,10 +42,31 @@ fn service() -> ControlService {
     )
 }
 
+const fn role_name(role: Role) -> &'static str {
+    match role {
+        Role::Viewer => "viewer",
+        Role::Graphics => "graphics",
+        Role::Audio => "audio",
+        Role::Operator => "operator",
+        Role::Admin => "admin",
+    }
+}
+
+/// One person per role: two roles are two people, because one user and session
+/// cannot simultaneously hold two different role sets.
 fn principal(role: Role) -> Principal {
     Principal::authenticated(
-        UserId::new("user").unwrap(),
+        UserId::new(role_name(role)).unwrap(),
         SessionId::new("session").unwrap(),
+        [role],
+    )
+}
+
+/// The same person and session, holding a different role.
+fn regraded(principal: &Principal, role: Role) -> Principal {
+    Principal::authenticated(
+        principal.user_id().clone(),
+        principal.session_id().clone(),
         [role],
     )
 }
@@ -58,6 +79,10 @@ fn select_preview(value: u128) -> CommandPayload {
 
 fn request(value: u128) -> CommandIntent<AutomationRequest> {
     CommandIntent::discrete(AutomationRequest::new(select_preview(value)))
+}
+
+fn fader(stream: &str, value: u128) -> CommandIntent<AutomationRequest> {
+    CommandIntent::continuous(stream, AutomationRequest::new(select_preview(value)))
 }
 
 fn chord(key: &str) -> Chord {
@@ -78,6 +103,17 @@ fn sources(tick: &AutomationTick) -> Vec<String> {
         .collect()
 }
 
+fn keys(tick: &AutomationTick) -> Vec<String> {
+    tick.submitted
+        .iter()
+        .map(|entry| entry.idempotency_key.as_str().to_owned())
+        .collect()
+}
+
+fn preview(control: &ControlService) -> InputId {
+    control.snapshot().snapshot.desired_preview.to_domain()
+}
+
 fn beat_trigger(id: &str, value: u128) -> Trigger<AutomationRequest> {
     Trigger {
         id: id.to_owned(),
@@ -85,6 +121,38 @@ fn beat_trigger(id: &str, value: u128) -> Trigger<AutomationRequest> {
         delay_ms: 0,
         conditions: Vec::new(),
         intents: vec![request(value)],
+    }
+}
+
+/// The session store the [`AuthorityResolver`] seam exists for, standing in for
+/// one this repository does not have yet. The test holds it alongside the plane
+/// so a session can end mid-show, exactly as a real one would.
+#[derive(Clone, Default)]
+struct Sessions(Rc<RefCell<BTreeMap<AutomationIdentity, Principal>>>);
+
+impl Sessions {
+    fn set(&self, principal: &Principal) {
+        self.0
+            .borrow_mut()
+            .insert(AutomationIdentity::of(principal), principal.clone());
+    }
+
+    fn end(&self, identity: &AutomationIdentity) {
+        self.0.borrow_mut().remove(identity);
+    }
+}
+
+impl AuthorityResolver for Sessions {
+    fn resolve(&self, identity: &AutomationIdentity) -> Option<Principal> {
+        self.0.borrow().get(identity).cloned()
+    }
+
+    fn observe(&mut self, principal: &Principal) {
+        self.set(principal);
+    }
+
+    fn forget(&mut self, identity: &AutomationIdentity) {
+        self.end(identity);
     }
 }
 
@@ -104,20 +172,15 @@ fn automation_commands_are_authorized_as_their_requesting_principal() {
         .schedule(&viewer, "viewer", 100, ScheduleKind::Once, request(1))
         .unwrap();
 
-    let tick = plane
-        .tick(&mut control, 100, &ConditionContext::new())
-        .unwrap();
+    let tick = plane.tick(&mut control, 100, &ConditionContext::new());
     assert_eq!(sources(&tick), ["schedule/operator", "schedule/viewer"]);
     assert!(tick.refusals.is_empty());
+    assert!(tick.error.is_none());
 
     let operator_result = &tick.submitted[0].submission.output.result;
     assert!(matches!(operator_result, CommandResult::Accepted { .. }));
     assert_eq!(
-        tick.submitted[0].idempotency_key.as_str(),
-        "auto/schedule/operator@100#1"
-    );
-    assert_eq!(
-        control.snapshot().snapshot.desired_preview.to_domain(),
+        preview(&control),
         input(3),
         "the operator-armed schedule reached the engine"
     );
@@ -125,7 +188,7 @@ fn automation_commands_are_authorized_as_their_requesting_principal() {
     let denied = &tick.submitted[1].submission.output.result;
     assert_eq!(rejection_code(denied), Some("permission_denied"));
     assert_eq!(
-        control.snapshot().snapshot.desired_preview.to_domain(),
+        preview(&control),
         input(3),
         "the viewer-armed schedule changed nothing"
     );
@@ -175,14 +238,194 @@ fn automation_commands_are_authorized_as_their_requesting_principal() {
         pressed.submission.output.result,
         CommandResult::Accepted { .. }
     ));
+    assert_eq!(preview(&control), input(1));
+}
+
+/// An emitted idempotency key identifies the action, not the emission, so one
+/// logical action submitted twice is replayed instead of going on air twice.
+#[test]
+fn one_action_submitted_twice_is_replayed_not_put_on_air_twice() {
+    let mut control = service();
+    let mut plane = AutomationPlane::new(AutomationLimits::default());
+    let operator = principal(Role::Operator);
+    let source = WireInputId::from_domain(input(1));
+
+    plane
+        .program_go(
+            source,
+            ProgrammedGo::new([GoAction::Intent(request(3)), GoAction::Intent(request(2))])
+                .unwrap(),
+        )
+        .unwrap();
+
+    // One operator GO press, retried once.
+    let first = plane.start_go(&operator, source, "press-1", 100).unwrap();
+    let retry = plane.start_go(&operator, source, "press-1", 100).unwrap();
+    assert_eq!(first, retry, "a retried press is the same run");
+    assert_eq!(plane.active_go_run_len(), 1);
+
+    let tick = plane.tick(&mut control, 100, &ConditionContext::new());
     assert_eq!(
-        control.snapshot().snapshot.desired_preview.to_domain(),
-        input(1)
+        keys(&tick),
+        ["auto/operator/go/1/0@100#0", "auto/operator/go/1/1@100#0"],
+        "two actions, two keys -- not four"
+    );
+    assert!(
+        tick.submitted
+            .iter()
+            .all(|entry| !entry.submission.replayed)
+    );
+    assert_eq!(preview(&control), input(2));
+
+    // A retry that arrives after the run has finished is still the same run and
+    // schedules nothing, so nothing fires a second time.
+    assert_eq!(
+        plane.start_go(&operator, source, "press-1", 400).unwrap(),
+        first
+    );
+    let after = plane.tick(&mut control, 400, &ConditionContext::new());
+    assert!(after.submitted.is_empty());
+    assert!(after.refusals.is_empty());
+
+    // The same press emitted twice: the second submission is replayed and the
+    // engine state does not move again.
+    plane
+        .insert_shortcut(Shortcut {
+            id: "take-three".to_owned(),
+            scope: ShortcutScope::Global,
+            chord: chord("T"),
+            intent: request(3),
+        })
+        .unwrap();
+    let pressed = plane
+        .press(&mut control, &operator, None, &chord("T"), 500)
+        .unwrap();
+    let bounced = plane
+        .press(&mut control, &operator, None, &chord("T"), 500)
+        .unwrap();
+    assert_eq!(pressed.idempotency_key, bounced.idempotency_key);
+    assert!(!pressed.submission.replayed);
+    assert!(
+        bounced.submission.replayed,
+        "a bouncing key does not cut twice"
     );
 }
 
+/// Continuous coalescing is last-value-wins within one stream of one binding
+/// and never across bindings, and whatever it supersedes is reported.
+#[test]
+fn a_continuous_collision_across_bindings_reports_both_commands() {
+    let mut control = service();
+    let mut plane = AutomationPlane::new(AutomationLimits::default());
+    let operator = principal(Role::Operator);
+    let viewer = principal(Role::Viewer);
+
+    plane
+        .schedule(&operator, "a", 100, ScheduleKind::Once, fader("tbar", 3))
+        .unwrap();
+    plane
+        .schedule(&viewer, "b", 100, ScheduleKind::Once, fader("tbar", 1))
+        .unwrap();
+
+    let tick = plane.tick(&mut control, 100, &ConditionContext::new());
+    assert_eq!(
+        sources(&tick),
+        ["schedule/a", "schedule/b"],
+        "two bindings sharing a stream name are two commands, not one"
+    );
+    assert!(tick.refusals.is_empty());
+    assert_eq!(
+        preview(&control),
+        input(3),
+        "the operator's command reached the engine"
+    );
+
+    // Within one binding and one stream, the last value wins and the value it
+    // superseded is reported rather than dropped.
+    plane
+        .insert_trigger(
+            &operator,
+            Trigger {
+                intents: vec![fader("tbar", 1), fader("tbar", 2)],
+                ..beat_trigger("sweep", 1)
+            },
+        )
+        .unwrap();
+    plane
+        .ingest_event(&AutomationEvent::new("beat", 200))
+        .unwrap();
+    let tick = plane.tick(&mut control, 200, &ConditionContext::new());
+    assert_eq!(sources(&tick), ["trigger/sweep"]);
+    assert_eq!(preview(&control), input(2));
+    assert_eq!(tick.refusals.len(), 1);
+    assert_eq!(tick.refusals[0].reason, AutomationRefusalReason::Coalesced);
+    assert_eq!(tick.refusals[0].request.payload, select_preview(1));
+}
+
+/// A binding stamps an identity, not a role set, so authority is whatever that
+/// identity holds at the moment the command is emitted.
+#[test]
+fn authority_is_resolved_at_emission_not_frozen_at_arm_time() {
+    let mut control = service();
+    let sessions = Sessions::default();
+    let mut plane = AutomationPlane::with_resolver(AutomationLimits::default(), sessions.clone());
+    let operator = principal(Role::Operator);
+    let identity = AutomationIdentity::of(&operator);
+
+    plane
+        .schedule(
+            &operator,
+            "break",
+            100,
+            ScheduleKind::Every { interval_ms: 100 },
+            request(3),
+        )
+        .unwrap();
+    assert_eq!(
+        plane.bindings_for(&identity),
+        [AutomationBinding::Schedule(ScheduleId::from("break"))]
+    );
+
+    let tick = plane.tick(&mut control, 100, &ConditionContext::new());
+    assert!(tick.submitted[0].submission.is_accepted());
+    assert_eq!(preview(&control), input(3));
+
+    // The same person is downgraded mid-show. The armed schedule is refused on
+    // the ordinary command path, with the code an operator command would get.
+    sessions.set(&regraded(&operator, Role::Viewer));
+    let tick = plane.tick(&mut control, 200, &ConditionContext::new());
+    assert_eq!(
+        rejection_code(&tick.submitted[0].submission.output.result),
+        Some("permission_denied")
+    );
+
+    // The session ends. The binding is refused before it reaches the authority,
+    // and the refusal carries the payload it did not submit.
+    sessions.end(&identity);
+    let tick = plane.tick(&mut control, 300, &ConditionContext::new());
+    assert!(tick.submitted.is_empty());
+    assert_eq!(tick.refusals.len(), 1);
+    assert_eq!(
+        tick.refusals[0].reason,
+        AutomationRefusalReason::IdentityRevoked
+    );
+    assert_eq!(tick.refusals[0].identity, identity);
+    assert_eq!(tick.refusals[0].request.payload, select_preview(3));
+
+    // Revoking by identity cancels what that identity armed.
+    assert_eq!(
+        plane.revoke_identity(&identity),
+        [AutomationBinding::Schedule(ScheduleId::from("break"))]
+    );
+    assert_eq!(plane.schedule_len(), 0);
+    assert!(plane.bindings_for(&identity).is_empty());
+    let tick = plane.tick(&mut control, 400, &ConditionContext::new());
+    assert!(tick.submitted.is_empty());
+    assert!(tick.refusals.is_empty());
+}
+
 /// Every bound refuses observably: nothing is queued without a limit and
-/// nothing is dropped without being reported.
+/// nothing is dropped without being reported with enough to act on.
 #[test]
 fn bounds_refuse_a_flood_instead_of_queueing_or_dropping_it() {
     let mut control = service();
@@ -190,6 +433,7 @@ fn bounds_refuse_a_flood_instead_of_queueing_or_dropping_it() {
         max_triggers: 1,
         max_pending_trigger_actions: 1,
         max_commands_per_tick: 4,
+        max_presses_per_frame: 2,
         ..AutomationLimits::default()
     });
     let operator = principal(Role::Operator);
@@ -219,27 +463,112 @@ fn bounds_refuse_a_flood_instead_of_queueing_or_dropping_it() {
         })
     );
 
-    let tick = plane
-        .tick(&mut control, 10, &ConditionContext::new())
+    // A sponsor break planned in the same frame is refused first, because the
+    // budget refuses from the least operator-driven end.
+    plane
+        .schedule(
+            &operator,
+            "sponsor-break",
+            10,
+            ScheduleKind::Once,
+            request(2),
+        )
         .unwrap();
+
+    let tick = plane.tick(&mut control, 10, &ConditionContext::new());
     assert_eq!(tick.submitted.len(), 4);
-    assert_eq!(tick.refusals.len(), 8);
-    assert!(tick.refusals.iter().all(|refusal| refusal.limit == 4
-        && refusal.source
-            == AutomationSource::Trigger {
-                id: "flood".to_owned()
-            }));
+    assert_eq!(tick.refusals.len(), 9);
+    assert!(tick.error.is_none());
+    assert!(
+        tick.refusals
+            .iter()
+            .all(|refusal| refusal.reason == AutomationRefusalReason::TickBudget { limit: 4 })
+    );
+    assert_eq!(
+        tick.refusals[0].source,
+        AutomationSource::Schedule {
+            id: "sponsor-break".to_owned()
+        }
+    );
+    assert_eq!(
+        plane.schedule_len(),
+        0,
+        "the fired one-shot schedule is gone from the plane"
+    );
+    assert_eq!(
+        tick.refusals[0].request.payload,
+        select_preview(2),
+        "the refused break is handed back whole, so the caller can re-emit it"
+    );
     assert_eq!(
         plane.pending_trigger_action_len(),
         0,
         "the refused commands are not requeued"
     );
 
-    let settled = plane
-        .tick(&mut control, 11, &ConditionContext::new())
-        .unwrap();
+    let settled = plane.tick(&mut control, 11, &ConditionContext::new());
     assert!(settled.submitted.is_empty());
     assert!(settled.refusals.is_empty());
+
+    // Presses do not consume the automation budget, but they are bounded, and
+    // the allowance is replenished once per frame.
+    plane
+        .insert_shortcut(Shortcut {
+            id: "take-one".to_owned(),
+            scope: ShortcutScope::Global,
+            chord: chord("T"),
+            intent: request(1),
+        })
+        .unwrap();
+    plane
+        .press(&mut control, &operator, None, &chord("T"), 12)
+        .unwrap();
+    plane
+        .press(&mut control, &operator, None, &chord("T"), 13)
+        .unwrap();
+    assert_eq!(
+        plane.press(&mut control, &operator, None, &chord("T"), 14),
+        Err(AutomationError::LimitReached {
+            resource: AutomationResource::Presses,
+            limit: 2,
+        })
+    );
+    plane.tick(&mut control, 15, &ConditionContext::new());
+    plane
+        .press(&mut control, &operator, None, &chord("T"), 16)
+        .unwrap();
+}
+
+/// A stalled frame fires a recurring schedule once, and says how many
+/// occurrences that cost.
+#[test]
+fn a_stalled_frame_reports_the_occurrences_it_skipped() {
+    let mut control = service();
+    let mut plane = AutomationPlane::new(AutomationLimits::default());
+    let operator = principal(Role::Operator);
+
+    plane
+        .schedule(
+            &operator,
+            "break",
+            100,
+            ScheduleKind::Every { interval_ms: 100 },
+            request(3),
+        )
+        .unwrap();
+    let tick = plane.tick(&mut control, 100, &ConditionContext::new());
+    assert!(tick.missed.is_empty());
+
+    let tick = plane.tick(&mut control, 600, &ConditionContext::new());
+    assert_eq!(tick.submitted.len(), 1, "no catch-up burst on air");
+    assert_eq!(
+        tick.missed,
+        [AutomationMissedOccurrences {
+            id: ScheduleId::from("break"),
+            occurrence_ms: 200,
+            missed: 4,
+        }]
+    );
 }
 
 /// Bindings that match one input emit in a defined, stable order rather than
@@ -263,16 +592,14 @@ fn bindings_matching_one_input_emit_in_a_defined_order() {
         .ingest_event(&AutomationEvent::new("beat", 50))
         .unwrap();
 
-    let tick = plane
-        .tick(&mut control, 50, &ConditionContext::new())
-        .unwrap();
+    let tick = plane.tick(&mut control, 50, &ConditionContext::new());
     assert_eq!(
         sources(&tick),
         ["schedule/backdrop", "trigger/alpha", "trigger/beta"],
         "schedules precede triggers, and triggers keep registration order"
     );
     assert_eq!(
-        control.snapshot().snapshot.desired_preview.to_domain(),
+        preview(&control),
         input(1),
         "the last binding in the defined order owns the resulting state"
     );

@@ -229,6 +229,18 @@ impl<C: Clone> TriggerEngine<C> {
         count
     }
 
+    /// Unregisters a trigger and cancels every action it has already armed, so
+    /// a revoked binding cannot fire from the pending queue afterwards.
+    pub fn remove(&mut self, trigger_id: &str) -> bool {
+        let before = self.triggers.len();
+        self.triggers.retain(|trigger| trigger.id != trigger_id);
+        if self.triggers.len() == before {
+            return false;
+        }
+        self.cancel_trigger(trigger_id);
+        true
+    }
+
     /// Number of registered triggers, for caller-enforced registration bounds.
     #[must_use]
     pub fn registered_len(&self) -> usize {

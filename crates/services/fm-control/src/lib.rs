@@ -18,8 +18,10 @@ use std::{
 mod automation;
 
 pub use automation::{
-    AutomationError, AutomationLimits, AutomationPlane, AutomationRefusal, AutomationRequest,
-    AutomationResource, AutomationSource, AutomationSubmission, AutomationTick,
+    ArmTimeAuthority, AuthorityResolver, AutomationBinding, AutomationError, AutomationIdentity,
+    AutomationLimits, AutomationMissedOccurrences, AutomationPlane, AutomationRefusal,
+    AutomationRefusalReason, AutomationRequest, AutomationResource, AutomationSource,
+    AutomationSubmission, AutomationTick,
 };
 
 use fm_auth::{AuthorizationDenial, CommandClass, Policy, Principal};

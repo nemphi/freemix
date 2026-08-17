@@ -20,7 +20,8 @@ pub use controller::{
     MappedControllerIntent, Mapping, TallySnapshot, ValueRange,
 };
 pub use go::{
-    GoAction, GoActionFire, GoEngine, GoError, GoPreview, GoStart, PlannedGoAction, ProgrammedGo,
+    GoAction, GoActionFire, GoEngine, GoError, GoPreview, GoStart, MAX_GO_START_RECEIPTS,
+    PlannedGoAction, ProgrammedGo,
 };
 pub use intent::{CommandIntent, IntentBuffer};
 pub use macros::{
