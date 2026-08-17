@@ -5,14 +5,17 @@
 //! found they skip, unless `FM_REQUIRE_FONT=1` makes absence a failure.
 
 use fm_titles::{
-    Alignment, AssetCatalog, Bounds, Color, Element, ElementId, ElementKind, FieldDefinition,
-    FieldId, FieldValue, FontStyle, HorizontalAlignment, MAX_GLYPHS_PER_ELEMENT, ReferenceRenderer,
-    RenderError, Style, TemplateId, TickerDirection, TickerSpec, TitleId, TitleTemplate,
-    VerticalAlignment,
+    Alignment, AssetCatalog, Bounds, Color, Degradation, DegradedElement, Element, ElementId,
+    ElementKind, FieldDefinition, FieldId, FieldValue, FontStyle, HorizontalAlignment,
+    MAX_GLYPHS_PER_ELEMENT, ReferenceRenderer, Style, TemplateId, TickerDirection, TickerSpec,
+    TitleId, TitleTemplate, VerticalAlignment,
 };
 use std::fs;
 use std::num::NonZeroU128;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 const FAMILY: &str = "test-face";
 
@@ -342,10 +345,80 @@ fn text_wraps_inside_and_is_clipped_to_the_element_box() {
     );
 }
 
+/// Renders `message` into a 400x120 frame through a 120x40 box at 20 px, and
+/// returns the raw pixels. The box is narrow enough that a mis-placed line
+/// leaves the frame entirely.
+fn render_in_narrow_box(assets: &AssetCatalog, message: &str) -> Vec<u8> {
+    let scene = scene_of(
+        message,
+        400,
+        120,
+        text_element(
+            Bounds {
+                x: 20,
+                y: 10,
+                width: 120,
+                height: 40,
+            },
+            text_style(20, Color::new(255, 255, 255, 255), Alignment::default()),
+        ),
+    )
+    .instantiate(TitleId::new(NonZeroU128::new(1).unwrap()))
+    .expect("valid template");
+    ReferenceRenderer
+        .render(&scene, 0, assets)
+        .expect("frame renders")
+        .frame
+        .pixels()
+        .to_vec()
+}
+
 #[test]
-fn text_longer_than_the_element_glyph_cap_is_refused() {
+fn leading_whitespace_never_hides_text_and_a_tab_is_one_space() {
     let Some(assets) = catalog() else { return };
-    let message = "A".repeat(MAX_GLYPHS_PER_ELEMENT + 1);
+    // An operator pasting "    John Smith" out of a spreadsheet: leading
+    // whitespace used to advance the pen without committing a glyph, so the
+    // wrap test was skipped, the word was laid out past the box, and every
+    // pixel of it was clipped. `render` returned Ok with an empty report and
+    // the name never appeared on air.
+    let plain = render_in_narrow_box(&assets, "WWWW");
+    assert!(
+        ink_bounds(&plain, 400).is_some(),
+        "the sample word must ink at all"
+    );
+    for indent in [4, 20, 40] {
+        let indented = render_in_narrow_box(&assets, &format!("{}WWWW", " ".repeat(indent)));
+        assert_eq!(
+            indented, plain,
+            "{indent} leading spaces must be dropped, not indent the line off the box"
+        );
+    }
+
+    // Interior whitespace still separates words, and a tab is exactly one
+    // space rather than a control character that vanishes.
+    let tabbed = render_in_narrow_box(&assets, "W\tW");
+    assert_eq!(
+        tabbed,
+        render_in_narrow_box(&assets, "W W"),
+        "a tab must lay out as one space"
+    );
+    assert_ne!(
+        tabbed,
+        render_in_narrow_box(&assets, "WW"),
+        "a tab must not be dropped, joining the words on either side"
+    );
+}
+
+#[test]
+fn whitespace_only_input_is_bounded_by_the_element_cap() {
+    let Some(assets) = catalog() else { return };
+    // Newlines and spaces used to be laid out before the cap was charged: each
+    // newline pushed a line into an uncapped Vec and each space walked the pen,
+    // so this input allocated hundreds of megabytes and took seconds inside a
+    // 16 ms frame budget, then returned Ok.
+    let mut message = "\n".repeat(2_000_000);
+    message.push_str(&" ".repeat(2_000_000));
+    message.push_str("END");
     let scene = scene_of(
         &message,
         64,
@@ -363,35 +436,90 @@ fn text_longer_than_the_element_glyph_cap_is_refused() {
     .instantiate(TitleId::new(NonZeroU128::new(1).unwrap()))
     .expect("valid template");
 
-    let error = ReferenceRenderer.render(&scene, 0, &assets).unwrap_err();
-    assert!(
-        matches!(
-            error,
-            RenderError::TextTooLong {
-                maximum: MAX_GLYPHS_PER_ELEMENT,
-                ..
-            }
-        ),
-        "expected a glyph cap error, got {error}"
-    );
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let output = ReferenceRenderer
+            .render(&scene, 0, &assets)
+            .expect("frame renders");
+        sender.send(output.report.degraded).ok();
+    });
+    let degraded = receiver
+        .recv_timeout(Duration::from_secs(10))
+        .expect("layout must be bounded by the cap, not by the length of the input");
 
-    // One glyph fewer renders normally, so the cap is exact rather than a
-    // symptom of the text being large.
+    assert_eq!(
+        degraded,
+        vec![DegradedElement {
+            element: ElementId::new(NonZeroU128::new(1).unwrap()),
+            reason: Degradation::TextTruncated {
+                maximum: MAX_GLYPHS_PER_ELEMENT
+            },
+        }],
+        "whitespace must be charged against the cap and reported"
+    );
+}
+
+#[test]
+fn text_over_the_element_cap_degrades_one_element_not_the_frame() {
+    let Some(assets) = catalog() else { return };
+    let bounds = Bounds {
+        x: 0,
+        y: 0,
+        width: 64,
+        height: 64,
+    };
+    let message = "A".repeat(MAX_GLYPHS_PER_ELEMENT + 1);
     let scene = scene_of(
-        &message[..MAX_GLYPHS_PER_ELEMENT],
+        &message,
         64,
         64,
         text_element(
-            Bounds {
-                x: 0,
-                y: 0,
-                width: 64,
-                height: 64,
-            },
+            bounds,
             text_style(8, Color::new(255, 255, 255, 255), Alignment::default()),
         ),
     )
     .instantiate(TitleId::new(NonZeroU128::new(1).unwrap()))
     .expect("valid template");
-    assert!(ReferenceRenderer.render(&scene, 0, &assets).is_ok());
+
+    // One over-long field used to fail the whole render: the frame that was
+    // supposed to go to air did not exist at all.
+    let output = ReferenceRenderer
+        .render(&scene, 0, &assets)
+        .expect("an over-long field must not take the frame off air");
+    assert!(
+        ink_bounds(output.frame.pixels(), 64).is_some(),
+        "the element must still draw the text that fit"
+    );
+    assert_eq!(
+        output.report.degraded,
+        vec![DegradedElement {
+            element: ElementId::new(NonZeroU128::new(1).unwrap()),
+            reason: Degradation::TextTruncated {
+                maximum: MAX_GLYPHS_PER_ELEMENT
+            },
+        }],
+        "the truncation must be reported, not silent"
+    );
+
+    // One character fewer is exactly at the cap and is not degraded, so the
+    // cap is exact rather than a symptom of the text being large.
+    let scene = scene_of(
+        &message[..MAX_GLYPHS_PER_ELEMENT],
+        64,
+        64,
+        text_element(
+            bounds,
+            text_style(8, Color::new(255, 255, 255, 255), Alignment::default()),
+        ),
+    )
+    .instantiate(TitleId::new(NonZeroU128::new(1).unwrap()))
+    .expect("valid template");
+    assert!(
+        ReferenceRenderer
+            .render(&scene, 0, &assets)
+            .expect("frame renders")
+            .report
+            .degraded
+            .is_empty()
+    );
 }

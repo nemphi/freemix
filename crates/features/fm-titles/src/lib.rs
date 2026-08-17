@@ -9,9 +9,12 @@
 //!   per-element pixel sizes, greedy word wrapping, horizontal and vertical
 //!   alignment, anti-aliased coverage composited into premultiplied RGBA8, and
 //!   clipping at the element box and the frame edge.
-//! * Bounded work: output size, font size, glyphs per element, glyphs per
-//!   frame, and per-glyph rasterization area are capped, and exceeding a cap is
-//!   a typed [`RenderError`] rather than an allocation.
+//! * Bounded work: output size, font size, characters per element, lines per
+//!   element, glyphs per frame, and per-glyph rasterization area are capped,
+//!   and every fill iterates its intersection with the canvas rather than the
+//!   element's declared extent. Reaching a per-element cap degrades that
+//!   element and is listed in [`RenderReport::degraded`] so the rest of the
+//!   frame still goes to air; only a whole-frame cap is a [`RenderError`].
 //!
 //! # What is still missing
 //!
@@ -40,9 +43,10 @@ pub use model::{
     TitleTemplate, UpdateError, VerticalAlignment,
 };
 pub use render::{
-    MAX_FONT_SIZE_PX, MAX_GLYPH_RASTER_DIMENSION, MAX_GLYPH_RASTER_PIXELS, MAX_GLYPHS_PER_ELEMENT,
-    MAX_GLYPHS_PER_FRAME, MAX_OUTPUT_HEIGHT, MAX_OUTPUT_WIDTH, REFERENCE_RENDERER_LIMITATIONS,
-    ReferenceRenderer, RenderError, RenderOutput, RenderReport,
+    Degradation, DegradedElement, MAX_FONT_SIZE_PX, MAX_GLYPH_RASTER_DIMENSION,
+    MAX_GLYPH_RASTER_PIXELS, MAX_GLYPHS_PER_ELEMENT, MAX_GLYPHS_PER_FRAME, MAX_OUTPUT_HEIGHT,
+    MAX_OUTPUT_WIDTH, REFERENCE_RENDERER_LIMITATIONS, ReferenceRenderer, RenderError, RenderOutput,
+    RenderReport,
 };
 pub use runtime::{
     ClockDirection, ClockFormat, ClockSpec, TickerDirection, TickerSpec, evaluate_clock,

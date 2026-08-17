@@ -8,6 +8,26 @@
 //! * Breaks paragraphs on `'\n'` and greedily word-wraps on Unicode whitespace
 //!   inside a pixel width, hard-breaking a single word that cannot fit.
 //!
+//! # Whitespace
+//!
+//! * `'\n'` ends the line.
+//! * `'\t'` advances exactly one space. This layout has no tab stops.
+//! * Whitespace at the start of a line is **dropped**: it never indents. An
+//!   indent would advance the pen without putting a glyph on the line, and the
+//!   first word would then be placed past the wrap width and clipped away, so
+//!   `"    John Smith"` pasted from a spreadsheet would render as nothing.
+//!   Dropping it makes wrapping independent of leading whitespace.
+//! * Every other control character carries no layout meaning and is dropped.
+//!
+//! # Bounds
+//!
+//! Every consumed character costs one glyph slot - a newline and a space cost
+//! the same as an inked glyph - and layout stops consuming input as soon as the
+//! glyph or line cap is reached, before the work is done. Layout time and
+//! allocation are therefore bounded by the caps and never by the length of the
+//! input; the caller learns the text was cut short from [`LaidText::truncated`]
+//! and reports it instead of dropping the frame.
+//!
 //! # What this layout deliberately does not do
 //!
 //! Grapheme-level shaping is out of scope: there is no bidirectional
@@ -30,6 +50,11 @@ use ab_glyph::{GlyphId, ScaleFont};
 
 /// Sub-pixel denominator for horizontal accumulation: 1/64 px.
 pub(crate) const FIXED_ONE: i64 = 64;
+
+/// Maximum lines one element lays out. Every line costs at least one consumed
+/// character, so the caller's glyph cap already bounds the line count; this cap
+/// bounds the line vector on its own terms as well.
+const MAX_LINES: usize = 4_096;
 
 /// Clamp applied to every fixed-point accumulator so a hostile font with
 /// absurd advances cannot overflow the pen.
@@ -66,11 +91,10 @@ pub(crate) struct LaidText {
     pub line_height_px: i64,
     /// Widest line in whole pixels.
     pub width_px: u32,
+    /// A cap stopped layout before the end of the input: what is here is a
+    /// prefix of the requested text.
+    pub truncated: bool,
 }
-
-/// The text exceeded the caller's glyph budget for a single element.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct TextTooLong;
 
 /// Rounds a font metric to 1/64 px, half away from zero.
 ///
@@ -109,29 +133,34 @@ fn round_px(value: f32) -> i64 {
 /// `None` lays every paragraph out as one unbounded line (used by tickers,
 /// which scroll horizontally instead of wrapping).
 ///
-/// # Errors
-///
-/// Returns [`TextTooLong`] as soon as more than `max_glyphs` glyphs would be
-/// laid out, before the work is done, so a hostile field value cannot force an
-/// unbounded allocation.
+/// Layout stops consuming `text` as soon as `max_glyphs` characters have been
+/// consumed or [`MAX_LINES`] lines have been laid out, and sets
+/// [`LaidText::truncated`]. It never walks the rest of the input, so a hostile
+/// field value costs bounded time and bounded allocation.
 pub(crate) fn layout_text(
     face: &ScaledFace<'_>,
     text: &str,
     wrap_width_px: Option<u32>,
     max_glyphs: usize,
-) -> Result<LaidText, TextTooLong> {
+) -> LaidText {
     let mut layout = Layout::new(face, wrap_width_px, max_glyphs);
+    let mut truncated = false;
     for character in text.chars() {
-        layout.push(character)?;
+        if !layout.push(character) {
+            truncated = true;
+            break;
+        }
     }
-    Ok(layout.finish())
+    layout.finish(truncated)
 }
 
 struct Layout<'a, 'f> {
     face: &'a ScaledFace<'f>,
     max_fixed: Option<i64>,
     max_glyphs: usize,
-    used_glyphs: usize,
+    /// Characters consumed so far. Charged for every character, so whitespace
+    /// cannot buy layout work for free.
+    used: usize,
     lines: Vec<LaidLine>,
     line: LaidLine,
     line_pen: i64,
@@ -149,7 +178,7 @@ impl<'a, 'f> Layout<'a, 'f> {
             face,
             max_fixed: wrap_width_px.map(|width| i64::from(width) * FIXED_ONE),
             max_glyphs,
-            used_glyphs: 0,
+            used: 0,
             lines: Vec::new(),
             line: LaidLine::default(),
             line_pen: 0,
@@ -169,32 +198,51 @@ impl<'a, 'f> Layout<'a, 'f> {
         previous.map_or(0, |previous| to_fixed(self.face.kern(previous, id)))
     }
 
-    fn push(&mut self, character: char) -> Result<(), TextTooLong> {
+    /// Consumes one character, returning `false` when a cap is reached and the
+    /// caller must stop feeding input.
+    ///
+    /// The cap is charged *before* the character is laid out and is charged for
+    /// every character, including newlines, tabs, spaces and dropped control
+    /// characters. A newline costs a line and a space costs pen movement, so
+    /// letting either through for free would let whitespace-only input allocate
+    /// and iterate without bound.
+    fn push(&mut self, character: char) -> bool {
+        if self.used >= self.max_glyphs || self.lines.len() >= MAX_LINES {
+            return false;
+        }
+        self.used += 1;
+
         if character == '\n' {
             self.commit_word();
             self.flush_line();
-            return Ok(());
+            return true;
         }
+        // A tab advances one space: there are no tab stops in this layout, and
+        // silently dropping it would join the words on either side.
+        let character = if character == '\t' { ' ' } else { character };
         // Control characters other than the newline above carry no layout
         // meaning here and are dropped rather than rendered as .notdef boxes.
         if character.is_control() {
-            return Ok(());
+            return true;
         }
         if character.is_whitespace() {
             self.commit_word();
+            // Leading whitespace is dropped rather than indenting the line: an
+            // indent moves the pen without committing a glyph, which would
+            // leave `fresh_line` set and push the first word past the wrap
+            // width, off the element box, and out of the frame.
+            if self.fresh_line {
+                return true;
+            }
             let id = self.face.glyph_id(character);
             let x = self.line_pen.saturating_add(self.kern(self.line_last, id));
             self.line_pen = x
                 .saturating_add(self.advance(id))
                 .clamp(-FIXED_LIMIT, FIXED_LIMIT);
             self.line_last = Some(id);
-            return Ok(());
+            return true;
         }
 
-        self.used_glyphs += 1;
-        if self.used_glyphs > self.max_glyphs {
-            return Err(TextTooLong);
-        }
         let id = self.face.glyph_id(character);
         let x = self.word_pen.saturating_add(self.kern(self.word_last, id));
         let advance = self.advance(id);
@@ -205,7 +253,7 @@ impl<'a, 'f> Layout<'a, 'f> {
         });
         self.word_pen = x.saturating_add(advance).clamp(-FIXED_LIMIT, FIXED_LIMIT);
         self.word_last = Some(id);
-        Ok(())
+        true
     }
 
     fn commit_word(&mut self) {
@@ -300,7 +348,7 @@ impl<'a, 'f> Layout<'a, 'f> {
         self.fresh_line = true;
     }
 
-    fn finish(mut self) -> LaidText {
+    fn finish(mut self, truncated: bool) -> LaidText {
         self.commit_word();
         self.flush_line();
 
@@ -322,6 +370,7 @@ impl<'a, 'f> Layout<'a, 'f> {
             ascent_px,
             line_height_px,
             width_px: u32::try_from(width_px).unwrap_or(u32::MAX),
+            truncated,
         }
     }
 }

@@ -7,6 +7,9 @@ use fm_titles::{
     evaluate_ticker_position, validate_template,
 };
 use std::num::NonZeroU128;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 fn field_id(value: u128) -> FieldId {
     FieldId::new(NonZeroU128::new(value).unwrap())
@@ -383,6 +386,47 @@ fn invalid_font_bytes_produce_typed_errors() {
     let mut truncated = vec![0x00, 0x01, 0x00, 0x00, 0x00, 0x09];
     truncated.extend_from_slice(&[0xff; 250]);
     assert!(FontFace::from_bytes(truncated).is_err());
+}
+
+#[test]
+fn an_element_far_larger_than_the_canvas_costs_only_the_canvas() {
+    // Element extents are `u32` and animatable to `u32::MAX`, so an operator
+    // can put this on air with a valid template. Filling it must iterate the
+    // canvas intersection; iterating the declared extent and discarding the
+    // off-canvas pixels one at a time never finishes.
+    let bounds = Bounds {
+        x: -1_000_000,
+        y: -1_000_000,
+        width: 4_000_000_000,
+        height: 4_000_000_000,
+    };
+    let scene = template(
+        Vec::new(),
+        vec![rectangle(1, 0, Color::new(0, 255, 0, 255), bounds)],
+        64,
+        64,
+    )
+    .instantiate(title_id(1))
+    .unwrap();
+
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let output = ReferenceRenderer
+            .render(&scene, 0, &AssetCatalog::new())
+            .unwrap();
+        sender.send(output.frame.pixels().to_vec()).ok();
+    });
+    let pixels = receiver
+        .recv_timeout(Duration::from_secs(10))
+        .expect("a 64x64 render must be bounded by the canvas, not by the element extent");
+
+    // The canvas is entirely inside the element, so every pixel is filled.
+    assert!(
+        pixels
+            .chunks_exact(4)
+            .all(|pixel| pixel == [0, 255, 0, 255]),
+        "the clipped fill must still cover the whole canvas"
+    );
 }
 
 #[test]
