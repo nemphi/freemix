@@ -2,13 +2,15 @@
 
 mod asset;
 mod journal;
+mod journal_db;
 mod json;
 mod model;
 mod store;
 
 pub use asset::{AssetAuditIssue, AssetAuditReason, AssetResolveError, validate_asset_uri};
 pub use journal::{
-    CompactionReport, JournalError, JournalScan, MAX_JOURNAL_RECORD_BYTES, MutationBatch,
+    CompactionReport, JournalError, JournalScan, MAX_JOURNAL_RECORD_BYTES,
+    MAX_UNAPPLIED_JOURNAL_BATCHES, MutationBatch,
 };
 pub use model::{
     CURRENT_SCHEMA_VERSION, FadeToBlackState, IdempotencyReceipt,

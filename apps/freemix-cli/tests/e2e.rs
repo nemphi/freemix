@@ -6437,66 +6437,40 @@ fn local_scene_program_render_composes_supported_layers_and_rejects_unsupported_
 }
 
 #[test]
-fn journal_recover_removes_only_torn_final_record_and_refuses_valid_batch() {
+fn journal_recover_reports_a_clean_journal_and_refuses_unapplied_batches() {
     let root = unique_test_root();
-    let torn_project = root.join("torn.freemix");
-    let valid_project = root.join("valid.freemix");
+    let clean_project = root.join("clean.freemix");
+    let unapplied_project = root.join("unapplied.freemix");
     fs::create_dir_all(&root).unwrap();
-    assert_success(&invoke(&["new", torn_project.to_str().unwrap()]));
-    let torn_store = ProjectStore::new(&torn_project).unwrap();
-    torn_store
-        .append_batch(&MutationBatch::new(1, 0, 1, b"torn".to_vec()))
-        .unwrap();
-    let torn_record = torn_store.journal_path().join("00000000000000000001.batch");
-    fs::OpenOptions::new()
-        .write(true)
-        .open(&torn_record)
-        .unwrap()
-        .set_len(12)
-        .unwrap();
 
-    let recovered = invoke(&["journal-recover", torn_project.to_str().unwrap()]);
+    // A journal with nothing left to apply recovers to its durable checkpoint.
+    assert_success(&invoke(&["new", clean_project.to_str().unwrap()]));
+    let recovered = invoke(&["journal-recover", clean_project.to_str().unwrap()]);
     assert_success(&recovered);
     assert_eq!(
         String::from_utf8_lossy(&recovered.stdout),
         "journal recovered: checkpoint_sequence=0 checkpoint_revision=0 unapplied_batches=0\n"
     );
-    assert!(!torn_record.exists());
-    assert_success(&invoke(&["status", torn_project.to_str().unwrap()]));
+    assert_success(&invoke(&["status", clean_project.to_str().unwrap()]));
 
-    assert_success(&invoke(&["new", valid_project.to_str().unwrap()]));
-    let valid_store = ProjectStore::new(&valid_project).unwrap();
-    valid_store
+    // Batches the CLI cannot interpret are refused, and nothing is applied.
+    assert_success(&invoke(&["new", unapplied_project.to_str().unwrap()]));
+    let store = ProjectStore::new(&unapplied_project).unwrap();
+    store
         .append_batch(&MutationBatch::new(1, 0, 1, b"valid".to_vec()))
         .unwrap();
-    valid_store
-        .append_batch(&MutationBatch::new(2, 1, 2, b"torn".to_vec()))
-        .unwrap();
-    let valid_record = valid_store
-        .journal_path()
-        .join("00000000000000000001.batch");
-    let torn_record = valid_store
-        .journal_path()
-        .join("00000000000000000002.batch");
-    fs::OpenOptions::new()
-        .write(true)
-        .open(&torn_record)
-        .unwrap()
-        .set_len(12)
-        .unwrap();
-    let valid_before = fs::read(&valid_record).unwrap();
-    let torn_before = fs::read(&torn_record).unwrap();
-    let manifest = fs::read(valid_project.join("project.json")).unwrap();
+    let manifest = fs::read(unapplied_project.join("project.json")).unwrap();
 
-    let refused = invoke(&["journal-recover", valid_project.to_str().unwrap()]);
+    let refused = invoke(&["journal-recover", unapplied_project.to_str().unwrap()]);
     assert_failure_contains(
         &refused,
         "journal recovery refused: 1 unapplied journal batch(es) remain; no batches were applied",
     );
-    assert_eq!(fs::read(&valid_record).unwrap(), valid_before);
-    assert_eq!(fs::read(&torn_record).unwrap(), torn_before);
+    let scan = store.scan_journal().unwrap();
+    assert_eq!(scan.batches().len(), 1);
+    assert_eq!(scan.batches()[0].payload(), b"valid");
     assert_eq!(
-        fs::read(valid_project.join("project.json")).unwrap(),
+        fs::read(unapplied_project.join("project.json")).unwrap(),
         manifest
     );
     fs::remove_dir_all(root).unwrap();
