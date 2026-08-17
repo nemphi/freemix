@@ -1272,6 +1272,7 @@ name = "fm-control"
 version = "0.1.0"
 dependencies = [
  "fm-auth",
+ "fm-automation",
  "fm-clock",
  "fm-command",
  "fm-engine",
