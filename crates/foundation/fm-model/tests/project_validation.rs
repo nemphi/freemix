@@ -1,14 +1,16 @@
 use std::num::NonZeroU128;
 
 use fm_model::{
-    AddInputError, AddSceneInputError, AddSceneLayerError, AudioBus, BusSend,
+    AddInputError, AddSceneInputError, AddSceneLayerError, AddStreamTargetError, AudioBus, BusSend,
     CURRENT_SCHEMA_VERSION, CropRect, DuplicateSceneInputError, EntityRef, Input,
     InputAudioStripState, InputBalanceBasisPoints, InputDelaySamples, InputGainMilliDb, InputKind,
     Layer, LayerGeometry, MainMix, Output, OutputFormat, Project, ProjectSettings, RectMask,
     RemoveAudioBusError, RemoveInputError, RemoveOutputError, RemoveSceneError, RenameSceneError,
     RestartPolicy, Rgba8, Rotation, Scene, SceneLayerError, SetStingerError, SimulatedAudio,
     SimulatedInput, SimulatedVideo, SolidColor, SourceRef, StartupPolicy, StingerAudioPolicy,
-    StingerConfig, StingerMissingMediaFallback, StingerSlotNumber, ValidationErrorKind,
+    StingerConfig, StingerMissingMediaFallback, StingerSlotNumber, StreamEndpoint,
+    StreamEndpointError, StreamKey, StreamKeyError, StreamProtocol, StreamTarget, StreamTargetId,
+    ValidationError, ValidationErrorKind,
 };
 use fm_types::{
     AudioFormat, BusId, ChannelLayout, ColorMetadata, FrameRate, InputId, MAX_INPUT_NAME_BYTES,
@@ -880,6 +882,164 @@ fn duplicate_routes_are_rejected() {
 #[test]
 fn project_uses_the_current_schema_contract() {
     assert_eq!(valid_project().schema_version(), CURRENT_SCHEMA_VERSION);
+}
+
+fn stream_target_id(value: u128) -> StreamTargetId {
+    StreamTargetId::new(NonZeroU128::new(value).unwrap())
+}
+
+fn stream_target(id: u128, name: &str, output: OutputId) -> StreamTarget {
+    StreamTarget::new(
+        stream_target_id(id),
+        name.to_owned(),
+        StreamProtocol::Rtmps,
+        StreamEndpoint::parse("ingest.example:443/live").unwrap(),
+        StreamKey::parse("sk-abcdef-012345").unwrap(),
+        output,
+    )
+    .unwrap()
+}
+
+#[test]
+fn stream_destinations_refuse_bad_urls_credentials_duplicate_ids_and_dangling_outputs() {
+    for (url, expected) in [
+        (
+            "http://ingest.example/live",
+            StreamEndpointError::UnsupportedScheme,
+        ),
+        (
+            "srt://ingest.example/live",
+            StreamEndpointError::UnsupportedScheme,
+        ),
+        (
+            "ingest.example/live",
+            StreamEndpointError::UnsupportedScheme,
+        ),
+        (
+            "rtmps://operator:hunter2@ingest.example/live",
+            StreamEndpointError::EmbeddedCredentials,
+        ),
+        ("rtmps:///live", StreamEndpointError::MissingHost),
+        (
+            "rtmps://ingest.example",
+            StreamEndpointError::MissingApplicationPath,
+        ),
+        (
+            "rtmps://ingest.example/live/",
+            StreamEndpointError::EmptyPathSegment,
+        ),
+        (
+            "rtmps://ingest.example/live?token=abcdef",
+            StreamEndpointError::QueryOrFragment,
+        ),
+        (
+            "rtmps://ingest.example/li ve",
+            StreamEndpointError::InvalidCharacter,
+        ),
+    ] {
+        assert_eq!(
+            StreamEndpoint::parse_url(url).map(|(_, endpoint)| endpoint),
+            Err(expected),
+            "{url} must be refused"
+        );
+    }
+    assert_eq!(StreamKey::parse("abc"), Err(StreamKeyError::TooShort));
+    assert_eq!(
+        StreamKey::parse("has/slash"),
+        Err(StreamKeyError::PathSeparator)
+    );
+
+    let mut project = valid_project();
+    project
+        .add_stream_target_checked(stream_target(1, "Primary", output_id(1)))
+        .unwrap();
+    assert!(project.validate().is_ok());
+
+    assert_eq!(
+        project.add_stream_target_checked(stream_target(1, "Backup", output_id(1))),
+        Err(AddStreamTargetError::DuplicateId(stream_target_id(1)))
+    );
+    assert_eq!(
+        project.add_stream_target_checked(stream_target(2, "pRiMaRy", output_id(1))),
+        Err(AddStreamTargetError::DuplicateName)
+    );
+    assert_eq!(
+        project.add_stream_target_checked(stream_target(2, "Backup", output_id(9))),
+        Err(AddStreamTargetError::UnknownOutput(output_id(9)))
+    );
+    assert_eq!(project.stream_targets().len(), 1);
+
+    // An output that a destination publishes cannot be pulled out from under it.
+    assert_eq!(
+        project.remove_output(output_id(1)),
+        Err(RemoveOutputError::StreamTargetReference {
+            output: output_id(1),
+            stream_target: stream_target_id(1),
+        })
+    );
+
+    // The unchecked path is what the decoder uses, so whole-project
+    // validation has to catch a dangling output on its own.
+    let mut dangling = valid_project();
+    dangling.add_stream_target(stream_target(1, "Primary", output_id(9)));
+    let errors = dangling.validate().unwrap_err();
+    assert!(errors.contains(&ValidationError {
+        entity: Some(EntityRef::StreamTarget(stream_target_id(1))),
+        field: "output",
+        kind: ValidationErrorKind::MissingReference(EntityRef::Output(output_id(9))),
+    }));
+}
+
+#[test]
+fn stream_key_never_appears_in_debug_display_or_errors() {
+    const SECRET: &str = "live-9f3c-secret-key";
+    let target = StreamTarget::new(
+        stream_target_id(1),
+        "Primary".to_owned(),
+        StreamProtocol::Rtmps,
+        StreamEndpoint::parse("ingest.example:443/live").unwrap(),
+        StreamKey::parse(SECRET).unwrap(),
+        output_id(1),
+    )
+    .unwrap()
+    .with_backup_endpoint(Some(StreamEndpoint::parse("backup.example/live").unwrap()))
+    .unwrap();
+    let mut project = valid_project();
+    project.add_stream_target_checked(target.clone()).unwrap();
+
+    // The whole project derives Debug, so the containing type has to stay
+    // clean too, not just the leaf.
+    for rendered in [
+        format!("{target:?}"),
+        format!("{target}"),
+        format!("{:?}", target.key()),
+        format!("{project:?}"),
+        format!("{:?}", project.stream_targets()),
+        target.redacted_url(),
+        target.redacted_backup_url().unwrap(),
+        StreamKey::parse("ab").unwrap_err().to_string(),
+        StreamEndpoint::parse_url(&format!("rtmp://operator:{SECRET}@host/live"))
+            .unwrap_err()
+            .to_string(),
+    ] {
+        assert!(
+            !rendered.contains(SECRET),
+            "stream key leaked into `{rendered}`"
+        );
+    }
+
+    assert_eq!(
+        target.redacted_url(),
+        "rtmps://ingest.example:443/live/****"
+    );
+    assert_eq!(
+        target.redacted_backup_url().as_deref(),
+        Some("rtmps://backup.example/live/****")
+    );
+    assert_eq!(
+        target.expose_url(),
+        format!("rtmps://ingest.example:443/live/{SECRET}")
+    );
 }
 
 #[test]

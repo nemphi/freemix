@@ -67,6 +67,40 @@ impl FadeToBlackTarget {
     }
 }
 
+/// Everything `stream-add` and `stream-update` author about one destination.
+///
+/// The stream key arrives as a positional argument, so it is visible in this
+/// machine's process list while the command runs. That matches the bundle's
+/// trust model, which stores the key in plaintext in `project.json`; it is
+/// still worth knowing before pasting a production key on a shared host.
+/// Once parsed the key stops being printable: `Debug` here redacts it, and the
+/// model type it becomes never renders it at all.
+#[derive(Clone, Eq, PartialEq)]
+pub struct StreamSpec {
+    pub stream: u128,
+    pub output: u128,
+    pub url: String,
+    pub key: String,
+    pub name: String,
+    pub backup_url: Option<String>,
+    pub startup: StartupPolicy,
+}
+
+impl std::fmt::Debug for StreamSpec {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StreamSpec")
+            .field("stream", &self.stream)
+            .field("output", &self.output)
+            .field("url", &self.url)
+            .field("key", &"****")
+            .field("name", &self.name)
+            .field("backup_url", &self.backup_url)
+            .field("startup", &self.startup)
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Command {
     New {
@@ -148,6 +182,21 @@ pub enum Command {
     OutputRemove {
         path: PathBuf,
         output: u128,
+    },
+    StreamAdd {
+        path: PathBuf,
+        spec: StreamSpec,
+    },
+    StreamUpdate {
+        path: PathBuf,
+        spec: StreamSpec,
+    },
+    StreamRemove {
+        path: PathBuf,
+        stream: u128,
+    },
+    Streams {
+        path: PathBuf,
     },
     SceneInputAdd {
         path: PathBuf,
@@ -762,6 +811,11 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
         "output-route" => parse_output_route(arguments),
         "output-rename" => parse_output_rename(arguments),
         "output-startup" => parse_output_startup(arguments),
+        "stream-add" => parse_stream(arguments, |path, spec| Command::StreamAdd { path, spec }),
+        "stream-update" => {
+            parse_stream(arguments, |path, spec| Command::StreamUpdate { path, spec })
+        }
+        "stream-remove" => parse_stream_remove(arguments),
         "scene-input-add" => parse_scene_input_add(arguments),
         "scene-input-duplicate" => parse_scene_input_duplicate(arguments),
         "scene-input-audio-source" => parse_scene_input_audio_source(arguments),
@@ -811,6 +865,11 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
             let path = required_path(&mut arguments, "project path")?;
             reject_extra(&mut arguments)?;
             Ok(Command::Outputs { path })
+        }
+        "streams" => {
+            let path = required_path(&mut arguments, "project path")?;
+            reject_extra(&mut arguments)?;
+            Ok(Command::Streams { path })
         }
         "audio-buses" => {
             let path = required_path(&mut arguments, "project path")?;
@@ -941,23 +1000,68 @@ fn parse_output_route(mut arguments: impl Iterator<Item = String>) -> Result<Com
 fn parse_output_startup(mut arguments: impl Iterator<Item = String>) -> Result<Command, ArgsError> {
     let path = required_path(&mut arguments, "project path")?;
     let output = number(&required(&mut arguments, "output")?, "output")?;
-    let value = required(&mut arguments, "startup policy")?;
-    let startup = match value.as_str() {
-        "stopped" => StartupPolicy::Stopped,
-        "reconcile-desired-state" => StartupPolicy::ReconcileDesiredState,
-        _ => {
-            return Err(ArgsError::InvalidChoice {
-                field: "startup policy",
-                value,
-            });
-        }
-    };
+    let startup = startup_policy(&required(&mut arguments, "startup policy")?)?;
     reject_extra(&mut arguments)?;
     Ok(Command::OutputStartup {
         path,
         output,
         startup,
     })
+}
+
+fn parse_stream(
+    mut arguments: impl Iterator<Item = String>,
+    build: fn(PathBuf, StreamSpec) -> Command,
+) -> Result<Command, ArgsError> {
+    let path = required_path(&mut arguments, "project path")?;
+    let stream = number(&required(&mut arguments, "stream")?, "stream")?;
+    let output = number(&required(&mut arguments, "output")?, "output")?;
+    let url = nonblank(&mut arguments, "stream url")?;
+    let key = nonblank(&mut arguments, "stream key")?;
+    let name = nonblank(&mut arguments, "stream name")?;
+    let mut backup_url = None;
+    let mut startup = StartupPolicy::Stopped;
+    while let Some(option) = arguments.next() {
+        match option.as_str() {
+            "--backup" => {
+                backup_url = Some(nonblank(&mut arguments, "backup stream url")?);
+            }
+            "--startup" => {
+                startup = startup_policy(&required(&mut arguments, "startup policy")?)?;
+            }
+            _ => return Err(ArgsError::UnknownOption(option)),
+        }
+    }
+    Ok(build(
+        path,
+        StreamSpec {
+            stream,
+            output,
+            url,
+            key,
+            name,
+            backup_url,
+            startup,
+        },
+    ))
+}
+
+fn parse_stream_remove(mut arguments: impl Iterator<Item = String>) -> Result<Command, ArgsError> {
+    let path = required_path(&mut arguments, "project path")?;
+    let stream = number(&required(&mut arguments, "stream")?, "stream")?;
+    reject_extra(&mut arguments)?;
+    Ok(Command::StreamRemove { path, stream })
+}
+
+fn startup_policy(value: &str) -> Result<StartupPolicy, ArgsError> {
+    match value {
+        "stopped" => Ok(StartupPolicy::Stopped),
+        "reconcile-desired-state" => Ok(StartupPolicy::ReconcileDesiredState),
+        _ => Err(ArgsError::InvalidChoice {
+            field: "startup policy",
+            value: value.to_owned(),
+        }),
+    }
 }
 
 fn parse_output_rename(mut arguments: impl Iterator<Item = String>) -> Result<Command, ArgsError> {

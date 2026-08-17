@@ -6,11 +6,12 @@ use std::{
 };
 
 use fm_model::{
-    AudioBus, BusSend, CropRect, Input, InputAudioStripState, InputBalanceBasisPoints,
-    InputDelaySamples, InputGainMilliDb, InputKind, Layer, LayerGeometry, MainMix, Output, Project,
-    ProjectSettings, RectMask, RestartPolicy, Rgba8, Rotation, Scene, SimulatedAudio,
-    SimulatedInput, SimulatedVideo, SolidColor, SourceRef, StartupPolicy, StingerAudioPolicy,
-    StingerConfig, StingerMissingMediaFallback, StingerSlotNumber,
+    AudioBus, BusSend, CURRENT_SCHEMA_VERSION, CropRect, Input, InputAudioStripState,
+    InputBalanceBasisPoints, InputDelaySamples, InputGainMilliDb, InputKind, Layer, LayerGeometry,
+    MainMix, Output, Project, ProjectSettings, RectMask, RestartPolicy, Rgba8, Rotation, Scene,
+    SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef, StartupPolicy,
+    StingerAudioPolicy, StingerConfig, StingerMissingMediaFallback, StingerSlotNumber,
+    StreamEndpoint, StreamKey, StreamProtocol, StreamTarget, StreamTargetId,
 };
 use fm_persistence::{ProjectPosition, ProjectStore, RuntimeRouting, StoreError, StoredProject};
 use fm_types::{
@@ -63,6 +64,12 @@ fn bus_id(value: u128) -> BusId {
 fn output_id(value: u128) -> OutputId {
     OutputId::new(nz(value))
 }
+fn stream_target_id(value: u128) -> StreamTargetId {
+    StreamTargetId::new(nz(value))
+}
+
+/// The rich fixture's stream key. Nothing but `project.json` may contain it.
+const RICH_STREAM_KEY: &str = "live-2f8c41d9-secret";
 
 fn rich_settings() -> ProjectSettings {
     let frame_rate = FrameRate::new(24_000, 1_001).unwrap();
@@ -160,6 +167,23 @@ fn rich_inputs(high: u128) -> [Input; 7] {
     ]
 }
 
+fn rich_stream_target(high: u128) -> StreamTarget {
+    StreamTarget::new(
+        stream_target_id(high + 40),
+        "Main ingest".into(),
+        StreamProtocol::Rtmps,
+        StreamEndpoint::parse("ingest.example.test:443/live").unwrap(),
+        StreamKey::parse(RICH_STREAM_KEY).unwrap(),
+        output_id(high + 30),
+    )
+    .unwrap()
+    .with_backup_endpoint(Some(
+        StreamEndpoint::parse("backup.example.test/live/eu").unwrap(),
+    ))
+    .unwrap()
+    .with_startup(StartupPolicy::ReconcileDesiredState)
+}
+
 fn rich_project() -> Project {
     let high = u128::from(u64::MAX) + 101;
     let mut project = Project::new(
@@ -251,6 +275,7 @@ fn rich_project() -> Project {
         startup: StartupPolicy::ReconcileDesiredState,
         required_capabilities: vec!["output.network.srt".into()],
     });
+    project.add_stream_target(rich_stream_target(high));
     project
 }
 
@@ -386,6 +411,144 @@ fn current_project_round_trip_preserves_formats_graph_capabilities_and_u128_ids(
         } if id.get().get() > u128::from(u64::MAX)
             && audio.get().get() > u128::from(u64::MAX)
     ));
+}
+
+#[test]
+fn stream_destination_round_trips_at_the_current_schema_and_keeps_its_key_off_every_other_surface()
+{
+    let temp = TestDirectory::new("stream-destination");
+    let store = temp.store("show");
+    let expected = stored_rich_project();
+
+    store.save(&expected).unwrap();
+    let loaded = store.load().unwrap();
+
+    assert_eq!(loaded, expected);
+    assert_eq!(loaded.project().schema_version(), CURRENT_SCHEMA_VERSION);
+    let target = &loaded.project().stream_targets()[0];
+    assert_eq!(target.name(), "Main ingest");
+    assert_eq!(target.protocol(), StreamProtocol::Rtmps);
+    assert_eq!(target.endpoint().as_str(), "ingest.example.test:443/live");
+    assert_eq!(
+        target.backup_endpoint().map(StreamEndpoint::as_str),
+        Some("backup.example.test/live/eu")
+    );
+    assert_eq!(target.key().expose_secret(), RICH_STREAM_KEY);
+    assert_eq!(target.startup(), StartupPolicy::ReconcileDesiredState);
+    assert_eq!(
+        target.expose_url(),
+        format!("rtmps://ingest.example.test:443/live/{RICH_STREAM_KEY}")
+    );
+
+    // The manifest is the one place the key is allowed to appear: the bundle
+    // is plaintext by design and must be protected like the credential it now
+    // holds. Nothing derived from the loaded project may repeat it.
+    let encoded = fs::read_to_string(store.manifest_path()).unwrap();
+    assert!(encoded.contains(&format!("\"key\": \"{RICH_STREAM_KEY}\"")));
+    for rendered in [
+        format!("{target:?}"),
+        format!("{target}"),
+        format!("{:?}", loaded.project()),
+        target.redacted_url(),
+        target.redacted_backup_url().unwrap(),
+    ] {
+        assert!(
+            !rendered.contains(RICH_STREAM_KEY),
+            "stream key leaked into `{rendered}`"
+        );
+    }
+    assert_eq!(
+        target.redacted_url(),
+        "rtmps://ingest.example.test:443/live/****"
+    );
+}
+
+#[test]
+fn strict_stream_destination_parser_rejects_missing_wrong_typed_and_out_of_contract_fields() {
+    let temp = TestDirectory::new("strict-stream-destination");
+    let store = temp.store("show");
+    store.save(&stored_rich_project()).unwrap();
+    let valid = fs::read_to_string(store.manifest_path()).unwrap();
+
+    for malformed in [
+        // Missing, wrong-typed, unknown and duplicated fields.
+        valid.replacen("\"protocol\": \"rtmps\",\n        ", "", 1),
+        valid.replacen("\"protocol\": \"rtmps\"", "\"protocol\": 443", 1),
+        valid.replacen(
+            "\"backup_endpoint\":",
+            "\"future_field\": 1,\n        \"backup_endpoint\":",
+            1,
+        ),
+        valid.replacen(
+            &format!("\"key\": \"{RICH_STREAM_KEY}\""),
+            &format!("\"key\": \"{RICH_STREAM_KEY}\", \"key\": \"{RICH_STREAM_KEY}\""),
+            1,
+        ),
+        valid.replacen("\"output\": ", "\"output\": 0, \"ignored\": ", 1),
+        // Values outside the destination contract the sink enforces.
+        valid.replacen("\"protocol\": \"rtmps\"", "\"protocol\": \"srt\"", 1),
+        valid.replacen(
+            "\"endpoint\": \"ingest.example.test:443/live\"",
+            "\"endpoint\": \"rtmps://ingest.example.test/live\"",
+            1,
+        ),
+        valid.replacen(
+            "\"endpoint\": \"ingest.example.test:443/live\"",
+            "\"endpoint\": \"operator:hunter2@ingest.example.test/live\"",
+            1,
+        ),
+        valid.replacen(
+            "\"endpoint\": \"ingest.example.test:443/live\"",
+            "\"endpoint\": \"ingest.example.test\"",
+            1,
+        ),
+        valid.replacen(
+            "\"backup_endpoint\": \"backup.example.test/live/eu\"",
+            "\"backup_endpoint\": \"backup.example.test/live/\"",
+            1,
+        ),
+        valid.replacen(
+            &format!("\"key\": \"{RICH_STREAM_KEY}\""),
+            "\"key\": \"ab\"",
+            1,
+        ),
+        valid.replacen(
+            &format!("\"key\": \"{RICH_STREAM_KEY}\""),
+            "\"key\": \"has/slash\"",
+            1,
+        ),
+        valid.replacen(
+            "\"startup\": \"reconcile_desired_state\",\n        \"output\"",
+            "\"startup\": \"running\",\n        \"output\"",
+            1,
+        ),
+    ] {
+        fs::write(store.manifest_path(), &malformed).unwrap();
+        let error = store.load().unwrap_err();
+        assert!(
+            matches!(error, StoreError::MalformedManifest { .. }),
+            "expected a malformed manifest, got {error:?}"
+        );
+        assert!(
+            !error.to_string().contains(RICH_STREAM_KEY),
+            "stream key leaked into `{error}`"
+        );
+    }
+
+    // A destination whose output does not exist is a project-level failure,
+    // not a syntax one.
+    let missing_output = u128::from(u64::MAX) + 999;
+    let current_output = u128::from(u64::MAX) + 131;
+    fs::write(
+        store.manifest_path(),
+        valid.replacen(
+            &format!("\"output\": {current_output}"),
+            &format!("\"output\": {missing_output}"),
+            1,
+        ),
+    )
+    .unwrap();
+    assert!(matches!(store.load(), Err(StoreError::Validation(_))));
 }
 
 #[test]

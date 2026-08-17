@@ -6,6 +6,7 @@ use fm_model::{
     MainMix, Output, Project, ProjectSettings, RectMask, RestartPolicy, Rgba8, Rotation, Scene,
     SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef, StartupPolicy,
     StingerAudioPolicy, StingerConfig, StingerMissingMediaFallback, StingerSlotNumber,
+    StreamEndpoint, StreamKey, StreamProtocol, StreamTarget, StreamTargetId,
 };
 use fm_types::{
     AudioFormat, BusId, Channel, ChannelLayout, ChromaLocation, ColorMetadata, ColorPrimaries,
@@ -61,6 +62,7 @@ struct ProjectDto {
     scenes: Vec<Scene>,
     audio_buses: Vec<AudioBus>,
     outputs: Vec<Output>,
+    stream_targets: Vec<StreamTarget>,
     main_mix: Option<MainMix>,
     stingers: Vec<StingerConfig>,
     restart_policy: RestartPolicy,
@@ -86,6 +88,11 @@ impl ProjectDto {
             scenes: parse_array(object.take("scenes")?, "scenes", parse_scene)?,
             audio_buses: parse_array(object.take("audio_buses")?, "audio_buses", parse_bus)?,
             outputs: parse_array(object.take("outputs")?, "outputs", parse_output)?,
+            stream_targets: parse_array(
+                object.take("stream_targets")?,
+                "stream_targets",
+                parse_stream_target,
+            )?,
             main_mix: parse_optional(object.take("main_mix")?, parse_main_mix)?,
             stingers: parse_array(object.take("stingers")?, "stingers", parse_stinger)?,
             restart_policy: parse_restart_policy(object.take("restart_policy")?)?,
@@ -136,6 +143,9 @@ impl ProjectDto {
         }
         for output in self.outputs {
             project.add_output(output);
+        }
+        for target in self.stream_targets {
+            project.add_stream_target(target);
         }
         if let Some(main_mix) = self.main_mix {
             project.set_main_mix(main_mix);
@@ -559,6 +569,44 @@ fn parse_output(value: Value) -> Result<Output, DecodeError> {
     Ok(output)
 }
 
+/// Parses one streaming destination.
+///
+/// Every rejection message below is built from a typed model error that
+/// carries no endpoint or key text, so a manifest with a bad stream key is
+/// refused without the key appearing in the failure.
+fn parse_stream_target(value: Value) -> Result<StreamTarget, DecodeError> {
+    let mut object = Object::new(value, "stream target")?;
+    let id = StreamTargetId::new(object.nonzero_u128("id")?);
+    let name = object.string("name")?;
+    let protocol = match object.string("protocol")?.as_str() {
+        "rtmp" => StreamProtocol::Rtmp,
+        "rtmps" => StreamProtocol::Rtmps,
+        value => return Err(unknown_enum("stream target protocol", value)),
+    };
+    let endpoint = StreamEndpoint::parse(&object.string("endpoint")?)
+        .map_err(|error| syntax(format!("field `endpoint` is invalid: {error}")))?;
+    let backup_endpoint = object
+        .optional_string("backup_endpoint")?
+        .map(|text| {
+            StreamEndpoint::parse(&text)
+                .map_err(|error| syntax(format!("field `backup_endpoint` is invalid: {error}")))
+        })
+        .transpose()?;
+    let key = StreamKey::parse(&object.string("key")?)
+        .map_err(|error| syntax(format!("field `key` is invalid: {error}")))?;
+    let startup = match object.string("startup")?.as_str() {
+        "stopped" => StartupPolicy::Stopped,
+        "reconcile_desired_state" => StartupPolicy::ReconcileDesiredState,
+        value => return Err(unknown_enum("startup", value)),
+    };
+    let output = OutputId::new(object.nonzero_u128("output")?);
+    object.finish()?;
+    StreamTarget::new(id, name, protocol, endpoint, key, output)
+        .and_then(|target| target.with_backup_endpoint(backup_endpoint))
+        .map(|target| target.with_startup(startup))
+        .map_err(|error| syntax(format!("stream target is invalid: {error}")))
+}
+
 fn parse_main_mix(value: Value) -> Result<MainMix, DecodeError> {
     let mut object = Object::new(value, "main mix")?;
     let mix = MainMix::new(
@@ -862,6 +910,14 @@ impl Object {
     fn nonzero_u128(&mut self, field: &str) -> Result<NonZeroU128, DecodeError> {
         NonZeroU128::new(self.number(field)?)
             .ok_or_else(|| syntax(format!("field `{field}` must be nonzero")))
+    }
+
+    fn optional_string(&mut self, field: &str) -> Result<Option<String>, DecodeError> {
+        match self.take(field)? {
+            Value::Null => Ok(None),
+            Value::String(value) => Ok(Some(value)),
+            _ => Err(syntax(format!("field `{field}` must be a string or null"))),
+        }
     }
 
     fn optional_input_id(&mut self, field: &str) -> Result<Option<InputId>, DecodeError> {

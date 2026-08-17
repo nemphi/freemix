@@ -290,6 +290,7 @@ fn write_project_collections(output: &mut String, project: &fm_model::Project) {
         output.push_str("\n      }");
     }
     array_end(output, project.outputs().is_empty(), 4);
+    write_stream_targets(output, project);
     output.push_str(",\n    \"stingers\": [");
     for (index, stinger) in project.stingers().iter().enumerate() {
         item_prefix(output, index, 6);
@@ -317,6 +318,51 @@ fn write_project_collections(output: &mut String, project: &fm_model::Project) {
     }
     array_end(output, project.stingers().is_empty(), 4);
     output.push(',');
+}
+
+/// Writes the configured streaming destinations.
+///
+/// The stream key is written in the clear. That is the `.freemix` bundle's
+/// existing trust model: `project.json` is plaintext and the bundle must be
+/// protected like the credential it now contains. This is the one place the
+/// secret is allowed to leave [`fm_model::StreamKey`].
+fn write_stream_targets(output: &mut String, project: &fm_model::Project) {
+    output.push_str(",\n    \"stream_targets\": [");
+    for (index, target) in project.stream_targets().iter().enumerate() {
+        item_prefix(output, index, 6);
+        write!(
+            output,
+            "{{\n        \"id\": {},\n        \"name\": \"",
+            target.id()
+        )
+        .expect("writing to a string cannot fail");
+        escape_string(output, target.name());
+        write!(
+            output,
+            "\",\n        \"protocol\": \"{}\",\n        \"endpoint\": \"",
+            target.protocol().scheme()
+        )
+        .expect("writing to a string cannot fail");
+        escape_string(output, target.endpoint().as_str());
+        output.push_str("\",\n        \"backup_endpoint\": ");
+        if let Some(backup) = target.backup_endpoint() {
+            output.push('"');
+            escape_string(output, backup.as_str());
+            output.push('"');
+        } else {
+            output.push_str("null");
+        }
+        output.push_str(",\n        \"key\": \"");
+        escape_string(output, target.key().expose_secret());
+        write!(
+            output,
+            "\",\n        \"startup\": \"{}\",\n        \"output\": {}\n      }}",
+            startup_policy(target.startup()),
+            target.output(),
+        )
+        .expect("writing to a string cannot fail");
+    }
+    array_end(output, project.stream_targets().is_empty(), 4);
 }
 
 fn write_input_audio_strips(output: &mut String, project: &fm_model::Project) {

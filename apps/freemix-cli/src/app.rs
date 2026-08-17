@@ -22,7 +22,8 @@ use fm_model::{
     InputGainMilliDb, InputKind, Layer, LayerGeometry, MainMix, Project, ProjectSettings, RectMask,
     Rgba8 as ModelRgba8, Rotation, SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor,
     SourceRef, StartupPolicy, StingerAudioPolicy as ModelStingerAudioPolicy, StingerConfig,
-    StingerMissingMediaFallback, StingerSlotNumber,
+    StingerMissingMediaFallback, StingerSlotNumber, StreamEndpoint, StreamKey, StreamTarget,
+    StreamTargetId,
 };
 use fm_persistence::validate_asset_uri;
 use fm_persistence::{
@@ -50,7 +51,7 @@ use crate::{
         Command, ManualTransitionKind, OverlayBorder as CliOverlayBorder,
         OverlayPosition as CliOverlayPosition, OverlayTransition as CliOverlayTransition,
         StingerAudioPolicy as CliStingerAudioPolicy, StingerFallback as CliStingerFallback,
-        TBarAction,
+        StreamSpec, TBarAction,
     },
     remote,
 };
@@ -170,6 +171,15 @@ pub fn run(command: Command) -> AppResult<()> {
         } => set_output_startup(&path, output_id(output)?, startup)?,
         Command::OutputRemove { path, output } => {
             remove_output(&path, output_id(output)?)?;
+        }
+        Command::StreamAdd { path, spec } => add_stream_target(&path, &spec)?,
+        Command::StreamUpdate { path, spec } => update_stream_target(&path, &spec)?,
+        Command::StreamRemove { path, stream } => {
+            remove_stream_target(&path, stream_target_id(stream)?)?;
+        }
+        Command::Streams { path } => {
+            let stored = inspect_stored_project(&path)?;
+            print_stream_targets(stored.project());
         }
         Command::SceneInputAdd {
             path,
@@ -1771,6 +1781,67 @@ fn rename_output(path: &Path, output: OutputId, name: String) -> AppResult<()> {
     Ok(())
 }
 
+/// Builds a validated destination from the authored arguments.
+///
+/// Every rejection here comes from a typed model error that carries no URL or
+/// key text, so a mistyped key is refused without echoing it back to the
+/// terminal or into a shell history through an error message.
+fn stream_target(spec: &StreamSpec) -> AppResult<StreamTarget> {
+    let (protocol, endpoint) = StreamEndpoint::parse_url(&spec.url)
+        .map_err(|error| AppFailure(format!("invalid stream url: {error}")))?;
+    let backup_endpoint = spec
+        .backup_url
+        .as_deref()
+        .map(|url| {
+            let (backup_protocol, backup_endpoint) = StreamEndpoint::parse_url(url)
+                .map_err(|error| AppFailure(format!("invalid backup stream url: {error}")))?;
+            if backup_protocol == protocol {
+                Ok(backup_endpoint)
+            } else {
+                Err(AppFailure(format!(
+                    "backup stream url must use {protocol}://, matching the primary"
+                )))
+            }
+        })
+        .transpose()?;
+    let key = StreamKey::parse(&spec.key)
+        .map_err(|error| AppFailure(format!("invalid stream key: {error}")))?;
+    let target = StreamTarget::new(
+        stream_target_id(spec.stream)?,
+        spec.name.clone(),
+        protocol,
+        endpoint,
+        key,
+        output_id(spec.output)?,
+    )
+    .and_then(|target| target.with_backup_endpoint(backup_endpoint))
+    .map_err(|error| AppFailure(error.to_string()))?;
+    Ok(target.with_startup(spec.startup))
+}
+
+fn add_stream_target(path: &Path, spec: &StreamSpec) -> AppResult<()> {
+    let target = stream_target(spec)?;
+    update_project(path, |project| {
+        project.add_stream_target_checked(target)?;
+        Ok(())
+    })
+}
+
+fn update_stream_target(path: &Path, spec: &StreamSpec) -> AppResult<()> {
+    let target = stream_target(spec)?;
+    update_project(path, |project| {
+        project.replace_stream_target(target)?;
+        Ok(())
+    })
+}
+
+fn remove_stream_target(path: &Path, target: StreamTargetId) -> AppResult<()> {
+    update_project(path, |project| {
+        project.remove_stream_target(target)?;
+        Ok(())
+    })
+}
+
 fn set_scene_input_audio_source(
     path: &Path,
     scene_input: InputId,
@@ -3000,6 +3071,36 @@ fn print_outputs(project: &Project) {
     }
 }
 
+/// Lists configured streaming destinations with the stream key redacted.
+///
+/// The URLs printed here come from [`StreamTarget::redacted_url`], which
+/// renders the key as `****`. No line in this program prints the key.
+fn print_stream_targets(project: &Project) {
+    for target in project.stream_targets() {
+        let output = project
+            .outputs()
+            .iter()
+            .find(|output| output.id == target.output())
+            .expect("validated stream destination output reference");
+        let startup = match target.startup() {
+            StartupPolicy::Stopped => "stopped",
+            StartupPolicy::ReconcileDesiredState => "reconcile-desired-state",
+        };
+        println!(
+            "stream id={} name={:?} protocol={} url={:?} backup_url={:?} output={} output_name={:?} startup={startup}",
+            target.id(),
+            target.name(),
+            target.protocol(),
+            target.redacted_url(),
+            target
+                .redacted_backup_url()
+                .unwrap_or_else(|| "none".to_owned()),
+            target.output(),
+            output.name,
+        );
+    }
+}
+
 fn print_audio_buses(project: &Project) {
     for bus in project.audio_buses() {
         let sends = bus
@@ -3196,6 +3297,13 @@ Usage:
   freemix-cli output-rename <show.freemix> <existing-output-id> <name>
   freemix-cli output-startup <show.freemix> <existing-output-id> <stopped|reconcile-desired-state>
   freemix-cli output-remove <show.freemix> <existing-output-id>
+  freemix-cli stream-add <show.freemix> <nonzero-stream-id> <existing-output-id> <rtmp(s)://host/app> <stream-key> <name> [--backup <rtmp(s)://host/app>] [--startup <stopped|reconcile-desired-state>]
+  freemix-cli stream-update <show.freemix> <existing-stream-id> <existing-output-id> <rtmp(s)://host/app> <stream-key> <name> [--backup <rtmp(s)://host/app>] [--startup <stopped|reconcile-desired-state>]
+  freemix-cli stream-remove <show.freemix> <existing-stream-id>
+      The stream key is a positional argument and is therefore visible in this
+      machine's process list. It is stored in plaintext in project.json, like
+      every other authored field, so protect the bundle accordingly. It is
+      never printed: `streams` and every error render it as ****.
   freemix-cli scene-input-add <show.freemix> <nonzero-input-id> <nonzero-scene-id> <name>
   freemix-cli scene-input-duplicate <show.freemix> <source-scene-id> <new-scene-id> <new-input-id> <scene-name> <input-name>
   freemix-cli scene-input-audio-source <show.freemix> <scene-input-id> <source-input-id>
@@ -3230,6 +3338,7 @@ Usage:
   freemix-cli journal-recover <show.freemix>
   freemix-cli inputs <show.freemix>
   freemix-cli outputs <show.freemix>
+  freemix-cli streams <show.freemix>
   freemix-cli audio-buses <show.freemix>
   freemix-cli scenes <show.freemix>
   freemix-cli asset-audit <show.freemix>
@@ -3492,6 +3601,12 @@ fn bus_id(value: u128) -> AppResult<BusId> {
     NonZeroU128::new(value)
         .map(BusId::new)
         .ok_or_else(|| AppFailure("bus ID must be nonzero".into()).into())
+}
+
+fn stream_target_id(value: u128) -> AppResult<StreamTargetId> {
+    NonZeroU128::new(value)
+        .map(StreamTargetId::new)
+        .ok_or_else(|| AppFailure("stream destination ID must be nonzero".into()).into())
 }
 
 fn required_routing(value: Option<InputId>, field: &'static str) -> AppResult<InputId> {

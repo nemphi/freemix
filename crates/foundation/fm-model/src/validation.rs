@@ -1,7 +1,8 @@
 use fm_types::{BusId, InputId, MAX_INPUT_NAME_BYTES, OutputId, SceneId};
 
 use crate::{
-    InputKind, Project, ProjectSettings, RestartPolicy, SimulatedAudio, SourceRef,
+    InputKind, MAX_STREAM_TARGET_NAME_BYTES, Project, ProjectSettings, RestartPolicy,
+    SimulatedAudio, SourceRef, StreamTargetId,
     cycles::{mark_audio_input_cycles, mark_bus_cycles, mark_scene_cycles},
 };
 
@@ -12,6 +13,7 @@ pub enum EntityRef {
     Scene(SceneId),
     AudioBus(BusId),
     Output(OutputId),
+    StreamTarget(StreamTargetId),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -48,6 +50,7 @@ pub(crate) fn validate_project(project: &Project) -> Vec<ValidationError> {
     validate_scenes(project, &mut errors);
     validate_buses(project, &mut errors);
     validate_outputs(project, &mut errors);
+    validate_stream_targets(project, &mut errors);
     mark_scene_cycles(project, &mut errors);
     mark_audio_input_cycles(project, &mut errors);
     mark_bus_cycles(project, &mut errors);
@@ -210,6 +213,17 @@ fn validate_unique_entities(project: &Project, errors: &mut Vec<ValidationError>
                 output.id,
                 output.name.as_str(),
                 EntityRef::Output(output.id),
+            )
+        }),
+        false,
+    );
+    duplicates(
+        errors,
+        project.stream_targets().iter().map(|target| {
+            (
+                target.id(),
+                target.name(),
+                EntityRef::StreamTarget(target.id()),
             )
         }),
         false,
@@ -484,6 +498,36 @@ fn validate_outputs(project: &Project, errors: &mut Vec<ValidationError>) {
             entity,
             output.required_capabilities.iter().map(String::as_str),
         );
+    }
+}
+
+/// Re-checks what only the project knows about a streaming destination.
+///
+/// Scheme, endpoint shape, credentials and key bounds are enforced when a
+/// [`StreamTarget`](crate::StreamTarget) is constructed and cannot be violated
+/// by a value that exists, so they are not restated here.
+fn validate_stream_targets(project: &Project, errors: &mut Vec<ValidationError>) {
+    for target in project.stream_targets() {
+        let entity = Some(EntityRef::StreamTarget(target.id()));
+        require_name(errors, entity, "name", target.name());
+        if target.name().len() > MAX_STREAM_TARGET_NAME_BYTES {
+            errors.push(ValidationError {
+                entity,
+                field: "name",
+                kind: ValidationErrorKind::OutOfRange,
+            });
+        }
+        if !project
+            .outputs()
+            .iter()
+            .any(|output| output.id == target.output())
+        {
+            errors.push(ValidationError {
+                entity,
+                field: "output",
+                kind: ValidationErrorKind::MissingReference(EntityRef::Output(target.output())),
+            });
+        }
     }
 }
 
