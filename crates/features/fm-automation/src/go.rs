@@ -3,7 +3,15 @@ use core::fmt;
 use fm_command::{IdempotencyKey, MAX_TRANSACTION_COMMANDS};
 use fm_scheduler::{ActionError, ActionId, ActionQueue, FrameNumber};
 use fm_types::InputId;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+
+/// Start receipts one [`GoEngine`] retains for duplicate suppression.
+///
+/// A retried GO press must resolve to the run the first press created, because
+/// every action's command identity is derived from `run_id`. Receipts are
+/// evicted oldest-first at this bound, so suppression is bounded memory rather
+/// than the unbounded map this replaces.
+pub const MAX_GO_START_RECEIPTS: usize = 256;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum GoAction<C> {
@@ -81,6 +89,8 @@ struct PendingGo<C> {
 #[derive(Clone, Debug, PartialEq)]
 pub struct GoStart<C> {
     pub run_id: u64,
+    /// The idempotency key had already started this run, so nothing was
+    /// scheduled a second time.
     pub replayed: bool,
     pub preview: GoPreview<C>,
 }
@@ -134,7 +144,8 @@ pub struct GoEngine<C> {
     queue: ActionQueue<PendingGo<C>>,
     action_ids: HashMap<u64, Vec<ActionId>>,
     active: HashSet<u64>,
-    receipts: HashMap<IdempotencyKey, GoStart<C>>,
+    starts: HashMap<IdempotencyKey, (InputId, u64)>,
+    start_order: VecDeque<IdempotencyKey>,
     next_run_id: u64,
 }
 
@@ -145,7 +156,8 @@ impl<C> Default for GoEngine<C> {
             queue: ActionQueue::default(),
             action_ids: HashMap::new(),
             active: HashSet::new(),
-            receipts: HashMap::new(),
+            starts: HashMap::new(),
+            start_order: VecDeque::new(),
             next_run_id: 0,
         }
     }
@@ -165,8 +177,17 @@ impl<C: Clone> GoEngine<C> {
         })
     }
 
-    /// Starts a programmed GO. Reusing an idempotency key returns the original
-    /// receipt and never schedules the edge-triggered actions again.
+    /// Starts a programmed GO at a caller-owned timestamp under a caller-owned
+    /// idempotency key.
+    ///
+    /// Every action this run emits is identified downstream by its
+    /// `(run_id, index)` pair, so `run_id` has to be a function of the press
+    /// rather than of how many times the press arrived: a retried start returns
+    /// the original run with [`GoStart::replayed`] set and schedules nothing
+    /// again. Without the key a retried GO press mints a second run, whose
+    /// actions carry different command identities, and the authority has
+    /// nothing left to deduplicate -- one operator press then puts two cuts on
+    /// air.
     ///
     /// # Errors
     ///
@@ -178,10 +199,15 @@ impl<C: Clone> GoEngine<C> {
         idempotency_key: IdempotencyKey,
         now_ms: u64,
     ) -> Result<GoStart<C>, GoError> {
-        if let Some(receipt) = self.receipts.get(&idempotency_key) {
-            let mut replay = receipt.clone();
-            replay.replayed = true;
-            return Ok(replay);
+        if let Some((started, run_id)) = self.starts.get(&idempotency_key).copied() {
+            let preview = self
+                .preview(started)
+                .ok_or(GoError::UnknownInput(started))?;
+            return Ok(GoStart {
+                run_id,
+                replayed: true,
+                preview,
+            });
         }
         let preview = self.preview(input).ok_or(GoError::UnknownInput(input))?;
         let run_id = self
@@ -220,13 +246,30 @@ impl<C: Clone> GoEngine<C> {
         self.next_run_id = run_id;
         self.action_ids.insert(run_id, scheduled);
         self.active.insert(run_id);
-        let receipt = GoStart {
+        self.remember_start(idempotency_key, input, run_id);
+        Ok(GoStart {
             run_id,
             replayed: false,
             preview,
-        };
-        self.receipts.insert(idempotency_key, receipt.clone());
-        Ok(receipt)
+        })
+    }
+
+    fn remember_start(&mut self, idempotency_key: IdempotencyKey, input: InputId, run_id: u64) {
+        while self.starts.len() >= MAX_GO_START_RECEIPTS {
+            let Some(expired) = self.start_order.pop_front() else {
+                break;
+            };
+            self.starts.remove(&expired);
+        }
+        self.start_order.push_back(idempotency_key.clone());
+        self.starts.insert(idempotency_key, (input, run_id));
+    }
+
+    /// The run an idempotency key already started, while its receipt is
+    /// retained.
+    #[must_use]
+    pub fn started(&self, idempotency_key: &IdempotencyKey) -> Option<u64> {
+        self.starts.get(idempotency_key).map(|(_, run_id)| *run_id)
     }
 
     pub fn cancel(&mut self, run_id: u64) -> bool {
@@ -268,5 +311,22 @@ impl<C: Clone> GoEngine<C> {
     #[must_use]
     pub fn is_active(&self, run_id: u64) -> bool {
         self.active.contains(&run_id)
+    }
+
+    /// Number of inputs holding a programmed GO list.
+    #[must_use]
+    pub fn program_len(&self) -> usize {
+        self.programs.len()
+    }
+
+    #[must_use]
+    pub fn has_program(&self, input: InputId) -> bool {
+        self.programs.contains_key(&input)
+    }
+
+    /// Number of runs with actions still to fire.
+    #[must_use]
+    pub fn active_run_len(&self) -> usize {
+        self.active.len()
     }
 }

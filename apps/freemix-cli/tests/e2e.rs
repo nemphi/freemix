@@ -2042,7 +2042,7 @@ fn local_media_input_add_persists_offline_asset_contract() {
         "Other",
         "asset://other.ppm",
     ]);
-    assert_failure_contains(&duplicate_id, "domain project failed validation");
+    assert_failure_contains(&duplicate_id, "input 9 already exists");
     assert_eq!(
         fs::read(context.project.join("project.json")).unwrap(),
         manifest_before_failure
@@ -2055,7 +2055,7 @@ fn local_media_input_add_persists_offline_asset_contract() {
         "Media  input ",
         "asset://other.ppm",
     ]);
-    assert_failure_contains(&duplicate_name, "domain project failed validation");
+    assert_failure_contains(&duplicate_name, "input name is already in use");
     assert_eq!(
         fs::read(context.project.join("project.json")).unwrap(),
         manifest_before_failure
@@ -2287,6 +2287,227 @@ fn journal_bytes(store: &ProjectStore) -> Vec<(PathBuf, Vec<u8>)> {
             (path.clone(), fs::read(path).unwrap())
         })
         .collect()
+}
+
+const STREAM_KEY: &str = "live-7c2a-secret-key";
+
+/// Authors a project with one output and one streaming destination on it.
+fn author_stream_destination(context: &ContractContext) {
+    assert_success(&invoke_bounded(&["new", context.project_path()]));
+    assert_success(&invoke_bounded(&[
+        "scene-input-add",
+        context.project_path(),
+        "10",
+        "10",
+        "Program",
+    ]));
+    assert_success(&invoke_bounded(&[
+        "audio-bus-add",
+        context.project_path(),
+        "20",
+        "Master",
+    ]));
+    assert_success(&invoke_bounded(&[
+        "output-add",
+        context.project_path(),
+        "30",
+        "10",
+        "20",
+        "Primary",
+    ]));
+    assert_success(&invoke_bounded(&[
+        "stream-add",
+        context.project_path(),
+        "40",
+        "30",
+        "rtmps://ingest.example.test:443/live",
+        STREAM_KEY,
+        "Main ingest",
+        "--backup",
+        "rtmps://backup.example.test/live",
+        "--startup",
+        "reconcile-desired-state",
+    ]));
+}
+
+/// Every authoring refusal must be reported and must leave the bundle
+/// byte-identical, including the one that protects a published output.
+fn assert_stream_authoring_refusals_are_atomic(context: &ContractContext) {
+    let unchanged = fs::read(context.project.join("project.json")).unwrap();
+    for (arguments, expected) in [
+        (
+            vec![
+                "stream-add",
+                context.project_path(),
+                "41",
+                "30",
+                "rtmps://ingest.example.test/live",
+                STREAM_KEY,
+                "mAiN iNgEsT",
+            ],
+            "duplicate stream destination name",
+        ),
+        (
+            vec![
+                "stream-add",
+                context.project_path(),
+                "40",
+                "30",
+                "rtmps://ingest.example.test/live",
+                STREAM_KEY,
+                "Second",
+            ],
+            "duplicate stream destination 40",
+        ),
+        (
+            vec![
+                "stream-add",
+                context.project_path(),
+                "41",
+                "999",
+                "rtmps://ingest.example.test/live",
+                STREAM_KEY,
+                "Second",
+            ],
+            "unknown output 999",
+        ),
+        (
+            vec![
+                "stream-add",
+                context.project_path(),
+                "41",
+                "30",
+                "rtmps://operator:hunter2@ingest.example.test/live",
+                STREAM_KEY,
+                "Second",
+            ],
+            "must not embed user:password credentials",
+        ),
+        (
+            vec![
+                "stream-update",
+                context.project_path(),
+                "999",
+                "30",
+                "rtmps://ingest.example.test/live",
+                STREAM_KEY,
+                "Missing",
+            ],
+            "unknown stream destination 999",
+        ),
+        (
+            vec!["output-remove", context.project_path(), "30"],
+            "output 30 is used by stream destination 40",
+        ),
+    ] {
+        let rejected = invoke_bounded(&arguments);
+        assert_failure_contains(&rejected, expected);
+        assert_eq!(
+            fs::read(context.project.join("project.json")).unwrap(),
+            unchanged
+        );
+    }
+}
+
+#[test]
+fn local_stream_destinations_are_authored_offline_and_never_print_the_stream_key() {
+    const KEY: &str = STREAM_KEY;
+    let context = ContractContext::new();
+    author_stream_destination(&context);
+
+    let store = ProjectStore::new(&context.project).unwrap();
+    let stored = store.load().unwrap();
+    let target = &stored.project().stream_targets()[0];
+    assert_eq!(target.name(), "Main ingest");
+    assert_eq!(target.key().expose_secret(), KEY);
+    assert_eq!(target.startup(), StartupPolicy::ReconcileDesiredState);
+
+    // The inventory line is the operator-facing surface. It must carry enough
+    // to identify the destination and none of the secret.
+    let streams = invoke_bounded(&["streams", context.project_path()]);
+    assert_success(&streams);
+    assert_eq!(
+        stdout(&streams),
+        concat!(
+            "stream id=40 name=\"Main ingest\" protocol=rtmps ",
+            "url=\"rtmps://ingest.example.test:443/live/****\" ",
+            "backup_url=\"rtmps://backup.example.test/live/****\" ",
+            "output=30 output_name=\"Primary\" startup=reconcile-desired-state"
+        )
+    );
+
+    // Only project.json may hold the key; no other command output may.
+    let manifest = fs::read_to_string(context.project.join("project.json")).unwrap();
+    assert!(manifest.contains(&format!("\"key\": \"{KEY}\"")));
+    for output in [
+        &streams,
+        &invoke_bounded(&["status", context.project_path()]),
+        &invoke_bounded(&["outputs", context.project_path()]),
+        &invoke_bounded(&["help"]),
+        &invoke_bounded(&[
+            "stream-add",
+            context.project_path(),
+            "41",
+            "30",
+            "http://ingest.example.test/live",
+            KEY,
+            "Rejected",
+        ]),
+        &invoke_bounded(&[
+            "stream-add",
+            context.project_path(),
+            "41",
+            "30",
+            "rtmps://ingest.example.test/live",
+            "ab",
+            "Rejected",
+        ]),
+    ] {
+        let rendered = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !rendered.contains(KEY),
+            "stream key leaked into `{rendered}`"
+        );
+    }
+
+    assert_stream_authoring_refusals_are_atomic(&context);
+
+    assert_success(&invoke_bounded(&[
+        "stream-update",
+        context.project_path(),
+        "40",
+        "30",
+        "rtmp://relay.example.test/live",
+        "rotated-key-0001",
+        "Main ingest",
+    ]));
+    let updated = store.load().unwrap();
+    let target = &updated.project().stream_targets()[0];
+    assert_eq!(target.key().expose_secret(), "rotated-key-0001");
+    assert_eq!(target.redacted_url(), "rtmp://relay.example.test/live/****");
+    assert_eq!(target.backup_endpoint(), None);
+    assert_eq!(target.startup(), StartupPolicy::Stopped);
+
+    assert_success(&invoke_bounded(&[
+        "stream-remove",
+        context.project_path(),
+        "40",
+    ]));
+    assert!(store.load().unwrap().project().stream_targets().is_empty());
+    assert_eq!(
+        stdout(&invoke_bounded(&["streams", context.project_path()])),
+        ""
+    );
+    assert_success(&invoke_bounded(&[
+        "output-remove",
+        context.project_path(),
+        "30",
+    ]));
+    fs::remove_dir_all(context.root).unwrap();
 }
 
 #[test]
@@ -6437,68 +6658,86 @@ fn local_scene_program_render_composes_supported_layers_and_rejects_unsupported_
 }
 
 #[test]
-fn journal_recover_removes_only_torn_final_record_and_refuses_valid_batch() {
+fn journal_recover_reports_a_clean_journal_and_refuses_unapplied_batches() {
     let root = unique_test_root();
-    let torn_project = root.join("torn.freemix");
-    let valid_project = root.join("valid.freemix");
+    let clean_project = root.join("clean.freemix");
+    let unapplied_project = root.join("unapplied.freemix");
     fs::create_dir_all(&root).unwrap();
-    assert_success(&invoke(&["new", torn_project.to_str().unwrap()]));
-    let torn_store = ProjectStore::new(&torn_project).unwrap();
-    torn_store
-        .append_batch(&MutationBatch::new(1, 0, 1, b"torn".to_vec()))
-        .unwrap();
-    let torn_record = torn_store.journal_path().join("00000000000000000001.batch");
-    fs::OpenOptions::new()
-        .write(true)
-        .open(&torn_record)
-        .unwrap()
-        .set_len(12)
-        .unwrap();
 
-    let recovered = invoke(&["journal-recover", torn_project.to_str().unwrap()]);
+    // A journal with nothing left to apply recovers to its durable checkpoint.
+    assert_success(&invoke(&["new", clean_project.to_str().unwrap()]));
+    let recovered = invoke(&["journal-recover", clean_project.to_str().unwrap()]);
     assert_success(&recovered);
     assert_eq!(
         String::from_utf8_lossy(&recovered.stdout),
         "journal recovered: checkpoint_sequence=0 checkpoint_revision=0 unapplied_batches=0\n"
     );
-    assert!(!torn_record.exists());
-    assert_success(&invoke(&["status", torn_project.to_str().unwrap()]));
+    assert_success(&invoke(&["status", clean_project.to_str().unwrap()]));
 
-    assert_success(&invoke(&["new", valid_project.to_str().unwrap()]));
-    let valid_store = ProjectStore::new(&valid_project).unwrap();
-    valid_store
+    // Batches the CLI cannot interpret are refused, and nothing is applied.
+    assert_success(&invoke(&["new", unapplied_project.to_str().unwrap()]));
+    let store = ProjectStore::new(&unapplied_project).unwrap();
+    store
         .append_batch(&MutationBatch::new(1, 0, 1, b"valid".to_vec()))
         .unwrap();
-    valid_store
-        .append_batch(&MutationBatch::new(2, 1, 2, b"torn".to_vec()))
-        .unwrap();
-    let valid_record = valid_store
-        .journal_path()
-        .join("00000000000000000001.batch");
-    let torn_record = valid_store
-        .journal_path()
-        .join("00000000000000000002.batch");
-    fs::OpenOptions::new()
-        .write(true)
-        .open(&torn_record)
-        .unwrap()
-        .set_len(12)
-        .unwrap();
-    let valid_before = fs::read(&valid_record).unwrap();
-    let torn_before = fs::read(&torn_record).unwrap();
-    let manifest = fs::read(valid_project.join("project.json")).unwrap();
+    let manifest = fs::read(unapplied_project.join("project.json")).unwrap();
 
-    let refused = invoke(&["journal-recover", valid_project.to_str().unwrap()]);
+    let refused = invoke(&["journal-recover", unapplied_project.to_str().unwrap()]);
     assert_failure_contains(
         &refused,
         "journal recovery refused: 1 unapplied journal batch(es) remain; no batches were applied",
     );
-    assert_eq!(fs::read(&valid_record).unwrap(), valid_before);
-    assert_eq!(fs::read(&torn_record).unwrap(), torn_before);
+    let scan = store.scan_journal().unwrap();
+    assert_eq!(scan.batches().len(), 1);
+    assert_eq!(scan.batches()[0].payload(), b"valid");
     assert_eq!(
-        fs::read(valid_project.join("project.json")).unwrap(),
+        fs::read(unapplied_project.join("project.json")).unwrap(),
         manifest
     );
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// turso locks the journal database exclusively even to read it, so a process
+/// that opens it locks every other process out. Inspecting a project must
+/// therefore never open it: `status` has to work on a show whose journal is
+/// held by a running daemon, and concurrent readers must not lock each other
+/// out. The command that does own the journal reports the problem instead.
+#[test]
+fn status_reads_a_project_without_opening_its_journal() {
+    let root = unique_test_root();
+    fs::create_dir_all(&root).unwrap();
+    let path = root.join("show.freemix");
+    let project = path.to_str().unwrap();
+    assert_success(&invoke(&["new", project]));
+    assert_success(&invoke(&["journal-recover", project]));
+    assert!(path.join("journal").join("journal.db").is_file());
+
+    let concurrent: Vec<_> = (0..12)
+        .map(|_| {
+            Command::new(env!("CARGO_BIN_EXE_freemix-cli"))
+                .args(["status", project])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    for reader in concurrent {
+        assert_success(&reader.wait_with_output().unwrap());
+    }
+
+    // A journal database that cannot be opened at all proves the point: the
+    // manifest still reports, and only the journal command fails.
+    let database = path.join("journal").join("journal.db");
+    fs::remove_file(&database).unwrap();
+    fs::create_dir(&database).unwrap();
+    assert_success(&invoke(&["status", project]));
+    let refused = invoke(&["journal-recover", project]);
+    assert!(
+        !refused.status.success(),
+        "recovery must not report a clean journal it could not open"
+    );
+
     fs::remove_dir_all(root).unwrap();
 }
 

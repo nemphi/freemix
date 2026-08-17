@@ -3,7 +3,11 @@ use fm_types::{
     SceneId, VideoFormat, validate_input_name, validate_input_order,
 };
 
-use crate::{EntityRef, ValidationError, ValidationErrorKind, validation::validate_project};
+use crate::{
+    EntityRef, ValidationError, ValidationErrorKind,
+    stream::{StreamTarget, StreamTargetId},
+    validation::validate_project,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RemoveInputError {
@@ -290,6 +294,29 @@ pub enum RenameOutputError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RemoveOutputError {
     UnknownOutput(OutputId),
+    StreamTargetReference {
+        output: OutputId,
+        stream_target: StreamTargetId,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AddStreamTargetError {
+    DuplicateId(StreamTargetId),
+    DuplicateName,
+    UnknownOutput(OutputId),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UpdateStreamTargetError {
+    UnknownStreamTarget(StreamTargetId),
+    DuplicateName,
+    UnknownOutput(OutputId),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemoveStreamTargetError {
+    UnknownStreamTarget(StreamTargetId),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -534,11 +561,56 @@ impl std::fmt::Display for RemoveOutputError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnknownOutput(output) => write!(formatter, "unknown output {output}"),
+            Self::StreamTargetReference {
+                output,
+                stream_target,
+            } => write!(
+                formatter,
+                "output {output} is used by stream destination {stream_target}"
+            ),
         }
     }
 }
 
 impl std::error::Error for RemoveOutputError {}
+
+impl std::fmt::Display for AddStreamTargetError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DuplicateId(id) => write!(formatter, "duplicate stream destination {id}"),
+            Self::DuplicateName => formatter.write_str("duplicate stream destination name"),
+            Self::UnknownOutput(output) => write!(formatter, "unknown output {output}"),
+        }
+    }
+}
+
+impl std::error::Error for AddStreamTargetError {}
+
+impl std::fmt::Display for UpdateStreamTargetError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownStreamTarget(id) => {
+                write!(formatter, "unknown stream destination {id}")
+            }
+            Self::DuplicateName => formatter.write_str("duplicate stream destination name"),
+            Self::UnknownOutput(output) => write!(formatter, "unknown output {output}"),
+        }
+    }
+}
+
+impl std::error::Error for UpdateStreamTargetError {}
+
+impl std::fmt::Display for RemoveStreamTargetError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownStreamTarget(id) => {
+                write!(formatter, "unknown stream destination {id}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RemoveStreamTargetError {}
 
 impl std::fmt::Display for RemoveAudioBusError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -606,7 +678,7 @@ impl std::fmt::Display for RenameSceneError {
 
 impl std::error::Error for RenameSceneError {}
 
-pub const CURRENT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(17);
+pub const CURRENT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(18);
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct SchemaVersion(u32);
@@ -634,6 +706,7 @@ pub struct Project {
     scenes: Vec<Scene>,
     audio_buses: Vec<AudioBus>,
     outputs: Vec<Output>,
+    stream_targets: Vec<StreamTarget>,
     main_mix: Option<MainMix>,
     stingers: Vec<StingerConfig>,
     restart_policy: RestartPolicy,
@@ -652,6 +725,7 @@ impl Project {
             scenes: Vec::new(),
             audio_buses: Vec::new(),
             outputs: Vec::new(),
+            stream_targets: Vec::new(),
             main_mix: None,
             stingers: Vec::new(),
             restart_policy: RestartPolicy::default(),
@@ -722,6 +796,11 @@ impl Project {
     #[must_use]
     pub fn outputs(&self) -> &[Output] {
         &self.outputs
+    }
+
+    #[must_use]
+    pub fn stream_targets(&self) -> &[StreamTarget] {
+        &self.stream_targets
     }
 
     #[must_use]
@@ -1698,7 +1777,121 @@ impl Project {
         if !self.outputs.iter().any(|candidate| candidate.id == output) {
             return Err(RemoveOutputError::UnknownOutput(output));
         }
+        if let Some(target) = self
+            .stream_targets
+            .iter()
+            .find(|target| target.output() == output)
+        {
+            return Err(RemoveOutputError::StreamTargetReference {
+                output,
+                stream_target: target.id(),
+            });
+        }
         self.outputs.retain(|candidate| candidate.id != output);
+        Ok(())
+    }
+
+    /// Appends a destination without checking it against the rest of the
+    /// project, mirroring [`Project::add_output`]. The decoder uses this and
+    /// then validates the whole manifest.
+    pub fn add_stream_target(&mut self, target: StreamTarget) {
+        self.stream_targets.push(target);
+    }
+
+    /// Appends a destination after checking project-wide invariants.
+    ///
+    /// The destination's own fields were already validated when it was
+    /// constructed; what is checked here is what only the project knows: a
+    /// unique id, a name no other destination uses, and an output that exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AddStreamTargetError`].
+    pub fn add_stream_target_checked(
+        &mut self,
+        target: StreamTarget,
+    ) -> Result<(), AddStreamTargetError> {
+        if self
+            .stream_targets
+            .iter()
+            .any(|candidate| candidate.id() == target.id())
+        {
+            return Err(AddStreamTargetError::DuplicateId(target.id()));
+        }
+        if self
+            .stream_targets
+            .iter()
+            .any(|candidate| candidate.name().eq_ignore_ascii_case(target.name()))
+        {
+            return Err(AddStreamTargetError::DuplicateName);
+        }
+        if !self
+            .outputs
+            .iter()
+            .any(|candidate| candidate.id == target.output())
+        {
+            return Err(AddStreamTargetError::UnknownOutput(target.output()));
+        }
+        self.stream_targets.push(target);
+        Ok(())
+    }
+
+    /// Replaces an existing destination's configuration, keeping its id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UpdateStreamTargetError`] when the id does not exist, another
+    /// destination already uses the new name, or the referenced output does
+    /// not exist.
+    pub fn replace_stream_target(
+        &mut self,
+        target: StreamTarget,
+    ) -> Result<(), UpdateStreamTargetError> {
+        let index = self
+            .stream_targets
+            .iter()
+            .position(|candidate| candidate.id() == target.id())
+            .ok_or(UpdateStreamTargetError::UnknownStreamTarget(target.id()))?;
+        if self
+            .stream_targets
+            .iter()
+            .enumerate()
+            .any(|(candidate_index, candidate)| {
+                candidate_index != index && candidate.name().eq_ignore_ascii_case(target.name())
+            })
+        {
+            return Err(UpdateStreamTargetError::DuplicateName);
+        }
+        if !self
+            .outputs
+            .iter()
+            .any(|candidate| candidate.id == target.output())
+        {
+            return Err(UpdateStreamTargetError::UnknownOutput(target.output()));
+        }
+        self.stream_targets[index] = target;
+        Ok(())
+    }
+
+    /// Removes a destination.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RemoveStreamTargetError::UnknownStreamTarget`] when the id
+    /// does not exist.
+    pub fn remove_stream_target(
+        &mut self,
+        target: StreamTargetId,
+    ) -> Result<(), RemoveStreamTargetError> {
+        if !self
+            .stream_targets
+            .iter()
+            .any(|candidate| candidate.id() == target)
+        {
+            return Err(RemoveStreamTargetError::UnknownStreamTarget(target));
+        }
+        self.stream_targets
+            .retain(|candidate| candidate.id() != target);
         Ok(())
     }
 

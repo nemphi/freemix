@@ -13,7 +13,7 @@ use std::{
 
 use fm_auth::Principal;
 use fm_control::{LiveEvent, Subscription};
-use fm_persistence::{ProjectStore, StoredProject};
+use fm_persistence::StoredProject;
 use fm_protocol::{
     AudioMetersMessage, ClientType, ErrorMessage, HandshakeOutcome as ProtocolHandshakeOutcome,
     HandshakeResponse, HeartbeatAcknowledgementMessage, LineDecoder, ServerIdentity,
@@ -29,6 +29,7 @@ use super::{
     reconciled_handshake_outcome, record_heartbeat, rejected_handshake_response,
     requested_daemon_shutdown, server_identity, shutdown_message, structured_session_error,
 };
+use crate::journal::DurableStore;
 use crate::latest_record::LatestRecord;
 use crate::web::{WebEvent, WebGateway};
 
@@ -237,7 +238,7 @@ pub(super) fn run(
     listener: TcpListener,
     server: &Server<ControlHandle>,
     control: &SharedControl,
-    store: &ProjectStore,
+    store: &dyn DurableStore,
     durable: &mut StoredProject,
     principal: &Principal,
     native: Option<&mut NativeDaemon>,
@@ -432,10 +433,7 @@ pub(super) fn run(
         }
 
         if let Some(id) = once_peer
-            && peers
-                .iter()
-                .find(|peer| peer.id == id)
-                .is_none_or(|peer| peer.phase == Phase::Active)
+            && !peers.iter().any(|peer| peer.id == id)
         {
             close_all(&mut peers, control);
             return Ok(DaemonShutdownReason::Once);
@@ -511,7 +509,7 @@ impl From<()> for DispatchError {
 struct Runtime<'a> {
     server: &'a Server<ControlHandle>,
     control: &'a SharedControl,
-    store: &'a ProjectStore,
+    store: &'a dyn DurableStore,
     process_shutdown: &'a ProcessShutdown,
 }
 

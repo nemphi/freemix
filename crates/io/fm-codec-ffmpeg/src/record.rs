@@ -2,8 +2,11 @@
 //!
 //! The recorder authenticates independent loopback HTTP input streams with
 //! random bearer paths. This prevents accidental or unauthenticated local
-//! connections; a same-user process able to inspect the child's argv can still
-//! recover the paths and is outside this crate's isolation boundary. The
+//! connections. It is not a defence against a local attacker: `/proc/<pid>/cmdline`
+//! is world readable unless the operating system is configured otherwise, so
+//! any local user can recover the paths while the child runs. Confining that is
+//! an OS-level concern (`hidepid`, a container, or a dedicated user) and lies
+//! outside this crate's isolation boundary. The
 //! recorder owns only the direct child and does not create a process group.
 //! Normal stop and cleanup paths are deadline-bounded. If the operating system
 //! cannot create the final fallback cleanup thread, ownership is retained and
@@ -31,6 +34,9 @@ const POLL_INTERVAL: Duration = Duration::from_millis(5);
 const MAX_HTTP_HEADER_BYTES: usize = 8 * 1024;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 const TOKEN_BYTES: usize = 32;
+/// `FFmpeg`'s floor for `-probesize`. Both raw inputs are fully specified on the
+/// command line, so no input byte needs to be inspected to describe them.
+pub(crate) const PROBE_SIZE: &str = "32";
 
 /// Validated raw input format for one recording.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -170,23 +176,26 @@ impl RecordFormat {
         })
     }
 
-    fn maximum_pair_bytes(&self) -> Result<usize, LimitsError> {
+    /// The largest interleaved audio span one pair of this format can carry.
+    pub(crate) fn maximum_audio_bytes(&self) -> Option<usize> {
         let samples = (u128::from(self.sample_rate.hertz())
             * u128::from(self.frame_rate.denominator()))
         .div_ceil(u128::from(self.frame_rate.numerator()));
-        let audio = samples
-            .checked_mul(self.channel_layout.channels().len() as u128)
-            .and_then(|value| value.checked_mul(4))
+        samples
+            .checked_mul(self.channel_layout.channels().len() as u128)?
+            .checked_mul(4)
             .and_then(|value| usize::try_from(value).ok())
-            .ok_or(LimitsError::ByteCountOverflow)?;
+    }
+
+    /// The largest value [`PairedFrame::retained_bytes`] can report for a pair
+    /// of this format, derived from the same accounting that method uses so a
+    /// sink's byte budget cannot drift away from what a pair actually charges.
+    pub(crate) fn maximum_pair_bytes(&self) -> Option<usize> {
         self.rgba_bytes
-            .checked_add(audio)
-            .and_then(|bytes| {
-                bytes.checked_add(pair_accounting_overhead(
-                    self.channel_layout.channels().len(),
-                ))
-            })
-            .ok_or(LimitsError::ByteCountOverflow)
+            .checked_add(self.maximum_audio_bytes()?)?
+            .checked_add(pair_accounting_overhead(
+                self.channel_layout.channels().len(),
+            ))
     }
 }
 
@@ -322,8 +331,8 @@ fn validate_limits(format: &RecordFormat, limits: RecordLimits) -> Result<(), Li
         }
     }
     let required = format
-        .maximum_pair_bytes()?
-        .checked_mul(limits.max_outstanding_pairs)
+        .maximum_pair_bytes()
+        .and_then(|bytes| bytes.checked_mul(limits.max_outstanding_pairs))
         .ok_or(LimitsError::ByteCountOverflow)?;
     if required > limits.max_retained_bytes {
         return Err(LimitsError::RetainedBytesTooSmall {
@@ -419,6 +428,16 @@ impl PairedFrame {
     #[must_use]
     pub const fn sequence(&self) -> SequenceNumber {
         self.sequence
+    }
+
+    /// The exact format this pair was validated against.
+    ///
+    /// Sinks must compare this whole value rather than payload byte counts: a
+    /// transposed frame and a relayout of the same audio both preserve the byte
+    /// counts while describing completely different media.
+    #[must_use]
+    pub const fn format(&self) -> &RecordFormat {
+        &self.format
     }
 
     #[must_use]
@@ -968,6 +987,10 @@ struct PairJob {
     completion: Arc<Completion>,
 }
 
+/// Private per-pair bookkeeping charged on top of the two payload allocations.
+/// Derived from the types that actually hold a queued pair so that adding a
+/// field to [`PairedFrame`] or [`Completion`] cannot silently invalidate the
+/// byte budget the limits were validated against.
 fn pair_accounting_overhead(channels: usize) -> usize {
     size_of::<PairJob>()
         .saturating_add(size_of::<Completion>())
@@ -2370,6 +2393,14 @@ fn command_args(
         format!("{}x{}", dimensions.width(), dimensions.height()),
         "-framerate".to_owned(),
         format!("{}/{}", rate.numerator(), rate.denominator()),
+        // Both raw inputs are fully described above, so there is nothing to
+        // probe. Without this the child buys `analyzeduration` (5s by default)
+        // worth of one input before it drains the other, which deadlocks the
+        // pair writers at any real frame size.
+        "-probesize".to_owned(),
+        PROBE_SIZE.to_owned(),
+        "-analyzeduration".to_owned(),
+        "0".to_owned(),
         "-protocol_whitelist".to_owned(),
         "http,tcp".to_owned(),
         "-i".to_owned(),
@@ -2382,6 +2413,10 @@ fn command_args(
         format.channel_layout.channels().len().to_string(),
         "-channel_layout".to_owned(),
         format.ffmpeg_channel_layout.to_owned(),
+        "-probesize".to_owned(),
+        PROBE_SIZE.to_owned(),
+        "-analyzeduration".to_owned(),
+        "0".to_owned(),
         "-protocol_whitelist".to_owned(),
         "http,tcp".to_owned(),
         "-i".to_owned(),

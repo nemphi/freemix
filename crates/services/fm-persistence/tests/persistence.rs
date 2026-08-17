@@ -7,11 +7,11 @@ use std::{
 
 use fm_model::{Input, InputKind, MainMix, Project, ProjectSettings};
 use fm_persistence::{
-    CURRENT_SCHEMA_VERSION, FadeToBlackState, IdempotencyReceipt, JournalError, MAX_MANIFEST_BYTES,
-    ManualTransitionKind, ManualTransitionState, MutationBatch, ProjectPosition, ProjectStore,
-    ProjectValidationError, ReceiptOutcome, ReferenceField, RuntimeFadeToBlack,
-    RuntimeManualTransitions, RuntimeOverlayChannel, RuntimeOverlays, RuntimeRouting, StoreError,
-    StoredProject,
+    CURRENT_SCHEMA_VERSION, FadeToBlackState, IdempotencyReceipt, JournalError,
+    MAX_JOURNAL_RECORD_BYTES, MAX_MANIFEST_BYTES, ManualTransitionKind, ManualTransitionState,
+    MutationBatch, ProjectPosition, ProjectStore, ProjectValidationError, ReceiptOutcome,
+    ReferenceField, RuntimeFadeToBlack, RuntimeManualTransitions, RuntimeOverlayChannel,
+    RuntimeOverlays, RuntimeRouting, StoreError, StoredProject,
 };
 use fm_types::{
     AudioFormat, ChannelLayout, ColorMetadata, FrameRate, InputId, PixelFormat, ProjectId,
@@ -686,9 +686,10 @@ fn strict_parser_rejects_receipt_variant_fields() {
 }
 
 #[test]
-fn journal_append_scan_and_torn_final_record_recovery() {
-    let temp = TestDirectory::new("journal-torn");
-    let store = ProjectStore::new(temp.project_path("show")).unwrap();
+fn journal_appends_are_durable_and_replay_in_sequence_order() {
+    let temp = TestDirectory::new("journal-durable");
+    let root = temp.project_path("show");
+    let store = ProjectStore::new(&root).unwrap();
     store.save(&project("Journal", 10)).unwrap();
     store
         .append_batch(&MutationBatch::new(1, 10, 11, b"first".to_vec()))
@@ -696,83 +697,35 @@ fn journal_append_scan_and_torn_final_record_recovery() {
     store
         .append_batch(&MutationBatch::new(2, 11, 12, b"second".to_vec()))
         .unwrap();
-    let final_record = store.journal_path().join("00000000000000000002.batch");
-    fs::OpenOptions::new()
-        .write(true)
-        .open(&final_record)
-        .unwrap()
-        .set_len(12)
-        .unwrap();
 
-    let scan = store.scan_journal().unwrap();
-    assert_eq!(scan.batches().len(), 1);
+    // A fresh handle reopens the database from disk: the appends were durable
+    // before each call returned, and nothing else is stored in the bundle.
+    let reopened = ProjectStore::new(&root).unwrap();
+    let scan = reopened.scan_journal().unwrap();
+    assert_eq!(scan.checkpoint_sequence(), 0);
+    assert_eq!(scan.checkpoint_revision(), 10);
+    let sequences: Vec<u64> = scan.batches().iter().map(MutationBatch::sequence).collect();
+    assert_eq!(sequences, vec![1, 2]);
     assert_eq!(scan.batches()[0].payload(), b"first");
+    assert_eq!(scan.batches()[1].payload(), b"second");
+    assert!(store.journal_database_path().is_file());
+    let mut entries: Vec<String> = fs::read_dir(store.root())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    entries.sort();
     assert_eq!(
-        scan.ignored_torn_paths(),
-        std::slice::from_ref(&final_record)
-    );
-    let recovered = store.recover_journal().unwrap();
-    assert_eq!(
-        recovered.ignored_torn_paths(),
-        std::slice::from_ref(&final_record)
-    );
-    assert!(!final_record.exists());
-    assert!(
-        store
-            .scan_journal()
-            .unwrap()
-            .ignored_torn_paths()
-            .is_empty()
+        entries,
+        vec!["journal".to_owned(), "project.json".to_owned()]
     );
 }
 
 #[test]
-fn journal_ignores_and_recovers_only_a_final_append_temp_after_crash() {
-    let temp = TestDirectory::new("journal-crash-temp");
-    let store = ProjectStore::new(temp.project_path("show")).unwrap();
-    store.save(&project("Journal", 3)).unwrap();
-    store
-        .append_batch(&MutationBatch::new(1, 3, 4, Vec::new()))
-        .unwrap();
-    let torn_temp = store
-        .journal_path()
-        .join(".00000000000000000002.batch.tmp-crash-0");
-    fs::write(&torn_temp, b"partial").unwrap();
-
-    let scan = store.scan_journal().unwrap();
-    assert_eq!(scan.ignored_torn_paths(), std::slice::from_ref(&torn_temp));
-    assert!(matches!(
-        store.append_batch(&MutationBatch::new(2, 4, 5, Vec::new())),
-        Err(StoreError::Journal(JournalError::TornRecordPending))
-    ));
-    store.recover_journal().unwrap();
-    assert!(!torn_temp.exists());
-}
-
-#[test]
-fn journal_rejects_checksum_corruption_even_in_final_record() {
-    let temp = TestDirectory::new("journal-corrupt");
-    let store = ProjectStore::new(temp.project_path("show")).unwrap();
-    store.save(&project("Journal", 1)).unwrap();
-    store
-        .append_batch(&MutationBatch::new(1, 1, 2, b"payload".to_vec()))
-        .unwrap();
-    let path = store.journal_path().join("00000000000000000001.batch");
-    let mut bytes = fs::read(&path).unwrap();
-    bytes[36] ^= 0xff;
-    fs::write(path, bytes).unwrap();
-
-    assert!(matches!(
-        store.scan_journal(),
-        Err(StoreError::Journal(JournalError::ChecksumMismatch { .. }))
-    ));
-}
-
-#[test]
-fn journal_rejects_sequence_and_revision_gaps() {
+fn journal_refuses_sequence_and_revision_gaps_without_recording_them() {
     let temp = TestDirectory::new("journal-gaps");
     let store = ProjectStore::new(temp.project_path("show")).unwrap();
     store.save(&project("Journal", 6)).unwrap();
+
     assert!(matches!(
         store.append_batch(&MutationBatch::new(2, 6, 7, Vec::new())),
         Err(StoreError::Journal(JournalError::SequenceGap {
@@ -788,28 +741,51 @@ fn journal_rejects_sequence_and_revision_gaps() {
         store.append_batch(&MutationBatch::new(1, 6, 8, Vec::new())),
         Err(StoreError::Journal(JournalError::RevisionGap { .. }))
     ));
+    // Every refusal rolled back: the journal is still empty.
+    assert!(store.scan_journal().unwrap().batches().is_empty());
+
     store
         .append_batch(&MutationBatch::new(1, 6, 7, Vec::new()))
         .unwrap();
-    store
-        .append_batch(&MutationBatch::new(2, 7, 8, Vec::new()))
-        .unwrap();
-    fs::rename(
-        store.journal_path().join("00000000000000000002.batch"),
-        store.journal_path().join("00000000000000000003.batch"),
-    )
-    .unwrap();
     assert!(matches!(
-        store.scan_journal(),
+        store.append_batch(&MutationBatch::new(1, 7, 8, Vec::new())),
         Err(StoreError::Journal(JournalError::SequenceGap {
             expected: 2,
-            found: 3
+            found: 1
         }))
     ));
+    assert_eq!(store.scan_journal().unwrap().batches().len(), 1);
 }
 
 #[test]
-fn compaction_checkpoints_manifest_before_removing_applied_records() {
+fn journal_refuses_oversized_records_before_creating_the_journal() {
+    let temp = TestDirectory::new("journal-oversize");
+    let store = ProjectStore::new(temp.project_path("show")).unwrap();
+    store.save(&project("Journal", 0)).unwrap();
+    let payload = vec![0_u8; usize::try_from(MAX_JOURNAL_RECORD_BYTES).unwrap()];
+
+    let error = store
+        .append_batch(&MutationBatch::new(1, 0, 1, payload))
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        StoreError::Journal(JournalError::RecordTooLarge {
+            maximum: MAX_JOURNAL_RECORD_BYTES,
+            ..
+        })
+    ));
+    assert!(!store.journal_path().exists());
+
+    // A large payload that fits the bound still round-trips byte for byte.
+    let large = vec![0xa5_u8; usize::try_from(MAX_JOURNAL_RECORD_BYTES).unwrap() / 2];
+    store
+        .append_batch(&MutationBatch::new(1, 0, 1, large.clone()))
+        .unwrap();
+    assert_eq!(store.scan_journal().unwrap().batches()[0].payload(), large);
+}
+
+#[test]
+fn compaction_saves_the_manifest_then_atomically_advances_the_checkpoint() {
     let temp = TestDirectory::new("journal-compact");
     let store = ProjectStore::new(temp.project_path("show")).unwrap();
     store.save(&project("Before", 20)).unwrap();
@@ -819,26 +795,78 @@ fn compaction_checkpoints_manifest_before_removing_applied_records() {
     store
         .append_batch(&MutationBatch::new(2, 21, 22, b"two".to_vec()))
         .unwrap();
-    let first_path = store.journal_path().join("00000000000000000001.batch");
-    let first_record = fs::read(&first_path).unwrap();
 
     let report = store
         .checkpoint_and_compact(&project("Checkpoint", 21), 1)
         .unwrap();
+
     assert_eq!(report.applied_through_sequence(), 1);
     assert_eq!(report.removed_records(), 1);
     assert_eq!(store.load().unwrap().show_name(), "Checkpoint");
-    assert!(!first_path.exists());
     let scan = store.scan_journal().unwrap();
     assert_eq!(scan.checkpoint_sequence(), 1);
     assert_eq!(scan.checkpoint_revision(), 21);
     assert_eq!(scan.batches().len(), 1);
+    assert_eq!(scan.batches()[0].sequence(), 2);
+    assert_eq!(scan.batches()[0].payload(), b"two");
+}
 
-    // Simulate a crash after checkpoint durability but before applied cleanup.
-    fs::write(&first_path, first_record).unwrap();
-    let crash_scan = store.scan_journal().unwrap();
-    assert_eq!(crash_scan.batches().len(), 1);
-    assert_eq!(crash_scan.batches()[0].sequence(), 2);
-    store.recover_journal().unwrap();
-    assert!(!first_path.exists());
+#[test]
+fn compaction_refuses_a_mismatched_or_unknown_checkpoint_without_saving() {
+    let temp = TestDirectory::new("journal-compact-refuse");
+    let store = ProjectStore::new(temp.project_path("show")).unwrap();
+    store.save(&project("Before", 20)).unwrap();
+    store
+        .append_batch(&MutationBatch::new(1, 20, 21, b"one".to_vec()))
+        .unwrap();
+
+    assert!(matches!(
+        store.checkpoint_and_compact(&project("Wrong", 22), 1),
+        Err(StoreError::Journal(JournalError::CheckpointRevision {
+            sequence: 1,
+            expected: 21,
+            found: 22
+        }))
+    ));
+    assert!(matches!(
+        store.checkpoint_and_compact(&project("Unknown", 21), 9),
+        Err(StoreError::Journal(JournalError::UnknownCheckpoint(9)))
+    ));
+
+    // Neither refusal saved the manifest or moved the checkpoint.
+    assert_eq!(store.load().unwrap().show_name(), "Before");
+    let scan = store.scan_journal().unwrap();
+    assert_eq!(scan.checkpoint_sequence(), 0);
+    assert_eq!(scan.batches().len(), 1);
+}
+
+#[test]
+fn a_damaged_journal_database_is_a_typed_error_and_leaves_the_manifest_readable() {
+    let temp = TestDirectory::new("journal-damaged");
+    let store = ProjectStore::new(temp.project_path("show")).unwrap();
+    store.save(&project("Journal", 3)).unwrap();
+    store
+        .append_batch(&MutationBatch::new(1, 3, 4, b"payload".to_vec()))
+        .unwrap();
+
+    // Overwrite the database header with garbage, as a torn write would.
+    let database = store.journal_database_path();
+    let mut bytes = fs::read(&database).unwrap();
+    for byte in bytes.iter_mut().take(64) {
+        *byte ^= 0xff;
+    }
+    fs::write(&database, bytes).unwrap();
+
+    let error = store.scan_journal().unwrap_err();
+    assert!(
+        matches!(
+            error,
+            StoreError::Journal(
+                JournalError::CorruptDatabase { .. } | JournalError::Database { .. }
+            )
+        ),
+        "expected a typed journal database error, got {error:?}"
+    );
+    // The last consistent state stays readable through the manifest.
+    assert_eq!(store.load().unwrap().position().revision, 3);
 }

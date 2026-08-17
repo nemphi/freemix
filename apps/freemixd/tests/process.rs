@@ -6,7 +6,8 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command as ProcessCommand, Stdio},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
     time::{Duration, Instant},
@@ -38,7 +39,7 @@ use fm_types::{
     AudioFormat, BusId, ChannelLayout, ColorMetadata, FrameRate, InputId, OutputId, PixelFormat,
     ProjectId, SampleFormat, SampleRate, ScanMode, SceneId, VideoDimensions, VideoFormat,
 };
-use freemixd::ReadinessRecord;
+use freemixd::{ReadinessRecord, StatusReadinessRecord};
 
 static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const U64_MAX_ID: u128 = 18_446_744_073_709_551_615;
@@ -143,6 +144,69 @@ impl Daemon {
                 project_id: readiness.project_id,
             },
             web_address,
+        )
+    }
+
+    fn start_with_status(project: &Path, token: &str, once: bool) -> (Self, SocketAddr) {
+        Self::start_with_status_and_web(project, token, once, false)
+    }
+
+    /// `web` also starts the WebSocket gateway, whose bounded shutdown keeps the
+    /// daemon winding down long enough to observe a readiness transition.
+    fn start_with_status_and_web(
+        project: &Path,
+        token: &str,
+        once: bool,
+        web: bool,
+    ) -> (Self, SocketAddr) {
+        let mut command = ProcessCommand::new(env!("CARGO_BIN_EXE_freemixd"));
+        command
+            .arg("serve")
+            .arg(project)
+            .args(["--listen", "127.0.0.1:0", "--status-listen", "127.0.0.1:0"])
+            .env("FREEMIXD_STATUS_TOKEN", token);
+        if once {
+            command.arg("--once");
+        }
+        if web {
+            command
+                .args(["--web-listen", "127.0.0.1:0"])
+                .env("FREEMIXD_WEB_TOKEN", token);
+        }
+        let mut child = command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let expected = if web { 3 } else { 2 };
+        let mut lines = read_startup_lines(&mut child, expected);
+        let line = lines.remove(0);
+        let status_line = lines.pop().unwrap();
+        let readiness = line.parse::<ReadinessRecord>().unwrap_or_else(|error| {
+            startup_failure(
+                &mut child,
+                vec![line.clone(), status_line.clone()],
+                error.to_string(),
+                None,
+            )
+        });
+        let status = status_line
+            .parse::<StatusReadinessRecord>()
+            .unwrap_or_else(|error| {
+                startup_failure(
+                    &mut child,
+                    vec![line.clone(), status_line.clone()],
+                    error.to_string(),
+                    None,
+                )
+            });
+        (
+            Self {
+                child: Some(child),
+                address: readiness.address,
+                project_id: readiness.project_id,
+            },
+            status.address,
         )
     }
 
@@ -552,6 +616,339 @@ fn daemon_acknowledges_only_valid_heartbeats() {
 
     drop(client);
     daemon.wait_success();
+}
+
+const STATUS_TOKEN: &str = "status-token-0123456789abcdef0123456789";
+
+/// Sends one raw HTTP/1.1 request and returns the whole response the listener
+/// wrote before closing. Write failures are tolerated so a rejected request
+/// still surfaces the daemon's response instead of a client-side panic.
+fn status_request(address: SocketAddr, request: &[u8]) -> String {
+    try_status_request(address, request).unwrap()
+}
+
+/// The same request, tolerating a refused connection so a probe loop can keep
+/// running across a daemon that is on its way out.
+fn try_status_request(address: SocketAddr, request: &[u8]) -> Option<String> {
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(1)).ok()?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let _ = stream.write_all(request);
+    let _ = stream.flush();
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response);
+    Some(String::from_utf8_lossy(&response).into_owned())
+}
+
+/// Request shapes a supervisor or a scanner actually sends: a HEAD probe, an
+/// unsupported method, an absent route, a head past the cap, and a protected
+/// route probed without credentials.
+fn assert_status_request_shapes(status_address: SocketAddr) {
+    // HEAD-default supervisors get the same headers a GET would, and no body.
+    let probed = status_request(
+        status_address,
+        b"HEAD /healthz HTTP/1.1\r\nHost: status\r\n\r\n",
+    );
+    assert!(probed.starts_with("HTTP/1.1 200 OK\r\n"), "{probed}");
+    assert!(probed.contains("Content-Length: "), "{probed}");
+    assert!(!probed.contains("check=healthz"), "{probed}");
+
+    let unsupported = status_request(
+        status_address,
+        b"POST /healthz HTTP/1.1\r\nHost: status\r\n\r\n",
+    );
+    assert!(
+        unsupported.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"),
+        "{unsupported}"
+    );
+
+    let unknown = status_request(
+        status_address,
+        b"GET /metrics HTTP/1.1\r\nHost: status\r\n\r\n",
+    );
+    assert!(
+        unknown.starts_with("HTTP/1.1 404 Not Found\r\n"),
+        "{unknown}"
+    );
+
+    let mut oversized = String::from("GET /healthz HTTP/1.1\r\nHost: status\r\n");
+    while oversized.len() < 8 * 1024 {
+        oversized.push_str("X-Padding: 0123456789012345678901234567890123456789\r\n");
+    }
+    oversized.push_str("\r\n");
+    let rejected = status_request(status_address, oversized.as_bytes());
+    assert!(
+        rejected.starts_with("HTTP/1.1 413 Content Too Large\r\n"),
+        "{rejected}"
+    );
+    assert!(
+        rejected.contains("check=request\tstatus=too-large\tlimit_bytes=4096"),
+        "{rejected}"
+    );
+
+    // An unauthenticated caller must not be able to confirm the protected route
+    // exists by probing it with a method the route does not serve.
+    let probed_route = status_request(
+        status_address,
+        b"POST /v1/support-bundle HTTP/1.1\r\nHost: status\r\n\r\n",
+    );
+    assert!(
+        probed_route.starts_with("HTTP/1.1 401 Unauthorized\r\n"),
+        "{probed_route}"
+    );
+}
+
+/// RFC 7235 makes the scheme case-insensitive; the token itself stays exact.
+fn assert_bundle_authentication_scheme(status_address: SocketAddr) {
+    let lowercase_scheme = status_request(
+        status_address,
+        format!(
+            "GET /v1/support-bundle HTTP/1.1\r\nHost: status\r\nAuthorization: bEaReR   {STATUS_TOKEN}\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    assert!(
+        lowercase_scheme.starts_with("HTTP/1.1 200 OK\r\n"),
+        "{lowercase_scheme}"
+    );
+
+    let mixed_case_token = status_request(
+        status_address,
+        format!(
+            "GET /v1/support-bundle HTTP/1.1\r\nHost: status\r\nAuthorization: Bearer {}\r\n\r\n",
+            STATUS_TOKEN.to_uppercase()
+        )
+        .as_bytes(),
+    );
+    assert!(
+        mixed_case_token.starts_with("HTTP/1.1 401 Unauthorized\r\n"),
+        "{mixed_case_token}"
+    );
+}
+
+#[test]
+fn status_listener_serves_health_readiness_and_guarded_support_bundle() {
+    let directory = TestDirectory::new("status-listener");
+    let project_path = directory.project_path();
+    create_project(&project_path);
+
+    let (daemon, status_address) = Daemon::start_with_status(&project_path, STATUS_TOKEN, false);
+
+    let health = status_request(
+        status_address,
+        b"GET /healthz HTTP/1.1\r\nHost: status\r\n\r\n",
+    );
+    assert!(health.starts_with("HTTP/1.1 200 OK\r\n"), "{health}");
+    assert!(
+        health.contains("FREEMIXD_STATUS\tv=1\tcheck=healthz\tstatus=live\t"),
+        "{health}"
+    );
+
+    let ready = status_request(
+        status_address,
+        b"GET /readyz HTTP/1.1\r\nHost: status\r\n\r\n",
+    );
+    assert!(ready.starts_with("HTTP/1.1 200 OK\r\n"), "{ready}");
+    assert!(
+        ready.contains(
+            "check=readyz\tstatus=ready\treadiness=ready\thealth=healthy\tliveness=live\t"
+        ),
+        "{ready}"
+    );
+
+    assert_status_request_shapes(status_address);
+
+    let anonymous = status_request(
+        status_address,
+        b"GET /v1/support-bundle HTTP/1.1\r\nHost: status\r\n\r\n",
+    );
+    assert!(
+        anonymous.starts_with("HTTP/1.1 401 Unauthorized\r\n"),
+        "{anonymous}"
+    );
+    assert!(!anonymous.contains(STATUS_TOKEN), "{anonymous}");
+
+    let wrong = status_request(
+        status_address,
+        b"GET /v1/support-bundle HTTP/1.1\r\nHost: status\r\nAuthorization: Bearer status-token-0123456789abcdef012345678\r\n\r\n",
+    );
+    assert!(
+        wrong.starts_with("HTTP/1.1 401 Unauthorized\r\n"),
+        "{wrong}"
+    );
+
+    let bundle = status_request(
+        status_address,
+        format!(
+            "GET /v1/support-bundle HTTP/1.1\r\nHost: status\r\nAuthorization: Bearer {STATUS_TOKEN}\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    assert!(bundle.starts_with("HTTP/1.1 200 OK\r\n"), "{bundle}");
+    assert!(
+        bundle.contains("check=support-bundle\tstatus=ok\t"),
+        "{bundle}"
+    );
+    assert!(bundle.contains("\"schema\":\"fm-support-v1\""), "{bundle}");
+    assert_bundle_authentication_scheme(status_address);
+    assert!(!bundle.contains(STATUS_TOKEN), "{bundle}");
+    assert!(
+        !bundle.contains(&project_path.display().to_string()),
+        "{bundle}"
+    );
+    assert!(!bundle.contains(&status_address.to_string()), "{bundle}");
+
+    daemon.stop();
+}
+
+/// Liveness and readiness are answered by the accept thread, so connections
+/// that occupy the listener without ever sending a request must not be able to
+/// delay or fail a supervisor probe. Sixteen of forty probes failed here before
+/// the accept thread stopped handing probe sockets to the request workers.
+#[test]
+fn status_listener_answers_probes_while_silent_connections_flood_it() {
+    const HELD: usize = 50;
+    const FLOOD_THREADS: usize = 4;
+    const PROBES: usize = 40;
+
+    let directory = TestDirectory::new("status-listener-flood");
+    let project_path = directory.project_path();
+    create_project(&project_path);
+
+    let (daemon, status_address) = Daemon::start_with_status(&project_path, STATUS_TOKEN, true);
+
+    let held: Vec<TcpStream> = (0..HELD)
+        .filter_map(|_| TcpStream::connect_timeout(&status_address, Duration::from_secs(1)).ok())
+        .collect();
+    assert_eq!(held.len(), HELD, "could not open the silent connections");
+
+    let flooding = Arc::new(AtomicBool::new(true));
+    let threads: Vec<_> = (0..FLOOD_THREADS)
+        .map(|_| {
+            let flooding = Arc::clone(&flooding);
+            std::thread::spawn(move || {
+                let mut sockets = Vec::new();
+                while flooding.load(Ordering::Acquire) {
+                    if let Ok(socket) =
+                        TcpStream::connect_timeout(&status_address, Duration::from_secs(1))
+                    {
+                        sockets.push(socket);
+                    }
+                    if sockets.len() >= 16 {
+                        sockets.clear();
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            })
+        })
+        .collect();
+
+    let mut answered = 0_usize;
+    let mut slowest = Duration::ZERO;
+    let mut failure = String::new();
+    for _ in 0..PROBES {
+        let started = Instant::now();
+        let health = status_request(
+            status_address,
+            b"GET /healthz HTTP/1.1\r\nHost: status\r\n\r\n",
+        );
+        slowest = slowest.max(started.elapsed());
+        if health.starts_with("HTTP/1.1 200 OK\r\n") {
+            answered += 1;
+        } else if failure.is_empty() {
+            failure = health;
+        }
+    }
+
+    flooding.store(false, Ordering::Release);
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    drop(held);
+
+    assert_eq!(
+        answered, PROBES,
+        "flooded listener failed a probe: {failure}"
+    );
+    assert!(
+        slowest < Duration::from_millis(250),
+        "slowest probe under flood took {slowest:?}"
+    );
+
+    let mut client = daemon.connect();
+    client.handshake(None);
+    drop(client);
+    daemon.wait_success();
+}
+
+/// The published readiness must track the daemon, not the value startup wrote.
+///
+/// SIGTERM moves the daemon from ready to draining while the status listener is
+/// still up, which is exactly the interval a supervisor has to be able to tell
+/// apart from a crash. The gateway is enabled so the daemon spends a bounded
+/// but measurable interval winding its other subsystems down; probing across
+/// the signal must observe `readiness=draining`, which a readiness frozen at
+/// startup never reports.
+#[cfg(unix)]
+#[test]
+fn readiness_reports_draining_after_a_cooperative_stop_request() {
+    let directory = TestDirectory::new("status-listener-draining");
+    let project_path = directory.project_path();
+    create_project(&project_path);
+
+    let (daemon, status_address) =
+        Daemon::start_with_status_and_web(&project_path, STATUS_TOKEN, false, true);
+    let ready = status_request(
+        status_address,
+        b"GET /readyz HTTP/1.1\r\nHost: status\r\n\r\n",
+    );
+    assert!(ready.contains("status=ready\treadiness=ready\t"), "{ready}");
+
+    let probing = Arc::new(AtomicBool::new(true));
+    let drained = Arc::new(AtomicBool::new(false));
+    let probes: Vec<_> = (0..8)
+        .map(|_| {
+            let probing = Arc::clone(&probing);
+            let drained = Arc::clone(&drained);
+            std::thread::spawn(move || {
+                while probing.load(Ordering::Acquire) {
+                    let Some(readiness) = try_status_request(
+                        status_address,
+                        b"GET /readyz HTTP/1.1\r\nHost: status\r\n\r\n",
+                    ) else {
+                        continue;
+                    };
+                    if readiness.contains("status=not-ready\treadiness=draining\t") {
+                        assert!(
+                            readiness.starts_with("HTTP/1.1 503 Service Unavailable\r\n"),
+                            "{readiness}"
+                        );
+                        drained.store(true, Ordering::Release);
+                    }
+                }
+            })
+        })
+        .collect();
+
+    let status = ProcessCommand::new("/bin/kill")
+        .args(["-TERM", &daemon.child.as_ref().unwrap().id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success(), "SIGTERM command failed: {status}");
+    daemon.wait_success();
+
+    probing.store(false, Ordering::Release);
+    for probe in probes {
+        probe.join().unwrap();
+    }
+    assert!(
+        drained.load(Ordering::Acquire),
+        "/readyz never reported the draining transition"
+    );
 }
 
 #[test]
@@ -1049,6 +1446,26 @@ fn remote_input_rename_is_authorized_replicated_replay_safe_and_survives_restart
     drop(snapshot_client);
     daemon.stop();
 
+    // The daemon was killed, not stopped: these revisions live in the journal
+    // and only reach the manifest when the next daemon recovers them.
+    let daemon = Daemon::start(&project_path);
+    let mut restarted = daemon.connect();
+    let handshake = restarted.handshake_as(Role::Graphics, None);
+    assert_eq!(handshake.current_revision, 2);
+    let WireMessage::Snapshot(snapshot) = restarted.receive() else {
+        panic!("expected snapshot after restart");
+    };
+    assert_eq!(
+        snapshot
+            .inputs
+            .iter()
+            .map(|status| (status.input, status.name.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(input(2), "Input 2"), (input(1), "Camera Left")]
+    );
+    drop(restarted);
+    daemon.wait_success();
+
     let persisted = ProjectStore::new(&project_path).unwrap().load().unwrap();
     assert_eq!(persisted.position().revision, 2);
     assert_eq!(persisted.position().frames_rendered, 2);
@@ -1089,24 +1506,6 @@ fn remote_input_rename_is_authorized_replicated_replay_safe_and_survives_restart
             .get(),
         -2_000
     );
-
-    let daemon = Daemon::start(&project_path);
-    let mut restarted = daemon.connect();
-    let handshake = restarted.handshake_as(Role::Graphics, None);
-    assert_eq!(handshake.current_revision, 2);
-    let WireMessage::Snapshot(snapshot) = restarted.receive() else {
-        panic!("expected snapshot after restart");
-    };
-    assert_eq!(
-        snapshot
-            .inputs
-            .iter()
-            .map(|status| (status.input, status.name.as_str()))
-            .collect::<Vec<_>>(),
-        vec![(input(2), "Input 2"), (input(1), "Camera Left")]
-    );
-    drop(restarted);
-    daemon.wait_success();
 }
 
 #[test]
@@ -1210,6 +1609,277 @@ fn commands_survive_restart_resume_and_duplicate_replay() {
     daemon.wait_success();
 
     assert_eq!(store.load().unwrap(), persisted);
+}
+
+/// The whole point of the journal: a command the operator was told succeeded
+/// must survive `SIGKILL`.
+///
+/// The daemon is killed with the acknowledgement already in the client's hand
+/// and no chance to shut down, flush or checkpoint. The manifest is still at
+/// revision 0 at that instant, so nothing here can pass because a file happened
+/// to be written — the two revisions exist only as journal batches, and only
+/// recovery can bring them back.
+#[test]
+fn acknowledged_commands_survive_sigkill_before_any_checkpoint() {
+    let directory = TestDirectory::new("sigkill-durability");
+    let project_path = directory.project_path();
+    create_project(&project_path);
+    let store = ProjectStore::new(&project_path).unwrap();
+
+    let daemon = Daemon::start(&project_path);
+    let mut client = daemon.connect();
+    assert_eq!(client.handshake(None).current_revision, 0);
+    assert!(matches!(client.receive(), WireMessage::Snapshot(_)));
+
+    client.send(&command(
+        "killed-preview",
+        "killed-preview-key",
+        CommandPayload::SelectPreview { input: input(3) },
+    ));
+    assert!(matches!(
+        client.next_result(),
+        CommandResult::Accepted { revision: 1, .. }
+    ));
+    client.send(&command(
+        "killed-cut",
+        "killed-cut-key",
+        CommandPayload::Cut,
+    ));
+    assert!(matches!(
+        client.next_result(),
+        CommandResult::Accepted { revision: 2, .. }
+    ));
+
+    // Both acknowledgements are in hand. Kill the process outright.
+    daemon.stop();
+
+    // Nothing acknowledged is in the manifest, so the recovery below cannot be
+    // reading a per-command manifest rewrite.
+    assert_eq!(store.load().unwrap().position().revision, 0);
+    let crashed = store.scan_journal().unwrap();
+    assert_eq!(crashed.batches().len(), 2);
+    assert_eq!(crashed.checkpoint_sequence(), 0);
+    assert!(crashed.observations().is_empty());
+
+    let daemon = Daemon::start(&project_path);
+    let mut restarted = daemon.connect();
+    assert_eq!(restarted.handshake(None).current_revision, 2);
+    assert!(matches!(restarted.receive(), WireMessage::Snapshot(_)));
+    // The receipts came back too, so a client that retries after the crash is
+    // answered from the original acceptance instead of cutting the show again.
+    restarted.send(&command(
+        "killed-cut-retry",
+        "killed-cut-key",
+        CommandPayload::Cut,
+    ));
+    assert!(matches!(
+        restarted.next_result(),
+        CommandResult::Accepted {
+            id,
+            revision: 2,
+            ..
+        } if id == "killed-cut"
+    ));
+    drop(restarted);
+    daemon.wait_success();
+
+    let persisted = store.load().unwrap();
+    assert_eq!(persisted.position().revision, 2);
+    assert_eq!(persisted.idempotency_receipts().len(), 2);
+    // The cut swapped the preview selected at revision 1 onto program.
+    assert_eq!(
+        persisted.runtime_routing().realized_program_id,
+        Some(domain_input(3))
+    );
+    assert_eq!(
+        persisted.runtime_routing().desired_program_id,
+        Some(domain_input(3))
+    );
+}
+
+/// Checkpoints must bound journal growth on their own, and recovery must land
+/// on the exact state the daemon held, not merely a plausible one.
+///
+/// A run of `CHECKPOINTED_COMMANDS` commands is executed twice against
+/// identical projects: once stopped cleanly, once killed and recovered. The two
+/// projects must end byte-for-byte identical as `StoredProject` values —
+/// revision, event sequence, frames rendered, runtime generation, clock time,
+/// routing and every receipt.
+#[test]
+fn checkpoints_compact_the_journal_and_recovery_reproduces_the_exact_state() {
+    /// One more than the daemon's checkpoint interval, so a checkpoint is
+    /// forced mid-run without a clean shutdown.
+    const CHECKPOINTED_COMMANDS: u32 = 65;
+
+    fn cut_repeatedly(daemon: &Daemon, count: u32) {
+        let mut client = daemon.connect();
+        client.handshake(None);
+        assert!(matches!(client.receive(), WireMessage::Snapshot(_)));
+        for revision in 1..=count {
+            client.send(&command(
+                &format!("cut-{revision}"),
+                &format!("cut-key-{revision}"),
+                CommandPayload::Cut,
+            ));
+            match client.next_result() {
+                CommandResult::Accepted { revision: got, .. } => {
+                    assert_eq!(got, u64::from(revision));
+                }
+                CommandResult::Rejected { code, message, .. } => {
+                    panic!("command {revision} was rejected as {code}: {message}")
+                }
+            }
+        }
+    }
+
+    let directory = TestDirectory::new("checkpoint-clean");
+    let clean_path = directory.project_path();
+    create_project(&clean_path);
+    let clean_store = ProjectStore::new(&clean_path).unwrap();
+    let daemon = Daemon::start(&clean_path);
+    cut_repeatedly(&daemon, CHECKPOINTED_COMMANDS);
+    daemon.wait_success();
+    let clean = clean_store.load().unwrap();
+    assert_eq!(clean.position().revision, u64::from(CHECKPOINTED_COMMANDS));
+
+    let crash_directory = TestDirectory::new("checkpoint-crash");
+    let crash_path = crash_directory.project_path();
+    create_project(&crash_path);
+    let crash_store = ProjectStore::new(&crash_path).unwrap();
+    let daemon = Daemon::start(&crash_path);
+    cut_repeatedly(&daemon, CHECKPOINTED_COMMANDS);
+    daemon.stop();
+
+    // The bounded checkpoint fired mid-run: the manifest advanced without a
+    // clean shutdown, and only the commands after it were left to replay.
+    let crashed = crash_store.load().unwrap();
+    assert!(
+        crashed.position().revision > 0 && crashed.position().revision < clean.position().revision,
+        "a checkpoint must have advanced the manifest mid-run, found revision {}",
+        crashed.position().revision
+    );
+    let scan = crash_store.scan_journal().unwrap();
+    assert_eq!(scan.checkpoint_revision(), crashed.position().revision);
+    assert_eq!(
+        u64::from(CHECKPOINTED_COMMANDS) - crashed.position().revision,
+        scan.batches().len() as u64,
+        "every command after the checkpoint must still be in the journal"
+    );
+
+    let daemon = Daemon::start(&crash_path);
+    let mut client = daemon.connect();
+    assert_eq!(
+        client.handshake(None).current_revision,
+        u64::from(CHECKPOINTED_COMMANDS)
+    );
+    drop(client);
+    daemon.wait_success();
+
+    assert_eq!(crash_store.load().unwrap(), clean);
+    // Checkpointing discarded what it applied instead of retaining it forever.
+    let settled = crash_store.scan_journal().unwrap();
+    assert!(settled.batches().is_empty());
+    assert_eq!(
+        settled.checkpoint_revision(),
+        u64::from(CHECKPOINTED_COMMANDS)
+    );
+}
+
+/// Work that is not durable is never acknowledged.
+///
+/// The journal is made unusable underneath a running daemon — the specific
+/// fault stands in for a failing or full show disk. The commands that follow
+/// must come back refused and retryable, the daemon must stay up and keep
+/// serving, and no refused command may leave a trace: once the journal works
+/// again the next command takes the very next revision.
+#[test]
+fn a_command_that_cannot_be_journalled_is_refused_and_the_daemon_keeps_serving() {
+    let directory = TestDirectory::new("journal-append-failure");
+    let project_path = directory.project_path();
+    create_project(&project_path);
+    let journal = project_path.join("journal");
+
+    let daemon = Daemon::start_without_once(&project_path);
+    let mut client = daemon.connect();
+    client.handshake(None);
+    assert!(matches!(client.receive(), WireMessage::Snapshot(_)));
+    client.send(&command(
+        "durable-cut",
+        "durable-cut-key",
+        CommandPayload::Cut,
+    ));
+    assert!(matches!(
+        client.next_result(),
+        CommandResult::Accepted { revision: 1, .. }
+    ));
+
+    let saved: Vec<(PathBuf, Vec<u8>)> = fs::read_dir(&journal)
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            let bytes = fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect();
+    assert!(!saved.is_empty(), "the accepted command was journalled");
+    fs::remove_dir_all(&journal).unwrap();
+    fs::create_dir(&journal).unwrap();
+    fs::create_dir(journal.join("journal.db")).unwrap();
+
+    for id in ["refused-first", "refused-second"] {
+        client.send(&command(id, &format!("{id}-key"), CommandPayload::Cut));
+        match client.next_result() {
+            CommandResult::Rejected {
+                id: rejected,
+                code,
+                current_revision,
+                retryable,
+                ..
+            } => {
+                assert_eq!(rejected, id);
+                assert_eq!(code, "unavailable");
+                assert_eq!(current_revision, 1, "a refused command takes no revision");
+                assert!(retryable);
+            }
+            CommandResult::Accepted { revision, .. } => {
+                panic!("{id} must not be acknowledged, yet it took revision {revision}")
+            }
+        }
+    }
+
+    fs::remove_dir_all(&journal).unwrap();
+    fs::create_dir(&journal).unwrap();
+    for (path, bytes) in saved {
+        fs::write(path, bytes).unwrap();
+    }
+    client.send(&command(
+        "after-repair",
+        "after-repair-key",
+        CommandPayload::Cut,
+    ));
+    assert!(
+        matches!(
+            client.next_result(),
+            CommandResult::Accepted { revision: 2, .. }
+        ),
+        "the refused commands left no gap in the revision or the journal"
+    );
+    drop(client);
+    daemon.stop();
+
+    let store = ProjectStore::new(&project_path).unwrap();
+    let scan = store.scan_journal().unwrap();
+    assert_eq!(
+        scan.batches().len(),
+        2,
+        "only the accepted commands persist"
+    );
+    let daemon = Daemon::start(&project_path);
+    let mut restarted = daemon.connect();
+    assert_eq!(restarted.handshake(None).current_revision, 2);
+    drop(restarted);
+    daemon.wait_success();
+    assert_eq!(store.load().unwrap().position().revision, 2);
 }
 
 #[test]

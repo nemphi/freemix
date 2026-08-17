@@ -22,7 +22,8 @@ use fm_model::{
     InputGainMilliDb, InputKind, Layer, LayerGeometry, MainMix, Project, ProjectSettings, RectMask,
     Rgba8 as ModelRgba8, Rotation, SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor,
     SourceRef, StartupPolicy, StingerAudioPolicy as ModelStingerAudioPolicy, StingerConfig,
-    StingerMissingMediaFallback, StingerSlotNumber,
+    StingerMissingMediaFallback, StingerSlotNumber, StreamEndpoint, StreamKey, StreamTarget,
+    StreamTargetId,
 };
 use fm_persistence::validate_asset_uri;
 use fm_persistence::{
@@ -50,7 +51,7 @@ use crate::{
         Command, ManualTransitionKind, OverlayBorder as CliOverlayBorder,
         OverlayPosition as CliOverlayPosition, OverlayTransition as CliOverlayTransition,
         StingerAudioPolicy as CliStingerAudioPolicy, StingerFallback as CliStingerFallback,
-        TBarAction,
+        StreamSpec, TBarAction,
     },
     remote,
 };
@@ -170,6 +171,15 @@ pub fn run(command: Command) -> AppResult<()> {
         } => set_output_startup(&path, output_id(output)?, startup)?,
         Command::OutputRemove { path, output } => {
             remove_output(&path, output_id(output)?)?;
+        }
+        Command::StreamAdd { path, spec } => add_stream_target(&path, &spec)?,
+        Command::StreamUpdate { path, spec } => update_stream_target(&path, &spec)?,
+        Command::StreamRemove { path, stream } => {
+            remove_stream_target(&path, stream_target_id(stream)?)?;
+        }
+        Command::Streams { path } => {
+            let stored = inspect_stored_project(&path)?;
+            print_stream_targets(stored.project());
         }
         Command::SceneInputAdd {
             path,
@@ -405,22 +415,22 @@ pub fn run(command: Command) -> AppResult<()> {
         Command::InputReplaceScene { path, input, scene } => {
             replace_input_scene(&path, input_id(input)?, scene_id(scene)?)?
         }
-        Command::Status { path } => print_status(&load_engine(&path)?),
+        Command::Status { path } => print_status(&inspect_engine(&path)?),
         Command::JournalRecover { path } => recover_journal(&path)?,
         Command::Inputs { path } => {
-            let stored = load_stored_project(&path)?;
+            let stored = inspect_stored_project(&path)?;
             print_inputs(stored.project());
         }
         Command::Outputs { path } => {
-            let stored = load_stored_project(&path)?;
+            let stored = inspect_stored_project(&path)?;
             print_outputs(stored.project());
         }
         Command::AudioBuses { path } => {
-            let stored = load_stored_project(&path)?;
+            let stored = inspect_stored_project(&path)?;
             print_audio_buses(stored.project());
         }
         Command::Scenes { path } => {
-            let stored = load_stored_project(&path)?;
+            let stored = inspect_stored_project(&path)?;
             print_scenes(stored.project());
         }
         Command::AssetAudit { path } => audit_assets(&path)?,
@@ -1771,6 +1781,67 @@ fn rename_output(path: &Path, output: OutputId, name: String) -> AppResult<()> {
     Ok(())
 }
 
+/// Builds a validated destination from the authored arguments.
+///
+/// Every rejection here comes from a typed model error that carries no URL or
+/// key text, so a mistyped key is refused without echoing it back to the
+/// terminal or into a shell history through an error message.
+fn stream_target(spec: &StreamSpec) -> AppResult<StreamTarget> {
+    let (protocol, endpoint) = StreamEndpoint::parse_url(&spec.url)
+        .map_err(|error| AppFailure(format!("invalid stream url: {error}")))?;
+    let backup_endpoint = spec
+        .backup_url
+        .as_deref()
+        .map(|url| {
+            let (backup_protocol, backup_endpoint) = StreamEndpoint::parse_url(url)
+                .map_err(|error| AppFailure(format!("invalid backup stream url: {error}")))?;
+            if backup_protocol == protocol {
+                Ok(backup_endpoint)
+            } else {
+                Err(AppFailure(format!(
+                    "backup stream url must use {protocol}://, matching the primary"
+                )))
+            }
+        })
+        .transpose()?;
+    let key = StreamKey::parse(&spec.key)
+        .map_err(|error| AppFailure(format!("invalid stream key: {error}")))?;
+    let target = StreamTarget::new(
+        stream_target_id(spec.stream)?,
+        spec.name.clone(),
+        protocol,
+        endpoint,
+        key,
+        output_id(spec.output)?,
+    )
+    .and_then(|target| target.with_backup_endpoint(backup_endpoint))
+    .map_err(|error| AppFailure(error.to_string()))?;
+    Ok(target.with_startup(spec.startup))
+}
+
+fn add_stream_target(path: &Path, spec: &StreamSpec) -> AppResult<()> {
+    let target = stream_target(spec)?;
+    update_project(path, |project| {
+        project.add_stream_target_checked(target)?;
+        Ok(())
+    })
+}
+
+fn update_stream_target(path: &Path, spec: &StreamSpec) -> AppResult<()> {
+    let target = stream_target(spec)?;
+    update_project(path, |project| {
+        project.replace_stream_target(target)?;
+        Ok(())
+    })
+}
+
+fn remove_stream_target(path: &Path, target: StreamTargetId) -> AppResult<()> {
+    update_project(path, |project| {
+        project.remove_stream_target(target)?;
+        Ok(())
+    })
+}
+
 fn set_scene_input_audio_source(
     path: &Path,
     scene_input: InputId,
@@ -2345,7 +2416,15 @@ fn update_project(
 }
 
 fn load_engine(path: &Path) -> AppResult<ProjectEngine> {
-    let stored = load_stored_project(path)?;
+    restore_project_engine(load_stored_project(path)?)
+}
+
+/// Restores an engine for reporting only, without opening the journal.
+fn inspect_engine(path: &Path) -> AppResult<ProjectEngine> {
+    restore_project_engine(inspect_stored_project(path)?)
+}
+
+fn restore_project_engine(stored: StoredProject) -> AppResult<ProjectEngine> {
     let project = stored.project().clone();
     let inputs = project
         .inputs()
@@ -2658,6 +2737,11 @@ fn restored_t_bar(state: PersistedManualTransitionState) -> AppResult<TBarState>
     ))
 }
 
+/// Loads a project that is about to be mutated.
+///
+/// This opens the journal database, which a running daemon owns exclusively:
+/// the mutation is refused while the daemon holds it, and refused again if
+/// batches the daemon recorded are still unapplied.
 fn load_stored_project(path: &Path) -> AppResult<StoredProject> {
     let store = ProjectStore::new(path)?;
     let project = store.load()?;
@@ -2674,8 +2758,17 @@ fn load_stored_project(path: &Path) -> AppResult<StoredProject> {
     Ok(project)
 }
 
+/// Reads a project without touching its journal.
+///
+/// The journal database is locked exclusively by whichever process has it
+/// open, so inspecting a project must never open it: reporting a show's state
+/// has to work while its daemon is running.
+fn inspect_stored_project(path: &Path) -> AppResult<StoredProject> {
+    Ok(ProjectStore::new(path)?.load()?)
+}
+
 fn audit_assets(path: &Path) -> AppResult<()> {
-    let stored = load_stored_project(path)?;
+    let stored = inspect_stored_project(path)?;
     let store = ProjectStore::new(path)?;
     let issues = store.audit_assets(&stored);
     for issue in &issues {
@@ -2704,6 +2797,9 @@ fn recover_journal(path: &Path) -> AppResult<()> {
     reject_unapplied_journal_batches(scan.batches().len())?;
     let recovered = store.recover_journal()?;
     reject_unapplied_journal_batches(recovered.batches().len())?;
+    for observation in recovered.observations() {
+        println!("journal observation: {observation}");
+    }
     println!(
         "journal recovered: checkpoint_sequence={} checkpoint_revision={} unapplied_batches=0",
         recovered.checkpoint_sequence(),
@@ -2723,7 +2819,7 @@ fn reject_unapplied_journal_batches(count: usize) -> AppResult<()> {
 }
 
 fn render(path: &Path, output: &Path, width: u32, height: u32) -> AppResult<()> {
-    let project = load_engine(path)?;
+    let project = inspect_engine(path)?;
     let engine = &project.engine;
     let mut pipeline = SimulatedPipeline::new(width, height)?;
     for input in project.project.inputs() {
@@ -2975,6 +3071,36 @@ fn print_outputs(project: &Project) {
     }
 }
 
+/// Lists configured streaming destinations with the stream key redacted.
+///
+/// The URLs printed here come from [`StreamTarget::redacted_url`], which
+/// renders the key as `****`. No line in this program prints the key.
+fn print_stream_targets(project: &Project) {
+    for target in project.stream_targets() {
+        let output = project
+            .outputs()
+            .iter()
+            .find(|output| output.id == target.output())
+            .expect("validated stream destination output reference");
+        let startup = match target.startup() {
+            StartupPolicy::Stopped => "stopped",
+            StartupPolicy::ReconcileDesiredState => "reconcile-desired-state",
+        };
+        println!(
+            "stream id={} name={:?} protocol={} url={:?} backup_url={:?} output={} output_name={:?} startup={startup}",
+            target.id(),
+            target.name(),
+            target.protocol(),
+            target.redacted_url(),
+            target
+                .redacted_backup_url()
+                .unwrap_or_else(|| "none".to_owned()),
+            target.output(),
+            output.name,
+        );
+    }
+}
+
 fn print_audio_buses(project: &Project) {
     for bus in project.audio_buses() {
         let sends = bus
@@ -3171,6 +3297,13 @@ Usage:
   freemix-cli output-rename <show.freemix> <existing-output-id> <name>
   freemix-cli output-startup <show.freemix> <existing-output-id> <stopped|reconcile-desired-state>
   freemix-cli output-remove <show.freemix> <existing-output-id>
+  freemix-cli stream-add <show.freemix> <nonzero-stream-id> <existing-output-id> <rtmp(s)://host/app> <stream-key> <name> [--backup <rtmp(s)://host/app>] [--startup <stopped|reconcile-desired-state>]
+  freemix-cli stream-update <show.freemix> <existing-stream-id> <existing-output-id> <rtmp(s)://host/app> <stream-key> <name> [--backup <rtmp(s)://host/app>] [--startup <stopped|reconcile-desired-state>]
+  freemix-cli stream-remove <show.freemix> <existing-stream-id>
+      The stream key is a positional argument and is therefore visible in this
+      machine's process list. It is stored in plaintext in project.json, like
+      every other authored field, so protect the bundle accordingly. It is
+      never printed: `streams` and every error render it as ****.
   freemix-cli scene-input-add <show.freemix> <nonzero-input-id> <nonzero-scene-id> <name>
   freemix-cli scene-input-duplicate <show.freemix> <source-scene-id> <new-scene-id> <new-input-id> <scene-name> <input-name>
   freemix-cli scene-input-audio-source <show.freemix> <scene-input-id> <source-input-id>
@@ -3205,6 +3338,7 @@ Usage:
   freemix-cli journal-recover <show.freemix>
   freemix-cli inputs <show.freemix>
   freemix-cli outputs <show.freemix>
+  freemix-cli streams <show.freemix>
   freemix-cli audio-buses <show.freemix>
   freemix-cli scenes <show.freemix>
   freemix-cli asset-audit <show.freemix>
@@ -3469,6 +3603,12 @@ fn bus_id(value: u128) -> AppResult<BusId> {
         .ok_or_else(|| AppFailure("bus ID must be nonzero".into()).into())
 }
 
+fn stream_target_id(value: u128) -> AppResult<StreamTargetId> {
+    NonZeroU128::new(value)
+        .map(StreamTargetId::new)
+        .ok_or_else(|| AppFailure("stream destination ID must be nonzero".into()).into())
+}
+
 fn required_routing(value: Option<InputId>, field: &'static str) -> AppResult<InputId> {
     value.ok_or_else(|| AppFailure(format!("project is missing {field} routing")).into())
 }
@@ -3590,8 +3730,6 @@ mod tests {
             .append_batch(&MutationBatch::new(1, 0, 1, b"unapplied".to_vec()))
             .unwrap();
         let manifest = fs::read(path.join("project.json")).unwrap();
-        let record = store.journal_path().join("00000000000000000001.batch");
-        let journal = fs::read(&record).unwrap();
 
         let error = load_stored_project(&path).unwrap_err();
         assert_eq!(
@@ -3599,34 +3737,9 @@ mod tests {
             "project has unapplied journal batches that freemix-cli cannot safely interpret"
         );
         assert_eq!(fs::read(path.join("project.json")).unwrap(), manifest);
-        assert_eq!(fs::read(record).unwrap(), journal);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn local_load_allows_torn_final_record_and_leaves_it_in_place() {
-        let root = std::env::temp_dir().join(format!(
-            "freemix-cli-journal-{}-{}",
-            std::process::id(),
-            PROJECT_ID_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&root).unwrap();
-        let path = root.join("show.freemix");
-        save_engine(&path, &default_project("Journal".into()).unwrap()).unwrap();
-        let store = ProjectStore::new(&path).unwrap();
-        store
-            .append_batch(&MutationBatch::new(1, 0, 1, b"torn".to_vec()))
-            .unwrap();
-        let record = store.journal_path().join("00000000000000000001.batch");
-        fs::OpenOptions::new()
-            .write(true)
-            .open(&record)
-            .unwrap()
-            .set_len(12)
-            .unwrap();
-
-        assert!(load_stored_project(&path).is_ok());
-        assert!(record.exists());
+        let scan = store.scan_journal().unwrap();
+        assert_eq!(scan.batches().len(), 1);
+        assert_eq!(scan.batches()[0].payload(), b"unapplied");
         fs::remove_dir_all(root).unwrap();
     }
 

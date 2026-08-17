@@ -35,7 +35,8 @@ use fm_command::{
     Rejection, RejectionCode, Revision, RuntimeGeneration, StateEpoch,
 };
 use fm_control::{
-    CommandSubmission, ControlLimits, ControlService, PrepareSubmitOutcome, ResumeDecision,
+    CommandSubmission, ControlLimits, ControlService, PrepareSubmitOutcome, ResultBeforeEvents,
+    ResumeDecision,
 };
 #[cfg(feature = "native-media")]
 use fm_engine::FrameResult;
@@ -51,10 +52,10 @@ use fm_model::{
 use fm_persistence::{
     FadeToBlackState as PersistedFadeToBlackState, IdempotencyReceipt,
     ManualTransitionKind as PersistedManualTransitionKind,
-    ManualTransitionState as PersistedManualTransitionState, ProjectPosition, ProjectStore,
-    ReceiptOutcome, RuntimeFadeToBlack, RuntimeManualTransitions, RuntimeOverlayBorder,
-    RuntimeOverlayChannel, RuntimeOverlayPosition, RuntimeOverlayTransition, RuntimeOverlays,
-    RuntimeRouting, StoredProject,
+    ManualTransitionState as PersistedManualTransitionState, MutationBatch, ProjectPosition,
+    ProjectStore, ReceiptOutcome, RuntimeFadeToBlack, RuntimeManualTransitions,
+    RuntimeOverlayBorder, RuntimeOverlayChannel, RuntimeOverlayPosition, RuntimeOverlayTransition,
+    RuntimeOverlays, RuntimeRouting, StoredProject,
 };
 #[cfg(feature = "native-media")]
 use fm_protocol::{AUDIO_METER_LEVEL_SCALE, AudioMeterChannel, InputAudioMeters, WireInputId};
@@ -69,7 +70,7 @@ use fm_protocol::{
 use fm_protocol::{CodecError, EventMessage, HeartbeatAcknowledgementMessage, LineDecoder};
 use fm_server::{
     AuthenticationMode, ControlPlane, DisconnectReason, HandshakeError, Heartbeat, InitialSync,
-    Server, ServerConfig, ServerMode, Session, SessionError, SyncPayload,
+    Server, ServerConfig, ServerMode, ServiceStatus, Session, SessionError, SyncPayload,
 };
 use fm_switcher::{
     MissingMediaFallback, OverlayBorderPreset, OverlayChannelId, OverlayChannelState,
@@ -77,15 +78,20 @@ use fm_switcher::{
     StingerSlotId, SwitcherState, TBarPosition, TBarState, TransitionKind,
 };
 use fm_types::{InputId, ProjectId};
-use freemixd::ReadinessRecord;
+use freemixd::{ReadinessRecord, StatusReadinessRecord};
 
+mod journal;
 mod latest_record;
 mod non_native_sessions;
 #[cfg(feature = "macos-program-surface")]
 mod program_surface;
+mod status_listener;
 #[cfg(feature = "native-media")]
 mod stinger_mutation;
 mod web;
+
+use journal::{DurableJournal, DurableStore, ReplayedMutations};
+use status_listener::{DaemonStatus, StatusListener};
 
 #[cfg(feature = "native-media")]
 use fm_codec_ffmpeg::{
@@ -172,9 +178,23 @@ const PROGRAM_CHECKPOINT_MARGIN: Duration = Duration::from_secs(5);
 struct ProcessShutdown {
     requested: Arc<AtomicBool>,
     diagnostic_deadline: Option<Instant>,
+    /// Snapshot published to the status listener; never read by the daemon.
+    status: Arc<DaemonStatus>,
+    /// The authoritative `fm-server` status the control loop republishes on
+    /// every pass. The session loop only ever holds `&Server`, so the server
+    /// cannot change its own status while the loop runs; this is the value the
+    /// daemon knows, recorded by [`Self::observe_service`] at every point that
+    /// can move it.
+    service: ServiceStatus,
 }
 
 impl ProcessShutdown {
+    /// Records a new authoritative service status and publishes it at once.
+    fn observe_service(&mut self, service: ServiceStatus) {
+        self.service = service;
+        self.status.publish(service);
+    }
+
     fn requested(&self) -> bool {
         self.requested.load(AtomicOrdering::Acquire)
             || self
@@ -202,6 +222,8 @@ fn register_process_shutdown() -> AppResult<ProcessShutdown> {
     Ok(ProcessShutdown {
         requested,
         diagnostic_deadline: None,
+        status: DaemonStatus::new(),
+        service: ServiceStatus::new(),
     })
 }
 
@@ -213,6 +235,8 @@ fn register_process_shutdown() -> AppResult<ProcessShutdown> {
     Ok(ProcessShutdown {
         requested,
         diagnostic_deadline: None,
+        status: DaemonStatus::new(),
+        service: ServiceStatus::new(),
     })
 }
 
@@ -221,6 +245,8 @@ fn register_process_shutdown() -> AppResult<ProcessShutdown> {
     Ok(ProcessShutdown {
         requested: Arc::new(AtomicBool::new(false)),
         diagnostic_deadline: None,
+        status: DaemonStatus::new(),
+        service: ServiceStatus::new(),
     })
 }
 
@@ -238,27 +264,32 @@ enum OnceClientOutcome {
     HandshakeResponseWritten,
 }
 
+/// Polled by every daemon loop, which makes it the control plane's liveness
+/// beat as well as its cooperative stop check.
 fn requested_daemon_shutdown(
     native: Option<&NativeDaemon>,
     process: Option<&ProcessShutdown>,
 ) -> Option<DaemonShutdownReason> {
-    if process.is_some_and(ProcessShutdown::requested) {
+    if let Some(process) = process {
+        // Two atomic stores next to the beat. Republishing keeps the health
+        // surface live: a degraded daemon shows up on `/healthz` within one
+        // poll interval instead of staying frozen at whatever startup wrote.
+        process.status.beat();
+        process.status.publish(process.service);
+    }
+    let reason = if process.is_some_and(ProcessShutdown::requested) {
         Some(DaemonShutdownReason::ProcessSignal)
     } else if native.is_some_and(NativeDaemon::shutdown_requested) {
         Some(DaemonShutdownReason::ProgramSurface)
     } else {
         None
+    };
+    if reason.is_some()
+        && let Some(process) = process
+    {
+        process.status.begin_draining();
     }
-}
-
-trait ProjectSaver {
-    fn save(&self, project: &StoredProject) -> AppResult<()>;
-}
-
-impl ProjectSaver for ProjectStore {
-    fn save(&self, project: &StoredProject) -> AppResult<()> {
-        ProjectStore::save(self, project).map_err(Into::into)
-    }
+    reason
 }
 
 #[cfg(feature = "native-media")]
@@ -3002,6 +3033,7 @@ enum Command {
         project: PathBuf,
         listen: SocketAddr,
         web_listen: Option<SocketAddr>,
+        status_listen: Option<SocketAddr>,
         once: bool,
         native_media: bool,
         fullscreen_program: bool,
@@ -3009,6 +3041,7 @@ enum Command {
         camera_helper: Option<PathBuf>,
         record_program: Option<PathBuf>,
         diagnostic_stop_after: Option<Duration>,
+        recover_to_checkpoint: bool,
     },
     Help,
     Version,
@@ -3044,6 +3077,7 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> AppResult<Command>
                 .ok_or_else(|| AppFailure("missing project path".into()))?;
             let mut listen = DEFAULT_LISTEN.parse()?;
             let mut web_listen: Option<SocketAddr> = None;
+            let mut status_listen: Option<SocketAddr> = None;
             let mut once = false;
             let mut native_media = false;
             let mut fullscreen_program = false;
@@ -3051,6 +3085,7 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> AppResult<Command>
             let mut camera_helper = None;
             let mut record_program = None;
             let mut diagnostic_stop_after = None;
+            let mut recover_to_checkpoint = false;
             while let Some(option) = arguments.next() {
                 if let Some(value) = option.strip_prefix("--record-program=") {
                     if record_program.is_some() {
@@ -3091,6 +3126,15 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> AppResult<Command>
                     })?);
                     continue;
                 }
+                if let Some(value) = option.strip_prefix("--status-listen=") {
+                    if status_listen.is_some() {
+                        return Err(AppFailure("duplicate option `--status-listen`".into()).into());
+                    }
+                    status_listen = Some(value.parse().map_err(|error| {
+                        AppFailure(format!("invalid status listen address: {error}"))
+                    })?);
+                    continue;
+                }
                 match option.as_str() {
                     "--listen" => {
                         listen = arguments
@@ -3112,11 +3156,30 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> AppResult<Command>
                             AppFailure(format!("invalid web listen address: {error}"))
                         })?);
                     }
+                    "--status-listen" => {
+                        if status_listen.is_some() {
+                            return Err(
+                                AppFailure("duplicate option `--status-listen`".into()).into()
+                            );
+                        }
+                        let value = arguments.next().ok_or_else(|| {
+                            AppFailure("missing value for --status-listen".into())
+                        })?;
+                        status_listen = Some(value.parse().map_err(|error| {
+                            AppFailure(format!("invalid status listen address: {error}"))
+                        })?);
+                    }
                     "--once" => once = true,
                     "--native-media" if native_media => {
                         return Err(AppFailure("duplicate option `--native-media`".into()).into());
                     }
                     "--native-media" => native_media = true,
+                    "--recover-to-checkpoint" if recover_to_checkpoint => {
+                        return Err(
+                            AppFailure("duplicate option `--recover-to-checkpoint`".into()).into(),
+                        );
+                    }
+                    "--recover-to-checkpoint" => recover_to_checkpoint = true,
                     "--fullscreen-program" if fullscreen_program => {
                         return Err(
                             AppFailure("duplicate option `--fullscreen-program`".into()).into()
@@ -3194,6 +3257,14 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> AppResult<Command>
             if camera_helper.is_some() && !native_media {
                 return Err(AppFailure("--camera-helper requires --native-media".into()).into());
             }
+            if recover_to_checkpoint && fullscreen_program {
+                return Err(AppFailure(
+                    "--recover-to-checkpoint cannot be combined with --fullscreen-program; \
+                     abandon the batches with one headless start, then start fullscreen"
+                        .into(),
+                )
+                .into());
+            }
             if diagnostic_stop_after.is_some() && once {
                 return Err(AppFailure(
                     "--diagnostic-stop-after cannot be combined with --once".into(),
@@ -3224,10 +3295,24 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> AppResult<Command>
                     .into());
                 }
             }
+            if let Some(address) = status_listen {
+                if !address.ip().is_loopback() {
+                    return Err(
+                        AppFailure("--status-listen must use a loopback address".into()).into(),
+                    );
+                }
+                if fullscreen_program {
+                    return Err(AppFailure(
+                        "--status-listen cannot be combined with --fullscreen-program".into(),
+                    )
+                    .into());
+                }
+            }
             Ok(Command::Serve {
                 project,
                 listen,
                 web_listen,
+                status_listen,
                 once,
                 native_media,
                 fullscreen_program,
@@ -3235,6 +3320,7 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> AppResult<Command>
                 camera_helper,
                 record_program,
                 diagnostic_stop_after,
+                recover_to_checkpoint,
             })
         }
         "help" | "--help" | "-h" => {
@@ -3307,6 +3393,7 @@ fn run(command: Command) -> AppResult<()> {
             project,
             listen,
             web_listen,
+            status_listen,
             once,
             native_media,
             fullscreen_program,
@@ -3314,6 +3401,7 @@ fn run(command: Command) -> AppResult<()> {
             camera_helper,
             record_program,
             diagnostic_stop_after,
+            recover_to_checkpoint,
         } => {
             if fullscreen_program {
                 run_fullscreen_program(
@@ -3325,15 +3413,22 @@ fn run(command: Command) -> AppResult<()> {
                     record_program,
                 )
             } else {
-                serve(
+                serve_inner(
                     &project,
-                    listen,
+                    ServeListeners {
+                        listen,
+                        web_listen,
+                        status_listen,
+                    },
                     once,
-                    native_media,
-                    web_listen,
-                    camera_helper,
+                    if native_media {
+                        NativeServeMode::Headless { camera_helper }
+                    } else {
+                        NativeServeMode::Disabled
+                    },
                     record_program,
                     diagnostic_stop_after,
+                    recover_to_checkpoint,
                 )
             }
         }
@@ -3399,29 +3494,12 @@ struct ProgramServeSetup {
     camera_helper: Option<PathBuf>,
 }
 
-fn serve(
-    path: &Path,
+/// The daemon's bound sockets: control, optional web gateway, optional status.
+#[derive(Clone, Copy)]
+struct ServeListeners {
     listen: SocketAddr,
-    once: bool,
-    native_media: bool,
     web_listen: Option<SocketAddr>,
-    camera_helper: Option<PathBuf>,
-    record_program: Option<PathBuf>,
-    diagnostic_stop_after: Option<Duration>,
-) -> AppResult<()> {
-    serve_inner(
-        path,
-        listen,
-        web_listen,
-        once,
-        if native_media {
-            NativeServeMode::Headless { camera_helper }
-        } else {
-            NativeServeMode::Disabled
-        },
-        record_program,
-        diagnostic_stop_after,
-    )
+    status_listen: Option<SocketAddr>,
 }
 
 #[cfg(all(feature = "macos-program-surface", target_os = "macos"))]
@@ -3438,8 +3516,11 @@ fn serve_program_worker(
 ) -> AppResult<()> {
     serve_inner(
         path,
-        listen,
-        None,
+        ServeListeners {
+            listen,
+            web_listen: None,
+            status_listen: None,
+        },
         once,
         NativeServeMode::Program(Box::new(ProgramServeSetup {
             context,
@@ -3449,19 +3530,26 @@ fn serve_program_worker(
         })),
         record_program,
         None,
+        // `--recover-to-checkpoint` is refused with `--fullscreen-program`.
+        false,
     )
 }
 
 #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
 fn serve_inner(
     path: &Path,
-    listen: SocketAddr,
-    web_listen: Option<SocketAddr>,
+    listeners: ServeListeners,
     once: bool,
     mode: NativeServeMode,
     record_program: Option<PathBuf>,
     diagnostic_stop_after: Option<Duration>,
+    recover_to_checkpoint: bool,
 ) -> AppResult<()> {
+    let ServeListeners {
+        listen,
+        web_listen,
+        status_listen,
+    } = listeners;
     if !listen.ip().is_loopback() {
         return Err(AppFailure(format!(
             "development mode requires a loopback listen address, got {}",
@@ -3482,9 +3570,16 @@ fn serve_inner(
             );
         }
     }
+    if status_listen.is_some_and(|address| !address.ip().is_loopback()) {
+        return Err(AppFailure("--status-listen must use a loopback address".into()).into());
+    }
 
     let store = ProjectStore::new(path)?;
-    let project = load_and_recover(&store)?;
+    let project = load_and_recover(&store, recover_to_checkpoint)?;
+    // Opened once and held for the run: this process is the journal's only
+    // writer, and reopening it per command is what made an accepted command
+    // cost what the whole show had cost so far.
+    let journal = DurableJournal::new(store.open_journal_writer()?);
     let project_id = project.project().id();
     let engine = restore_engine(&project)?;
     let identity = format!("project-{project_id}");
@@ -3537,7 +3632,7 @@ fn serve_inner(
         match primed {
             Ok(true) => {}
             Ok(false) => {
-                checkpoint_native(&control, &store, &mut durable)?;
+                checkpoint_native(&control, &journal, &mut durable)?;
                 native
                     .as_mut()
                     .expect("recording requires native state")
@@ -3579,7 +3674,11 @@ fn serve_inner(
     } else {
         None
     };
+    let operator_status = status_listen
+        .map(|address| StatusListener::bind(address, &process_shutdown.status))
+        .transpose()?;
     server.mark_ready()?;
+    process_shutdown.observe_service(server.status());
     let readiness = ReadinessRecord {
         address: listener.local_addr()?,
         project_id,
@@ -3591,6 +3690,15 @@ fn serve_inner(
         std::io::stdout().flush()?;
         web.start_accepting();
     }
+    if let Some(listener) = operator_status.as_ref() {
+        println!(
+            "{}",
+            StatusReadinessRecord {
+                address: listener.address()
+            }
+        );
+        std::io::stdout().flush()?;
+    }
     if let Some(duration) = diagnostic_stop_after {
         process_shutdown.set_diagnostic_deadline(duration)?;
     }
@@ -3599,7 +3707,7 @@ fn serve_inner(
         listener,
         &server,
         &control,
-        &store,
+        &journal,
         &mut durable,
         &principal,
         native.as_mut(),
@@ -3608,13 +3716,23 @@ fn serve_inner(
         once,
         web_gateway.as_ref(),
     );
+    process_shutdown.status.begin_draining();
     let gateway_result = web_gateway.map(web::WebGateway::shutdown);
+    let status_result = operator_status.map(StatusListener::shutdown);
     let _shutdown_reason = session_result?;
     if let Some(result) = gateway_result {
         result?;
     }
+    if let Some(result) = status_result {
+        result?;
+    }
     if native.is_some() {
-        checkpoint_native(&control, &store, &mut durable)?;
+        checkpoint_native(&control, &journal, &mut durable)?;
+    } else {
+        // A clean stop is the safest checkpoint there is: no command is in
+        // flight, so the manifest ends the run holding everything the journal
+        // recorded and the next start has nothing to replay.
+        journal.settle(&durable)?;
     }
     #[cfg(all(feature = "macos-program-surface", target_os = "macos"))]
     if fullscreen_active {
@@ -3638,28 +3756,158 @@ fn serve_inner(
 
 fn checkpoint_native(
     control: &SharedControl,
-    store: &ProjectStore,
+    store: &dyn DurableStore,
     durable: &mut StoredProject,
 ) -> AppResult<()> {
     let snapshot = control.borrow().idle_engine_snapshot()?;
     *durable = stored_project_checkpoint(durable, &snapshot)?;
-    store.save(durable)?;
+    // The idle snapshot advances the runtime position without advancing the
+    // revision, so it is not a mutation: it belongs in the manifest directly.
+    store.checkpoint(durable)?;
     Ok(())
 }
 
-fn load_and_recover(store: &ProjectStore) -> AppResult<StoredProject> {
-    let project = store.load()?;
-    if store.journal_path().try_exists()? {
-        let scan = store.recover_journal()?;
-        if !scan.batches().is_empty() {
-            return Err(AppFailure(
-                "project has unapplied journal batches that freemixd cannot safely interpret"
-                    .into(),
-            )
+/// Loads the manifest and replays whatever the journal recorded after it.
+///
+/// The manifest is the last checkpointed state; every mutation accepted since
+/// then is in the journal. Recovery therefore loads the manifest, re-executes
+/// the recorded commands through the same path that first accepted them, and
+/// checkpoints the result, so the daemon opens at the revision the operator was
+/// last acknowledged at rather than at the last checkpoint.
+///
+/// Opening also creates the journal when the project has never had one, so the
+/// daemon starts owning a journal whose checkpoint agrees with the manifest and
+/// the first command can be appended without re-reading it.
+///
+/// `recover_to_checkpoint` abandons that history instead of replaying it. See
+/// [`abandon_to_checkpoint`].
+fn load_and_recover(store: &ProjectStore, recover_to_checkpoint: bool) -> AppResult<StoredProject> {
+    let manifest = store.load()?;
+    if recover_to_checkpoint {
+        return abandon_to_checkpoint(store, manifest);
+    }
+    let scan = store.recover_journal()?;
+    for observation in scan.observations() {
+        eprintln!("FREEMIXD_JOURNAL\tv=1\tobservation={observation}");
+    }
+    if scan.batches().is_empty() {
+        return Ok(manifest);
+    }
+    let journal_head = scan
+        .batches()
+        .last()
+        .map_or_else(|| scan.checkpoint_sequence(), MutationBatch::sequence);
+
+    let durable = replay_journal(&manifest, scan.batches())?;
+    // Fold the replayed mutations into the manifest and discard them, so the
+    // next crash replays only what happened after this point and a second
+    // recovery of the same batches is impossible.
+    store.checkpoint_and_compact(&durable, journal_head)?;
+    eprintln!(
+        "FREEMIXD_JOURNAL\tv=1\trecovered_batches={}\tfrom_revision={}\tto_revision={}",
+        scan.batches().len(),
+        manifest.position().revision,
+        durable.position().revision
+    );
+    Ok(durable)
+}
+
+/// Throws away everything the journal recorded after the manifest.
+///
+/// Refusing a replay that does not reproduce what was acknowledged is right,
+/// and it leaves an operator minutes from air with a bundle that will not open.
+/// Deleting the journal directory was the only way back on air, and it discards
+/// the same work with no record that it ever existed. This is that act made
+/// deliberate and legible: it is asked for by name on the command line, and
+/// every batch it destroys is printed with its sequence, its revision and the
+/// command it carried — including the ones too damaged to decode — before the
+/// daemon serves anything.
+fn abandon_to_checkpoint(
+    store: &ProjectStore,
+    manifest: StoredProject,
+) -> AppResult<StoredProject> {
+    let abandoned = store.abandon_unapplied_batches()?;
+    for batch in abandoned.batches() {
+        let command = journal::decode_mutation(batch.payload()).map_or_else(
+            |error| format!("<unreadable: {error}>"),
+            |recorded| recorded.command.id,
+        );
+        eprintln!(
+            "FREEMIXD_JOURNAL\tv=1\tabandoned_batch={}\tbase_revision={}\trevision={}\tcommand={command}",
+            batch.sequence(),
+            batch.base_revision(),
+            batch.revision()
+        );
+    }
+    eprintln!(
+        "FREEMIXD_JOURNAL\tv=1\trecover_to_checkpoint=1\tabandoned_batches={}\tserving_revision={}",
+        abandoned.batches().len(),
+        manifest.position().revision
+    );
+    Ok(manifest)
+}
+
+/// Rebuilds the pre-crash state by re-running the recorded commands.
+///
+/// Nothing in this workspace applies an event to a project: the engine is
+/// command-sourced, so the only faithful way to reach the pre-crash state is
+/// the path that produced it. Each batch therefore carries the command and the
+/// instant it was submitted, and replay runs `execute_durable_command` against
+/// an engine restored from the manifest, recording nothing and publishing to
+/// nobody.
+///
+/// Every batch must land on exactly the position it recorded — not just its
+/// revision. A refused command advances no revision and a frame that elapsed
+/// between two commands advances no revision either, so the revision alone
+/// cannot see a replay whose frame cursor, clock or event stream came back
+/// different from the one the operator was acknowledged against. A divergence
+/// means the replay is not that history, so it is reported instead of silently
+/// becoming the project's state.
+fn replay_journal(manifest: &StoredProject, batches: &[MutationBatch]) -> AppResult<StoredProject> {
+    let mut durable = manifest.clone();
+    let project_id = durable.project().id();
+    let identity = format!("project-{project_id}");
+    let mut control = ControlService::new(
+        restore_engine(&durable)?,
+        Policy::development(),
+        identity.clone(),
+        format!("{identity}-log"),
+        ControlLimits::default(),
+    );
+    let server = control_server_identity(&control, project_id);
+    let principal = development_principal()?;
+    for batch in batches {
+        let recorded = journal::decode_mutation(batch.payload())?;
+        if recorded.position.revision != batch.revision() {
+            return Err(AppFailure(format!(
+                "journal batch {} claims revision {} but its record holds revision {}",
+                batch.sequence(),
+                batch.revision(),
+                recorded.position.revision
+            ))
+            .into());
+        }
+        execute_durable_command(
+            &mut control,
+            &ReplayedMutations,
+            &mut durable,
+            &principal,
+            &server,
+            &recorded.command,
+            recorded.submitted_at_millis,
+        )?;
+        if durable.position() != recorded.position {
+            return Err(AppFailure(format!(
+                "journal batch {} replayed command `{}` to {:?} instead of the acknowledged {:?}",
+                batch.sequence(),
+                recorded.command.id,
+                durable.position(),
+                recorded.position
+            ))
             .into());
         }
     }
-    Ok(project)
+    Ok(durable)
 }
 
 fn restore_engine(project: &StoredProject) -> AppResult<Engine> {
@@ -3806,7 +4054,7 @@ fn handle_client(
     stream: TcpStream,
     server: &Server<ControlHandle>,
     control: &SharedControl,
-    store: &ProjectStore,
+    store: &dyn DurableStore,
     durable: &mut StoredProject,
     principal: &Principal,
     authority: &ServerIdentity,
@@ -4190,7 +4438,7 @@ fn process_command(
     writer: &mut TcpStream,
     session: &mut Session,
     control: &SharedControl,
-    store: &ProjectStore,
+    store: &dyn DurableStore,
     durable: &mut StoredProject,
     principal: &Principal,
     server: &ServerIdentity,
@@ -4235,7 +4483,7 @@ struct CommandDelivery {
 fn execute_session_command(
     session: &mut Session,
     control: &SharedControl,
-    store: &ProjectStore,
+    store: &dyn DurableStore,
     durable: &mut StoredProject,
     principal: &Principal,
     server: &ServerIdentity,
@@ -4366,7 +4614,7 @@ struct NativeMutationFailure {
 #[cfg(feature = "native-media")]
 fn execute_native_stinger_mutation(
     control: &mut ControlService<Policy>,
-    store: &ProjectStore,
+    store: &dyn DurableStore,
     durable: &mut StoredProject,
     principal: &Principal,
     server: &ServerIdentity,
@@ -4393,7 +4641,21 @@ fn execute_native_stinger_mutation(
             command,
             &first_prepared.output().result,
         )?;
-        store.save(&updated)?;
+        // A durability failure refuses the command; it does not take the daemon
+        // down. Dropping the preparation abandons it without touching the
+        // engine, exactly as the simulated path does.
+        if let Err(error) = store.record(command, now_millis, durable, &updated) {
+            drop(first_prepared);
+            return Ok(Ok(DurableExecution {
+                submission: refuse_undurable(
+                    command,
+                    control.diagnostics().current_revision,
+                    updated.position().revision,
+                    error.as_ref(),
+                ),
+                runtime_events: Vec::new(),
+            }));
+        }
         let submission = first_prepared.commit()?;
         *durable = updated;
         return Ok(Ok(DurableExecution {
@@ -4455,7 +4717,18 @@ fn execute_native_stinger_mutation(
             command,
             &second_prepared.output().result,
         )?;
-        store.save(&updated)?;
+        if let Err(error) = store.record(command, now_millis, durable, &updated) {
+            drop(second_prepared);
+            return Ok(Ok(DurableExecution {
+                submission: refuse_undurable(
+                    command,
+                    control.diagnostics().current_revision,
+                    updated.position().revision,
+                    error.as_ref(),
+                ),
+                runtime_events: preflight_runtime_events,
+            }));
+        }
         let submission = second_prepared.commit()?;
         *durable = updated;
         return Ok(Ok(DurableExecution {
@@ -4488,7 +4761,21 @@ fn execute_native_stinger_mutation(
             runtime_events: preflight_runtime_events,
         }));
     }
-    store.save(&updated)?;
+    if let Err(error) = store.record(command, now_millis, durable, &updated) {
+        // The staged native resources are released with the preparation: the
+        // command was never applied, so retrying it prepares them again.
+        drop(second_prepared);
+        native.stinger_retirements.discard(mutation)?;
+        return Ok(Ok(DurableExecution {
+            submission: refuse_undurable(
+                command,
+                control.diagnostics().current_revision,
+                updated.position().revision,
+                error.as_ref(),
+            ),
+            runtime_events: preflight_runtime_events,
+        }));
+    }
     let submission = second_prepared.commit()?;
     native.stage_stinger_mutation(mutation);
     let runtime_events = match native.wait_and_tick(control, server, process_shutdown)? {
@@ -4507,7 +4794,7 @@ fn execute_native_stinger_mutation(
 #[cfg(not(feature = "native-media"))]
 fn execute_native_stinger_mutation(
     _control: &mut ControlService<Policy>,
-    _store: &ProjectStore,
+    _store: &dyn DurableStore,
     _durable: &mut StoredProject,
     _principal: &Principal,
     _server: &ServerIdentity,
@@ -4524,10 +4811,58 @@ struct DurableExecution {
     runtime_events: Vec<RuntimeEventMessage>,
 }
 
+/// Refuses a command that could not be made durable, and says so.
+///
+/// Every command path answers a durability failure the same way, because it is
+/// the same failure: a full disk during a show must cost one refused command
+/// the operator can retry, never the daemon.
+fn refuse_undurable(
+    command: &CommandMessage,
+    current_revision: u64,
+    attempted_revision: u64,
+    error: &dyn Error,
+) -> CommandSubmission {
+    eprintln!(
+        "FREEMIXD_DURABILITY\tv=1\tcommand={}\trevision={attempted_revision}\terror={error}",
+        command.id
+    );
+    refused_submission(command, current_revision, error)
+}
+
+/// The answer to a command that could not be made durable.
+///
+/// It is refused, not failed: the engine never saw it, so retrying it is safe
+/// and the operator is told which command did not take effect instead of being
+/// told nothing or being told it succeeded.
+fn refused_submission(
+    command: &CommandMessage,
+    current_revision: u64,
+    error: &dyn Error,
+) -> CommandSubmission {
+    CommandSubmission {
+        output: ResultBeforeEvents {
+            result: CommandResult::Rejected {
+                id: command.id.clone(),
+                code: RejectionCode::Unavailable.as_str().to_owned(),
+                message: format!(
+                    "command was refused because it could not be made durable: {error}"
+                ),
+                fields: Vec::new(),
+                current_revision,
+                retryable: true,
+            },
+            events: Vec::new(),
+        },
+        replayed: false,
+        accepted: None,
+        subscriber_failures: Vec::new(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_durable_command(
     control: &mut ControlService<Policy>,
-    store: &dyn ProjectSaver,
+    store: &dyn DurableStore,
     durable: &mut StoredProject,
     principal: &Principal,
     server: &ServerIdentity,
@@ -4549,7 +4884,7 @@ fn execute_durable_command(
 #[allow(clippy::too_many_arguments)]
 fn execute_durable_command_with_ticks(
     control: &mut ControlService<Policy>,
-    store: &dyn ProjectSaver,
+    store: &dyn DurableStore,
     durable: &mut StoredProject,
     principal: &Principal,
     server: &ServerIdentity,
@@ -4579,7 +4914,28 @@ fn execute_durable_command_with_ticks(
     let projected = prepared.project(u64::from(ticks))?;
     let updated =
         stored_project_from_snapshot(durable, &projected, command, &prepared.output().result)?;
-    store.save(&updated)?;
+    // Durability comes first: the mutation survives a crash before the engine
+    // commits it, before its events are published, and before the acceptance is
+    // returned to the caller for acknowledgement.
+    if let Err(error) = store.record(command, now_millis, durable, &updated) {
+        // Nothing was made durable, so nothing may be acknowledged. Dropping
+        // the preparation abandons it without touching the engine: no revision,
+        // no receipt, no events, so the same command may simply be sent again.
+        drop(prepared);
+        eprintln!(
+            "FREEMIXD_DURABILITY\tv=1\tcommand={}\trevision={}\terror={error}",
+            command.id,
+            updated.position().revision
+        );
+        return Ok(DurableExecution {
+            submission: refused_submission(
+                command,
+                control.diagnostics().current_revision,
+                error.as_ref(),
+            ),
+            runtime_events: Vec::new(),
+        });
+    }
 
     let submission = prepared.commit()?;
     let mut runtime_events = Vec::new();
@@ -5392,14 +5748,16 @@ fn now_millis() -> AppResult<u64> {
 fn print_help() {
     println!(
         "FreeMix headless production daemon\n\n\
-Usage:\n  freemixd serve <show.freemix> [--listen 127.0.0.1:0] [--web-listen 127.0.0.1:0] [--once] [--native-media [--camera-helper PATH]] [--record-program output.mp4] [--diagnostic-stop-after 10m] [--fullscreen-program [--fullscreen-display 0]]\n  freemixd help\n  freemixd --version\n\n\
+Usage:\n  freemixd serve <show.freemix> [--listen 127.0.0.1:0] [--web-listen 127.0.0.1:0] [--status-listen 127.0.0.1:0] [--once] [--native-media [--camera-helper PATH]] [--record-program output.mp4] [--diagnostic-stop-after 10m] [--recover-to-checkpoint] [--fullscreen-program [--fullscreen-display 0]]\n  freemixd help\n  freemixd --version\n\n\
 Native media is opt-in; without it the daemon uses simulated frame realization.\n\
 --camera-helper overrides the developer AVFoundation helper path for exact macOS Device inputs; it never requests permission.\n\
 Program recording requires native media, an existing output parent, and a new final .mp4 file. Existing files are never overwritten.\n\
 Use --record-program=<path> when the output name begins with --. Recorder capability digests describe configured startup support; FREEMIXD_RECORDER reports runtime health.\n\
 macOS fullscreen display selection is a zero-based index ordered by physical position, then stable descriptive fields.\n\
 --diagnostic-stop-after schedules cooperative simulated or headless native shutdown after readiness; accepted units are ms, s, m, and h up to 24h.\n\
+--recover-to-checkpoint opens the project at its last checkpoint and permanently discards every acknowledged command the journal recorded after it, printing each abandoned sequence, revision and command id first. It loses work; use it only when a replay is refused and the show must go on. It is unavailable with --fullscreen-program.\n\
 --web-listen enables the loopback-only `/v1/control` WebSocket listener and requires FREEMIXD_WEB_TOKEN.\n\
+--status-listen enables the loopback-only operator status listener serving /healthz, /readyz, and the token-guarded /v1/support-bundle; it requires FREEMIXD_STATUS_TOKEN and is unavailable with --fullscreen-program.\n\
 Native mode continues across client disconnects; close the Program window or press Escape for bounded shutdown."
     );
 }
@@ -5885,8 +6243,18 @@ mod tests {
 
     struct FailingSaver;
 
-    impl ProjectSaver for FailingSaver {
-        fn save(&self, _project: &StoredProject) -> AppResult<()> {
+    impl DurableStore for FailingSaver {
+        fn record(
+            &self,
+            _command: &CommandMessage,
+            _now_millis: u64,
+            _previous: &StoredProject,
+            _updated: &StoredProject,
+        ) -> AppResult<()> {
+            Err(AppFailure("injected save failure".into()).into())
+        }
+
+        fn checkpoint(&self, _project: &StoredProject) -> AppResult<()> {
             Err(AppFailure("injected save failure".into()).into())
         }
     }
@@ -5896,10 +6264,27 @@ mod tests {
         saved: RefCell<Option<StoredProject>>,
     }
 
-    impl ProjectSaver for ObservingSaver<'_> {
-        fn save(&self, project: &StoredProject) -> AppResult<()> {
+    impl ObservingSaver<'_> {
+        fn observe(&self, project: &StoredProject) {
             assert_eq!(self.subscription.try_recv(), Err(TryRecvError::Empty));
             self.saved.replace(Some(project.clone()));
+        }
+    }
+
+    impl DurableStore for ObservingSaver<'_> {
+        fn record(
+            &self,
+            _command: &CommandMessage,
+            _now_millis: u64,
+            _previous: &StoredProject,
+            updated: &StoredProject,
+        ) -> AppResult<()> {
+            self.observe(updated);
+            Ok(())
+        }
+
+        fn checkpoint(&self, project: &StoredProject) -> AppResult<()> {
+            self.observe(project);
             Ok(())
         }
     }
@@ -5907,8 +6292,19 @@ mod tests {
     #[derive(Default)]
     struct CountingSaver(Cell<u32>);
 
-    impl ProjectSaver for CountingSaver {
-        fn save(&self, _project: &StoredProject) -> AppResult<()> {
+    impl DurableStore for CountingSaver {
+        fn record(
+            &self,
+            _command: &CommandMessage,
+            _now_millis: u64,
+            _previous: &StoredProject,
+            _updated: &StoredProject,
+        ) -> AppResult<()> {
+            self.0.set(self.0.get() + 1);
+            Ok(())
+        }
+
+        fn checkpoint(&self, _project: &StoredProject) -> AppResult<()> {
             self.0.set(self.0.get() + 1);
             Ok(())
         }
@@ -5916,10 +6312,26 @@ mod tests {
 
     struct CrashAfterSave<'a>(&'a ProjectStore);
 
-    impl ProjectSaver for CrashAfterSave<'_> {
-        fn save(&self, project: &StoredProject) -> AppResult<()> {
+    impl CrashAfterSave<'_> {
+        fn save_then_crash(&self, project: &StoredProject) -> AppResult<()> {
             ProjectStore::save(self.0, project)?;
             panic!("simulated crash after save");
+        }
+    }
+
+    impl DurableStore for CrashAfterSave<'_> {
+        fn record(
+            &self,
+            _command: &CommandMessage,
+            _now_millis: u64,
+            _previous: &StoredProject,
+            updated: &StoredProject,
+        ) -> AppResult<()> {
+            self.save_then_crash(updated)
+        }
+
+        fn checkpoint(&self, project: &StoredProject) -> AppResult<()> {
+            self.save_then_crash(project)
         }
     }
 
@@ -5942,6 +6354,7 @@ mod tests {
                 project: "show.freemix".into(),
                 listen: "127.0.0.1:9123".parse().unwrap(),
                 web_listen: None,
+                status_listen: None,
                 once: true,
                 native_media: false,
                 fullscreen_program: false,
@@ -6667,6 +7080,7 @@ mod tests {
         let (expired_tx, expired_rx) = std::sync::mpsc::sync_channel(1);
         let server_thread = thread::spawn(move || {
             let store = ProjectStore::new(project_path).unwrap();
+            let journal = DurableJournal::new(&store, 0);
             let mut durable = test_project();
             let project_id = durable.project().id();
             let control = Rc::new(RefCell::new(test_control(&durable)));
@@ -6694,7 +7108,7 @@ mod tests {
                     stream,
                     &server,
                     &control,
-                    &store,
+                    &journal,
                     &mut durable,
                     &principal,
                     &authority,
@@ -6741,6 +7155,7 @@ mod tests {
         let (completed_tx, completed_rx) = std::sync::mpsc::sync_channel(1);
         let server_thread = thread::spawn(move || {
             let store = ProjectStore::new(project_path).unwrap();
+            let journal = DurableJournal::new(&store, 0);
             let mut durable = test_project();
             let project_id = durable.project().id();
             let control = Rc::new(RefCell::new(test_control(&durable)));
@@ -6764,7 +7179,7 @@ mod tests {
                 stream,
                 &server,
                 &control,
-                &store,
+                &journal,
                 &mut durable,
                 &principal,
                 &authority,
@@ -6783,7 +7198,7 @@ mod tests {
                 stream,
                 &server,
                 &control,
-                &store,
+                &journal,
                 &mut durable,
                 &principal,
                 &authority,
@@ -6845,6 +7260,7 @@ mod tests {
         let (expired_tx, expired_rx) = std::sync::mpsc::sync_channel(1);
         let server_thread = thread::spawn(move || {
             let store = ProjectStore::new(project_path).unwrap();
+            let journal = DurableJournal::new(&store, 0);
             let mut durable = test_project();
             let project_id = durable.project().id();
             let control = Rc::new(RefCell::new(test_control(&durable)));
@@ -6869,7 +7285,7 @@ mod tests {
                     stream,
                     &server,
                     &control,
-                    &store,
+                    &journal,
                     &mut durable,
                     &principal,
                     &authority,
@@ -7752,8 +8168,11 @@ mod tests {
         assert_eq!(host_deadline_offset(&pacer).unwrap().as_secs(), 1_001);
     }
 
+    /// A command that could not be made durable is refused, not acknowledged
+    /// and not half-applied: the engine keeps its revision, publishes nothing,
+    /// and installs no receipt, so the same command may simply be sent again.
     #[test]
-    fn failed_save_aborts_preparation_without_authority_or_output() {
+    fn a_command_that_cannot_be_made_durable_is_refused() {
         let mut durable = test_project();
         let initial_engine = restore_engine(&durable).unwrap().snapshot().unwrap();
         let mut control = test_control(&durable);
@@ -7763,7 +8182,7 @@ mod tests {
         let server = test_server(&control);
         let command = test_command("failed-save", "failed-save-key", CommandPayload::Cut);
 
-        let error = execute_durable_command(
+        let execution = execute_durable_command(
             &mut control,
             &FailingSaver,
             &mut durable,
@@ -7772,10 +8191,21 @@ mod tests {
             &command,
             0,
         )
-        .err()
-        .expect("save failure must not produce a command result");
+        .expect("a durability failure is refused, not propagated");
 
-        assert_eq!(error.to_string(), "injected save failure");
+        assert!(matches!(
+            &execution.submission.output.result,
+            CommandResult::Rejected {
+                code,
+                retryable: true,
+                current_revision: 0,
+                ..
+            } if code == "unavailable"
+        ));
+        assert!(execution.submission.output.events.is_empty());
+        assert!(execution.submission.accepted.is_none());
+        assert!(!execution.submission.replayed);
+        assert!(execution.runtime_events.is_empty());
         assert_eq!(durable, test_project());
         assert_eq!(control.diagnostics(), before_diagnostics);
         assert_eq!(control.snapshot(), &before_snapshot);
@@ -7790,7 +8220,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_manual_position_save_preserves_restart_state_and_retryability() {
+    fn a_refused_manual_position_preserves_restart_state_and_stays_retryable() {
         let mut durable = test_project();
         let mut control = test_control(&durable);
         let server = test_server(&control);
@@ -7820,7 +8250,7 @@ mod tests {
             },
         );
 
-        let error = execute_durable_command(
+        let refused = execute_durable_command(
             &mut control,
             &FailingSaver,
             &mut durable,
@@ -7829,10 +8259,12 @@ mod tests {
             &position_command,
             0,
         )
-        .err()
-        .expect("save failure must abort the manual position command");
+        .expect("a durability failure is refused, not propagated");
 
-        assert_eq!(error.to_string(), "injected save failure");
+        assert!(matches!(
+            &refused.submission.output.result,
+            CommandResult::Rejected { code, retryable: true, .. } if code == "unavailable"
+        ));
         assert_eq!(durable, before_durable);
         assert_eq!(control.idle_engine_snapshot().unwrap(), before_engine);
 

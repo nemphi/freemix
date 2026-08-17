@@ -278,7 +278,7 @@ fn schedule_boundaries_are_inclusive_anchored_and_caller_driven() {
 }
 
 #[test]
-fn programmed_go_previews_orders_cancels_and_is_idempotent() {
+fn programmed_go_previews_orders_cancels_and_suppresses_a_retried_press() {
     let source = input(7);
     let program = ProgrammedGo::new([
         GoAction::Intent(CommandIntent::discrete(TestCommand::Named("preview"))),
@@ -301,15 +301,33 @@ fn programmed_go_previews_orders_cancels_and_is_idempotent() {
         [0, 10, 15]
     );
 
-    let key = IdempotencyKey::new("go-1");
-    let first = engine.start(source, key.clone(), 100).unwrap();
-    let duplicate = engine.start(source, key, 999).unwrap();
-    assert_eq!(duplicate.run_id, first.run_id);
-    assert!(duplicate.replayed);
+    let press = IdempotencyKey::new("go-1");
+    let first = engine.start(source, press.clone(), 100).unwrap();
+    assert!(!first.replayed);
+    assert_eq!(engine.program_len(), 1);
+    assert_eq!(engine.active_run_len(), 1);
+
+    // One operator press, retried: the same run, and nothing scheduled twice.
+    let retry = engine.start(source, press, 999).unwrap();
+    assert!(retry.replayed);
+    assert_eq!(retry.run_id, first.run_id);
+    assert_eq!(engine.active_run_len(), 1);
+
     assert_eq!(engine.poll(100)[0].action.index, 0);
+    assert!(
+        engine.poll(100).is_empty(),
+        "the retried press scheduled nothing a second time"
+    );
     assert_eq!(engine.poll(110)[0].action.index, 1);
     assert!(engine.cancel(first.run_id));
     assert!(engine.poll(115).is_empty());
+
+    // A different press is a different run.
+    let second = engine
+        .start(source, IdempotencyKey::new("go-2"), 200)
+        .unwrap();
+    assert!(!second.replayed);
+    assert_ne!(second.run_id, first.run_id);
 }
 
 #[test]
@@ -438,12 +456,38 @@ fn controller_learn_and_activator_reconnect_are_state_only() {
 }
 
 #[test]
-fn continuous_intents_coalesce_without_absorbing_discrete_commands() {
-    let mut buffer = IntentBuffer::default();
-    buffer.push(CommandIntent::continuous("fader-1", TestCommand::Value(10)));
-    buffer.push(CommandIntent::discrete(TestCommand::Named("cut")));
-    buffer.push(CommandIntent::continuous("fader-1", TestCommand::Value(20)));
-    buffer.push(CommandIntent::continuous("fader-2", TestCommand::Value(30)));
+fn continuous_intents_coalesce_within_one_scope_and_report_what_they_supersede() {
+    let mut buffer: IntentBuffer<TestCommand, &str> = IntentBuffer::default();
+    assert_eq!(
+        buffer.push(
+            "a",
+            CommandIntent::continuous("fader-1", TestCommand::Value(10))
+        ),
+        None
+    );
+    buffer.push("a", CommandIntent::discrete(TestCommand::Named("cut")));
+    assert_eq!(
+        buffer.push(
+            "a",
+            CommandIntent::continuous("fader-1", TestCommand::Value(20))
+        ),
+        Some(TestCommand::Value(10)),
+        "a superseded value is handed back, never dropped in silence"
+    );
+    buffer.push(
+        "a",
+        CommandIntent::continuous("fader-2", TestCommand::Value(30)),
+    );
+
+    // A second binding driving a stream of the same name is a different
+    // command; coalescing it into the first would destroy one of them.
+    assert_eq!(
+        buffer.push(
+            "b",
+            CommandIntent::continuous("fader-1", TestCommand::Value(99))
+        ),
+        None
+    );
 
     assert_eq!(
         buffer.drain_discrete(),
@@ -454,14 +498,21 @@ fn continuous_intents_coalesce_without_absorbing_discrete_commands() {
         [
             CommandIntent::continuous("fader-1", TestCommand::Value(20)),
             CommandIntent::continuous("fader-2", TestCommand::Value(30)),
+            CommandIntent::continuous("fader-1", TestCommand::Value(99)),
         ]
     );
 
-    buffer.push(CommandIntent::continuous("fader-1", TestCommand::Value(40)));
-    buffer.push(CommandIntent::commit_continuous(
-        "fader-1",
-        TestCommand::Value(50),
-    ));
+    buffer.push(
+        "a",
+        CommandIntent::continuous("fader-1", TestCommand::Value(40)),
+    );
+    assert_eq!(
+        buffer.push(
+            "a",
+            CommandIntent::commit_continuous("fader-1", TestCommand::Value(50))
+        ),
+        Some(TestCommand::Value(40))
+    );
     assert_eq!(buffer.continuous_len(), 0);
     assert!(matches!(
         buffer.pop_discrete(),

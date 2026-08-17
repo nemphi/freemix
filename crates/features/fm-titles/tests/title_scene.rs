@@ -1,11 +1,15 @@
 use fm_titles::{
     Alignment, AnimatedProperty, AnimationTrack, AssetCatalog, Bounds, ClockDirection, ClockFormat,
     ClockSpec, Color, Element, ElementId, ElementKind, FieldDefinition, FieldId, FieldType,
-    FieldValue, FontStyle, HorizontalAlignment, ImageSource, Interpolation, Keyframe,
-    ReferenceRenderer, Style, TemplateId, TickerDirection, TickerSpec, TitleId, TitleTemplate,
-    UpdateError, VerticalAlignment, evaluate_clock, evaluate_ticker_position, validate_template,
+    FieldValue, FontError, FontFace, FontStyle, ImageSource, Interpolation, Keyframe,
+    MAX_OUTPUT_WIDTH, ReferenceRenderer, RenderError, Style, TemplateId, TickerDirection,
+    TickerSpec, TitleId, TitleTemplate, UpdateError, ValidationError, evaluate_clock,
+    evaluate_ticker_position, validate_template,
 };
 use std::num::NonZeroU128;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 fn field_id(value: u128) -> FieldId {
     FieldId::new(NonZeroU128::new(value).unwrap())
@@ -312,7 +316,7 @@ fn validation_and_rendering_report_missing_assets_and_limitations() {
             .report
             .limitations
             .iter()
-            .any(|limitation| limitation.contains("without shaping"))
+            .any(|limitation| limitation.contains("no complex-script shaping"))
     );
     assert!(
         rendered
@@ -324,128 +328,123 @@ fn validation_and_rendering_report_missing_assets_and_limitations() {
 }
 
 #[test]
-#[allow(clippy::too_many_lines)]
-fn all_element_kinds_produce_repeatable_pixels() {
-    let text_field = field_id(1);
-    let image_field = field_id(2);
-    let color_field = field_id(3);
-    let fields = vec![
-        FieldDefinition {
-            id: text_field,
-            name: "message".into(),
-            default: FieldValue::Text("AB".into()),
-        },
-        FieldDefinition {
-            id: image_field,
-            name: "image".into(),
-            default: FieldValue::Image(ImageSource::new("image.png")),
-        },
-        FieldDefinition {
-            id: color_field,
-            name: "color".into(),
-            default: FieldValue::Color(Color::new(12, 34, 56, 255)),
-        },
-    ];
-    let text_style = Style {
-        fill: Color::new(255, 255, 255, 255),
-        background: None,
-        opacity: 255,
-        font: Some(FontStyle {
-            family: "Block Test".into(),
-            size_px: 4,
-        }),
-        alignment: Alignment {
-            horizontal: HorizontalAlignment::Center,
-            vertical: VerticalAlignment::Center,
-        },
-    };
+fn text_elements_require_a_resolvable_font_style() {
+    let message = field_id(1);
+    let fields = vec![FieldDefinition {
+        id: message,
+        name: "message".into(),
+        default: FieldValue::Text("hello".into()),
+    }];
     let bounds = Bounds {
         x: 0,
         y: 0,
-        width: 16,
+        width: 8,
         height: 8,
     };
-    let elements = vec![
-        rectangle(1, 0, Color::BLACK, bounds),
-        Element {
-            id: element_id(2),
-            name: "text".into(),
-            bounds,
-            z_index: 1,
-            visible: true,
-            style: text_style.clone(),
-            color_field: Some(color_field),
-            kind: ElementKind::Text { field: text_field },
-            animations: vec![AnimationTrack {
-                property: AnimatedProperty::Opacity,
-                keyframes: vec![Keyframe {
-                    at_ms: 0,
-                    value: 255,
-                    interpolation: Interpolation::Hold,
-                }],
-            }],
-        },
-        Element {
-            id: element_id(3),
-            name: "image".into(),
-            bounds: Bounds {
-                x: 0,
-                y: 0,
-                width: 4,
-                height: 4,
-            },
-            z_index: 2,
-            visible: true,
-            style: style(Color::new(200, 0, 0, 255)),
-            color_field: None,
-            kind: ElementKind::ImagePlaceholder { field: image_field },
-            animations: Vec::new(),
-        },
-        Element {
-            id: element_id(4),
-            name: "clock".into(),
-            bounds,
-            z_index: 3,
-            visible: true,
-            style: text_style.clone(),
-            color_field: None,
-            kind: ElementKind::Clock(ClockSpec {
-                direction: ClockDirection::CountUp,
-                start_value_ms: 0,
-                starts_at_ms: 0,
-                format: ClockFormat::MinutesSeconds,
-            }),
-            animations: Vec::new(),
-        },
-        Element {
-            id: element_id(5),
-            name: "ticker".into(),
-            bounds,
-            z_index: 4,
-            visible: true,
-            style: text_style,
-            color_field: None,
-            kind: ElementKind::Ticker(TickerSpec {
-                field: text_field,
-                direction: TickerDirection::Right,
-                pixels_per_second: 3,
-                gap_px: 2,
-                starts_at_ms: 0,
-            }),
-            animations: Vec::new(),
-        },
-    ];
-    let scene = template(fields, elements, 16, 8)
+    let mut element = Element {
+        id: element_id(1),
+        name: "text".into(),
+        bounds,
+        z_index: 0,
+        visible: true,
+        style: style(Color::new(255, 255, 255, 255)),
+        color_field: None,
+        kind: ElementKind::Text { field: message },
+        animations: Vec::new(),
+    };
+    let without_font = template(fields.clone(), vec![element.clone()], 8, 8);
+    assert!(
+        validate_template(&without_font, &AssetCatalog::new())
+            .errors
+            .contains(&ValidationError::MissingFontStyle(element_id(1)))
+    );
+
+    element.style.font = Some(FontStyle {
+        family: "  ".into(),
+        size_px: 8,
+    });
+    let blank_family = template(fields, vec![element], 8, 8);
+    assert!(
+        validate_template(&blank_family, &AssetCatalog::new())
+            .errors
+            .contains(&ValidationError::EmptyFontFamily(element_id(1)))
+    );
+}
+
+#[test]
+fn invalid_font_bytes_produce_typed_errors() {
+    assert_eq!(
+        FontFace::from_bytes(Vec::new()).err(),
+        Some(FontError::Empty)
+    );
+    assert_eq!(
+        FontFace::from_bytes(vec![0; 64]).err(),
+        Some(FontError::Unparsable)
+    );
+    // A plausible-looking TrueType header with no tables must be refused too,
+    // rather than parsing into a face that panics during layout.
+    let mut truncated = vec![0x00, 0x01, 0x00, 0x00, 0x00, 0x09];
+    truncated.extend_from_slice(&[0xff; 250]);
+    assert!(FontFace::from_bytes(truncated).is_err());
+}
+
+#[test]
+fn an_element_far_larger_than_the_canvas_costs_only_the_canvas() {
+    // Element extents are `u32` and animatable to `u32::MAX`, so an operator
+    // can put this on air with a valid template. Filling it must iterate the
+    // canvas intersection; iterating the declared extent and discarding the
+    // off-canvas pixels one at a time never finishes.
+    let bounds = Bounds {
+        x: -1_000_000,
+        y: -1_000_000,
+        width: 4_000_000_000,
+        height: 4_000_000_000,
+    };
+    let scene = template(
+        Vec::new(),
+        vec![rectangle(1, 0, Color::new(0, 255, 0, 255), bounds)],
+        64,
+        64,
+    )
+    .instantiate(title_id(1))
+    .unwrap();
+
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let output = ReferenceRenderer
+            .render(&scene, 0, &AssetCatalog::new())
+            .unwrap();
+        sender.send(output.frame.pixels().to_vec()).ok();
+    });
+    let pixels = receiver
+        .recv_timeout(Duration::from_secs(10))
+        .expect("a 64x64 render must be bounded by the canvas, not by the element extent");
+
+    // The canvas is entirely inside the element, so every pixel is filled.
+    assert!(
+        pixels
+            .chunks_exact(4)
+            .all(|pixel| pixel == [0, 255, 0, 255]),
+        "the clipped fill must still cover the whole canvas"
+    );
+}
+
+#[test]
+fn oversized_output_is_refused_before_allocating() {
+    let scene = template(Vec::new(), Vec::new(), MAX_OUTPUT_WIDTH + 1, 16)
         .instantiate(title_id(1))
         .unwrap();
-    let assets = AssetCatalog::new()
-        .with_font("Block Test")
-        .with_image("image.png");
-    let first = ReferenceRenderer.render(&scene, 1_234, &assets).unwrap();
-    let second = ReferenceRenderer.render(&scene, 1_234, &assets).unwrap();
-
-    assert_eq!(first.frame.pixels(), second.frame.pixels());
-    assert!(first.frame.pixels().iter().any(|channel| *channel != 0));
-    assert!(first.report.missing_fonts.is_empty());
-    assert!(first.report.missing_images.is_empty());
+    let error = ReferenceRenderer
+        .render(&scene, 0, &AssetCatalog::new())
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            RenderError::OutputTooLarge {
+                max_width: MAX_OUTPUT_WIDTH,
+                ..
+            }
+        ),
+        "expected an output size cap error, got {error}"
+    );
 }

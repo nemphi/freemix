@@ -30,6 +30,7 @@ mod error;
 mod probe;
 mod process;
 pub mod record;
+pub mod stream;
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, Metadata};

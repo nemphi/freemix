@@ -220,8 +220,13 @@ impl<C> ShortcutRegistry<C> {
         Some(self.shortcuts.remove(index))
     }
 
+    /// Resolves a chord to exactly one binding.
+    ///
+    /// A local binding for `scope` always wins over a global one; [`Self::insert`]
+    /// refuses any other ambiguity, so the outcome never depends on iteration
+    /// order.
     #[must_use]
-    pub fn resolve(&self, scope: Option<&str>, chord: &Chord) -> Option<&CommandIntent<C>> {
+    pub fn resolve(&self, scope: Option<&str>, chord: &Chord) -> Option<&Shortcut<C>> {
         scope
             .and_then(|scope| {
                 self.shortcuts.iter().find(|entry| {
@@ -234,6 +239,5 @@ impl<C> ShortcutRegistry<C> {
                     entry.chord == *chord && matches!(entry.scope, ShortcutScope::Global)
                 })
             })
-            .map(|entry| &entry.intent)
     }
 }

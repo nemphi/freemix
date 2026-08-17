@@ -1,12 +1,19 @@
 use crate::{
-    AnimatedProperty, Element, ElementId, ElementKind, FieldId, FieldType, FieldValue, TitleScene,
-    TitleTemplate,
+    AnimatedProperty, Element, ElementId, ElementKind, FieldId, FieldType, FieldValue, FontError,
+    FontFace, TitleScene, TitleTemplate,
 };
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+/// Assets a scene may reference: parsed font faces keyed by family name, and
+/// image asset names.
+///
+/// Fonts are owned bytes the caller loaded from a project asset. There is no
+/// system font discovery and no fallback chain: a family that is not in the
+/// catalog simply does not render, and is reported as missing.
+#[derive(Clone, Debug, Default)]
 pub struct AssetCatalog {
-    fonts: BTreeSet<String>,
+    fonts: BTreeMap<String, Arc<FontFace>>,
     images: BTreeSet<String>,
 }
 
@@ -14,15 +21,31 @@ impl AssetCatalog {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            fonts: BTreeSet::new(),
+            fonts: BTreeMap::new(),
             images: BTreeSet::new(),
         }
     }
 
+    /// Registers an already parsed face under a family name.
     #[must_use]
-    pub fn with_font(mut self, family: impl Into<String>) -> Self {
-        self.fonts.insert(family.into());
+    pub fn with_font(mut self, family: impl Into<String>, face: FontFace) -> Self {
+        self.fonts.insert(family.into(), Arc::new(face));
         self
+    }
+
+    /// Parses owned font bytes and registers them under a family name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FontError`] if the bytes are empty, oversized, unparsable, or
+    /// metrically unusable.
+    pub fn with_font_bytes(
+        self,
+        family: impl Into<String>,
+        bytes: Vec<u8>,
+    ) -> Result<Self, FontError> {
+        let face = FontFace::from_bytes(bytes)?;
+        Ok(self.with_font(family, face))
     }
 
     #[must_use]
@@ -33,7 +56,12 @@ impl AssetCatalog {
 
     #[must_use]
     pub fn has_font(&self, family: &str) -> bool {
-        self.fonts.contains(family)
+        self.fonts.contains_key(family)
+    }
+
+    #[must_use]
+    pub fn font(&self, family: &str) -> Option<&FontFace> {
+        self.fonts.get(family).map(AsRef::as_ref)
     }
 
     #[must_use]
@@ -52,6 +80,11 @@ pub enum ValidationError {
     DuplicateElementId(ElementId),
     ZeroElementBounds(ElementId),
     ZeroFontSize(ElementId),
+    /// A declared font family is blank and can never resolve to a face.
+    EmptyFontFamily(ElementId),
+    /// A text, clock, or ticker element carries no font style, so there is no
+    /// face to rasterize with.
+    MissingFontStyle(ElementId),
     UnknownField {
         element: ElementId,
         field: FieldId,
@@ -175,13 +208,21 @@ fn validate_element(
     if element.bounds.width == 0 || element.bounds.height == 0 {
         errors.push(ValidationError::ZeroElementBounds(element.id));
     }
-    if element
-        .style
-        .font
-        .as_ref()
-        .is_some_and(|font| font.size_px == 0)
-    {
-        errors.push(ValidationError::ZeroFontSize(element.id));
+    let needs_font = matches!(
+        element.kind,
+        ElementKind::Text { .. } | ElementKind::Clock(_) | ElementKind::Ticker(_)
+    );
+    match element.style.font.as_ref() {
+        Some(font) => {
+            if font.size_px == 0 {
+                errors.push(ValidationError::ZeroFontSize(element.id));
+            }
+            if font.family.trim().is_empty() {
+                errors.push(ValidationError::EmptyFontFamily(element.id));
+            }
+        }
+        None if needs_font => errors.push(ValidationError::MissingFontStyle(element.id)),
+        None => {}
     }
 
     match element.kind {

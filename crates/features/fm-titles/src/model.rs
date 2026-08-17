@@ -3,6 +3,7 @@ use crate::{
     validation::validate_template_structure,
 };
 use core::fmt;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -121,10 +122,12 @@ impl FieldValue {
         }
     }
 
-    pub(crate) fn display_text(&self) -> Option<String> {
+    /// Borrows the text a renderer would draw. Borrowed, not cloned: copying a
+    /// field would allocate once per frame in proportion to its length.
+    pub(crate) fn display_text(&self) -> Option<Cow<'_, str>> {
         match self {
-            Self::Text(value) => Some(value.clone()),
-            Self::Number(value) => Some(value.to_string()),
+            Self::Text(value) => Some(Cow::Borrowed(value)),
+            Self::Number(value) => Some(Cow::Owned(value.to_string())),
             Self::Image(_) | Self::Color(_) => None,
         }
     }

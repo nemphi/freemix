@@ -6,6 +6,7 @@ use fm_types::ProjectId;
 pub mod native_media;
 
 const READY_PREFIX: &str = "FREEMIXD_READY";
+const STATUS_READY_PREFIX: &str = "FREEMIXD_STATUS_READY";
 const READY_VERSION: &str = "v=1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -51,6 +52,43 @@ impl FromStr for ReadinessRecord {
             address,
             project_id,
         })
+    }
+}
+
+/// The operator status listener address, announced once the daemon is ready.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StatusReadinessRecord {
+    pub address: SocketAddr,
+}
+
+impl fmt::Display for StatusReadinessRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{STATUS_READY_PREFIX}\t{READY_VERSION}\taddress={}",
+            self.address
+        )
+    }
+}
+
+impl FromStr for StatusReadinessRecord {
+    type Err = ReadinessParseError;
+
+    fn from_str(line: &str) -> Result<Self, Self::Err> {
+        let line = line.trim_end_matches(['\r', '\n']);
+        let mut fields = line.split('\t');
+        if fields.next() != Some(STATUS_READY_PREFIX) || fields.next() != Some(READY_VERSION) {
+            return Err(ReadinessParseError);
+        }
+        let address = fields
+            .next()
+            .and_then(|field| field.strip_prefix("address="))
+            .and_then(|address| address.parse().ok())
+            .ok_or(ReadinessParseError)?;
+        if fields.next().is_some() {
+            return Err(ReadinessParseError);
+        }
+        Ok(Self { address })
     }
 }
 
