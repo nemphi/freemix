@@ -264,7 +264,7 @@ pub fn run(command: Command) -> AppResult<()> {
             name,
         )?,
         Command::SceneLayerRemove { path, scene, index } => {
-            remove_scene_layer(&path, scene_id(scene)?, index)?
+            remove_scene_layer(&path, scene_id(scene)?, index)?;
         }
         Command::SceneLayerMove {
             path,
@@ -362,7 +362,7 @@ pub fn run(command: Command) -> AppResult<()> {
             Some(CropRect::new(x, y, width, height)),
         )?,
         Command::SceneLayerCropClear { path, scene, index } => {
-            set_scene_layer_crop(&path, scene_id(scene)?, index, None)?
+            set_scene_layer_crop(&path, scene_id(scene)?, index, None)?;
         }
         Command::SceneLayerMask {
             path,
@@ -380,7 +380,7 @@ pub fn run(command: Command) -> AppResult<()> {
             Some(RectMask::new(x, y, width, height).inverted(inverted)),
         )?,
         Command::SceneLayerMaskClear { path, scene, index } => {
-            set_scene_layer_mask(&path, scene_id(scene)?, index, None)?
+            set_scene_layer_mask(&path, scene_id(scene)?, index, None)?;
         }
         Command::InputRemove { path, input } => remove_input(&path, input_id(input)?)?,
         Command::InputDuplicate {
@@ -390,7 +390,7 @@ pub fn run(command: Command) -> AppResult<()> {
             name,
         } => duplicate_input(&path, input_id(source)?, input_id(input)?, name)?,
         Command::InputReplaceSimulated { path, input } => {
-            replace_input_simulated(&path, input_id(input)?)?
+            replace_input_simulated(&path, input_id(input)?)?;
         }
         Command::InputReplaceSolid {
             path,
@@ -413,7 +413,7 @@ pub fn run(command: Command) -> AppResult<()> {
             replace_input_media(&path, input_id(input)?, asset_uri)?;
         }
         Command::InputReplaceScene { path, input, scene } => {
-            replace_input_scene(&path, input_id(input)?, scene_id(scene)?)?
+            replace_input_scene(&path, input_id(input)?, scene_id(scene)?)?;
         }
         Command::Status { path } => print_status(&inspect_engine(&path)?),
         Command::JournalRecover { path } => recover_journal(&path)?,
@@ -1457,7 +1457,7 @@ fn save_engine(path: &Path, project_engine: &ProjectEngine) -> AppResult<()> {
     let realized = snapshot.realized_switcher();
     let mut project = project_engine.project.clone();
     project.set_main_mix(MainMix::new(desired.program(), desired.preview()));
-    project.reorder_inputs(snapshot.show().inputs().to_vec())?;
+    project.reorder_inputs(snapshot.show().inputs())?;
     sync_input_names(&mut project, snapshot.show())?;
     sync_input_audio_strips(&mut project, snapshot.show())?;
     let stored = StoredProject::from_project_with_complete_runtime_state(
@@ -2416,15 +2416,15 @@ fn update_project(
 }
 
 fn load_engine(path: &Path) -> AppResult<ProjectEngine> {
-    restore_project_engine(load_stored_project(path)?)
+    restore_project_engine(&load_stored_project(path)?)
 }
 
 /// Restores an engine for reporting only, without opening the journal.
 fn inspect_engine(path: &Path) -> AppResult<ProjectEngine> {
-    restore_project_engine(inspect_stored_project(path)?)
+    restore_project_engine(&inspect_stored_project(path)?)
 }
 
-fn restore_project_engine(stored: StoredProject) -> AppResult<ProjectEngine> {
+fn restore_project_engine(stored: &StoredProject) -> AppResult<ProjectEngine> {
     let project = stored.project().clone();
     let inputs = project
         .inputs()
@@ -3276,6 +3276,7 @@ fn format_t_bar(state: Option<TBarState>) -> String {
     )
 }
 
+#[allow(clippy::too_many_lines)]
 fn print_help() {
     println!(
         "\

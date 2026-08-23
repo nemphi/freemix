@@ -11,8 +11,9 @@ use std::{
 };
 
 use fm_model::{
-    AudioBus, BusSend, Input, InputKind, Layer, LayerGeometry, RectMask, Rgba8, Rotation, Scene,
-    SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef, StartupPolicy,
+    AudioBus, BusSend, Input, InputAudioStripState, InputKind, Layer, LayerGeometry, RectMask,
+    Rgba8, Rotation, Scene, SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef,
+    StartupPolicy,
 };
 use fm_persistence::{MutationBatch, ProjectStore, StoredProject};
 use fm_protocol::{
@@ -226,14 +227,14 @@ fn serve_remote_sessions(listener: &TcpListener) {
         match session {
             1 => assert_command(
                 &command,
-                CommandPayload::SelectPreview { input: input(1) },
+                &CommandPayload::SelectPreview { input: input(1) },
                 "remote-preview",
                 0,
             ),
-            2 => assert_command(&command, CommandPayload::Cut, "remote-cut", 1),
+            2 => assert_command(&command, &CommandPayload::Cut, "remote-cut", 1),
             3 => assert_command(
                 &command,
-                CommandPayload::Fade { duration_frames: 4 },
+                &CommandPayload::Fade { duration_frames: 4 },
                 "remote-fade",
                 2,
             ),
@@ -251,7 +252,7 @@ fn serve_remote_sessions(listener: &TcpListener) {
             &mut writer,
             &engine,
             revision,
-            command.payload,
+            &command.payload,
             input(1),
             input(1),
         );
@@ -345,7 +346,7 @@ fn serve_peer_event_interleave(listener: &TcpListener) {
         &mut writer,
         &engine,
         1,
-        CommandPayload::Cut,
+        &CommandPayload::Cut,
         input(2),
         input(1),
     );
@@ -474,7 +475,7 @@ fn serve_alpha_fade(listener: &TcpListener) {
     serve_automatic_transition(
         listener,
         fm_protocol::CURRENT_PROTOCOL_VERSION,
-        CommandPayload::AlphaFade { duration_frames: 3 },
+        &CommandPayload::AlphaFade { duration_frames: 3 },
         "remote-alpha-fade",
     );
 }
@@ -483,7 +484,7 @@ fn serve_slide(listener: &TcpListener) {
     serve_automatic_transition(
         listener,
         fm_protocol::CURRENT_PROTOCOL_VERSION,
-        CommandPayload::Slide { duration_frames: 3 },
+        &CommandPayload::Slide { duration_frames: 3 },
         "remote-slide",
     );
 }
@@ -492,7 +493,7 @@ fn serve_zoom(listener: &TcpListener) {
     serve_automatic_transition(
         listener,
         fm_protocol::CURRENT_PROTOCOL_VERSION,
-        CommandPayload::Zoom { duration_frames: 3 },
+        &CommandPayload::Zoom { duration_frames: 3 },
         "remote-zoom",
     );
 }
@@ -514,7 +515,7 @@ fn serve_audio_strip(listener: &TcpListener) {
     };
     assert_command(
         &command,
-        CommandPayload::SetInputAudioStrip {
+        &CommandPayload::SetInputAudioStrip {
             input: input(2),
             gain_millidb: -6_000,
             balance_basis_points: 2_500,
@@ -590,7 +591,7 @@ fn serve_stinger(listener: &TcpListener) {
     serve_automatic_transition(
         listener,
         fm_protocol::CURRENT_PROTOCOL_VERSION,
-        CommandPayload::Stinger {
+        &CommandPayload::Stinger {
             slot: fm_protocol::WireStingerSlotId::new(8).unwrap(),
             duration_frames: 3,
         },
@@ -629,7 +630,7 @@ fn serve_stinger_configuration(listener: &TcpListener) {
         };
         assert_command(
             &command,
-            expected_payload,
+            &expected_payload,
             if index == 0 {
                 "configure-stinger"
             } else {
@@ -685,7 +686,7 @@ fn serve_stinger_configuration(listener: &TcpListener) {
 fn serve_automatic_transition(
     listener: &TcpListener,
     protocol: ProtocolVersion,
-    expected_payload: CommandPayload,
+    expected_payload: &CommandPayload,
     expected_key: &str,
 ) {
     let engine = EngineIdentity {
@@ -709,7 +710,7 @@ fn serve_automatic_transition(
         panic!("expected remote automatic transition command");
     };
     assert_eq!(command.protocol, protocol);
-    assert_eq!(command.payload, expected_payload);
+    assert_eq!(&command.payload, expected_payload);
     assert_eq!(command.idempotency_key, expected_key);
     assert_eq!(command.expected_revision, Some(0));
     write_message(
@@ -1099,7 +1100,7 @@ fn live_fade_to_black() -> fm_protocol::FadeToBlackState {
 
 fn assert_command(
     command: &CommandMessage,
-    payload: CommandPayload,
+    payload: &CommandPayload,
     key: &str,
     expected_revision: u64,
 ) {
@@ -1107,14 +1108,14 @@ fn assert_command(
     assert_eq!(command.idempotency_key, key);
     assert_eq!(command.expected_revision, Some(expected_revision));
     assert_eq!(command.deadline_ms, None);
-    assert_eq!(command.payload, payload);
+    assert_eq!(&command.payload, payload);
 }
 
 fn write_command_events(
     writer: &mut TcpStream,
     engine: &EngineIdentity,
     revision: u64,
-    payload: CommandPayload,
+    payload: &CommandPayload,
     program: WireInputId,
     preview: WireInputId,
 ) {
@@ -1140,7 +1141,7 @@ fn write_command_events(
     let mut sequence = 1;
     if matches!(
         payload,
-        CommandPayload::Fade { duration_frames } if duration_frames > 1
+        CommandPayload::Fade { duration_frames } if *duration_frames > 1
     ) {
         write_message(
             writer,
@@ -1873,7 +1874,7 @@ fn local_input_add_persists_default_simulated_strip() {
     ));
     assert_eq!(
         stored.project().input_audio_strip(input.id).unwrap(),
-        Default::default()
+        InputAudioStripState::default()
     );
 
     assert_success(&invoke(&[
@@ -1935,7 +1936,7 @@ fn local_simulated_solid_input_add_persists_exact_rgba() {
     ));
     assert_eq!(
         after.project().input_audio_strip(input.id).unwrap(),
-        Default::default()
+        InputAudioStripState::default()
     );
     assert_eq!(after.position(), before.position());
     assert_eq!(after.runtime_routing(), before.runtime_routing());
@@ -2000,7 +2001,7 @@ fn local_media_input_add_persists_offline_asset_contract() {
     assert!(input.required_capabilities.is_empty());
     assert_eq!(
         after.project().input_audio_strip(input.id).unwrap(),
-        Default::default()
+        InputAudioStripState::default()
     );
     assert_eq!(after.position(), before.position());
     assert_eq!(after.runtime_routing(), before.runtime_routing());
@@ -2064,6 +2065,7 @@ fn local_media_input_add_persists_offline_asset_contract() {
     fs::remove_dir_all(context.root).unwrap();
 }
 
+#[allow(clippy::too_many_lines)]
 #[test]
 fn local_media_input_relink_preserves_identity_and_runtime() {
     let context = ContractContext::new();
@@ -2578,6 +2580,7 @@ fn local_output_startup_persists_selected_policy_and_rejects_unknown_output() {
     fs::remove_dir_all(context.root).unwrap();
 }
 
+#[allow(clippy::too_many_lines)]
 #[test]
 fn local_output_editing_persists_routes_and_names_and_rejects_unknown_references() {
     let context = ContractContext::new();
@@ -3220,6 +3223,7 @@ fn local_inputs_reports_ordered_inventory() {
     fs::remove_dir_all(context.root).unwrap();
 }
 
+#[allow(clippy::too_many_lines)]
 #[test]
 fn local_scene_input_add_persists_empty_scene_without_routing() {
     let context = ContractContext::new();
@@ -3272,7 +3276,7 @@ fn local_scene_input_add_persists_empty_scene_without_routing() {
     );
     assert_eq!(
         after.project().input_audio_strip(input.id).unwrap(),
-        Default::default()
+        InputAudioStripState::default()
     );
     assert_eq!(
         after
@@ -3379,7 +3383,7 @@ fn local_scene_input_duplicate_persists_scene_pair_and_default_strip() {
     ));
     assert_eq!(
         after.project().input_audio_strip(copied_input.id),
-        Some(Default::default())
+        Some(InputAudioStripState::default())
     );
     assert_eq!(after.runtime_routing(), before.runtime_routing());
     assert_eq!(
@@ -3422,6 +3426,7 @@ fn local_scene_input_duplicate_persists_scene_pair_and_default_strip() {
     fs::remove_dir_all(context.root).unwrap();
 }
 
+#[allow(clippy::too_many_lines)]
 #[test]
 fn scene_rename_persists_exact_name_and_failures_preserve_manifest() {
     let context = ContractContext::new();
@@ -3582,6 +3587,7 @@ fn scene_rename_persists_exact_name_and_failures_preserve_manifest() {
     fs::remove_dir_all(context.root).unwrap();
 }
 
+#[allow(clippy::too_many_lines)]
 #[test]
 fn local_scene_input_remove_is_atomic_across_input_and_scene() {
     let context = ContractContext::new();
@@ -3640,7 +3646,7 @@ fn local_scene_input_remove_is_atomic_across_input_and_scene() {
             .input_audio_strips()
             .iter()
             .filter(|strip| strip.input != removed_input)
-            .cloned()
+            .copied()
             .collect::<Vec<_>>()
     );
     assert_eq!(
@@ -3718,6 +3724,7 @@ fn local_scene_input_remove_is_atomic_across_input_and_scene() {
     fs::remove_dir_all(context.root).unwrap();
 }
 
+#[allow(clippy::too_many_lines)]
 #[test]
 fn local_scene_removal_preserves_runtime_and_rejects_references() {
     fn prepare(reference: Option<&str>) -> ContractContext {
@@ -3976,6 +3983,7 @@ fn local_scene_input_audio_source() {
     fs::remove_dir_all(context.root).unwrap();
 }
 
+#[allow(clippy::too_many_lines)]
 #[test]
 fn local_scene_background() {
     let context = ContractContext::new();
@@ -4266,6 +4274,7 @@ fn local_scene_layer_add_rejects_missing_input_without_manifest_or_journal_chang
     fs::remove_dir_all(context.root).unwrap();
 }
 
+#[allow(clippy::too_many_lines)]
 #[test]
 fn local_scene_layer_rename_persists_exact_name_and_rejects_invalid_target() {
     let context = ContractContext::new();
@@ -4610,6 +4619,7 @@ fn local_scene_layer_move_changes_only_stable_tie_order() {
     fs::remove_dir_all(context.root).unwrap();
 }
 
+#[allow(clippy::too_many_lines)]
 #[test]
 fn local_scene_layer_source_reassignment() {
     let context = ContractContext::new();
@@ -4751,7 +4761,7 @@ fn local_scene_layer_remove_preserves_remaining_order() {
         "9",
         "Second",
     ]));
-    let before = ProjectStore::new(&context.project_path())
+    let before = ProjectStore::new(context.project_path())
         .unwrap()
         .load()
         .unwrap();
@@ -4761,7 +4771,7 @@ fn local_scene_layer_remove_preserves_remaining_order() {
         "7",
         "0",
     ]));
-    let after = ProjectStore::new(&context.project_path())
+    let after = ProjectStore::new(context.project_path())
         .unwrap()
         .load()
         .unwrap();
@@ -4827,7 +4837,7 @@ fn local_scene_layer_appearance_preserves_layer_identity() {
             name,
         ]));
     }
-    let before = ProjectStore::new(&context.project_path())
+    let before = ProjectStore::new(context.project_path())
         .unwrap()
         .load()
         .unwrap();
@@ -4840,7 +4850,7 @@ fn local_scene_layer_appearance_preserves_layer_identity() {
         "off",
         "96",
     ]));
-    let after = ProjectStore::new(&context.project_path())
+    let after = ProjectStore::new(context.project_path())
         .unwrap()
         .load()
         .unwrap();
@@ -4903,7 +4913,7 @@ fn local_scene_layer_geometry_rejects_invalid_values_without_persistence() {
             name,
         ]));
     }
-    let before = ProjectStore::new(&context.project_path())
+    let before = ProjectStore::new(context.project_path())
         .unwrap()
         .load()
         .unwrap();
@@ -4942,7 +4952,7 @@ fn local_scene_layer_geometry_rejects_invalid_values_without_persistence() {
         "480",
         "270",
     ]));
-    let after = ProjectStore::new(&context.project_path())
+    let after = ProjectStore::new(context.project_path())
         .unwrap()
         .load()
         .unwrap();
@@ -4993,7 +5003,7 @@ fn local_scene_layer_z_order_preserves_vector_and_runtime() {
             name,
         ]));
     }
-    let before = ProjectStore::new(&context.project_path())
+    let before = ProjectStore::new(context.project_path())
         .unwrap()
         .load()
         .unwrap();
@@ -5013,7 +5023,7 @@ fn local_scene_layer_z_order_preserves_vector_and_runtime() {
         "1",
         &i32::MIN.to_string(),
     ]));
-    let after = ProjectStore::new(&context.project_path())
+    let after = ProjectStore::new(context.project_path())
         .unwrap()
         .load()
         .unwrap();
@@ -5040,7 +5050,7 @@ fn local_scene_layer_z_order_preserves_vector_and_runtime() {
         "1",
         "4",
     ]));
-    let repeated = ProjectStore::new(&context.project_path())
+    let repeated = ProjectStore::new(context.project_path())
         .unwrap()
         .load()
         .unwrap();
@@ -5088,7 +5098,7 @@ fn local_scene_layer_crop_checked_preserves_manifest_and_journal() {
         "5",
         "Other layer",
     ]));
-    let before = ProjectStore::new(&context.project_path())
+    let before = ProjectStore::new(context.project_path())
         .unwrap()
         .load()
         .unwrap();
@@ -5102,7 +5112,7 @@ fn local_scene_layer_crop_checked_preserves_manifest_and_journal() {
         "640",
         "480",
     ]));
-    let cropped = ProjectStore::new(&context.project_path())
+    let cropped = ProjectStore::new(context.project_path())
         .unwrap()
         .load()
         .unwrap();
@@ -5134,7 +5144,7 @@ fn local_scene_layer_crop_checked_preserves_manifest_and_journal() {
         "7",
         "0",
     ]));
-    let cleared = ProjectStore::new(&context.project_path())
+    let cleared = ProjectStore::new(context.project_path())
         .unwrap()
         .load()
         .unwrap();
@@ -5144,7 +5154,7 @@ fn local_scene_layer_crop_checked_preserves_manifest_and_journal() {
     );
 
     let before_invalid = manifest(&context.project);
-    let store = ProjectStore::new(&context.project_path()).unwrap();
+    let store = ProjectStore::new(context.project_path()).unwrap();
     let journal_before_invalid = journal_bytes(&store);
     assert_failure_contains(
         &invoke(&[
@@ -5164,6 +5174,7 @@ fn local_scene_layer_crop_checked_preserves_manifest_and_journal() {
     fs::remove_dir_all(context.root).unwrap();
 }
 
+#[allow(clippy::too_many_lines)]
 #[test]
 fn local_scene_layer_mask_checked_preserves_manifest_and_journal() {
     let context = ContractContext::new();
@@ -5201,7 +5212,7 @@ fn local_scene_layer_mask_checked_preserves_manifest_and_journal() {
         "640",
         "480",
     ]));
-    let before = ProjectStore::new(&context.project_path())
+    let before = ProjectStore::new(context.project_path())
         .unwrap()
         .load()
         .unwrap();
@@ -5216,7 +5227,7 @@ fn local_scene_layer_mask_checked_preserves_manifest_and_journal() {
         "400",
         "inverted",
     ]));
-    let masked = ProjectStore::new(&context.project_path())
+    let masked = ProjectStore::new(context.project_path())
         .unwrap()
         .load()
         .unwrap();
@@ -5248,7 +5259,7 @@ fn local_scene_layer_mask_checked_preserves_manifest_and_journal() {
         "7",
         "0",
     ]));
-    let cleared = ProjectStore::new(&context.project_path())
+    let cleared = ProjectStore::new(context.project_path())
         .unwrap()
         .load()
         .unwrap();
@@ -5258,7 +5269,7 @@ fn local_scene_layer_mask_checked_preserves_manifest_and_journal() {
     );
 
     let before_invalid = manifest(&context.project);
-    let store = ProjectStore::new(&context.project_path()).unwrap();
+    let store = ProjectStore::new(context.project_path()).unwrap();
     let journal_before_invalid = journal_bytes(&store);
     assert_failure_contains(
         &invoke(&[
@@ -5395,6 +5406,7 @@ fn local_input_replace_simulated_preserves_identity_and_runtime() {
     fs::remove_dir_all(context.root).unwrap();
 }
 
+#[allow(clippy::too_many_lines)]
 #[test]
 fn local_input_replace_solid_preserves_identity_and_runtime() {
     let context = ContractContext::new();
@@ -5536,6 +5548,7 @@ fn local_input_replace_solid_preserves_identity_and_runtime() {
     fs::remove_dir_all(context.root).unwrap();
 }
 
+#[allow(clippy::too_many_lines)]
 #[test]
 fn local_input_replace_media_preserves_identity_and_runtime() {
     let context = ContractContext::new();
@@ -5677,6 +5690,7 @@ fn local_input_replace_media_preserves_identity_and_runtime() {
     fs::remove_dir_all(context.root).unwrap();
 }
 
+#[allow(clippy::too_many_lines)]
 #[test]
 fn local_input_replace_scene_preserves_identity_and_rejects_cycle() {
     let context = ContractContext::new();

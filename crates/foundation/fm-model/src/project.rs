@@ -826,6 +826,14 @@ impl Project {
         self.inputs.push(input);
     }
 
+    /// Adds an input after checking id uniqueness and name validity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AddInputError::DuplicateId`] when the id already exists,
+    /// [`AddInputError::EmptyName`] or [`AddInputError::NameTooLong`] when the
+    /// name fails validation, and [`AddInputError::DuplicateName`] when another
+    /// input already uses the name.
     pub fn add_input_checked(&mut self, input: Input) -> Result<(), AddInputError> {
         if self.inputs.iter().any(|candidate| candidate.id == input.id) {
             return Err(AddInputError::DuplicateId(input.id));
@@ -847,6 +855,14 @@ impl Project {
         Ok(())
     }
 
+    /// Removes an input together with its persisted audio strip.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RemoveInputError::UnknownInput`] when the input does not
+    /// exist and [`RemoveInputError::DomainReference`] when it is referenced
+    /// by the main mix, a stinger, a scene layer, or another input's audio
+    /// source.
     pub fn remove_input(&mut self, input: InputId) -> Result<(), RemoveInputError> {
         if !self.inputs.iter().any(|candidate| candidate.id == input) {
             return Err(RemoveInputError::UnknownInput(input));
@@ -893,6 +909,12 @@ impl Project {
         Ok(())
     }
 
+    /// Replaces an input's source kind and required capabilities.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReplaceInputError::UnknownInput`] when the input does not
+    /// exist.
     pub fn replace_input_source(
         &mut self,
         input: InputId,
@@ -909,6 +931,13 @@ impl Project {
         Ok(())
     }
 
+    /// Points an existing media input at a new asset URI.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RelinkMediaInputError::UnknownInput`] when the input does not
+    /// exist and [`RelinkMediaInputError::NotMediaInput`] when it is not a
+    /// media input.
     pub fn relink_media_input(
         &mut self,
         input: InputId,
@@ -929,9 +958,23 @@ impl Project {
         Ok(())
     }
 
-    pub fn reorder_inputs(&mut self, inputs: Vec<InputId>) -> Result<(), InputOrderError> {
+    /// Reorders the project's inputs to match the supplied id sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InputOrderError::EmptyOrder`] for an empty request,
+    /// [`InputOrderError::WrongLength`] on a length mismatch,
+    /// [`InputOrderError::UnknownInput`] for an input outside the current set,
+    /// and [`InputOrderError::DuplicateInput`] when an input repeats.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a validated order references an input missing from the
+    /// project; unreachable because [`validate_input_order`] already rejected
+    /// unknown ids.
+    pub fn reorder_inputs(&mut self, inputs: &[InputId]) -> Result<(), InputOrderError> {
         let current = self.inputs.iter().map(|input| input.id).collect::<Vec<_>>();
-        validate_input_order(&current, &inputs)?;
+        validate_input_order(&current, inputs)?;
         let reordered = inputs
             .iter()
             .map(|input| {
@@ -965,6 +1008,20 @@ impl Project {
         self.scenes.push(scene);
     }
 
+    /// Adds a scene together with its dedicated scene input after checking
+    /// id and name invariants.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AddSceneInputError::DuplicateSceneId`] when the scene id or
+    /// [`AddSceneInputError::DuplicateInputId`] when the input id already
+    /// exists, [`AddSceneInputError::EmptySceneName`],
+    /// [`AddSceneInputError::DuplicateSceneName`],
+    /// [`AddSceneInputError::EmptyInputName`],
+    /// [`AddSceneInputError::InputNameTooLong`], and
+    /// [`AddSceneInputError::DuplicateInputName`] for name violations, and
+    /// [`AddSceneInputError::InvalidProject`] when the composed project fails
+    /// validation.
     pub fn add_scene_input_checked(
         &mut self,
         scene: SceneId,
@@ -972,8 +1029,7 @@ impl Project {
         input: InputId,
         input_name: String,
     ) -> Result<(), AddSceneInputError> {
-        self.validate_new_scene_input(scene, &scene_name, input, &input_name)
-            .map_err(AddSceneInputError::from)?;
+        self.validate_new_scene_input(scene, &scene_name, input, &input_name)?;
         let mut candidate = self.clone();
         candidate.add_scene(Scene {
             id: scene,
@@ -997,6 +1053,22 @@ impl Project {
         Ok(())
     }
 
+    /// Duplicates a scene and its dedicated scene input under new ids.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DuplicateSceneInputError::UnknownSourceScene`] when the
+    /// source scene does not exist, the same id and name violations as
+    /// [`Project::add_scene_input_checked`]
+    /// ([`DuplicateSceneInputError::DuplicateSceneId`],
+    /// [`DuplicateSceneInputError::DuplicateInputId`],
+    /// [`DuplicateSceneInputError::EmptySceneName`],
+    /// [`DuplicateSceneInputError::DuplicateSceneName`],
+    /// [`DuplicateSceneInputError::EmptyInputName`],
+    /// [`DuplicateSceneInputError::InputNameTooLong`],
+    /// [`DuplicateSceneInputError::DuplicateInputName`]), and
+    /// [`DuplicateSceneInputError::InvalidProject`] when the composed project
+    /// fails validation.
     pub fn duplicate_scene_input_checked(
         &mut self,
         source_scene: SceneId,
@@ -1033,6 +1105,14 @@ impl Project {
         Ok(())
     }
 
+    /// Renames one scene while preserving the exact supplied text.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RenameSceneError::UnknownScene`] when the scene does not
+    /// exist, [`RenameSceneError::EmptyName`] when the name is blank, and
+    /// [`RenameSceneError::DuplicateName`] when another scene already uses
+    /// the name.
     pub fn rename_scene(&mut self, scene: SceneId, name: String) -> Result<(), RenameSceneError> {
         let index = self
             .scenes
@@ -1056,6 +1136,15 @@ impl Project {
         Ok(())
     }
 
+    /// Removes a scene that no other project entity references.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RemoveSceneError::UnknownScene`] when the scene does not
+    /// exist and [`RemoveSceneError::InputReference`],
+    /// [`RemoveSceneError::LayerReference`], or
+    /// [`RemoveSceneError::OutputReference`] when an input, another scene's
+    /// layer, or an output still references it.
     pub fn remove_scene(&mut self, scene: SceneId) -> Result<(), RemoveSceneError> {
         if !self.scenes.iter().any(|candidate| candidate.id == scene) {
             return Err(RemoveSceneError::UnknownScene(scene));
@@ -1086,6 +1175,13 @@ impl Project {
         Ok(())
     }
 
+    /// Sets a scene's premultiplied background color.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SetSceneBackgroundError::UnknownScene`] when the scene does
+    /// not exist and [`SetSceneBackgroundError::NotPremultiplied`] when the
+    /// color is not premultiplied.
     pub fn set_scene_background(
         &mut self,
         scene: SceneId,
@@ -1103,6 +1199,17 @@ impl Project {
         Ok(())
     }
 
+    /// Appends a layer to a scene after checking the scene, name, and source.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AddSceneLayerError::UnknownScene`] when the scene does not
+    /// exist, [`AddSceneLayerError::EmptyName`] when the layer name is blank,
+    /// [`AddSceneLayerError::MissingInput`] or
+    /// [`AddSceneLayerError::MissingScene`] when the source references an
+    /// entity that does not exist, and
+    /// [`AddSceneLayerError::SourceCycle`] when the source would create a
+    /// self-reference or cycle.
     pub fn add_layer_to_scene(
         &mut self,
         scene: SceneId,
@@ -1150,6 +1257,13 @@ impl Project {
         Ok(())
     }
 
+    /// Removes one layer from a scene and returns it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SceneLayerError::UnknownScene`] when the scene does not
+    /// exist and [`SceneLayerError::LayerIndexOutOfRange`] when the index is
+    /// beyond the scene's layer count.
     pub fn remove_layer_from_scene(
         &mut self,
         scene: SceneId,
@@ -1170,6 +1284,13 @@ impl Project {
         Ok(target.layers.remove(index))
     }
 
+    /// Moves one layer within a scene to a new stacking position.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SceneLayerError::UnknownScene`] when the scene does not
+    /// exist and [`SceneLayerError::LayerIndexOutOfRange`] when either index
+    /// is beyond the scene's layer count.
     pub fn move_scene_layer(
         &mut self,
         scene: SceneId,
@@ -1203,6 +1324,16 @@ impl Project {
         Ok(())
     }
 
+    /// Duplicates a scene layer in place under a new name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SceneLayerError::UnknownScene`] when the scene does not
+    /// exist, [`SceneLayerError::LayerIndexOutOfRange`] when the index is
+    /// beyond the scene's layer count, [`SceneLayerError::EmptyName`] when
+    /// the new name is blank, and [`SceneLayerError::MissingInput`],
+    /// [`SceneLayerError::MissingScene`], or
+    /// [`SceneLayerError::SourceCycle`] when appending the copy fails.
     pub fn duplicate_scene_layer(
         &mut self,
         scene: SceneId,
@@ -1239,6 +1370,17 @@ impl Project {
             })
     }
 
+    /// Copies a layer from one scene into another under a new name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SceneLayerError::UnknownScene`] when either scene does not
+    /// exist, [`SceneLayerError::SameScene`] when both scenes are identical,
+    /// [`SceneLayerError::LayerIndexOutOfRange`] when the index is beyond the
+    /// source's layer count, [`SceneLayerError::EmptyName`] when the new name
+    /// is blank, and [`SceneLayerError::MissingInput`],
+    /// [`SceneLayerError::MissingScene`], or
+    /// [`SceneLayerError::SourceCycle`] when appending the copy fails.
     pub fn copy_scene_layer(
         &mut self,
         source_scene: SceneId,
@@ -1286,6 +1428,13 @@ impl Project {
             })
     }
 
+    /// Sets one layer's z-order within its scene.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SceneLayerError::UnknownScene`] when the scene does not
+    /// exist and [`SceneLayerError::LayerIndexOutOfRange`] when the index is
+    /// beyond the scene's layer count.
     pub fn set_scene_layer_z_order(
         &mut self,
         scene: SceneId,
@@ -1310,6 +1459,14 @@ impl Project {
         Ok(())
     }
 
+    /// Renames one scene layer while preserving the exact supplied text.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SceneLayerError::UnknownScene`] when the scene does not
+    /// exist, [`SceneLayerError::LayerIndexOutOfRange`] when the index is
+    /// beyond the scene's layer count, and [`SceneLayerError::EmptyName`]
+    /// when the name is blank.
     pub fn rename_scene_layer(
         &mut self,
         scene: SceneId,
@@ -1337,6 +1494,16 @@ impl Project {
         Ok(())
     }
 
+    /// Repoints one layer's source after checking references and cycles.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SceneLayerError::UnknownScene`] when the scene does not
+    /// exist, [`SceneLayerError::LayerIndexOutOfRange`] when the index is
+    /// beyond the scene's layer count, [`SceneLayerError::MissingInput`] or
+    /// [`SceneLayerError::MissingScene`] when the source references an entity
+    /// that does not exist, and [`SceneLayerError::SourceCycle`] when the
+    /// source would create a self-reference or cycle.
     pub fn set_scene_layer_source(
         &mut self,
         scene: SceneId,
@@ -1389,6 +1556,13 @@ impl Project {
         Ok(())
     }
 
+    /// Sets one layer's enabled flag and opacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SceneLayerError::UnknownScene`] when the scene does not
+    /// exist and [`SceneLayerError::LayerIndexOutOfRange`] when the index is
+    /// beyond the scene's layer count.
     pub fn set_scene_layer_appearance(
         &mut self,
         scene: SceneId,
@@ -1415,6 +1589,15 @@ impl Project {
         Ok(())
     }
 
+    /// Sets one layer's geometry after range checks.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SceneLayerError::UnknownScene`] when the scene does not
+    /// exist, [`SceneLayerError::LayerIndexOutOfRange`] when the index is
+    /// beyond the scene's layer count, and
+    /// [`SceneLayerError::InvalidGeometry`] when a dimension is zero or
+    /// exceeds the project limits.
     pub fn set_scene_layer_geometry(
         &mut self,
         scene: SceneId,
@@ -1445,6 +1628,16 @@ impl Project {
         Ok(())
     }
 
+    /// Sets or clears one layer's crop rectangle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SceneLayerError::UnknownScene`] when the scene does not
+    /// exist, [`SceneLayerError::LayerIndexOutOfRange`] when the index is
+    /// beyond the scene's layer count, [`SceneLayerError::InvalidCrop`] when
+    /// the crop is empty or exceeds the video dimensions, and
+    /// [`SceneLayerError::CropWouldInvalidateMask`] when an existing mask
+    /// would fall outside the new crop.
     pub fn set_scene_layer_crop(
         &mut self,
         scene: SceneId,
@@ -1500,6 +1693,14 @@ impl Project {
         Ok(())
     }
 
+    /// Sets or clears one layer's rectangular mask.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SceneLayerError::UnknownScene`] when the scene does not
+    /// exist, [`SceneLayerError::LayerIndexOutOfRange`] when the index is
+    /// beyond the scene's layer count, and [`SceneLayerError::InvalidMask`]
+    /// when the mask is empty or exceeds the cropped layer area.
     pub fn set_scene_layer_mask(
         &mut self,
         scene: SceneId,
@@ -1553,6 +1754,14 @@ impl Project {
         self.audio_buses.push(bus);
     }
 
+    /// Adds an audio bus after checking id and name invariants.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AddAudioBusError::DuplicateId`] when the id already exists,
+    /// [`AddAudioBusError::EmptyName`] when the name is blank, and
+    /// [`AddAudioBusError::DuplicateName`] when another bus already uses the
+    /// name.
     pub fn add_audio_bus_checked(&mut self, bus: AudioBus) -> Result<(), AddAudioBusError> {
         if self
             .audio_buses
@@ -1575,6 +1784,14 @@ impl Project {
         Ok(())
     }
 
+    /// Renames one audio bus while preserving the exact supplied text.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RenameAudioBusError::UnknownBus`] when the bus does not
+    /// exist, [`RenameAudioBusError::EmptyName`] when the name is blank, and
+    /// [`RenameAudioBusError::DuplicateName`] when another bus already uses
+    /// the name.
     pub fn rename_audio_bus(
         &mut self,
         bus: BusId,
@@ -1602,6 +1819,17 @@ impl Project {
         Ok(())
     }
 
+    /// Adds a send from one audio bus to another, rolling back on failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AudioBusSendError::UnknownSource`] or
+    /// [`AudioBusSendError::UnknownDestination`] when either bus does not
+    /// exist, [`AudioBusSendError::SelfSend`] when both ids match,
+    /// [`AudioBusSendError::DuplicateSend`] when the send already exists,
+    /// [`AudioBusSendError::InvalidProject`] when the project is invalid
+    /// before or after the change, and [`AudioBusSendError::Cycle`] when the
+    /// send would create a cycle.
     pub fn add_audio_bus_send(
         &mut self,
         source: BusId,
@@ -1645,6 +1873,14 @@ impl Project {
         Ok(())
     }
 
+    /// Removes one existing send between two audio buses.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AudioBusSendError::UnknownSource`] or
+    /// [`AudioBusSendError::UnknownDestination`] when either bus does not
+    /// exist, [`AudioBusSendError::SelfSend`] when both ids match, and
+    /// [`AudioBusSendError::MissingSend`] when the send does not exist.
     pub fn remove_audio_bus_send(
         &mut self,
         source: BusId,
@@ -1674,6 +1910,15 @@ impl Project {
         self.outputs.push(output);
     }
 
+    /// Adds an output after checking id, name, and routing invariants.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AddOutputError::DuplicateId`] when the id already exists,
+    /// [`AddOutputError::EmptyName`] or [`AddOutputError::DuplicateName`]
+    /// for name violations, and [`AddOutputError::UnknownScene`] or
+    /// [`AddOutputError::UnknownBus`] when the routed scene or audio bus
+    /// does not exist.
     pub fn add_output_checked(&mut self, output: Output) -> Result<(), AddOutputError> {
         if self
             .outputs
@@ -1710,6 +1955,14 @@ impl Project {
         Ok(())
     }
 
+    /// Retargets one output's video scene and audio bus.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SetOutputRouteError::UnknownOutput`] when the output does
+    /// not exist and [`SetOutputRouteError::UnknownScene`] or
+    /// [`SetOutputRouteError::UnknownBus`] when the routed scene or audio
+    /// bus does not exist.
     pub fn set_output_route(
         &mut self,
         output: OutputId,
@@ -1732,6 +1985,12 @@ impl Project {
         Ok(())
     }
 
+    /// Sets one output's startup policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SetOutputStartupError::UnknownOutput`] when the output does
+    /// not exist.
     pub fn set_output_startup(
         &mut self,
         output: OutputId,
@@ -1746,6 +2005,14 @@ impl Project {
         Ok(())
     }
 
+    /// Renames one output while preserving the exact supplied text.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RenameOutputError::UnknownOutput`] when the output does not
+    /// exist, [`RenameOutputError::EmptyName`] when the name is blank, and
+    /// [`RenameOutputError::DuplicateName`] when another output already uses
+    /// the name.
     pub fn rename_output(
         &mut self,
         output: OutputId,
@@ -1773,6 +2040,13 @@ impl Project {
         Ok(())
     }
 
+    /// Removes an output that no stream destination references.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RemoveOutputError::UnknownOutput`] when the output does not
+    /// exist and [`RemoveOutputError::StreamTargetReference`] when a stream
+    /// destination still uses it.
     pub fn remove_output(&mut self, output: OutputId) -> Result<(), RemoveOutputError> {
         if !self.outputs.iter().any(|candidate| candidate.id == output) {
             return Err(RemoveOutputError::UnknownOutput(output));
@@ -1895,6 +2169,15 @@ impl Project {
         Ok(())
     }
 
+    /// Removes an audio bus that no send or output references.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RemoveAudioBusError::UnknownBus`] when the bus does not
+    /// exist, [`RemoveAudioBusError::OutputReference`] when an output uses
+    /// it, and [`RemoveAudioBusError::OutgoingSend`] or
+    /// [`RemoveAudioBusError::IncomingSend`] when a send to or from the bus
+    /// still exists.
     pub fn remove_audio_bus(&mut self, bus: BusId) -> Result<(), RemoveAudioBusError> {
         if !self.audio_buses.iter().any(|candidate| candidate.id == bus) {
             return Err(RemoveAudioBusError::UnknownBus(bus));
@@ -1953,6 +2236,12 @@ impl Project {
         }
     }
 
+    /// Inserts or replaces one Stinger slot after checking its media input.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SetStingerError::UnknownInput`] when the stinger's media
+    /// input does not exist.
     pub fn set_stinger_checked(&mut self, stinger: StingerConfig) -> Result<(), SetStingerError> {
         if !self
             .inputs
@@ -2005,6 +2294,23 @@ impl Project {
         }
     }
 
+    /// Sets or clears one scene input's audio source, rejecting cycles.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SceneInputAudioSourceError::MissingTargetInput`] when the
+    /// target input does not exist,
+    /// [`SceneInputAudioSourceError::NonSceneTargetInput`] when it is not a
+    /// scene input, [`SceneInputAudioSourceError::MissingSourceInput`] when
+    /// the requested source input does not exist, and
+    /// [`SceneInputAudioSourceError::SourceCycle`] when the assignment would
+    /// create a self-reference or cycle.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the validated target input is missing from the candidate
+    /// clone; unreachable because the existence check above already rejected
+    /// unknown ids.
     pub fn set_scene_input_audio_source(
         &mut self,
         scene_input: InputId,

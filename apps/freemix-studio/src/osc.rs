@@ -68,7 +68,9 @@ impl OscReceiver {
         let worker_cancel = Arc::clone(&cancel);
         let worker = thread::Builder::new()
             .name("freemix-osc".to_owned())
-            .spawn(move || receive_loop(socket, action_sender, &worker_counters, &worker_cancel))?;
+            .spawn(move || {
+                receive_loop(&socket, &action_sender, &worker_counters, &worker_cancel);
+            })?;
 
         Ok(Self {
             actions,
@@ -130,8 +132,8 @@ fn validate_listen_address(address: SocketAddr) -> io::Result<()> {
 }
 
 fn receive_loop(
-    socket: UdpSocket,
-    actions: SyncSender<OscAction>,
+    socket: &UdpSocket,
+    actions: &SyncSender<OscAction>,
     counters: &SharedCounters,
     cancel: &AtomicBool,
 ) {

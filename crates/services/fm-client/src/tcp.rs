@@ -628,6 +628,14 @@ impl TcpSession {
         self.finish_connect(Transport::Tcp(connection), None)
     }
 
+    /// Connects over WebSocket while polling for caller-requested cancellation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an already connected session, an invalid
+    /// WebSocket address or bearer token, or the same errors as
+    /// [`Self::connect`], and returns [`TcpSessionError::Cancelled`] when
+    /// `cancelled` returns `true`.
     #[cfg(feature = "std-websocket")]
     pub fn connect_websocket_cancellable(
         &mut self,
@@ -870,6 +878,12 @@ impl TcpSession {
     }
 
     /// Waits for one event, returning `None` when the receive timeout elapsed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when not connected, on I/O or decoding failure
+    /// other than the timeout itself, or when the owned client rejects a
+    /// received record.
     pub fn receive_timeout(
         &mut self,
         timeout: Duration,
@@ -924,6 +938,12 @@ impl TcpSession {
 
     /// Sends one diagnostics request and waits for its matching response.
     /// Valid durable and runtime events may arrive while waiting.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when not connected, another diagnostics request is
+    /// already pending, the request ID is invalid, `cancelled` returns
+    /// `true`, or the request, response wait, or response validation fails.
     pub fn send_diagnostics_cancellable(
         &mut self,
         request_id: impl Into<String>,

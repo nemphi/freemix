@@ -273,6 +273,7 @@ fn rename_input_is_bounded_unique_and_replay_safe() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn reorder_inputs_preserves_id_references_and_rejects_invalid_orders_atomically() {
     let mut engine = engine();
     let current = [input(1), input(2), input(3)];

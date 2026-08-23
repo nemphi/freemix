@@ -17,9 +17,11 @@ use std::{
 };
 
 #[cfg(any(test, feature = "native-media"))]
+use std::io::Read;
+#[cfg(any(test, feature = "native-media"))]
 use std::thread;
 #[cfg(test)]
-use std::{collections::VecDeque, io::Read, net::TcpStream};
+use std::{collections::VecDeque, net::TcpStream};
 
 #[cfg(feature = "native-media")]
 use std::fs::{self, File, OpenOptions};
@@ -172,6 +174,8 @@ const PROGRAM_RECORDER_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(feature = "native-media")]
 const PROGRAM_RECORDER_KILL_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(all(feature = "native-media", feature = "macos-program-surface"))]
+// Referenced by macos-program-surface code paths that are themselves inert off macOS.
+#[allow(dead_code)]
 const PROGRAM_CHECKPOINT_MARGIN: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
@@ -1793,7 +1797,7 @@ impl NativeDaemon {
             projected_frame: None,
             runtime,
             resolved_sources: Arc::new(sources),
-            assets_root: store.assets_root().to_path_buf(),
+            assets_root: store.assets_root().clone(),
             pending_stinger_mutation: None,
             stinger_retirements: NativeStingerRetirements::start()?,
             recorder: None,
@@ -2025,7 +2029,7 @@ impl NativeDaemon {
                 .audio_meter_sequence
                 .checked_add(1)
                 .ok_or_else(|| AppFailure("audio meter sequence exhausted".into()))?;
-            self.pending_audio_meters = Some(audio_meters_message(server, sequence, meters));
+            self.pending_audio_meters = Some(audio_meters_message(server, sequence, &meters));
             self.audio_meter_sequence = sequence;
         }
         self.install_stinger_mutation()?;
@@ -2073,6 +2077,7 @@ impl NativeDaemon {
         result
     }
 
+    #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
     fn finalize_cameras(&mut self) -> AppResult<()> {
         #[cfg(target_os = "macos")]
         {
@@ -2120,6 +2125,7 @@ impl NativeDaemon {
         self.telemetry_emitted = true;
     }
 
+    #[allow(clippy::unused_self)]
     fn emit_camera_source_telemetry(&mut self) {
         #[cfg(target_os = "macos")]
         {
@@ -2308,7 +2314,7 @@ fn validate_native_video_dimensions(
 fn audio_meters_message(
     server: &ServerIdentity,
     sequence: u64,
-    meters: NativeAudioMeters<'_>,
+    meters: &NativeAudioMeters<'_>,
 ) -> AudioMetersMessage {
     AudioMetersMessage {
         server: server.clone(),
@@ -2316,21 +2322,26 @@ fn audio_meters_message(
         frame: meters.frame,
         start_sample: meters.start_sample,
         end_sample: meters.end_sample,
-        master: meters.master.iter().map(protocol_audio_meter).collect(),
+        master: meters
+            .master
+            .iter()
+            .copied()
+            .map(protocol_audio_meter)
+            .collect(),
         inputs: meters
             .inputs
             .iter()
             .zip(meters.input_meters.chunks_exact(meters.channels))
             .map(|(&input, channels)| InputAudioMeters {
                 input: WireInputId::from_domain(input),
-                channels: channels.iter().map(protocol_audio_meter).collect(),
+                channels: channels.iter().copied().map(protocol_audio_meter).collect(),
             })
             .collect(),
     }
 }
 
 #[cfg(feature = "native-media")]
-fn protocol_audio_meter(meter: &fm_audio::ChannelMeter) -> AudioMeterChannel {
+fn protocol_audio_meter(meter: fm_audio::ChannelMeter) -> AudioMeterChannel {
     let peak_millionths = meter_level_millionths(meter.peak);
     AudioMeterChannel {
         peak_millionths,
@@ -2339,6 +2350,8 @@ fn protocol_audio_meter(meter: &fm_audio::ChannelMeter) -> AudioMeterChannel {
 }
 
 #[cfg(feature = "native-media")]
+// Levels are clamped to [0, u32::MAX] before the cast; truncation is not reachable.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn meter_level_millionths(level: f32) -> u32 {
     (f64::from(level.max(0.0)) * f64::from(AUDIO_METER_LEVEL_SCALE))
         .round()
@@ -3175,9 +3188,10 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> AppResult<Command>
                     }
                     "--native-media" => native_media = true,
                     "--recover-to-checkpoint" if recover_to_checkpoint => {
-                        return Err(
-                            AppFailure("duplicate option `--recover-to-checkpoint`".into()).into(),
-                        );
+                        return Err(AppFailure(
+                            "duplicate option `--recover-to-checkpoint`".into(),
+                        )
+                        .into());
                     }
                     "--recover-to-checkpoint" => recover_to_checkpoint = true,
                     "--fullscreen-program" if fullscreen_program => {
@@ -3704,7 +3718,7 @@ fn serve_inner(
     }
 
     let session_result = non_native_sessions::run(
-        listener,
+        &listener,
         &server,
         &control,
         &journal,
@@ -4216,6 +4230,7 @@ fn handle_client(
 }
 
 #[cfg(test)]
+#[allow(clippy::large_enum_variant)]
 enum ClientRead {
     Message(WireMessage),
     Closed,
@@ -4479,7 +4494,7 @@ struct CommandDelivery {
     runtime_events: Vec<RuntimeEventMessage>,
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::used_underscore_binding)]
 fn execute_session_command(
     session: &mut Session,
     control: &SharedControl,
@@ -4683,18 +4698,15 @@ fn execute_native_stinger_mutation(
         Some((mutation, events)) => (mutation, events),
         None => (Err(()), Vec::new()),
     };
-    let mutation = match mutation {
-        Ok(mutation) => mutation,
-        Err(()) => {
-            return Ok(Err(NativeMutationFailure {
-                result: native_stinger_preflight_rejection(
-                    command,
-                    control.diagnostics().current_revision,
-                ),
-                #[cfg(test)]
-                runtime_events: preflight_runtime_events,
-            }));
-        }
+    let Ok(mutation) = mutation else {
+        return Ok(Err(NativeMutationFailure {
+            result: native_stinger_preflight_rejection(
+                command,
+                control.diagnostics().current_revision,
+            ),
+            #[cfg(test)]
+            runtime_events: preflight_runtime_events,
+        }));
     };
 
     let second_preparation = control.prepare_submit(principal, command.clone(), now_millis)?;
@@ -5057,7 +5069,7 @@ fn stored_project_with_receipts(
         .map(|input| input.id)
         .ne(show.inputs().iter().copied())
     {
-        project.reorder_inputs(show.inputs().to_vec())?;
+        project.reorder_inputs(show.inputs())?;
     }
     for (&input, name) in show.inputs().iter().zip(show.input_names()) {
         if project
@@ -5807,6 +5819,7 @@ mod tests {
         cell::Cell,
         fs,
         panic::{AssertUnwindSafe, catch_unwind},
+        sync::atomic::{AtomicU64, Ordering},
         sync::mpsc::TryRecvError,
     };
 
@@ -6362,6 +6375,7 @@ mod tests {
                 camera_helper: None,
                 record_program: None,
                 diagnostic_stop_after: None,
+                recover_to_checkpoint: false,
             }
         );
         let web = parse_args(strings(&[
@@ -7020,6 +7034,167 @@ mod tests {
         );
     }
 
+    /// Work that is not durable is never acknowledged.
+    ///
+    /// The journal is the only thing standing between an accepted command and
+    /// its acknowledgement, so while it cannot record, every command must come
+    /// back refused and retryable with no revision consumed, the daemon must
+    /// stay up and keep serving, and once recording works again the next
+    /// command takes the very next revision. The fault stands in for a failing
+    /// or full show disk at the exact seam the daemon hands its journal; file
+    /// surgery under a running daemon cannot inject it, because the journal
+    /// database is opened once, at startup, and held for the daemon's run.
+    #[test]
+    fn unavailable_journal_refuses_commands_and_the_session_keeps_serving() {
+        struct SwitchableJournal {
+            available: Arc<AtomicBool>,
+            recorded: AtomicU64,
+        }
+
+        impl DurableStore for SwitchableJournal {
+            fn record(
+                &self,
+                _command: &CommandMessage,
+                _now_millis: u64,
+                _previous: &StoredProject,
+                _updated: &StoredProject,
+            ) -> AppResult<()> {
+                if !self.available.load(Ordering::SeqCst) {
+                    return Err(AppFailure("injected journal unavailability".into()).into());
+                }
+                self.recorded.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+
+            fn checkpoint(&self, _project: &StoredProject) -> AppResult<()> {
+                if !self.available.load(Ordering::SeqCst) {
+                    return Err(AppFailure("injected journal unavailability".into()).into());
+                }
+                Ok(())
+            }
+        }
+
+        fn next_command_result(reader: &mut MessageReader) -> CommandResult {
+            loop {
+                match reader.read_message_with_idle(|| Ok(false)).unwrap() {
+                    Some(WireMessage::CommandResult(result)) => return result,
+                    Some(_) => continue,
+                    None => panic!("expected a command result"),
+                }
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let available = Arc::new(AtomicBool::new(true));
+        let journal_available = Arc::clone(&available);
+        let (served_tx, served_rx) = std::sync::mpsc::sync_channel(0);
+        let server_thread = thread::spawn(move || {
+            let journal = SwitchableJournal {
+                available: journal_available,
+                recorded: AtomicU64::new(0),
+            };
+            let mut durable = test_project();
+            let project_id = durable.project().id();
+            let control = Rc::new(RefCell::new(test_control(&durable)));
+            let authority = control_server_identity(&control.borrow(), project_id);
+            let config = ServerConfig::new(
+                ServerMode::Development,
+                AuthenticationMode::Development,
+                address.ip(),
+                CAPABILITIES_DIGEST,
+            );
+            let mut server = Server::new(config, ControlHandle(Rc::clone(&control))).unwrap();
+            server.mark_ready().unwrap();
+            let principal = development_principal().unwrap();
+
+            let (stream, _) = listener.accept().unwrap();
+            handle_client(
+                stream,
+                &server,
+                &control,
+                &journal,
+                &mut durable,
+                &principal,
+                &authority,
+                None,
+                None,
+                &mut OnceClientOutcome::Unserved,
+            )
+            .unwrap();
+            served_tx.send(()).unwrap();
+        });
+
+        let stream = TcpStream::connect(address).unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        let (mut reader, _) = complete_test_handshake(&stream);
+
+        write_message(
+            &mut writer,
+            &WireMessage::Command(test_command(
+                "durable-cut",
+                "durable-cut-key",
+                CommandPayload::Cut,
+            )),
+        )
+        .unwrap();
+        assert!(matches!(
+            next_command_result(&mut reader),
+            CommandResult::Accepted { revision: 1, .. }
+        ));
+
+        available.store(false, Ordering::SeqCst);
+        for id in ["refused-first", "refused-second"] {
+            write_message(
+                &mut writer,
+                &WireMessage::Command(test_command(id, &format!("{id}-key"), CommandPayload::Cut)),
+            )
+            .unwrap();
+            match next_command_result(&mut reader) {
+                CommandResult::Rejected {
+                    id: rejected,
+                    code,
+                    current_revision,
+                    retryable,
+                    ..
+                } => {
+                    assert_eq!(rejected, id);
+                    assert_eq!(code, "unavailable");
+                    assert_eq!(current_revision, 1, "a refused command takes no revision");
+                    assert!(retryable);
+                }
+                CommandResult::Accepted { revision, .. } => {
+                    panic!("{id} must not be acknowledged, yet it took revision {revision}")
+                }
+            }
+        }
+
+        available.store(true, Ordering::SeqCst);
+        write_message(
+            &mut writer,
+            &WireMessage::Command(test_command(
+                "after-repair",
+                "after-repair-key",
+                CommandPayload::Cut,
+            )),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                next_command_result(&mut reader),
+                CommandResult::Accepted { revision: 2, .. }
+            ),
+            "the refused commands left no gap in the revision or the journal"
+        );
+        stream.shutdown(std::net::Shutdown::Write).unwrap();
+        while matches!(
+            reader.read_message_with_idle(|| Ok(false)).unwrap(),
+            Some(_)
+        ) {}
+        served_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        server_thread.join().unwrap();
+    }
+
     #[test]
     fn client_socket_configuration_sets_read_and_write_timeouts() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -7080,8 +7255,9 @@ mod tests {
         let (expired_tx, expired_rx) = std::sync::mpsc::sync_channel(1);
         let server_thread = thread::spawn(move || {
             let store = ProjectStore::new(project_path).unwrap();
-            let journal = DurableJournal::new(&store, 0);
             let mut durable = test_project();
+            store.save(&durable).unwrap();
+            let journal = DurableJournal::new(store.open_journal_writer().unwrap());
             let project_id = durable.project().id();
             let control = Rc::new(RefCell::new(test_control(&durable)));
             let authority = control_server_identity(&control.borrow(), project_id);
@@ -7155,8 +7331,9 @@ mod tests {
         let (completed_tx, completed_rx) = std::sync::mpsc::sync_channel(1);
         let server_thread = thread::spawn(move || {
             let store = ProjectStore::new(project_path).unwrap();
-            let journal = DurableJournal::new(&store, 0);
             let mut durable = test_project();
+            store.save(&durable).unwrap();
+            let journal = DurableJournal::new(store.open_journal_writer().unwrap());
             let project_id = durable.project().id();
             let control = Rc::new(RefCell::new(test_control(&durable)));
             let authority = control_server_identity(&control.borrow(), project_id);
@@ -7260,8 +7437,9 @@ mod tests {
         let (expired_tx, expired_rx) = std::sync::mpsc::sync_channel(1);
         let server_thread = thread::spawn(move || {
             let store = ProjectStore::new(project_path).unwrap();
-            let journal = DurableJournal::new(&store, 0);
             let mut durable = test_project();
+            store.save(&durable).unwrap();
+            let journal = DurableJournal::new(store.open_journal_writer().unwrap());
             let project_id = durable.project().id();
             let control = Rc::new(RefCell::new(test_control(&durable)));
             let authority = control_server_identity(&control.borrow(), project_id);
@@ -8402,6 +8580,8 @@ mod tests {
             CommandPayload::TakeNextOverlay { channel },
         )
         .unwrap();
+        // Dropping the closure ends its captured mutable borrows before the assertions below.
+        #[allow(clippy::drop_non_drop)]
         drop(execute);
 
         assert!(matches!(
@@ -9110,7 +9290,7 @@ mod tests {
             InputAudioStripState {
                 gain: InputGainMilliDb::new(-3_000).unwrap(),
                 balance: InputBalanceBasisPoints::CENTER,
-                delay_samples: Default::default(),
+                delay_samples: InputDelaySamples::default(),
                 muted: false,
                 soloed: false,
                 follow_video: true,

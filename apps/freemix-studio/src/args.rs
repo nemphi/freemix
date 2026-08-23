@@ -171,6 +171,7 @@ impl std::error::Error for ArgsError {}
 /// # Errors
 ///
 /// Returns an error for unknown, duplicate, conflicting, missing, or invalid options.
+#[allow(clippy::too_many_lines)]
 pub fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<Command, ArgsError> {
     let arguments = arguments.into_iter().collect::<Vec<_>>();
     if arguments.as_slice() == ["--help"] || arguments.as_slice() == ["-h"] {
@@ -249,11 +250,10 @@ pub fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<Command
         }
     }
 
-    if web_connect.is_some() {
+    if let Some(address) = web_connect {
         if project.is_some() || connect.is_some() || daemon.is_some() || listen.is_some() {
             return Err(ArgsError::WebConnectConflicting);
         }
-        let address = web_connect.expect("checked above");
         if !address.ip().is_loopback() || address.port() == 0 {
             return Err(ArgsError::InvalidWebConnect(address));
         }

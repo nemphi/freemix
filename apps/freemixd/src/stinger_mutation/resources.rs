@@ -50,6 +50,8 @@ struct NativeStingerPreflight {
     worker: thread::JoinHandle<()>,
 }
 
+type StingerPreflightOutcome = (Result<NativeStingerMutation, ()>, Vec<RuntimeEventMessage>);
+
 impl NativeStingerRetirements {
     pub(crate) fn start() -> AppResult<Self> {
         let (sender, receiver) = mpsc::sync_channel::<Box<RetiredResources>>(RETIREMENT_QUEUE);
@@ -150,7 +152,7 @@ impl NativeDaemon {
         control: &mut ControlService<Policy>,
         server: &ServerIdentity,
         process_shutdown: Option<&ProcessShutdown>,
-    ) -> AppResult<Option<(Result<NativeStingerMutation, ()>, Vec<RuntimeEventMessage>)>> {
+    ) -> AppResult<Option<StingerPreflightOutcome>> {
         if !self.stinger_retirements.can_accept() {
             return Ok(Some((Err(()), Vec::new())));
         }

@@ -177,6 +177,7 @@ fn single_revision_step(previous: &StoredProject, updated: &StoredProject) -> Op
 }
 
 /// One recorded mutation, exactly as the daemon that accepted it wrote it.
+#[derive(Debug)]
 pub(crate) struct RecordedMutation {
     pub(crate) command: CommandMessage,
     pub(crate) submitted_at_millis: u64,

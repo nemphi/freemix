@@ -24,6 +24,8 @@ use crate::args::{
     MIN_CAMERA_SMOKE_TIMEOUT_MS,
 };
 
+// Report helpers run on macOS diagnostics paths and in unit tests; unused on other targets.
+#[allow(dead_code)]
 const HEX: &[u8; 16] = b"0123456789ABCDEF";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -255,6 +257,7 @@ fn cleanup_source(source: &mut MacosAudioSource) -> Result<(), AudioDiagnosticEr
     Ok(())
 }
 
+#[allow(dead_code)]
 fn format_report(permission: &PermissionState, snapshot: &DiscoverySnapshot) -> String {
     let mut report = format!(
         "FREEMIX_CAPTURE_AUDIO_INPUTS\tv=1\tplatform={}\tpermission={}\tsources={}\n",
@@ -277,6 +280,7 @@ fn format_report(permission: &PermissionState, snapshot: &DiscoverySnapshot) -> 
     report
 }
 
+#[allow(dead_code)]
 const fn permission_label(permission: &PermissionState) -> &'static str {
     match permission {
         PermissionState::Granted => "granted",
@@ -286,6 +290,7 @@ const fn permission_label(permission: &PermissionState) -> &'static str {
     }
 }
 
+#[allow(dead_code)]
 fn encode_field(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {

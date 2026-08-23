@@ -340,10 +340,10 @@ impl StudioApp {
 
 impl eframe::App for StudioApp {
     fn logic(&mut self, _context: &egui::Context, _frame: &mut eframe::Frame) {
-        if let Some(updates) = &self.updates {
-            if let Some(state) = updates.try_recv() {
-                self.state = state;
-            }
+        if let Some(updates) = &self.updates
+            && let Some(state) = updates.try_recv()
+        {
+            self.state = state;
         }
         self.check_worker_health();
         self.drain_osc();
@@ -782,6 +782,7 @@ fn initialize_worker(
     Some((runtime, recovery))
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_worker(
     config: StudioConfig,
     requests: &Receiver<WorkerRequest>,
@@ -1319,10 +1320,10 @@ fn resolve_input_move(
     })
 }
 
-fn desired_overlay<'view>(
-    view: Option<&'view ClientView>,
+fn desired_overlay(
+    view: Option<&ClientView>,
     channel: fm_protocol::WireOverlayChannelId,
-) -> Result<&'view fm_ui_model::OverlayStatus, String> {
+) -> Result<&fm_ui_model::OverlayStatus, String> {
     let view =
         view.ok_or_else(|| "Cannot edit overlay before project state is synchronized".to_owned())?;
     let overlay = view
@@ -1351,6 +1352,7 @@ fn desired_overlay_output_included(
     Ok(overlay.included_outputs.contains(&output))
 }
 
+#[allow(clippy::too_many_lines)]
 fn consume_command_sequence(
     runtime: &mut StudioRuntime,
     command_id: &str,
@@ -1374,7 +1376,7 @@ fn consume_command_sequence(
             &mut consumed,
         )? {
             SessionEvent::CommandResult { result, intake } => break (result, intake),
-            SessionEvent::Event { .. } | SessionEvent::RuntimeEvent { .. } => continue,
+            SessionEvent::Event { .. } | SessionEvent::RuntimeEvent { .. } => {}
             other => return Err(unexpected_failure("command result", &other)),
         }
     };
@@ -1422,16 +1424,14 @@ fn consume_command_sequence(
             SessionEvent::Event { event, .. } if event.cursor.revision == accepted_revision => {
                 break;
             }
-            SessionEvent::Event { event, .. } if event.cursor.revision < accepted_revision => {
-                continue;
-            }
+            SessionEvent::Event { event, .. } if event.cursor.revision < accepted_revision => {}
             SessionEvent::Event { event, .. } => {
                 return Err(WorkerFailure::Fatal(format!(
                     "Unexpected durable event revision {}; expected {accepted_revision}",
                     event.cursor.revision
                 )));
             }
-            SessionEvent::RuntimeEvent { .. } => continue,
+            SessionEvent::RuntimeEvent { .. } => {}
             other => return Err(unexpected_failure("durable event", &other)),
         }
     }
@@ -1450,16 +1450,14 @@ fn consume_command_sequence(
             SessionEvent::RuntimeEvent { event, .. } if event.revision == accepted_revision => {
                 break;
             }
-            SessionEvent::RuntimeEvent { event, .. } if event.revision < accepted_revision => {
-                continue;
-            }
+            SessionEvent::RuntimeEvent { event, .. } if event.revision < accepted_revision => {}
             SessionEvent::RuntimeEvent { event, .. } => {
                 return Err(WorkerFailure::Fatal(format!(
                     "Unexpected runtime event revision {}; expected {accepted_revision}",
                     event.revision
                 )));
             }
-            SessionEvent::Event { .. } => continue,
+            SessionEvent::Event { .. } => {}
             other => return Err(unexpected_failure("runtime event", &other)),
         }
     }
@@ -1665,6 +1663,7 @@ fn result_id(result: &CommandResult) -> &str {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn intent_payload(
     intent: StudioIntent,
     view: Option<&ClientView>,
@@ -2074,6 +2073,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::needless_pass_by_value)] // ownership moves into the spawned server thread
     fn serve_worker_recovery(listener: TcpListener) {
         let mut first = HeartbeatPeer::accept(&listener);
         first.handshake_request();
@@ -2277,7 +2277,7 @@ mod tests {
             &publisher,
             &recovery
         ));
-        let _ = updates
+        updates
             .receiver
             .recv_timeout(HEARTBEAT_TEST_TIMEOUT)
             .unwrap();
@@ -2326,6 +2326,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)] // values bounded by REQUEST_CAPACITY
     fn pending_intents_coalesce_adjacent_audio_updates_without_crossing_boundaries() {
         let input = WireInputId::new(NonZeroU128::new(2).unwrap()).to_domain();
         let other_input = WireInputId::new(NonZeroU128::new(3).unwrap()).to_domain();
@@ -2607,6 +2608,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn osc_ingress_obeys_limits_gates_and_worker_order() {
         let address = UdpSocket::bind("127.0.0.1:0")
             .unwrap()
@@ -2916,6 +2918,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn queued_overlay_actions_resolve_from_the_latest_confirmed_channel() {
         let project = ProjectId::new(NonZeroU128::new(7).unwrap());
         let output = WireOutputId::new(NonZeroU128::new(9).unwrap());

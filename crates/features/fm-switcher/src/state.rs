@@ -67,6 +67,12 @@ impl SwitcherState {
         &self.inputs
     }
 
+    /// Replaces the input order with a permutation of the current inputs.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`InputOrderError`] from
+    /// [`fm_types::validate_input_order`] and leaves the order unchanged.
     pub fn reorder_inputs(&mut self, inputs: Vec<InputId>) -> Result<(), InputOrderError> {
         validate_input_order(&self.inputs, &inputs)?;
         self.inputs = inputs;

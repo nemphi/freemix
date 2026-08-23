@@ -1,10 +1,33 @@
-use super::*;
+use std::{
+    io,
+    net::{Shutdown, TcpListener, TcpStream},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, SyncSender, TryRecvError},
+    },
+    thread,
+    time::Duration,
+};
+
+use tungstenite::{
+    Error as WebSocketError, Message, accept_hdr_with_config,
+    handshake::server::{ErrorResponse, Request, Response},
+    http::StatusCode,
+    protocol::WebSocketConfig,
+};
+
+use super::{
+    INBOUND_CAPACITY, OUTBOUND_CAPACITY, PATH, RELAY_POLL, SOCKET_HANDSHAKE_TIMEOUT,
+    WEBSOCKET_MAX_WRITE_BUFFER, WEBSOCKET_MESSAGE_LIMIT, WEBSOCKET_READ_BUFFER,
+    WEBSOCKET_WRITE_BUFFER, WebConnection, WebEvent, WebToken, WireMessage, decode_line,
+};
 
 pub(super) fn listener_loop(
-    listener: TcpListener,
-    accepted: SyncSender<TcpStream>,
-    cancel: Arc<AtomicBool>,
-    accepting: Arc<AtomicBool>,
+    listener: &TcpListener,
+    accepted: &SyncSender<TcpStream>,
+    cancel: &Arc<AtomicBool>,
+    accepting: &Arc<AtomicBool>,
 ) {
     while !cancel.load(Ordering::Acquire) {
         if !accepting.load(Ordering::Acquire) {
@@ -23,18 +46,19 @@ pub(super) fn listener_loop(
                     io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
                 ) =>
             {
-                thread::sleep(RELAY_POLL)
+                thread::sleep(RELAY_POLL);
             }
             Err(_) => break,
         }
     }
 }
 
+#[allow(clippy::result_large_err)] // tungstenite handshake error response is externally sized
 pub(super) fn worker_loop(
-    accepted: Receiver<TcpStream>,
-    events: SyncSender<WebEvent>,
-    cancel: Arc<AtomicBool>,
-    token: Arc<WebToken>,
+    accepted: &Receiver<TcpStream>,
+    events: &SyncSender<WebEvent>,
+    cancel: &Arc<AtomicBool>,
+    token: &Arc<WebToken>,
 ) {
     while !cancel.load(Ordering::Acquire) {
         let stream = match accepted.recv_timeout(RELAY_POLL) {
@@ -63,11 +87,16 @@ pub(super) fn worker_loop(
             .max_message_size(Some(WEBSOCKET_MESSAGE_LIMIT))
             .max_frame_size(Some(WEBSOCKET_MESSAGE_LIMIT))
             .accept_unmasked_frames(false);
-        let callback_token = Arc::clone(&token);
+        let callback_token = Arc::clone(token);
         let websocket = accept_hdr_with_config(
             stream,
             move |request: &Request, response: Response| {
-                if request.uri().path_and_query().map(|value| value.as_str()) != Some(PATH) {
+                if request
+                    .uri()
+                    .path_and_query()
+                    .map(tungstenite::http::uri::PathAndQuery::as_str)
+                    != Some(PATH)
+                {
                     return Err(http_error(StatusCode::NOT_FOUND));
                 }
                 if !callback_token.matches(request.headers().get("Authorization")) {
@@ -109,21 +138,21 @@ pub(super) fn worker_loop(
         }
         relay(
             &mut websocket,
-            inbound_tx,
-            outbound_rx,
-            acknowledgements_tx,
-            peer_cancel,
-            &cancel,
+            &inbound_tx,
+            &outbound_rx,
+            &acknowledgements_tx,
+            &peer_cancel,
+            cancel,
         );
     }
 }
 
 fn relay(
     websocket: &mut tungstenite::WebSocket<TcpStream>,
-    inbound: SyncSender<WireMessage>,
-    outbound: Receiver<Vec<u8>>,
-    acknowledgements: SyncSender<()>,
-    peer_cancel: Arc<AtomicBool>,
+    inbound: &SyncSender<WireMessage>,
+    outbound: &Receiver<Vec<u8>>,
+    acknowledgements: &SyncSender<()>,
+    peer_cancel: &Arc<AtomicBool>,
     gateway_cancel: &AtomicBool,
 ) {
     while !gateway_cancel.load(Ordering::Acquire) && !peer_cancel.load(Ordering::Acquire) {
@@ -154,7 +183,6 @@ fn relay(
                     return;
                 }
             }
-            Ok(Message::Binary(_)) => return,
             Ok(Message::Ping(_) | Message::Pong(_)) => {}
             Ok(Message::Close(_)) => {
                 if websocket.flush().is_err() {
@@ -162,7 +190,6 @@ fn relay(
                 }
                 return;
             }
-            Ok(Message::Frame(_)) => return,
             Err(WebSocketError::Io(error))
                 if matches!(
                     error.kind(),
@@ -171,9 +198,9 @@ fn relay(
                         | io::ErrorKind::TimedOut
                 ) =>
             {
-                thread::sleep(RELAY_POLL)
+                thread::sleep(RELAY_POLL);
             }
-            Err(_) => return,
+            Ok(Message::Binary(_) | Message::Frame(_)) | Err(_) => return,
         }
     }
     let _ = websocket.close(None);

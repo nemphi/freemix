@@ -100,7 +100,7 @@ impl WebSocketConnection {
             // Do not retry: a partial WebSocket frame makes replay unsafe.
             self.socket
                 .write(Message::text(line))
-                .map(|_| true)
+                .map(|()| true)
                 .map_err(|_| "WebSocket write failed")
         };
         self.reset_write_timeout(result)
@@ -183,7 +183,7 @@ impl WebSocketConnection {
                         })
                         .map_err(WebSocketReceiveError::Codec);
                 }
-                Ok(Message::Ping(_) | Message::Pong(_)) => continue,
+                Ok(Message::Ping(_) | Message::Pong(_)) => {}
                 Ok(Message::Close(_)) => {
                     // tungstenite queued its automatic Close reply; flush it once.
                     if let Some(deadline) = deadline {

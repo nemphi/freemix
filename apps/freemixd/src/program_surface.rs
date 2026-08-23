@@ -1,5 +1,6 @@
 //! Opt-in macOS Program surface and its platform-neutral policies.
 
+#[cfg(any(target_os = "macos", test))]
 use std::{
     cmp::Ordering,
     sync::{
@@ -30,11 +31,13 @@ use fm_gpu::{
     NativeBackend, NativeContext, NativeGpuError, NativeSurface, NativeSurfaceAcquire,
     NativeSurfaceFactory, NativeTexture,
 };
+#[cfg(any(target_os = "macos", test))]
 use fm_gpu::{
     PresentationAction, PresentationLifecycle, PresentationState, ResizeGeneration,
     SurfaceAcquisition,
 };
 
+#[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct MonitorDescriptor {
     x: i32,
@@ -46,6 +49,7 @@ struct MonitorDescriptor {
     scale_bits: u64,
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl Ord for MonitorDescriptor {
     fn cmp(&self, other: &Self) -> Ordering {
         (
@@ -69,12 +73,14 @@ impl Ord for MonitorDescriptor {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl PartialOrd for MonitorDescriptor {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MonitorChange {
     Unchanged,
@@ -82,27 +88,32 @@ enum MonitorChange {
     Reconnected(usize),
 }
 
+#[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MonitorSelectionError {
     Unavailable,
     AmbiguousDescriptors,
 }
 
+#[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct MonitorEntry<I> {
     descriptor: MonitorDescriptor,
     identity: I,
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn sort_monitor_entries<I>(inventory: &mut [MonitorEntry<I>]) {
     inventory.sort_by(|left, right| left.descriptor.cmp(&right.descriptor));
 }
 
+#[cfg(any(target_os = "macos", test))]
 struct MonitorPolicy<I> {
     selected: I,
     connected: bool,
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl<I: Clone + Eq> MonitorPolicy<I> {
     fn select(
         inventory: &mut [MonitorEntry<I>],
@@ -145,6 +156,7 @@ impl<I: Clone + Eq> MonitorPolicy<I> {
         }
     }
 
+    #[cfg(target_os = "macos")]
     fn selected_index(&self, inventory: &[MonitorEntry<I>]) -> Option<usize> {
         inventory
             .iter()
@@ -156,9 +168,11 @@ impl<I: Clone + Eq> MonitorPolicy<I> {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 #[derive(Clone)]
 pub(super) struct ShutdownSignal(Arc<AtomicBool>);
 
+#[cfg(any(target_os = "macos", test))]
 impl ShutdownSignal {
     fn new() -> Self {
         Self(Arc::new(AtomicBool::new(false)))
@@ -173,6 +187,7 @@ impl ShutdownSignal {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn begin_shutdown<T>(signal: &ShutdownSignal, deadline: &mut Option<T>, value: T) -> bool {
     if !signal.request() {
         return false;
@@ -181,6 +196,7 @@ fn begin_shutdown<T>(signal: &ShutdownSignal, deadline: &mut Option<T>, value: T
     true
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn program_shutdown_timeout(recorder: bool) -> Duration {
     if recorder {
         super::PROGRAM_RECORDER_STOP_TIMEOUT
@@ -191,20 +207,24 @@ fn program_shutdown_timeout(recorder: bool) -> Duration {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 const fn accepts_escape_press(pressed: bool, repeat: bool, escape: bool) -> bool {
     pressed && !repeat && escape
 }
 
+#[cfg(any(target_os = "macos", test))]
 struct CoalescingSender<T> {
     slot: Arc<Mutex<Option<T>>>,
     wake: SyncSender<()>,
 }
 
+#[cfg(any(target_os = "macos", test))]
 pub(super) struct CoalescingReceiver<T> {
     slot: Arc<Mutex<Option<T>>>,
     wake: Receiver<()>,
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn coalescing_channel<T>() -> (CoalescingSender<T>, CoalescingReceiver<T>) {
     let slot = Arc::new(Mutex::new(None));
     let (wake, receiver) = mpsc::sync_channel(1);
@@ -220,6 +240,7 @@ fn coalescing_channel<T>() -> (CoalescingSender<T>, CoalescingReceiver<T>) {
     )
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl<T> CoalescingSender<T> {
     fn send(&self, value: T) -> Result<(), ()> {
         *self.slot.lock().expect("coalescing slot poisoned") = Some(value);
@@ -230,17 +251,21 @@ impl<T> CoalescingSender<T> {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 #[derive(Debug)]
 struct Correlated<T> {
     generation: ResizeGeneration,
+    #[allow(dead_code)] // consumed only by the macOS presentation service loop
     value: T,
 }
 
+#[cfg(any(target_os = "macos", test))]
 struct RecreationCoordinator<T> {
     pending: Option<ResizeGeneration>,
     ready: Option<Correlated<T>>,
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl<T> RecreationCoordinator<T> {
     const fn new() -> Self {
         Self {
@@ -294,6 +319,7 @@ impl<T> RecreationCoordinator<T> {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl<T> CoalescingReceiver<T> {
     pub(super) fn take_latest(&self) -> Option<T> {
         match self.wake.try_recv() {
@@ -324,6 +350,7 @@ impl ProgramWorkerChannels {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReplacementDisposition {
     Install,
@@ -331,6 +358,7 @@ enum ReplacementDisposition {
     DiscardAndRetry(ResizeGeneration),
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn replacement_disposition(
     state: PresentationState,
     response: ResizeGeneration,
@@ -600,6 +628,7 @@ fn surface_error(error: &NativeGpuError) -> String {
     format!("Program surface GPU failure: {error}")
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn surface_validation_error(detail: &str) -> String {
     format!("fatal Program surface validation failure: {detail}")
 }

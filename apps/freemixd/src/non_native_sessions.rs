@@ -52,6 +52,7 @@ enum Accounting {
     Session,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 struct Outbound {
     write: OutboundWrite,
     accounting: Accounting,
@@ -222,20 +223,22 @@ impl Peer {
     }
 
     fn discard_outbound(&mut self, index: usize) {
-        if let Some(record) = self.outbound.remove(index) {
-            if record.accounted && matches!(record.accounting, Accounting::Session) {
-                let _ = self
-                    .session
-                    .as_mut()
-                    .and_then(|session| session.discard_outbound(index).ok());
-            }
+        if let Some(record) = self.outbound.remove(index)
+            && record.accounted
+            && matches!(record.accounting, Accounting::Session)
+        {
+            let _ = self
+                .session
+                .as_mut()
+                .and_then(|session| session.discard_outbound(index).ok());
         }
     }
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 pub(super) fn run(
-    listener: TcpListener,
+    listener: &TcpListener,
     server: &Server<ControlHandle>,
     control: &SharedControl,
     store: &dyn DurableStore,
@@ -268,10 +271,8 @@ pub(super) fn run(
 
         if let Some(web) = web {
             loop {
-                let event = match web.try_event() {
-                    Ok(Some(event)) => event,
-                    Ok(None) => break,
-                    Err(()) => break,
+                let Ok(Some(event)) = web.try_event() else {
+                    break;
                 };
                 match event {
                     WebEvent::Connected(connection)
@@ -344,10 +345,10 @@ pub(super) fn run(
             if !close[index] && peer.phase == Phase::AwaitHandshake {
                 close[index] = Instant::now() >= peer.handshake_deadline;
             }
-            if !close[index] && peer.session.is_some() {
-                close[index] =
-                    !super::session_heartbeat_active(peer.session.as_mut().expect("checked above"))
-                        .unwrap_or(false);
+            if !close[index]
+                && let Some(session) = peer.session.as_mut()
+            {
+                close[index] = !super::session_heartbeat_active(session).unwrap_or(false);
             }
             if !close[index]
                 && peer
@@ -376,7 +377,7 @@ pub(super) fn run(
                 Ok(()) => {}
                 Err(DispatchError::Peer) => close[index] = true,
                 Err(DispatchError::Daemon(error)) => {
-                    shutdown_peers(&mut peers, control, ShutdownQueue::Replace);
+                    shutdown_peers(&mut peers, control, &ShutdownQueue::Replace);
                     return Err(error);
                 }
             }
@@ -386,7 +387,7 @@ pub(super) fn run(
         }
         if let Some(native) = native.as_deref_mut() {
             if let Err(error) = native.tick_if_due(&mut control.borrow_mut(), authority) {
-                shutdown_peers(&mut peers, control, ShutdownQueue::Replace);
+                shutdown_peers(&mut peers, control, &ShutdownQueue::Replace);
                 return Err(error);
             }
             if let Some(meters) = native.take_audio_meters() {
@@ -792,8 +793,7 @@ fn write_peer(peer: &mut Peer) -> WriteOutcome {
                 record.channel_sent = true;
                 WriteOutcome::Pending
             }
-            Err(TrySendError::Full(_)) => WriteOutcome::Failed,
-            Err(TrySendError::Disconnected(_)) => WriteOutcome::Failed,
+            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => WriteOutcome::Failed,
         }
     } else {
         if peer.latest_meter.started() {
@@ -878,7 +878,7 @@ enum ShutdownQueue {
     PreserveCommandResult,
 }
 
-fn shutdown_peers(peers: &mut Vec<Peer>, control: &SharedControl, queue: ShutdownQueue) {
+fn shutdown_peers(peers: &mut Vec<Peer>, control: &SharedControl, queue: &ShutdownQueue) {
     for index in (0..peers.len()).rev() {
         if peers[index].session.is_none() || !peers[index].handshake_written {
             close_peer(peers.swap_remove(index), control);
@@ -944,7 +944,7 @@ fn shutdown_for_reason(
             } else {
                 ShutdownQueue::Replace
             };
-            shutdown_peers(peers, control, queue)
+            shutdown_peers(peers, control, &queue);
         }
         DaemonShutdownReason::ProgramSurface => close_all(peers, control),
         DaemonShutdownReason::Once => unreachable!("once is handled below"),

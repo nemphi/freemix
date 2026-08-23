@@ -1279,7 +1279,7 @@ fn apply_runtime(
             .expect("accepted engine FTB durations are validated"));
     }
     if is_overlay_command(&command) {
-        return apply_runtime_overlay(switcher, command);
+        return apply_runtime_overlay(switcher, &command);
     }
     switcher.apply(match command {
         EngineCommand::RenameInput { .. } => {
@@ -1355,46 +1355,52 @@ fn apply_runtime(
 
 fn apply_runtime_overlay(
     switcher: &mut SwitcherState,
-    command: EngineCommand,
+    command: &EngineCommand,
 ) -> Result<Vec<SwitcherEvent>, SwitcherError> {
     match command {
         EngineCommand::TakeOverlay { channel, source } => {
-            switcher.request_overlay_take(channel, source)
+            switcher.request_overlay_take(*channel, *source)
         }
-        EngineCommand::OverlayOff { channel } => Ok(switcher.request_overlay_off(channel)),
-        EngineCommand::TakeNextOverlay { channel } => switcher.request_overlay_take_next(channel),
+        EngineCommand::OverlayOff { channel } => Ok(switcher.request_overlay_off(*channel)),
+        EngineCommand::TakeNextOverlay { channel } => switcher.request_overlay_take_next(*channel),
         EngineCommand::UpdateOverlay { channel, source } => {
-            switcher.apply(SwitcherCommand::UpdateOverlay { channel, source })
+            switcher.apply(SwitcherCommand::UpdateOverlay {
+                channel: *channel,
+                source: *source,
+            })
         }
         EngineCommand::ConfigureOverlayTransition {
             channel,
             transition,
             duration_frames,
         } => switcher.apply(SwitcherCommand::ConfigureOverlayTransition {
-            channel,
-            transition,
-            duration_frames,
+            channel: *channel,
+            transition: *transition,
+            duration_frames: *duration_frames,
         }),
         EngineCommand::ConfigureOverlayAppearance {
             channel,
             position,
             border,
         } => switcher.apply(SwitcherCommand::ConfigureOverlayAppearance {
-            channel,
-            position,
-            border,
+            channel: *channel,
+            position: *position,
+            border: *border,
         }),
         EngineCommand::QueueOverlay { channel, source } => {
-            switcher.apply(SwitcherCommand::QueueOverlay { channel, source })
+            switcher.apply(SwitcherCommand::QueueOverlay {
+                channel: *channel,
+                source: *source,
+            })
         }
         EngineCommand::SetOverlayOutputInclusion {
             channel,
             output,
             included,
         } => switcher.apply(SwitcherCommand::SetOverlayOutputInclusion {
-            channel,
-            output,
-            included,
+            channel: *channel,
+            output: *output,
+            included: *included,
         }),
         _ => unreachable!("only overlay commands are delegated"),
     }

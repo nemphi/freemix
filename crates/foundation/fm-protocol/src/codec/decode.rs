@@ -717,28 +717,7 @@ fn decode_overlay_status(
     let position = decode_overlay_position((*position).to_owned(), field)?;
     let border = decode_overlay_border((*border).to_owned(), field)?;
     let queued_sources = decode_overlay_queue(queue, entry, field)?;
-    let included_outputs = if outputs.is_empty() {
-        Vec::new()
-    } else {
-        let included_outputs = outputs
-            .split(',')
-            .map(|output| NonZeroU128::new(output.parse().ok()?).map(WireOutputId::new))
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| CodecError::InvalidField {
-                field,
-                value: entry.to_owned(),
-            })?;
-        let mut output_ids = BTreeSet::new();
-        for output in &included_outputs {
-            if !output_ids.insert(output.to_domain().get()) {
-                return Err(CodecError::InvalidField {
-                    field,
-                    value: entry.to_owned(),
-                });
-            }
-        }
-        included_outputs
-    };
+    let included_outputs = decode_overlay_included_outputs(outputs, entry, field)?;
     Ok(OverlayStatus {
         channel,
         source,
@@ -751,6 +730,34 @@ fn decode_overlay_status(
         queued_sources,
         included_outputs,
     })
+}
+
+fn decode_overlay_included_outputs(
+    outputs: &str,
+    entry: &str,
+    field: &'static str,
+) -> Result<Vec<WireOutputId>, CodecError> {
+    if outputs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let included_outputs = outputs
+        .split(',')
+        .map(|output| NonZeroU128::new(output.parse().ok()?).map(WireOutputId::new))
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| CodecError::InvalidField {
+            field,
+            value: entry.to_owned(),
+        })?;
+    let mut output_ids = BTreeSet::new();
+    for output in &included_outputs {
+        if !output_ids.insert(output.to_domain().get()) {
+            return Err(CodecError::InvalidField {
+                field,
+                value: entry.to_owned(),
+            });
+        }
+    }
+    Ok(included_outputs)
 }
 
 fn decode_overlay_queue(

@@ -1,6 +1,6 @@
 use std::{
-    env, io,
-    net::{Shutdown, SocketAddr, TcpListener, TcpStream},
+    env,
+    net::{SocketAddr, TcpListener},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -11,12 +11,7 @@ use std::{
 };
 
 use fm_protocol::{MAX_LINE_BYTES, WireMessage, decode_line};
-use tungstenite::{
-    Error as WebSocketError, Message, accept_hdr_with_config,
-    handshake::server::{ErrorResponse, Request, Response},
-    http::{HeaderValue, StatusCode},
-    protocol::WebSocketConfig,
-};
+use tungstenite::http::HeaderValue;
 
 use super::AppResult;
 
@@ -106,14 +101,19 @@ impl WebGateway {
         let listener_thread = thread::Builder::new()
             .name("freemixd-web-listener".into())
             .spawn(move || {
-                listener_loop(listener, accepted_tx, listener_cancel, listener_accepting)
+                listener_loop(
+                    &listener,
+                    &accepted_tx,
+                    &listener_cancel,
+                    &listener_accepting,
+                );
             })?;
 
         let worker_cancel = Arc::clone(&cancel);
         let worker_token = Arc::clone(&token);
         let worker_thread = match thread::Builder::new()
             .name("freemixd-web-worker".into())
-            .spawn(move || worker_loop(accepted_rx, events_tx, worker_cancel, worker_token))
+            .spawn(move || worker_loop(&accepted_rx, &events_tx, &worker_cancel, &worker_token))
         {
             Ok(handle) => handle,
             Err(error) => {

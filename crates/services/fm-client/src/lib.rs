@@ -223,7 +223,8 @@ impl fmt::Display for ClientError {
         match self {
             Self::InvalidConfig(message)
             | Self::InvalidHandshake(message)
-            | Self::InvalidSnapshot(message) => formatter.write_str(message),
+            | Self::InvalidSnapshot(message)
+            | Self::InvalidHeartbeatAcknowledgement(message) => formatter.write_str(message),
             Self::InvalidState { operation, state } => {
                 write!(formatter, "cannot {operation} while client is {state:?}")
             }
@@ -284,7 +285,6 @@ impl fmt::Display for ClientError {
             Self::HeartbeatAcknowledgementPending => {
                 formatter.write_str("a heartbeat acknowledgement is already pending")
             }
-            Self::InvalidHeartbeatAcknowledgement(message) => formatter.write_str(message),
             Self::UnknownCommand(id) => write!(formatter, "unknown command result ID {id:?}"),
             Self::CommandAlreadyCompleted(id) => {
                 write!(formatter, "command {id:?} is already complete")

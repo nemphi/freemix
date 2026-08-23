@@ -724,31 +724,13 @@ impl fmt::Display for ModelError {
                 write!(formatter, "snapshot repeats Stinger slot {slot}")
             }
             Self::InvalidStingerSlot(slot) => write!(formatter, "invalid Stinger slot {slot}"),
-            Self::InvalidOverlayCount(count) => {
-                write!(
-                    formatter,
-                    "snapshot contains {count} overlay channels; expected 8"
-                )
-            }
-            Self::InvalidOverlayChannel(channel) => {
-                write!(formatter, "invalid or duplicate overlay channel {channel}")
-            }
-            Self::InvalidOverlayTransitionDuration {
-                channel,
-                duration_frames,
-            } => write!(
-                formatter,
-                "overlay channel {channel} transition duration {duration_frames} is outside 1..=3600 frames"
-            ),
-            Self::ActiveOverlayMissingSource(channel) => {
-                write!(formatter, "active overlay channel {channel} has no source")
-            }
-            Self::InvalidOverlayQueueDepth { channel, depth } => write!(
-                formatter,
-                "overlay channel {channel} queue depth {depth} exceeds 64"
-            ),
-            Self::DuplicateOverlayOutput(channel) => {
-                write!(formatter, "overlay channel {channel} repeats an output")
+            Self::InvalidOverlayCount(_)
+            | Self::InvalidOverlayChannel(_)
+            | Self::InvalidOverlayTransitionDuration { .. }
+            | Self::ActiveOverlayMissingSource(_)
+            | Self::InvalidOverlayQueueDepth { .. }
+            | Self::DuplicateOverlayOutput(_) => {
+                write_overlay_message(self, formatter).expect("overlay errors always format")
             }
             Self::UnknownInput(input) => write!(formatter, "unknown input {input}"),
             Self::UnknownOutput(output) => write!(formatter, "unknown output {output}"),
@@ -762,6 +744,42 @@ impl fmt::Display for ModelError {
 }
 
 impl std::error::Error for ModelError {}
+
+fn write_overlay_message(
+    error: &ModelError,
+    formatter: &mut fmt::Formatter<'_>,
+) -> Option<fmt::Result> {
+    match error {
+        ModelError::InvalidOverlayCount(count) => Some(write!(
+            formatter,
+            "snapshot contains {count} overlay channels; expected 8"
+        )),
+        ModelError::InvalidOverlayChannel(channel) => Some(write!(
+            formatter,
+            "invalid or duplicate overlay channel {channel}"
+        )),
+        ModelError::InvalidOverlayTransitionDuration {
+            channel,
+            duration_frames,
+        } => Some(write!(
+            formatter,
+            "overlay channel {channel} transition duration {duration_frames} is outside 1..=3600 frames"
+        )),
+        ModelError::ActiveOverlayMissingSource(channel) => Some(write!(
+            formatter,
+            "active overlay channel {channel} has no source"
+        )),
+        ModelError::InvalidOverlayQueueDepth { channel, depth } => Some(write!(
+            formatter,
+            "overlay channel {channel} queue depth {depth} exceeds 64"
+        )),
+        ModelError::DuplicateOverlayOutput(channel) => Some(write!(
+            formatter,
+            "overlay channel {channel} repeats an output"
+        )),
+        _ => None,
+    }
+}
 
 /// Project-bound replicated client state and reducer.
 #[derive(Clone, Debug)]

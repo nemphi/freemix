@@ -47,10 +47,10 @@ pub fn encode_line(message: &WireMessage) -> Result<String, CodecError> {
         WireMessage::AudioMeters(message) => encode_audio_meters(&mut record, message)?,
         WireMessage::CapabilityReport(message) => encode_capability_report(&mut record, message)?,
         WireMessage::DiagnosticsRequest(message) => {
-            encode_diagnostics_request(&mut record, message)?
+            encode_diagnostics_request(&mut record, message)?;
         }
         WireMessage::DiagnosticsResponse(message) => {
-            encode_diagnostics_response(&mut record, message)?
+            encode_diagnostics_response(&mut record, message)?;
         }
         WireMessage::Error(message) => encode_error_message(&mut record, message)?,
     }

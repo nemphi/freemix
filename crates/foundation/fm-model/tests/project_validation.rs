@@ -410,7 +410,7 @@ fn duplicate_scene_input_is_atomic_and_preserves_layer_fields() {
     assert!(project.inputs()[1].required_capabilities.is_empty());
     assert_eq!(
         project.input_audio_strip(input_id(2)),
-        Some(Default::default())
+        Some(InputAudioStripState::default())
     );
 
     let mut reject = |source: SceneId,
@@ -472,7 +472,7 @@ fn add_scene_input_is_atomic_and_uses_current_name_contract() {
     assert!(project.inputs()[1].required_capabilities.is_empty());
     assert_eq!(
         project.input_audio_strip(input_id(2)),
-        Some(Default::default())
+        Some(InputAudioStripState::default())
     );
 
     let mut reject = |scene: SceneId, input: InputId, scene_name: &str, input_name: &str, error| {
@@ -561,6 +561,7 @@ fn complete_simulated_production_is_valid() {
 
 #[test]
 fn remove_input_removes_pair_and_rejects_domain_references() {
+    type Mutation = Box<dyn FnOnce(&mut Project)>;
     let mut base = Project::new(project_id(70), "Remove", settings());
     for id in [1, 2, 3] {
         base.add_input(Input {
@@ -583,7 +584,7 @@ fn remove_input_removes_pair_and_rejects_domain_references() {
             .any(|strip| strip.input == input_id(3))
     );
 
-    let mut cases: Vec<Box<dyn FnOnce(&mut Project)>> = vec![
+    let mut cases: Vec<Mutation> = vec![
         Box::new(|project| project.set_main_mix(MainMix::new(input_id(3), input_id(1)))),
         Box::new(|project| {
             project.add_stinger(StingerConfig::new(
@@ -593,7 +594,7 @@ fn remove_input_removes_pair_and_rejects_domain_references() {
                 0,
                 StingerAudioPolicy::Muted,
                 StingerMissingMediaFallback::Cut,
-            ))
+            ));
         }),
         Box::new(|project| {
             project.add_scene(Scene {
@@ -601,7 +602,7 @@ fn remove_input_removes_pair_and_rejects_domain_references() {
                 name: "Scene".into(),
                 background: Rgba8::OPAQUE_BLACK,
                 layers: vec![layer("Input", SourceRef::Input(input_id(3)))],
-            })
+            });
         }),
         Box::new(|project| {
             project.add_input(Input {
@@ -612,7 +613,7 @@ fn remove_input_removes_pair_and_rejects_domain_references() {
                     audio_source: Some(input_id(3)),
                 },
                 required_capabilities: Vec::new(),
-            })
+            });
         }),
     ];
     for configure in cases.drain(..) {
@@ -643,7 +644,7 @@ fn add_input_checked_is_atomic_and_preserves_exact_name() {
     assert_eq!(project.inputs()[1].name, "Exact  name  ");
     assert_eq!(
         project.input_audio_strip(input_id(2)),
-        Some(Default::default())
+        Some(InputAudioStripState::default())
     );
     assert_eq!(
         project
@@ -673,6 +674,7 @@ fn add_input_checked_is_atomic_and_preserves_exact_name() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn remove_outputs_and_audio_buses_preserves_order_and_rejects_references() {
     let mut base = valid_project();
     base.add_audio_bus(AudioBus {

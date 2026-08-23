@@ -173,6 +173,17 @@ impl ShowState {
         Ok(())
     }
 
+    /// Reorders show inputs to match the supplied order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InputOrderError`] when the order is not a permutation of
+    /// exactly the current show inputs.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if a validated order fails to resolve a canonical input
+    /// name, which cannot happen once validation succeeds.
     pub fn reorder_inputs(&mut self, inputs: Vec<InputId>) -> Result<(), InputOrderError> {
         let mut desired_switcher = self.desired_switcher.clone();
         desired_switcher.reorder_inputs(inputs.clone())?;

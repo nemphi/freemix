@@ -231,6 +231,11 @@ impl Session {
     }
 
     /// Authorizes and accounts for one read-only diagnostics query.
+    ///
+    /// # Errors
+    ///
+    /// Returns a session, authorization, protocol, size, or rate error when
+    /// the diagnostics query cannot be admitted.
     pub fn admit_diagnostics(
         &mut self,
         request: &DiagnosticsRequest,

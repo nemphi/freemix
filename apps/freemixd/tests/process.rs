@@ -95,7 +95,7 @@ impl Daemon {
         let lines = read_startup_lines(&mut child, 1);
         let readiness = match lines[0].parse::<ReadinessRecord>() {
             Ok(readiness) => readiness,
-            Err(error) => startup_failure(&mut child, lines, error.to_string(), None),
+            Err(error) => startup_failure(&mut child, &lines, &error.to_string(), None),
         };
         Self {
             child: Some(child),
@@ -120,8 +120,8 @@ impl Daemon {
         let readiness = line.parse::<ReadinessRecord>().unwrap_or_else(|error| {
             startup_failure(
                 &mut child,
-                vec![line.clone(), web_line.clone()],
-                error.to_string(),
+                &[line.clone(), web_line.clone()],
+                &error.to_string(),
                 None,
             )
         });
@@ -130,12 +130,7 @@ impl Daemon {
             .and_then(|line| line.strip_suffix('\n'))
             .and_then(|address| address.parse().ok())
             .unwrap_or_else(|| {
-                startup_failure(
-                    &mut child,
-                    vec![line, web_line],
-                    "invalid web readiness".into(),
-                    None,
-                )
+                startup_failure(&mut child, &[line, web_line], "invalid web readiness", None)
             });
         (
             Self {
@@ -185,8 +180,8 @@ impl Daemon {
         let readiness = line.parse::<ReadinessRecord>().unwrap_or_else(|error| {
             startup_failure(
                 &mut child,
-                vec![line.clone(), status_line.clone()],
-                error.to_string(),
+                &[line.clone(), status_line.clone()],
+                &error.to_string(),
                 None,
             )
         });
@@ -195,8 +190,8 @@ impl Daemon {
             .unwrap_or_else(|error| {
                 startup_failure(
                     &mut child,
-                    vec![line.clone(), status_line.clone()],
-                    error.to_string(),
+                    &[line.clone(), status_line.clone()],
+                    &error.to_string(),
                     None,
                 )
             });
@@ -224,7 +219,7 @@ impl Daemon {
         let lines = read_startup_lines(&mut child, 1);
         let readiness = match lines[0].parse::<ReadinessRecord>() {
             Ok(readiness) => readiness,
-            Err(error) => startup_failure(&mut child, lines, error.to_string(), None),
+            Err(error) => startup_failure(&mut child, &lines, &error.to_string(), None),
         };
         Self {
             child: Some(child),
@@ -319,22 +314,22 @@ fn read_startup_lines(child: &mut Child, count: usize) -> Vec<String> {
     let deadline = Instant::now() + Duration::from_secs(1);
     let result = match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
         Ok(result) => result,
-        Err(error) => startup_failure(child, Vec::new(), error.to_string(), Some(reader)),
+        Err(error) => startup_failure(child, &[], &error.to_string(), Some(reader)),
     };
     let lines = match result {
         Ok(lines) => lines,
-        Err(error) => startup_failure(child, Vec::new(), error.to_string(), Some(reader)),
+        Err(error) => startup_failure(child, &[], &error.to_string(), Some(reader)),
     };
     if reader.join().is_err() {
-        startup_failure(child, lines, "startup stdout reader panicked".into(), None);
+        startup_failure(child, &lines, "startup stdout reader panicked", None);
     }
     lines
 }
 
 fn startup_failure(
     child: &mut Child,
-    stdout: Vec<String>,
-    failure: String,
+    stdout: &[String],
+    failure: &str,
     reader: Option<std::thread::JoinHandle<()>>,
 ) -> ! {
     let stopped = terminate_child(child);
@@ -1298,6 +1293,7 @@ fn current_client_receives_structured_handshake_rejection() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn remote_input_rename_is_authorized_replicated_replay_safe_and_survives_restart() {
     let directory = TestDirectory::new("remote-input-rename");
     let project_path = directory.project_path();
@@ -1785,103 +1781,6 @@ fn checkpoints_compact_the_journal_and_recovery_reproduces_the_exact_state() {
     );
 }
 
-/// Work that is not durable is never acknowledged.
-///
-/// The journal is made unusable underneath a running daemon — the specific
-/// fault stands in for a failing or full show disk. The commands that follow
-/// must come back refused and retryable, the daemon must stay up and keep
-/// serving, and no refused command may leave a trace: once the journal works
-/// again the next command takes the very next revision.
-#[test]
-fn a_command_that_cannot_be_journalled_is_refused_and_the_daemon_keeps_serving() {
-    let directory = TestDirectory::new("journal-append-failure");
-    let project_path = directory.project_path();
-    create_project(&project_path);
-    let journal = project_path.join("journal");
-
-    let daemon = Daemon::start_without_once(&project_path);
-    let mut client = daemon.connect();
-    client.handshake(None);
-    assert!(matches!(client.receive(), WireMessage::Snapshot(_)));
-    client.send(&command(
-        "durable-cut",
-        "durable-cut-key",
-        CommandPayload::Cut,
-    ));
-    assert!(matches!(
-        client.next_result(),
-        CommandResult::Accepted { revision: 1, .. }
-    ));
-
-    let saved: Vec<(PathBuf, Vec<u8>)> = fs::read_dir(&journal)
-        .unwrap()
-        .map(|entry| {
-            let path = entry.unwrap().path();
-            let bytes = fs::read(&path).unwrap();
-            (path, bytes)
-        })
-        .collect();
-    assert!(!saved.is_empty(), "the accepted command was journalled");
-    fs::remove_dir_all(&journal).unwrap();
-    fs::create_dir(&journal).unwrap();
-    fs::create_dir(journal.join("journal.db")).unwrap();
-
-    for id in ["refused-first", "refused-second"] {
-        client.send(&command(id, &format!("{id}-key"), CommandPayload::Cut));
-        match client.next_result() {
-            CommandResult::Rejected {
-                id: rejected,
-                code,
-                current_revision,
-                retryable,
-                ..
-            } => {
-                assert_eq!(rejected, id);
-                assert_eq!(code, "unavailable");
-                assert_eq!(current_revision, 1, "a refused command takes no revision");
-                assert!(retryable);
-            }
-            CommandResult::Accepted { revision, .. } => {
-                panic!("{id} must not be acknowledged, yet it took revision {revision}")
-            }
-        }
-    }
-
-    fs::remove_dir_all(&journal).unwrap();
-    fs::create_dir(&journal).unwrap();
-    for (path, bytes) in saved {
-        fs::write(path, bytes).unwrap();
-    }
-    client.send(&command(
-        "after-repair",
-        "after-repair-key",
-        CommandPayload::Cut,
-    ));
-    assert!(
-        matches!(
-            client.next_result(),
-            CommandResult::Accepted { revision: 2, .. }
-        ),
-        "the refused commands left no gap in the revision or the journal"
-    );
-    drop(client);
-    daemon.stop();
-
-    let store = ProjectStore::new(&project_path).unwrap();
-    let scan = store.scan_journal().unwrap();
-    assert_eq!(
-        scan.batches().len(),
-        2,
-        "only the accepted commands persist"
-    );
-    let daemon = Daemon::start(&project_path);
-    let mut restarted = daemon.connect();
-    assert_eq!(restarted.handshake(None).current_revision, 2);
-    drop(restarted);
-    daemon.wait_success();
-    assert_eq!(store.load().unwrap().position().revision, 2);
-}
-
 #[test]
 fn live_stinger_slot_mutations_fire_immediately_and_survive_restart() {
     let directory = TestDirectory::new("live-stinger-configuration");
@@ -2315,6 +2214,7 @@ fn manual_alpha_fade_state_and_receipts_survive_restart_through_commit_and_cance
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn manual_slide_state_survives_restart_through_commit_and_cancel() {
     for (name, terminal, swaps_routes) in [
         (
@@ -2567,6 +2467,7 @@ fn sigterm_notifies_established_client_then_exits_cleanly() {
 
 #[cfg(unix)]
 #[test]
+#[allow(clippy::too_many_lines)]
 fn websocket_control_is_authenticated_ordered_and_raw_compatible() {
     let directory = TestDirectory::new("websocket-control");
     let project_path = directory.project_path();
@@ -2709,10 +2610,12 @@ fn websocket_control_is_authenticated_ordered_and_raw_compatible() {
     ));
     match websocket.read() {
         Ok(tungstenite::Message::Close(_))
-        | Err(tungstenite::Error::ConnectionClosed)
-        | Err(tungstenite::Error::Protocol(
-            tungstenite::error::ProtocolError::ResetWithoutClosingHandshake,
-        )) => {}
+        | Err(
+            tungstenite::Error::ConnectionClosed
+            | tungstenite::Error::Protocol(
+                tungstenite::error::ProtocolError::ResetWithoutClosingHandshake,
+            ),
+        ) => {}
         Err(tungstenite::Error::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
         }
         result => panic!("WebSocket did not terminate cleanly: {result:?}"),

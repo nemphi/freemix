@@ -199,6 +199,7 @@ pub struct TerminalUncertaintyNotice {
 }
 
 /// Owned render input for one studio frame.
+#[allow(clippy::struct_excessive_bools)] // each bool is a distinct operator permission gate
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct StudioUiState {
     pub connection_status: StudioConnectionStatus,
@@ -894,6 +895,7 @@ fn meter_group(ui: &mut Ui, label: &str, channels: &[AudioMeterChannel]) {
     });
 }
 
+#[allow(clippy::too_many_lines)]
 fn draw_input_audio_strips(ui: &mut Ui, state: &StudioUiState, intents: &mut Vec<StudioIntent>) {
     let enabled = state.connection_status.controls_enabled()
         && state.can_control_audio
@@ -1034,6 +1036,7 @@ fn draw_overlays(
         });
 }
 
+#[allow(clippy::too_many_lines)]
 fn draw_overlay_channel(
     ui: &mut Ui,
     state: &StudioUiState,
@@ -1709,9 +1712,9 @@ impl StudioShell {
         let current = &view.input_names[index];
         if current != &draft.confirmed_name {
             if draft.name == draft.confirmed_name {
-                draft.name = current.clone();
+                draft.name.clone_from(current);
             }
-            draft.confirmed_name = current.clone();
+            draft.confirmed_name.clone_from(current);
         }
     }
 
@@ -2017,6 +2020,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn fade_to_black_shortcut_preserves_order_durations_and_operator_gates() {
         let inputs = [11, 12, 13, 14, 15, 16, 17, 18].map(input);
         let gate = TransitionGate {
@@ -2550,6 +2554,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn intents_are_typed_and_comparable() {
         assert_eq!(
             StudioIntent::SetInputAudioStrip {

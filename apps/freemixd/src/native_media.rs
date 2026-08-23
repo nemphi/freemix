@@ -3683,7 +3683,7 @@ impl NativeMasterRuntime {
     /// owned audio block. A clone is retained in the bounded fake sink so
     /// existing diagnostics remain identical to [`Self::render_frame`].
     ///
-    /// Fade, Wipe, AlphaFade, Slide, and Zoom linearly weight both sources across the exact interval;
+    /// Fade, Wipe, `AlphaFade`, Slide, and Zoom linearly weight both sources across the exact interval;
     /// Cut keeps one source at unity. This method performs no probe, decode,
     /// channel mapping, or blocking wait.
     ///
@@ -3865,8 +3865,10 @@ impl NativeMasterRuntime {
                         &[primary, secondary],
                         active_video_inputs,
                         &mut self.scratch.mix,
-                        &mut self.scratch.master_meters,
-                        &mut self.scratch.input_meters,
+                        (
+                            &mut self.scratch.master_meters,
+                            &mut self.scratch.input_meters,
+                        ),
                     )?;
                 }
                 (Some(submission), None) | (None, Some(submission)) => {
@@ -3876,8 +3878,10 @@ impl NativeMasterRuntime {
                         &[submission],
                         active_video_inputs,
                         &mut self.scratch.mix,
-                        &mut self.scratch.master_meters,
-                        &mut self.scratch.input_meters,
+                        (
+                            &mut self.scratch.master_meters,
+                            &mut self.scratch.input_meters,
+                        ),
                     )?;
                 }
                 (None, None) => {
@@ -3887,8 +3891,10 @@ impl NativeMasterRuntime {
                         &[],
                         active_video_inputs,
                         &mut self.scratch.mix,
-                        &mut self.scratch.master_meters,
-                        &mut self.scratch.input_meters,
+                        (
+                            &mut self.scratch.master_meters,
+                            &mut self.scratch.input_meters,
+                        ),
                     )?;
                 }
             }
@@ -4753,8 +4759,7 @@ fn mix_project_audio_strips(
             &[],
             active_video_inputs,
             output,
-            master_meters,
-            input_meters,
+            (master_meters, input_meters),
         )?;
         return Ok(());
     };
@@ -4789,8 +4794,7 @@ fn mix_project_audio_strips(
         &submissions[..submission_count],
         active_video_inputs,
         output,
-        master_meters,
-        input_meters,
+        (master_meters, input_meters),
     )?;
     Ok(())
 }
@@ -8298,7 +8302,7 @@ mod tests {
             InputAudioStripState {
                 gain: InputGainMilliDb::new(-6_021).unwrap(),
                 balance: InputBalanceBasisPoints::CENTER,
-                delay_samples: Default::default(),
+                delay_samples: InputDelaySamples::default(),
                 muted: false,
                 soloed: false,
                 follow_video: false,
@@ -8355,7 +8359,7 @@ mod tests {
             InputAudioStripState {
                 gain: InputGainMilliDb::new(-6_021).unwrap(),
                 balance: InputBalanceBasisPoints::CENTER,
-                delay_samples: Default::default(),
+                delay_samples: InputDelaySamples::default(),
                 muted: false,
                 soloed: false,
                 follow_video: true,
@@ -8366,7 +8370,7 @@ mod tests {
             InputAudioStripState {
                 gain: InputGainMilliDb::UNITY,
                 balance: InputBalanceBasisPoints::CENTER,
-                delay_samples: Default::default(),
+                delay_samples: InputDelaySamples::default(),
                 muted: false,
                 soloed: false,
                 follow_video: true,
@@ -8393,7 +8397,7 @@ mod tests {
             InputAudioStripState {
                 gain: InputGainMilliDb::UNITY,
                 balance: InputBalanceBasisPoints::CENTER,
-                delay_samples: Default::default(),
+                delay_samples: InputDelaySamples::default(),
                 muted: true,
                 soloed: false,
                 follow_video: true,
@@ -8486,7 +8490,7 @@ mod tests {
             InputAudioStripState {
                 gain: InputGainMilliDb::new(-6_021).unwrap(),
                 balance: InputBalanceBasisPoints::CENTER,
-                delay_samples: Default::default(),
+                delay_samples: InputDelaySamples::default(),
                 muted: false,
                 soloed: false,
                 follow_video: true,
@@ -11062,10 +11066,11 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn engine_ticks_propagate_automatic_and_manual_intervals_to_audio_plans() {
         let old = input(1);
         let new = input(2);
-        let inputs = vec![old, new];
+        let inputs = [old, new];
         let frame_rate = FrameRate::new(25, 1).unwrap();
         let clock_domain = EngineClockDomainId::new(NonZeroU128::new(99).unwrap());
         let show = || {

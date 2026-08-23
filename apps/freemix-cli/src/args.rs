@@ -789,6 +789,7 @@ impl core::fmt::Display for ArgsError {
 
 impl std::error::Error for ArgsError {}
 
+#[allow(clippy::too_many_lines)]
 pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, ArgsError> {
     let mut arguments = arguments.into_iter();
     let Some(command) = arguments.next() else {
