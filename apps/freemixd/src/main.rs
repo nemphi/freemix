@@ -8072,7 +8072,14 @@ mod tests {
         ));
         assert!(Instant::now() >= original_deadline);
         expired_rx.recv_timeout(HEARTBEAT_TIMEOUT).unwrap();
-        assert!(heartbeat_sent_at.elapsed() >= HEARTBEAT_TIMEOUT);
+        // The server expires sessions on absolute wall-clock deadlines while
+        // this measurement is monotonic, so a small system-clock step may
+        // legitimately fire expiry early against this instant.
+        const CLOCK_SKEW_TOLERANCE: Duration = Duration::from_millis(250);
+        assert!(
+            heartbeat_sent_at.elapsed() + CLOCK_SKEW_TOLERANCE >= HEARTBEAT_TIMEOUT,
+            "the session expired before its heartbeat deadline"
+        );
 
         let next_client = TcpStream::connect(address).unwrap();
         next_client

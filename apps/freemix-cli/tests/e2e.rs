@@ -2641,12 +2641,47 @@ fn local_stream_destinations_are_authored_offline_and_never_print_the_stream_key
         stdout(&invoke_bounded(&["streams", context.project_path()])),
         ""
     );
+
+    // An srt:// destination authors through the same surface, persists the
+    // canonical scheme spelling, and redacts its key into the stream id.
+    author_srt_stream_destination(&context);
+
     assert_success(&invoke_bounded(&[
         "output-remove",
         context.project_path(),
         "30",
     ]));
     fs::remove_dir_all(context.root).unwrap();
+}
+
+/// Authors and removes one `srt://` destination on the existing output,
+/// asserting the persisted scheme spelling and the redacted inventory line.
+fn author_srt_stream_destination(context: &ContractContext) {
+    assert_success(&invoke_bounded(&[
+        "stream-add",
+        context.project_path(),
+        "41",
+        "30",
+        "srt://relay.example.test:9710",
+        STREAM_KEY,
+        "SRT relay",
+    ]));
+    let srt_manifest = fs::read_to_string(context.project.join("project.json")).unwrap();
+    assert!(srt_manifest.contains("\"protocol\": \"srt\""));
+    assert_eq!(
+        stdout(&invoke_bounded(&["streams", context.project_path()])),
+        concat!(
+            "stream id=41 name=\"SRT relay\" protocol=srt ",
+            "url=\"srt://relay.example.test:9710?streamid=****\" ",
+            "backup_url=\"none\" ",
+            "output=30 output_name=\"Primary\" startup=stopped running=false"
+        )
+    );
+    assert_success(&invoke_bounded(&[
+        "stream-remove",
+        context.project_path(),
+        "41",
+    ]));
 }
 
 #[test]

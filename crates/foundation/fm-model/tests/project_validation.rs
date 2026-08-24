@@ -910,10 +910,6 @@ fn stream_destinations_refuse_bad_urls_credentials_duplicate_ids_and_dangling_ou
             StreamEndpointError::UnsupportedScheme,
         ),
         (
-            "srt://ingest.example/live",
-            StreamEndpointError::UnsupportedScheme,
-        ),
-        (
             "ingest.example/live",
             StreamEndpointError::UnsupportedScheme,
         ),
@@ -990,6 +986,120 @@ fn stream_destinations_refuse_bad_urls_credentials_duplicate_ids_and_dangling_ou
         field: "output",
         kind: ValidationErrorKind::MissingReference(EntityRef::Output(output_id(9))),
     }));
+}
+
+#[test]
+fn srt_endpoints_take_host_port_only_and_recompose_through_a_streamid_query() {
+    const KEY: &str = "srt-live-9f3c-key";
+
+    // The port is optional and the endpoint is stored scheme-free.
+    assert_eq!(
+        StreamEndpoint::parse_url("srt://ingest.example.test:9710").unwrap(),
+        (
+            StreamProtocol::Srt,
+            StreamEndpoint::parse_for(StreamProtocol::Srt, "ingest.example.test:9710").unwrap()
+        )
+    );
+    assert_eq!(
+        StreamEndpoint::parse_url("srt://ingest.example.test")
+            .unwrap()
+            .1
+            .as_str(),
+        "ingest.example.test"
+    );
+
+    for (endpoint, expected) in [
+        (
+            "ingest.example.test:9710/live",
+            StreamEndpointError::PathNotAllowed,
+        ),
+        ("ingest.example.test/", StreamEndpointError::PathNotAllowed),
+        (
+            "ingest.example.test?streamid=abcdef",
+            StreamEndpointError::QueryOrFragment,
+        ),
+        (
+            "ingest.example.test#fragment",
+            StreamEndpointError::QueryOrFragment,
+        ),
+        (
+            "operator:hunter2@ingest.example.test:9710",
+            StreamEndpointError::EmbeddedCredentials,
+        ),
+        (":9710", StreamEndpointError::MissingHost),
+        ("", StreamEndpointError::Empty),
+        (
+            "ingest.example.test:9710 li",
+            StreamEndpointError::InvalidCharacter,
+        ),
+    ] {
+        assert_eq!(
+            StreamEndpoint::parse_for(StreamProtocol::Srt, endpoint),
+            Err(expected),
+            "{endpoint} must be refused"
+        );
+    }
+
+    // A full URL dispatches on its scheme: paths stay legal for RTMP but not
+    // for SRT, and unknown schemes are still refused outright.
+    assert_eq!(
+        StreamEndpoint::parse_url("srt://ingest.example.test/live"),
+        Err(StreamEndpointError::PathNotAllowed)
+    );
+    assert_eq!(
+        StreamEndpoint::parse_url("rtmps://ingest.example.test/live"),
+        Ok((
+            StreamProtocol::Rtmps,
+            StreamEndpoint::parse("ingest.example.test/live").unwrap()
+        ))
+    );
+    assert_eq!(
+        StreamEndpoint::parse_url("udp://ingest.example.test:9710"),
+        Err(StreamEndpointError::UnsupportedScheme)
+    );
+
+    // Recomposition puts the key into the stream id query, and redaction
+    // scrubs it there too.
+    let target = StreamTarget::new(
+        stream_target_id(7),
+        "SRT relay".to_owned(),
+        StreamProtocol::Srt,
+        StreamEndpoint::parse_url("srt://ingest.example.test:9710")
+            .unwrap()
+            .1,
+        StreamKey::parse(KEY).unwrap(),
+        output_id(1),
+    )
+    .unwrap()
+    .with_backup_endpoint(Some(
+        StreamEndpoint::parse_url("srt://backup.example.test")
+            .unwrap()
+            .1,
+    ))
+    .unwrap();
+    assert_eq!(
+        target.expose_url(),
+        format!("srt://ingest.example.test:9710?streamid={KEY}")
+    );
+    assert_eq!(
+        target.expose_backup_url(),
+        Some(format!("srt://backup.example.test?streamid={KEY}"))
+    );
+    assert_eq!(
+        target.redacted_url(),
+        "srt://ingest.example.test:9710?streamid=****"
+    );
+    assert_eq!(
+        target.redacted_backup_url().as_deref(),
+        Some("srt://backup.example.test?streamid=****")
+    );
+
+    // The strict RTMP-style entry point still demands an application path,
+    // so a bare host:port stays an authoring error there.
+    assert_eq!(
+        StreamEndpoint::parse("ingest.example.test:9710"),
+        Err(StreamEndpointError::MissingApplicationPath)
+    );
 }
 
 #[test]

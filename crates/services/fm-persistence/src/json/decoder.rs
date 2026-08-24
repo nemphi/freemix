@@ -581,14 +581,15 @@ fn parse_stream_target(value: Value) -> Result<StreamTarget, DecodeError> {
     let protocol = match object.string("protocol")?.as_str() {
         "rtmp" => StreamProtocol::Rtmp,
         "rtmps" => StreamProtocol::Rtmps,
+        "srt" => StreamProtocol::Srt,
         value => return Err(unknown_enum("stream target protocol", value)),
     };
-    let endpoint = StreamEndpoint::parse(&object.string("endpoint")?)
+    let endpoint = StreamEndpoint::parse_for(protocol, &object.string("endpoint")?)
         .map_err(|error| syntax(format!("field `endpoint` is invalid: {error}")))?;
     let backup_endpoint = object
         .optional_string("backup_endpoint")?
         .map(|text| {
-            StreamEndpoint::parse(&text)
+            StreamEndpoint::parse_for(protocol, &text)
                 .map_err(|error| syntax(format!("field `backup_endpoint` is invalid: {error}")))
         })
         .transpose()?;

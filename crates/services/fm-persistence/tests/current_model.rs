@@ -473,6 +473,60 @@ fn stream_destination_round_trips_at_the_current_schema_and_keeps_its_key_off_ev
 }
 
 #[test]
+fn srt_stream_destination_round_trips_at_the_current_schema() {
+    const KEY: &str = "srt-4e7a-roundtrip-key";
+    let high = u128::from(u64::MAX) + 101;
+    let temp = TestDirectory::new("stream-target-srt");
+    let store = temp.store("show");
+
+    let mut project = rich_project();
+    let target = StreamTarget::new(
+        stream_target_id(high + 40),
+        "SRT relay".into(),
+        StreamProtocol::Srt,
+        StreamEndpoint::parse_for(StreamProtocol::Srt, "relay.example.test:9710").unwrap(),
+        StreamKey::parse(KEY).unwrap(),
+        output_id(high + 30),
+    )
+    .unwrap()
+    .with_backup_endpoint(Some(
+        StreamEndpoint::parse_for(StreamProtocol::Srt, "fallback.example.test").unwrap(),
+    ))
+    .unwrap();
+    project.replace_stream_target(target).unwrap();
+    let expected = StoredProject::from_project(
+        project,
+        RuntimeRouting::default(),
+        ProjectPosition::default(),
+        Vec::new(),
+    )
+    .unwrap();
+
+    store.save(&expected).unwrap();
+    let encoded = fs::read_to_string(store.manifest_path()).unwrap();
+    assert!(encoded.contains("\"protocol\": \"srt\""));
+    assert!(encoded.contains("\"endpoint\": \"relay.example.test:9710\""));
+
+    let loaded = store.load().unwrap();
+    assert_eq!(loaded, expected);
+    let target = &loaded.project().stream_targets()[0];
+    assert_eq!(target.protocol(), StreamProtocol::Srt);
+    assert_eq!(target.endpoint().as_str(), "relay.example.test:9710");
+    assert_eq!(
+        target.backup_endpoint().map(StreamEndpoint::as_str),
+        Some("fallback.example.test")
+    );
+    assert_eq!(
+        target.expose_url(),
+        format!("srt://relay.example.test:9710?streamid={KEY}")
+    );
+    assert_eq!(
+        target.redacted_url(),
+        "srt://relay.example.test:9710?streamid=****"
+    );
+}
+
+#[test]
 fn stream_target_running_state_round_trips_and_is_required_at_the_current_schema() {
     let temp = TestDirectory::new("stream-target-running");
     let store = temp.store("show");

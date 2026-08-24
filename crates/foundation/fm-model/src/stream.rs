@@ -1,4 +1,4 @@
-//! Configured RTMP/RTMPS streaming destinations.
+//! Configured RTMP/RTMPS/SRT streaming destinations.
 //!
 //! A [`StreamTarget`] is the authored, persisted half of going live: it names
 //! an ingest server, carries the service's stream key, and says which
@@ -28,9 +28,10 @@
 //! the sink then refuses is a show that fails at air time instead of at
 //! authoring time. `fm-model` is a foundation crate and cannot depend on the
 //! `io` layer, so the rules are restated here against the same contract:
-//! `rtmp`/`rtmps` only, printable ASCII, no `user:password@host` userinfo, a
-//! stream key of at least [`MIN_STREAM_KEY_BYTES`], and a total URL that stays
-//! inside the sink's bound. The composed URL is [`StreamTarget::expose_url`].
+//! `rtmp`/`rtmps`/`srt` only, printable ASCII, no `user:password@host`
+//! userinfo, a stream key of at least [`MIN_STREAM_KEY_BYTES`], and a total
+//! URL that stays inside the sink's bound. The composed URL is
+//! [`StreamTarget::expose_url`].
 
 use core::{fmt, num::NonZeroU128};
 
@@ -41,7 +42,8 @@ use crate::StartupPolicy;
 /// Longest operator-facing destination name, matching the input-name bound.
 pub const MAX_STREAM_TARGET_NAME_BYTES: usize = 128;
 
-/// Longest scheme-relative endpoint, as `host[:port]/application/path`.
+/// Longest scheme-relative endpoint, as `host[:port]/application/path` for
+/// RTMP/RTMPS or bare `host[:port]` for SRT.
 pub const MAX_STREAM_ENDPOINT_BYTES: usize = 1_024;
 
 /// Shortest stream key that can be substituted out of captured child output
@@ -91,6 +93,7 @@ impl fmt::Display for StreamTargetId {
 pub enum StreamProtocol {
     Rtmp,
     Rtmps,
+    Srt,
 }
 
 impl StreamProtocol {
@@ -100,6 +103,7 @@ impl StreamProtocol {
         match self {
             Self::Rtmp => "rtmp",
             Self::Rtmps => "rtmps",
+            Self::Srt => "srt",
         }
     }
 }
@@ -120,7 +124,7 @@ pub enum StreamEndpointError {
     TooLong,
     /// The endpoint contains whitespace, control, or non-ASCII bytes.
     InvalidCharacter,
-    /// Only `rtmp://` and `rtmps://` are accepted.
+    /// Only `rtmp://`, `rtmps://`, and `srt://` are accepted.
     UnsupportedScheme,
     /// A scheme appeared inside the scheme-relative endpoint text.
     EmbeddedScheme,
@@ -131,6 +135,9 @@ pub enum StreamEndpointError {
     /// The endpoint has no `/application` path, so appending the stream key
     /// would produce a URL with no redactable final segment.
     MissingApplicationPath,
+    /// An SRT endpoint carries an application path, but SRT names only a
+    /// `host[:port]`; per-session identity belongs in the stream id.
+    PathNotAllowed,
     /// A `//` or a trailing `/` left a path segment empty.
     EmptyPathSegment,
     /// `?` and `#` belong to the stream key, which is where services put
@@ -144,11 +151,12 @@ impl fmt::Display for StreamEndpointError {
             Self::Empty => "stream endpoint must not be empty",
             Self::TooLong => "stream endpoint is too long",
             Self::InvalidCharacter => "stream endpoint must be printable ASCII without whitespace",
-            Self::UnsupportedScheme => "stream endpoint must use rtmp:// or rtmps://",
+            Self::UnsupportedScheme => "stream endpoint must use rtmp://, rtmps:// or srt://",
             Self::EmbeddedScheme => "stream endpoint must not repeat the URL scheme",
             Self::MissingHost => "stream endpoint must name a host",
             Self::EmbeddedCredentials => "stream endpoint must not embed user:password credentials",
             Self::MissingApplicationPath => "stream endpoint must include an application path",
+            Self::PathNotAllowed => "stream endpoint must be host[:port] only without a path",
             Self::EmptyPathSegment => "stream endpoint must not contain an empty path segment",
             Self::QueryOrFragment => {
                 "stream endpoint must not contain a query or fragment; put tokens in the key"
@@ -161,21 +169,35 @@ impl std::error::Error for StreamEndpointError {}
 
 /// One validated ingest location, stored without its scheme.
 ///
-/// The text is `host[:port]/application[/path]`. The scheme lives on
-/// [`StreamTarget::protocol`] so that it is not stored twice and cannot
-/// disagree with itself.
+/// The text is `host[:port]/application[/path]` for RTMP/RTMPS and bare
+/// `host[:port]` for SRT. The scheme lives on [`StreamTarget::protocol`] so
+/// that it is not stored twice and cannot disagree with itself.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StreamEndpoint {
     text: String,
 }
 
 impl StreamEndpoint {
-    /// Validates a scheme-relative `host[:port]/application` endpoint.
+    /// Validates a scheme-relative `host[:port]/application` endpoint under
+    /// the strict RTMP-style rules, which require an application path.
     ///
     /// # Errors
     ///
     /// Returns a typed [`StreamEndpointError`]. No variant carries URL text.
     pub fn parse(text: &str) -> Result<Self, StreamEndpointError> {
+        Self::parse_for(StreamProtocol::Rtmp, text)
+    }
+
+    /// Validates a scheme-relative endpoint for one [`StreamProtocol`].
+    ///
+    /// RTMP/RTMPS accept `host[:port]/application[/path]`. SRT accepts only
+    /// `host[:port]`: it has no application path, and per-session identity is
+    /// carried by the stream id tail instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed [`StreamEndpointError`]. No variant carries URL text.
+    pub fn parse_for(protocol: StreamProtocol, text: &str) -> Result<Self, StreamEndpointError> {
         if text.is_empty() {
             return Err(StreamEndpointError::Empty);
         }
@@ -191,27 +213,43 @@ impl StreamEndpoint {
         if text.contains('?') || text.contains('#') {
             return Err(StreamEndpointError::QueryOrFragment);
         }
-        let (authority, path) = text
-            .split_once('/')
-            .ok_or(StreamEndpointError::MissingApplicationPath)?;
-        if authority.is_empty() {
-            return Err(StreamEndpointError::MissingHost);
-        }
-        if authority.contains('@') {
-            return Err(StreamEndpointError::EmbeddedCredentials);
-        }
-        if path.split('/').any(str::is_empty) {
-            return Err(StreamEndpointError::EmptyPathSegment);
+        match protocol {
+            StreamProtocol::Rtmp | StreamProtocol::Rtmps => {
+                let (authority, path) = text
+                    .split_once('/')
+                    .ok_or(StreamEndpointError::MissingApplicationPath)?;
+                if authority.is_empty() {
+                    return Err(StreamEndpointError::MissingHost);
+                }
+                if authority.contains('@') {
+                    return Err(StreamEndpointError::EmbeddedCredentials);
+                }
+                if path.split('/').any(str::is_empty) {
+                    return Err(StreamEndpointError::EmptyPathSegment);
+                }
+            }
+            StreamProtocol::Srt => {
+                if text.contains('/') {
+                    return Err(StreamEndpointError::PathNotAllowed);
+                }
+                if text.split(':').next().is_none_or(str::is_empty) {
+                    return Err(StreamEndpointError::MissingHost);
+                }
+                if text.contains('@') {
+                    return Err(StreamEndpointError::EmbeddedCredentials);
+                }
+            }
         }
         Ok(Self {
             text: text.to_owned(),
         })
     }
 
-    /// Splits and validates a full `rtmp://host/application` URL.
+    /// Splits and validates a full `rtmp://host/application`,
+    /// `rtmps://host/application`, or `srt://host[:port]` URL.
     ///
-    /// The URL must not already carry a stream key: the key is a separate
-    /// authored field so that it can be redacted independently.
+    /// The URL must not already carry a stream key or stream id: the tail is
+    /// a separate authored field so that it can be redacted independently.
     ///
     /// # Errors
     ///
@@ -221,15 +259,18 @@ impl StreamEndpoint {
             (StreamProtocol::Rtmps, rest)
         } else if let Some(rest) = url.strip_prefix("rtmp://") {
             (StreamProtocol::Rtmp, rest)
+        } else if let Some(rest) = url.strip_prefix("srt://") {
+            (StreamProtocol::Srt, rest)
         } else if url.is_empty() {
             return Err(StreamEndpointError::Empty);
         } else {
             return Err(StreamEndpointError::UnsupportedScheme);
         };
-        Ok((protocol, Self::parse(rest)?))
+        Ok((protocol, Self::parse_for(protocol, rest)?))
     }
 
-    /// The scheme-relative `host[:port]/application` text.
+    /// The scheme-relative endpoint text: `host[:port]/application[/path]`
+    /// for RTMP/RTMPS, bare `host[:port]` for SRT.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.text
@@ -569,9 +610,28 @@ impl fmt::Display for StreamTarget {
 }
 
 fn compose_url(protocol: StreamProtocol, endpoint: &StreamEndpoint, tail: &str) -> String {
-    format!("{}://{}/{tail}", protocol.scheme(), endpoint.as_str())
+    match protocol {
+        StreamProtocol::Rtmp | StreamProtocol::Rtmps => {
+            format!("{}://{}/{tail}", protocol.scheme(), endpoint.as_str())
+        }
+        StreamProtocol::Srt => {
+            format!(
+                "{}://{}?streamid={tail}",
+                protocol.scheme(),
+                endpoint.as_str()
+            )
+        }
+    }
 }
 
 fn url_bytes(protocol: StreamProtocol, endpoint: &StreamEndpoint, key: &StreamKey) -> usize {
-    protocol.scheme().len() + "://".len() + endpoint.as_str().len() + 1 + key.expose_secret().len()
+    let separator = match protocol {
+        StreamProtocol::Rtmp | StreamProtocol::Rtmps => 1,
+        StreamProtocol::Srt => "?streamid=".len(),
+    };
+    protocol.scheme().len()
+        + "://".len()
+        + endpoint.as_str().len()
+        + separator
+        + key.expose_secret().len()
 }

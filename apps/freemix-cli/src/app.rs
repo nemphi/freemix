@@ -3432,8 +3432,8 @@ Usage:
   freemix-cli output-rename <show.freemix> <existing-output-id> <name>
   freemix-cli output-startup <show.freemix> <existing-output-id> <stopped|reconcile-desired-state>
   freemix-cli output-remove <show.freemix> <existing-output-id>
-  freemix-cli stream-add <show.freemix> <nonzero-stream-id> <existing-output-id> <rtmp(s)://host/app> <stream-key> <name> [--backup <rtmp(s)://host/app>] [--startup <stopped|reconcile-desired-state>]
-  freemix-cli stream-update <show.freemix> <existing-stream-id> <existing-output-id> <rtmp(s)://host/app> <stream-key> <name> [--backup <rtmp(s)://host/app>] [--startup <stopped|reconcile-desired-state>]
+  freemix-cli stream-add <show.freemix> <nonzero-stream-id> <existing-output-id> <rtmp(s)://host/app|srt://host[:port]> <stream-key> <name> [--backup <url matching the primary scheme>] [--startup <stopped|reconcile-desired-state>]
+  freemix-cli stream-update <show.freemix> <existing-stream-id> <existing-output-id> <rtmp(s)://host/app|srt://host[:port]> <stream-key> <name> [--backup <url matching the primary scheme>] [--startup <stopped|reconcile-desired-state>]
   freemix-cli stream-remove <show.freemix> <existing-stream-id>
   freemix-cli stream-start <show.freemix> <existing-stream-id>
   freemix-cli stream-stop <show.freemix> <existing-stream-id>

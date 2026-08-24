@@ -1,8 +1,9 @@
-//! Bounded RTMP/RTMPS live streaming through one direct `FFmpeg` child.
+//! Bounded RTMP/RTMPS/SRT live streaming through one direct `FFmpeg` child.
 //!
 //! The streamer feeds one `FFmpeg` child tightly packed RGBA8 video frames and
 //! sample-major interleaved `f32le` audio over two authenticated loopback HTTP
-//! inputs, and muxes `-f flv` to one `rtmp://` or `rtmps://` destination. It
+//! inputs, and muxes `-f flv` to one `rtmp://` or `rtmps://` destination, or
+//! `-f mpegts` to one `srt://host[:port]?streamid=KEY` destination. It
 //! reuses [`RecordFormat`] and [`PairedFrame`] from [`crate::record`], which
 //! own cadence, layout, and per-pair timing validation. The recorder's private
 //! process plumbing (loopback HTTP handshake, child reaping, fallback cleanup)
@@ -11,7 +12,8 @@
 //!
 //! # Secret handling
 //!
-//! The destination carries a stream key. [`StreamDestination`] keeps the key
+//! The destination carries a stream key: an RTMP path tail or an SRT
+//! `streamid`. [`StreamDestination`] keeps the key
 //! private: its `Debug` and `Display` render the redacted form only, every
 //! typed error is path- and key-free, and child stderr is redacted *before* it
 //! enters the bounded retention ring, so neither truncation nor a read split
@@ -47,7 +49,9 @@
 //! to the caller, which owns backoff, destination rotation, and whether a new
 //! [`Streamer`] should be started at all. Also out of scope: per-output wiring
 //! into the engine, hardware encoders, adaptive bitrate, and TLS certificate
-//! policy (`rtmps://` uses the child's default trust configuration).
+//! policy (`rtmps://` uses the child's default trust configuration), and SRT
+//! encryption and passphrase policy (`srt://` likewise uses the child's
+//! defaults).
 
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
@@ -80,6 +84,8 @@ const PROGRESS_PENDING_BYTES: usize = 4 * 1024;
 const TOKEN_BYTES: usize = 32;
 const MAX_DESTINATION_BYTES: usize = 2 * 1024;
 const MIN_STREAM_KEY_BYTES: usize = 4;
+/// The only query parameter an SRT destination may carry.
+const STREAM_ID_PARAM: &str = "streamid";
 const REDACTED_KEY: &str = "****";
 const REDACTED_TOKEN: &[u8] = b"<input-token>";
 const STATS_PERIOD: &str = "0.25";
@@ -102,7 +108,7 @@ pub enum DestinationError {
     TooLong,
     /// The URL contains whitespace, control, or non-ASCII bytes.
     InvalidCharacter,
-    /// Only `rtmp://` and `rtmps://` are accepted.
+    /// Only `rtmp://`, `rtmps://`, and `srt://` are accepted.
     UnsupportedScheme,
     MissingHost,
     /// `user:password@host` credentials are refused; they cannot be redacted
@@ -113,6 +119,10 @@ pub enum DestinationError {
     /// The stream key is too short to be substituted out of captured text
     /// without mangling unrelated output.
     StreamKeyTooShort,
+    /// An `srt://` destination is not exactly `host[:port]` plus at most one
+    /// `?streamid=<key>` parameter: a path component, a second `?`, an unknown
+    /// parameter name, or extra parameters are all refused.
+    MalformedSrtUrl,
 }
 
 impl fmt::Display for DestinationError {
@@ -123,7 +133,20 @@ impl fmt::Display for DestinationError {
 
 impl std::error::Error for DestinationError {}
 
-/// One validated `rtmp://` or `rtmps://` destination with a redacted view.
+/// The validated transport a destination publishes over, which selects the
+/// muxer the child is driven with.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DestinationKind {
+    /// `rtmp://`, muxed as FLV.
+    Rtmp,
+    /// `rtmps://`, muxed as FLV over the child's default TLS trust.
+    Rtmps,
+    /// `srt://`, muxed as MPEG-TS.
+    Srt,
+}
+
+/// One validated `rtmp://`, `rtmps://`, or `srt://` destination with a
+/// redacted view.
 ///
 /// The secret tail is never rendered. `Debug` and `Display` both produce the
 /// redacted form, so embedding this value in a derived `Debug` type is safe.
@@ -132,13 +155,16 @@ pub struct StreamDestination {
     url: String,
     redacted: String,
     key_offset: usize,
+    kind: DestinationKind,
 }
 
 impl StreamDestination {
     /// Validates scheme, authority, and the presence of a redactable key.
     ///
-    /// The secret is everything after the final `/`, including any query
-    /// string, which is where RTMP services carry stream keys and tokens.
+    /// For RTMP the secret is everything after the final `/`, including any
+    /// query string, which is where RTMP services carry stream keys and tokens.
+    /// For SRT the secret is the value of the single optional `streamid`
+    /// parameter; no path component is allowed there at all.
     ///
     /// # Errors
     ///
@@ -153,10 +179,37 @@ impl StreamDestination {
         if !url.bytes().all(|byte| (0x21..=0x7e).contains(&byte)) {
             return Err(DestinationError::InvalidCharacter);
         }
-        let rest = url
-            .strip_prefix("rtmp://")
-            .or_else(|| url.strip_prefix("rtmps://"))
-            .ok_or(DestinationError::UnsupportedScheme)?;
+        let (kind, rest) = if let Some(rest) = url.strip_prefix("rtmp://") {
+            (DestinationKind::Rtmp, rest)
+        } else if let Some(rest) = url.strip_prefix("rtmps://") {
+            (DestinationKind::Rtmps, rest)
+        } else if let Some(rest) = url.strip_prefix("srt://") {
+            (DestinationKind::Srt, rest)
+        } else {
+            return Err(DestinationError::UnsupportedScheme);
+        };
+        let key = match kind {
+            DestinationKind::Rtmp | DestinationKind::Rtmps => Self::rtmp_key(rest)?,
+            DestinationKind::Srt => Self::srt_stream_id(rest)?.unwrap_or_default(),
+        };
+        let key_offset = url.len() - key.len();
+        let redacted = if key.is_empty() {
+            // Nothing to mask: an SRT destination without `?streamid=` has no
+            // secret, so its redacted form is the URL itself.
+            url.to_owned()
+        } else {
+            format!("{}{REDACTED_KEY}", &url[..key_offset])
+        };
+        Ok(Self {
+            redacted,
+            url: url.to_owned(),
+            key_offset,
+            kind,
+        })
+    }
+
+    /// The RTMP secret: everything after the final `/`.
+    fn rtmp_key(rest: &str) -> Result<&str, DestinationError> {
         let (authority, path) = rest
             .split_once('/')
             .ok_or(DestinationError::MissingStreamKey)?;
@@ -174,12 +227,54 @@ impl StreamDestination {
         if key.len() < MIN_STREAM_KEY_BYTES {
             return Err(DestinationError::StreamKeyTooShort);
         }
-        let key_offset = url.len() - key.len();
-        Ok(Self {
-            redacted: format!("{}{REDACTED_KEY}", &url[..key_offset]),
-            url: url.to_owned(),
-            key_offset,
-        })
+        Ok(key)
+    }
+
+    /// The SRT secret: the value of the single optional `streamid` parameter.
+    ///
+    /// The body must be exactly `host[:port]` plus at most one query string of
+    /// exactly `streamid=<key>`; anything else — a path, a second `?`, another
+    /// parameter name, extra parameters — is refused. A `/` is refused
+    /// everywhere in the body, including inside a stream id, because the SRT
+    /// URL has no path component to redact out of captured output.
+    fn srt_stream_id(rest: &str) -> Result<Option<&str>, DestinationError> {
+        let (authority, query) = match rest.split_once('?') {
+            Some((authority, query)) => {
+                if query.contains('?') || query.contains('&') {
+                    return Err(DestinationError::MalformedSrtUrl);
+                }
+                (authority, Some(query))
+            }
+            None => (rest, None),
+        };
+        if authority.is_empty() {
+            return Err(DestinationError::MissingHost);
+        }
+        if authority.contains('@') {
+            return Err(DestinationError::EmbeddedCredentials);
+        }
+        if authority.contains('/') || query.is_some_and(|query| query.contains('/')) {
+            return Err(DestinationError::MalformedSrtUrl);
+        }
+        let Some(query) = query else {
+            return Ok(None);
+        };
+        let Some((name, value)) = query.split_once('=') else {
+            return Err(DestinationError::MalformedSrtUrl);
+        };
+        if name != STREAM_ID_PARAM {
+            return Err(DestinationError::MalformedSrtUrl);
+        }
+        if value.len() < MIN_STREAM_KEY_BYTES {
+            return Err(DestinationError::StreamKeyTooShort);
+        }
+        Ok(Some(value))
+    }
+
+    /// The validated transport this destination publishes over.
+    #[must_use]
+    pub const fn kind(&self) -> DestinationKind {
+        self.kind
     }
 
     /// The destination with its stream key replaced by `****`.
@@ -356,7 +451,9 @@ pub enum StartErrorKind {
     InvalidLimits(LimitsError),
     InvalidExecutable,
     ToolUnavailable(UnavailableReason),
-    /// FLV carries mono or stereo audio only.
+    /// FLV carries mono or stereo audio only; MPEG-TS additionally carries
+    /// multi-channel AAC. Wider layouts are refused rather than silently
+    /// downmixed.
     UnsupportedChannelLayout,
     Randomness,
     ThreadSpawn(io::ErrorKind),
@@ -1170,8 +1267,9 @@ impl Streamer {
             config.encoder,
         )
         .map_err(|error| StartError::complete(StartErrorKind::InvalidLimits(error)))?;
-        let layout = flv_channel_layout(config.format.channel_layout())
-            .ok_or_else(|| StartError::complete(StartErrorKind::UnsupportedChannelLayout))?;
+        let layout =
+            output_channel_layout(config.destination.kind(), config.format.channel_layout())
+                .ok_or_else(|| StartError::complete(StartErrorKind::UnsupportedChannelLayout))?;
         let executable = streamer_executable(config.ffmpeg.clone())?;
         let video_token = random_token()?;
         let audio_token = random_token()?;
@@ -1817,6 +1915,34 @@ fn flv_channel_layout(layout: &ChannelLayout) -> Option<&'static str> {
         [Channel::Mono] => Some("mono"),
         [Channel::Left, Channel::Right] => Some("stereo"),
         _ => None,
+    }
+}
+
+/// MPEG-TS carries AAC with more channels than FLV's stereo ceiling: the
+/// standard mono, stereo, and 5.1 channel configurations are all expressible
+/// exactly. Anything else is refused rather than silently downmixed or guessed
+/// at a layout name the child would reject.
+fn mpegts_channel_layout(layout: &ChannelLayout) -> Option<&'static str> {
+    match layout.channels() {
+        [Channel::Mono] => Some("mono"),
+        [Channel::Left, Channel::Right] => Some("stereo"),
+        [
+            Channel::Left,
+            Channel::Right,
+            Channel::Center,
+            Channel::LowFrequency,
+            Channel::LeftSurround,
+            Channel::RightSurround,
+        ] => Some("5.1"),
+        _ => None,
+    }
+}
+
+/// The audio channel-layout descriptor the output muxer can carry exactly.
+fn output_channel_layout(kind: DestinationKind, layout: &ChannelLayout) -> Option<&'static str> {
+    match kind {
+        DestinationKind::Rtmp | DestinationKind::Rtmps => flv_channel_layout(layout),
+        DestinationKind::Srt => mpegts_channel_layout(layout),
     }
 }
 
@@ -2660,7 +2786,7 @@ fn command_args(config: &StreamConfig, layout: &str, inputs: &Inputs<'_>) -> Vec
     let fps = u64::from(rate.numerator()).div_ceil(u64::from(rate.denominator()));
     let gop = fps.saturating_mul(u64::from(config.encoder.keyframe_interval_seconds));
     let video_bitrate = format!("{}k", config.encoder.video_bitrate_kbps);
-    let values = vec![
+    let mut values = vec![
         "-nostdin".to_owned(),
         "-hide_banner".to_owned(),
         "-loglevel".to_owned(),
@@ -2743,13 +2869,41 @@ fn command_args(config: &StreamConfig, layout: &str, inputs: &Inputs<'_>) -> Vec
         format!("{}k", config.encoder.audio_bitrate_kbps),
         "-flush_packets".to_owned(),
         "1".to_owned(),
-        "-flvflags".to_owned(),
-        "no_duration_filesize".to_owned(),
-        "-f".to_owned(),
-        "flv".to_owned(),
-        config.destination.url.clone(),
     ];
+    values.extend(output_args(
+        config.destination.kind(),
+        &config.destination.url,
+    ));
     values.into_iter().map(OsString::from).collect()
+}
+
+/// The container each transport is muxed into: FLV for RTMP(S), MPEG-TS for
+/// SRT.
+#[must_use]
+const fn muxer_format(kind: DestinationKind) -> &'static str {
+    match kind {
+        DestinationKind::Rtmp | DestinationKind::Rtmps => "flv",
+        DestinationKind::Srt => "mpegts",
+    }
+}
+
+/// The output-side argument tail, from the first muxer-owned flag to the
+/// destination URL. Kept pure so tests can assert exactly what the child is
+/// told to mux.
+fn output_args(kind: DestinationKind, url: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    if kind != DestinationKind::Srt {
+        // FLV-only: suppress the duration/filesize warnings a live FLV muxer
+        // would otherwise print, since a live stream has neither. MPEG-TS has
+        // no such flag and needs no equivalent.
+        values.extend(["-flvflags".to_owned(), "no_duration_filesize".to_owned()]);
+    }
+    values.extend([
+        "-f".to_owned(),
+        muxer_format(kind).to_owned(),
+        url.to_owned(),
+    ]);
+    values
 }
 
 #[cfg(test)]
@@ -2770,10 +2924,7 @@ mod tests {
                 "http://host/app/key12345",
                 DestinationError::UnsupportedScheme,
             ),
-            (
-                "srt://host/app/key12345",
-                DestinationError::UnsupportedScheme,
-            ),
+            ("srt://host/app/key12345", DestinationError::MalformedSrtUrl),
             ("file:///tmp/x", DestinationError::UnsupportedScheme),
             ("rtmp://", DestinationError::MissingStreamKey),
             ("rtmp:///app/key12345", DestinationError::MissingHost),
@@ -2815,6 +2966,227 @@ mod tests {
                 .redacted(),
             "rtmps://host/app/****"
         );
+    }
+
+    const SRT_KEY: &str = "SRT_live_998877_SecretStreamId";
+
+    #[test]
+    fn srt_destinations_are_shape_checked_and_mask_only_the_stream_id() {
+        for rejected in [
+            ("srt://", DestinationError::MissingHost),
+            ("srt://?streamid=abcd1234", DestinationError::MissingHost),
+            ("srt://host/app/key12345", DestinationError::MalformedSrtUrl),
+            ("srt://host/", DestinationError::MalformedSrtUrl),
+            (
+                "srt://host/app/key12345?streamid=abcd1234",
+                DestinationError::MalformedSrtUrl,
+            ),
+            (
+                "srt://host/streamid=abcd1234",
+                DestinationError::MalformedSrtUrl,
+            ),
+            ("srt://host?streamid=", DestinationError::StreamKeyTooShort),
+            (
+                "srt://host?streamid=ab",
+                DestinationError::StreamKeyTooShort,
+            ),
+            (
+                "srt://host?other=abcd1234",
+                DestinationError::MalformedSrtUrl,
+            ),
+            ("srt://host?abcd1234", DestinationError::MalformedSrtUrl),
+            ("srt://host?", DestinationError::MalformedSrtUrl),
+            (
+                "srt://host?streamid=abcd1234&mode=caller",
+                DestinationError::MalformedSrtUrl,
+            ),
+            (
+                "srt://host?mode=caller&streamid=abcd1234",
+                DestinationError::MalformedSrtUrl,
+            ),
+            (
+                "srt://host??streamid=abcd1234",
+                DestinationError::MalformedSrtUrl,
+            ),
+            (
+                "srt://host?streamid=abcd1234?",
+                DestinationError::MalformedSrtUrl,
+            ),
+            (
+                "srt://host?streamid=ab?cd1234",
+                DestinationError::MalformedSrtUrl,
+            ),
+            (
+                "srt://user@host?streamid=abcd1234",
+                DestinationError::EmbeddedCredentials,
+            ),
+            (
+                "srt://host:9710/x?streamid=abcd1234",
+                DestinationError::MalformedSrtUrl,
+            ),
+            (
+                "srt://ho st?streamid=abcd1234",
+                DestinationError::InvalidCharacter,
+            ),
+        ] {
+            assert_eq!(
+                StreamDestination::parse(rejected.0),
+                Err(rejected.1),
+                "{}",
+                rejected.0
+            );
+        }
+        let too_long = format!("srt://{}?streamid={}", "h".repeat(2 * 1024), SRT_KEY);
+        assert_eq!(
+            StreamDestination::parse(&too_long),
+            Err(DestinationError::TooLong)
+        );
+
+        // Exactly at every boundary the sink accepts.
+        let minimal = StreamDestination::parse("srt://h?streamid=abcd").unwrap();
+        assert_eq!(minimal.kind(), DestinationKind::Srt);
+        assert_eq!(minimal.redacted(), "srt://h?streamid=****");
+        // A port with no query carries no secret, so redaction is identity.
+        let bare = StreamDestination::parse("srt://ingest.example:9710").unwrap();
+        assert_eq!(bare.kind(), DestinationKind::Srt);
+        assert_eq!(bare.redacted(), "srt://ingest.example:9710");
+
+        let destination = StreamDestination::parse(
+            "srt://ingest.example:9710?streamid=SRT_live_998877_SecretStreamId",
+        )
+        .unwrap();
+        // Only the stream id is masked; the visible `?streamid=` shape stays.
+        assert_eq!(
+            destination.redacted(),
+            "srt://ingest.example:9710?streamid=****"
+        );
+        for rendered in [
+            format!("{destination}"),
+            format!("{destination:?}"),
+            format!("{:?}", StreamConfig::new(format(), destination.clone())),
+        ] {
+            assert!(!rendered.contains(SRT_KEY), "{rendered}");
+            assert!(rendered.contains("****"), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn kind_maps_scheme_to_transport_and_srt_to_mpegts_args() {
+        assert_eq!(
+            StreamDestination::parse("rtmp://host/app/key12345")
+                .unwrap()
+                .kind(),
+            DestinationKind::Rtmp
+        );
+        assert_eq!(
+            StreamDestination::parse("rtmps://host/app/key12345")
+                .unwrap()
+                .kind(),
+            DestinationKind::Rtmps
+        );
+        assert_eq!(
+            StreamDestination::parse("srt://host?streamid=abcd1234")
+                .unwrap()
+                .kind(),
+            DestinationKind::Srt
+        );
+        assert_eq!(muxer_format(DestinationKind::Rtmp), "flv");
+        assert_eq!(muxer_format(DestinationKind::Rtmps), "flv");
+        assert_eq!(muxer_format(DestinationKind::Srt), "mpegts");
+
+        let video_address: SocketAddr = "127.0.0.1:20001".parse().unwrap();
+        let audio_address: SocketAddr = "127.0.0.1:20002".parse().unwrap();
+        let inputs = Inputs {
+            video_address,
+            audio_address,
+            video_token: "video-token",
+            audio_token: "audio-token",
+        };
+        let srt = StreamConfig::new(
+            format(),
+            StreamDestination::parse("srt://127.0.0.1:9000?streamid=abcd1234").unwrap(),
+        );
+        let args = command_args(&srt, "stereo", &inputs);
+        let text = args
+            .iter()
+            .map(|argument| argument.to_str().unwrap())
+            .collect::<Vec<_>>();
+        let url_position = text.len() - 1;
+        assert_eq!(text[url_position], "srt://127.0.0.1:9000?streamid=abcd1234");
+        assert_eq!(text[url_position - 1], "mpegts");
+        assert_eq!(text[url_position - 2], "-f");
+        assert!(!text.contains(&"-flvflags"), "{text:?}");
+
+        let rtmp = StreamConfig::new(
+            format(),
+            StreamDestination::parse("rtmp://127.0.0.1:1935/app/key12345").unwrap(),
+        );
+        let args = command_args(&rtmp, "stereo", &inputs);
+        let text = args
+            .iter()
+            .map(|argument| argument.to_str().unwrap())
+            .collect::<Vec<_>>();
+        let url_position = text.len() - 1;
+        assert_eq!(text[url_position], "rtmp://127.0.0.1:1935/app/key12345");
+        assert_eq!(text[url_position - 1], "flv");
+        assert_eq!(text[url_position - 2], "-f");
+        let flvflags = text
+            .windows(2)
+            .position(|window| window == ["-flvflags", "no_duration_filesize"])
+            .expect("FLV output keeps -flvflags");
+        assert!(flvflags < url_position - 2);
+    }
+
+    #[test]
+    fn mpegts_carries_wider_audio_than_flv() {
+        let surround = ChannelLayout::new(vec![
+            Channel::Left,
+            Channel::Right,
+            Channel::Center,
+            Channel::LowFrequency,
+            Channel::LeftSurround,
+            Channel::RightSurround,
+        ])
+        .unwrap();
+        assert_eq!(flv_channel_layout(&surround), None);
+        assert_eq!(mpegts_channel_layout(&surround), Some("5.1"));
+        assert_eq!(
+            output_channel_layout(DestinationKind::Srt, &surround),
+            Some("5.1")
+        );
+        assert_eq!(
+            output_channel_layout(DestinationKind::Rtmp, &surround),
+            None
+        );
+        assert_eq!(
+            output_channel_layout(DestinationKind::Rtmps, &surround),
+            None
+        );
+        for (kind, layout) in [
+            (
+                DestinationKind::Rtmp,
+                flv_channel_layout(&ChannelLayout::stereo()),
+            ),
+            (
+                DestinationKind::Rtmps,
+                flv_channel_layout(&ChannelLayout::stereo()),
+            ),
+            (
+                DestinationKind::Srt,
+                mpegts_channel_layout(&ChannelLayout::stereo()),
+            ),
+        ] {
+            assert_eq!(
+                output_channel_layout(kind, &ChannelLayout::stereo()),
+                layout
+            );
+            assert_eq!(layout, Some("stereo"));
+        }
+        // A duplicated-channel pseudo-layout is not a named configuration and
+        // is refused rather than guessed.
+        let doubled = ChannelLayout::new(vec![Channel::Mono, Channel::Mono]).unwrap();
+        assert_eq!(mpegts_channel_layout(&doubled), None);
+        assert_eq!(output_channel_layout(DestinationKind::Srt, &doubled), None);
     }
 
     fn format() -> RecordFormat {
