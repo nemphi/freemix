@@ -1265,8 +1265,13 @@ planned. The model and sink accept SRT alongside RTMP/RTMPS:
 redaction, the FFmpeg sink muxes MPEG-TS with its own channel-layout rules,
 and a real-ffmpeg integration receives an SRT broadcast and probes H.264/AAC.
 Schema 20 persists each target's authored video bitrate and native sessions
-thread it into the encoder, but there is still no shared-rendition planning
-caller fanning one readback out across destinations. Protocol 2.17 adds the
+thread it into the encoder. Destinations whose scheme and authored bitrate
+match share one GPU readback, one packed raw pair per frame, and one group
+sequence cursor, fanned out through the rendition planner over exactly the
+group's active members with per-route results mapping back to per-target
+ledger drops and congestion flags; distinct bitrates stay independent groups,
+a stopped member leaves its plan, and a restart resumes the same group past
+the gap. Protocol 2.17 adds the
 lossy latest-wins `stream_status` peer record beside audio meters: native
 `freemixd` publishes per-target realized state, counters, and sanitized
 failures each frame interval; sessions validate identity and monotonic
