@@ -13,13 +13,17 @@ use fm_protocol::{
     ManualTransitionStatus, OutputStatus, OverlayStatus, OverlayTransitionKind, ProtocolVersion,
     ResumeCursor, RuntimeDomainBoundary, RuntimeEventMessage, RuntimeFailureDisposition,
     RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage, SnapshotReason, StingerAudioPolicy,
-    StingerMissingMediaFallback, StingerReadiness, StingerStatus, StructuredError, WireInputId,
-    WireMessage, WireOutputId, WireOverlayChannelId, WireStingerSlotId, choose_handshake_outcome,
-    decode_line, encode_line,
+    StingerMissingMediaFallback, StingerReadiness, StingerStatus, StreamRealizedState,
+    StreamStatus, StructuredError, WireInputId, WireMessage, WireOutputId, WireOverlayChannelId,
+    WireStingerSlotId, WireStreamTargetId, choose_handshake_outcome, decode_line, encode_line,
 };
 
 fn input(value: u128) -> WireInputId {
     WireInputId::new(NonZeroU128::new(value).unwrap())
+}
+
+fn stream_target(value: u128) -> WireStreamTargetId {
+    WireStreamTargetId::new(NonZeroU128::new(value).unwrap())
 }
 
 fn input_statuses(values: &[(u128, &str)]) -> Vec<InputStatus> {
@@ -106,6 +110,16 @@ fn command() -> CommandMessage {
     }
 }
 
+fn stream_status(value: u128, name: &str, realized: StreamRealizedState) -> StreamStatus {
+    StreamStatus {
+        target: stream_target(value),
+        name: name.into(),
+        desired_running: true,
+        realized,
+        detail: None,
+    }
+}
+
 fn snapshot(inputs: Vec<InputStatus>) -> WireMessage {
     WireMessage::Snapshot(SnapshotMessage {
         engine: identity(),
@@ -138,14 +152,15 @@ fn snapshot(inputs: Vec<InputStatus>) -> WireMessage {
             position: FadeToBlackPosition::LIVE,
         },
         stingers: Vec::new(),
+        streams: Vec::new(),
         desired_overlays: OverlayStatus::empty_channels(),
         realized_overlays: OverlayStatus::empty_channels(),
     })
 }
 
 #[test]
-fn protocol_2_15_heartbeat_acknowledgement_codec_is_exact() {
-    assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(2, 15));
+fn protocol_2_16_heartbeat_acknowledgement_codec_is_exact() {
+    assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(2, 16));
     let acknowledgement = WireMessage::HeartbeatAcknowledgement(HeartbeatAcknowledgementMessage {
         server: server_identity(),
         heartbeat_sequence: 88,
@@ -730,6 +745,253 @@ fn stinger_encoder_rejects_too_many_or_duplicate_slots() {
         encode_line(&event(vec![status; 9])),
         Err(CodecError::TooManyItems("stingers"))
     );
+}
+
+#[test]
+fn stream_start_and_stop_commands_round_trip_and_reject_invalid_targets() {
+    for (expected_payload, payload) in [
+        (
+            "payload=stream_start",
+            CommandPayload::StreamStart {
+                target: stream_target(9_001),
+            },
+        ),
+        (
+            "payload=stream_stop",
+            CommandPayload::StreamStop {
+                target: stream_target(9_002),
+            },
+        ),
+    ] {
+        let message = WireMessage::Command(CommandMessage {
+            protocol: CURRENT_PROTOCOL_VERSION,
+            payload,
+            ..command()
+        });
+        let encoded = encode_line(&message).unwrap();
+        assert!(encoded.contains(expected_payload));
+        assert_eq!(decode_line(&encoded).unwrap(), message);
+    }
+
+    let start = encode_line(&WireMessage::Command(CommandMessage {
+        payload: CommandPayload::StreamStart {
+            target: stream_target(9_001),
+        },
+        ..command()
+    }))
+    .unwrap();
+    assert!(start.contains("target=9001"));
+
+    for malformed in [
+        start.replace("\ttarget=9001", ""),
+        start.replace("target=9001", "target=0"),
+        start.replace("target=9001", "target=twitch"),
+    ] {
+        if malformed.contains("target=") {
+            assert!(matches!(
+                decode_line(&malformed),
+                Err(CodecError::InvalidField {
+                    field: "target",
+                    ..
+                })
+            ));
+        } else {
+            assert_eq!(
+                decode_line(&malformed),
+                Err(CodecError::MissingField("target"))
+            );
+        }
+    }
+    let unknown = start.replace("payload=stream_start", "payload=stream_pause");
+    assert!(matches!(
+        decode_line(&unknown),
+        Err(CodecError::InvalidField {
+            field: "payload",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn snapshot_streams_round_trip_and_reject_duplicates_and_bounds() {
+    let mut message = snapshot(input_statuses(&[(1, "camera"), (2, "slides")]));
+    let WireMessage::Snapshot(snapshot_message) = &mut message else {
+        unreachable!();
+    };
+    snapshot_message.streams = vec![
+        StreamStatus {
+            target: stream_target(9_001),
+            name: "Twitch, Main".into(),
+            desired_running: true,
+            realized: StreamRealizedState::Live,
+            detail: None,
+        },
+        StreamStatus {
+            target: stream_target(9_002),
+            name: "Restream ~ Backup".into(),
+            desired_running: false,
+            realized: StreamRealizedState::Failed,
+            detail: Some("auth_rejected".into()),
+        },
+    ];
+    let encoded = encode_line(&message).unwrap();
+    assert!(encoded.contains("streams=9001%3A"));
+    assert_eq!(decode_line(&encoded).unwrap(), message);
+
+    let mut duplicate = message.clone();
+    let WireMessage::Snapshot(snapshot_message) = &mut duplicate else {
+        unreachable!();
+    };
+    snapshot_message.streams[1].target = stream_target(9_001);
+    assert!(matches!(
+        encode_line(&duplicate),
+        Err(CodecError::InvalidField {
+            field: "streams",
+            ..
+        })
+    ));
+
+    let duplicate_line = encoded.replace("9002%3A", "9001%3A");
+    assert!(matches!(
+        decode_line(&duplicate_line),
+        Err(CodecError::InvalidField {
+            field: "streams",
+            ..
+        })
+    ));
+
+    let unknown_state = encoded.replace("%3A1%3Alive%3A", "%3A1%3Areconnecting%3A");
+    assert!(matches!(
+        decode_line(&unknown_state),
+        Err(CodecError::InvalidField {
+            field: "streams",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn snapshot_stream_text_bounds_are_enforced_in_both_directions() {
+    let mut message = snapshot(input_statuses(&[(1, "camera"), (2, "slides")]));
+    let WireMessage::Snapshot(snapshot_message) = &mut message else {
+        unreachable!();
+    };
+    snapshot_message.streams = vec![
+        StreamStatus {
+            target: stream_target(9_001),
+            name: "Twitch, Main".into(),
+            desired_running: true,
+            realized: StreamRealizedState::Live,
+            detail: None,
+        },
+        StreamStatus {
+            target: stream_target(9_002),
+            name: "Restream ~ Backup".into(),
+            desired_running: false,
+            realized: StreamRealizedState::Failed,
+            detail: Some("auth_rejected".into()),
+        },
+    ];
+    let encoded = encode_line(&message).unwrap();
+
+    let mut oversized_name = message.clone();
+    let WireMessage::Snapshot(snapshot_message) = &mut oversized_name else {
+        unreachable!();
+    };
+    snapshot_message.streams[0].name = "x".repeat(129);
+    assert!(matches!(
+        encode_line(&oversized_name),
+        Err(CodecError::InvalidField {
+            field: "streams",
+            ..
+        })
+    ));
+    let oversized_name_line = encoded.replace("Twitch%252C%2520Main", &"x".repeat(129));
+    assert!(matches!(
+        decode_line(&oversized_name_line),
+        Err(CodecError::InvalidField {
+            field: "streams",
+            ..
+        })
+    ));
+
+    let mut oversized_detail = message.clone();
+    let WireMessage::Snapshot(snapshot_message) = &mut oversized_detail else {
+        unreachable!();
+    };
+    snapshot_message.streams[1].detail = Some("y".repeat(65));
+    assert!(matches!(
+        encode_line(&oversized_detail),
+        Err(CodecError::InvalidField {
+            field: "streams",
+            ..
+        })
+    ));
+    let oversized_detail_line = encoded.replace("auth_rejected", &"y".repeat(65));
+    assert!(matches!(
+        decode_line(&oversized_detail_line),
+        Err(CodecError::InvalidField {
+            field: "streams",
+            ..
+        })
+    ));
+
+    let mut empty_detail = message.clone();
+    let WireMessage::Snapshot(snapshot_message) = &mut empty_detail else {
+        unreachable!();
+    };
+    snapshot_message.streams[0].detail = Some(String::new());
+    assert!(matches!(
+        encode_line(&empty_detail),
+        Err(CodecError::InvalidField {
+            field: "streams",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn streams_changed_event_round_trips_every_realized_state() {
+    let event = |streams| {
+        WireMessage::Event(EventMessage {
+            cursor: cursor(),
+            payload: EventPayload::StreamsChanged { streams },
+        })
+    };
+    let populated = event(vec![
+        StreamStatus {
+            target: stream_target(9_003),
+            name: "YouTube A".into(),
+            desired_running: true,
+            realized: StreamRealizedState::WaitingToReconnect,
+            detail: Some("rtmp_timeout".into()),
+        },
+        StreamStatus {
+            target: stream_target(9_004),
+            name: "Local".into(),
+            desired_running: false,
+            realized: StreamRealizedState::Stopped,
+            detail: None,
+        },
+        stream_status(9_005, "Starting", StreamRealizedState::Starting),
+        stream_status(9_006, "Slow", StreamRealizedState::Congested),
+        stream_status(9_007, "Offline", StreamRealizedState::Unavailable),
+    ]);
+    let encoded = encode_line(&populated).unwrap();
+    assert!(encoded.contains("event=streams_changed"));
+    assert_eq!(decode_line(&encoded).unwrap(), populated);
+
+    let empty = event(Vec::new());
+    let encoded = encode_line(&empty).unwrap();
+    assert_eq!(decode_line(&encoded).unwrap(), empty);
+
+    let unknown_event = encode_line(&populated)
+        .unwrap()
+        .replace("event=streams_changed", "event=strings_changed");
+    assert!(matches!(
+        decode_line(&unknown_event),
+        Err(CodecError::InvalidField { field: "event", .. })
+    ));
 }
 
 #[test]

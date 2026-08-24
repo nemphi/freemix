@@ -1,6 +1,9 @@
 use core::num::NonZeroU128;
 
-use fm_protocol::{CommandResult, EngineIdentity, FadeToBlackPosition};
+use fm_protocol::{
+    CommandResult, EngineIdentity, FadeToBlackPosition,
+    StreamRealizedState as ProtocolStreamRealizedState,
+};
 
 use super::*;
 
@@ -78,6 +81,7 @@ fn snapshot(project_id: ProjectId, revision: u64) -> ProjectSnapshot {
         ],
         input_audio_strips: input_audio_strips(),
         stingers: Vec::new(),
+        streams: Vec::new(),
         desired_overlays: overlays(),
         realized_overlays: overlays(),
         switcher: SwitcherState {
@@ -744,4 +748,97 @@ fn input_order_change_reorders_pairs_and_rejects_wrong_set_atomically() {
         Err(ModelError::InvalidInputOrder)
     );
     assert_eq!(model.state().unwrap(), &before);
+}
+
+fn stream(value: u128, name: &str, desired_running: bool) -> StreamStatus {
+    StreamStatus {
+        target: NonZeroU128::new(value).unwrap(),
+        name: name.to_owned(),
+        desired_running,
+        realized: ProtocolStreamRealizedState::Stopped,
+        detail: None,
+    }
+}
+
+#[test]
+fn snapshot_stream_validation_rejects_overflow_duplicates_and_bad_names() {
+    let project_id = project(10);
+    let mut model = ClientModel::new(project_id);
+
+    let mut duplicate = snapshot(project_id, 1);
+    duplicate.streams = vec![stream(5, "Twitch", false), stream(5, "Again", true)];
+    assert_eq!(
+        model.install_snapshot(duplicate),
+        Err(ModelError::DuplicateStreamTarget(
+            NonZeroU128::new(5).unwrap()
+        ))
+    );
+
+    let mut overflow = snapshot(project_id, 1);
+    overflow.streams = (0..=MAX_STREAM_STATUSES)
+        .map(|index| stream(index as u128 + 1, "Stream", false))
+        .collect();
+    assert_eq!(
+        model.install_snapshot(overflow),
+        Err(ModelError::InvalidStreamCount(MAX_STREAM_STATUSES + 1))
+    );
+
+    for bad_name in ["   ".to_owned(), "x".repeat(MAX_STREAM_NAME_BYTES + 1)] {
+        let mut invalid = snapshot(project_id, 1);
+        invalid.streams = vec![stream(5, &bad_name, false)];
+        assert_eq!(
+            model.install_snapshot(invalid),
+            Err(ModelError::InvalidStreamNames)
+        );
+    }
+
+    let mut valid = snapshot(project_id, 1);
+    valid.streams = vec![stream(5, "Twitch", false), stream(9, "YouTube", true)];
+    model.install_snapshot(valid.clone()).unwrap();
+    assert_eq!(model.state().unwrap().streams(), valid.streams.as_slice());
+    assert_eq!(model.view().unwrap().streams, valid.streams);
+}
+
+#[test]
+fn streams_changed_events_replace_the_latest_replicated_projection() {
+    let project_id = project(10);
+    let mut initial = snapshot(project_id, 4);
+    initial.streams = vec![stream(5, "Twitch", false), stream(9, "YouTube", false)];
+    let mut model = ClientModel::new(project_id);
+    model.install_snapshot(initial).unwrap();
+    let identity = model.reconnect_cursor().unwrap().engine.clone();
+
+    model
+        .apply_event(event(
+            project_id,
+            identity.clone(),
+            5,
+            DurableChange::StreamsChanged {
+                streams: vec![stream(5, "Twitch", true), stream(9, "YouTube", false)],
+            },
+        ))
+        .unwrap();
+    assert_eq!(
+        model.state().unwrap().streams(),
+        [stream(5, "Twitch", true), stream(9, "YouTube", false),].as_slice()
+    );
+    assert_eq!(model.sync_status(), &SyncStatus::Current);
+
+    assert_eq!(
+        model.apply_event(event(
+            project_id,
+            identity,
+            6,
+            DurableChange::StreamsChanged {
+                streams: vec![stream(5, "Twitch", true), stream(5, "Duplicate", false),],
+            },
+        )),
+        Err(ModelError::DuplicateStreamTarget(
+            NonZeroU128::new(5).unwrap()
+        ))
+    );
+    assert_eq!(
+        model.state().unwrap().streams(),
+        [stream(5, "Twitch", true), stream(9, "YouTube", false),].as_slice()
+    );
 }

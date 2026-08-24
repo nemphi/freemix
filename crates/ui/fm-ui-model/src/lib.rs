@@ -6,7 +6,7 @@
 //! separate so a render frame can use [`ClientModel::view`] without mistaking
 //! intent for realization.
 
-use core::{cmp::Ordering, fmt};
+use core::{cmp::Ordering, fmt, num::NonZeroU128};
 use std::collections::{HashMap, HashSet};
 
 use fm_command::{CommandId, Revision};
@@ -15,9 +15,14 @@ use fm_protocol::{
     FieldIssue, ManualTransitionKind, ManualTransitionPosition,
     ManualTransitionStatus as ProtocolManualTransitionStatus, ResumeCursor, ServerHello,
     ServerIdentity, SnapshotMessage, StingerAudioPolicy, StingerMissingMediaFallback,
-    StingerReadiness,
+    StingerReadiness, StreamRealizedState as ProtocolStreamRealizedState,
 };
 use fm_types::{InputId, MAX_INPUT_NAME_BYTES, OutputId, ProjectId};
+
+/// Maximum number of replicated stream statuses accepted in one snapshot.
+pub const MAX_STREAM_STATUSES: usize = 64;
+/// Largest replicated stream status label in bytes.
+pub const MAX_STREAM_NAME_BYTES: usize = 128;
 
 /// A project-aware cursor used at the UI/protocol boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -142,6 +147,16 @@ pub struct InputAudioStripStatus {
     pub delay_samples: u32,
 }
 
+/// Replicated desired and last-confirmed realized state of one stream target.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamStatus {
+    pub target: NonZeroU128,
+    pub name: String,
+    pub desired_running: bool,
+    pub realized: ProtocolStreamRealizedState,
+    pub detail: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OutputStatus {
     pub output: OutputId,
@@ -189,6 +204,7 @@ pub struct ProjectSnapshot {
     pub outputs: Vec<OutputStatus>,
     pub input_audio_strips: Vec<InputAudioStripStatus>,
     pub stingers: Vec<StingerStatus>,
+    pub streams: Vec<StreamStatus>,
     pub desired_overlays: Vec<OverlayStatus>,
     pub realized_overlays: Vec<OverlayStatus>,
     pub switcher: SwitcherState,
@@ -199,6 +215,7 @@ impl ProjectSnapshot {
     #[must_use]
     pub fn from_protocol(project_id: ProjectId, message: SnapshotMessage) -> Self {
         let stingers = protocol_stingers(message.stingers);
+        let streams = protocol_streams(message.streams);
         let desired_overlays = protocol_overlays(message.desired_overlays);
         let realized_overlays = protocol_overlays(message.realized_overlays);
         let input_audio_strips = protocol_input_audio_strips(message.input_audio_strips);
@@ -227,6 +244,7 @@ impl ProjectSnapshot {
             outputs,
             input_audio_strips,
             stingers,
+            streams,
             desired_overlays,
             realized_overlays,
             switcher: SwitcherState {
@@ -276,6 +294,9 @@ pub enum DurableChange {
         stingers: Vec<StingerStatus>,
         overlays: Vec<OverlayStatus>,
         input_audio_strips: Vec<InputAudioStripStatus>,
+    },
+    StreamsChanged {
+        streams: Vec<StreamStatus>,
     },
 }
 
@@ -330,6 +351,9 @@ impl DurableProjectEvent {
                 stingers: protocol_stingers(stingers),
                 overlays: protocol_overlays(overlays),
                 input_audio_strips: protocol_input_audio_strips(input_audio_strips),
+            },
+            EventPayload::StreamsChanged { streams } => DurableChange::StreamsChanged {
+                streams: protocol_streams(streams),
             },
         };
         Self {
@@ -387,6 +411,7 @@ pub struct ProjectState {
     outputs: Vec<OutputStatus>,
     input_audio_strips: Vec<InputAudioStripStatus>,
     stingers: Vec<StingerStatus>,
+    streams: Vec<StreamStatus>,
     desired_overlays: Vec<OverlayStatus>,
     realized_overlays: Vec<OverlayStatus>,
     switcher: SwitcherState,
@@ -427,6 +452,11 @@ impl ProjectState {
     }
 
     #[must_use]
+    pub fn streams(&self) -> &[StreamStatus] {
+        &self.streams
+    }
+
+    #[must_use]
     pub fn desired_overlays(&self) -> &[OverlayStatus] {
         &self.desired_overlays
     }
@@ -452,6 +482,7 @@ pub struct ClientView {
     pub outputs: Vec<OutputStatus>,
     pub input_audio_strips: Vec<InputAudioStripStatus>,
     pub stingers: Vec<StingerStatus>,
+    pub streams: Vec<StreamStatus>,
     pub desired_overlays: Vec<OverlayStatus>,
     pub realized_overlays: Vec<OverlayStatus>,
     pub switcher: SwitcherState,
@@ -634,6 +665,9 @@ pub enum ModelError {
     InvalidInputAudioStrips,
     DuplicateStingerSlot(u8),
     InvalidStingerSlot(u8),
+    InvalidStreamCount(usize),
+    DuplicateStreamTarget(NonZeroU128),
+    InvalidStreamNames,
     InvalidOverlayCount(usize),
     InvalidOverlayChannel(u8),
     InvalidOverlayTransitionDuration {
@@ -724,6 +758,16 @@ impl fmt::Display for ModelError {
                 write!(formatter, "snapshot repeats Stinger slot {slot}")
             }
             Self::InvalidStingerSlot(slot) => write!(formatter, "invalid Stinger slot {slot}"),
+            Self::InvalidStreamCount(count) => write!(
+                formatter,
+                "snapshot contains {count} stream statuses; maximum is {MAX_STREAM_STATUSES}"
+            ),
+            Self::DuplicateStreamTarget(target) => {
+                write!(formatter, "snapshot repeats stream target {}", target.get())
+            }
+            Self::InvalidStreamNames => formatter.write_str(
+                "stream names must contain one unique, nonblank label within the byte limit",
+            ),
             Self::InvalidOverlayCount(_)
             | Self::InvalidOverlayChannel(_)
             | Self::InvalidOverlayTransitionDuration { .. }
@@ -853,6 +897,7 @@ impl ClientModel {
             outputs: state.outputs.clone(),
             input_audio_strips: state.input_audio_strips.clone(),
             stingers: state.stingers.clone(),
+            streams: state.streams.clone(),
             desired_overlays: state.desired_overlays.clone(),
             realized_overlays: state.realized_overlays.clone(),
             switcher,
@@ -1029,6 +1074,7 @@ impl ClientModel {
             outputs: snapshot.outputs,
             input_audio_strips: snapshot.input_audio_strips,
             stingers: snapshot.stingers,
+            streams: snapshot.streams,
             desired_overlays: snapshot.desired_overlays,
             realized_overlays: snapshot.realized_overlays,
             switcher: snapshot.switcher,
@@ -1431,6 +1477,7 @@ fn validate_snapshot_inputs(snapshot: &ProjectSnapshot) -> Result<(), ModelError
         }
     }
     validate_stingers(&snapshot.stingers, &inputs)?;
+    validate_streams(&snapshot.streams)?;
     validate_input_audio_strips(&snapshot.input_audio_strips, &inputs)?;
     validate_overlays(&snapshot.desired_overlays, &inputs, &outputs)?;
     validate_overlays(&snapshot.realized_overlays, &inputs, &outputs)?;
@@ -1523,6 +1570,22 @@ fn validate_stingers(
     Ok(())
 }
 
+fn validate_streams(streams: &[StreamStatus]) -> Result<(), ModelError> {
+    if streams.len() > MAX_STREAM_STATUSES {
+        return Err(ModelError::InvalidStreamCount(streams.len()));
+    }
+    let mut targets = HashSet::with_capacity(streams.len());
+    for stream in streams {
+        if stream.name.trim().is_empty() || stream.name.len() > MAX_STREAM_NAME_BYTES {
+            return Err(ModelError::InvalidStreamNames);
+        }
+        if !targets.insert(stream.target) {
+            return Err(ModelError::DuplicateStreamTarget(stream.target));
+        }
+    }
+    Ok(())
+}
+
 fn validate_input_audio_strips(
     strips: &[InputAudioStripStatus],
     inputs: &HashSet<InputId>,
@@ -1600,6 +1663,10 @@ fn validate_change(change: &DurableChange, state: &ProjectState) -> Result<(), M
             overlays,
             input_audio_strips,
         ),
+        DurableChange::StreamsChanged { streams } => {
+            validate_streams(streams)?;
+            return Ok(());
+        }
     };
     let inputs = &state.inputs;
     for input in [selection.program, selection.preview] {
@@ -1680,6 +1747,9 @@ fn apply_change(state: &mut ProjectState, change: DurableChange) {
             state.desired_overlays = overlays;
             state.input_audio_strips = input_audio_strips;
         }
+        DurableChange::StreamsChanged { streams } => {
+            state.streams = streams;
+        }
     }
 }
 
@@ -1737,6 +1807,19 @@ fn protocol_overlays(overlays: Vec<fm_protocol::OverlayStatus>) -> Vec<OverlaySt
                 .into_iter()
                 .map(fm_protocol::WireOutputId::to_domain)
                 .collect(),
+        })
+        .collect()
+}
+
+fn protocol_streams(streams: Vec<fm_protocol::StreamStatus>) -> Vec<StreamStatus> {
+    streams
+        .into_iter()
+        .map(|status| StreamStatus {
+            target: status.target.get(),
+            name: status.name,
+            desired_running: status.desired_running,
+            realized: status.realized,
+            detail: status.detail,
         })
         .collect()
 }

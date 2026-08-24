@@ -77,7 +77,8 @@ use fm_server::{
 use fm_switcher::{
     MissingMediaFallback, OverlayBorderPreset, OverlayChannelId, OverlayChannelState,
     OverlayPositionPreset, OverlayTransitionKind, StingerAudioPolicy, StingerDescriptor,
-    StingerSlotId, SwitcherState, TBarPosition, TBarState, TransitionKind,
+    StingerSlotId, StreamTargetId as SwitcherStreamTargetId, SwitcherState, TBarPosition,
+    TBarState, TransitionKind,
 };
 use fm_types::{InputId, ProjectId};
 use freemixd::{ReadinessRecord, StatusReadinessRecord};
@@ -102,6 +103,10 @@ use fm_codec_ffmpeg::{
         CleanupStatus, EnqueueRejection, OutputFinalization, PairedFrame, RecordConfig,
         RecordFormat, Recorder, RecorderState, StopOutcome,
     },
+    stream::{
+        EnqueueRejection as StreamEnqueueRejection, StopOutcome as StreamStopOutcome, StreamConfig,
+        StreamDestination, StreamState, Streamer,
+    },
 };
 #[cfg(feature = "native-media")]
 use fm_codec_image::{StillDecodeLimits, decode_still, sniff_still_format};
@@ -124,7 +129,7 @@ use fm_io_api::{
 #[cfg(all(feature = "native-media", target_os = "macos"))]
 use fm_io_macos::{CameraTelemetry, CameraVideoSource, MacosCameraAdapter};
 #[cfg(feature = "native-media")]
-use fm_model::{InputKind, SimulatedAudio, SimulatedVideo};
+use fm_model::{InputKind, SimulatedAudio, SimulatedVideo, StartupPolicy};
 #[cfg(feature = "native-media")]
 use fm_observability::{Metric, MetricStore};
 #[cfg(feature = "native-media")]
@@ -173,6 +178,10 @@ const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
 const PROGRAM_RECORDER_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(feature = "native-media")]
 const PROGRAM_RECORDER_KILL_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(feature = "native-media")]
+const PROGRAM_STREAM_STOP_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(feature = "native-media")]
+const PROGRAM_STREAM_KILL_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(all(feature = "native-media", feature = "macos-program-surface"))]
 // Referenced by macos-program-surface code paths that are themselves inert off macOS.
 #[allow(dead_code)]
@@ -314,6 +323,12 @@ struct NativeDaemon {
     pending_stinger_mutation: Option<NativeStingerMutation>,
     stinger_retirements: NativeStingerRetirements,
     recorder: Option<NativeProgramRecorder>,
+    streams: Vec<NativeProgramStream>,
+    /// `StreamStart` acceptances waiting for the next frame boundary.
+    pending_stream_starts: Vec<SwitcherStreamTargetId>,
+    /// Live sinks cancelled off the render path, reaped at shutdown.
+    retired_streams: Vec<Streamer>,
+    streams_finalized: bool,
     telemetry: NativeRuntimeTelemetry,
     telemetry_emitted: bool,
     audio_meter_sequence: u64,
@@ -1198,6 +1213,8 @@ struct NativeRuntimeTelemetry {
     recorder_peak_outstanding_pairs: u64,
     recorder_retained_bytes: u64,
     recorder_peak_retained_bytes: u64,
+    stream_enqueued_pairs_total: u64,
+    stream_dropped_pairs_total: u64,
 }
 
 #[cfg(feature = "native-media")]
@@ -1243,6 +1260,8 @@ impl NativeRuntimeTelemetry {
             recorder_peak_outstanding_pairs: 0,
             recorder_retained_bytes: 0,
             recorder_peak_retained_bytes: 0,
+            stream_enqueued_pairs_total: 0,
+            stream_dropped_pairs_total: 0,
         }
     }
 
@@ -1320,6 +1339,14 @@ impl NativeRuntimeTelemetry {
             .max(self.recorder_retained_bytes);
     }
 
+    /// Additive v4 aggregation: whole-run stream pair admission counters. The
+    /// record stays key=value, so existing consumers that look fields up by
+    /// name keep parsing unchanged.
+    fn observe_streams(&mut self, enqueued_pairs: u64, dropped_pairs: u64) {
+        self.stream_enqueued_pairs_total = enqueued_pairs;
+        self.stream_dropped_pairs_total = dropped_pairs;
+    }
+
     fn emit(&self, presentation: Option<fm_gpu::PresentationTelemetry>) {
         eprintln!("{}", self.diagnostic(presentation));
     }
@@ -1338,7 +1365,7 @@ impl NativeRuntimeTelemetry {
         let presentation_active = presentation.is_some();
         let presentation = presentation.unwrap_or_default();
         format!(
-            "FREEMIXD_TELEMETRY\tv=4\thost_lateness_samples_total={}\thost_lateness_samples_retained={}\thost_lateness_metric_samples_dropped={}\thost_lateness_p50_ms={}\thost_lateness_p95_ms={}\thost_lateness_p99_ms={}\taudio_retained_blocks={}\taudio_observed_peak_retained_blocks={}\taudio_retained_samples={}\taudio_observed_peak_retained_samples={}\taudio_retained_bytes={}\taudio_observed_peak_retained_bytes={}\taudio_reservation_requests={}\taudio_reserved_blocks={}\taudio_observed_peak_reserved_blocks={}\taudio_reserved_samples={}\taudio_observed_peak_reserved_samples={}\taudio_reserved_bytes={}\taudio_observed_peak_reserved_bytes={}\taudio_source_stalls={}\taudio_positioned_blocks={}\taudio_positioned_samples={}\taudio_leading_silence_samples={}\taudio_eos_padding_blocks={}\taudio_eos_padding_samples={}\taudio_sink_depth={}\taudio_sink_peak_depth={}\taudio_sink_dropped={}\tcamera_configured_sources={}\tcamera_frames_received={}\tcamera_frames_ingested={}\tcamera_native_dropped={}\tcamera_queue_depth={}\tcamera_queue_peak_depth={}\tcamera_queue_dropped={}\tcamera_continuity_rejected={}\tcamera_recovery_timeout_discarded={}\tcamera_terminal_error_discarded={}\tcamera_terminal_trigger_discarded={}\tcamera_ready_delivery_depth={}\tcamera_ready_delivery_discarded={}\tcamera_cancellation_discarded={}\tcamera_supervisor_slot_replaced={}\tcamera_supervisor_slot_depth={}\tcamera_ingest_failed={}\tcamera_preflight_depth={}\tcamera_preflight_discarded={}\tcamera_recovery_attempts={}\tcamera_recovery_successes={}\tcamera_recovery_exhausted={}\tcamera_recovery_worker_failures={}\tpresentation_active={}\tpresentation_pending_depth={}\tpresentation_peak_pending_depth={}\tpresentation_dropped={}\trecorder_configured={}\trecorder_outstanding_pairs={}\trecorder_observed_peak_outstanding_pairs={}\trecorder_retained_bytes={}\trecorder_observed_peak_retained_bytes={}\tgpu_backend={:?}\tgpu_adapter={}\tgpu_timing={:?}\tgpu_pass_samples_total={}\tgpu_pass_samples_retained={}\tgpu_pass_metric_samples_dropped={}\tgpu_pass_p50_ms={}\tgpu_pass_p95_ms={}\tgpu_pass_p99_ms={}\tgpu_samples_pending={}\tgpu_samples_dropped={}\tgpu_samples_unavailable={}\tmetric_errors={}\tmetric_samples_dropped={}",
+            "FREEMIXD_TELEMETRY\tv=4\thost_lateness_samples_total={}\thost_lateness_samples_retained={}\thost_lateness_metric_samples_dropped={}\thost_lateness_p50_ms={}\thost_lateness_p95_ms={}\thost_lateness_p99_ms={}\taudio_retained_blocks={}\taudio_observed_peak_retained_blocks={}\taudio_retained_samples={}\taudio_observed_peak_retained_samples={}\taudio_retained_bytes={}\taudio_observed_peak_retained_bytes={}\taudio_reservation_requests={}\taudio_reserved_blocks={}\taudio_observed_peak_reserved_blocks={}\taudio_reserved_samples={}\taudio_observed_peak_reserved_samples={}\taudio_reserved_bytes={}\taudio_observed_peak_reserved_bytes={}\taudio_source_stalls={}\taudio_positioned_blocks={}\taudio_positioned_samples={}\taudio_leading_silence_samples={}\taudio_eos_padding_blocks={}\taudio_eos_padding_samples={}\taudio_sink_depth={}\taudio_sink_peak_depth={}\taudio_sink_dropped={}\tcamera_configured_sources={}\tcamera_frames_received={}\tcamera_frames_ingested={}\tcamera_native_dropped={}\tcamera_queue_depth={}\tcamera_queue_peak_depth={}\tcamera_queue_dropped={}\tcamera_continuity_rejected={}\tcamera_recovery_timeout_discarded={}\tcamera_terminal_error_discarded={}\tcamera_terminal_trigger_discarded={}\tcamera_ready_delivery_depth={}\tcamera_ready_delivery_discarded={}\tcamera_cancellation_discarded={}\tcamera_supervisor_slot_replaced={}\tcamera_supervisor_slot_depth={}\tcamera_ingest_failed={}\tcamera_preflight_depth={}\tcamera_preflight_discarded={}\tcamera_recovery_attempts={}\tcamera_recovery_successes={}\tcamera_recovery_exhausted={}\tcamera_recovery_worker_failures={}\tpresentation_active={}\tpresentation_pending_depth={}\tpresentation_peak_pending_depth={}\tpresentation_dropped={}\trecorder_configured={}\trecorder_outstanding_pairs={}\trecorder_observed_peak_outstanding_pairs={}\trecorder_retained_bytes={}\trecorder_observed_peak_retained_bytes={}\tstream_pairs_enqueued_total={}\tstream_pairs_dropped_total={}\tgpu_backend={:?}\tgpu_adapter={}\tgpu_timing={:?}\tgpu_pass_samples_total={}\tgpu_pass_samples_retained={}\tgpu_pass_metric_samples_dropped={}\tgpu_pass_p50_ms={}\tgpu_pass_p95_ms={}\tgpu_pass_p99_ms={}\tgpu_samples_pending={}\tgpu_samples_dropped={}\tgpu_samples_unavailable={}\tmetric_errors={}\tmetric_samples_dropped={}",
             host.count,
             host.retained_samples,
             host.dropped_samples,
@@ -1399,6 +1426,8 @@ impl NativeRuntimeTelemetry {
             self.recorder_peak_outstanding_pairs,
             self.recorder_retained_bytes,
             self.recorder_peak_retained_bytes,
+            self.stream_enqueued_pairs_total,
+            self.stream_dropped_pairs_total,
             self.gpu_backend,
             diagnostic_field(&self.gpu_adapter),
             self.gpu_support,
@@ -1678,6 +1707,297 @@ fn startup_pair_decision(
     }
 }
 
+/// Per-target bookkeeping for the native streaming feed path.
+///
+/// The ledger is separated from the sink so the sequencing rules — advance only
+/// on a successful enqueue, count every refusal, never block or panic — are
+/// testable without a GPU runtime or an `FFmpeg` child.
+#[cfg(feature = "native-media")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct StreamPairLedger {
+    /// Smallest sequence this target may still admit. It advances only when a
+    /// pair is actually accepted, so a rejected pair leaves its sequence to be
+    /// skipped (and padded by the sink) rather than reused.
+    next_sequence: u64,
+    enqueued_pairs: u64,
+    dropped_pairs: u64,
+}
+
+#[cfg(feature = "native-media")]
+impl StreamPairLedger {
+    /// Whether a pair at `sequence` may still be dispatched. Pairs behind the
+    /// cursor were either already delivered or abandoned with the sink in a
+    /// state that cannot accept them; re-dispatching them would be rejected as
+    /// out-of-order, so they are dropped instead.
+    fn deliverable(&self, sequence: SequenceNumber) -> bool {
+        sequence.get() >= self.next_sequence
+    }
+
+    fn note_admitted(&mut self, sequence: SequenceNumber) {
+        self.enqueued_pairs = self.enqueued_pairs.saturating_add(1);
+        self.next_sequence = sequence.get().saturating_add(1);
+    }
+
+    fn note_dropped(&mut self) {
+        self.dropped_pairs = self.dropped_pairs.saturating_add(1);
+    }
+}
+
+/// Rejections that mean the sink can never accept another pair. Capacity
+/// rejections are backpressure: they cost one dropped pair and the next frame
+/// retries, exactly like the sink's own overflow policy intends.
+#[cfg(feature = "native-media")]
+const fn sticky_stream_rejection(reason: &StreamEnqueueRejection) -> bool {
+    matches!(
+        reason,
+        StreamEnqueueRejection::Failed(_)
+            | StreamEnqueueRejection::Stopped
+            | StreamEnqueueRejection::Stopping
+            | StreamEnqueueRejection::FormatMismatch
+            | StreamEnqueueRejection::Sequence { .. }
+            | StreamEnqueueRejection::SequenceExhausted
+    )
+}
+
+/// One configured stream target's native realization: its own readback owner,
+/// format, optional live sink, and per-target capture bookkeeping.
+///
+/// Mirrors [`NativeProgramRecorder`]: failures latch per target, are reported
+/// once as a sanitized record, and degrade that target only — they never abort
+/// daemon startup or the render loop.
+#[cfg(feature = "native-media")]
+struct NativeProgramStream {
+    target: SwitcherStreamTargetId,
+    destination: StreamDestination,
+    readback: NativeProgramReadback,
+    format: RecordFormat,
+    streamer: Option<Streamer>,
+    ledger: StreamPairLedger,
+    first_failure: Option<String>,
+}
+
+#[cfg(feature = "native-media")]
+impl NativeProgramStream {
+    /// Compiles one runtime per configured project destination in project
+    /// vector order.
+    ///
+    /// Startup fails closed on more targets than the engine inventories or a
+    /// destination the sink would refuse; both are authoring errors the model
+    /// validation mirrors, so refusing before any process spawns keeps them
+    /// visible instead of latching every target failed at air time.
+    fn compile(runtime: &NativeMediaRuntime, stored: &StoredProject) -> AppResult<Vec<Self>> {
+        let targets = stored.project().stream_targets();
+        if targets.len() > fm_switcher::MAX_STREAM_COUNT {
+            return Err(AppFailure(format!(
+                "stream target count {} exceeds the engine inventory limit {}",
+                targets.len(),
+                fm_switcher::MAX_STREAM_COUNT
+            ))
+            .into());
+        }
+        let settings = stored.project().settings();
+        let frames_rendered = stored.position().frames_rendered;
+        let mut streams = Vec::with_capacity(targets.len());
+        for target in targets {
+            let destination = StreamDestination::parse(&target.expose_url()).map_err(|error| {
+                AppFailure(format!(
+                    "stream target {} destination was refused before startup: {error:?}",
+                    target.id()
+                ))
+            })?;
+            let format = RecordFormat::new(
+                settings.video.dimensions.width(),
+                settings.video.dimensions.height(),
+                settings.frame_rate,
+                settings.audio.sample_rate,
+                settings.audio.channels.clone(),
+                SequenceNumber::new(frames_rendered),
+            )?;
+            let readback = runtime.create_program_readback_blocking(
+                NonZeroU32::new(settings.video.dimensions.width())
+                    .expect("project width is nonzero"),
+                NonZeroU32::new(settings.video.dimensions.height())
+                    .expect("project height is nonzero"),
+            )?;
+            streams.push(Self {
+                target: SwitcherStreamTargetId::from_non_zero(target.id().get()),
+                destination,
+                readback,
+                format,
+                streamer: None,
+                ledger: StreamPairLedger {
+                    next_sequence: frames_rendered,
+                    ..StreamPairLedger::default()
+                },
+                first_failure: None,
+            });
+        }
+        Ok(streams)
+    }
+
+    fn live(&self) -> bool {
+        self.streamer.is_some()
+    }
+
+    /// Starts the sink for one target. Failures latch the target and emit one
+    /// sanitized failure record; they never abort startup or the render loop.
+    fn start(&mut self) {
+        if self.live() || self.first_failure.is_some() {
+            return;
+        }
+        let mut config = StreamConfig::new(self.format.clone(), self.destination.clone());
+        config.limits.stop_timeout = PROGRAM_STREAM_STOP_TIMEOUT;
+        config.limits.kill_timeout = PROGRAM_STREAM_KILL_TIMEOUT;
+        match Streamer::start(config) {
+            Ok(streamer) => self.streamer = Some(streamer),
+            Err(error) => {
+                let failure = format!("start:{:?} ({:?})", error.kind, error.cleanup);
+                self.fail(&failure);
+            }
+        }
+    }
+
+    /// Cancels the live sink off the render path and retires it for bounded
+    /// reaping at shutdown. Bookkeeping stays with the target so a later
+    /// `StreamStart` can relaunch it and shutdown reports whole-run counters.
+    fn stop_live(&mut self) -> Option<Streamer> {
+        let mut streamer = self.streamer.take()?;
+        streamer.request_cancel();
+        Some(streamer)
+    }
+
+    /// Reads back one program frame and admits it to this target's sink.
+    ///
+    /// Sequential by design: each target owns its readback, the recorder goes
+    /// first, and no path here blocks the render loop beyond the existing
+    /// synchronous diagnostic readback contract. Every refusal is counted;
+    /// sticky ones latch the target like [`RecorderCapturePolicy`].
+    fn capture(
+        &mut self,
+        runtime: &NativeMediaRuntime,
+        program: &NativeTexture,
+        audio: &AudioBlock,
+    ) {
+        if !self.live() || self.first_failure.is_some() {
+            return;
+        }
+        let telemetry = self
+            .streamer
+            .as_ref()
+            .expect("live stream has a sink")
+            .telemetry();
+        if telemetry.state == StreamState::Failed {
+            self.fail(&format!("backend:{:?}", telemetry.failure));
+            return;
+        }
+        let sequence = audio.timing().sequence();
+        if !self.ledger.deliverable(sequence) {
+            self.ledger.note_dropped();
+            return;
+        }
+        // This is the existing synchronous diagnostic readback path per target,
+        // not a nonblocking or zero-copy encoder bridge.
+        let readback = match runtime.readback_program_blocking(&mut self.readback, program) {
+            Ok(readback) => readback,
+            Err(error) => {
+                self.fail(&format!("readback:{error}"));
+                return;
+            }
+        };
+        let Some(expected_stride) = readback.width.checked_mul(4) else {
+            self.fail("readback:stride_overflow");
+            return;
+        };
+        if readback.width != self.readback.width()
+            || readback.height != self.readback.height()
+            || readback.stride != expected_stride
+        {
+            self.fail("readback:invalid_tight_layout");
+            return;
+        }
+        let pair = match PairedFrame::new(&self.format, sequence, readback.rgba, audio.clone()) {
+            Ok(pair) => pair,
+            Err(error) => {
+                self.fail(&format!("frame:{error}"));
+                return;
+            }
+        };
+        let streamer = self.streamer.as_mut().expect("live stream has a sink");
+        match streamer.enqueue(pair) {
+            Ok(()) => self.ledger.note_admitted(sequence),
+            Err(error) => {
+                let reason = error.reason.clone();
+                drop(error.into_frame());
+                self.ledger.note_dropped();
+                if sticky_stream_rejection(&reason) {
+                    self.fail(&format!("enqueue:{reason:?}"));
+                }
+            }
+        }
+    }
+
+    /// Latches the first failure per target and cancels its sink.
+    fn fail(&mut self, failure: &str) {
+        if self.first_failure.is_some() {
+            return;
+        }
+        self.first_failure = Some(failure.to_owned());
+        eprintln!(
+            "FREEMIXD_STREAM_FAILURE\tv=1\ttarget={}\tdestination={}\tfailure={}",
+            self.target,
+            diagnostic_field(self.destination.redacted()),
+            diagnostic_field(failure),
+        );
+        if let Some(streamer) = self.streamer.as_mut() {
+            streamer.request_cancel();
+        }
+    }
+
+    /// Emits the single sanitized end-of-run record for this target using the
+    /// frozen sink telemetry, if the target ever had a sink.
+    ///
+    /// Only redacted destinations and sink telemetry fields reach the record:
+    /// neither the stream key nor child stderr URL text can appear.
+    fn emit_final_record(&self, telemetry: Option<&fm_codec_ffmpeg::stream::StreamTelemetry>) {
+        let (state, muxed_bytes, out_time_us, connected, failure) =
+            telemetry.map_or((None, 0, 0, false, None), |telemetry| {
+                (
+                    Some(telemetry.state),
+                    telemetry.muxed_bytes,
+                    u64::try_from(telemetry.muxed_media_time.as_micros()).unwrap_or(u64::MAX),
+                    telemetry.connected,
+                    telemetry
+                        .failure
+                        .as_ref()
+                        .map(|failure| format!("{failure:?}")),
+                )
+            });
+        eprintln!(
+            "FREEMIXD_STREAM\tv=1\ttarget={}\tdestination={}\tstate={}\tmuxed_bytes={muxed_bytes}\tout_time_us={out_time_us}\tconnected={connected}\tenqueued_pairs={}\tdropped_pairs={}\tfailure={}",
+            self.target,
+            diagnostic_field(self.destination.redacted()),
+            state.map_or_else(
+                || {
+                    if self.first_failure.is_some() {
+                        "Failed".to_owned()
+                    } else {
+                        "NotStarted".to_owned()
+                    }
+                },
+                |state| format!("{state:?}"),
+            ),
+            self.ledger.enqueued_pairs,
+            self.ledger.dropped_pairs,
+            diagnostic_field(
+                self.first_failure
+                    .as_deref()
+                    .or(failure.as_deref())
+                    .unwrap_or("none"),
+            ),
+        );
+    }
+}
+
 #[cfg(feature = "native-media")]
 #[derive(Debug)]
 enum NativeRealizationError {
@@ -1774,6 +2094,10 @@ impl NativeDaemon {
         });
         let (playback, stingers) =
             preflight_native_video(&runtime, adapter.as_ref(), sources.clone(), stored)?;
+        // Stream runtimes compile after video/audio preflight so a destination
+        // problem is reported against an otherwise healthy show. Starting one
+        // is deferred to readiness; failures there latch per target.
+        let streams = NativeProgramStream::compile(&runtime, stored)?;
         #[cfg(target_os = "macos")]
         resolution.cameras.mark_preflight_frames_ingested();
         let pacer = FramePacer::restore(
@@ -1801,6 +2125,10 @@ impl NativeDaemon {
             pending_stinger_mutation: None,
             stinger_retirements: NativeStingerRetirements::start()?,
             recorder: None,
+            streams,
+            pending_stream_starts: Vec::new(),
+            retired_streams: Vec::new(),
+            streams_finalized: false,
             telemetry,
             telemetry_emitted: false,
             audio_meter_sequence: 0,
@@ -1875,6 +2203,114 @@ impl NativeDaemon {
             self.tick_if_due(control, server)?;
             thread::sleep(NATIVE_IO_POLL_INTERVAL);
         }
+    }
+
+    /// Starts sinks for every target whose authored intent is to be running
+    /// once the daemon reconciles desired state.
+    ///
+    /// Called at readiness, mirroring the recorder's startup priming but
+    /// deliberately without a barrier: a destination that refuses to open must
+    /// degrade its own target, not delay or abort daemon startup.
+    fn prime_startup_streams(&mut self, stored: &StoredProject) {
+        for target in stored.project().stream_targets() {
+            if !target.running() || target.startup() != StartupPolicy::ReconcileDesiredState {
+                continue;
+            }
+            let target_id = SwitcherStreamTargetId::from_non_zero(target.id().get());
+            if let Some(stream) = self
+                .streams
+                .iter_mut()
+                .find(|stream| stream.target == target_id)
+            {
+                stream.start();
+            }
+        }
+    }
+
+    /// Schedules live sink changes for an accepted StreamStart/StreamStop.
+    ///
+    /// Starts wait for the next frame boundary; stops cancel off the render
+    /// path immediately and retire the sink for bounded reaping at shutdown,
+    /// the same division of labor the stinger pool retirement uses.
+    fn observe_stream_command(&mut self, command: &CommandMessage, result: &CommandResult) {
+        let (target, running) = match command.payload {
+            CommandPayload::StreamStart { target } => (target, true),
+            CommandPayload::StreamStop { target } => (target, false),
+            _ => return,
+        };
+        if !matches!(result, CommandResult::Accepted { .. }) {
+            return;
+        }
+        let target_id = SwitcherStreamTargetId::from_non_zero(target.get());
+        if running {
+            if !self.pending_stream_starts.contains(&target_id) {
+                self.pending_stream_starts.push(target_id);
+            }
+            return;
+        }
+        self.pending_stream_starts
+            .retain(|pending| *pending != target_id);
+        if let Some(stream) = self
+            .streams
+            .iter_mut()
+            .find(|stream| stream.target == target_id)
+            && let Some(streamer) = stream.stop_live()
+        {
+            self.retired_streams.push(streamer);
+        }
+    }
+
+    /// Consumes pending `StreamStart` requests at a frame boundary.
+    fn start_pending_streams(&mut self) {
+        for target in std::mem::take(&mut self.pending_stream_starts) {
+            if let Some(stream) = self
+                .streams
+                .iter_mut()
+                .find(|stream| stream.target == target)
+            {
+                stream.start();
+            }
+        }
+    }
+
+    /// Stops every stream under a bounded per-sink deadline and emits exactly
+    /// one sanitized final record per configured target, retired sinks
+    /// included. Collected failures are returned so shutdown can report them
+    /// after the recorder result instead of abandoning the rest of teardown.
+    fn finalize_streams(&mut self) -> Vec<AppResult<()>> {
+        if self.streams_finalized {
+            return Vec::new();
+        }
+        self.streams_finalized = true;
+        // Retired sinks were already cancelled; their stop reaps the child
+        // under kill_timeout because cancellation latched first.
+        for mut streamer in std::mem::take(&mut self.retired_streams) {
+            // The retired copy's report is intentionally dropped: the single
+            // per-target record is emitted from the target's own entry below.
+            drop(streamer.stop());
+        }
+        let mut results = Vec::new();
+        for index in 0..self.streams.len() {
+            let telemetry = if let Some(streamer) = self.streams[index].streamer.as_mut() {
+                let report = streamer.stop();
+                let clean = matches!(
+                    report.outcome,
+                    StreamStopOutcome::Clean | StreamStopOutcome::Killed
+                );
+                if !clean {
+                    results.push(Err(AppFailure(format!(
+                        "stream target {} did not shut down cleanly: outcome={:?} cleanup={:?}",
+                        self.streams[index].target, report.outcome, report.cleanup
+                    ))
+                    .into()));
+                }
+                Some(report.telemetry)
+            } else {
+                None
+            };
+            self.streams[index].emit_final_record(telemetry.as_ref());
+        }
+        results
     }
 
     fn tick_if_due(
@@ -1975,6 +2411,9 @@ impl NativeDaemon {
         control: &mut ControlService<Policy>,
         server: &ServerIdentity,
     ) -> AppResult<Vec<RuntimeEventMessage>> {
+        // Accepted StreamStart commands start on this frame boundary, before
+        // the frame is produced, so the first fed pair is the next real frame.
+        self.start_pending_streams();
         let runtime = &self.runtime;
         let registry = self.playback.registry();
         let stinger_registry = self.stingers.registry();
@@ -2046,10 +2485,20 @@ impl NativeDaemon {
                 .present_latest(self.runtime.context(), output)
                 .map_err(|error| -> Box<dyn Error> { Box::new(AppFailure(error)) })?;
         }
+        let stream_audio = if self.streams.is_empty() {
+            None
+        } else {
+            audio.clone()
+        };
         if let (Some(recorder), Some(output), Some(audio)) =
             (&mut self.recorder, latest_program, audio)
         {
             recorder.capture(&self.runtime, output, audio);
+        }
+        if let (Some(output), Some(audio)) = (latest_program, stream_audio) {
+            for stream in &mut self.streams {
+                stream.capture(&self.runtime, output, &audio);
+            }
         }
         self.observe_native_telemetry();
         Ok(outcome.runtime_events)
@@ -2105,6 +2554,18 @@ impl NativeDaemon {
         if let Some(recorder) = self.recorder.as_ref() {
             self.telemetry.observe_recorder(recorder);
         }
+        let streams_enqueued = self
+            .streams
+            .iter()
+            .map(|stream| stream.ledger.enqueued_pairs)
+            .fold(0_u64, u64::saturating_add);
+        let streams_dropped = self
+            .streams
+            .iter()
+            .map(|stream| stream.ledger.dropped_pairs)
+            .fold(0_u64, u64::saturating_add);
+        self.telemetry
+            .observe_streams(streams_enqueued, streams_dropped);
         self.telemetry.observe_gpu(self.runtime.context());
     }
 
@@ -2364,6 +2825,10 @@ impl Drop for NativeDaemon {
         if let Some(mutation) = self.pending_stinger_mutation.take() {
             let _ = self.stinger_retirements.discard(mutation);
         }
+        for result in self.finalize_streams() {
+            // Drop must never panic; the serve path reports these results.
+            drop(result);
+        }
         let _ = self.finalize_recorder();
         self.emit_camera_source_telemetry();
         #[cfg(target_os = "macos")]
@@ -2459,6 +2924,14 @@ impl NativeDaemon {
     #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
     fn finalize_recorder(&mut self) -> AppResult<()> {
         Ok(())
+    }
+
+    #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
+    fn prime_startup_streams(&mut self, _stored: &StoredProject) {}
+
+    #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
+    fn finalize_streams(&mut self) -> Vec<AppResult<()>> {
+        Vec::new()
     }
 
     #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
@@ -3664,6 +4137,12 @@ fn serve_inner(
     }
     #[cfg(not(all(feature = "macos-program-surface", target_os = "macos")))]
     let fullscreen_active = false;
+    // Reconciled stream targets start here, after all preflight succeeded and
+    // before readiness is advertised. A refusing destination latches its own
+    // target and is reported; it never keeps the daemon from becoming ready.
+    if let Some(native) = native.as_mut() {
+        native.prime_startup_streams(&durable);
+    }
     // The immutable handshake digest advertises successfully configured
     // startup support. Late recorder health is reported by FREEMIXD_RECORDER.
     let capabilities_digest = capabilities_digest(
@@ -3758,12 +4237,19 @@ fn serve_inner(
         eprintln!("FREEMIXD_PROGRAM\tv=1\tframes_presented={frames_presented}");
     }
     if let Some(native) = &mut native {
+        // Streams stop before the recorder so the final records reflect the
+        // same shutdown instant, and their results report after the recorder's
+        // like camera results do.
+        let stream_results = native.finalize_streams();
         let recorder_result = native.finalize_recorder();
         native.emit_camera_source_telemetry();
         let camera_result = native.finalize_cameras();
         native.emit_telemetry();
         recorder_result?;
         camera_result?;
+        for result in stream_results {
+            result?;
+        }
     }
     Ok(())
 }
@@ -3938,6 +4424,20 @@ fn restore_engine(project: &StoredProject) -> AppResult<Engine> {
     let routing = project.runtime_routing();
     let realized_program = required_routing(routing.realized_program_id, "realized program")?;
     let realized_preview = required_routing(routing.realized_preview_id, "realized preview")?;
+    // The stream inventory and desired running flags are seeded from the
+    // project in vector order, so the restored show keeps the authored order.
+    // Duplicates, oversized inventories, and blank names fail closed through
+    // the switcher's own validation errors.
+    let stream_inventory = canonical
+        .stream_targets()
+        .iter()
+        .map(|target| {
+            (
+                SwitcherStreamTargetId::from_non_zero(target.id().get()),
+                target.name().to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
     let mut show = ShowState::new(
         canonical.name(),
         inputs,
@@ -3950,9 +4450,22 @@ fn restore_engine(project: &StoredProject) -> AppResult<Engine> {
             .iter()
             .map(|output| (output.id, output.name.clone()))
             .collect(),
-    )?;
+    )?
+    .with_streams(stream_inventory.clone())?;
     restore_input_audio_strips(&mut show, canonical)?;
-    let mut realized = SwitcherState::new(input_ids, realized_program, realized_preview)?;
+    let mut realized = SwitcherState::new(input_ids, realized_program, realized_preview)?
+        .with_streams(stream_inventory)?;
+    for target in canonical
+        .stream_targets()
+        .iter()
+        .filter(|target| target.running())
+    {
+        let target_id = SwitcherStreamTargetId::from_non_zero(target.id().get());
+        show.set_stream_running(target_id, true)?;
+        // Idle restore requires desired and realized to agree on stream state;
+        // realization itself is daemon-side runtime work, not engine history.
+        realized.set_stream_running(target_id, true)?;
+    }
     for config in canonical.stingers() {
         restore_stinger(&mut show, &mut realized, *config)?;
     }
@@ -4526,7 +5039,7 @@ fn execute_session_command(
         let mut control = control.borrow_mut();
         if let Some(native) = native {
             native.invalidate_projection();
-            if is_stinger_mutation(command) {
+            let execution = if is_stinger_mutation(command) {
                 match execute_native_stinger_mutation(
                     &mut control,
                     store,
@@ -4569,7 +5082,13 @@ fn execute_session_command(
                             )
                     },
                 )?
-            }
+            };
+            // A live sink change is realized by the native runtime at the next
+            // frame boundary, after durability and acknowledgement have both
+            // settled.
+            #[cfg(feature = "native-media")]
+            native.observe_stream_command(command, &execution.submission.output.result);
+            execution
         } else {
             execute_durable_command(
                 &mut control,
@@ -5006,7 +5525,9 @@ fn command_ticks(
         | CommandPayload::StartManualTransition { .. }
         | CommandPayload::SetManualTransitionPosition { .. }
         | CommandPayload::CommitManualTransition
-        | CommandPayload::CancelManualTransition => 1,
+        | CommandPayload::CancelManualTransition
+        | CommandPayload::StreamStart { .. }
+        | CommandPayload::StreamStop { .. } => 1,
     }
 }
 
@@ -5089,6 +5610,7 @@ fn stored_project_with_receipts(
         }
     }
     sync_project_stingers(&mut project, desired, realized)?;
+    sync_project_streams(&mut project, desired)?;
     StoredProject::from_project_with_complete_runtime_state(
         project,
         RuntimeRouting {
@@ -5117,6 +5639,40 @@ fn stored_project_with_receipts(
         receipts,
     )
     .map_err(Into::into)
+}
+
+/// Folds the desired stream running flags into the stored project.
+///
+/// StreamStart/StreamStop are engine commands, so the projected snapshot's
+/// desired switcher is the authority; mirroring it here makes an accepted
+/// command survive restart through journal replay and checkpoint, exactly as
+/// renames and audio strips do.
+fn sync_project_streams(project: &mut fm_model::Project, desired: &SwitcherState) -> AppResult<()> {
+    let updates = project
+        .stream_targets()
+        .iter()
+        .map(|target| {
+            let target_id = SwitcherStreamTargetId::from_non_zero(target.id().get());
+            let running = desired.stream_running(target_id).ok_or_else(|| {
+                AppFailure(format!(
+                    "projected engine snapshot is missing stream target {target_id}"
+                ))
+            })?;
+            let changed = target.running() != running;
+            AppResult::Ok((target.clone().set_running(running), changed))
+        })
+        .collect::<AppResult<Vec<_>>>()?;
+    for (target, changed) in updates {
+        if changed {
+            let target_id = target.id();
+            project.replace_stream_target(target).map_err(|error| {
+                AppFailure(format!(
+                    "stream target {target_id} could not be persisted: {error}"
+                ))
+            })?;
+        }
+    }
+    Ok(())
 }
 
 fn persisted_overlays(desired: &SwitcherState, realized: &SwitcherState) -> RuntimeOverlays {
@@ -7045,6 +7601,7 @@ mod tests {
     /// surgery under a running daemon cannot inject it, because the journal
     /// database is opened once, at startup, and held for the daemon's run.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn unavailable_journal_refuses_commands_and_the_session_keeps_serving() {
         struct SwitchableJournal {
             available: Arc<AtomicBool>,
@@ -7078,7 +7635,7 @@ mod tests {
             loop {
                 match reader.read_message_with_idle(|| Ok(false)).unwrap() {
                     Some(WireMessage::CommandResult(result)) => return result,
-                    Some(_) => continue,
+                    Some(_) => {}
                     None => panic!("expected a command result"),
                 }
             }
@@ -7187,10 +7744,11 @@ mod tests {
             "the refused commands left no gap in the revision or the journal"
         );
         stream.shutdown(std::net::Shutdown::Write).unwrap();
-        while matches!(
-            reader.read_message_with_idle(|| Ok(false)).unwrap(),
-            Some(_)
-        ) {}
+        while reader
+            .read_message_with_idle(|| Ok(false))
+            .unwrap()
+            .is_some()
+        {}
         served_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         server_thread.join().unwrap();
     }
@@ -9485,5 +10043,337 @@ mod tests {
         let snapshot = prepared.project(0).unwrap();
         prepared.abort();
         snapshot
+    }
+
+    const STREAM_TARGET_A: u128 = 7_001;
+    const STREAM_TARGET_B: u128 = 7_002;
+
+    /// A project with one routed output and two stream destinations, the first
+    /// carrying an authored desired-running intent when `running[0]` is true.
+    fn test_project_with_streams(running: [bool; 2]) -> StoredProject {
+        use fm_model::{
+            AudioBus, Output, Rgba8 as TestRgba8, Scene as TestScene,
+            StartupPolicy as ModelStartup, StreamEndpoint, StreamKey, StreamProtocol, StreamTarget,
+            StreamTargetId,
+        };
+        use fm_types::{BusId as TestBusId, OutputId as TestOutputId, SceneId as TestSceneId};
+
+        let baseline = test_project();
+        let mut project = baseline.project().clone();
+        let scene_id = TestSceneId::new(NonZeroU128::new(900).unwrap());
+        let bus_id = TestBusId::new(NonZeroU128::new(901).unwrap());
+        let output_id = TestOutputId::new(NonZeroU128::new(902).unwrap());
+        project.add_scene(TestScene {
+            id: scene_id,
+            name: "Program".into(),
+            background: TestRgba8::OPAQUE_BLACK,
+            layers: Vec::new(),
+        });
+        project.add_audio_bus(AudioBus {
+            id: bus_id,
+            name: "Program bus".into(),
+            sends: Vec::new(),
+        });
+        project.add_output(Output {
+            id: output_id,
+            name: "Program output".into(),
+            video_source: scene_id,
+            audio_source: bus_id,
+            startup: ModelStartup::ReconcileDesiredState,
+            required_capabilities: Vec::new(),
+        });
+        for (index, number) in [STREAM_TARGET_A, STREAM_TARGET_B].into_iter().enumerate() {
+            let target = StreamTarget::new(
+                StreamTargetId::new(NonZeroU128::new(number).unwrap()),
+                format!(
+                    "Destination {}",
+                    u128::from(u8::try_from(index).unwrap() + 1)
+                ),
+                StreamProtocol::Rtmp,
+                StreamEndpoint::parse("ingest.example.com/live").unwrap(),
+                StreamKey::parse("unit-secret-key").unwrap(),
+                output_id,
+            )
+            .unwrap()
+            .with_startup(ModelStartup::ReconcileDesiredState)
+            .set_running(running[index]);
+            project.add_stream_target_checked(target).unwrap();
+        }
+        StoredProject::from_project(
+            project,
+            baseline.runtime_routing(),
+            baseline.position(),
+            baseline.idempotency_receipts().to_vec(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn restore_engine_seeds_stream_inventory_and_desired_running() {
+        let durable = test_project_with_streams([true, false]);
+        let snapshot = restore_engine(&durable).unwrap().snapshot().unwrap();
+
+        for switcher in [
+            snapshot.show().desired_switcher(),
+            snapshot.realized_switcher(),
+        ] {
+            assert_eq!(switcher.streams().len(), 2);
+            // Project vector order is preserved.
+            assert_eq!(switcher.streams()[0].name(), "Destination 1");
+            assert_eq!(
+                switcher.streams()[1].id(),
+                SwitcherStreamTargetId::from_non_zero(NonZeroU128::new(STREAM_TARGET_B).unwrap())
+            );
+            assert_eq!(switcher.streams()[1].name(), "Destination 2");
+            assert_eq!(
+                switcher.stream_running(SwitcherStreamTargetId::from_non_zero(
+                    NonZeroU128::new(STREAM_TARGET_A).unwrap()
+                )),
+                Some(true)
+            );
+            assert_eq!(
+                switcher.stream_running(SwitcherStreamTargetId::from_non_zero(
+                    NonZeroU128::new(STREAM_TARGET_B).unwrap()
+                )),
+                Some(false)
+            );
+            assert_eq!(
+                switcher.running_stream_targets(),
+                &std::collections::BTreeSet::from([SwitcherStreamTargetId::from_non_zero(
+                    NonZeroU128::new(STREAM_TARGET_A).unwrap()
+                )])
+            );
+        }
+        // Authored running flags survive a restore round trip unchanged.
+        assert!(durable.project().stream_targets()[0].running());
+        assert!(!durable.project().stream_targets()[1].running());
+    }
+
+    #[test]
+    fn stream_commands_persist_desired_running_and_reject_unknown_targets() {
+        let mut durable = test_project_with_streams([false, false]);
+        let mut control = test_control(&durable);
+        let server = test_server(&control);
+        let wire_target =
+            || fm_protocol::WireStreamTargetId::new(NonZeroU128::new(STREAM_TARGET_A).unwrap());
+        let execute = |control: &mut ControlService<Policy>,
+                       durable: &mut StoredProject,
+                       id: &str,
+                       key: &str,
+                       payload| {
+            execute_durable_command(
+                control,
+                &CountingSaver::default(),
+                durable,
+                &operator(),
+                &server,
+                &test_command(id, key, payload),
+                0,
+            )
+        };
+
+        let started = execute(
+            &mut control,
+            &mut durable,
+            "stream-on",
+            "stream-on-key",
+            CommandPayload::StreamStart {
+                target: wire_target(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            started.submission.output.result,
+            CommandResult::Accepted { revision: 1, .. }
+        ));
+        assert!(matches!(
+            started.submission.output.events.as_slice(),
+            [fm_protocol::EventMessage {
+                payload: fm_protocol::EventPayload::StreamsChanged { .. },
+                ..
+            }]
+        ));
+        assert_eq!(durable.position().frames_rendered, 1);
+        assert!(durable.project().stream_targets()[0].running());
+
+        let rejected = execute(
+            &mut control,
+            &mut durable,
+            "stream-unknown",
+            "stream-unknown-key",
+            CommandPayload::StreamStart {
+                target: fm_protocol::WireStreamTargetId::new(NonZeroU128::new(9_999).unwrap()),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            rejected.submission.output.result,
+            CommandResult::Rejected { ref code, .. } if code == "not_found"
+        ));
+        assert!(!durable.project().stream_targets()[1].running());
+
+        let stopped = execute(
+            &mut control,
+            &mut durable,
+            "stream-off",
+            "stream-off-key",
+            CommandPayload::StreamStop {
+                target: wire_target(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            stopped.submission.output.result,
+            CommandResult::Accepted { revision: 2, .. }
+        ));
+        assert!(!durable.project().stream_targets()[0].running());
+        assert_eq!(durable.position().frames_rendered, 2);
+
+        // The replayed start answers from its original receipt and changes
+        // nothing about the stored project.
+        let replayed = execute(
+            &mut control,
+            &mut durable,
+            "stream-replay",
+            "stream-on-key",
+            CommandPayload::StreamStart {
+                target: wire_target(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            replayed.submission.output.result,
+            CommandResult::Accepted { ref id, revision: 1, .. } if id == "stream-on"
+        ));
+        assert!(!durable.project().stream_targets()[0].running());
+
+        // The persisted project alone reproduces the live engine's desired
+        // stream state on restore.
+        let restored = restore_engine(&durable).unwrap().snapshot().unwrap();
+        assert_eq!(live_engine_snapshot(&mut control), restored);
+    }
+
+    #[cfg(feature = "native-media")]
+    #[test]
+    fn stream_pair_ledger_advances_only_on_successful_enqueue() {
+        let mut ledger = StreamPairLedger {
+            next_sequence: 7,
+            ..StreamPairLedger::default()
+        };
+        assert!(ledger.deliverable(SequenceNumber::new(7)));
+        // Gaps are allowed; the sink pads them.
+        assert!(ledger.deliverable(SequenceNumber::new(9)));
+        assert!(!ledger.deliverable(SequenceNumber::new(6)));
+
+        ledger.note_admitted(SequenceNumber::new(9));
+        assert_eq!(ledger.enqueued_pairs, 1);
+        assert_eq!(ledger.next_sequence, 10);
+        assert!(!ledger.deliverable(SequenceNumber::new(9)));
+
+        ledger.note_dropped();
+        assert_eq!(ledger.dropped_pairs, 1);
+        assert_eq!(ledger.next_sequence, 10);
+
+        let mut saturated = StreamPairLedger {
+            next_sequence: u64::MAX,
+            enqueued_pairs: u64::MAX,
+            dropped_pairs: u64::MAX,
+        };
+        saturated.note_admitted(SequenceNumber::new(u64::MAX));
+        saturated.note_dropped();
+        assert_eq!(saturated.next_sequence, u64::MAX);
+        assert_eq!(saturated.enqueued_pairs, u64::MAX);
+        assert_eq!(saturated.dropped_pairs, u64::MAX);
+    }
+
+    #[cfg(feature = "native-media")]
+    #[test]
+    fn sticky_stream_rejection_latches_only_sink_terminal_states() {
+        use fm_codec_ffmpeg::stream::{EnqueueRejection as Rejection, StreamFailure};
+
+        for sticky in [
+            Rejection::Failed(StreamFailure::Cancelled),
+            Rejection::Stopped,
+            Rejection::Stopping,
+            Rejection::FormatMismatch,
+            Rejection::Sequence {
+                minimum: SequenceNumber::new(1),
+                actual: SequenceNumber::new(0),
+            },
+            Rejection::SequenceExhausted,
+        ] {
+            assert!(
+                sticky_stream_rejection(&sticky),
+                "{sticky:?} must be sticky"
+            );
+        }
+        for transient in [Rejection::QueueFull, Rejection::RetainedByteLimit] {
+            assert!(
+                !sticky_stream_rejection(&transient),
+                "{transient:?} must be counted as backpressure"
+            );
+        }
+    }
+
+    #[cfg(feature = "native-media")]
+    #[test]
+    fn stream_feed_builds_valid_paired_frames_from_cloned_audio() {
+        // Mirrors NativeProgramStream::compile: format from project settings,
+        // pairs built with each frame's audio sequence and a cloned block.
+        let format = RecordFormat::new(
+            16,
+            16,
+            FrameRate::new(25, 1).unwrap(),
+            SampleRate::new(44_100).unwrap(),
+            ChannelLayout::stereo(),
+            SequenceNumber::new(0),
+        )
+        .unwrap();
+        let build_pair = |sequence: SequenceNumber| {
+            // The engine's absolute-boundary audio contract, restated here
+            // because the codec keeps its timing oracle private:
+            // sample bounds are floor(n * rate * den / num).
+            let hertz = u128::from(format.sample_rate().hertz());
+            let boundary = |frames: u64| -> u128 {
+                u128::from(frames) * hertz * u128::from(format.frame_rate().denominator())
+                    / u128::from(format.frame_rate().numerator())
+            };
+            let start_sample = boundary(sequence.get());
+            let end_sample = boundary(sequence.get().checked_add(1).expect("sequence fits"));
+            let start_nanos = start_sample * 1_000_000_000 / hertz;
+            let duration_nanos = (end_sample * 1_000_000_000 / hertz) - start_nanos;
+            let timing = MediaTiming::new(
+                OriginalTimestamp::new(
+                    MediaTimestamp::new(i64::try_from(start_sample).unwrap()),
+                    fm_frame::TimeBase::new(1, format.sample_rate().hertz()).unwrap(),
+                ),
+                NormalizedTimestamp::from_nanos(i64::try_from(start_nanos).unwrap()),
+                NormalizedDuration::from_nanos(u64::try_from(duration_nanos).unwrap()).unwrap(),
+                native_clock_domain(),
+                sequence,
+            )
+            .unwrap();
+            let samples = usize::try_from(end_sample - start_sample).unwrap();
+            AudioBlock::new(
+                timing,
+                format.sample_rate(),
+                format.channel_layout().clone(),
+                vec![vec![0.25; samples], vec![-0.25; samples]],
+            )
+            .unwrap()
+        };
+        for sequence in [SequenceNumber::new(0), SequenceNumber::new(41)] {
+            let audio = build_pair(sequence);
+            let cloned = audio.clone();
+            let pair = PairedFrame::new(
+                &format,
+                sequence,
+                vec![0; format.rgba_bytes_per_frame()],
+                cloned,
+            )
+            .expect("cloned project audio must pair");
+            assert_eq!(pair.sequence(), sequence);
+            assert_eq!(pair.format(), &format);
+        }
     }
 }

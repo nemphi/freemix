@@ -1045,6 +1045,17 @@ fn stream_key_never_appears_in_debug_display_or_errors() {
 }
 
 #[test]
+fn stream_destinations_author_desired_running_state_off_by_default() {
+    let stopped = stream_target(1, "Stopped", output_id(1));
+    assert!(!stopped.running());
+
+    let running = stopped.clone().set_running(true);
+    assert!(running.running());
+    // The setter is builder-style: the original is untouched.
+    assert!(!stopped.running());
+}
+
+#[test]
 fn stinger_slots_are_unique_and_reference_project_inputs() {
     let mut project = valid_project();
     let slot = StingerSlotNumber::new(1).unwrap();

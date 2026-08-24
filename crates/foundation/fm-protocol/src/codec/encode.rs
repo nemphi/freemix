@@ -14,7 +14,7 @@ use crate::{
 
 use super::value::{
     client_type, durable_events, field_issues, input_ids, input_statuses, output_statuses, role,
-    runtime_domains, string_list,
+    runtime_domains, stream_statuses, string_list,
 };
 use super::{
     CodecError, MAX_FIELD_VALUE_BYTES, MAX_LINE_BYTES, MAX_LIST_ITEMS, validate_request_id,
@@ -208,6 +208,9 @@ fn encode_command(record: &mut Record, message: &CommandMessage) -> Result<(), C
         | CommandPayload::TakeNextOverlay { .. }) => {
             encode_overlay_command(record, payload)?;
         }
+        payload @ (CommandPayload::StreamStart { .. } | CommandPayload::StreamStop { .. }) => {
+            encode_stream_command(record, payload)?;
+        }
         CommandPayload::Wipe { duration_frames } => {
             record.field("payload", "wipe")?;
             record.field("duration_frames", duration_frames)?;
@@ -382,6 +385,16 @@ fn encode_stinger_mutation(
     )
 }
 
+fn encode_stream_command(record: &mut Record, payload: &CommandPayload) -> Result<(), CodecError> {
+    let (name, target) = match payload {
+        CommandPayload::StreamStart { target } => ("stream_start", target),
+        CommandPayload::StreamStop { target } => ("stream_stop", target),
+        _ => unreachable!("only stream commands are delegated"),
+    };
+    record.field("payload", name)?;
+    record.field("target", *target)
+}
+
 fn encode_result(record: &mut Record, message: &CommandResult) -> Result<(), CodecError> {
     record.kind("command_result");
     match message {
@@ -448,6 +461,7 @@ fn encode_snapshot(record: &mut Record, message: &SnapshotMessage) -> Result<(),
         FadeToBlackStateFields::Realized,
     )?;
     encode_stingers(record, &message.stingers)?;
+    record.field_string("streams", stream_statuses(&message.streams)?)?;
     encode_overlays(record, "desired_overlays", &message.desired_overlays)?;
     encode_overlays(record, "realized_overlays", &message.realized_overlays)
 }
@@ -680,6 +694,10 @@ fn encode_event(record: &mut Record, message: &EventMessage) -> Result<(), Codec
             encode_stingers(record, stingers)?;
             encode_overlays(record, "overlays", overlays)?;
             encode_input_audio_strips(record, input_audio_strips)?;
+        }
+        EventPayload::StreamsChanged { streams } => {
+            record.field("event", "streams_changed")?;
+            record.field_string("streams", stream_statuses(streams)?)?;
         }
     }
     Ok(())

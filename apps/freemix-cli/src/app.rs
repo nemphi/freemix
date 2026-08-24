@@ -177,6 +177,20 @@ pub fn run(command: Command) -> AppResult<()> {
         Command::StreamRemove { path, stream } => {
             remove_stream_target(&path, stream_target_id(stream)?)?;
         }
+        Command::StreamStart { path, stream } => {
+            set_stream_running(
+                &path,
+                switcher_stream_target(stream_target_id(stream)?),
+                true,
+            )?;
+        }
+        Command::StreamStop { path, stream } => {
+            set_stream_running(
+                &path,
+                switcher_stream_target(stream_target_id(stream)?),
+                false,
+            )?;
+        }
         Command::Streams { path } => {
             let stored = inspect_stored_project(&path)?;
             print_stream_targets(stored.project());
@@ -1177,6 +1191,32 @@ pub fn run(command: Command) -> AppResult<()> {
             key,
             expected_revision,
         )?,
+        Command::RemoteStreamStart {
+            address,
+            stream,
+            key,
+            expected_revision,
+        } => remote::execute(
+            address,
+            fm_protocol::CommandPayload::StreamStart {
+                target: wire_stream_target(stream)?,
+            },
+            key,
+            expected_revision,
+        )?,
+        Command::RemoteStreamStop {
+            address,
+            stream,
+            key,
+            expected_revision,
+        } => remote::execute(
+            address,
+            fm_protocol::CommandPayload::StreamStop {
+                target: wire_stream_target(stream)?,
+            },
+            key,
+            expected_revision,
+        )?,
         Command::Render {
             path,
             output,
@@ -1263,7 +1303,13 @@ fn engine_from_project(project: Project) -> AppResult<ProjectEngine> {
             .iter()
             .map(|output| (output.id, output.name.clone()))
             .collect(),
-    )?;
+    )?
+    .with_streams(project.stream_targets().iter().map(|target| {
+        (
+            switcher_stream_target(target.id()),
+            target.name().to_owned(),
+        )
+    }))?;
     restore_input_audio_strips(&mut show, &project)?;
     let engine = Engine::new(show, project.settings().frame_rate, clock_domain());
     Ok(ProjectEngine { project, engine })
@@ -1460,6 +1506,7 @@ fn save_engine(path: &Path, project_engine: &ProjectEngine) -> AppResult<()> {
     project.reorder_inputs(snapshot.show().inputs())?;
     sync_input_names(&mut project, snapshot.show())?;
     sync_input_audio_strips(&mut project, snapshot.show())?;
+    sync_stream_running(&mut project, snapshot.show())?;
     let stored = StoredProject::from_project_with_complete_runtime_state(
         project,
         RuntimeRouting {
@@ -1504,6 +1551,28 @@ fn sync_input_names(project: &mut Project, show: &ShowState) -> AppResult<()> {
             .is_none_or(|candidate| candidate.name != *name)
         {
             project.rename_input(input, name.clone())?;
+        }
+    }
+    Ok(())
+}
+
+/// Copies the engine's desired stream running flags into the authored
+/// destinations so the checkpoint persists them like every other desired
+/// switcher field.
+fn sync_stream_running(project: &mut Project, show: &ShowState) -> AppResult<()> {
+    for target in project.stream_targets().to_vec() {
+        let running = show
+            .stream_running(switcher_stream_target(target.id()))
+            .ok_or_else(|| {
+                AppFailure(format!(
+                    "project is missing engine stream target {}",
+                    target.id()
+                ))
+            })?;
+        if running != target.running() {
+            project
+                .replace_stream_target(target.set_running(running))
+                .map_err(|error| AppFailure(error.to_string()))?;
         }
     }
     Ok(())
@@ -1840,6 +1909,44 @@ fn remove_stream_target(path: &Path, target: StreamTargetId) -> AppResult<()> {
         project.remove_stream_target(target)?;
         Ok(())
     })
+}
+
+/// Starts or stops one inventoried stream destination.
+///
+/// This is an instant switcher mutation: it restores the engine checkpoint,
+/// applies [`EngineCommand::StreamStart`] or [`EngineCommand::StreamStop`]
+/// through the same path as every other instant command, checkpoints, and only
+/// then persists. An unknown target is refused before any engine work so a
+/// mistyped id leaves the bundle byte-identical.
+fn set_stream_running(
+    path: &Path,
+    target: fm_switcher::StreamTargetId,
+    running: bool,
+) -> AppResult<()> {
+    let mut project_engine = load_engine(path)?;
+    if !project_engine
+        .engine
+        .show()
+        .streams()
+        .iter()
+        .any(|stream| stream.id() == target)
+    {
+        return Err(AppFailure(format!("unknown stream destination {target}")).into());
+    }
+    let command = if running {
+        EngineCommand::StreamStart { target }
+    } else {
+        EngineCommand::StreamStop { target }
+    };
+    let result = execute(&mut project_engine.engine, command, 1, None, None)?;
+    if let Some(rejection) = result.rejection {
+        return Err(rejection.into());
+    }
+    if !result.replayed {
+        save_engine(path, &project_engine)?;
+    }
+    print_status(&project_engine);
+    Ok(())
 }
 
 fn set_scene_input_audio_source(
@@ -2448,9 +2555,35 @@ fn restore_project_engine(stored: &StoredProject) -> AppResult<ProjectEngine> {
             .iter()
             .map(|output| (output.id, output.name.clone()))
             .collect(),
-    )?;
+    )?
+    .with_streams(project.stream_targets().iter().map(|target| {
+        (
+            switcher_stream_target(target.id()),
+            target.name().to_owned(),
+        )
+    }))?;
+    for target in project
+        .stream_targets()
+        .iter()
+        .filter(|target| target.running())
+    {
+        show.set_stream_running(switcher_stream_target(target.id()), true)?;
+    }
     restore_input_audio_strips(&mut show, &project)?;
-    let mut realized = SwitcherState::new(input_ids, realized_program, realized_preview)?;
+    let mut realized = SwitcherState::new(input_ids, realized_program, realized_preview)?
+        .with_streams(project.stream_targets().iter().map(|target| {
+            (
+                switcher_stream_target(target.id()),
+                target.name().to_owned(),
+            )
+        }))?;
+    for target in project
+        .stream_targets()
+        .iter()
+        .filter(|target| target.running())
+    {
+        realized.set_stream_running(switcher_stream_target(target.id()), true)?;
+    }
     for config in project.stingers() {
         restore_stinger(&mut show, &mut realized, *config)?;
     }
@@ -3087,7 +3220,7 @@ fn print_stream_targets(project: &Project) {
             StartupPolicy::ReconcileDesiredState => "reconcile-desired-state",
         };
         println!(
-            "stream id={} name={:?} protocol={} url={:?} backup_url={:?} output={} output_name={:?} startup={startup}",
+            "stream id={} name={:?} protocol={} url={:?} backup_url={:?} output={} output_name={:?} startup={startup} running={}",
             target.id(),
             target.name(),
             target.protocol(),
@@ -3097,6 +3230,7 @@ fn print_stream_targets(project: &Project) {
                 .unwrap_or_else(|| "none".to_owned()),
             target.output(),
             output.name,
+            target.running(),
         );
     }
 }
@@ -3301,6 +3435,8 @@ Usage:
   freemix-cli stream-add <show.freemix> <nonzero-stream-id> <existing-output-id> <rtmp(s)://host/app> <stream-key> <name> [--backup <rtmp(s)://host/app>] [--startup <stopped|reconcile-desired-state>]
   freemix-cli stream-update <show.freemix> <existing-stream-id> <existing-output-id> <rtmp(s)://host/app> <stream-key> <name> [--backup <rtmp(s)://host/app>] [--startup <stopped|reconcile-desired-state>]
   freemix-cli stream-remove <show.freemix> <existing-stream-id>
+  freemix-cli stream-start <show.freemix> <existing-stream-id>
+  freemix-cli stream-stop <show.freemix> <existing-stream-id>
       The stream key is a positional argument and is therefore visible in this
       machine's process list. It is stored in plaintext in project.json, like
       every other authored field, so protect the bundle accordingly. It is
@@ -3397,6 +3533,8 @@ Usage:
   freemix-cli remote-tbar-commit <127.0.0.1:port> [--key <key>] [--expect <revision>]
   freemix-cli remote-tbar-cancel <127.0.0.1:port> [--key <key>] [--expect <revision>]
   freemix-cli remote-ftb <127.0.0.1:port> <live|black> <frames> [--key <key>] [--expect <revision>]
+  freemix-cli remote-stream-start <127.0.0.1:port> <existing-stream-id> [--key <key>] [--expect <revision>]
+  freemix-cli remote-stream-stop <127.0.0.1:port> <existing-stream-id> [--key <key>] [--expect <revision>]
   freemix-cli render <show.freemix> <output.ppm> [--width <px>] [--height <px>]
   freemix-cli demo <show.freemix> [output.ppm]"
     );
@@ -3608,6 +3746,16 @@ fn stream_target_id(value: u128) -> AppResult<StreamTargetId> {
     NonZeroU128::new(value)
         .map(StreamTargetId::new)
         .ok_or_else(|| AppFailure("stream destination ID must be nonzero".into()).into())
+}
+
+fn switcher_stream_target(target: StreamTargetId) -> fm_switcher::StreamTargetId {
+    fm_switcher::StreamTargetId::from_non_zero(target.get())
+}
+
+fn wire_stream_target(value: u128) -> AppResult<fm_protocol::WireStreamTargetId> {
+    Ok(fm_protocol::WireStreamTargetId::new(
+        stream_target_id(value)?.get(),
+    ))
 }
 
 fn required_routing(value: Option<InputId>, field: &'static str) -> AppResult<InputId> {

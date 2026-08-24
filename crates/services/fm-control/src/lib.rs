@@ -41,13 +41,14 @@ use fm_protocol::{
     OverlayTransitionKind as ProtocolOverlayTransition, RuntimeEventMessage, RuntimeLifecycleEvent,
     ServerIdentity, SnapshotMessage, StingerAudioPolicy as ProtocolStingerAudioPolicy,
     StingerMissingMediaFallback as ProtocolStingerFallback, StingerReadiness, StingerStatus,
-    WireInputId, WireMessage, WireOutputId, WireOverlayChannelId, WireStingerSlotId,
+    StreamRealizedState, StreamStatus, WireInputId, WireMessage, WireOutputId,
+    WireOverlayChannelId, WireStingerSlotId, WireStreamTargetId,
 };
 use fm_switcher::{
     MissingMediaFallback, OverlayBorderPreset as SwitcherOverlayBorder, OverlayChannelId,
     OverlayChannelState, OverlayPositionPreset as SwitcherOverlayPosition,
     OverlayTransitionKind as SwitcherOverlayTransition, StingerAudioPolicy, StingerDescriptor,
-    StingerPreloadState, StingerSlotId,
+    StingerPreloadState, StingerSlotId, StreamTargetId,
 };
 
 /// Target-free authorization called before an engine command is constructed or validated.
@@ -1109,7 +1110,9 @@ const fn command_class(payload: &CommandPayload) -> CommandClass {
         | CommandPayload::StartManualTransition { .. }
         | CommandPayload::SetManualTransitionPosition { .. }
         | CommandPayload::CommitManualTransition
-        | CommandPayload::CancelManualTransition => CommandClass::Transition,
+        | CommandPayload::CancelManualTransition
+        | CommandPayload::StreamStart { .. }
+        | CommandPayload::StreamStop { .. } => CommandClass::Transition,
     }
 }
 
@@ -1191,7 +1194,17 @@ fn engine_command(payload: &CommandPayload) -> EngineCommand {
         }
         CommandPayload::CommitManualTransition => EngineCommand::CommitManualTransition,
         CommandPayload::CancelManualTransition => EngineCommand::CancelManualTransition,
+        CommandPayload::StreamStart { target } => EngineCommand::StreamStart {
+            target: domain_stream_target(*target),
+        },
+        CommandPayload::StreamStop { target } => EngineCommand::StreamStop {
+            target: domain_stream_target(*target),
+        },
     }
+}
+
+fn domain_stream_target(target: WireStreamTargetId) -> StreamTargetId {
+    StreamTargetId::from_non_zero(target.get())
 }
 
 fn stinger_engine_command(payload: &CommandPayload) -> EngineCommand {
@@ -1365,7 +1378,15 @@ fn engine_submission(
 ) -> CommandSubmission {
     let result = command_result(&outcome.receipt);
     let events = if !outcome.replayed && outcome.receipt.accepted().is_some() {
-        let payload = if let Some((input, name)) = outcome.events.iter().find_map(|event| {
+        let streams_changed = outcome
+            .events
+            .iter()
+            .any(|event| matches!(&event.payload, EngineEvent::StreamsChanged { .. }));
+        let payload = if streams_changed {
+            EventPayload::StreamsChanged {
+                streams: protocol_streams(engine),
+            }
+        } else if let Some((input, name)) = outcome.events.iter().find_map(|event| {
             let EngineEvent::InputRenamed { input, name } = &event.payload else {
                 return None;
             };
@@ -1496,6 +1517,7 @@ fn snapshot_record(engine: &Engine, identity: &EngineIdentity) -> SnapshotRecord
         desired_fade_to_black: protocol_fade_to_black_state(engine.desired_fade_to_black()),
         realized_fade_to_black: protocol_fade_to_black_state(engine.realized_fade_to_black()),
         stingers: protocol_stingers(engine),
+        streams: protocol_streams(engine),
         desired_overlays: protocol_overlays(engine.show().desired_switcher().overlays()),
         realized_overlays: protocol_overlays(engine.realized_switcher().overlays()),
     };
@@ -1637,6 +1659,23 @@ fn protocol_desired_stingers(engine: &Engine) -> Vec<StingerStatus> {
                 descriptor,
                 desired.preload_state(),
             ))
+        })
+        .collect()
+}
+
+fn protocol_streams(engine: &Engine) -> Vec<StreamStatus> {
+    let desired = engine.show().desired_switcher();
+    desired
+        .streams()
+        .iter()
+        .map(|stream| StreamStatus {
+            target: WireStreamTargetId::new(stream.id().get()),
+            name: stream.name().to_owned(),
+            desired_running: desired
+                .stream_running(stream.id())
+                .expect("inventoried stream has a desired flag"),
+            realized: StreamRealizedState::Stopped,
+            detail: None,
         })
         .collect()
 }

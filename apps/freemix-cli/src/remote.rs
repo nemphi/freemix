@@ -10,8 +10,8 @@ use fm_client::{Client, ClientConfig, Intake, Outbound};
 use fm_protocol::{
     CURRENT_PROTOCOL_VERSION, ClientType, CommandPayload, CommandResult, DiagnosticsRequest,
     DiagnosticsResponse, EventPayload, FadeToBlackState, HandshakeOutcome, HandshakeRequest,
-    MAX_LINE_BYTES, Role, RuntimeLifecycleEvent, ServerIdentity, WireMessage, decode_line,
-    encode_line,
+    MAX_LINE_BYTES, Role, RuntimeLifecycleEvent, ServerIdentity, StreamRealizedState, WireMessage,
+    decode_line, encode_line,
 };
 use fm_types::ProjectId;
 use fm_ui_model::ManualTransitionStatus;
@@ -325,7 +325,8 @@ impl Remote {
                             completion == CommandCompletion::Project
                         }
                         EventPayload::DesiredSwitcher { .. }
-                        | EventPayload::StingerSlotsChanged { .. } => {
+                        | EventPayload::StingerSlotsChanged { .. }
+                        | EventPayload::StreamsChanged { .. } => {
                             completion != CommandCompletion::Project
                         }
                     };
@@ -373,7 +374,7 @@ impl Remote {
             .ok_or_else(|| RemoteFailure("remote project cursor is unavailable".into()))?;
         let switcher = state.switcher();
         println!(
-            "project_id={} show={:?} revision={} frame=unavailable Program(desired={}, realized={}) Preview(desired={}, realized={}) TBar(desired={}, realized={}) FTB(desired={}, realized={}) AudioStrips={} Overlays(desired={}, realized={}) Inputs={} Outputs={}",
+            "project_id={} show={:?} revision={} frame=unavailable Program(desired={}, realized={}) Preview(desired={}, realized={}) TBar(desired={}, realized={}) FTB(desired={}, realized={}) AudioStrips={} Streams={} Overlays(desired={}, realized={}) Inputs={} Outputs={}",
             self.project_id,
             state.show_name(),
             cursor.revision,
@@ -386,6 +387,7 @@ impl Remote {
             format_fade_to_black(switcher.desired_fade_to_black),
             format_fade_to_black(switcher.realized_fade_to_black),
             format_input_audio_strips(state),
+            format_streams(state.streams()),
             format_overlays(state.desired_overlays()),
             format_overlays(state.realized_overlays()),
             format_input_roster(state),
@@ -501,6 +503,38 @@ fn format_output_roster(state: &fm_ui_model::ProjectState) -> String {
             .collect::<Vec<_>>()
             .join(",")
     )
+}
+
+/// Renders the latest stream projection the client retained from the snapshot
+/// and `StreamsChanged` events.
+fn format_streams(streams: &[fm_ui_model::StreamStatus]) -> String {
+    format!(
+        "[{}]",
+        streams
+            .iter()
+            .map(|stream| format!(
+                "{}:{:?}:desired={}:realized={}:detail={}",
+                stream.target,
+                stream.name,
+                stream.desired_running,
+                stream_realized_name(stream.realized),
+                stream.detail.as_deref().unwrap_or("none"),
+            ))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+const fn stream_realized_name(state: fm_protocol::StreamRealizedState) -> &'static str {
+    match state {
+        StreamRealizedState::Stopped => "stopped",
+        StreamRealizedState::Starting => "starting",
+        StreamRealizedState::Live => "live",
+        StreamRealizedState::WaitingToReconnect => "waiting-to-reconnect",
+        StreamRealizedState::Congested => "congested",
+        StreamRealizedState::Failed => "failed",
+        StreamRealizedState::Unavailable => "unavailable",
+    }
 }
 
 fn format_fade_to_black(state: FadeToBlackState) -> String {

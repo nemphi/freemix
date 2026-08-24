@@ -15,6 +15,10 @@ pub const MAX_LIST_ITEMS: usize = 256;
 pub const MAX_BATCH_EVENTS: usize = 256;
 pub const MAX_MESSAGES_PER_PUSH: usize = 1024;
 pub const MAX_REQUEST_ID_BYTES: usize = 128;
+/// Largest `StreamStatus` name in bytes.
+pub const MAX_STREAM_NAME_BYTES: usize = 128;
+/// Largest redacted `StreamStatus` detail string in bytes.
+pub const MAX_STREAM_DETAIL_BYTES: usize = 64;
 
 fn validate_request_id(value: &str) -> Result<(), CodecError> {
     if value.is_empty()

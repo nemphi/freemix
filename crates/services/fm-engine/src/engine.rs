@@ -10,8 +10,8 @@ use fm_scheduler::{FrameNumber, FrameScheduler, PlanGeneration};
 use fm_switcher::{
     FadeToBlackFrame, FadeToBlackPosition, OVERLAY_CHANNEL_COUNT, OverlayBorderPreset,
     OverlayChannelId, OverlayChannelState, OverlayPositionPreset, OverlayTransitionKind,
-    ProgramFrame, StingerDescriptor, StingerSlotId, SwitcherCommand, SwitcherError, SwitcherEvent,
-    SwitcherState, TBarPosition, TransitionKind,
+    ProgramFrame, StingerDescriptor, StingerSlotId, StreamTargetId, SwitcherCommand, SwitcherError,
+    SwitcherEvent, SwitcherState, TBarPosition, TransitionKind,
 };
 use fm_types::{FrameRate, InputId, InputOrderError, OutputId, RenameInputError};
 
@@ -160,6 +160,12 @@ pub enum EngineCommand {
     },
     CommitManualTransition,
     CancelManualTransition,
+    StreamStart {
+        target: StreamTargetId,
+    },
+    StreamStop {
+        target: StreamTargetId,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -172,6 +178,16 @@ pub enum EngineEvent {
     DesiredSwitcherChanged(EngineCommand),
     InputRenamed { input: InputId, name: String },
     InputOrderChanged { inputs: Vec<InputId> },
+    StreamsChanged { streams: Vec<EngineStreamStatus> },
+}
+
+/// Engine-level desired status of one stream target; realization is owned by
+/// the media plane and always reads as `Stopped` at this layer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EngineStreamStatus {
+    pub target: StreamTargetId,
+    pub name: String,
+    pub desired_running: bool,
 }
 
 pub type EngineCommandOutcome = ApplyOutcome<EngineAcceptance, EngineEvent>;
@@ -582,6 +598,10 @@ impl Engine {
                     && !matches!(&command, EngineCommand::FadeToBlack { .. })
                     && !matches!(&command, EngineCommand::RenameInput { .. })
                     && !matches!(&command, EngineCommand::ReorderInputs { .. })
+                    && !matches!(
+                        &command,
+                        EngineCommand::StreamStart { .. } | EngineCommand::StreamStop { .. }
+                    )
                     && !is_overlay_command(&command)
                 {
                     let name = match kind {
@@ -636,7 +656,9 @@ impl Engine {
                 | EngineCommand::StartManualTransition { .. }
                 | EngineCommand::SetManualTransitionPosition { .. }
                 | EngineCommand::CommitManualTransition
-                | EngineCommand::CancelManualTransition => None,
+                | EngineCommand::CancelManualTransition
+                | EngineCommand::StreamStart { .. }
+                | EngineCommand::StreamStop { .. } => None,
                 EngineCommand::Wipe { .. } => Some(TransitionKind::Wipe),
             } {
                 self.transition_in_flight = Some(kind);
@@ -842,6 +864,9 @@ fn validate_idle_restore(
             != realized_switcher.fade_to_black_position()
         || show.desired_switcher().stingers() != realized_switcher.stingers()
         || show.desired_switcher().overlays() != realized_switcher.overlays()
+        || show.desired_switcher().streams() != realized_switcher.streams()
+        || show.desired_switcher().running_stream_targets()
+            != realized_switcher.running_stream_targets()
     {
         return Err(SnapshotError::MismatchedSwitcherRouting);
     }
@@ -998,6 +1023,12 @@ impl Mutation<ShowState, EngineEvent, EngineAcceptance> for EngineMutation {
         }
         if matches!(
             &self.command,
+            EngineCommand::StreamStart { .. } | EngineCommand::StreamStop { .. }
+        ) {
+            return apply_stream_mutation(state, events, self);
+        }
+        if matches!(
+            &self.command,
             EngineCommand::TakeOverlay { .. }
                 | EngineCommand::UpdateOverlay { .. }
                 | EngineCommand::OverlayOff { .. }
@@ -1110,6 +1141,9 @@ impl Mutation<ShowState, EngineEvent, EngineAcceptance> for EngineMutation {
             }
             EngineCommand::CommitManualTransition => SwitcherCommand::CommitTBar,
             EngineCommand::CancelManualTransition => SwitcherCommand::CancelTBar,
+            EngineCommand::StreamStart { .. } | EngineCommand::StreamStop { .. } => {
+                unreachable!("stream mutations return before switcher command mapping")
+            }
         };
         state
             .desired_switcher_mut()
@@ -1120,6 +1154,44 @@ impl Mutation<ShowState, EngineEvent, EngineAcceptance> for EngineMutation {
             target_frame: self.target_frame,
         })
     }
+}
+
+fn apply_stream_mutation(
+    state: &mut ShowState,
+    events: &mut Vec<EngineEvent>,
+    mutation: EngineMutation,
+) -> Result<EngineAcceptance, Rejection> {
+    let EngineMutation {
+        command,
+        target_frame,
+    } = mutation;
+    let running = matches!(command, EngineCommand::StreamStart { .. });
+    let target = match &command {
+        EngineCommand::StreamStart { target } | EngineCommand::StreamStop { target } => *target,
+        _ => unreachable!("only stream mutations are delegated"),
+    };
+    state
+        .desired_switcher_mut()
+        .set_stream_running(target, running)
+        .map_err(switcher_rejection)?;
+    events.push(EngineEvent::StreamsChanged {
+        streams: desired_stream_statuses(state),
+    });
+    Ok(EngineAcceptance { target_frame })
+}
+
+fn desired_stream_statuses(state: &ShowState) -> Vec<EngineStreamStatus> {
+    state
+        .streams()
+        .iter()
+        .map(|stream| EngineStreamStatus {
+            target: stream.id(),
+            name: stream.name().to_owned(),
+            desired_running: state
+                .stream_running(stream.id())
+                .expect("inventoried stream has a desired flag"),
+        })
+        .collect()
 }
 
 fn apply_fade_to_black_mutation(
@@ -1263,6 +1335,9 @@ fn apply_runtime(
     ) {
         return Ok(Vec::new());
     }
+    if let Some(result) = apply_runtime_stream(switcher, &command) {
+        return result;
+    }
     if let EngineCommand::ReorderInputs { inputs } = command {
         switcher
             .reorder_inputs(inputs)
@@ -1350,7 +1425,21 @@ fn apply_runtime(
         }
         EngineCommand::CommitManualTransition => SwitcherCommand::CommitTBar,
         EngineCommand::CancelManualTransition => SwitcherCommand::CancelTBar,
+        EngineCommand::StreamStart { .. } | EngineCommand::StreamStop { .. } => {
+            unreachable!("stream commands return before switcher command mapping")
+        }
     })
+}
+
+fn apply_runtime_stream(
+    switcher: &mut SwitcherState,
+    command: &EngineCommand,
+) -> Option<Result<Vec<SwitcherEvent>, SwitcherError>> {
+    match command {
+        EngineCommand::StreamStart { target } => Some(switcher.set_stream_running(*target, true)),
+        EngineCommand::StreamStop { target } => Some(switcher.set_stream_running(*target, false)),
+        _ => None,
+    }
 }
 
 fn apply_runtime_overlay(
@@ -1538,9 +1627,9 @@ fn engine_manual_state(state: fm_switcher::TBarState) -> EngineManualTransitionS
 
 fn switcher_rejection(error: SwitcherError) -> Rejection {
     let code = match error {
-        SwitcherError::UnknownInput(_) | SwitcherError::UnconfiguredStinger(_) => {
-            RejectionCode::NotFound
-        }
+        SwitcherError::UnknownInput(_)
+        | SwitcherError::UnconfiguredStinger(_)
+        | SwitcherError::UnknownStreamTarget(_) => RejectionCode::NotFound,
         SwitcherError::TransitionInProgress => RejectionCode::Conflict,
         SwitcherError::UnsupportedManualTransitionKind
         | SwitcherError::InvalidManualTransitionRoute
@@ -1548,7 +1637,10 @@ fn switcher_rejection(error: SwitcherError) -> Rejection {
         | SwitcherError::InvalidOverlayTransitionDuration { .. }
         | SwitcherError::OverlayQueueFull { .. }
         | SwitcherError::OverlayQueueEmpty(_)
-        | SwitcherError::StingerCutPointOutOfRange { .. } => RejectionCode::InvalidCommand,
+        | SwitcherError::StingerCutPointOutOfRange { .. }
+        | SwitcherError::DuplicateStreamTarget(_)
+        | SwitcherError::InvalidStreamName
+        | SwitcherError::TooManyStreams { .. } => RejectionCode::InvalidCommand,
     };
     Rejection::new(code, error.to_string())
 }

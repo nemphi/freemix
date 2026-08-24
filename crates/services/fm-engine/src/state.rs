@@ -1,7 +1,10 @@
 use core::fmt;
 use std::collections::{BTreeMap, HashSet};
 
-use fm_switcher::{StingerDescriptor, StingerSlotId, SwitcherEvent, SwitcherState, TBarState};
+use fm_switcher::{
+    DesiredStream, StingerDescriptor, StingerSlotId, StreamTargetId, SwitcherEvent, SwitcherState,
+    TBarState,
+};
 use fm_types::{
     InputId, InputOrderError, MAX_INPUT_NAME_BYTES, OutputId, RenameInputError, validate_input_name,
 };
@@ -119,6 +122,25 @@ impl ShowState {
         Ok(self)
     }
 
+    /// Replaces the bounded desired stream inventory carried by the switcher.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ShowError::Switcher`] error when more than
+    /// [`fm_switcher::MAX_STREAM_COUNT`] targets are supplied, an identifier
+    /// repeats, or a name is blank or exceeds
+    /// [`fm_switcher::MAX_STREAM_NAME_BYTES`] bytes.
+    pub fn with_streams(
+        mut self,
+        streams: impl IntoIterator<Item = (StreamTargetId, String)>,
+    ) -> Result<Self, ShowError> {
+        self.desired_switcher = self
+            .desired_switcher
+            .with_streams(streams)
+            .map_err(ShowError::Switcher)?;
+        Ok(self)
+    }
+
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
@@ -146,6 +168,33 @@ impl ShowState {
     #[must_use]
     pub fn outputs(&self) -> &[(OutputId, String)] {
         &self.outputs
+    }
+
+    #[must_use]
+    pub fn streams(&self) -> &[DesiredStream] {
+        self.desired_switcher.streams()
+    }
+
+    /// Returns the desired running flag for one inventoried stream target.
+    #[must_use]
+    pub fn stream_running(&self, target: StreamTargetId) -> Option<bool> {
+        self.desired_switcher.stream_running(target)
+    }
+
+    /// Sets the desired running flag for one inventoried stream target.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShowError::Switcher`] with
+    /// [`SwitcherError::UnknownStreamTarget`] when the target is unknown.
+    pub fn set_stream_running(
+        &mut self,
+        target: StreamTargetId,
+        running: bool,
+    ) -> Result<Vec<SwitcherEvent>, ShowError> {
+        self.desired_switcher
+            .set_stream_running(target, running)
+            .map_err(ShowError::Switcher)
     }
 
     /// Renames one durable input while preserving the exact supplied text.

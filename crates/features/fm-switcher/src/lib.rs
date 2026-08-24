@@ -5,6 +5,7 @@ mod fade_to_black;
 mod overlay;
 mod state;
 mod stinger;
+mod stream;
 mod transition;
 
 pub use command::{SwitcherCommand, SwitcherError, SwitcherEvent};
@@ -23,4 +24,5 @@ pub use stinger::{
     MissingMediaFallback, STINGER_SLOT_COUNT, StingerAudioPolicy, StingerDescriptor,
     StingerPlaybackDecision, StingerPreloadState, StingerSlotId, StingerSlotState,
 };
+pub use stream::{DesiredStream, MAX_STREAM_COUNT, MAX_STREAM_NAME_BYTES, StreamTargetId};
 pub use transition::{TBarPosition, TBarState, TransitionKind, TransitionState};

@@ -195,7 +195,9 @@ impl Session {
             | CommandPayload::StartManualTransition { .. }
             | CommandPayload::SetManualTransitionPosition { .. }
             | CommandPayload::CommitManualTransition
-            | CommandPayload::CancelManualTransition => CommandClass::Transition,
+            | CommandPayload::CancelManualTransition
+            | CommandPayload::StreamStart { .. }
+            | CommandPayload::StreamStop { .. } => CommandClass::Transition,
         };
         self.policy.authorize(&self.principal, class)?;
 

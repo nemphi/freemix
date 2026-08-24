@@ -600,10 +600,12 @@ fn parse_stream_target(value: Value) -> Result<StreamTarget, DecodeError> {
         value => return Err(unknown_enum("startup", value)),
     };
     let output = OutputId::new(object.nonzero_u128("output")?);
+    let running = object.boolean("running")?;
     object.finish()?;
     StreamTarget::new(id, name, protocol, endpoint, key, output)
         .and_then(|target| target.with_backup_endpoint(backup_endpoint))
         .map(|target| target.with_startup(startup))
+        .map(|target| target.set_running(running))
         .map_err(|error| syntax(format!("stream target is invalid: {error}")))
 }
 

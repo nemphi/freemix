@@ -182,6 +182,7 @@ fn rich_stream_target(high: u128) -> StreamTarget {
     ))
     .unwrap()
     .with_startup(StartupPolicy::ReconcileDesiredState)
+    .set_running(true)
 }
 
 fn rich_project() -> Project {
@@ -280,9 +281,16 @@ fn rich_project() -> Project {
 }
 
 fn stored_rich_project() -> StoredProject {
+    stored_rich_project_with_running_target(true)
+}
+
+fn stored_rich_project_with_running_target(running: bool) -> StoredProject {
     let high = u128::from(u64::MAX) + 101;
+    let mut project = rich_project();
+    let target = project.stream_targets()[0].clone().set_running(running);
+    project.replace_stream_target(target).unwrap();
     StoredProject::from_project(
-        rich_project(),
+        project,
         RuntimeRouting {
             desired_program_id: Some(input_id(high)),
             realized_program_id: Some(input_id(high + 1)),
@@ -435,6 +443,7 @@ fn stream_destination_round_trips_at_the_current_schema_and_keeps_its_key_off_ev
     );
     assert_eq!(target.key().expose_secret(), RICH_STREAM_KEY);
     assert_eq!(target.startup(), StartupPolicy::ReconcileDesiredState);
+    assert!(target.running());
     assert_eq!(
         target.expose_url(),
         format!("rtmps://ingest.example.test:443/live/{RICH_STREAM_KEY}")
@@ -464,6 +473,49 @@ fn stream_destination_round_trips_at_the_current_schema_and_keeps_its_key_off_ev
 }
 
 #[test]
+fn stream_target_running_state_round_trips_and_is_required_at_the_current_schema() {
+    let temp = TestDirectory::new("stream-target-running");
+    let store = temp.store("show");
+
+    // Both authored desired states survive a full save/load cycle unchanged.
+    for running in [true, false] {
+        let expected = stored_rich_project_with_running_target(running);
+        store.save(&expected).unwrap();
+        let encoded = fs::read_to_string(store.manifest_path()).unwrap();
+        assert!(encoded.contains(&format!("\"running\": {running}")));
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded, expected);
+        assert_eq!(loaded.project().stream_targets()[0].running(), running);
+    }
+
+    // The field is part of the current contract: it must be present with a
+    // boolean value and the manifest must carry the current schema version.
+    store.save(&stored_rich_project()).unwrap();
+    let valid = fs::read_to_string(store.manifest_path()).unwrap();
+    assert!(valid.contains("\"schema_version\": 19"));
+    for malformed in [
+        valid.replacen(",\n        \"running\": true", "", 1),
+        valid.replacen("\"running\": true", "\"running\": \"true\"", 1),
+        valid.replacen("\"running\": true", "\"running\": 1", 1),
+    ] {
+        fs::write(store.manifest_path(), malformed).unwrap();
+        assert!(matches!(
+            store.load(),
+            Err(StoreError::MalformedManifest { .. })
+        ));
+    }
+
+    // An older manifest is refused outright; no migration path exists.
+    fs::write(
+        store.manifest_path(),
+        valid.replacen("\"schema_version\": 19", "\"schema_version\": 18", 1),
+    )
+    .unwrap();
+    let error = store.load().unwrap_err();
+    assert!(matches!(error, StoreError::Validation(_)), "got {error:?}");
+}
+
+#[test]
 fn strict_stream_destination_parser_rejects_missing_wrong_typed_and_out_of_contract_fields() {
     let temp = TestDirectory::new("strict-stream-destination");
     let store = temp.store("show");
@@ -474,6 +526,8 @@ fn strict_stream_destination_parser_rejects_missing_wrong_typed_and_out_of_contr
         // Missing, wrong-typed, unknown and duplicated fields.
         valid.replacen("\"protocol\": \"rtmps\",\n        ", "", 1),
         valid.replacen("\"protocol\": \"rtmps\"", "\"protocol\": 443", 1),
+        valid.replacen(",\n        \"running\": true", "", 1),
+        valid.replacen("\"running\": true", "\"running\": \"true\"", 1),
         valid.replacen(
             "\"backup_endpoint\":",
             "\"future_field\": 1,\n        \"backup_endpoint\":",

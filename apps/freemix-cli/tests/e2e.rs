@@ -141,6 +141,13 @@ impl FakeRemoteServer {
         Self { address, worker }
     }
 
+    fn start_stream_start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || serve_stream_start(&listener));
+        Self { address, worker }
+    }
+
     fn start_manual_position() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -477,6 +484,134 @@ fn serve_alpha_fade(listener: &TcpListener) {
         fm_protocol::CURRENT_PROTOCOL_VERSION,
         &CommandPayload::AlphaFade { duration_frames: 3 },
         "remote-alpha-fade",
+    );
+}
+
+/// Serves one Operator `StreamStart` command session followed by one Viewer
+/// session whose snapshot carries the durable streams roster.
+fn serve_stream_start(listener: &TcpListener) {
+    let engine = EngineIdentity {
+        engine_id: "project-42".into(),
+        state_epoch: 1,
+        log_id: "fake-remote-log".into(),
+    };
+    let target = fm_protocol::WireStreamTargetId::new(NonZeroU128::new(40).unwrap());
+    let (stream, _) = listener.accept().unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(stream);
+    assert_handshake_request(read_message(&mut reader));
+    write_handshake_role(&mut writer, &engine, 0, Role::Operator);
+
+    let WireMessage::Command(command) = read_message(&mut reader) else {
+        panic!("expected remote stream command");
+    };
+    assert_command(
+        &command,
+        &CommandPayload::StreamStart { target },
+        "remote-stream-start",
+        0,
+    );
+    write_message(
+        &mut writer,
+        &WireMessage::CommandResult(CommandResult::Accepted {
+            id: command.id,
+            revision: 1,
+            scheduled_frame: None,
+        }),
+    );
+    write_message(
+        &mut writer,
+        &WireMessage::Event(EventMessage {
+            cursor: EventCursor {
+                engine: engine.clone(),
+                revision: 1,
+            },
+            payload: EventPayload::StreamsChanged {
+                streams: vec![fm_protocol::StreamStatus {
+                    target,
+                    name: "Main ingest".into(),
+                    desired_running: true,
+                    realized: fm_protocol::StreamRealizedState::Starting,
+                    detail: Some("connecting to ingest".into()),
+                }],
+            },
+        }),
+    );
+    write_message(
+        &mut writer,
+        &WireMessage::RuntimeEvent(RuntimeEventMessage {
+            server: server_identity(&engine),
+            revision: 1,
+            generation: 1,
+            sequence: 1,
+            event: RuntimeLifecycleEvent::Realized {
+                domain: "switcher".into(),
+                manual_transition: fm_protocol::ManualTransitionStatus::Inactive,
+                fade_to_black: live_fade_to_black(),
+            },
+        }),
+    );
+    serve_streams_snapshot_peer(listener, &engine, target);
+}
+
+/// Serves a Viewer session whose initial snapshot reports the durable stream.
+fn serve_streams_snapshot_peer(
+    listener: &TcpListener,
+    engine: &EngineIdentity,
+    target: fm_protocol::WireStreamTargetId,
+) {
+    let (stream, _) = listener.accept().unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(stream);
+    assert_handshake_request_viewer(read_message(&mut reader));
+    write_message(
+        &mut writer,
+        &WireMessage::HandshakeResponse(HandshakeResponse {
+            protocol: CURRENT_PROTOCOL_VERSION,
+            granted_role: Role::Viewer,
+            permissions: handshake_permissions(Role::Viewer),
+            capabilities: CapabilityReportSummary {
+                digest: "fake-capabilities".into(),
+                total: 0,
+                available: 0,
+                degraded: 0,
+                unavailable: 0,
+            },
+            server: server_identity(engine),
+            current_revision: 1,
+            outcome: HandshakeOutcome::Snapshot {
+                reason: SnapshotReason::NoCursor,
+            },
+        }),
+    );
+    write_message(
+        &mut writer,
+        &WireMessage::Snapshot(SnapshotMessage {
+            engine: engine.clone(),
+            revision: 1,
+            show_name: "Remote Contract".into(),
+            inputs: input_statuses(),
+            outputs: output_statuses(),
+            input_audio_strips: input_audio_strips(),
+            desired_program: input(1),
+            desired_preview: input(2),
+            realized_program: input(1),
+            realized_preview: input(2),
+            desired_manual_transition: fm_protocol::ManualTransitionStatus::Inactive,
+            realized_manual_transition: fm_protocol::ManualTransitionStatus::Inactive,
+            desired_fade_to_black: live_fade_to_black(),
+            realized_fade_to_black: live_fade_to_black(),
+            stingers: Vec::new(),
+            streams: vec![fm_protocol::StreamStatus {
+                target,
+                name: "Main ingest".into(),
+                desired_running: true,
+                realized: fm_protocol::StreamRealizedState::Live,
+                detail: None,
+            }],
+            desired_overlays: OverlayStatus::empty_channels(),
+            realized_overlays: OverlayStatus::empty_channels(),
+        }),
     );
 }
 
@@ -1014,6 +1149,7 @@ fn write_handshake_version_with_manual(
             desired_fade_to_black: live_fade_to_black(),
             realized_fade_to_black: live_fade_to_black(),
             stingers: Vec::new(),
+            streams: Vec::new(),
             desired_overlays: OverlayStatus::empty_channels(),
             realized_overlays: OverlayStatus::empty_channels(),
         }),
@@ -1087,6 +1223,7 @@ fn write_handshake_version_with_fade_to_black(
             desired_overlays: OverlayStatus::empty_channels(),
             realized_overlays: OverlayStatus::empty_channels(),
             stingers: Vec::new(),
+            streams: Vec::new(),
         }),
     );
 }
@@ -2434,7 +2571,7 @@ fn local_stream_destinations_are_authored_offline_and_never_print_the_stream_key
             "stream id=40 name=\"Main ingest\" protocol=rtmps ",
             "url=\"rtmps://ingest.example.test:443/live/****\" ",
             "backup_url=\"rtmps://backup.example.test/live/****\" ",
-            "output=30 output_name=\"Primary\" startup=reconcile-desired-state"
+            "output=30 output_name=\"Primary\" startup=reconcile-desired-state running=false"
         )
     );
 
@@ -2510,6 +2647,95 @@ fn local_stream_destinations_are_authored_offline_and_never_print_the_stream_key
         "30",
     ]));
     fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
+fn local_stream_start_stop_round_trip_persists_desired_running() {
+    let context = ContractContext::new();
+    author_stream_destination(&context);
+    let store = ProjectStore::new(&context.project).unwrap();
+    assert_eq!(
+        json_number(&manifest(&context.project), "schema_version"),
+        19
+    );
+
+    let started = invoke_bounded(&["stream-start", context.project_path(), "40"]);
+    assert_success(&started);
+    let started_manifest = manifest(&context.project);
+    assert_eq!(json_number(&started_manifest, "schema_version"), 19);
+    assert!(started_manifest.contains("\"running\": true"));
+    let loaded = store.load().unwrap();
+    let target = &loaded.project().stream_targets()[0];
+    assert_eq!(target.id().to_string(), "40");
+    assert!(target.running());
+    let streams_after_start = invoke_bounded(&["streams", context.project_path()]);
+    assert_success(&streams_after_start);
+    assert!(stdout(&streams_after_start).ends_with("running=true"));
+
+    let stopped = invoke_bounded(&["stream-stop", context.project_path(), "40"]);
+    assert_success(&stopped);
+    let stopped_manifest = manifest(&context.project);
+    assert_eq!(json_number(&stopped_manifest, "schema_version"), 19);
+    assert!(stopped_manifest.contains("\"running\": false"));
+    assert!(!stopped_manifest.contains("\"running\": true"));
+    assert!(!store.load().unwrap().project().stream_targets()[0].running());
+    let streams_after_stop = invoke_bounded(&["streams", context.project_path()]);
+    assert_success(&streams_after_stop);
+    assert!(stdout(&streams_after_stop).ends_with("running=false"));
+
+    // A mistyped or zero id must fail cleanly and leave the bundle untouched.
+    for (arguments, expected) in [
+        (
+            vec!["stream-stop", context.project_path(), "99"],
+            "unknown stream destination 99",
+        ),
+        (
+            vec!["stream-start", context.project_path(), "0"],
+            "stream destination ID must be nonzero",
+        ),
+    ] {
+        let manifest_before_failure = fs::read(context.project.join("project.json")).unwrap();
+        let journal_before = journal_bytes(&store);
+        let failure = invoke_bounded(&arguments);
+        assert_failure_contains(&failure, expected);
+        assert_eq!(
+            fs::read(context.project.join("project.json")).unwrap(),
+            manifest_before_failure
+        );
+        assert_eq!(journal_bytes(&store), journal_before);
+    }
+
+    fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
+fn remote_stream_start_is_accepted_and_replicates_the_streams_roster() {
+    let server = FakeRemoteServer::start_stream_start();
+    let address = server.address();
+    let output = invoke_bounded(&[
+        "remote-stream-start",
+        &address,
+        "40",
+        "--key",
+        "remote-stream-start",
+        "--expect",
+        "0",
+    ]);
+    assert_success(&output);
+    let status = stdout(&output);
+    assert_remote_status(&status, 1, 1, 1, 2, 2);
+    assert!(status.contains(
+        r#"Streams=[40:"Main ingest":desired=true:realized=starting:detail=connecting to ingest]"#
+    ));
+
+    // A second client reconnecting to the daemon observes the durable roster.
+    let observed = invoke_bounded(&["remote-status", &address]);
+    assert_success(&observed);
+    assert!(
+        stdout(&observed)
+            .contains(r#"Streams=[40:"Main ingest":desired=true:realized=live:detail=none]"#)
+    );
+    server.finish();
 }
 
 #[test]

@@ -21,6 +21,7 @@ use fm_model::{
     AudioBus, Input, InputAudioStripState, InputGainMilliDb, InputKind, Layer, LayerGeometry,
     MainMix, Output, Project, ProjectSettings, RectMask, RestartPolicy, Rgba8, Rotation, Scene,
     SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef, StartupPolicy,
+    StreamEndpoint, StreamKey, StreamProtocol, StreamTarget, StreamTargetId,
 };
 use fm_persistence::{
     ManualTransitionKind as PersistedManualTransitionKind, ProjectPosition, ProjectStore,
@@ -32,8 +33,8 @@ use fm_protocol::{
     HandshakeOutcome, HandshakeRequest, HeartbeatMessage, ManualTransitionKind,
     ManualTransitionPosition, ManualTransitionStatus, ProtocolVersion, ResumeCursor, Role,
     RuntimeLifecycleEvent, ServerIdentity, SnapshotReason, StingerAudioPolicy,
-    StingerMissingMediaFallback, WireInputId, WireMessage, WireStingerSlotId, decode_line,
-    encode_line,
+    StingerMissingMediaFallback, WireInputId, WireMessage, WireStingerSlotId, WireStreamTargetId,
+    decode_line, encode_line,
 };
 use fm_types::{
     AudioFormat, BusId, ChannelLayout, ColorMetadata, FrameRate, InputId, OutputId, PixelFormat,
@@ -1504,6 +1505,132 @@ fn remote_input_rename_is_authorized_replicated_replay_safe_and_survives_restart
     );
 }
 
+/// `StreamStart` is an authorized transition-class command: its acceptance
+/// publishes a durable event, an unknown target is rejected without state
+/// change, and the desired running flag survives a kill plus journal recovery.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn stream_start_is_replicated_rejects_unknown_targets_and_survives_restart() {
+    let directory = TestDirectory::new("stream-reconcile");
+    let project_path = directory.project_path();
+    create_stream_project(&project_path);
+
+    let daemon = Daemon::start_without_once(&project_path);
+    let mut client = daemon.connect();
+    client.handshake(None);
+    let WireMessage::Snapshot(snapshot) = client.receive() else {
+        panic!("expected initial snapshot");
+    };
+    assert_eq!(snapshot.streams.len(), 2);
+    assert!(
+        snapshot
+            .streams
+            .iter()
+            .all(|stream| !stream.desired_running)
+    );
+    assert!(
+        snapshot
+            .streams
+            .iter()
+            .all(|stream| matches!(stream.realized, fm_protocol::StreamRealizedState::Stopped),)
+    );
+
+    client.send(&command(
+        "stream-start",
+        "stream-start-key",
+        CommandPayload::StreamStart {
+            target: stream_target(1),
+        },
+    ));
+    assert!(matches!(
+        client.next_result(),
+        CommandResult::Accepted { revision: 1, .. }
+    ));
+    let WireMessage::Event(event) = client.receive() else {
+        panic!("expected durable stream event after acceptance");
+    };
+    assert_eq!(event.cursor.revision, 1);
+    let EventPayload::StreamsChanged { streams } = &event.payload else {
+        panic!(
+            "expected streams_changed durable event: {:?}",
+            event.payload
+        );
+    };
+    assert!(
+        streams
+            .iter()
+            .find(|s| s.target == stream_target(1))
+            .unwrap()
+            .desired_running
+    );
+    assert!(
+        !streams
+            .iter()
+            .find(|s| s.target == stream_target(2))
+            .unwrap()
+            .desired_running
+    );
+
+    client.send(&command(
+        "stream-unknown",
+        "stream-unknown-key",
+        CommandPayload::StreamStart {
+            target: stream_target(9),
+        },
+    ));
+    assert!(matches!(
+        client.next_result(),
+        CommandResult::Rejected { ref code, current_revision: 1, .. } if code == "not_found"
+    ));
+
+    // The daemon is killed with the acknowledgement in hand and no checkpoint:
+    // revision 1 exists only as a journal batch.
+    drop(client);
+    daemon.stop();
+    assert_eq!(
+        ProjectStore::new(&project_path)
+            .unwrap()
+            .load()
+            .unwrap()
+            .position()
+            .revision,
+        0
+    );
+
+    let daemon = Daemon::start(&project_path);
+    let mut restarted = daemon.connect();
+    let handshake = restarted.handshake(None);
+    assert_eq!(handshake.current_revision, 1);
+    let WireMessage::Snapshot(snapshot) = restarted.receive() else {
+        panic!("expected snapshot after restart");
+    };
+    assert!(
+        snapshot
+            .streams
+            .iter()
+            .find(|stream| stream.target == stream_target(1))
+            .expect("restarted snapshot keeps the stream inventory")
+            .desired_running
+    );
+    assert!(
+        !snapshot
+            .streams
+            .iter()
+            .find(|stream| stream.target == stream_target(2))
+            .expect("restarted snapshot keeps the stream inventory")
+            .desired_running
+    );
+    drop(restarted);
+    daemon.wait_success();
+
+    let persisted = ProjectStore::new(&project_path).unwrap().load().unwrap();
+    assert_eq!(persisted.position().revision, 1);
+    let targets = persisted.project().stream_targets();
+    assert_eq!(targets.len(), 2);
+    assert!(targets[0].running());
+    assert!(!targets[1].running());
+}
+
 #[test]
 fn commands_survive_restart_resume_and_duplicate_replay() {
     let directory = TestDirectory::new("restart");
@@ -2788,6 +2915,106 @@ fn create_rename_project(path: &Path) {
     ProjectStore::new(path).unwrap().save(&stored).unwrap();
 }
 
+fn create_stream_project(path: &Path) {
+    const STREAM_ID_BASE: u128 = U64_MAX_ID + 500;
+    let frame_rate = FrameRate::new(25, 1).unwrap();
+    let mut project = Project::new(
+        project_id(),
+        "Stream Reconcile",
+        ProjectSettings {
+            frame_rate,
+            video: VideoFormat {
+                dimensions: VideoDimensions::new(16, 16).unwrap(),
+                frame_rate,
+                pixel_format: PixelFormat::Rgba8,
+                scan: ScanMode::Progressive,
+                color: ColorMetadata::default(),
+            },
+            audio: AudioFormat {
+                sample_rate: SampleRate::new(44_100).unwrap(),
+                sample_format: SampleFormat::I24,
+                channels: ChannelLayout::stereo(),
+            },
+        },
+    );
+    for number in 1..=2 {
+        project.add_input(Input {
+            id: domain_input(number),
+            name: format!("Input {number}"),
+            kind: InputKind::Simulated(SimulatedInput::new(
+                SimulatedVideo::Bars,
+                SimulatedAudio::Silence,
+            )),
+            required_capabilities: Vec::new(),
+        });
+    }
+    project.set_main_mix(MainMix::new(domain_input(1), domain_input(2)));
+    let scene = scene_id(1);
+    project.add_scene(Scene {
+        id: scene,
+        name: "Program scene".into(),
+        background: Rgba8::OPAQUE_BLACK,
+        layers: vec![Layer {
+            name: "Source".into(),
+            source: SourceRef::Input(domain_input(1)),
+            enabled: true,
+            geometry: LayerGeometry::new(0, 0, 16, 16, Rotation::Deg0),
+            crop: None,
+            mask: None,
+            opacity: u8::MAX,
+            z_order: 0,
+        }],
+    });
+    let bus = bus_id(1);
+    project.add_audio_bus(AudioBus {
+        id: bus,
+        name: "Program bus".into(),
+        sends: Vec::new(),
+    });
+    project.add_output(Output {
+        id: output_id(1),
+        name: "Program output".into(),
+        video_source: scene,
+        audio_source: bus,
+        startup: StartupPolicy::ReconcileDesiredState,
+        required_capabilities: vec!["simulation.output".into()],
+    });
+    for (index, offset) in [1_u128, 2].into_iter().enumerate() {
+        let target = StreamTarget::new(
+            StreamTargetId::new(NonZeroU128::new(STREAM_ID_BASE + offset).unwrap()),
+            format!("Destination {}", index + 1),
+            StreamProtocol::Rtmp,
+            StreamEndpoint::parse("127.0.0.1/live").unwrap(),
+            StreamKey::parse("live-key-0001").unwrap(),
+            output_id(1),
+        )
+        .unwrap()
+        .with_startup(StartupPolicy::ReconcileDesiredState)
+        .set_running(false);
+        project.add_stream_target_checked(target).unwrap();
+    }
+    let stored = StoredProject::from_project(
+        project,
+        RuntimeRouting {
+            desired_program_id: Some(domain_input(1)),
+            realized_program_id: Some(domain_input(1)),
+            desired_preview_id: Some(domain_input(2)),
+            realized_preview_id: Some(domain_input(2)),
+        },
+        ProjectPosition {
+            revision: 0,
+            state_epoch: 1,
+            event_sequence: 0,
+            frames_rendered: 0,
+            runtime_generation: 0,
+            clock_time_nanos: 0,
+        },
+        Vec::new(),
+    )
+    .unwrap();
+    ProjectStore::new(path).unwrap().save(&stored).unwrap();
+}
+
 fn canonical_project() -> Project {
     let frame_rate = FrameRate::new(25, 1).unwrap();
     let mut project = Project::new(
@@ -2906,4 +3133,8 @@ fn bus_id(value: u128) -> BusId {
 
 fn output_id(value: u128) -> OutputId {
     OutputId::new(NonZeroU128::new(INPUT_ID_BASE + 300 + value).unwrap())
+}
+
+fn stream_target(offset: u128) -> WireStreamTargetId {
+    WireStreamTargetId::new(NonZeroU128::new(U64_MAX_ID + 500 + offset).unwrap())
 }

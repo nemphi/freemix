@@ -1,5 +1,8 @@
+use std::collections::BTreeSet;
+
 use fm_types::{InputId, InputOrderError, OutputId, validate_input_order};
 
+use crate::stream::{DesiredStream, StreamTargetId, collect_desired_streams};
 use crate::{
     FadeToBlackAdvance, FadeToBlackController, FadeToBlackError, FadeToBlackFrame,
     FadeToBlackPosition, FadeToBlackRequest, FadeToBlackTarget,
@@ -34,6 +37,8 @@ pub struct SwitcherState {
     fade_to_black: FadeToBlackController,
     overlays: [OverlayChannelState; OVERLAY_CHANNEL_COUNT],
     stingers: [StingerSlotState; STINGER_SLOT_COUNT],
+    streams: Vec<DesiredStream>,
+    streams_running: BTreeSet<StreamTargetId>,
 }
 
 impl SwitcherState {
@@ -56,10 +61,29 @@ impl SwitcherState {
             fade_to_black: FadeToBlackController::default(),
             overlays: std::array::from_fn(|_| OverlayChannelState::empty()),
             stingers: std::array::from_fn(|_| StingerSlotState::empty()),
+            streams: Vec::new(),
+            streams_running: BTreeSet::new(),
         };
         state.require_input(program)?;
         state.require_input(preview)?;
         Ok(state)
+    }
+
+    /// Replaces the bounded desired stream inventory with validated entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SwitcherError`] when more than [`crate::MAX_STREAM_COUNT`]
+    /// targets are supplied, an identifier repeats, or a name is blank or
+    /// exceeds [`crate::MAX_STREAM_NAME_BYTES`] bytes. The inventory remains
+    /// unchanged on error.
+    pub fn with_streams(
+        mut self,
+        streams: impl IntoIterator<Item = (StreamTargetId, String)>,
+    ) -> Result<Self, SwitcherError> {
+        let desired = collect_desired_streams(streams)?;
+        self.streams = desired;
+        Ok(self)
     }
 
     #[must_use]
@@ -165,6 +189,49 @@ impl SwitcherState {
         &self.stingers[slot.index()]
     }
 
+    #[must_use]
+    pub fn streams(&self) -> &[DesiredStream] {
+        &self.streams
+    }
+
+    #[must_use]
+    pub fn stream_running(&self, target: StreamTargetId) -> Option<bool> {
+        self.streams
+            .iter()
+            .any(|stream| stream.id() == target)
+            .then(|| self.streams_running.contains(&target))
+    }
+
+    #[must_use]
+    pub fn running_stream_targets(&self) -> &BTreeSet<StreamTargetId> {
+        &self.streams_running
+    }
+
+    /// Sets the desired running flag for one inventoried stream target.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SwitcherError::UnknownStreamTarget`] when the target is not
+    /// part of this mix. Setting the current value again is accepted.
+    pub fn set_stream_running(
+        &mut self,
+        target: StreamTargetId,
+        running: bool,
+    ) -> Result<Vec<SwitcherEvent>, SwitcherError> {
+        if !self.streams.iter().any(|stream| stream.id() == target) {
+            return Err(SwitcherError::UnknownStreamTarget(target));
+        }
+        if running {
+            self.streams_running.insert(target);
+        } else {
+            self.streams_running.remove(&target);
+        }
+        Ok(vec![SwitcherEvent::StreamRunningChanged {
+            target,
+            running,
+        }])
+    }
+
     /// Applies one operator command atomically to desired switcher state.
     ///
     /// # Errors
@@ -227,6 +294,9 @@ impl SwitcherState {
                 output,
                 included,
             } => Ok(self.set_overlay_output_inclusion(channel, output, included)),
+            SwitcherCommand::SetStreamRunning { target, running } => {
+                self.set_stream_running(target, running)
+            }
         }
     }
 

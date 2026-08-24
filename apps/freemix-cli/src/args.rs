@@ -195,6 +195,14 @@ pub enum Command {
         path: PathBuf,
         stream: u128,
     },
+    StreamStart {
+        path: PathBuf,
+        stream: u128,
+    },
+    StreamStop {
+        path: PathBuf,
+        stream: u128,
+    },
     Streams {
         path: PathBuf,
     },
@@ -723,6 +731,18 @@ pub enum Command {
         key: Option<String>,
         expected_revision: Option<u64>,
     },
+    RemoteStreamStart {
+        address: SocketAddr,
+        stream: u128,
+        key: Option<String>,
+        expected_revision: Option<u64>,
+    },
+    RemoteStreamStop {
+        address: SocketAddr,
+        stream: u128,
+        key: Option<String>,
+        expected_revision: Option<u64>,
+    },
     Render {
         path: PathBuf,
         output: PathBuf,
@@ -817,6 +837,8 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
             parse_stream(arguments, |path, spec| Command::StreamUpdate { path, spec })
         }
         "stream-remove" => parse_stream_remove(arguments),
+        "stream-start" => parse_stream_running(arguments, true),
+        "stream-stop" => parse_stream_running(arguments, false),
         "scene-input-add" => parse_scene_input_add(arguments),
         "scene-input-duplicate" => parse_scene_input_duplicate(arguments),
         "scene-input-audio-source" => parse_scene_input_audio_source(arguments),
@@ -950,6 +972,8 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
         | "remote-tbar-commit"
         | "remote-tbar-cancel" => parse_remote_t_bar(&command, arguments),
         "remote-ftb" => parse_remote_fade_to_black(arguments),
+        "remote-stream-start" => parse_remote_stream_running(arguments, true),
+        "remote-stream-stop" => parse_remote_stream_running(arguments, false),
         "render" => {
             let path = required_path(&mut arguments, "project path")?;
             let output = required_path(&mut arguments, "output path")?;
@@ -1052,6 +1076,44 @@ fn parse_stream_remove(mut arguments: impl Iterator<Item = String>) -> Result<Co
     let stream = number(&required(&mut arguments, "stream")?, "stream")?;
     reject_extra(&mut arguments)?;
     Ok(Command::StreamRemove { path, stream })
+}
+
+fn parse_stream_running(
+    mut arguments: impl Iterator<Item = String>,
+    running: bool,
+) -> Result<Command, ArgsError> {
+    let path = required_path(&mut arguments, "project path")?;
+    let stream = number(&required(&mut arguments, "stream")?, "stream")?;
+    reject_extra(&mut arguments)?;
+    Ok(if running {
+        Command::StreamStart { path, stream }
+    } else {
+        Command::StreamStop { path, stream }
+    })
+}
+
+fn parse_remote_stream_running(
+    mut arguments: impl Iterator<Item = String>,
+    running: bool,
+) -> Result<Command, ArgsError> {
+    let address = socket_address(&required(&mut arguments, "address")?)?;
+    let stream = number(&required(&mut arguments, "stream")?, "stream")?;
+    let (key, expected_revision) = command_options(arguments)?;
+    Ok(if running {
+        Command::RemoteStreamStart {
+            address,
+            stream,
+            key,
+            expected_revision,
+        }
+    } else {
+        Command::RemoteStreamStop {
+            address,
+            stream,
+            key,
+            expected_revision,
+        }
+    })
 }
 
 fn startup_policy(value: &str) -> Result<StartupPolicy, ArgsError> {

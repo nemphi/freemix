@@ -12,13 +12,13 @@ use crate::{
     ResumeCursor, RuntimeEventMessage, RuntimeFailureDisposition, RuntimeLifecycleEvent,
     ServerIdentity, SnapshotMessage, SnapshotReason, StingerAudioPolicy,
     StingerMissingMediaFallback, StingerReadiness, StingerStatus, StructuredError, WireInputId,
-    WireMessage, WireOutputId, WireOverlayChannelId, WireStingerSlotId,
+    WireMessage, WireOutputId, WireOverlayChannelId, WireStingerSlotId, WireStreamTargetId,
 };
 
 use super::value::{
     parse_client_type, parse_durable_events, parse_field_issues, parse_input_ids,
     parse_input_statuses, parse_output_statuses, parse_role, parse_runtime_domains,
-    parse_string_list, parse_version, unescape,
+    parse_stream_statuses, parse_string_list, parse_version, unescape,
 };
 use super::{
     MAX_FIELD_NAME_BYTES, MAX_FIELD_VALUE_BYTES, MAX_FIELDS_PER_MESSAGE, MAX_LINE_BYTES,
@@ -312,6 +312,7 @@ fn decode_command_payload(
         overlay @ ("overlay_take" | "overlay_update" | "overlay_off" | "overlay_output"
         | "overlay_transition" | "overlay_appearance" | "overlay_queue"
         | "overlay_next") => decode_overlay_command(fields, overlay)?,
+        stream @ ("stream_start" | "stream_stop") => decode_stream_command(fields, stream)?,
         "wipe" => CommandPayload::Wipe {
             duration_frames: fields.parse_required("duration_frames")?,
         },
@@ -468,6 +469,19 @@ fn decode_output(fields: &mut Fields, field: &'static str) -> Result<WireOutputI
     Ok(WireOutputId::new(id))
 }
 
+fn decode_stream_target(fields: &mut Fields) -> Result<WireStreamTargetId, CodecError> {
+    let value = fields.required("target")?;
+    let id = NonZeroU128::new(value.parse().map_err(|_| CodecError::InvalidField {
+        field: "target",
+        value: value.clone(),
+    })?)
+    .ok_or(CodecError::InvalidField {
+        field: "target",
+        value,
+    })?;
+    Ok(WireStreamTargetId::new(id))
+}
+
 fn decode_configure_stinger(fields: &mut Fields) -> Result<CommandPayload, CodecError> {
     let audio_policy = fields.required("audio_policy")?;
     let missing_media_fallback = fields.required("missing_media_fallback")?;
@@ -506,6 +520,15 @@ fn decode_stinger_slot(fields: &mut Fields) -> Result<WireStingerSlotId, CodecEr
     WireStingerSlotId::new(number).ok_or(CodecError::InvalidField {
         field: "slot",
         value: number.to_string(),
+    })
+}
+
+fn decode_stream_command(fields: &mut Fields, name: &str) -> Result<CommandPayload, CodecError> {
+    let target = decode_stream_target(fields)?;
+    Ok(match name {
+        "stream_start" => CommandPayload::StreamStart { target },
+        "stream_stop" => CommandPayload::StreamStop { target },
+        _ => unreachable!("only stream command names are delegated"),
     })
 }
 
@@ -553,6 +576,7 @@ fn decode_snapshot(fields: &mut Fields) -> Result<SnapshotMessage, CodecError> {
             FadeToBlackStateFields::Realized,
         )?,
         stingers: decode_stingers(fields)?,
+        streams: parse_stream_statuses(&fields.required("streams")?)?,
         desired_overlays: decode_overlays(fields, "desired_overlays")?,
         realized_overlays: decode_overlays(fields, "realized_overlays")?,
     })
@@ -882,6 +906,9 @@ fn decode_event(fields: &mut Fields) -> Result<EventMessage, CodecError> {
             stingers: decode_stingers(fields)?,
             overlays: decode_overlays(fields, "overlays")?,
             input_audio_strips: decode_input_audio_strips(fields)?,
+        },
+        "streams_changed" => EventPayload::StreamsChanged {
+            streams: parse_stream_statuses(&fields.required("streams")?)?,
         },
         _ => {
             return Err(CodecError::InvalidField {

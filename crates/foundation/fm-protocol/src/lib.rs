@@ -21,7 +21,8 @@ pub use dto::{
     OverlayPositionPreset, OverlayStatus, OverlayTransitionKind, ResumeCursor, Role,
     RuntimeDomainBoundary, RuntimeEventMessage, RuntimeFailureDisposition, RuntimeLifecycleEvent,
     ServerHello, ServerIdentity, SnapshotMessage, SnapshotReason, StingerAudioPolicy,
-    StingerMissingMediaFallback, StingerReadiness, StingerStatus, StructuredError, WireInputId,
-    WireMessage, WireOutputId, WireOverlayChannelId, WireStingerSlotId, choose_handshake_outcome,
+    StingerMissingMediaFallback, StingerReadiness, StingerStatus, StreamRealizedState,
+    StreamStatus, StructuredError, WireInputId, WireMessage, WireOutputId, WireOverlayChannelId,
+    WireStingerSlotId, WireStreamTargetId, choose_handshake_outcome,
 };
 pub use version::{CURRENT_PROTOCOL_VERSION, ProtocolVersion};

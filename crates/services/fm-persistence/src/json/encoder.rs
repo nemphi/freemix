@@ -356,9 +356,10 @@ fn write_stream_targets(output: &mut String, project: &fm_model::Project) {
         escape_string(output, target.key().expose_secret());
         write!(
             output,
-            "\",\n        \"startup\": \"{}\",\n        \"output\": {}\n      }}",
+            "\",\n        \"startup\": \"{}\",\n        \"output\": {},\n        \"running\": {}\n      }}",
             startup_policy(target.startup()),
             target.output(),
+            target.running(),
         )
         .expect("writing to a string cannot fail");
     }

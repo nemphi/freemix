@@ -2068,6 +2068,7 @@ mod tests {
                 position: FadeToBlackPosition::LIVE,
             },
             stingers: Vec::new(),
+            streams: Vec::new(),
             desired_overlays: OverlayStatus::empty_channels(),
             realized_overlays: OverlayStatus::empty_channels(),
         }

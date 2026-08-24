@@ -366,6 +366,7 @@ pub struct StreamTarget {
     backup_endpoint: Option<StreamEndpoint>,
     key: StreamKey,
     startup: StartupPolicy,
+    running: bool,
     output: OutputId,
 }
 
@@ -405,6 +406,7 @@ impl StreamTarget {
             backup_endpoint: None,
             key,
             startup: StartupPolicy::Stopped,
+            running: false,
             output,
         })
     }
@@ -432,6 +434,13 @@ impl StreamTarget {
     #[must_use]
     pub fn with_startup(mut self, startup: StartupPolicy) -> Self {
         self.startup = startup;
+        self
+    }
+
+    /// Builder-style setter for the desired running state.
+    #[must_use]
+    pub fn set_running(mut self, running: bool) -> Self {
+        self.running = running;
         self
     }
 
@@ -470,6 +479,13 @@ impl StreamTarget {
     #[must_use]
     pub const fn startup(&self) -> StartupPolicy {
         self.startup
+    }
+
+    /// Whether the destination should be running once the engine reconciles
+    /// desired state. This is authored intent, not a live stream status.
+    #[must_use]
+    pub const fn running(&self) -> bool {
+        self.running
     }
 
     /// The output this destination takes video and audio from.
