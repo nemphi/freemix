@@ -60,13 +60,17 @@ use fm_persistence::{
     RuntimeOverlays, RuntimeRouting, StoredProject,
 };
 #[cfg(feature = "native-media")]
-use fm_protocol::{AUDIO_METER_LEVEL_SCALE, AudioMeterChannel, InputAudioMeters, WireInputId};
+use fm_protocol::{
+    AUDIO_METER_LEVEL_SCALE, AudioMeterChannel, InputAudioMeters, MAX_STREAM_SAMPLES,
+    StreamRealizedState, StreamStatusSample, WireInputId, WireStreamTargetId,
+};
 use fm_protocol::{
     AudioMetersMessage, CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, CommandMessage,
     CommandPayload, CommandResult, DiagnosticsRequest, DiagnosticsResponse, ErrorMessage,
     EventCursor, HandshakeOutcome as ProtocolHandshakeOutcome, HandshakeRequest, HandshakeResponse,
     HeartbeatMessage, ProtocolVersion, ResumeCursor, RuntimeEventMessage, ServerHello,
-    ServerIdentity, StructuredError, WireMessage, choose_handshake_outcome, encode_line,
+    ServerIdentity, StreamStatusMessage, StructuredError, WireMessage, choose_handshake_outcome,
+    encode_line,
 };
 #[cfg(test)]
 use fm_protocol::{CodecError, EventMessage, HeartbeatAcknowledgementMessage, LineDecoder};
@@ -333,6 +337,8 @@ struct NativeDaemon {
     telemetry_emitted: bool,
     audio_meter_sequence: u64,
     pending_audio_meters: Option<AudioMetersMessage>,
+    stream_status_sequence: u64,
+    pending_stream_status: Option<StreamStatusMessage>,
     #[cfg(target_os = "macos")]
     cameras: NativeCameraInputs,
     #[cfg(target_os = "macos")]
@@ -1774,6 +1780,9 @@ struct NativeProgramStream {
     streamer: Option<Streamer>,
     ledger: StreamPairLedger,
     first_failure: Option<String>,
+    /// Set when the sink refused a pair with capacity backpressure since the
+    /// last status sample; consumed (and cleared) by the sampler.
+    enqueue_backpressure: bool,
 }
 
 #[cfg(feature = "native-media")]
@@ -1830,6 +1839,7 @@ impl NativeProgramStream {
                     ..StreamPairLedger::default()
                 },
                 first_failure: None,
+                enqueue_backpressure: false,
             });
         }
         Ok(streams)
@@ -1931,6 +1941,16 @@ impl NativeProgramStream {
                 self.ledger.note_dropped();
                 if sticky_stream_rejection(&reason) {
                     self.fail(&format!("enqueue:{reason:?}"));
+                } else {
+                    // Only capacity refusals remain: QueueFull and
+                    // RetainedByteLimit are enqueue backpressure, so the next
+                    // status sample reports this target as Congested.
+                    debug_assert!(matches!(
+                        reason,
+                        StreamEnqueueRejection::QueueFull
+                            | StreamEnqueueRejection::RetainedByteLimit
+                    ));
+                    self.enqueue_backpressure = true;
                 }
             }
         }
@@ -1995,6 +2015,145 @@ impl NativeProgramStream {
                     .unwrap_or("none"),
             ),
         );
+    }
+}
+
+/// Plain sampling inputs for one configured stream target, extracted so the
+/// status mapping stays testable without a GPU runtime or an `FFmpeg` child.
+#[cfg(feature = "native-media")]
+struct StreamRuntimeSnapshot<'a> {
+    target: SwitcherStreamTargetId,
+    ledger: StreamPairLedger,
+    /// Capacity backpressure observed since the previous sample.
+    congested: bool,
+    first_failure: Option<&'a str>,
+    telemetry: Option<fm_codec_ffmpeg::stream::StreamTelemetry>,
+}
+
+/// Assembles the per-pass status record: `None` when no target is active or
+/// latched, otherwise the message with its monotonic sequence advanced by one
+/// from the previous publish (the first publish is sequence 1).
+#[cfg(feature = "native-media")]
+fn stream_status_message(
+    server: &ServerIdentity,
+    previous_sequence: u64,
+    samples: Vec<StreamStatusSample>,
+) -> AppResult<Option<StreamStatusMessage>> {
+    if samples.is_empty() {
+        return Ok(None);
+    }
+    let sequence = previous_sequence
+        .checked_add(1)
+        .ok_or_else(|| AppFailure("stream status sequence exhausted".into()))?;
+    Ok(Some(StreamStatusMessage {
+        server: server.clone(),
+        sequence,
+        samples,
+    }))
+}
+
+#[cfg(feature = "native-media")]
+fn native_stream_snapshots(streams: &mut [NativeProgramStream]) -> Vec<StreamRuntimeSnapshot<'_>> {
+    streams
+        .iter_mut()
+        .map(|stream| StreamRuntimeSnapshot {
+            congested: std::mem::take(&mut stream.enqueue_backpressure),
+            target: stream.target,
+            ledger: stream.ledger,
+            first_failure: stream.first_failure.as_deref(),
+            telemetry: stream.streamer.as_ref().map(Streamer::telemetry),
+        })
+        .collect()
+}
+
+/// Builds one lossy status sample per active or latched stream runtime.
+///
+/// Targets that never started (and never latched a failure) are omitted, so
+/// an all-inactive set yields no samples and the daemon publishes nothing.
+/// Output is bounded to [`MAX_STREAM_SAMPLES`] and sorted into the strictly
+/// ascending target order the wire contract requires.
+#[cfg(feature = "native-media")]
+fn stream_status_samples<'a>(
+    runtimes: impl IntoIterator<Item = StreamRuntimeSnapshot<'a>>,
+) -> Vec<StreamStatusSample> {
+    let mut samples: Vec<_> = runtimes
+        .into_iter()
+        .filter_map(stream_status_sample)
+        .collect();
+    samples.sort_by_key(|sample| sample.target.get());
+    samples.truncate(MAX_STREAM_SAMPLES);
+    samples
+}
+
+/// Maps one target's runtime onto its protocol sample.
+///
+/// Counters come from the per-target feed ledger; `connected`, muxed bytes,
+/// and the sink failure come from the live [`Streamer::telemetry`]. The first
+/// latched failure is sticky and always wins over whatever the sink last
+/// reported, mirroring `emit_final_record`.
+#[cfg(feature = "native-media")]
+fn stream_status_sample(runtime: StreamRuntimeSnapshot<'_>) -> Option<StreamStatusSample> {
+    let StreamRuntimeSnapshot {
+        target,
+        ledger,
+        congested,
+        first_failure,
+        telemetry,
+    } = runtime;
+    if first_failure.is_none() && telemetry.is_none() {
+        // Configured but never started: an inactive target stays off the wire.
+        return None;
+    }
+    let telemetry = telemetry.as_ref();
+    let failure = first_failure.map(str::to_owned).or_else(|| {
+        telemetry
+            .and_then(|telemetry| telemetry.failure.as_ref())
+            .map(|failure| format!("{failure:?}"))
+    });
+    Some(StreamStatusSample {
+        target: WireStreamTargetId::new(target.get()),
+        realized: realized_stream_state(failure.is_some(), congested, telemetry),
+        connected: telemetry.is_some_and(|telemetry| telemetry.connected),
+        muxed_bytes: telemetry.map_or(0, |telemetry| telemetry.muxed_bytes),
+        enqueued_pairs: ledger.enqueued_pairs,
+        dropped_pairs: ledger.dropped_pairs,
+        failure,
+    })
+}
+
+/// Maps sink telemetry onto [`StreamRealizedState`].
+///
+/// Mapping choices, deliberately:
+///
+/// - A latched failure or any sink failure wins outright: `Failed`.
+/// - `Starting` covers both the sink's own starting state and a streaming
+///   child whose destination has not accepted it yet (`connected == false`
+///   until the child's first progress report).
+/// - `Streaming` with an open destination is `Live`, or `Congested` when the
+///   feed observed enqueue backpressure this interval.
+/// - The sink has no reconnect concept — reconnection lives in `fm-io-network`,
+///   which this daemon does not use directly — so `WaitingToReconnect` is
+///   unreachable by construction and is never emitted, exactly like
+///   `Unavailable`. A stopping or already-stopped sink reports `Stopped`; the
+///   cleanly stopped targets then leave the active set entirely.
+#[cfg(feature = "native-media")]
+fn realized_stream_state(
+    failed: bool,
+    congested: bool,
+    telemetry: Option<&fm_codec_ffmpeg::stream::StreamTelemetry>,
+) -> StreamRealizedState {
+    if failed {
+        return StreamRealizedState::Failed;
+    }
+    match telemetry.map(|telemetry| telemetry.state) {
+        None | Some(StreamState::Stopping | StreamState::Stopped) => StreamRealizedState::Stopped,
+        Some(StreamState::Starting) => StreamRealizedState::Starting,
+        Some(StreamState::Failed) => StreamRealizedState::Failed,
+        Some(StreamState::Streaming) if !telemetry.is_some_and(|t| t.connected) => {
+            StreamRealizedState::Starting
+        }
+        Some(StreamState::Streaming) if congested => StreamRealizedState::Congested,
+        Some(StreamState::Streaming) => StreamRealizedState::Live,
     }
 }
 
@@ -2133,6 +2292,8 @@ impl NativeDaemon {
             telemetry_emitted: false,
             audio_meter_sequence: 0,
             pending_audio_meters: None,
+            stream_status_sequence: 0,
+            pending_stream_status: None,
             #[cfg(target_os = "macos")]
             cameras: resolution.cameras,
             #[cfg(target_os = "macos")]
@@ -2326,6 +2487,12 @@ impl NativeDaemon {
         self.pending_audio_meters.take()
     }
 
+    /// Consumes the latest-wins stream status record built at the last frame
+    /// boundary, mirroring [`Self::take_audio_meters`].
+    fn take_stream_status(&mut self) -> Option<StreamStatusMessage> {
+        self.pending_stream_status.take()
+    }
+
     fn tick_if_due_collect(
         &mut self,
         control: &mut ControlService<Policy>,
@@ -2499,6 +2666,16 @@ impl NativeDaemon {
             for stream in &mut self.streams {
                 stream.capture(&self.runtime, output, &audio);
             }
+        }
+        // One bounded, latest-wins stream status record per completed frame
+        // interval, published exactly like audio meters are. An empty active
+        // set produces no record at all.
+        let status_samples = stream_status_samples(native_stream_snapshots(&mut self.streams));
+        if let Some(status) =
+            stream_status_message(server, self.stream_status_sequence, status_samples)?
+        {
+            self.stream_status_sequence = status.sequence;
+            self.pending_stream_status = Some(status);
         }
         self.observe_native_telemetry();
         Ok(outcome.runtime_events)
@@ -2883,6 +3060,10 @@ impl NativeDaemon {
     }
 
     fn take_audio_meters(&mut self) -> Option<AudioMetersMessage> {
+        None
+    }
+
+    fn take_stream_status(&mut self) -> Option<StreamStatusMessage> {
         None
     }
 
@@ -7987,6 +8168,10 @@ mod tests {
     fn expired_tcp_session_is_reclaimed_for_next_client() {
         const HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(600);
         const HEARTBEAT_DELAY: Duration = Duration::from_millis(200);
+        // The server expires sessions on absolute wall-clock deadlines while
+        // this measurement is monotonic, so a small system-clock step may
+        // legitimately fire expiry early against this instant.
+        const CLOCK_SKEW_TOLERANCE: Duration = Duration::from_millis(250);
 
         let directory = tempfile::tempdir().unwrap();
         let project_path = directory.path().join("show.freemix");
@@ -8072,10 +8257,6 @@ mod tests {
         ));
         assert!(Instant::now() >= original_deadline);
         expired_rx.recv_timeout(HEARTBEAT_TIMEOUT).unwrap();
-        // The server expires sessions on absolute wall-clock deadlines while
-        // this measurement is monotonic, so a small system-clock step may
-        // legitimately fire expiry early against this instant.
-        const CLOCK_SKEW_TOLERANCE: Duration = Duration::from_millis(250);
         assert!(
             heartbeat_sent_at.elapsed() + CLOCK_SKEW_TOLERANCE >= HEARTBEAT_TIMEOUT,
             "the session expired before its heartbeat deadline"
@@ -10319,6 +10500,309 @@ mod tests {
                 !sticky_stream_rejection(&transient),
                 "{transient:?} must be counted as backpressure"
             );
+        }
+    }
+
+    #[cfg(feature = "native-media")]
+    fn synthetic_stream_telemetry(
+        state: fm_codec_ffmpeg::stream::StreamState,
+        connected: bool,
+        failure: Option<fm_codec_ffmpeg::stream::StreamFailure>,
+    ) -> fm_codec_ffmpeg::stream::StreamTelemetry {
+        use fm_codec_ffmpeg::stream::{ChildState, RejectionCounts, StreamTelemetry};
+
+        StreamTelemetry {
+            state,
+            child: ChildState::Running,
+            failure,
+            destination: "rtmp://redacted".to_owned(),
+            accepted_pairs: 0,
+            delivered_pairs: 0,
+            write_failed_pairs: 0,
+            dropped_oldest_pairs: 0,
+            discarded_pairs: 0,
+            skipped_pairs: 0,
+            padded_pairs: 0,
+            rejected: RejectionCounts::default(),
+            outstanding_pairs: 0,
+            peak_outstanding_pairs: 0,
+            retained_bytes: 0,
+            peak_retained_bytes: 0,
+            muxed_bytes: 4_096,
+            encoded_frames: 12,
+            muxed_media_time: Duration::from_secs(1),
+            media_drift: Duration::ZERO,
+            connected,
+            stderr_tail: String::new(),
+            stderr_truncated: false,
+        }
+    }
+
+    #[cfg(feature = "native-media")]
+    fn stream_runtime(
+        target: u128,
+        ledger: StreamPairLedger,
+        congested: bool,
+        first_failure: Option<&str>,
+        telemetry: Option<fm_codec_ffmpeg::stream::StreamTelemetry>,
+    ) -> StreamRuntimeSnapshot<'_> {
+        StreamRuntimeSnapshot {
+            target: SwitcherStreamTargetId::from_non_zero(
+                NonZeroU128::new(target).expect("test target is nonzero"),
+            ),
+            ledger,
+            congested,
+            first_failure,
+            telemetry,
+        }
+    }
+
+    #[cfg(feature = "native-media")]
+    #[test]
+    fn stream_status_maps_each_reachable_sink_state() {
+        use fm_codec_ffmpeg::stream::{StreamFailure, StreamState};
+
+        let no_failure: Option<String> = None;
+        let sample = |congested, telemetry| {
+            stream_status_sample(stream_runtime(
+                7,
+                StreamPairLedger {
+                    enqueued_pairs: 30,
+                    dropped_pairs: 4,
+                    ..StreamPairLedger::default()
+                },
+                congested,
+                no_failure.as_deref(),
+                telemetry,
+            ))
+            .expect("live runtime always samples")
+        };
+
+        // Connecting: the sink is starting, or streaming but the destination
+        // has not accepted it yet (connected stays false until the child's
+        // first progress report).
+        for (state, connected) in [
+            (fm_codec_ffmpeg::stream::StreamState::Starting, false),
+            (fm_codec_ffmpeg::stream::StreamState::Streaming, false),
+        ] {
+            let sample = sample(
+                false,
+                Some(synthetic_stream_telemetry(state, connected, None)),
+            );
+            assert_eq!(sample.realized, StreamRealizedState::Starting);
+            assert_eq!(sample.connected, connected);
+        }
+
+        // Producing.
+        let live = sample(
+            false,
+            Some(synthetic_stream_telemetry(
+                StreamState::Streaming,
+                true,
+                None,
+            )),
+        );
+        assert_eq!(live.realized, StreamRealizedState::Live);
+        assert!(live.connected);
+        assert_eq!(live.muxed_bytes, 4_096);
+        assert_eq!(live.enqueued_pairs, 30);
+        assert_eq!(live.dropped_pairs, 4);
+        assert_eq!(live.failure, None);
+
+        // Backpressure observed this interval wins over Live.
+        let congested = sample(
+            true,
+            Some(synthetic_stream_telemetry(
+                StreamState::Streaming,
+                true,
+                None,
+            )),
+        );
+        assert_eq!(congested.realized, StreamRealizedState::Congested);
+
+        // Terminal states.
+        let failed_by_state = sample(
+            false,
+            Some(synthetic_stream_telemetry(StreamState::Failed, false, None)),
+        );
+        assert_eq!(failed_by_state.realized, StreamRealizedState::Failed);
+        let failed_by_reason = sample(
+            false,
+            Some(synthetic_stream_telemetry(
+                StreamState::Streaming,
+                true,
+                Some(StreamFailure::NoProgress),
+            )),
+        );
+        assert_eq!(failed_by_reason.realized, StreamRealizedState::Failed);
+        assert_eq!(
+            failed_by_reason.failure.as_deref(),
+            Some("NoProgress"),
+            "sink failures are sanitized debug codes"
+        );
+        for state in [StreamState::Stopping, StreamState::Stopped] {
+            let stopped = sample(false, Some(synthetic_stream_telemetry(state, true, None)));
+            assert_eq!(stopped.realized, StreamRealizedState::Stopped);
+        }
+    }
+
+    #[cfg(feature = "native-media")]
+    #[test]
+    fn latched_failure_is_sticky_over_live_telemetry_and_survives_a_gone_sink() {
+        use fm_codec_ffmpeg::stream::StreamState;
+
+        let latched = Some("enqueue:FormatMismatch".to_owned());
+        // The sink still streams, but the feed already latched its failure.
+        let sample = stream_status_sample(stream_runtime(
+            9,
+            StreamPairLedger {
+                enqueued_pairs: 2,
+                ..StreamPairLedger::default()
+            },
+            false,
+            latched.as_deref(),
+            Some(synthetic_stream_telemetry(
+                StreamState::Streaming,
+                true,
+                None,
+            )),
+        ))
+        .expect("latched runtimes stay on the wire");
+        assert_eq!(sample.realized, StreamRealizedState::Failed);
+        assert_eq!(sample.failure.as_deref(), Some("enqueue:FormatMismatch"));
+
+        // A start-time failure leaves no sink at all; counters still report.
+        let start_failed = stream_status_sample(stream_runtime(
+            11,
+            StreamPairLedger {
+                dropped_pairs: 1,
+                ..StreamPairLedger::default()
+            },
+            false,
+            Some("start:NotFound (Complete)"),
+            None,
+        ))
+        .expect("latched runtimes stay on the wire");
+        assert_eq!(start_failed.realized, StreamRealizedState::Failed);
+        assert!(!start_failed.connected);
+        assert_eq!(start_failed.muxed_bytes, 0);
+        assert_eq!(start_failed.dropped_pairs, 1);
+        assert_eq!(
+            start_failed.failure.as_deref(),
+            Some("start:NotFound (Complete)")
+        );
+    }
+
+    #[cfg(feature = "native-media")]
+    #[test]
+    fn inactive_targets_are_omitted_and_samples_sort_and_stay_bounded() {
+        let never_started: Option<String> = None;
+        // A target with no sink and no latched failure never appears.
+        let empty = stream_status_samples([stream_runtime(
+            5,
+            StreamPairLedger::default(),
+            false,
+            never_started.as_deref(),
+            None,
+        )]);
+        assert!(empty.is_empty(), "an all-inactive set publishes nothing");
+
+        // Mixed set: unsorted input comes out in strictly ascending wire
+        // order and inactive targets drop out of the middle.
+        let latched = Some("backend:Some(ChildExited { status: Some(1) })".to_owned());
+        let mixed = stream_status_samples([
+            stream_runtime(
+                90,
+                StreamPairLedger::default(),
+                false,
+                never_started.as_deref(),
+                None,
+            ),
+            stream_runtime(
+                40,
+                StreamPairLedger {
+                    enqueued_pairs: 1,
+                    ..StreamPairLedger::default()
+                },
+                false,
+                never_started.as_deref(),
+                Some(synthetic_stream_telemetry(
+                    fm_codec_ffmpeg::stream::StreamState::Streaming,
+                    true,
+                    None,
+                )),
+            ),
+            stream_runtime(
+                20,
+                StreamPairLedger::default(),
+                false,
+                latched.as_deref(),
+                None,
+            ),
+        ]);
+        let targets: Vec<_> = mixed
+            .iter()
+            .map(|sample| sample.target.get().get())
+            .collect();
+        assert_eq!(targets, [20, 40]);
+
+        // The bound holds even if a project ever exceeded the engine cap.
+        let flooded: Vec<_> = (0..=u128::try_from(MAX_STREAM_SAMPLES).unwrap())
+            .map(|index| {
+                stream_runtime(
+                    index + 1,
+                    StreamPairLedger::default(),
+                    false,
+                    latched.as_deref(),
+                    None,
+                )
+            })
+            .collect();
+        assert_eq!(flooded.len(), MAX_STREAM_SAMPLES + 1);
+        assert_eq!(stream_status_samples(flooded).len(), MAX_STREAM_SAMPLES);
+    }
+
+    #[cfg(feature = "native-media")]
+    #[test]
+    fn stream_status_message_sequence_starts_at_one_and_skips_empty_passes() {
+        let server = ServerIdentity {
+            engine_id: "engine".to_owned(),
+            project_id: "project".to_owned(),
+            state_epoch: 1,
+            log_id: "log".to_owned(),
+        };
+        assert!(
+            stream_status_message(&server, 0, Vec::new())
+                .unwrap()
+                .is_none(),
+            "an empty active set publishes no record"
+        );
+        let first = stream_status_message(&server, 0, vec![stream_status_placeholder_sample()])
+            .unwrap()
+            .expect("non-empty set publishes");
+        assert_eq!(first.sequence, 1);
+        assert_eq!(first.server, server);
+        let second = stream_status_message(
+            &server,
+            first.sequence,
+            vec![stream_status_placeholder_sample()],
+        )
+        .unwrap()
+        .expect("non-empty set publishes");
+        assert_eq!(second.sequence, 2);
+        assert!(encode_line(&WireMessage::StreamStatus(second)).is_ok());
+    }
+
+    #[cfg(feature = "native-media")]
+    fn stream_status_placeholder_sample() -> StreamStatusSample {
+        StreamStatusSample {
+            target: WireStreamTargetId::new(NonZeroU128::new(3).unwrap()),
+            realized: StreamRealizedState::Starting,
+            connected: false,
+            muxed_bytes: 0,
+            enqueued_pairs: 0,
+            dropped_pairs: 0,
+            failure: None,
         }
     }
 

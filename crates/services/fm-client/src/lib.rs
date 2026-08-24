@@ -538,6 +538,7 @@ impl Client {
             | WireMessage::DurableEventBatch(_)
             | WireMessage::Heartbeat(_)
             | WireMessage::AudioMeters(_)
+            | WireMessage::StreamStatus(_)
             | WireMessage::CapabilityReport(_)
             | WireMessage::DiagnosticsRequest(_)
             | WireMessage::DiagnosticsResponse(_)

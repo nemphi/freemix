@@ -10,8 +10,8 @@ use fm_client::{Client, ClientConfig, Intake, Outbound};
 use fm_protocol::{
     CURRENT_PROTOCOL_VERSION, ClientType, CommandPayload, CommandResult, DiagnosticsRequest,
     DiagnosticsResponse, EventPayload, FadeToBlackState, HandshakeOutcome, HandshakeRequest,
-    MAX_LINE_BYTES, Role, RuntimeLifecycleEvent, ServerIdentity, StreamRealizedState, WireMessage,
-    decode_line, encode_line,
+    MAX_LINE_BYTES, Role, RuntimeLifecycleEvent, ServerIdentity, StreamRealizedState,
+    StreamStatusMessage, WireMessage, decode_line, encode_line,
 };
 use fm_types::ProjectId;
 use fm_ui_model::ManualTransitionStatus;
@@ -149,6 +149,8 @@ struct Remote {
     client: Client,
     project_id: ProjectId,
     server: ServerIdentity,
+    last_stream_status_sequence: Option<u64>,
+    latest_stream_status: Option<StreamStatusMessage>,
 }
 
 impl Remote {
@@ -247,6 +249,8 @@ impl Remote {
                 state_epoch: 0,
                 log_id: "uninitialized".into(),
             },
+            last_stream_status_sequence: None,
+            latest_stream_status: None,
         })
     }
 
@@ -393,6 +397,42 @@ impl Remote {
             format_input_roster(state),
             format_output_roster(state),
         );
+        if let Some(status) = &self.latest_stream_status {
+            for sample in &status.samples {
+                println!(
+                    "StreamStatus(target={}, realized={}, connected={}, muxed_bytes={}, enqueued_pairs={}, dropped_pairs={}, failure={})",
+                    sample.target,
+                    stream_realized_name(sample.realized),
+                    sample.connected,
+                    sample.muxed_bytes,
+                    sample.enqueued_pairs,
+                    sample.dropped_pairs,
+                    sample.failure.as_deref().unwrap_or("none"),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Validates and retains one lossy stream-status record. Identity must
+    /// match the established session and sequences must be strictly increasing;
+    /// violations mirror the TCP session's disconnect-on-meters behavior.
+    fn absorb_stream_status(&mut self, status: StreamStatusMessage) -> RemoteResult<()> {
+        if status.server != self.server {
+            return Err(
+                RemoteFailure("stream status identity does not match the session".into()).into(),
+            );
+        }
+        if self
+            .last_stream_status_sequence
+            .is_some_and(|sequence| status.sequence <= sequence)
+        {
+            return Err(
+                RemoteFailure("stream status sequence is not strictly increasing".into()).into(),
+            );
+        }
+        self.last_stream_status_sequence = Some(status.sequence);
+        self.latest_stream_status = Some(status);
         Ok(())
     }
 
@@ -448,7 +488,13 @@ impl Remote {
             };
             self.reader.consume(count);
             if complete {
-                return Ok(decode_line(core::str::from_utf8(&line)?)?);
+                let message = decode_line(core::str::from_utf8(&line)?)?;
+                if let WireMessage::StreamStatus(status) = message {
+                    self.absorb_stream_status(status)?;
+                    line.clear();
+                    continue;
+                }
+                return Ok(message);
             }
             if line.len() == MAX_LINE_BYTES {
                 return Err(fm_protocol::CodecError::LineTooLong.into());

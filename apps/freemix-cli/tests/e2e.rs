@@ -521,6 +521,22 @@ fn serve_stream_start(listener: &TcpListener) {
     );
     write_message(
         &mut writer,
+        &WireMessage::StreamStatus(fm_protocol::StreamStatusMessage {
+            server: server_identity(&engine),
+            sequence: 1,
+            samples: vec![fm_protocol::StreamStatusSample {
+                target,
+                realized: fm_protocol::StreamRealizedState::Starting,
+                connected: false,
+                muxed_bytes: 2048,
+                enqueued_pairs: 12,
+                dropped_pairs: 3,
+                failure: None,
+            }],
+        }),
+    );
+    write_message(
+        &mut writer,
         &WireMessage::Event(EventMessage {
             cursor: EventCursor {
                 engine: engine.clone(),
@@ -2762,6 +2778,12 @@ fn remote_stream_start_is_accepted_and_replicates_the_streams_roster() {
     assert!(status.contains(
         r#"Streams=[40:"Main ingest":desired=true:realized=starting:detail=connecting to ingest]"#
     ));
+    assert!(
+        status.contains(
+            "StreamStatus(target=40, realized=starting, connected=false, muxed_bytes=2048, enqueued_pairs=12, dropped_pairs=3, failure=none)"
+        ),
+        "status output should surface the validated stream-status sample: {status}"
+    );
 
     // A second client reconnecting to the daemon observes the durable roster.
     let observed = invoke_bounded(&["remote-status", &address]);

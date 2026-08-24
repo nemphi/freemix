@@ -19,7 +19,8 @@ use fm_protocol::{
     HandshakeRequest, HandshakeResponse, InputAudioMeters, LineDecoder, MAX_LINE_BYTES,
     ManualTransitionStatus, OverlayStatus, ProtocolVersion, ResumeCursor, Role,
     RuntimeEventMessage, RuntimeLifecycleEvent, ServerIdentity, SnapshotMessage, SnapshotReason,
-    WireInputId, WireMessage, encode_line,
+    StreamRealizedState, StreamStatusMessage, StreamStatusSample, WireInputId, WireMessage,
+    WireStreamTargetId, encode_line,
 };
 use fm_types::ProjectId;
 use fm_ui_model::ModelError;
@@ -189,6 +190,26 @@ fn audio_meters(sequence: u64) -> AudioMetersMessage {
                 peak_millionths: 250_000,
                 rms_millionths: 125_000,
             }],
+        }],
+    }
+}
+
+fn stream_target() -> WireStreamTargetId {
+    WireStreamTargetId::new(NonZeroU128::new(40).unwrap())
+}
+
+fn stream_status(sequence: u64) -> StreamStatusMessage {
+    StreamStatusMessage {
+        server: server(),
+        sequence,
+        samples: vec![StreamStatusSample {
+            target: stream_target(),
+            realized: StreamRealizedState::Live,
+            connected: true,
+            muxed_bytes: sequence * 512,
+            enqueued_pairs: sequence * 30,
+            dropped_pairs: 0,
+            failure: None,
         }],
     }
 }
@@ -389,6 +410,80 @@ fn audio_meters_are_ephemeral_and_strictly_ordered() {
         ConnectionState::Backoff(_)
     ));
     assert!(session.latest_audio_meters().is_none());
+    server_thread.join().unwrap();
+}
+
+#[test]
+fn stream_status_is_ephemeral_and_strictly_ordered() {
+    let (release_tx, release_rx) = mpsc::channel();
+    let (address, server_thread) = spawn_server(move |listener| {
+        let mut peer = Peer::accept(&listener);
+        accept_snapshot(&mut peer, 4);
+        release_rx.recv().unwrap();
+        peer.send(&WireMessage::StreamStatus(stream_status(5)));
+        peer.send(&WireMessage::StreamStatus(stream_status(6)));
+        peer.send(&WireMessage::StreamStatus(stream_status(4)));
+    });
+
+    let mut session = TcpSession::new(client(4));
+    session.connect(address, CONNECT_TIMEOUT).unwrap();
+    assert!(
+        session
+            .receive_timeout(Duration::from_millis(10))
+            .unwrap()
+            .is_none()
+    );
+    release_tx.send(()).unwrap();
+    assert!(matches!(
+        session.receive().unwrap(),
+        SessionEvent::StreamStatus { status } if status.sequence == 5
+    ));
+    assert!(matches!(
+        session.receive().unwrap(),
+        SessionEvent::StreamStatus { status } if status.sequence == 6
+    ));
+    let latest = session.latest_stream_status().expect("retained status");
+    assert_eq!(latest.sequence, 6);
+    assert_eq!(latest.samples.len(), 1);
+    assert_eq!(latest.samples[0].target, stream_target());
+    assert_eq!(latest.samples[0].realized, StreamRealizedState::Live);
+    assert_eq!(session.client().last_applied_cursor().unwrap().revision, 4);
+    assert!(matches!(
+        session.receive(),
+        Err(TcpSessionError::UnexpectedMessage)
+    ));
+    assert!(matches!(
+        session.client().state(),
+        ConnectionState::Backoff(_)
+    ));
+    assert!(session.latest_stream_status().is_none());
+    server_thread.join().unwrap();
+}
+
+#[test]
+fn stream_status_rejects_foreign_server_identity() {
+    let (release_tx, release_rx) = mpsc::channel();
+    let (address, server_thread) = spawn_server(move |listener| {
+        let mut peer = Peer::accept(&listener);
+        accept_snapshot(&mut peer, 4);
+        release_rx.recv().unwrap();
+        let mut foreign = stream_status(5);
+        foreign.server.engine_id = "engine-b".to_owned();
+        peer.send(&WireMessage::StreamStatus(foreign));
+    });
+
+    let mut session = TcpSession::new(client(4));
+    session.connect(address, CONNECT_TIMEOUT).unwrap();
+    release_tx.send(()).unwrap();
+    assert!(matches!(
+        session.receive(),
+        Err(TcpSessionError::UnexpectedMessage)
+    ));
+    assert!(matches!(
+        session.client().state(),
+        ConnectionState::Backoff(_)
+    ));
+    assert!(session.latest_stream_status().is_none());
     server_thread.join().unwrap();
 }
 
