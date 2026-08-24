@@ -1247,22 +1247,33 @@ path, emits sanitized per-target `FREEMIXD_STREAM` finalization records, and
 adds enqueue/drop counters to telemetry; startup or feed failures latch
 per-target and degrade rather than abort the show. The CLI exposes local and
 remote `stream-start`/`stream-stop`, and status prints the validated roster.
-There is no five-destination fan-out through `OutputSet`, no output-health UI,
-no live decoder acceptance of a recorded broadcast, and no hardware encoder, so
-item 1 and `OR-005` remain planned. The model and sink now accept SRT alongside
-RTMP/RTMPS: `srt://host[:port]` endpoints compose `?streamid=` URLs with the
-same key redaction, the FFmpeg sink muxes MPEG-TS with its own channel-layout
-rules, and a real-ffmpeg integration receives an SRT broadcast and probes
-H.264/AAC. Schema 20 persists each target's authored video bitrate and native
-sessions thread it into the encoder, but there is still no shared-rendition
-planning caller fanning one readback out across destinations. Protocol 2.17
-adds the lossy latest-wins `stream_status` peer record beside audio meters:
-native `freemixd` publishes per-target realized state, counters, and sanitized
-failures from sink telemetry each frame interval; sessions validate identity
-and monotonic sequence with meter semantics and retain the latest record for
-operator status; Studio swallows the records beside meters and renders the
-roster with live samples. Snapshots still project only desired state; the
-lossy record is transport state and never durable.
+Native sessions now route every target through the `fm-io-network` state
+machine: one shared `OutputSet` with per-target sinks and renditions, so a
+retryable failure retains the bounded queue and fails over from the persisted
+primary to the backup endpoint under a bounded reconnect budget (250 ms
+doubling to 2 s across at most 40 attempts), refused frames are dropped rather
+than retried, `WaitingToReconnect` and `Congested` are reachable wire states,
+and final `FREEMIXD_STREAM` records derive from state-machine telemetry plus
+the per-target ledger. The stream inventory is bounded at five everywhere —
+authoring, engine, wire, and transport agree — matching the five-simultaneous
+destinations product contract. There is no output-health UI beyond Studio's
+compact panel, no live decoder acceptance of a streamed broadcast against a
+real receiver on this host (the ffmpeg listener integration skips without
+ffmpeg/libsrt), and no hardware encoder, so item 1 and `OR-005` remain
+planned. The model and sink accept SRT alongside RTMP/RTMPS:
+`srt://host[:port]` endpoints compose `?streamid=` URLs with the same key
+redaction, the FFmpeg sink muxes MPEG-TS with its own channel-layout rules,
+and a real-ffmpeg integration receives an SRT broadcast and probes H.264/AAC.
+Schema 20 persists each target's authored video bitrate and native sessions
+thread it into the encoder, but there is still no shared-rendition planning
+caller fanning one readback out across destinations. Protocol 2.17 adds the
+lossy latest-wins `stream_status` peer record beside audio meters: native
+`freemixd` publishes per-target realized state, counters, and sanitized
+failures each frame interval; sessions validate identity and monotonic
+sequence with meter semantics and retain the latest record for operator
+status; Studio swallows the records beside meters and renders the roster with
+live samples. Snapshots still project only desired state; the lossy record is
+transport state and never durable.
 
 Exit: a remote-controlled headless production can stream and record
 independently with tested recovery.
