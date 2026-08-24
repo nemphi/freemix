@@ -117,8 +117,8 @@ use fm_codec_image::{StillDecodeLimits, decode_still, sniff_still_format};
 use fm_frame::CpuVideoFrame;
 #[cfg(feature = "native-media")]
 use fm_frame::{
-    AudioBlock, ClockDomainId as MediaClockDomainId, MediaTimestamp, MediaTiming,
-    NormalizedDuration, NormalizedTimestamp, OriginalTimestamp, SequenceNumber,
+    AudioBlock, ClockDomainId as MediaClockDomainId, CodecId, MediaTimestamp, MediaTiming,
+    NormalizedDuration, NormalizedTimestamp, OriginalTimestamp, SequenceNumber, TimeBase,
 };
 #[cfg(feature = "native-media")]
 use fm_gpu::{NativeBackend, NativeContext, NativeTexture};
@@ -131,8 +131,11 @@ use fm_io_api::{
 use fm_io_macos::{CameraTelemetry, CameraVideoSource, MacosCameraAdapter};
 #[cfg(feature = "native-media")]
 use fm_io_network::{
-    DestinationConfig, DestinationId, DestinationState, Endpoint, NetworkTelemetry, OutputProtocol,
-    OutputSet, PollEvent, QueueCapacity, ReconnectPolicy, RenditionId,
+    AbrLadder, AbrVariant, AudioRendition, ColorDescription, DestinationConfig, DestinationEnqueue,
+    DestinationId, DestinationRenditions, DestinationState, Endpoint, EnqueueStatus, FrameRate,
+    NetworkTelemetry, OutputPacket, OutputProtocol, OutputSet, PollEvent, QueueCapacity,
+    ReconnectPolicy, RenditionId, RenditionPlan, RenditionPlanner, RenditionProfile, TimingProfile,
+    VideoRendition,
     rtmp::{FfmpegRtmpSink, RtmpSinkConfig, StreamKey, raw_pair_packet},
 };
 #[cfg(feature = "native-media")]
@@ -352,6 +355,11 @@ struct NativeDaemon {
     /// Segments stopped off the render path, awaiting bounded finalization.
     recording_finalizers: Vec<ProgramRecordingFinalizer>,
     streams: Vec<NativeProgramStream>,
+    /// One group per distinct encoder-relevant identity (output protocol plus
+    /// authored video bitrate): its members share one readback owner, one
+    /// packed pair per frame, and one sequence cursor, fanned out through the
+    /// shared [`OutputSet`]'s rendition planner.
+    stream_groups: Vec<StreamRenditionGroup>,
     /// Shared failover state machine for every stream target; per-target
     /// transports stay owned by each [`NativeProgramStream`].
     output_set: OutputSet,
@@ -1825,15 +1833,15 @@ fn next_record_segment_path(
 
 /// Per-target bookkeeping for the native streaming feed path.
 ///
-/// The ledger is separated from the sink so the sequencing rules — advance only
-/// on a successful enqueue, count every refusal, never block or panic — are
-/// testable without a GPU runtime or an `FFmpeg` child.
+/// The ledger is separated from the sink so the counting rules — advance the
+/// admitted cursor only on a successful enqueue, count every refusal, never
+/// block or panic — are testable without a GPU runtime or an `FFmpeg` child.
+/// Gating lives on the rendition group's shared cursor; this per-target
+/// cursor records how far each target's own admissions reached.
 #[cfg(feature = "native-media")]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct StreamPairLedger {
-    /// Smallest sequence this target may still admit. It advances only when a
-    /// pair is actually accepted, so a rejected pair leaves its sequence to be
-    /// skipped (and padded by the sink) rather than reused.
+    /// One past the highest sequence this target actually admitted.
     next_sequence: u64,
     enqueued_pairs: u64,
     dropped_pairs: u64,
@@ -1841,14 +1849,6 @@ struct StreamPairLedger {
 
 #[cfg(feature = "native-media")]
 impl StreamPairLedger {
-    /// Whether a pair at `sequence` may still be dispatched. Pairs behind the
-    /// cursor were either already delivered or abandoned with the sink in a
-    /// state that cannot accept them; re-dispatching them would be rejected as
-    /// out-of-order, so they are dropped instead.
-    fn deliverable(&self, sequence: SequenceNumber) -> bool {
-        sequence.get() >= self.next_sequence
-    }
-
     fn note_admitted(&mut self, sequence: SequenceNumber) {
         self.enqueued_pairs = self.enqueued_pairs.saturating_add(1);
         self.next_sequence = sequence.get().saturating_add(1);
@@ -1859,8 +1859,140 @@ impl StreamPairLedger {
     }
 }
 
-/// One configured stream target's native realization: its own readback owner,
-/// format, per-target transport, and capture bookkeeping.
+/// Planner-facing state of one shared-rendition group: the destinations whose
+/// encoder-relevant settings — output protocol plus authored video bitrate,
+/// the only per-target encoder knobs — are identical, so they share ONE
+/// readback, ONE packed pair per frame, and ONE sequence cursor. Record
+/// format, audio, GOP, and every other encoder input derive from project
+/// settings that are identical across targets by construction.
+///
+/// `variants` pins the group's rendition id inside planner-produced plans:
+/// [`RenditionPlanner`] numbers renditions by first-seen unique profile, so
+/// the group's real profile sits at exactly its group position among inert
+/// sibling rungs (see [`pinned_rendition_variants`]). Sinks refuse packets
+/// claiming any other rendition, which makes the id part of the sink
+/// contract and the reason the pinning exists.
+#[cfg(feature = "native-media")]
+struct StreamRenditionCore {
+    /// Member destination slots in authored order.
+    members: Vec<DestinationId>,
+    rendition: RenditionId,
+    variants: Vec<AbrVariant>,
+    /// Smallest sequence the group may still pack; advances once per packed
+    /// frame no matter how many member routes take it.
+    next_sequence: u64,
+}
+
+/// One rendition group's GPU-side state: the single synchronous program
+/// readback owner every member shares, and the format the group's pairs pack
+/// with.
+#[cfg(feature = "native-media")]
+struct StreamRenditionGroup {
+    core: StreamRenditionCore,
+    format: RecordFormat,
+    readback: NativeProgramReadback,
+}
+
+/// Builds one group's exact rendition identity from the project-wide format
+/// plus its authored video bitrate. `bitrate_step` offsets the video bitrate
+/// by one bit per step for the inert ladder rungs that pin plan numbering;
+/// authored bitrates start at 1000 kbps, so a few negative steps never reach
+/// zero.
+///
+/// # Errors
+///
+/// Returns any identity-validation failure from the planner crate.
+#[cfg(feature = "native-media")]
+fn rendition_profile(
+    format: &RecordFormat,
+    video_bitrate_kbps: u32,
+    bitrate_step: i32,
+) -> AppResult<RenditionProfile> {
+    let cadence = format.frame_rate();
+    let authored_bps = i64::from(video_bitrate_kbps) * 1_000 + i64::from(bitrate_step);
+    assert!(
+        authored_bps > 0,
+        "authored stream bitrates leave room for ladder-pinning steps"
+    );
+    let video = VideoRendition::new(
+        CodecId::new("video/h264")?,
+        "high",
+        format.dimensions(),
+        FrameRate::new(cadence.numerator(), cadence.denominator())?,
+        ColorDescription::Rec709Limited,
+        u64::try_from(authored_bps).expect("bitrate was checked positive above"),
+        gop_frames(cadence),
+    )?;
+    let channels = u16::try_from(format.channel_layout().channels().len()).unwrap_or(u16::MAX - 1);
+    let audio = AudioRendition::new(
+        CodecId::new("audio/aac")?,
+        "lc",
+        u64::from(EncoderSettings::default().audio_bitrate_kbps) * 1_000,
+        format.sample_rate().hertz(),
+        channels,
+        (0..channels).collect(),
+    )?;
+    Ok(RenditionProfile::new(
+        video,
+        audio,
+        TimingProfile::new(
+            TimeBase::new(cadence.numerator(), cadence.denominator())?,
+            0,
+        ),
+    ))
+}
+
+/// Two seconds of frames at the project cadence, at least one.
+#[cfg(feature = "native-media")]
+fn gop_frames(cadence: fm_types::FrameRate) -> u32 {
+    let frames = u64::from(cadence.numerator()) * 2 / u64::from(cadence.denominator());
+    u32::try_from(frames.max(1)).expect("two seconds of frames fit a GOP length")
+}
+
+/// Builds one group's planner request variants: with a single rendition
+/// group the plan is the plain single-rendition request; with several groups,
+/// each group's plan must still number its real rendition at the group's
+/// compile-time id because sinks refuse packets from any other rendition, so
+/// the real profile embeds at exactly its position among inert sibling rungs
+/// whose bitrates strictly increase by one bit per step around the authored
+/// one. Only the group's own rung is ever dispatched:
+/// [`OutputSet::enqueue_rendition`] fans out solely along the packed
+/// rendition's route.
+///
+/// # Errors
+///
+/// Returns any identity-validation failure from the planner crate.
+#[cfg(feature = "native-media")]
+fn pinned_rendition_variants(
+    format: &RecordFormat,
+    video_bitrate_kbps: u32,
+    group_index: usize,
+    group_count: usize,
+) -> AppResult<Vec<AbrVariant>> {
+    let rung = |step: i32, name: String| -> AppResult<AbrVariant> {
+        Ok(AbrVariant::new(
+            name,
+            rendition_profile(format, video_bitrate_kbps, step)?,
+        )?)
+    };
+    if group_count == 1 {
+        return Ok(vec![rung(0, "program".to_owned())?]);
+    }
+    let mut variants = Vec::with_capacity(group_count);
+    for index in 0..group_count {
+        let step = i32::try_from(index).expect("rendition group counts fit i32")
+            - i32::try_from(group_index).expect("rendition group counts fit i32");
+        variants.push(rung(step, format!("shared-rung-{}", index + 1))?);
+    }
+    AbrLadder::new(variants.clone())
+        .expect("pinned rendition rung bitrates strictly increase by one step");
+    Ok(variants)
+}
+
+/// One configured stream target's native realization: its own transport,
+/// per-target feed bookkeeping, and membership in one shared-rendition
+/// [`StreamRenditionGroup`] that owns the readback, the format, and the
+/// packing step for every target sharing its encoder identity.
 ///
 /// Mirrors [`NativeProgramRecorder`]: failures latch per target, are reported
 /// once as a sanitized record, and degrade that target only — they never abort
@@ -1877,9 +2009,6 @@ struct NativeProgramStream {
     /// Redacted primary destination for diagnostics; mirrors what
     /// `StreamDestination::redacted` renders.
     redacted_destination: String,
-    readback: NativeProgramReadback,
-    format: RecordFormat,
-    rendition: RenditionId,
     sink: FfmpegRtmpSink,
     ledger: StreamPairLedger,
     first_failure: Option<String>,
@@ -2066,11 +2195,114 @@ fn redacted_destination_url(protocol: OutputProtocol, endpoint: &Endpoint, keyed
     }
 }
 
+/// One target's validated destination pieces, split before grouping so
+/// rendition grouping happens over complete, already-validated inputs, plus
+/// its rendition group's position.
+#[cfg(feature = "native-media")]
+struct SplitStreamTarget<'a> {
+    target: &'a fm_model::StreamTarget,
+    protocol: OutputProtocol,
+    endpoint: Endpoint,
+    stream_key: Option<StreamKey>,
+    backup_endpoint: Option<Endpoint>,
+    group_index: usize,
+}
+
+/// Grouped target splits plus the distinct encoder-identity keys in
+/// first-appearance order.
+#[cfg(feature = "native-media")]
+struct SplitTargets<'a> {
+    splits: Vec<SplitStreamTarget<'a>>,
+    group_keys: Vec<(OutputProtocol, u32)>,
+}
+
+/// Splits every target's endpoints and assigns rendition groups by first
+/// appearance of the encoder-relevant key — output protocol plus authored
+/// video bitrate.
+///
+/// # Errors
+///
+/// Returns any destination URL that would be refused at connect time.
+#[cfg(feature = "native-media")]
+fn split_and_group_targets(targets: &[fm_model::StreamTarget]) -> AppResult<SplitTargets<'_>> {
+    let mut splits = Vec::with_capacity(targets.len());
+    for target in targets {
+        let (protocol, endpoint, stream_key, backup_endpoint) = split_target_endpoints(target)?;
+        splits.push(SplitStreamTarget {
+            target,
+            protocol,
+            endpoint,
+            stream_key,
+            backup_endpoint,
+            group_index: 0,
+        });
+    }
+    let mut group_keys: Vec<(OutputProtocol, u32)> = Vec::new();
+    for split in &mut splits {
+        let key = (split.protocol, split.target.video_bitrate_kbps());
+        split.group_index = group_keys
+            .iter()
+            .position(|existing| *existing == key)
+            .unwrap_or_else(|| {
+                group_keys.push(key);
+                group_keys.len() - 1
+            });
+    }
+    Ok(SplitTargets { splits, group_keys })
+}
+
+/// Builds one shared state bundle per rendition group: one readback owner for
+/// the whole group and the planner variants that pin the group's rendition id
+/// inside planner-produced plans. Group ids are their one-based positions.
+///
+/// # Errors
+///
+/// Returns any GPU readback-owner or rendition-identity failure.
+#[cfg(feature = "native-media")]
+fn build_stream_groups(
+    runtime: &NativeMediaRuntime,
+    format: &RecordFormat,
+    width: NonZeroU32,
+    height: NonZeroU32,
+    group_keys: &[(OutputProtocol, u32)],
+    next_sequence: u64,
+) -> AppResult<Vec<StreamRenditionGroup>> {
+    let mut groups = Vec::with_capacity(group_keys.len());
+    for (group_index, (_, video_bitrate_kbps)) in group_keys.iter().enumerate() {
+        let readback = runtime.create_program_readback_blocking(width, height)?;
+        groups.push(StreamRenditionGroup {
+            core: StreamRenditionCore {
+                members: Vec::new(),
+                rendition: RenditionId::new(
+                    NonZeroU32::new(
+                        u32::try_from(group_index + 1)
+                            .expect("bounded group count fits a rendition ordinal"),
+                    )
+                    .expect("rendition ordinals start at one"),
+                ),
+                variants: pinned_rendition_variants(
+                    format,
+                    *video_bitrate_kbps,
+                    group_index,
+                    group_keys.len(),
+                )?,
+                next_sequence,
+            },
+            format: format.clone(),
+            readback,
+        });
+    }
+    Ok(groups)
+}
+
 #[cfg(feature = "native-media")]
 impl NativeProgramStream {
     /// Compiles one runtime per configured project destination in project
     /// vector order, registering each target in the shared output set as
-    /// destination slot 1..=N.
+    /// destination slot 1..=N, and groups targets whose encoder-relevant
+    /// settings — output protocol plus authored video bitrate — match into
+    /// one shared-rendition group owning one readback and one packed pair
+    /// per frame.
     ///
     /// Startup fails closed on more targets than the engine inventories or the
     /// output set can carry, or a destination URL that would be refused at
@@ -2081,7 +2313,7 @@ impl NativeProgramStream {
         runtime: &NativeMediaRuntime,
         stored: &StoredProject,
         output_set: &mut OutputSet,
-    ) -> AppResult<Vec<Self>> {
+    ) -> AppResult<(Vec<Self>, Vec<StreamRenditionGroup>)> {
         let targets = stored.project().stream_targets();
         if targets.len() > fm_switcher::MAX_STREAM_COUNT {
             return Err(AppFailure(format!(
@@ -2108,45 +2340,52 @@ impl NativeProgramStream {
             Some(PROGRAM_STREAM_RECONNECT_ATTEMPTS),
         )
         .expect("the daemon reconnect policy constants are valid");
-        let mut streams = Vec::with_capacity(targets.len());
-        for (index, target) in targets.iter().enumerate() {
-            let (protocol, endpoint, stream_key, backup_endpoint) = split_target_endpoints(target)?;
-            // Destination slots are 1..=N in authored order and renditions are
-            // 1..=N with them; both bounds were checked above.
+        // The record format derives from project settings alone, so it is
+        // identical across every target by construction; each group packs its
+        // pairs with a clone of this one format.
+        let format = RecordFormat::new(
+            settings.video.dimensions.width(),
+            settings.video.dimensions.height(),
+            settings.frame_rate,
+            settings.audio.sample_rate,
+            settings.audio.channels.clone(),
+            SequenceNumber::new(frames_rendered),
+        )?;
+        let split_targets = split_and_group_targets(targets)?;
+        let mut groups = build_stream_groups(
+            runtime,
+            &format,
+            NonZeroU32::new(settings.video.dimensions.width()).expect("project width is nonzero"),
+            NonZeroU32::new(settings.video.dimensions.height()).expect("project height is nonzero"),
+            &split_targets.group_keys,
+            frames_rendered,
+        )?;
+        // One transport per target under its group's rendition identity;
+        // sinks refuse packets claiming any other rendition.
+        let mut streams = Vec::with_capacity(split_targets.splits.len());
+        for (index, split) in split_targets.splits.into_iter().enumerate() {
+            // Destination slots are 1..=N in authored order; both bounds were
+            // checked above.
             let ordinal =
                 u32::try_from(index + 1).expect("target count fits the destination slots");
             let destination_id = DestinationId::new(
                 u8::try_from(ordinal).expect("bounded target count fits a slot"),
             )
             .expect("bounded target count yields a valid slot");
-            let rendition =
-                RenditionId::new(NonZeroU32::new(ordinal).expect("rendition ordinal is nonzero"));
-            let format = RecordFormat::new(
-                settings.video.dimensions.width(),
-                settings.video.dimensions.height(),
-                settings.frame_rate,
-                settings.audio.sample_rate,
-                settings.audio.channels.clone(),
-                SequenceNumber::new(frames_rendered),
-            )?;
-            let readback = runtime.create_program_readback_blocking(
-                NonZeroU32::new(settings.video.dimensions.width())
-                    .expect("project width is nonzero"),
-                NonZeroU32::new(settings.video.dimensions.height())
-                    .expect("project height is nonzero"),
-            )?;
-            let mut sink_config = RtmpSinkConfig::new(rendition, format.clone());
+            let group = &mut groups[split.group_index];
+            group.core.members.push(destination_id);
+            let mut sink_config = RtmpSinkConfig::new(group.core.rendition, format.clone());
             sink_config.limits.stop_timeout = PROGRAM_STREAM_STOP_TIMEOUT;
             sink_config.limits.kill_timeout = PROGRAM_STREAM_KILL_TIMEOUT;
-            sink_config.encoder = stream_encoder_settings(target.video_bitrate_kbps());
-            sink_config.stream_key = stream_key;
+            sink_config.encoder = stream_encoder_settings(split.target.video_bitrate_kbps());
+            sink_config.stream_key = split.stream_key;
             output_set
                 .add_destination(
                     DestinationConfig::new(
                         destination_id,
-                        protocol,
-                        endpoint.clone(),
-                        backup_endpoint,
+                        split.protocol,
+                        split.endpoint.clone(),
+                        split.backup_endpoint,
                         // TLS policy was already settled by the protocol rules:
                         // plain RTMP and SRT refuse it and RTMPS uses the
                         // child's default trust, so no daemon-side TLS exists.
@@ -2160,16 +2399,13 @@ impl NativeProgramStream {
                 )
                 .expect("one output-set slot per compiled target");
             streams.push(Self {
-                target: SwitcherStreamTargetId::from_non_zero(target.id().get()),
+                target: SwitcherStreamTargetId::from_non_zero(split.target.id().get()),
                 destination_id,
                 redacted_destination: redacted_destination_url(
-                    protocol,
-                    &endpoint,
+                    split.protocol,
+                    &split.endpoint,
                     sink_config.stream_key.is_some(),
                 ),
-                readback,
-                format,
-                rendition,
                 sink: FfmpegRtmpSink::new(sink_config),
                 ledger: StreamPairLedger {
                     next_sequence: frames_rendered,
@@ -2180,7 +2416,7 @@ impl NativeProgramStream {
                 started: false,
             });
         }
-        Ok(streams)
+        Ok((streams, groups))
     }
 
     /// Marks this target running in the shared output set. Connection trouble
@@ -2216,80 +2452,6 @@ impl NativeProgramStream {
             self.target
         ))
         .into()))
-    }
-
-    /// Reads back one program frame and enqueues it into this target's route
-    /// in the shared output set.
-    ///
-    /// Sequential by design: each target owns its readback, the recorder goes
-    /// first, and no path here blocks the render loop beyond the existing
-    /// synchronous diagnostic readback contract. A refused pair is dropped
-    /// and counted, never retried; only an unrepresentable frame latches the
-    /// target.
-    fn capture(
-        &mut self,
-        output_set: &mut OutputSet,
-        runtime: &NativeMediaRuntime,
-        program: &NativeTexture,
-        audio: &AudioBlock,
-    ) {
-        if !self.started || self.first_failure.is_some() {
-            return;
-        }
-        // A deliberately stopped route accepts no feed: skip the readback
-        // instead of queueing pairs nothing will ever drain.
-        if matches!(
-            output_set.state(self.destination_id),
-            Some(DestinationState::Stopped)
-        ) {
-            return;
-        }
-        let sequence = audio.timing().sequence();
-        if !self.ledger.deliverable(sequence) {
-            self.ledger.note_dropped();
-            return;
-        }
-        // This is the existing synchronous diagnostic readback path per target,
-        // not a nonblocking or zero-copy encoder bridge.
-        let readback = match runtime.readback_program_blocking(&mut self.readback, program) {
-            Ok(readback) => readback,
-            Err(error) => {
-                self.fail(&format!("readback:{error}"), output_set);
-                return;
-            }
-        };
-        let Some(expected_stride) = readback.width.checked_mul(4) else {
-            self.fail("readback:stride_overflow", output_set);
-            return;
-        };
-        if readback.width != self.readback.width()
-            || readback.height != self.readback.height()
-            || readback.stride != expected_stride
-        {
-            self.fail("readback:invalid_tight_layout", output_set);
-            return;
-        }
-        let packet = match raw_pair_packet(
-            self.rendition,
-            &self.format,
-            sequence.get(),
-            &readback.rgba,
-            &interleaved_audio_bytes(audio),
-        ) {
-            Ok(packet) => packet,
-            Err(error) => {
-                self.fail(&format!("frame:{error}"), output_set);
-                return;
-            }
-        };
-        admit_packet(
-            &mut self.ledger,
-            &mut self.enqueue_backpressure,
-            output_set,
-            self.destination_id,
-            sequence,
-            packet,
-        );
     }
 
     /// Advances this target one step in the shared output set after the
@@ -2387,37 +2549,183 @@ impl NativeProgramStream {
     }
 }
 
-/// Admits one packed pair to its destination's queue with the ledger's rules:
-/// advance the cursor only on acceptance, count every refusal as a drop, and
-/// flag capacity backpressure for the next status sample. A refused packet is
-/// gone — never retried — because the sink pads its gap to hold the media
-/// clock.
+/// Whether a target's route joins this frame's rendition fan-out: it was
+/// asked to run, never latched a failure, and was not deliberately stopped.
+/// Stopped and unstarted destinations are excluded from the plan itself, so
+/// nothing is ever queued for a route nobody drains.
 #[cfg(feature = "native-media")]
-fn admit_packet(
-    ledger: &mut StreamPairLedger,
-    enqueue_backpressure: &mut bool,
-    output_set: &mut OutputSet,
-    destination: DestinationId,
+fn route_active(stream: &NativeProgramStream, output_set: &OutputSet) -> bool {
+    stream.started
+        && stream.first_failure.is_none()
+        && !matches!(
+            output_set.state(stream.destination_id),
+            Some(DestinationState::Stopped)
+        )
+}
+
+/// One rendition group's share of the frame pipeline.
+#[cfg(feature = "native-media")]
+enum GroupFrameOutcome {
+    /// Nothing to send: the group has no active member route, or this
+    /// frame's sequence was already consumed.
+    Idle,
+    /// One packed pair plus the plan that routes it to the active members.
+    Packed {
+        plan: RenditionPlan,
+        packet: OutputPacket,
+    },
+    /// The shared step failed; every active member latches its text.
+    Failed(Vec<(DestinationId, String)>),
+}
+
+/// Gates, plans, and packs one rendition group's pair for this frame — split
+/// from the GPU-owning daemon so hermetic tests drive the exact production
+/// sequencing with a scripted pack step instead of a readback.
+///
+/// A group with no active member packs nothing (its readback idles). The
+/// sequence cursor advances past this frame once the group commits to
+/// packing: a packed pair is never repacked because sinks pad gaps to hold
+/// the media clock. Plans cover exactly the active members; planner failures
+/// and pack failures return per-member texts to latch.
+#[cfg(feature = "native-media")]
+fn plan_and_pack_group_frame(
+    members: &[DestinationId],
+    variants: &[AbrVariant],
+    next_sequence: &mut u64,
     sequence: SequenceNumber,
-    packet: fm_io_network::OutputPacket,
-) {
-    match output_set.enqueue(destination, packet) {
-        Ok(fm_io_network::EnqueueStatus::Accepted) => ledger.note_admitted(sequence),
-        Ok(fm_io_network::EnqueueStatus::Backpressure(_)) => {
-            ledger.note_dropped();
-            *enqueue_backpressure = true;
-        }
-        Ok(fm_io_network::EnqueueStatus::DestinationUnavailable(_)) => {
-            ledger.note_dropped();
-        }
+    active: &[bool],
+    pack: impl FnOnce() -> Result<OutputPacket, String>,
+) -> GroupFrameOutcome {
+    let active_members: Vec<DestinationId> = members
+        .iter()
+        .zip(active)
+        .filter_map(|(member, &is_active)| is_active.then_some(*member))
+        .collect();
+    if active_members.is_empty() || sequence.get() < *next_sequence {
+        return GroupFrameOutcome::Idle;
+    }
+    *next_sequence = sequence.get().saturating_add(1);
+    let plan = match build_group_plan(members, variants, active) {
+        Ok(plan) => plan,
         Err(error) => {
-            ledger.note_dropped();
-            debug_assert!(
-                false,
-                "every compiled destination exists in the output set: {error}"
+            return GroupFrameOutcome::Failed(
+                active_members
+                    .into_iter()
+                    .map(|destination| (destination, format!("planner:{error}")))
+                    .collect(),
             );
         }
+    };
+    match pack() {
+        Ok(packet) => GroupFrameOutcome::Packed { plan, packet },
+        Err(failure) => GroupFrameOutcome::Failed(
+            active_members
+                .into_iter()
+                .map(|destination| (destination, failure.clone()))
+                .collect(),
+        ),
     }
+}
+
+/// Builds the planner request set for one group over its active members:
+/// every active member requests the group's variant ladder, so the planner
+/// deduplicates them into renditions whose ids match the compile-time group
+/// ids (the real profile sits at the group's pinned position).
+///
+/// # Errors
+///
+/// Returns [`fm_io_network::RenditionError`] for an empty request set or any
+/// other planner rule violation.
+#[cfg(feature = "native-media")]
+fn build_group_plan(
+    members: &[DestinationId],
+    variants: &[AbrVariant],
+    active: &[bool],
+) -> Result<RenditionPlan, fm_io_network::RenditionError> {
+    let mut requests = Vec::new();
+    for (member, is_active) in members.iter().zip(active) {
+        if !is_active {
+            continue;
+        }
+        let request = match variants {
+            [only] => DestinationRenditions::single(*member, only.profile().clone()),
+            many => DestinationRenditions::ladder(
+                *member,
+                AbrLadder::new(many.to_vec())
+                    .expect("compiled rendition variants stay a valid ladder"),
+            ),
+        };
+        requests.push(request);
+    }
+    RenditionPlanner::plan(&requests)
+}
+
+/// Maps one fanned-out packet's per-route results back onto the member
+/// ledgers: an accepted route advances that member's counter only, a refused
+/// route drops that member's counter and flags its backpressure, and a route
+/// to a destination missing from the set drops without touching anything
+/// else. A refused pair is gone — never retried — because the sink pads its
+/// gap to hold the media clock.
+#[cfg(feature = "native-media")]
+fn admit_rendition_outcomes(
+    outcomes: &[DestinationEnqueue],
+    sequence: SequenceNumber,
+    routes: &mut [(DestinationId, &mut StreamPairLedger, &mut bool)],
+) {
+    for outcome in outcomes {
+        let Some((_, ledger, enqueue_backpressure)) = routes
+            .iter_mut()
+            .find(|(destination, _, _)| *destination == outcome.destination)
+        else {
+            continue;
+        };
+        match outcome.status {
+            EnqueueStatus::Accepted => ledger.note_admitted(sequence),
+            EnqueueStatus::Backpressure(_) => {
+                ledger.note_dropped();
+                **enqueue_backpressure = true;
+            }
+            EnqueueStatus::DestinationUnavailable(_) => ledger.note_dropped(),
+        }
+    }
+}
+
+/// The production pack step for one group: ONE synchronous program readback
+/// through the shared owner, layout validation, and ONE raw pair packed under
+/// the group's rendition identity. This is the existing synchronous
+/// diagnostic readback contract, not a nonblocking or zero-copy encoder
+/// bridge; the failure texts mirror the per-target path they replaced.
+#[cfg(feature = "native-media")]
+fn pack_group_pair(
+    runtime: &NativeMediaRuntime,
+    program: &NativeTexture,
+    readback: &mut NativeProgramReadback,
+    format: &RecordFormat,
+    rendition: RenditionId,
+    sequence: SequenceNumber,
+    audio: &AudioBlock,
+) -> Result<OutputPacket, String> {
+    // This is the expensive synchronous step sharing removes duplicates of.
+    let frame = runtime
+        .readback_program_blocking(readback, program)
+        .map_err(|error| format!("readback:{error}"))?;
+    let Some(expected_stride) = frame.width.checked_mul(4) else {
+        return Err("readback:stride_overflow".to_owned());
+    };
+    if frame.width != readback.width()
+        || frame.height != readback.height()
+        || frame.stride != expected_stride
+    {
+        return Err("readback:invalid_tight_layout".to_owned());
+    }
+    raw_pair_packet(
+        rendition,
+        format,
+        sequence.get(),
+        &frame.rgba,
+        &interleaved_audio_bytes(audio),
+    )
+    .map_err(|error| format!("frame:{error}"))
 }
 
 /// Serializes one [`AudioBlock`] into the sample-major `f32le` span the raw
@@ -2695,7 +3003,8 @@ impl NativeDaemon {
         // problem is reported against an otherwise healthy show. Starting one
         // is deferred to readiness; failures there latch per target.
         let mut output_set = OutputSet::new();
-        let streams = NativeProgramStream::compile(&runtime, stored, &mut output_set)?;
+        let (streams, stream_groups) =
+            NativeProgramStream::compile(&runtime, stored, &mut output_set)?;
         #[cfg(target_os = "macos")]
         resolution.cameras.mark_preflight_frames_ingested();
         let pacer = FramePacer::restore(
@@ -2726,6 +3035,7 @@ impl NativeDaemon {
             record_program: None,
             recording_finalizers: Vec::new(),
             streams,
+            stream_groups,
             output_set,
             pending_stream_starts: Vec::new(),
             streams_finalized: false,
@@ -2935,6 +3245,120 @@ impl NativeDaemon {
     /// the shared output set schedules reconnects and backoff on.
     fn stream_clock_ms(&self) -> u64 {
         u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Packs one pair per rendition group per frame and fans it out through
+    /// the planner: destinations whose encoder-relevant settings match cost
+    /// one readback and one packed pair in total, while every member route
+    /// stays independently queued, counted, and flagged in the shared output
+    /// set.
+    ///
+    /// Sequential by design: the recorder captures first, each group performs
+    /// its one synchronous readback, and no path here blocks the render loop
+    /// beyond the existing diagnostic readback contract. A shared-step failure
+    /// latches every active member of that group; a refused route degrades
+    /// only its own target's counters. Takes the stream pieces separately so
+    /// the caller can hold immutable borrows of other daemon fields.
+    #[allow(clippy::too_many_arguments)]
+    fn capture_streams(
+        streams: &mut [NativeProgramStream],
+        stream_groups: &mut [StreamRenditionGroup],
+        output_set: &mut OutputSet,
+        runtime: &NativeMediaRuntime,
+        program: &NativeTexture,
+        audio: &AudioBlock,
+    ) {
+        let sequence = audio.timing().sequence();
+        for group in stream_groups.iter_mut() {
+            let members = group.core.members.clone();
+            // A route joins this frame only when it was asked to run, never
+            // latched a failure, and was not deliberately stopped.
+            let active: Vec<bool> = members
+                .iter()
+                .map(|destination| {
+                    streams
+                        .iter()
+                        .find(|stream| stream.destination_id == *destination)
+                        .is_some_and(|stream| route_active(stream, output_set))
+                })
+                .collect();
+            if !active.iter().any(|&is_active| is_active) {
+                continue;
+            }
+            let rendition = group.core.rendition;
+            let outcome = {
+                let StreamRenditionGroup {
+                    core,
+                    readback,
+                    format,
+                } = group;
+                let StreamRenditionCore {
+                    members,
+                    variants,
+                    next_sequence,
+                    ..
+                } = core;
+                plan_and_pack_group_frame(
+                    members,
+                    variants,
+                    next_sequence,
+                    sequence,
+                    &active,
+                    || {
+                        pack_group_pair(
+                            runtime, program, readback, format, rendition, sequence, audio,
+                        )
+                    },
+                )
+            };
+            match outcome {
+                GroupFrameOutcome::Idle => {}
+                GroupFrameOutcome::Failed(failures) => {
+                    for (destination, failure) in failures {
+                        if let Some(stream) = streams
+                            .iter_mut()
+                            .find(|stream| stream.destination_id == destination)
+                        {
+                            stream.fail(&failure, output_set);
+                        }
+                    }
+                }
+                GroupFrameOutcome::Packed { plan, packet } => {
+                    let mut routes: Vec<(DestinationId, &mut StreamPairLedger, &mut bool)> =
+                        streams
+                            .iter_mut()
+                            .filter(|stream| members.contains(&stream.destination_id))
+                            .map(|stream| {
+                                (
+                                    stream.destination_id,
+                                    &mut stream.ledger,
+                                    &mut stream.enqueue_backpressure,
+                                )
+                            })
+                            .collect();
+                    match output_set.enqueue_rendition(&plan, &packet) {
+                        Ok(outcomes) => admit_rendition_outcomes(&outcomes, sequence, &mut routes),
+                        Err(error) => {
+                            // Unreachable short of a bug: every planned
+                            // destination exists in this set, so degrade the
+                            // group's members instead of panicking on air.
+                            let fanned: Vec<DestinationId> = routes
+                                .iter()
+                                .map(|(destination, _, _)| *destination)
+                                .collect();
+                            for destination in fanned {
+                                if let Some(stream) = streams
+                                    .iter_mut()
+                                    .find(|stream| stream.destination_id == destination)
+                                {
+                                    stream.fail(&format!("fanout:{error}"), output_set);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Advances every target one step in the shared output set after each
@@ -3283,9 +3707,14 @@ impl NativeDaemon {
             ProgramRecording::Off => {}
         }
         if let (Some(output), Some(audio)) = (latest_program, stream_audio) {
-            for stream in &mut self.streams {
-                stream.capture(&mut self.output_set, &self.runtime, output, &audio);
-            }
+            Self::capture_streams(
+                &mut self.streams,
+                &mut self.stream_groups,
+                &mut self.output_set,
+                &self.runtime,
+                output,
+                &audio,
+            );
         }
         self.advance_stream_routes(server)?;
         self.observe_native_telemetry();
@@ -11335,16 +11764,12 @@ mod tests {
             next_sequence: 7,
             ..StreamPairLedger::default()
         };
-        assert!(ledger.deliverable(SequenceNumber::new(7)));
-        // Gaps are allowed; the sink pads them.
-        assert!(ledger.deliverable(SequenceNumber::new(9)));
-        assert!(!ledger.deliverable(SequenceNumber::new(6)));
 
         ledger.note_admitted(SequenceNumber::new(9));
         assert_eq!(ledger.enqueued_pairs, 1);
         assert_eq!(ledger.next_sequence, 10);
-        assert!(!ledger.deliverable(SequenceNumber::new(9)));
 
+        // Refusals only count; they never move the admitted cursor.
         ledger.note_dropped();
         assert_eq!(ledger.dropped_pairs, 1);
         assert_eq!(ledger.next_sequence, 10);
@@ -11614,6 +12039,9 @@ mod tests {
             std::collections::VecDeque<Result<fm_io_network::SinkWrite, fm_io_network::SinkError>>,
         hosts: Vec<String>,
         disconnects: usize,
+        /// Every packet the route attempted to write, cloned on arrival, so
+        /// rendition-sharing tests can compare payloads across sinks.
+        written: Vec<fm_io_network::OutputPacket>,
     }
 
     #[cfg(feature = "native-media")]
@@ -11631,8 +12059,9 @@ mod tests {
 
         fn write(
             &mut self,
-            _packet: &fm_io_network::OutputPacket,
+            packet: &fm_io_network::OutputPacket,
         ) -> Result<fm_io_network::SinkWrite, fm_io_network::SinkError> {
+            self.written.push(packet.clone());
             self.write_results.pop_front().unwrap_or_else(|| {
                 Ok(fm_io_network::SinkWrite::Sent(
                     fm_io_network::SendObservation::default(),
@@ -11668,16 +12097,88 @@ mod tests {
 
     #[cfg(feature = "native-media")]
     fn mock_packet(sequence: u64) -> fm_io_network::OutputPacket {
+        mock_packet_for(MOCK_RENDITION, sequence, 7)
+    }
+
+    #[cfg(feature = "native-media")]
+    fn mock_packet_for(
+        rendition: RenditionId,
+        sequence: u64,
+        payload_byte: u8,
+    ) -> fm_io_network::OutputPacket {
         use fm_frame::{NormalizedDuration, NormalizedTimestamp};
         fm_io_network::OutputPacket::new(
-            MOCK_RENDITION,
+            rendition,
             sequence,
             NormalizedTimestamp::from_nanos(i64::try_from(sequence).unwrap() * 33_333_333),
             NormalizedDuration::from_nanos(33_333_333).unwrap(),
             true,
-            vec![7_u8; 16],
+            vec![payload_byte; 16],
         )
         .unwrap()
+    }
+
+    /// One rendition group's planner state over hermetic project-format
+    /// settings, mirroring what `NativeProgramStream::compile` builds.
+    #[cfg(feature = "native-media")]
+    fn test_group(
+        rendition_value: u32,
+        members: &[u8],
+        video_bitrate_kbps: u32,
+        group_index: usize,
+        group_count: usize,
+    ) -> StreamRenditionCore {
+        StreamRenditionCore {
+            members: members
+                .iter()
+                .map(|id| DestinationId::new(*id).expect("test member fits a slot"))
+                .collect(),
+            rendition: RenditionId::new(
+                NonZeroU32::new(rendition_value).expect("test rendition is nonzero"),
+            ),
+            variants: pinned_rendition_variants(
+                &test_stream_format(),
+                video_bitrate_kbps,
+                group_index,
+                group_count,
+            )
+            .expect("test rendition variants validate"),
+            next_sequence: 0,
+        }
+    }
+
+    /// Drives one group through the exact production frame pipeline — gate,
+    /// plan, pack, fan out, admit — with the pack step scripted.
+    #[cfg(feature = "native-media")]
+    fn run_test_group_frame(
+        core: &mut StreamRenditionCore,
+        output_set: &mut OutputSet,
+        streams: &mut [(DestinationId, StreamPairLedger, bool)],
+        sequence: SequenceNumber,
+        active: &[bool],
+        pack: impl FnOnce() -> Result<fm_io_network::OutputPacket, String>,
+    ) -> GroupFrameOutcome {
+        let outcome = plan_and_pack_group_frame(
+            &core.members,
+            &core.variants,
+            &mut core.next_sequence,
+            sequence,
+            active,
+            pack,
+        );
+        if let GroupFrameOutcome::Packed { plan, packet } = outcome {
+            let outcomes = output_set
+                .enqueue_rendition(&plan, &packet)
+                .expect("the packed rendition is always planned");
+            let mut routes: Vec<(DestinationId, &mut StreamPairLedger, &mut bool)> = streams
+                .iter_mut()
+                .filter(|(destination, _, _)| core.members.contains(destination))
+                .map(|(destination, ledger, backpressure)| (*destination, ledger, backpressure))
+                .collect();
+            admit_rendition_outcomes(&outcomes, sequence, &mut routes);
+            return GroupFrameOutcome::Packed { plan, packet };
+        }
+        outcome
     }
 
     /// Drives one real output set to Live with one sent packet, so status
@@ -11797,6 +12298,24 @@ mod tests {
     }
 
     #[cfg(feature = "native-media")]
+    fn test_stream_format() -> RecordFormat {
+        RecordFormat::new(
+            16,
+            16,
+            FrameRate::new(25, 1).unwrap(),
+            SampleRate::new(44_100).unwrap(),
+            ChannelLayout::stereo(),
+            SequenceNumber::new(0),
+        )
+        .unwrap()
+    }
+
+    #[cfg(feature = "native-media")]
+    fn test_rendition(value: u32) -> RenditionId {
+        RenditionId::new(NonZeroU32::new(value).expect("test rendition is nonzero"))
+    }
+
+    #[cfg(feature = "native-media")]
     #[test]
     fn queue_full_refusals_are_dropped_once_and_reported_as_congestion() {
         let mut set = OutputSet::new();
@@ -11806,27 +12325,29 @@ mod tests {
         set.start(id).unwrap();
         set.poll(id, 0, &mut sink).unwrap();
 
-        let mut ledger = StreamPairLedger::default();
-        let mut backpressure = false;
-        admit_packet(
-            &mut ledger,
-            &mut backpressure,
+        let mut core = test_group(1, &[1], 4_500, 0, 1);
+        let mut rows = vec![(id, StreamPairLedger::default(), false)];
+
+        // Capacity is one: the first pair rides, the second is refused,
+        // counted as a drop, flagged as backpressure, and never retried.
+        run_test_group_frame(
+            &mut core,
             &mut set,
-            id,
+            &mut rows,
             SequenceNumber::new(0),
-            mock_packet(0),
+            &[true],
+            || Ok(mock_packet(0)),
         );
-        admit_packet(
-            &mut ledger,
-            &mut backpressure,
+        run_test_group_frame(
+            &mut core,
             &mut set,
-            id,
+            &mut rows,
             SequenceNumber::new(1),
-            mock_packet(1),
+            &[true],
+            || Ok(mock_packet(1)),
         );
 
-        // Capacity is one: the second pair was refused, counted as a drop,
-        // flagged as backpressure, and never retried afterwards.
+        let (_, ledger, backpressure) = rows[0];
         assert!(backpressure);
         assert_eq!(ledger.enqueued_pairs, 1);
         assert_eq!(ledger.dropped_pairs, 1);
@@ -11835,23 +12356,15 @@ mod tests {
         let realized = realized_stream_state(false, backpressure, set.state(id));
         assert_eq!(realized, StreamRealizedState::Congested);
 
-        // The admitted pair advanced the cursor; its sequence can never be
-        // delivered again, so a redelivery attempt would be dropped too.
-        assert!(!ledger.deliverable(SequenceNumber::new(0)));
-        assert!(ledger.deliverable(SequenceNumber::new(1)));
+        // The group consumed one sequence per frame even though the second
+        // pair was refused; the member's admitted cursor advanced only once.
+        assert_eq!(core.next_sequence, 2);
+        assert_eq!(ledger.next_sequence, 1);
     }
 
     #[cfg(feature = "native-media")]
     #[test]
-    fn behind_cursor_pairs_are_dropped_without_touching_the_route() {
-        let mut ledger = StreamPairLedger {
-            next_sequence: 9,
-            ..StreamPairLedger::default()
-        };
-        assert!(!ledger.deliverable(SequenceNumber::new(8)));
-        assert!(ledger.deliverable(SequenceNumber::new(9)));
-        assert!(ledger.deliverable(SequenceNumber::new(12)));
-
+    fn behind_cursor_frames_are_never_packed_or_fanned_out() {
         let mut set = OutputSet::new();
         set.add_destination(mock_destination(1)).unwrap();
         let id = DestinationId::new(1).unwrap();
@@ -11859,26 +12372,46 @@ mod tests {
         set.start(id).unwrap();
         set.poll(id, 0, &mut sink).unwrap();
 
-        // A behind-cursor pair costs one drop and never reaches the route;
-        // the gate is the same one `capture` applies before admitting.
-        let mut backpressure = false;
-        let sequence = SequenceNumber::new(3);
-        if ledger.deliverable(sequence) {
-            admit_packet(
-                &mut ledger,
-                &mut backpressure,
-                &mut set,
-                id,
-                sequence,
-                mock_packet(3),
-            );
-        } else {
-            ledger.note_dropped();
-        }
-        assert_eq!(ledger.dropped_pairs, 1);
-        assert_eq!(ledger.enqueued_pairs, 0);
-        assert!(!backpressure);
+        let mut core = test_group(1, &[1], 4_500, 0, 1);
+        core.next_sequence = 9;
+        let mut rows = vec![(id, StreamPairLedger::default(), false)];
+
+        // A frame behind the shared cursor costs nothing at all: no pack, no
+        // fan-out, no counter movement.
+        let outcome = run_test_group_frame(
+            &mut core,
+            &mut set,
+            &mut rows,
+            SequenceNumber::new(8),
+            &[true],
+            || panic!("a consumed sequence must never be packed again"),
+        );
+        assert!(matches!(outcome, GroupFrameOutcome::Idle));
+        assert_eq!(sink.written.len(), 0);
         assert_eq!(set.queue_depth(id), Some(0));
+        assert_eq!(rows[0].1.enqueued_pairs, 0);
+        assert_eq!(rows[0].1.dropped_pairs, 0);
+        assert!(!rows[0].2);
+        assert_eq!(core.next_sequence, 9, "an idle frame leaves the cursor");
+
+        // The current sequence packs and queues normally.
+        let packed = run_test_group_frame(
+            &mut core,
+            &mut set,
+            &mut rows,
+            SequenceNumber::new(9),
+            &[true],
+            || Ok(mock_packet(9)),
+        );
+        assert!(matches!(packed, GroupFrameOutcome::Packed { .. }));
+        assert_eq!(
+            sink.written.len(),
+            0,
+            "the pair waits for the route to poll"
+        );
+        assert_eq!(set.queue_depth(id), Some(1));
+        assert_eq!(core.next_sequence, 10);
+        assert_eq!(rows[0].1.enqueued_pairs, 1);
     }
 
     #[cfg(feature = "native-media")]
@@ -11898,6 +12431,340 @@ mod tests {
         assert_eq!(set.queue_depth(id), Some(0));
         // Telemetry survives the stop so final records keep whole-run counts.
         assert_eq!(set.telemetry(id).unwrap().packets_accepted(), 1);
+    }
+
+    /// Two destinations sharing their protocol and authored bitrate form ONE
+    /// rendition group: the expensive pack step runs exactly once per frame,
+    /// both sinks receive byte-identical payloads, and each member's ledger
+    /// advances while the group consumes one sequence per frame.
+    #[cfg(feature = "native-media")]
+    #[test]
+    fn same_bitrate_destinations_share_one_pack_per_frame() {
+        let mut set = OutputSet::new();
+        set.add_destination(mock_destination(1)).unwrap();
+        set.add_destination(mock_destination(2)).unwrap();
+        let id_a = DestinationId::new(1).unwrap();
+        let id_b = DestinationId::new(2).unwrap();
+        let mut sink_a = MockTransportSink::default();
+        let mut sink_b = MockTransportSink::default();
+        set.start(id_a).unwrap();
+        set.start(id_b).unwrap();
+        set.poll(id_a, 0, &mut sink_a).unwrap();
+        set.poll(id_b, 0, &mut sink_b).unwrap();
+
+        let mut core = test_group(1, &[1, 2], 4_500, 0, 1);
+        let mut rows = vec![
+            (id_a, StreamPairLedger::default(), false),
+            (id_b, StreamPairLedger::default(), false),
+        ];
+        let mut packs = Vec::new();
+
+        for sequence in [41_u64, 42] {
+            let packed = run_test_group_frame(
+                &mut core,
+                &mut set,
+                &mut rows,
+                SequenceNumber::new(sequence),
+                &[true, true],
+                || {
+                    packs.push(sequence);
+                    Ok(mock_packet_for(
+                        MOCK_RENDITION,
+                        sequence,
+                        u8::try_from(sequence).unwrap_or(u8::MAX),
+                    ))
+                },
+            );
+            assert!(matches!(packed, GroupFrameOutcome::Packed { .. }));
+            // Mirrors advance_stream_routes: the shared set drains each route
+            // after the frame's fan-out.
+            let now_ms = sequence * 33;
+            set.poll(id_a, now_ms, &mut sink_a).unwrap();
+            set.poll(id_b, now_ms, &mut sink_b).unwrap();
+        }
+
+        // One pack per frame feeds the whole group.
+        assert_eq!(packs, [41, 42]);
+        for (sink, name) in [(&sink_a, "a"), (&sink_b, "b")] {
+            assert_eq!(sink.written.len(), 2, "{name}");
+            for (index, expected) in [41_u64, 42].into_iter().enumerate() {
+                let packet = &sink.written[index];
+                let expected_byte = u8::try_from(expected).unwrap_or(u8::MAX);
+                assert_eq!(packet.sequence(), expected, "{name}");
+                assert_eq!(packet.rendition(), MOCK_RENDITION, "{name}");
+                assert!(
+                    packet.payload().iter().all(|&byte| byte == expected_byte),
+                    "{name} frame {expected} carries the scripted payload"
+                );
+            }
+        }
+        assert_eq!(
+            sink_a
+                .written
+                .iter()
+                .map(fm_io_network::OutputPacket::payload)
+                .collect::<Vec<_>>(),
+            sink_b
+                .written
+                .iter()
+                .map(fm_io_network::OutputPacket::payload)
+                .collect::<Vec<_>>(),
+            "both members receive the very same packed pair"
+        );
+
+        // Both members' ledgers advanced per frame; nobody dropped anything.
+        for (destination, ledger, backpressure) in &rows {
+            assert_eq!(ledger.enqueued_pairs, 2, "{destination}");
+            assert_eq!(ledger.dropped_pairs, 0, "{destination}");
+            assert!(!backpressure, "{destination}");
+            assert_eq!(ledger.next_sequence, 43, "{destination}");
+        }
+        assert_eq!(core.next_sequence, 43, "one sequence consumed per frame");
+    }
+
+    /// Distinct authored bitrates stay independent: two groups pack once each
+    /// per frame, every plan numbers its real rendition at the compile-time
+    /// group id (the inert sibling rungs exist purely to hold that position),
+    /// and neither sink ever sees the other group's payload.
+    #[cfg(feature = "native-media")]
+    #[test]
+    fn distinct_bitrates_pack_into_two_independent_groups() {
+        let mut set = OutputSet::new();
+        set.add_destination(mock_destination(1)).unwrap();
+        set.add_destination(mock_destination(2)).unwrap();
+        let id_a = DestinationId::new(1).unwrap();
+        let id_b = DestinationId::new(2).unwrap();
+        let mut sink_a = MockTransportSink::default();
+        let mut sink_b = MockTransportSink::default();
+        set.start(id_a).unwrap();
+        set.start(id_b).unwrap();
+        set.poll(id_a, 0, &mut sink_a).unwrap();
+        set.poll(id_b, 0, &mut sink_b).unwrap();
+
+        // Authored order: target A at 3000 kbps is group one, target B at
+        // 6000 kbps is group two.
+        let mut low = test_group(1, &[1], 3_000, 0, 2);
+        let mut high = test_group(2, &[2], 6_000, 1, 2);
+        let mut rows = vec![
+            (id_a, StreamPairLedger::default(), false),
+            (id_b, StreamPairLedger::default(), false),
+        ];
+        let (mut low_packs, mut high_packs) = (0_usize, 0_usize);
+
+        let low_outcome = run_test_group_frame(
+            &mut low,
+            &mut set,
+            &mut rows,
+            SequenceNumber::new(7),
+            &[true],
+            || {
+                low_packs += 1;
+                Ok(mock_packet_for(test_rendition(1), 7, 1))
+            },
+        );
+        let high_outcome = run_test_group_frame(
+            &mut high,
+            &mut set,
+            &mut rows,
+            SequenceNumber::new(7),
+            &[true],
+            || {
+                high_packs += 1;
+                Ok(mock_packet_for(test_rendition(2), 7, 2))
+            },
+        );
+        assert_eq!(
+            (low_packs, high_packs),
+            (1, 1),
+            "each group packs its own pair"
+        );
+        // Mirrors advance_stream_routes after the frame's fan-out.
+        set.poll(id_a, 7, &mut sink_a).unwrap();
+        set.poll(id_b, 7, &mut sink_b).unwrap();
+
+        let GroupFrameOutcome::Packed { plan: low_plan, .. } = low_outcome else {
+            panic!("the low group packed");
+        };
+        assert_eq!(
+            low_plan.destinations_for(test_rendition(1)),
+            Some([id_a].as_slice())
+        );
+        let GroupFrameOutcome::Packed {
+            plan: high_plan, ..
+        } = high_outcome
+        else {
+            panic!("the high group packed");
+        };
+        assert_eq!(
+            high_plan.destinations_for(test_rendition(2)),
+            Some([id_b].as_slice()),
+            "the inert sibling rung pins the real rendition at the compile-time id"
+        );
+
+        // Every sink saw exactly its own group's payload and rendition.
+        assert_eq!(sink_a.written.len(), 1);
+        assert_eq!(sink_a.written[0].rendition(), test_rendition(1));
+        assert!(sink_a.written[0].payload().iter().all(|&byte| byte == 1));
+        assert_eq!(sink_b.written.len(), 1);
+        assert_eq!(sink_b.written[0].rendition(), test_rendition(2));
+        assert!(sink_b.written[0].payload().iter().all(|&byte| byte == 2));
+
+        assert_eq!(rows[0].1.enqueued_pairs, 1);
+        assert_eq!(rows[1].1.enqueued_pairs, 1);
+        assert!(!rows[0].2 && !rows[1].2);
+    }
+
+    /// One member stopping mid-show leaves the plan, keeps its ledger frozen,
+    /// and never sees another packet; restarting it resumes under the same
+    /// group identity with the next deliverable sequences while the surviving
+    /// member never interrupted.
+    #[cfg(feature = "native-media")]
+    #[test]
+    fn stopped_member_is_skipped_and_restart_resumes_the_group() {
+        let mut set = OutputSet::new();
+        set.add_destination(mock_destination(1)).unwrap();
+        set.add_destination(mock_destination(2)).unwrap();
+        let id_a = DestinationId::new(1).unwrap();
+        let id_b = DestinationId::new(2).unwrap();
+        let mut sink_a = MockTransportSink::default();
+        let mut sink_b = MockTransportSink::default();
+        set.start(id_a).unwrap();
+        set.start(id_b).unwrap();
+        set.poll(id_a, 0, &mut sink_a).unwrap();
+        set.poll(id_b, 0, &mut sink_b).unwrap();
+
+        let mut core = test_group(1, &[1, 2], 4_500, 0, 1);
+        let mut rows = vec![
+            (id_a, StreamPairLedger::default(), false),
+            (id_b, StreamPairLedger::default(), false),
+        ];
+
+        // Frame five reaches both members.
+        run_test_group_frame(
+            &mut core,
+            &mut set,
+            &mut rows,
+            SequenceNumber::new(5),
+            &[true, true],
+            || Ok(mock_packet(5)),
+        );
+        set.poll(id_a, 5, &mut sink_a).unwrap();
+        set.poll(id_b, 5, &mut sink_b).unwrap();
+        assert_eq!(sink_a.written.len(), 1);
+        assert_eq!(sink_b.written.len(), 1);
+
+        // Target B stops mid-show: it leaves the plan entirely, its ledger
+        // freezes, and A keeps streaming without interruption.
+        set.stop(id_b, &mut sink_b).unwrap();
+        let packed = run_test_group_frame(
+            &mut core,
+            &mut set,
+            &mut rows,
+            SequenceNumber::new(6),
+            &[true, false],
+            || Ok(mock_packet(6)),
+        );
+        let GroupFrameOutcome::Packed { plan, .. } = packed else {
+            panic!("the surviving member keeps the group packing");
+        };
+        assert_eq!(
+            plan.destinations_for(MOCK_RENDITION),
+            Some([id_a].as_slice()),
+            "the plan covers exactly the still-active members"
+        );
+        set.poll(id_a, 6, &mut sink_a).unwrap();
+        assert_eq!(sink_a.written.len(), 2);
+        assert_eq!(sink_b.written.len(), 1, "a stopped route receives nothing");
+        assert_eq!(rows[0].1.enqueued_pairs, 2);
+        assert_eq!(rows[1].1.enqueued_pairs, 1, "the stopped ledger freezes");
+        assert_eq!(rows[1].1.dropped_pairs, 0);
+        assert!(!rows[1].2);
+
+        // Restarting B resumes under the same group identity with the next
+        // deliverable sequences; the sink pads the gap frame six skipped.
+        set.start(id_b).unwrap();
+        set.poll(id_b, 10, &mut sink_b).unwrap();
+        run_test_group_frame(
+            &mut core,
+            &mut set,
+            &mut rows,
+            SequenceNumber::new(7),
+            &[true, true],
+            || Ok(mock_packet(7)),
+        );
+        set.poll(id_a, 7, &mut sink_a).unwrap();
+        set.poll(id_b, 7, &mut sink_b).unwrap();
+        assert_eq!(sink_b.written.len(), 2);
+        assert_eq!(sink_b.written.last().unwrap().sequence(), 7);
+        assert_eq!(rows[1].1.enqueued_pairs, 2);
+        assert_eq!(rows[1].1.next_sequence, 8);
+        assert_eq!(core.next_sequence, 8);
+    }
+
+    /// Backpressure on one member's route flags and congests only that
+    /// target; the other member of the same group streams clean.
+    #[cfg(feature = "native-media")]
+    #[test]
+    fn a_congested_route_flags_only_that_target() {
+        let mut set = OutputSet::new();
+        set.add_destination(mock_destination(1)).unwrap();
+        set.add_destination(mock_destination(2)).unwrap();
+        let id_a = DestinationId::new(1).unwrap();
+        let id_b = DestinationId::new(2).unwrap();
+        let mut sink_a = MockTransportSink::default();
+        let mut sink_b = MockTransportSink::default();
+        set.start(id_a).unwrap();
+        set.start(id_b).unwrap();
+        set.poll(id_a, 0, &mut sink_a).unwrap();
+        set.poll(id_b, 0, &mut sink_b).unwrap();
+
+        let mut core = test_group(1, &[1, 2], 4_500, 0, 1);
+        let mut rows = vec![
+            (id_a, StreamPairLedger::default(), false),
+            (id_b, StreamPairLedger::default(), false),
+        ];
+
+        // Frame zero fills both single-slot queues.
+        run_test_group_frame(
+            &mut core,
+            &mut set,
+            &mut rows,
+            SequenceNumber::new(0),
+            &[true, true],
+            || Ok(mock_packet(0)),
+        );
+
+        // Only B drains between frames; A stays saturated.
+        set.poll(id_b, 1, &mut sink_b).unwrap();
+
+        run_test_group_frame(
+            &mut core,
+            &mut set,
+            &mut rows,
+            SequenceNumber::new(1),
+            &[true, true],
+            || Ok(mock_packet(1)),
+        );
+
+        let (_, ledger_a, flag_a) = rows[0];
+        let (_, ledger_b, flag_b) = rows[1];
+        assert!(flag_a);
+        assert!(!flag_b, "only the saturated route flags backpressure");
+        assert_eq!(ledger_a.enqueued_pairs, 1);
+        assert_eq!(ledger_a.dropped_pairs, 1);
+        assert_eq!(ledger_b.enqueued_pairs, 2);
+        assert_eq!(ledger_b.dropped_pairs, 0);
+
+        // Congestion is per-target on the wire too.
+        assert_eq!(set.state(id_a), Some(DestinationState::Congested));
+        assert_eq!(
+            realized_stream_state(false, flag_a, set.state(id_a)),
+            StreamRealizedState::Congested
+        );
+        assert_eq!(
+            realized_stream_state(false, flag_b, set.state(id_b)),
+            StreamRealizedState::Live
+        );
     }
 
     #[cfg(feature = "native-media")]

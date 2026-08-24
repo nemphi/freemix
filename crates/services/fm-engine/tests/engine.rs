@@ -14,10 +14,10 @@ use fm_engine::{
 };
 use fm_scheduler::FrameNumber;
 use fm_switcher::{
-    FadeToBlackPosition, FadeToBlackTarget, MissingMediaFallback, OverlayBorderPreset,
-    OverlayChannelId, OverlayPositionPreset, OverlayTransitionKind, StingerAudioPolicy,
-    StingerDescriptor, StingerSlotId, StreamTargetId, SwitcherError, SwitcherEvent, SwitcherState,
-    TBarPosition, TBarState, TransitionKind,
+    FadeToBlackPosition, FadeToBlackTarget, MAX_STREAM_COUNT, MissingMediaFallback,
+    OverlayBorderPreset, OverlayChannelId, OverlayPositionPreset, OverlayTransitionKind,
+    StingerAudioPolicy, StingerDescriptor, StingerSlotId, StreamTargetId, SwitcherError,
+    SwitcherEvent, SwitcherState, TBarPosition, TBarState, TransitionKind,
 };
 use fm_types::{
     FrameRate, InputId, InputOrderError, MAX_INPUT_NAME_BYTES, OutputId, validate_input_order,
@@ -2299,18 +2299,22 @@ fn show_stream_inventory_rejects_overflow_duplicates_and_invalid_names() {
         input(2),
     )
     .unwrap();
-    let full: Vec<_> = (1..=8_u128)
+    let maximum = u128::try_from(MAX_STREAM_COUNT).unwrap();
+    let full: Vec<_> = (1..=maximum)
         .map(|index| (target(index + 10), format!("S{index}")))
         .collect();
-    assert_eq!(base.clone().with_streams(full).unwrap().streams().len(), 8);
-    let overflow: Vec<_> = (0..=8_u128)
+    assert_eq!(
+        base.clone().with_streams(full).unwrap().streams().len(),
+        MAX_STREAM_COUNT
+    );
+    let overflow: Vec<_> = (0..=maximum)
         .map(|index| (target(index + 10), format!("S{index}")))
         .collect();
     assert_eq!(
         base.clone().with_streams(overflow).unwrap_err(),
         ShowError::Switcher(SwitcherError::TooManyStreams {
-            requested: 9,
-            maximum: 8,
+            requested: usize::try_from(maximum + 1).unwrap(),
+            maximum: MAX_STREAM_COUNT,
         })
     );
     assert_eq!(
