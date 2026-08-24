@@ -21,7 +21,7 @@ pub const MAX_STREAM_NAME_BYTES: usize = 128;
 pub const MAX_STREAM_DETAIL_BYTES: usize = 64;
 /// Largest `StreamStatusMessage` sample count; matches the engine's
 /// bounded stream inventory.
-pub const MAX_STREAM_SAMPLES: usize = 8;
+pub const MAX_STREAM_SAMPLES: usize = 5;
 
 fn validate_request_id(value: &str) -> Result<(), CodecError> {
     if value.is_empty()

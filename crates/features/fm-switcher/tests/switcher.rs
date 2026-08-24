@@ -949,7 +949,7 @@ fn stream_inventory_is_bounded_unique_and_name_checked() {
     let streams: Vec<_> = (1..=MAX_STREAM_COUNT)
         .map(|value| (target(value as u128 + 10), format!("Stream {value}")))
         .collect();
-    assert_eq!(state().with_streams(streams).unwrap().streams().len(), 8);
+    assert_eq!(state().with_streams(streams).unwrap().streams().len(), 5);
     let overflow: Vec<_> = (0..=MAX_STREAM_COUNT)
         .map(|value| (target(value as u128 + 10), format!("Stream {value}")))
         .collect();

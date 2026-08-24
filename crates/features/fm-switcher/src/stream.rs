@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::num::NonZeroU128;
 
 /// Maximum number of durable stream targets one show can inventory.
-pub const MAX_STREAM_COUNT: usize = 8;
+pub const MAX_STREAM_COUNT: usize = 5;
 /// Largest stream target label in bytes.
 pub const MAX_STREAM_NAME_BYTES: usize = 128;
 
