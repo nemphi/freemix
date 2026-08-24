@@ -217,7 +217,9 @@ state = "planned"
 
 [[tests]]
 id = "accept-or-001"
-state = "planned"
+state = "present"
+paths = ["crates/io/fm-codec-ffmpeg/tests/record.rs", "crates/foundation/fm-protocol/tests/protocol.rs", "crates/services/fm-engine/tests/engine.rs", "apps/freemixd/tests/process.rs", "apps/freemix-cli/tests/e2e.rs"]
+commands = ["cargo test -p fm-codec-ffmpeg --test record", "cargo test -p fm-protocol --test protocol", "cargo test -p fm-engine --test engine", "cargo test -p freemixd --test process", "cargo test -p freemix-cli --test e2e"]
 [[tests]]
 id = "accept-or-002"
 state = "planned"

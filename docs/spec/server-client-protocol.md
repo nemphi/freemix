@@ -34,7 +34,7 @@ into control messages.
    replacement, restore, log compaction, or engine identity change forces a
    snapshot and a new cursor.
 
-The current Protocol 2.17 implementation uses bounded newline-delimited raw TCP.
+The current Protocol 2.18 implementation uses bounded newline-delimited raw TCP.
 Studio keeps one expected heartbeat sequence and waits for its matching
 acknowledgement within the bounded peer wait. EOF, timeout, wrong server
 identity, or wrong sequence enters the existing reconnect backoff. The server
@@ -157,6 +157,15 @@ failure code in strict target order. Peers retain only the latest record;
 violations of identity or sequence disconnect the session exactly like meter
 violations. The record never advances or carries a durable revision, and native
 `freemixd` omits it entirely while no stream runtime is active.
+
+Protocol 2.18 adds field-free `record_start` and `record_stop` commands
+authorized as transition operations. The engine owns the desired recording
+flag, snapshots project `record_desired_active`, and each acceptance that
+changes the flag emits one durable `recording_changed` event; idempotent
+replays return the original receipt without a new event. Realization is
+daemon-side: a configured recorder reconciles at readiness against the
+persisted intent, live stops drain the current segment before its final
+report, and live starts open deterministically derived segment files.
 
 Each telemetry class has requested cadence, aggregation, and maximum bandwidth.
 Slow clients receive coalesced latest data, never unbounded queues.

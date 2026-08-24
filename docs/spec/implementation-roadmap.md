@@ -453,15 +453,21 @@ remaining Fade control state without rendering shutdown-only frames, checkpoint,
 and finalize without publishing false runtime-realized events. Separate
 required-tool macOS integrations start recording from an unaligned restored
 frame and decode the resulting H.264/AAC file, while a generator integration
-covers signal shutdown during a 3,600-frame Fade. This remains a diagnostic
-recorder: Program capture uses
-synchronous GPU-to-CPU readback, recording cannot be started or stopped through
-the protocol, encoding is software-only and fixed-format, parent path traversal
-is not file-capability based, and there is no zero-copy bridge, hardware encoder,
-codec/segment policy, disk-space status, second recorder, or cross-platform
-native evidence. Multi-file `fm-record` repair is necessarily sequential after
-validation and assumes exclusive ownership of each recorder directory. Item 8
-and its parity rows therefore remain incomplete.
+covers signal shutdown during a 3,600-frame Fade. Protocol 2.18 makes the
+configured recorder runtime-controllable: field-free `record_start` and
+`record_stop` commands carry an engine-owned desired flag authorized as a
+transition operation, schema 20 persists the project's recording intent so a
+restart reconciles against it, live stop drains the segment on a finalizer
+worker with its full `FREEMIXD_RECORDER` report, and live start derives the
+next segment deterministically from the configured path
+(`<stem>-NNN.mp4`, `002..=999`, skipping existing names) before re-running the
+bounded startup pair barrier. This remains a diagnostic recorder: Program capture uses
+synchronous GPU-to-CPU readback, encoding is software-only and fixed-format,
+parent path traversal is not file-capability based, and there is no zero-copy
+bridge, hardware encoder, disk-space status, second simultaneous recorder, or
+cross-platform native evidence. Multi-file `fm-record` repair is necessarily
+sequential after validation and assumes exclusive ownership of each recorder
+directory. Item 8 and its parity rows therefore remain incomplete.
 
 Current implementation boundary for item 9: `fm-gpu` presentation telemetry
 now reports current and peak occupancy for its one-slot latest-frame queue in
@@ -1241,19 +1247,22 @@ path, emits sanitized per-target `FREEMIXD_STREAM` finalization records, and
 adds enqueue/drop counters to telemetry; startup or feed failures latch
 per-target and degrade rather than abort the show. The CLI exposes local and
 remote `stream-start`/`stream-stop`, and status prints the validated roster.
-There is no five-destination fan-out through `OutputSet`, no multi-bitrate
-rendition planning caller, no output-health UI, no live decoder acceptance of a
-recorded broadcast, and no hardware encoder, so item 1 and `OR-005` remain
-planned. The model and sink now accept SRT alongside RTMP/RTMPS:
-`srt://host[:port]` endpoints compose `?streamid=` URLs with the same key
-redaction, the FFmpeg sink muxes MPEG-TS with its own channel-layout rules,
-and a real-ffmpeg integration receives an SRT broadcast and probes H.264/AAC.
-Protocol 2.17 adds the lossy latest-wins `stream_status` peer record beside
-audio meters: native `freemixd` publishes per-target realized state, counters,
-and sanitized failures from sink telemetry each frame interval; sessions
-validate identity and monotonic sequence with meter semantics and retain the
-latest record for operator status. Snapshots still project only desired state;
-the lossy record is transport state and never durable.
+There is no five-destination fan-out through `OutputSet`, no output-health UI,
+no live decoder acceptance of a recorded broadcast, and no hardware encoder, so
+item 1 and `OR-005` remain planned. The model and sink now accept SRT alongside
+RTMP/RTMPS: `srt://host[:port]` endpoints compose `?streamid=` URLs with the
+same key redaction, the FFmpeg sink muxes MPEG-TS with its own channel-layout
+rules, and a real-ffmpeg integration receives an SRT broadcast and probes
+H.264/AAC. Schema 20 persists each target's authored video bitrate and native
+sessions thread it into the encoder, but there is still no shared-rendition
+planning caller fanning one readback out across destinations. Protocol 2.17
+adds the lossy latest-wins `stream_status` peer record beside audio meters:
+native `freemixd` publishes per-target realized state, counters, and sanitized
+failures from sink telemetry each frame interval; sessions validate identity
+and monotonic sequence with meter semantics and retain the latest record for
+operator status; Studio swallows the records beside meters and renders the
+roster with live samples. Snapshots still project only desired state; the
+lossy record is transport state and never durable.
 
 Exit: a remote-controlled headless production can stream and record
 independently with tested recovery.
