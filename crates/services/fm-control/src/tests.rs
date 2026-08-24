@@ -1995,3 +1995,78 @@ fn admin_can_stop_streams_and_snapshots_carry_the_desired_projection() {
     control.tick(&server_identity()).unwrap();
     assert!(!control.snapshot().snapshot.streams[0].desired_running);
 }
+
+#[test]
+fn record_commands_require_transition_permission_and_project_the_desired_flag() {
+    let mut control = streamed_service();
+    let denied = control
+        .submit(
+            &principal(Role::Viewer),
+            command("denied", "denied-key", CommandPayload::RecordStart),
+            0,
+        )
+        .unwrap();
+    assert!(matches!(
+        denied.output.result,
+        CommandResult::Rejected { ref code, .. } if code == "permission_denied"
+    ));
+    assert_eq!(control.diagnostics().current_revision, 0);
+    assert!(!control.snapshot().snapshot.record_desired_active);
+
+    let accepted = control
+        .submit(
+            &principal(Role::Operator),
+            command("rec-on", "rec-on-key", CommandPayload::RecordStart),
+            0,
+        )
+        .unwrap();
+    assert!(accepted.is_accepted());
+    assert_eq!(
+        accepted.output.events,
+        vec![EventMessage {
+            cursor: EventCursor {
+                engine: control.identity().clone(),
+                revision: 1,
+            },
+            payload: EventPayload::RecordingChanged { active: true },
+        }]
+    );
+    assert!(control.snapshot().snapshot.record_desired_active);
+
+    let replay = control
+        .submit(
+            &principal(Role::Operator),
+            command("again", "rec-on-key", CommandPayload::RecordStart),
+            0,
+        )
+        .unwrap();
+    assert!(replay.replayed);
+    assert!(replay.output.events.is_empty());
+
+    let stopped = control
+        .submit(
+            &principal(Role::Operator),
+            command("rec-off", "rec-off-key", CommandPayload::RecordStop),
+            0,
+        )
+        .unwrap();
+    assert!(stopped.is_accepted());
+    assert_eq!(
+        stopped.output.events[0].payload,
+        EventPayload::RecordingChanged { active: false }
+    );
+    control.tick(&server_identity()).unwrap();
+    assert!(!control.snapshot().snapshot.record_desired_active);
+
+    let viewer_denied_stop = control
+        .submit(
+            &principal(Role::Viewer),
+            command("viewer-off", "viewer-off-key", CommandPayload::RecordStop),
+            0,
+        )
+        .unwrap();
+    assert!(matches!(
+        viewer_denied_stop.output.result,
+        CommandResult::Rejected { ref code, .. } if code == "permission_denied"
+    ));
+}

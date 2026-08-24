@@ -82,6 +82,7 @@ fn snapshot(project_id: ProjectId, revision: u64) -> ProjectSnapshot {
         input_audio_strips: input_audio_strips(),
         stingers: Vec::new(),
         streams: Vec::new(),
+        record_desired_active: false,
         desired_overlays: overlays(),
         realized_overlays: overlays(),
         switcher: SwitcherState {
@@ -841,4 +842,57 @@ fn streams_changed_events_replace_the_latest_replicated_projection() {
         model.state().unwrap().streams(),
         [stream(5, "Twitch", true), stream(9, "YouTube", false),].as_slice()
     );
+}
+
+#[test]
+fn snapshot_record_desired_active_projects_into_state_and_view() {
+    let project_id = project(10);
+    let inactive = snapshot(project_id, 1);
+    assert!(!inactive.record_desired_active);
+    let mut model = ClientModel::new(project_id);
+    model.install_snapshot(inactive.clone()).unwrap();
+    assert!(!model.state().unwrap().record_desired_active());
+    assert!(!model.view().unwrap().record_desired_active);
+
+    let mut active = snapshot(project_id, 2);
+    active.record_desired_active = true;
+    model.install_snapshot(active).unwrap();
+    assert!(model.state().unwrap().record_desired_active());
+    assert_eq!(
+        model.view().unwrap().streams,
+        inactive.streams,
+        "recording projection is independent of the stream roster"
+    );
+}
+
+#[test]
+fn recording_changed_events_replace_the_latest_replicated_projection() {
+    let project_id = project(10);
+    let mut initial = snapshot(project_id, 4);
+    initial.record_desired_active = false;
+    let mut model = ClientModel::new(project_id);
+    model.install_snapshot(initial).unwrap();
+    let identity = model.reconnect_cursor().unwrap().engine.clone();
+
+    model
+        .apply_event(event(
+            project_id,
+            identity.clone(),
+            5,
+            DurableChange::RecordingChanged { active: true },
+        ))
+        .unwrap();
+    assert!(model.state().unwrap().record_desired_active());
+    assert!(model.view().unwrap().record_desired_active);
+    assert_eq!(model.sync_status(), &SyncStatus::Current);
+
+    model
+        .apply_event(event(
+            project_id,
+            identity,
+            6,
+            DurableChange::RecordingChanged { active: false },
+        ))
+        .unwrap();
+    assert!(!model.state().unwrap().record_desired_active());
 }

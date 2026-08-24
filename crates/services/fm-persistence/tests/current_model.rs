@@ -181,6 +181,8 @@ fn rich_stream_target(high: u128) -> StreamTarget {
         StreamEndpoint::parse("backup.example.test/live/eu").unwrap(),
     ))
     .unwrap()
+    .with_video_bitrate(9_000)
+    .unwrap()
     .with_startup(StartupPolicy::ReconcileDesiredState)
     .set_running(true)
 }
@@ -546,7 +548,7 @@ fn stream_target_running_state_round_trips_and_is_required_at_the_current_schema
     // boolean value and the manifest must carry the current schema version.
     store.save(&stored_rich_project()).unwrap();
     let valid = fs::read_to_string(store.manifest_path()).unwrap();
-    assert!(valid.contains("\"schema_version\": 19"));
+    assert!(valid.contains("\"schema_version\": 20"));
     for malformed in [
         valid.replacen(",\n        \"running\": true", "", 1),
         valid.replacen("\"running\": true", "\"running\": \"true\"", 1),
@@ -562,11 +564,97 @@ fn stream_target_running_state_round_trips_and_is_required_at_the_current_schema
     // An older manifest is refused outright; no migration path exists.
     fs::write(
         store.manifest_path(),
-        valid.replacen("\"schema_version\": 19", "\"schema_version\": 18", 1),
+        valid.replacen("\"schema_version\": 20", "\"schema_version\": 19", 1),
     )
     .unwrap();
     let error = store.load().unwrap_err();
     assert!(matches!(error, StoreError::Validation(_)), "got {error:?}");
+}
+
+#[test]
+fn recording_intent_and_video_bitrate_round_trip_at_the_current_schema() {
+    let temp = TestDirectory::new("recording-bitrate");
+    let store = temp.store("show");
+
+    for recording_desired_active in [true, false] {
+        let mut project = rich_project();
+        project.set_recording_desired_active(recording_desired_active);
+        let expected = StoredProject::from_project(
+            project,
+            RuntimeRouting::default(),
+            ProjectPosition::default(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        store.save(&expected).unwrap();
+        let encoded = fs::read_to_string(store.manifest_path()).unwrap();
+        assert!(encoded.contains(&format!(
+            "\"recording_desired_active\": {recording_desired_active}"
+        )));
+        assert!(
+            encoded.contains("\"video_bitrate_kbps\": 9000"),
+            "authored video bitrate must be written verbatim"
+        );
+
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded, expected);
+        assert_eq!(
+            loaded.project().recording_desired_active(),
+            recording_desired_active
+        );
+        assert_eq!(
+            loaded.project().stream_targets()[0].video_bitrate_kbps(),
+            9_000
+        );
+    }
+
+    // Both fields belong to the current contract: missing or wrong-typed
+    // values are refused as malformed manifests.
+    store.save(&stored_rich_project()).unwrap();
+    let valid = fs::read_to_string(store.manifest_path()).unwrap();
+    for malformed in [
+        valid.replacen(",\n    \"recording_desired_active\": false", "", 1),
+        valid.replacen(
+            "\"recording_desired_active\": false",
+            "\"recording_desired_active\": \"false\"",
+            1,
+        ),
+        valid.replacen(
+            "\"recording_desired_active\": false",
+            "\"recording_desired_active\": 0",
+            1,
+        ),
+        valid.replacen(",\n        \"video_bitrate_kbps\": 9000", "", 1),
+        valid.replacen(
+            "\"video_bitrate_kbps\": 9000",
+            "\"video_bitrate_kbps\": \"9000\"",
+            1,
+        ),
+    ] {
+        fs::write(store.manifest_path(), malformed).unwrap();
+        assert!(matches!(
+            store.load(),
+            Err(StoreError::MalformedManifest { .. })
+        ));
+    }
+
+    // The bitrate bound is enforced at decode through the model constructor.
+    for out_of_range in ["999", "100001", "0"] {
+        fs::write(
+            store.manifest_path(),
+            valid.replacen(
+                "\"video_bitrate_kbps\": 9000",
+                &format!("\"video_bitrate_kbps\": {out_of_range}"),
+                1,
+            ),
+        )
+        .unwrap();
+        assert!(matches!(
+            store.load(),
+            Err(StoreError::MalformedManifest { .. })
+        ));
+    }
 }
 
 #[test]

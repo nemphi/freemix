@@ -148,6 +148,13 @@ impl FakeRemoteServer {
         Self { address, worker }
     }
 
+    fn start_record_start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || serve_record_start(&listener));
+        Self { address, worker }
+    }
+
     fn start_manual_position() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -567,14 +574,85 @@ fn serve_stream_start(listener: &TcpListener) {
             },
         }),
     );
-    serve_streams_snapshot_peer(listener, &engine, target);
+    serve_streams_snapshot_peer(
+        listener,
+        &engine,
+        vec![fm_protocol::StreamStatus {
+            target,
+            name: "Main ingest".into(),
+            desired_running: true,
+            realized: fm_protocol::StreamRealizedState::Live,
+            detail: None,
+        }],
+        false,
+    );
 }
 
-/// Serves a Viewer session whose initial snapshot reports the durable stream.
+/// Serves one Operator `RecordStart` command session followed by one Viewer
+/// session whose snapshot carries the durable recording flag.
+fn serve_record_start(listener: &TcpListener) {
+    let engine = EngineIdentity {
+        engine_id: "project-42".into(),
+        state_epoch: 1,
+        log_id: "fake-remote-log".into(),
+    };
+    let (stream, _) = listener.accept().unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(stream);
+    assert_handshake_request(read_message(&mut reader));
+    write_handshake_role(&mut writer, &engine, 0, Role::Operator);
+
+    let WireMessage::Command(command) = read_message(&mut reader) else {
+        panic!("expected remote record command");
+    };
+    assert_command(
+        &command,
+        &CommandPayload::RecordStart,
+        "remote-record-start",
+        0,
+    );
+    write_message(
+        &mut writer,
+        &WireMessage::CommandResult(CommandResult::Accepted {
+            id: command.id,
+            revision: 1,
+            scheduled_frame: None,
+        }),
+    );
+    write_message(
+        &mut writer,
+        &WireMessage::Event(EventMessage {
+            cursor: EventCursor {
+                engine: engine.clone(),
+                revision: 1,
+            },
+            payload: EventPayload::RecordingChanged { active: true },
+        }),
+    );
+    write_message(
+        &mut writer,
+        &WireMessage::RuntimeEvent(RuntimeEventMessage {
+            server: server_identity(&engine),
+            revision: 1,
+            generation: 1,
+            sequence: 1,
+            event: RuntimeLifecycleEvent::Realized {
+                domain: "switcher".into(),
+                manual_transition: fm_protocol::ManualTransitionStatus::Inactive,
+                fade_to_black: live_fade_to_black(),
+            },
+        }),
+    );
+    serve_streams_snapshot_peer(listener, &engine, Vec::new(), true);
+}
+
+/// Serves a Viewer session whose initial snapshot reports the durable streams
+/// roster and recording flag.
 fn serve_streams_snapshot_peer(
     listener: &TcpListener,
     engine: &EngineIdentity,
-    target: fm_protocol::WireStreamTargetId,
+    streams: Vec<fm_protocol::StreamStatus>,
+    record_desired_active: bool,
 ) {
     let (stream, _) = listener.accept().unwrap();
     let mut writer = stream.try_clone().unwrap();
@@ -618,13 +696,8 @@ fn serve_streams_snapshot_peer(
             desired_fade_to_black: live_fade_to_black(),
             realized_fade_to_black: live_fade_to_black(),
             stingers: Vec::new(),
-            streams: vec![fm_protocol::StreamStatus {
-                target,
-                name: "Main ingest".into(),
-                desired_running: true,
-                realized: fm_protocol::StreamRealizedState::Live,
-                detail: None,
-            }],
+            streams,
+            record_desired_active,
             desired_overlays: OverlayStatus::empty_channels(),
             realized_overlays: OverlayStatus::empty_channels(),
         }),
@@ -1166,6 +1239,7 @@ fn write_handshake_version_with_manual(
             realized_fade_to_black: live_fade_to_black(),
             stingers: Vec::new(),
             streams: Vec::new(),
+            record_desired_active: false,
             desired_overlays: OverlayStatus::empty_channels(),
             realized_overlays: OverlayStatus::empty_channels(),
         }),
@@ -1240,6 +1314,7 @@ fn write_handshake_version_with_fade_to_black(
             realized_overlays: OverlayStatus::empty_channels(),
             stingers: Vec::new(),
             streams: Vec::new(),
+            record_desired_active: false,
         }),
     );
 }
@@ -2487,6 +2562,7 @@ fn author_stream_destination(context: &ContractContext) {
 
 /// Every authoring refusal must be reported and must leave the bundle
 /// byte-identical, including the one that protects a published output.
+#[allow(clippy::too_many_lines)]
 fn assert_stream_authoring_refusals_are_atomic(context: &ContractContext) {
     let unchanged = fs::read(context.project.join("project.json")).unwrap();
     for (arguments, expected) in [
@@ -2540,6 +2616,34 @@ fn assert_stream_authoring_refusals_are_atomic(context: &ContractContext) {
         ),
         (
             vec![
+                "stream-add",
+                context.project_path(),
+                "41",
+                "30",
+                "rtmps://ingest.example.test/live",
+                STREAM_KEY,
+                "Second",
+                "--video-bitrate-kbps",
+                "999",
+            ],
+            "video bitrate must be at least 1000 kbps",
+        ),
+        (
+            vec![
+                "stream-add",
+                context.project_path(),
+                "41",
+                "30",
+                "rtmps://ingest.example.test/live",
+                STREAM_KEY,
+                "Second",
+                "--video-bitrate-kbps",
+                "100001",
+            ],
+            "video bitrate must not exceed 100000 kbps",
+        ),
+        (
+            vec![
                 "stream-update",
                 context.project_path(),
                 "999",
@@ -2576,6 +2680,13 @@ fn local_stream_destinations_are_authored_offline_and_never_print_the_stream_key
     assert_eq!(target.name(), "Main ingest");
     assert_eq!(target.key().expose_secret(), KEY);
     assert_eq!(target.startup(), StartupPolicy::ReconcileDesiredState);
+    // Destinations authored without naming a bitrate assume the default.
+    assert_eq!(target.video_bitrate_kbps(), 4_500);
+    assert!(
+        fs::read_to_string(context.project.join("project.json"))
+            .unwrap()
+            .contains("\"video_bitrate_kbps\": 4500")
+    );
 
     // The inventory line is the operator-facing surface. It must carry enough
     // to identify the destination and none of the secret.
@@ -2639,6 +2750,8 @@ fn local_stream_destinations_are_authored_offline_and_never_print_the_stream_key
         "rtmp://relay.example.test/live",
         "rotated-key-0001",
         "Main ingest",
+        "--video-bitrate-kbps",
+        "8000",
     ]));
     let updated = store.load().unwrap();
     let target = &updated.project().stream_targets()[0];
@@ -2646,6 +2759,7 @@ fn local_stream_destinations_are_authored_offline_and_never_print_the_stream_key
     assert_eq!(target.redacted_url(), "rtmp://relay.example.test/live/****");
     assert_eq!(target.backup_endpoint(), None);
     assert_eq!(target.startup(), StartupPolicy::Stopped);
+    assert_eq!(target.video_bitrate_kbps(), 8_000);
 
     assert_success(&invoke_bounded(&[
         "stream-remove",
@@ -2707,13 +2821,13 @@ fn local_stream_start_stop_round_trip_persists_desired_running() {
     let store = ProjectStore::new(&context.project).unwrap();
     assert_eq!(
         json_number(&manifest(&context.project), "schema_version"),
-        19
+        20
     );
 
     let started = invoke_bounded(&["stream-start", context.project_path(), "40"]);
     assert_success(&started);
     let started_manifest = manifest(&context.project);
-    assert_eq!(json_number(&started_manifest, "schema_version"), 19);
+    assert_eq!(json_number(&started_manifest, "schema_version"), 20);
     assert!(started_manifest.contains("\"running\": true"));
     let loaded = store.load().unwrap();
     let target = &loaded.project().stream_targets()[0];
@@ -2726,7 +2840,7 @@ fn local_stream_start_stop_round_trip_persists_desired_running() {
     let stopped = invoke_bounded(&["stream-stop", context.project_path(), "40"]);
     assert_success(&stopped);
     let stopped_manifest = manifest(&context.project);
-    assert_eq!(json_number(&stopped_manifest, "schema_version"), 19);
+    assert_eq!(json_number(&stopped_manifest, "schema_version"), 20);
     assert!(stopped_manifest.contains("\"running\": false"));
     assert!(!stopped_manifest.contains("\"running\": true"));
     assert!(!store.load().unwrap().project().stream_targets()[0].running());
@@ -2791,6 +2905,91 @@ fn remote_stream_start_is_accepted_and_replicates_the_streams_roster() {
     assert!(
         stdout(&observed)
             .contains(r#"Streams=[40:"Main ingest":desired=true:realized=live:detail=none]"#)
+    );
+    server.finish();
+}
+
+#[test]
+fn local_record_start_stop_round_trip_persists_recording_desired_active() {
+    let context = ContractContext::new();
+    assert_success(&invoke_bounded(&["new", context.project_path()]));
+    let store = ProjectStore::new(&context.project).unwrap();
+    assert_eq!(
+        json_number(&manifest(&context.project), "schema_version"),
+        20
+    );
+    assert!(manifest(&context.project).contains("\"recording_desired_active\": false"));
+
+    let started = invoke_bounded(&["record-start", context.project_path()]);
+    assert_success(&started);
+    let started_manifest = manifest(&context.project);
+    assert_eq!(json_number(&started_manifest, "schema_version"), 20);
+    assert!(started_manifest.contains("\"recording_desired_active\": true"));
+    assert!(!started_manifest.contains("\"recording_desired_active\": false"));
+    assert!(stdout(&started).contains("recording_desired=true"));
+    assert_eq!(status(&context.project), stdout(&started));
+
+    let stopped = invoke_bounded(&["record-stop", context.project_path()]);
+    assert_success(&stopped);
+    let stopped_manifest = manifest(&context.project);
+    assert_eq!(json_number(&stopped_manifest, "schema_version"), 20);
+    assert!(stopped_manifest.contains("\"recording_desired_active\": false"));
+    assert!(!stopped_manifest.contains("\"recording_desired_active\": true"));
+    assert!(stdout(&stopped).contains("recording_desired=false"));
+    assert_eq!(status(&context.project), stdout(&stopped));
+
+    // A refusal must leave both the manifest and the journal byte-identical.
+    store
+        .append_batch(&MutationBatch::new(1, 2, 3, b"unapplied".to_vec()))
+        .unwrap();
+    let manifest_before_failure = fs::read(context.project.join("project.json")).unwrap();
+    let journal_before = journal_bytes(&store);
+    for arguments in [
+        vec!["record-start", context.project_path()],
+        vec!["record-stop", context.project_path()],
+    ] {
+        let failure = invoke_bounded(&arguments);
+        assert_failure_contains(
+            &failure,
+            "project has unapplied journal batches that freemix-cli cannot safely interpret",
+        );
+        assert_eq!(
+            fs::read(context.project.join("project.json")).unwrap(),
+            manifest_before_failure
+        );
+        assert_eq!(journal_bytes(&store), journal_before);
+    }
+
+    fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
+fn remote_record_start_is_accepted_and_replicates_the_recording_flag() {
+    let server = FakeRemoteServer::start_record_start();
+    let address = server.address();
+    let output = invoke_bounded(&[
+        "remote-record-start",
+        &address,
+        "--key",
+        "remote-record-start",
+        "--expect",
+        "0",
+    ]);
+    assert_success(&output);
+    let status = stdout(&output);
+    assert_remote_status(&status, 1, 1, 1, 2, 2);
+    assert!(
+        status.contains("Recording=desired=true"),
+        "status output should surface the durable recording flag: {status}"
+    );
+
+    // A second Viewer client reconnecting to the daemon observes the flag.
+    let observed = invoke_bounded(&["remote-status", &address]);
+    assert_success(&observed);
+    let observed_status = stdout(&observed);
+    assert!(
+        observed_status.contains("Recording=desired=true"),
+        "reconnecting viewer should see the replicated recording flag: {observed_status}"
     );
     server.finish();
 }

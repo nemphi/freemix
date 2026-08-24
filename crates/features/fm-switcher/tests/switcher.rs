@@ -1014,3 +1014,47 @@ fn stream_running_flags_validate_targets_and_preserve_insertion_order() {
         Err(SwitcherError::UnknownStreamTarget(target(99)))
     );
 }
+
+#[test]
+fn recording_desired_flags_emit_only_on_transition_and_apply_through_commands() {
+    let mut switcher = state();
+    assert!(!switcher.recording_desired());
+    assert_eq!(
+        switcher.set_recording_desired(true),
+        Ok(vec![SwitcherEvent::RecordingDesiredChanged {
+            active: true
+        }])
+    );
+    assert!(switcher.recording_desired());
+
+    assert_eq!(
+        switcher.set_recording_desired(true),
+        Ok(Vec::<SwitcherEvent>::new())
+    );
+    assert_eq!(
+        switcher.apply(SwitcherCommand::SetRecordingDesired(false)),
+        Ok(vec![SwitcherEvent::RecordingDesiredChanged {
+            active: false
+        }])
+    );
+    assert!(!switcher.recording_desired());
+    assert_eq!(
+        switcher.apply(SwitcherCommand::SetRecordingDesired(false)),
+        Ok(Vec::<SwitcherEvent>::new())
+    );
+
+    let mut mid_transition = streamed_switcher();
+    mid_transition
+        .apply(SwitcherCommand::Transition {
+            kind: TransitionKind::Fade,
+            duration_frames: 4,
+        })
+        .unwrap();
+    assert_eq!(
+        mid_transition.apply(SwitcherCommand::SetRecordingDesired(true)),
+        Ok(vec![SwitcherEvent::RecordingDesiredChanged {
+            active: true
+        }])
+    );
+    assert!(mid_transition.recording_desired());
+}

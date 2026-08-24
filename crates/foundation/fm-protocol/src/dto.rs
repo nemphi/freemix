@@ -604,6 +604,8 @@ pub enum CommandPayload {
     StreamStop {
         target: WireStreamTargetId,
     },
+    RecordStart,
+    RecordStop,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -715,6 +717,7 @@ pub struct SnapshotMessage {
     pub realized_fade_to_black: FadeToBlackState,
     pub stingers: Vec<StingerStatus>,
     pub streams: Vec<StreamStatus>,
+    pub record_desired_active: bool,
     pub desired_overlays: Vec<OverlayStatus>,
     pub realized_overlays: Vec<OverlayStatus>,
 }
@@ -748,6 +751,9 @@ pub enum EventPayload {
     },
     StreamsChanged {
         streams: Vec<StreamStatus>,
+    },
+    RecordingChanged {
+        active: bool,
     },
 }
 

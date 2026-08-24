@@ -87,6 +87,12 @@ fn write_project(output: &mut String, project: &fm_model::Project) {
             .expect("writing to a string cannot fail");
         }
     }
+    write!(
+        output,
+        ",\n    \"recording_desired_active\": {}",
+        project.recording_desired_active()
+    )
+    .expect("writing to a string cannot fail");
     output.push_str("\n  },");
 }
 
@@ -356,10 +362,11 @@ fn write_stream_targets(output: &mut String, project: &fm_model::Project) {
         escape_string(output, target.key().expose_secret());
         write!(
             output,
-            "\",\n        \"startup\": \"{}\",\n        \"output\": {},\n        \"running\": {}\n      }}",
+            "\",\n        \"startup\": \"{}\",\n        \"output\": {},\n        \"running\": {},\n        \"video_bitrate_kbps\": {}\n      }}",
             startup_policy(target.startup()),
             target.output(),
             target.running(),
+            target.video_bitrate_kbps(),
         )
         .expect("writing to a string cannot fail");
     }

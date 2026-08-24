@@ -56,6 +56,7 @@ pub enum SwitcherCommand {
         target: StreamTargetId,
         running: bool,
     },
+    SetRecordingDesired(bool),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -152,6 +153,9 @@ pub enum SwitcherEvent {
     StreamRunningChanged {
         target: StreamTargetId,
         running: bool,
+    },
+    RecordingDesiredChanged {
+        active: bool,
     },
 }
 

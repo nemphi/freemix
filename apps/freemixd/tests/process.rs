@@ -2793,7 +2793,8 @@ fn help_documents_program_output_and_fullscreen_selection() {
     assert!(stdout.contains("--camera-helper PATH"));
     assert!(stdout.contains("never requests permission"));
     assert!(stdout.contains("--record-program=<path>"));
-    assert!(stdout.contains("Existing files are never overwritten"));
+    assert!(stdout.contains("segments are created exclusively, never overwritten"));
+    assert!(stdout.contains("later record-start segments use"));
     assert!(stdout.contains("configured startup support"));
     assert!(stdout.contains("FREEMIXD_RECORDER reports runtime health"));
     assert!(stdout.contains("zero-based index"));
@@ -3036,7 +3037,11 @@ fn canonical_project() -> Project {
             },
         },
     )
-    .with_restart_policy(RestartPolicy::Always);
+    .with_restart_policy(RestartPolicy::Always)
+    // Recorder process tests start daemons with --record-program against this
+    // fixture, so its authored desired recording flag is active. Without a
+    // configured recorder the flag is inert durable state.
+    .with_recording_desired_active(true);
     for (index, input) in [
         SimulatedInput::new(
             SimulatedVideo::Solid(SolidColor::new(12, 34, 56, 255)),

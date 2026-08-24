@@ -131,6 +131,7 @@ fn snapshot(revision: u64) -> SnapshotMessage {
         },
         stingers: Vec::new(),
         streams: Vec::new(),
+        record_desired_active: false,
         desired_overlays: OverlayStatus::empty_channels(),
         realized_overlays: OverlayStatus::empty_channels(),
     }

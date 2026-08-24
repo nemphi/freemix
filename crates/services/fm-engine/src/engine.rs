@@ -166,6 +166,8 @@ pub enum EngineCommand {
     StreamStop {
         target: StreamTargetId,
     },
+    RecordStart,
+    RecordStop,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -179,6 +181,7 @@ pub enum EngineEvent {
     InputRenamed { input: InputId, name: String },
     InputOrderChanged { inputs: Vec<InputId> },
     StreamsChanged { streams: Vec<EngineStreamStatus> },
+    RecordingChanged { active: bool },
 }
 
 /// Engine-level desired status of one stream target; realization is owned by
@@ -602,6 +605,10 @@ impl Engine {
                         &command,
                         EngineCommand::StreamStart { .. } | EngineCommand::StreamStop { .. }
                     )
+                    && !matches!(
+                        &command,
+                        EngineCommand::RecordStart | EngineCommand::RecordStop
+                    )
                     && !is_overlay_command(&command)
                 {
                     let name = match kind {
@@ -658,7 +665,9 @@ impl Engine {
                 | EngineCommand::CommitManualTransition
                 | EngineCommand::CancelManualTransition
                 | EngineCommand::StreamStart { .. }
-                | EngineCommand::StreamStop { .. } => None,
+                | EngineCommand::StreamStop { .. }
+                | EngineCommand::RecordStart
+                | EngineCommand::RecordStop => None,
                 EngineCommand::Wipe { .. } => Some(TransitionKind::Wipe),
             } {
                 self.transition_in_flight = Some(kind);
@@ -867,6 +876,7 @@ fn validate_idle_restore(
         || show.desired_switcher().streams() != realized_switcher.streams()
         || show.desired_switcher().running_stream_targets()
             != realized_switcher.running_stream_targets()
+        || show.desired_switcher().recording_desired() != realized_switcher.recording_desired()
     {
         return Err(SnapshotError::MismatchedSwitcherRouting);
     }
@@ -1029,6 +1039,12 @@ impl Mutation<ShowState, EngineEvent, EngineAcceptance> for EngineMutation {
         }
         if matches!(
             &self.command,
+            EngineCommand::RecordStart | EngineCommand::RecordStop
+        ) {
+            return apply_recording_mutation(state, events, self);
+        }
+        if matches!(
+            &self.command,
             EngineCommand::TakeOverlay { .. }
                 | EngineCommand::UpdateOverlay { .. }
                 | EngineCommand::OverlayOff { .. }
@@ -1144,6 +1160,9 @@ impl Mutation<ShowState, EngineEvent, EngineAcceptance> for EngineMutation {
             EngineCommand::StreamStart { .. } | EngineCommand::StreamStop { .. } => {
                 unreachable!("stream mutations return before switcher command mapping")
             }
+            EngineCommand::RecordStart | EngineCommand::RecordStop => {
+                unreachable!("recording mutations return before switcher command mapping")
+            }
         };
         state
             .desired_switcher_mut()
@@ -1177,6 +1196,27 @@ fn apply_stream_mutation(
     events.push(EngineEvent::StreamsChanged {
         streams: desired_stream_statuses(state),
     });
+    Ok(EngineAcceptance { target_frame })
+}
+
+fn apply_recording_mutation(
+    state: &mut ShowState,
+    events: &mut Vec<EngineEvent>,
+    mutation: EngineMutation,
+) -> Result<EngineAcceptance, Rejection> {
+    let EngineMutation {
+        target_frame,
+        command,
+    } = mutation;
+    let active = matches!(command, EngineCommand::RecordStart);
+    let previous = state.desired_switcher().recording_desired();
+    state
+        .desired_switcher_mut()
+        .set_recording_desired(active)
+        .map_err(switcher_rejection)?;
+    if previous != active {
+        events.push(EngineEvent::RecordingChanged { active });
+    }
     Ok(EngineAcceptance { target_frame })
 }
 
@@ -1325,6 +1365,7 @@ fn apply_stinger_mutation(
     Ok(EngineAcceptance { target_frame })
 }
 
+#[allow(clippy::too_many_lines)]
 fn apply_runtime(
     switcher: &mut SwitcherState,
     command: EngineCommand,
@@ -1336,6 +1377,9 @@ fn apply_runtime(
         return Ok(Vec::new());
     }
     if let Some(result) = apply_runtime_stream(switcher, &command) {
+        return result;
+    }
+    if let Some(result) = apply_runtime_recording(switcher, &command) {
         return result;
     }
     if let EngineCommand::ReorderInputs { inputs } = command {
@@ -1428,6 +1472,9 @@ fn apply_runtime(
         EngineCommand::StreamStart { .. } | EngineCommand::StreamStop { .. } => {
             unreachable!("stream commands return before switcher command mapping")
         }
+        EngineCommand::RecordStart | EngineCommand::RecordStop => {
+            unreachable!("recording commands return before switcher command mapping")
+        }
     })
 }
 
@@ -1438,6 +1485,17 @@ fn apply_runtime_stream(
     match command {
         EngineCommand::StreamStart { target } => Some(switcher.set_stream_running(*target, true)),
         EngineCommand::StreamStop { target } => Some(switcher.set_stream_running(*target, false)),
+        _ => None,
+    }
+}
+
+fn apply_runtime_recording(
+    switcher: &mut SwitcherState,
+    command: &EngineCommand,
+) -> Option<Result<Vec<SwitcherEvent>, SwitcherError>> {
+    match command {
+        EngineCommand::RecordStart => Some(switcher.set_recording_desired(true)),
+        EngineCommand::RecordStop => Some(switcher.set_recording_desired(false)),
         _ => None,
     }
 }

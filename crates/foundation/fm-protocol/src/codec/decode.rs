@@ -315,6 +315,8 @@ fn decode_command_payload(
         | "overlay_transition" | "overlay_appearance" | "overlay_queue"
         | "overlay_next") => decode_overlay_command(fields, overlay)?,
         stream @ ("stream_start" | "stream_stop") => decode_stream_command(fields, stream)?,
+        "record_start" => CommandPayload::RecordStart,
+        "record_stop" => CommandPayload::RecordStop,
         "wipe" => CommandPayload::Wipe {
             duration_frames: fields.parse_required("duration_frames")?,
         },
@@ -579,6 +581,7 @@ fn decode_snapshot(fields: &mut Fields) -> Result<SnapshotMessage, CodecError> {
         )?,
         stingers: decode_stingers(fields)?,
         streams: parse_stream_statuses(&fields.required("streams")?)?,
+        record_desired_active: fields.boolean("record_desired_active")?,
         desired_overlays: decode_overlays(fields, "desired_overlays")?,
         realized_overlays: decode_overlays(fields, "realized_overlays")?,
     })
@@ -911,6 +914,9 @@ fn decode_event(fields: &mut Fields) -> Result<EventMessage, CodecError> {
         },
         "streams_changed" => EventPayload::StreamsChanged {
             streams: parse_stream_statuses(&fields.required("streams")?)?,
+        },
+        "recording_changed" => EventPayload::RecordingChanged {
+            active: fields.boolean("active")?,
         },
         _ => {
             return Err(CodecError::InvalidField {

@@ -57,6 +57,15 @@ pub const MAX_STREAM_KEY_BYTES: usize = 512;
 /// What a redacted stream key renders as, byte for byte as the sink renders it.
 pub const REDACTED_STREAM_KEY: &str = "****";
 
+/// Lowest authored video bitrate for one destination, in kilobits per second.
+pub const MIN_VIDEO_BITRATE_KBPS: u32 = 1_000;
+
+/// Highest authored video bitrate for one destination, in kilobits per second.
+pub const MAX_VIDEO_BITRATE_KBPS: u32 = 100_000;
+
+/// Video bitrate assumed when a destination is authored without naming one.
+pub const DEFAULT_VIDEO_BITRATE_KBPS: u32 = 4_500;
+
 /// Stable identity of one configured streaming destination.
 ///
 /// Domain ids normally live in `fm-types`; this one lives here because the
@@ -307,6 +316,33 @@ impl fmt::Display for StreamKeyError {
 
 impl std::error::Error for StreamKeyError {}
 
+/// Why an authored video bitrate was refused.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StreamVideoBitrateError {
+    /// Below [`MIN_VIDEO_BITRATE_KBPS`], which no ingest accepts as a real
+    /// encode target.
+    TooLow,
+    /// Above [`MAX_VIDEO_BITRATE_KBPS`].
+    TooHigh,
+}
+
+impl fmt::Display for StreamVideoBitrateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooLow => write!(
+                formatter,
+                "stream video bitrate must be at least {MIN_VIDEO_BITRATE_KBPS} kbps"
+            ),
+            Self::TooHigh => write!(
+                formatter,
+                "stream video bitrate must not exceed {MAX_VIDEO_BITRATE_KBPS} kbps"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for StreamVideoBitrateError {}
+
 /// One validated stream key.
 ///
 /// The value is never rendered. There is no `Display`, `Debug` prints
@@ -408,6 +444,7 @@ pub struct StreamTarget {
     key: StreamKey,
     startup: StartupPolicy,
     running: bool,
+    video_bitrate_kbps: u32,
     output: OutputId,
 }
 
@@ -448,6 +485,7 @@ impl StreamTarget {
             key,
             startup: StartupPolicy::Stopped,
             running: false,
+            video_bitrate_kbps: DEFAULT_VIDEO_BITRATE_KBPS,
             output,
         })
     }
@@ -483,6 +521,22 @@ impl StreamTarget {
     pub fn set_running(mut self, running: bool) -> Self {
         self.running = running;
         self
+    }
+
+    /// Builder-style setter for the authored video bitrate, in kilobits per
+    /// second.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StreamVideoBitrateError`] when the bitrate falls outside
+    /// [`MIN_VIDEO_BITRATE_KBPS`]..=[`MAX_VIDEO_BITRATE_KBPS`].
+    pub fn with_video_bitrate(
+        mut self,
+        video_bitrate_kbps: u32,
+    ) -> Result<Self, StreamVideoBitrateError> {
+        validate_video_bitrate(video_bitrate_kbps)?;
+        self.video_bitrate_kbps = video_bitrate_kbps;
+        Ok(self)
     }
 
     #[must_use]
@@ -527,6 +581,12 @@ impl StreamTarget {
     #[must_use]
     pub const fn running(&self) -> bool {
         self.running
+    }
+
+    /// The authored video bitrate, in kilobits per second.
+    #[must_use]
+    pub const fn video_bitrate_kbps(&self) -> u32 {
+        self.video_bitrate_kbps
     }
 
     /// The output this destination takes video and audio from.
@@ -634,4 +694,14 @@ fn url_bytes(protocol: StreamProtocol, endpoint: &StreamEndpoint, key: &StreamKe
         + endpoint.as_str().len()
         + separator
         + key.expose_secret().len()
+}
+
+fn validate_video_bitrate(video_bitrate_kbps: u32) -> Result<(), StreamVideoBitrateError> {
+    if video_bitrate_kbps < MIN_VIDEO_BITRATE_KBPS {
+        Err(StreamVideoBitrateError::TooLow)
+    } else if video_bitrate_kbps > MAX_VIDEO_BITRATE_KBPS {
+        Err(StreamVideoBitrateError::TooHigh)
+    } else {
+        Ok(())
+    }
 }

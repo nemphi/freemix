@@ -330,7 +330,8 @@ impl Remote {
                         }
                         EventPayload::DesiredSwitcher { .. }
                         | EventPayload::StingerSlotsChanged { .. }
-                        | EventPayload::StreamsChanged { .. } => {
+                        | EventPayload::StreamsChanged { .. }
+                        | EventPayload::RecordingChanged { .. } => {
                             completion != CommandCompletion::Project
                         }
                     };
@@ -378,7 +379,7 @@ impl Remote {
             .ok_or_else(|| RemoteFailure("remote project cursor is unavailable".into()))?;
         let switcher = state.switcher();
         println!(
-            "project_id={} show={:?} revision={} frame=unavailable Program(desired={}, realized={}) Preview(desired={}, realized={}) TBar(desired={}, realized={}) FTB(desired={}, realized={}) AudioStrips={} Streams={} Overlays(desired={}, realized={}) Inputs={} Outputs={}",
+            "project_id={} show={:?} revision={} frame=unavailable Program(desired={}, realized={}) Preview(desired={}, realized={}) TBar(desired={}, realized={}) FTB(desired={}, realized={}) AudioStrips={} Streams={} Recording=desired={} Overlays(desired={}, realized={}) Inputs={} Outputs={}",
             self.project_id,
             state.show_name(),
             cursor.revision,
@@ -392,6 +393,7 @@ impl Remote {
             format_fade_to_black(switcher.realized_fade_to_black),
             format_input_audio_strips(state),
             format_streams(state.streams()),
+            state.record_desired_active(),
             format_overlays(state.desired_overlays()),
             format_overlays(state.realized_overlays()),
             format_input_roster(state),

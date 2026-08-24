@@ -114,6 +114,7 @@ fn snapshot(revision: u64) -> SnapshotMessage {
         realized_fade_to_black: live_fade_to_black(),
         stingers: Vec::new(),
         streams: Vec::new(),
+        record_desired_active: false,
         desired_overlays: fm_protocol::OverlayStatus::empty_channels(),
         realized_overlays: fm_protocol::OverlayStatus::empty_channels(),
     }
@@ -1074,4 +1075,51 @@ fn streams_changed_events_retain_the_latest_projection() {
     assert!(state.streams()[0].desired_running);
     assert_eq!(state.streams()[1].target.get(), 9);
     assert!(!state.streams()[1].desired_running);
+}
+
+#[test]
+fn snapshots_intake_the_record_desired_projection() {
+    let mut client = Client::new(config(4)).unwrap();
+    client.start_connect().unwrap();
+    client.transport_connected().unwrap();
+    client.accept_handshake(handshake(4, None)).unwrap();
+
+    let mut message = snapshot_with_streams(4, Vec::new());
+    message.record_desired_active = true;
+    client.apply_snapshot(message).unwrap();
+    assert!(client.model().state().unwrap().record_desired_active());
+}
+
+#[test]
+fn recording_changed_events_retain_the_latest_desired_flag() {
+    let mut client = Client::new(config(4)).unwrap();
+    connect_snapshot(&mut client, 4);
+
+    client
+        .apply_event(EventMessage {
+            cursor: EventCursor {
+                engine: engine(),
+                revision: 5,
+            },
+            payload: EventPayload::RecordingChanged { active: true },
+        })
+        .unwrap();
+    assert!(client.model().state().unwrap().record_desired_active());
+
+    let command = client
+        .queue_command(CommandPayload::RecordStop, "rec-off", None, None)
+        .unwrap();
+    assert_eq!(command.payload, CommandPayload::RecordStop);
+    assert_eq!(client.model().pending_commands().len(), 1);
+
+    client
+        .apply_event(EventMessage {
+            cursor: EventCursor {
+                engine: engine(),
+                revision: 6,
+            },
+            payload: EventPayload::RecordingChanged { active: false },
+        })
+        .unwrap();
+    assert!(!client.model().state().unwrap().record_desired_active());
 }

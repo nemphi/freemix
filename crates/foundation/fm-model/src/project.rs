@@ -678,7 +678,7 @@ impl std::fmt::Display for RenameSceneError {
 
 impl std::error::Error for RenameSceneError {}
 
-pub const CURRENT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(19);
+pub const CURRENT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(20);
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct SchemaVersion(u32);
@@ -708,6 +708,7 @@ pub struct Project {
     outputs: Vec<Output>,
     stream_targets: Vec<StreamTarget>,
     main_mix: Option<MainMix>,
+    recording_desired_active: bool,
     stingers: Vec<StingerConfig>,
     restart_policy: RestartPolicy,
 }
@@ -727,6 +728,7 @@ impl Project {
             outputs: Vec::new(),
             stream_targets: Vec::new(),
             main_mix: None,
+            recording_desired_active: false,
             stingers: Vec::new(),
             restart_policy: RestartPolicy::default(),
         }
@@ -806,6 +808,13 @@ impl Project {
     #[must_use]
     pub const fn main_mix(&self) -> Option<MainMix> {
         self.main_mix
+    }
+
+    /// Whether recording is desired to be active. Authored intent persisted
+    /// with the project, not a live recorder status.
+    #[must_use]
+    pub const fn recording_desired_active(&self) -> bool {
+        self.recording_desired_active
     }
 
     #[must_use]
@@ -2217,6 +2226,16 @@ impl Project {
 
     pub fn set_main_mix(&mut self, main_mix: MainMix) {
         self.main_mix = Some(main_mix);
+    }
+
+    pub fn set_recording_desired_active(&mut self, recording_desired_active: bool) {
+        self.recording_desired_active = recording_desired_active;
+    }
+
+    #[must_use]
+    pub const fn with_recording_desired_active(mut self, recording_desired_active: bool) -> Self {
+        self.recording_desired_active = recording_desired_active;
+        self
     }
 
     pub fn add_stinger(&mut self, stinger: StingerConfig) {

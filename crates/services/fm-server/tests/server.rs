@@ -92,6 +92,7 @@ fn control() -> FakeControl {
         },
         stingers: Vec::new(),
         streams: Vec::new(),
+        record_desired_active: false,
         desired_overlays: fm_protocol::OverlayStatus::empty_channels(),
         realized_overlays: fm_protocol::OverlayStatus::empty_channels(),
     };

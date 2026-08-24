@@ -2,15 +2,16 @@ use std::num::NonZeroU128;
 
 use fm_model::{
     AddInputError, AddSceneInputError, AddSceneLayerError, AddStreamTargetError, AudioBus, BusSend,
-    CURRENT_SCHEMA_VERSION, CropRect, DuplicateSceneInputError, EntityRef, Input,
-    InputAudioStripState, InputBalanceBasisPoints, InputDelaySamples, InputGainMilliDb, InputKind,
-    Layer, LayerGeometry, MainMix, Output, OutputFormat, Project, ProjectSettings, RectMask,
+    CURRENT_SCHEMA_VERSION, CropRect, DEFAULT_VIDEO_BITRATE_KBPS, DuplicateSceneInputError,
+    EntityRef, Input, InputAudioStripState, InputBalanceBasisPoints, InputDelaySamples,
+    InputGainMilliDb, InputKind, Layer, LayerGeometry, MAX_VIDEO_BITRATE_KBPS,
+    MIN_VIDEO_BITRATE_KBPS, MainMix, Output, OutputFormat, Project, ProjectSettings, RectMask,
     RemoveAudioBusError, RemoveInputError, RemoveOutputError, RemoveSceneError, RenameSceneError,
     RestartPolicy, Rgba8, Rotation, Scene, SceneLayerError, SetStingerError, SimulatedAudio,
     SimulatedInput, SimulatedVideo, SolidColor, SourceRef, StartupPolicy, StingerAudioPolicy,
     StingerConfig, StingerMissingMediaFallback, StingerSlotNumber, StreamEndpoint,
     StreamEndpointError, StreamKey, StreamKeyError, StreamProtocol, StreamTarget, StreamTargetId,
-    ValidationError, ValidationErrorKind,
+    StreamVideoBitrateError, ValidationError, ValidationErrorKind,
 };
 use fm_types::{
     AudioFormat, BusId, ChannelLayout, ColorMetadata, FrameRate, InputId, MAX_INPUT_NAME_BYTES,
@@ -1163,6 +1164,58 @@ fn stream_destinations_author_desired_running_state_off_by_default() {
     assert!(running.running());
     // The setter is builder-style: the original is untouched.
     assert!(!stopped.running());
+}
+
+#[test]
+fn stream_destinations_author_a_bounded_video_bitrate_with_a_default() {
+    // Destinations authored without naming a bitrate assume the default.
+    let target = stream_target(1, "Primary", output_id(1));
+    assert_eq!(target.video_bitrate_kbps(), DEFAULT_VIDEO_BITRATE_KBPS);
+    assert_eq!(DEFAULT_VIDEO_BITRATE_KBPS, 4_500);
+
+    // The bounds are inclusive on both ends.
+    let low = target
+        .clone()
+        .with_video_bitrate(MIN_VIDEO_BITRATE_KBPS)
+        .unwrap();
+    assert_eq!(low.video_bitrate_kbps(), MIN_VIDEO_BITRATE_KBPS);
+    let high = target
+        .clone()
+        .with_video_bitrate(MAX_VIDEO_BITRATE_KBPS)
+        .unwrap();
+    assert_eq!(high.video_bitrate_kbps(), MAX_VIDEO_BITRATE_KBPS);
+
+    // Anything outside the bound is refused with a typed error.
+    assert_eq!(
+        target
+            .clone()
+            .with_video_bitrate(MIN_VIDEO_BITRATE_KBPS - 1),
+        Err(StreamVideoBitrateError::TooLow)
+    );
+    assert_eq!(
+        target.clone().with_video_bitrate(0),
+        Err(StreamVideoBitrateError::TooLow)
+    );
+    assert_eq!(
+        target
+            .clone()
+            .with_video_bitrate(MAX_VIDEO_BITRATE_KBPS + 1),
+        Err(StreamVideoBitrateError::TooHigh)
+    );
+    // The builder setter leaves the original untouched when it refuses.
+    assert_eq!(target.video_bitrate_kbps(), DEFAULT_VIDEO_BITRATE_KBPS);
+}
+
+#[test]
+fn projects_author_recording_desired_active_off_by_default() {
+    let project = valid_project();
+    assert!(!project.recording_desired_active());
+
+    let mut recording =
+        Project::new(project_id(9), "Recording", settings()).with_recording_desired_active(true);
+    assert!(recording.recording_desired_active());
+    recording.set_recording_desired_active(false);
+    assert!(!recording.recording_desired_active());
 }
 
 #[test]

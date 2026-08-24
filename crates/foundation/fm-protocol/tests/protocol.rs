@@ -153,14 +153,15 @@ fn snapshot(inputs: Vec<InputStatus>) -> WireMessage {
         },
         stingers: Vec::new(),
         streams: Vec::new(),
+        record_desired_active: false,
         desired_overlays: OverlayStatus::empty_channels(),
         realized_overlays: OverlayStatus::empty_channels(),
     })
 }
 
 #[test]
-fn protocol_2_17_heartbeat_acknowledgement_codec_is_exact() {
-    assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(2, 17));
+fn protocol_2_18_heartbeat_acknowledgement_codec_is_exact() {
+    assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(2, 18));
     let acknowledgement = WireMessage::HeartbeatAcknowledgement(HeartbeatAcknowledgementMessage {
         server: server_identity(),
         heartbeat_sequence: 88,
@@ -990,6 +991,105 @@ fn streams_changed_event_round_trips_every_realized_state() {
         .replace("event=streams_changed", "event=strings_changed");
     assert!(matches!(
         decode_line(&unknown_event),
+        Err(CodecError::InvalidField { field: "event", .. })
+    ));
+}
+
+#[test]
+fn record_start_and_stop_commands_round_trip_and_reject_extra_fields() {
+    for (expected_payload, payload) in [
+        ("payload=record_start", CommandPayload::RecordStart),
+        ("payload=record_stop", CommandPayload::RecordStop),
+    ] {
+        let message = WireMessage::Command(CommandMessage {
+            protocol: CURRENT_PROTOCOL_VERSION,
+            payload,
+            ..command()
+        });
+        let encoded = encode_line(&message).unwrap();
+        assert!(encoded.contains(expected_payload));
+        assert_eq!(decode_line(&encoded).unwrap(), message);
+    }
+
+    let start = encode_line(&WireMessage::Command(CommandMessage {
+        payload: CommandPayload::RecordStart,
+        ..command()
+    }))
+    .unwrap();
+    let extra = start.replace('\n', "\ttarget=9\n");
+    assert_eq!(
+        decode_line(&extra),
+        Err(CodecError::UnknownField("target".to_owned()))
+    );
+    let unknown = start.replace("payload=record_start", "payload=record_pause");
+    assert!(matches!(
+        decode_line(&unknown),
+        Err(CodecError::InvalidField {
+            field: "payload",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn snapshot_record_desired_active_round_trips_and_rejects_missing_and_invalid() {
+    let mut message = snapshot(input_statuses(&[(1, "camera"), (2, "slides")]));
+    let WireMessage::Snapshot(snapshot_message) = &mut message else {
+        unreachable!();
+    };
+    snapshot_message.record_desired_active = true;
+    let encoded = encode_line(&message).unwrap();
+    assert!(encoded.contains("record_desired_active=1"));
+    assert_eq!(decode_line(&encoded).unwrap(), message);
+
+    assert_eq!(
+        decode_line(&encoded.replace("\trecord_desired_active=1", "")),
+        Err(CodecError::MissingField("record_desired_active"))
+    );
+    let invalid = encoded.replace("record_desired_active=1", "record_desired_active=true");
+    assert!(matches!(
+        decode_line(&invalid),
+        Err(CodecError::InvalidField {
+            field: "record_desired_active",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn recording_changed_event_round_trips_both_values_and_rejects_unknown_names() {
+    for active in [true, false] {
+        let message = WireMessage::Event(EventMessage {
+            cursor: cursor(),
+            payload: EventPayload::RecordingChanged { active },
+        });
+        let encoded = encode_line(&message).unwrap();
+        assert!(encoded.contains("event=recording_changed"));
+        assert!(encoded.contains(&format!("active={}", u8::from(active))));
+        assert_eq!(decode_line(&encoded).unwrap(), message);
+    }
+
+    let populated = encode_line(&WireMessage::Event(EventMessage {
+        cursor: cursor(),
+        payload: EventPayload::RecordingChanged { active: true },
+    }))
+    .unwrap();
+    let missing = populated.replace("\tactive=1", "");
+    assert_eq!(
+        decode_line(&missing),
+        Err(CodecError::MissingField("active"))
+    );
+    let invalid = populated.replace("active=1", "active=yes");
+    assert!(matches!(
+        decode_line(&invalid),
+        Err(CodecError::InvalidField {
+            field: "active",
+            ..
+        })
+    ));
+    let unknown = populated.replace("event=recording_changed", "event=recording_paused");
+    assert!(matches!(
+        decode_line(&unknown),
         Err(CodecError::InvalidField { field: "event", .. })
     ));
 }

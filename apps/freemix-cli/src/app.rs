@@ -191,6 +191,8 @@ pub fn run(command: Command) -> AppResult<()> {
                 false,
             )?;
         }
+        Command::RecordStart { path } => set_recording_desired(&path, true)?,
+        Command::RecordStop { path } => set_recording_desired(&path, false)?,
         Command::Streams { path } => {
             let stored = inspect_stored_project(&path)?;
             print_stream_targets(stored.project());
@@ -1217,6 +1219,26 @@ pub fn run(command: Command) -> AppResult<()> {
             key,
             expected_revision,
         )?,
+        Command::RemoteRecordStart {
+            address,
+            key,
+            expected_revision,
+        } => remote::execute(
+            address,
+            fm_protocol::CommandPayload::RecordStart,
+            key,
+            expected_revision,
+        )?,
+        Command::RemoteRecordStop {
+            address,
+            key,
+            expected_revision,
+        } => remote::execute(
+            address,
+            fm_protocol::CommandPayload::RecordStop,
+            key,
+            expected_revision,
+        )?,
         Command::Render {
             path,
             output,
@@ -1507,6 +1529,7 @@ fn save_engine(path: &Path, project_engine: &ProjectEngine) -> AppResult<()> {
     sync_input_names(&mut project, snapshot.show())?;
     sync_input_audio_strips(&mut project, snapshot.show())?;
     sync_stream_running(&mut project, snapshot.show())?;
+    sync_recording_desired(&mut project, snapshot.show());
     let stored = StoredProject::from_project_with_complete_runtime_state(
         project,
         RuntimeRouting {
@@ -1576,6 +1599,15 @@ fn sync_stream_running(project: &mut Project, show: &ShowState) -> AppResult<()>
         }
     }
     Ok(())
+}
+
+/// Copies the engine's desired recording flag into the authored project so the
+/// checkpoint persists it like every other desired switcher field.
+fn sync_recording_desired(project: &mut Project, show: &ShowState) {
+    let active = show.desired_switcher().recording_desired();
+    if active != project.recording_desired_active() {
+        project.set_recording_desired_active(active);
+    }
 }
 
 fn configure_stinger(path: &Path, config: StingerConfig) -> AppResult<()> {
@@ -1885,6 +1917,9 @@ fn stream_target(spec: &StreamSpec) -> AppResult<StreamTarget> {
     )
     .and_then(|target| target.with_backup_endpoint(backup_endpoint))
     .map_err(|error| AppFailure(error.to_string()))?;
+    let target = target
+        .with_video_bitrate(spec.video_bitrate_kbps)
+        .map_err(|error| AppFailure(error.to_string()))?;
     Ok(target.with_startup(spec.startup))
 }
 
@@ -1937,6 +1972,32 @@ fn set_stream_running(
         EngineCommand::StreamStart { target }
     } else {
         EngineCommand::StreamStop { target }
+    };
+    let result = execute(&mut project_engine.engine, command, 1, None, None)?;
+    if let Some(rejection) = result.rejection {
+        return Err(rejection.into());
+    }
+    if !result.replayed {
+        save_engine(path, &project_engine)?;
+    }
+    print_status(&project_engine);
+    Ok(())
+}
+
+/// Starts or stops program recording.
+///
+/// This is an instant switcher mutation: it restores the engine checkpoint,
+/// applies [`EngineCommand::RecordStart`] or [`EngineCommand::RecordStop`]
+/// through the same path as every other instant command, checkpoints, and only
+/// then persists. The command carries no target field, so it is effect-free on
+/// unknown state and an idempotent replay returns the same receipt without
+/// touching the bundle.
+fn set_recording_desired(path: &Path, active: bool) -> AppResult<()> {
+    let mut project_engine = load_engine(path)?;
+    let command = if active {
+        EngineCommand::RecordStart
+    } else {
+        EngineCommand::RecordStop
     };
     let result = execute(&mut project_engine.engine, command, 1, None, None)?;
     if let Some(rejection) = result.rejection {
@@ -2584,6 +2645,10 @@ fn restore_project_engine(stored: &StoredProject) -> AppResult<ProjectEngine> {
     {
         realized.set_stream_running(switcher_stream_target(target.id()), true)?;
     }
+    if project.recording_desired_active() {
+        let _ = show.desired_switcher_mut().set_recording_desired(true);
+        let _ = realized.set_recording_desired(true);
+    }
     for config in project.stingers() {
         restore_stinger(&mut show, &mut realized, *config)?;
     }
@@ -3119,7 +3184,7 @@ fn print_status(project: &ProjectEngine) {
     let desired = engine.show().desired_switcher();
     let realized = engine.realized_switcher();
     println!(
-        "project_id={} show={:?} revision={} frame={} Program(desired={}, realized={}) Preview(desired={}, realized={}) TBar(desired={}, realized={}) FTB(desired={}, realized={}) Overlays(desired={}, realized={}) AudioStrips={} Stingers={}",
+        "project_id={} show={:?} revision={} frame={} Program(desired={}, realized={}) Preview(desired={}, realized={}) TBar(desired={}, realized={}) FTB(desired={}, realized={}) Overlays(desired={}, realized={}) AudioStrips={} Stingers={} recording_desired={}",
         project.project.id(),
         engine.show().name(),
         engine.revision(),
@@ -3136,6 +3201,7 @@ fn print_status(project: &ProjectEngine) {
         format_overlays(realized.overlays()),
         format_audio_strips(&project.project),
         format_stingers(project.project.stingers()),
+        desired.recording_desired(),
     );
 }
 
@@ -3432,11 +3498,13 @@ Usage:
   freemix-cli output-rename <show.freemix> <existing-output-id> <name>
   freemix-cli output-startup <show.freemix> <existing-output-id> <stopped|reconcile-desired-state>
   freemix-cli output-remove <show.freemix> <existing-output-id>
-  freemix-cli stream-add <show.freemix> <nonzero-stream-id> <existing-output-id> <rtmp(s)://host/app|srt://host[:port]> <stream-key> <name> [--backup <url matching the primary scheme>] [--startup <stopped|reconcile-desired-state>]
-  freemix-cli stream-update <show.freemix> <existing-stream-id> <existing-output-id> <rtmp(s)://host/app|srt://host[:port]> <stream-key> <name> [--backup <url matching the primary scheme>] [--startup <stopped|reconcile-desired-state>]
+  freemix-cli stream-add <show.freemix> <nonzero-stream-id> <existing-output-id> <rtmp(s)://host/app|srt://host[:port]> <stream-key> <name> [--backup <url matching the primary scheme>] [--startup <stopped|reconcile-desired-state>] [--video-bitrate-kbps <1000..=100000>]
+  freemix-cli stream-update <show.freemix> <existing-stream-id> <existing-output-id> <rtmp(s)://host/app|srt://host[:port]> <stream-key> <name> [--backup <url matching the primary scheme>] [--startup <stopped|reconcile-desired-state>] [--video-bitrate-kbps <1000..=100000>]
   freemix-cli stream-remove <show.freemix> <existing-stream-id>
   freemix-cli stream-start <show.freemix> <existing-stream-id>
   freemix-cli stream-stop <show.freemix> <existing-stream-id>
+  freemix-cli record-start <show.freemix>
+  freemix-cli record-stop <show.freemix>
       The stream key is a positional argument and is therefore visible in this
       machine's process list. It is stored in plaintext in project.json, like
       every other authored field, so protect the bundle accordingly. It is
@@ -3535,6 +3603,8 @@ Usage:
   freemix-cli remote-ftb <127.0.0.1:port> <live|black> <frames> [--key <key>] [--expect <revision>]
   freemix-cli remote-stream-start <127.0.0.1:port> <existing-stream-id> [--key <key>] [--expect <revision>]
   freemix-cli remote-stream-stop <127.0.0.1:port> <existing-stream-id> [--key <key>] [--expect <revision>]
+  freemix-cli remote-record-start <127.0.0.1:port> [--key <key>] [--expect <revision>]
+  freemix-cli remote-record-stop <127.0.0.1:port> [--key <key>] [--expect <revision>]
   freemix-cli render <show.freemix> <output.ppm> [--width <px>] [--height <px>]
   freemix-cli demo <show.freemix> [output.ppm]"
     );

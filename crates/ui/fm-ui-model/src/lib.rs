@@ -205,6 +205,7 @@ pub struct ProjectSnapshot {
     pub input_audio_strips: Vec<InputAudioStripStatus>,
     pub stingers: Vec<StingerStatus>,
     pub streams: Vec<StreamStatus>,
+    pub record_desired_active: bool,
     pub desired_overlays: Vec<OverlayStatus>,
     pub realized_overlays: Vec<OverlayStatus>,
     pub switcher: SwitcherState,
@@ -245,6 +246,7 @@ impl ProjectSnapshot {
             input_audio_strips,
             stingers,
             streams,
+            record_desired_active: message.record_desired_active,
             desired_overlays,
             realized_overlays,
             switcher: SwitcherState {
@@ -297,6 +299,9 @@ pub enum DurableChange {
     },
     StreamsChanged {
         streams: Vec<StreamStatus>,
+    },
+    RecordingChanged {
+        active: bool,
     },
 }
 
@@ -355,6 +360,7 @@ impl DurableProjectEvent {
             EventPayload::StreamsChanged { streams } => DurableChange::StreamsChanged {
                 streams: protocol_streams(streams),
             },
+            EventPayload::RecordingChanged { active } => DurableChange::RecordingChanged { active },
         };
         Self {
             cursor: ProjectCursor {
@@ -412,6 +418,7 @@ pub struct ProjectState {
     input_audio_strips: Vec<InputAudioStripStatus>,
     stingers: Vec<StingerStatus>,
     streams: Vec<StreamStatus>,
+    record_desired_active: bool,
     desired_overlays: Vec<OverlayStatus>,
     realized_overlays: Vec<OverlayStatus>,
     switcher: SwitcherState,
@@ -456,6 +463,12 @@ impl ProjectState {
         &self.streams
     }
 
+    /// Returns the latest replicated engine-owned recording-desired flag.
+    #[must_use]
+    pub const fn record_desired_active(&self) -> bool {
+        self.record_desired_active
+    }
+
     #[must_use]
     pub fn desired_overlays(&self) -> &[OverlayStatus] {
         &self.desired_overlays
@@ -483,6 +496,7 @@ pub struct ClientView {
     pub input_audio_strips: Vec<InputAudioStripStatus>,
     pub stingers: Vec<StingerStatus>,
     pub streams: Vec<StreamStatus>,
+    pub record_desired_active: bool,
     pub desired_overlays: Vec<OverlayStatus>,
     pub realized_overlays: Vec<OverlayStatus>,
     pub switcher: SwitcherState,
@@ -898,6 +912,7 @@ impl ClientModel {
             input_audio_strips: state.input_audio_strips.clone(),
             stingers: state.stingers.clone(),
             streams: state.streams.clone(),
+            record_desired_active: state.record_desired_active,
             desired_overlays: state.desired_overlays.clone(),
             realized_overlays: state.realized_overlays.clone(),
             switcher,
@@ -1075,6 +1090,7 @@ impl ClientModel {
             input_audio_strips: snapshot.input_audio_strips,
             stingers: snapshot.stingers,
             streams: snapshot.streams,
+            record_desired_active: snapshot.record_desired_active,
             desired_overlays: snapshot.desired_overlays,
             realized_overlays: snapshot.realized_overlays,
             switcher: snapshot.switcher,
@@ -1667,6 +1683,7 @@ fn validate_change(change: &DurableChange, state: &ProjectState) -> Result<(), M
             validate_streams(streams)?;
             return Ok(());
         }
+        DurableChange::RecordingChanged { .. } => return Ok(()),
     };
     let inputs = &state.inputs;
     for input in [selection.program, selection.preview] {
@@ -1749,6 +1766,9 @@ fn apply_change(state: &mut ProjectState, change: DurableChange) {
         }
         DurableChange::StreamsChanged { streams } => {
             state.streams = streams;
+        }
+        DurableChange::RecordingChanged { active } => {
+            state.record_desired_active = active;
         }
     }
 }

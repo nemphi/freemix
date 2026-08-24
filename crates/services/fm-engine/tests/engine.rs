@@ -2480,3 +2480,124 @@ fn snapshot_and_restore_preserve_desired_stream_running_state_exactly() {
         FrameNumber::new(1)
     );
 }
+
+#[test]
+fn record_start_and_stop_emit_changed_events_only_on_transitions() {
+    let mut engine = streamed_engine();
+    let started = engine
+        .execute(envelope("rec-on", EngineCommand::RecordStart), 0)
+        .unwrap();
+    assert!(started.receipt.accepted().is_some());
+    assert_eq!(
+        started.events[0].payload,
+        EngineEvent::RecordingChanged { active: true }
+    );
+    assert!(engine.show().desired_switcher().recording_desired());
+    engine.tick().unwrap();
+    assert!(engine.realized_switcher().recording_desired());
+
+    let repeated = engine
+        .execute(envelope("rec-on-again", EngineCommand::RecordStart), 0)
+        .unwrap();
+    assert!(repeated.receipt.accepted().is_some());
+    assert!(repeated.events.is_empty());
+    assert_eq!(engine.event_sequence(), EventSequence::new(1));
+
+    let stopped = engine
+        .execute(envelope("rec-off", EngineCommand::RecordStop), 0)
+        .unwrap();
+    assert_eq!(
+        stopped.events[0].payload,
+        EngineEvent::RecordingChanged { active: false }
+    );
+    assert!(!engine.show().desired_switcher().recording_desired());
+}
+
+#[test]
+fn record_commands_are_instant_and_replay_receipts_atomically() {
+    let mut engine = streamed_engine();
+    engine
+        .execute(
+            envelope("fade", EngineCommand::Fade { duration_frames: 4 }),
+            0,
+        )
+        .unwrap();
+    let accepted = engine
+        .execute(envelope("rec", EngineCommand::RecordStart), 0)
+        .unwrap();
+    assert!(accepted.receipt.accepted().is_some());
+    assert_eq!(engine.snapshot(), Err(SnapshotError::WorkInFlight));
+    while engine.snapshot().is_err() {
+        engine.tick().unwrap();
+    }
+
+    let replay = engine
+        .execute(envelope("rec", EngineCommand::RecordStart), 0)
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.receipt, accepted.receipt);
+    assert!(replay.events.is_empty());
+    assert_eq!(engine.revision(), Revision::new(2));
+}
+
+#[test]
+fn snapshot_and_restore_preserve_recording_desired_exactly() {
+    let mut engine = streamed_engine();
+    engine
+        .execute(envelope("rec-on", EngineCommand::RecordStart), 0)
+        .unwrap();
+    engine.tick().unwrap();
+
+    let snapshot = engine.snapshot().unwrap();
+    assert!(snapshot.show().desired_switcher().recording_desired());
+    let mut restored = Engine::restore(snapshot.clone()).unwrap();
+    assert!(restored.show().desired_switcher().recording_desired());
+    assert_eq!(
+        restored.realized_switcher().recording_desired(),
+        restored.show().desired_switcher().recording_desired()
+    );
+    let next = restored
+        .execute(envelope("rec-off", EngineCommand::RecordStop), 0)
+        .unwrap();
+    assert_eq!(
+        next.receipt.accepted().unwrap().result.target_frame,
+        FrameNumber::new(1)
+    );
+    assert_eq!(
+        next.events[0].payload,
+        EngineEvent::RecordingChanged { active: false }
+    );
+}
+
+#[test]
+fn idle_restore_rejects_divergent_desired_and_realized_recording_flags() {
+    let mut engine = streamed_engine();
+    engine
+        .execute(envelope("rec-on", EngineCommand::RecordStart), 0)
+        .unwrap();
+    engine.tick().unwrap();
+    let snapshot = engine.snapshot().unwrap();
+
+    let pristine_realized = streamed_engine().realized_switcher().clone();
+    assert!(!pristine_realized.recording_desired());
+    let restore_state = EngineRestoreState {
+        state_epoch: snapshot.state_epoch(),
+        revision: snapshot.revision(),
+        event_sequence: snapshot.event_sequence(),
+        runtime_generation: snapshot.runtime_generation(),
+        clock_time: snapshot.clock_time(),
+        frame_cursor: FrameNumber::new(snapshot.frames_rendered()),
+        receipts: snapshot.receipts().to_vec(),
+    };
+    assert_eq!(
+        Engine::restore_persisted(
+            snapshot.show().clone(),
+            pristine_realized,
+            snapshot.frame_rate(),
+            snapshot.clock_domain(),
+            restore_state,
+        )
+        .unwrap_err(),
+        SnapshotError::MismatchedSwitcherRouting
+    );
+}

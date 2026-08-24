@@ -214,6 +214,8 @@ fn encode_command(record: &mut Record, message: &CommandMessage) -> Result<(), C
         payload @ (CommandPayload::StreamStart { .. } | CommandPayload::StreamStop { .. }) => {
             encode_stream_command(record, payload)?;
         }
+        CommandPayload::RecordStart => record.field("payload", "record_start")?,
+        CommandPayload::RecordStop => record.field("payload", "record_stop")?,
         CommandPayload::Wipe { duration_frames } => {
             record.field("payload", "wipe")?;
             record.field("duration_frames", duration_frames)?;
@@ -242,12 +244,8 @@ fn encode_command(record: &mut Record, message: &CommandMessage) -> Result<(), C
             record.field("payload", "manual_position")?;
             record.field("position_basis_points", position.basis_points())?;
         }
-        CommandPayload::CommitManualTransition => {
-            record.field("payload", "manual_commit")?;
-        }
-        CommandPayload::CancelManualTransition => {
-            record.field("payload", "manual_cancel")?;
-        }
+        CommandPayload::CommitManualTransition => record.field("payload", "manual_commit")?,
+        CommandPayload::CancelManualTransition => record.field("payload", "manual_cancel")?,
     }
     Ok(())
 }
@@ -465,6 +463,10 @@ fn encode_snapshot(record: &mut Record, message: &SnapshotMessage) -> Result<(),
     )?;
     encode_stingers(record, &message.stingers)?;
     record.field_string("streams", stream_statuses(&message.streams)?)?;
+    record.field(
+        "record_desired_active",
+        u8::from(message.record_desired_active),
+    )?;
     encode_overlays(record, "desired_overlays", &message.desired_overlays)?;
     encode_overlays(record, "realized_overlays", &message.realized_overlays)
 }
@@ -701,6 +703,10 @@ fn encode_event(record: &mut Record, message: &EventMessage) -> Result<(), Codec
         EventPayload::StreamsChanged { streams } => {
             record.field("event", "streams_changed")?;
             record.field_string("streams", stream_statuses(streams)?)?;
+        }
+        EventPayload::RecordingChanged { active } => {
+            record.field("event", "recording_changed")?;
+            record.field("active", u8::from(*active))?;
         }
     }
     Ok(())

@@ -27,6 +27,8 @@ use std::{collections::VecDeque, net::TcpStream};
 use std::fs::{self, File, OpenOptions};
 #[cfg(feature = "native-media")]
 use std::num::NonZeroU32;
+#[cfg(feature = "native-media")]
+use std::sync::mpsc;
 #[cfg(all(feature = "native-media", target_os = "macos"))]
 use std::{collections::BTreeMap, num::NonZeroUsize, sync::Mutex, thread::JoinHandle};
 
@@ -108,8 +110,8 @@ use fm_codec_ffmpeg::{
         RecordFormat, Recorder, RecorderState, StopOutcome,
     },
     stream::{
-        EnqueueRejection as StreamEnqueueRejection, StopOutcome as StreamStopOutcome, StreamConfig,
-        StreamDestination, StreamState, Streamer,
+        EncoderSettings, EnqueueRejection as StreamEnqueueRejection,
+        StopOutcome as StreamStopOutcome, StreamConfig, StreamDestination, StreamState, Streamer,
     },
 };
 #[cfg(feature = "native-media")]
@@ -326,7 +328,12 @@ struct NativeDaemon {
     assets_root: PathBuf,
     pending_stinger_mutation: Option<NativeStingerMutation>,
     stinger_retirements: NativeStingerRetirements,
-    recorder: Option<NativeProgramRecorder>,
+    recorder: ProgramRecording,
+    /// Configured `--record-program` output path; recording configuration is
+    /// independent of whether a segment is currently open.
+    record_program: Option<PathBuf>,
+    /// Segments stopped off the render path, awaiting bounded finalization.
+    recording_finalizers: Vec<ProgramRecordingFinalizer>,
     streams: Vec<NativeProgramStream>,
     /// `StreamStart` acceptances waiting for the next frame boundary.
     pending_stream_starts: Vec<SwitcherStreamTargetId>,
@@ -1632,6 +1639,14 @@ impl NativeProgramRecorder {
         AppFailure("Program recorder mux output timed out before readiness".into()).into()
     }
 
+    /// Cancels the sink without waiting: future enqueues are refused and the
+    /// child is asked to terminate within the kill budget.
+    fn request_cancel(&mut self) {
+        if self.finalization_clean.is_none() {
+            self.recorder.request_cancel();
+        }
+    }
+
     fn stop_and_report(&mut self) -> AppResult<()> {
         if let Some(clean) = self.finalization_clean {
             return if clean {
@@ -1713,6 +1728,83 @@ fn startup_pair_decision(
     }
 }
 
+/// Realization state of the configured program recording.
+///
+/// Recording is configured by `--record-program` but only OPENED while the
+/// engine's desired flag is set, mirroring how stream sinks realize desired
+/// running flags. The open segment is boxed to keep this enum small; it is
+/// moved as a unit at every state change.
+#[cfg(feature = "native-media")]
+enum ProgramRecording {
+    /// Recording is configured, but no segment is open.
+    Off,
+    /// One open segment capturing the program feed.
+    Running(Box<NativeProgramRecorder>),
+}
+
+/// One segment handed off the render path for bounded finalization.
+///
+/// The worker owns the recorder and emits exactly one `FREEMIXD_RECORDER`
+/// stderr report; shutdown waits for completion within the recorder's own
+/// stop budget and detaches rather than blocking forever. The completion
+/// signal is a plain flag because the detailed report already reached stderr
+/// and [`AppResult`] is not `Send`.
+#[cfg(feature = "native-media")]
+struct ProgramRecordingFinalizer {
+    done: mpsc::Receiver<bool>,
+    worker: thread::JoinHandle<()>,
+}
+
+/// Upper bound for waiting on a detached finalizer at shutdown. The worker's
+/// own `stop()` drains within [`PROGRAM_RECORDER_STOP_TIMEOUT`] and kills
+/// within [`PROGRAM_RECORDER_KILL_TIMEOUT`], so this adds only scheduler
+/// slack; past it the worker is detached like stinger retirement cleanup.
+#[cfg(feature = "native-media")]
+const PROGRAM_RECORDER_FINALIZE_JOIN_TIMEOUT: Duration = Duration::from_secs(35);
+
+/// First-segment ordinal for derived recording paths; later segments count up
+/// from 002 so the configured path itself stays segment 001.
+#[cfg(feature = "native-media")]
+const RECORD_SEGMENT_LAST_ORDINAL: u32 = 999;
+
+#[cfg(feature = "native-media")]
+fn next_record_segment_path(
+    base: &Path,
+    mut exists: impl FnMut(&Path) -> bool,
+) -> AppResult<PathBuf> {
+    if base.extension().and_then(|extension| extension.to_str()) != Some("mp4") {
+        return Err(
+            AppFailure("recording output must have the final extension `.mp4`".into()).into(),
+        );
+    }
+    let file_name = base
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| AppFailure("recording output must name a final .mp4 file".into()))?;
+    if !exists(base) {
+        return Ok(base.to_path_buf());
+    }
+    // `to_string_lossy` keeps non-UTF8 stems refused instead of silently
+    // re-encoded: a path that cannot be named deterministically is never
+    // created.
+    let stem = base
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .ok_or_else(|| AppFailure("recording output stem is not valid Unicode".into()))?;
+    let parent = base.parent().unwrap_or_else(|| Path::new("."));
+    for ordinal in 2..=RECORD_SEGMENT_LAST_ORDINAL {
+        let candidate = parent.join(format!("{stem}-{ordinal:03}.mp4"));
+        if !exists(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    Err(AppFailure(format!(
+        "recording segments are exhausted past {RECORD_SEGMENT_LAST_ORDINAL} for {}",
+        diagnostic_field(&file_name.to_string_lossy())
+    ))
+    .into())
+}
+
 /// Per-target bookkeeping for the native streaming feed path.
 ///
 /// The ledger is separated from the sink so the sequencing rules — advance only
@@ -1775,6 +1867,7 @@ const fn sticky_stream_rejection(reason: &StreamEnqueueRejection) -> bool {
 struct NativeProgramStream {
     target: SwitcherStreamTargetId,
     destination: StreamDestination,
+    video_bitrate_kbps: u32,
     readback: NativeProgramReadback,
     format: RecordFormat,
     streamer: Option<Streamer>,
@@ -1783,6 +1876,16 @@ struct NativeProgramStream {
     /// Set when the sink refused a pair with capacity backpressure since the
     /// last status sample; consumed (and cleared) by the sampler.
     enqueue_backpressure: bool,
+}
+
+/// Compiles one target's authored video bitrate into the sink's encoder
+/// settings; every other encoder knob keeps its sink default.
+#[cfg(feature = "native-media")]
+fn stream_encoder_settings(video_bitrate_kbps: u32) -> EncoderSettings {
+    EncoderSettings {
+        video_bitrate_kbps,
+        ..EncoderSettings::default()
+    }
 }
 
 #[cfg(feature = "native-media")]
@@ -1831,6 +1934,7 @@ impl NativeProgramStream {
             streams.push(Self {
                 target: SwitcherStreamTargetId::from_non_zero(target.id().get()),
                 destination,
+                video_bitrate_kbps: target.video_bitrate_kbps(),
                 readback,
                 format,
                 streamer: None,
@@ -1858,6 +1962,7 @@ impl NativeProgramStream {
         let mut config = StreamConfig::new(self.format.clone(), self.destination.clone());
         config.limits.stop_timeout = PROGRAM_STREAM_STOP_TIMEOUT;
         config.limits.kill_timeout = PROGRAM_STREAM_KILL_TIMEOUT;
+        config.encoder = stream_encoder_settings(self.video_bitrate_kbps);
         match Streamer::start(config) {
             Ok(streamer) => self.streamer = Some(streamer),
             Err(error) => {
@@ -2283,7 +2388,9 @@ impl NativeDaemon {
             assets_root: store.assets_root().clone(),
             pending_stinger_mutation: None,
             stinger_retirements: NativeStingerRetirements::start()?,
-            recorder: None,
+            recorder: ProgramRecording::Off,
+            record_program: None,
+            recording_finalizers: Vec::new(),
             streams,
             pending_stream_starts: Vec::new(),
             retired_streams: Vec::new(),
@@ -2319,47 +2426,65 @@ impl NativeDaemon {
     }
 
     fn start_recorder(&mut self, stored: &StoredProject, path: &Path) -> AppResult<()> {
-        self.recorder = Some(NativeProgramRecorder::start(&self.runtime, stored, path)?);
+        let segment = next_record_segment_path(path, Path::exists)?;
+        self.recorder = ProgramRecording::Running(Box::new(NativeProgramRecorder::start(
+            &self.runtime,
+            stored,
+            &segment,
+        )?));
         Ok(())
+    }
+
+    /// Records the configured output path so runtime `RecordStart` commands
+    /// can derive later segment names from it even when startup itself does
+    /// not open a segment.
+    fn configure_recording(&mut self, path: PathBuf) {
+        self.record_program = Some(path);
+    }
+
+    /// Whether program recording support is CONFIGURED.
+    ///
+    /// Deliberately independent of segment activity: the immutable handshake
+    /// digest advertises configured startup support, while `FREEMIXD_RECORDER`
+    /// reports per-segment runtime health.
+    fn recording_configured(&self) -> bool {
+        self.record_program.is_some()
     }
 
     fn prime_recorder(
         &mut self,
         control: &mut ControlService<Policy>,
         server: &ServerIdentity,
-        shutdown: &ProcessShutdown,
+        shutdown: Option<&ProcessShutdown>,
     ) -> AppResult<bool> {
-        if self.recorder.is_none() {
+        let ProgramRecording::Running(_) = self.recorder else {
             return Ok(true);
-        }
-        let startup_timeout = self
-            .recorder
-            .as_ref()
-            .expect("recorder was checked")
-            .startup_pair_timeout;
+        };
+        let startup_timeout = match &self.recorder {
+            ProgramRecording::Running(recorder) => recorder.startup_pair_timeout,
+            ProgramRecording::Off => unreachable!("recorder presence was checked"),
+        };
         let deadline = Instant::now()
             .checked_add(startup_timeout)
             .ok_or_else(|| AppFailure("Program recorder startup deadline overflow".into()))?;
         loop {
-            if requested_daemon_shutdown(Some(&*self), Some(shutdown)).is_some() {
+            if requested_daemon_shutdown(Some(&*self), shutdown).is_some() {
                 return Ok(false);
             }
-            match self
-                .recorder
-                .as_ref()
-                .expect("recorder was checked")
-                .startup_decision()?
-            {
+            let decision = match &self.recorder {
+                ProgramRecording::Running(recorder) => recorder.startup_decision(),
+                ProgramRecording::Off => unreachable!("recorder presence was checked"),
+            }?;
+            match decision {
                 StartupPairDecision::Ready => return Ok(true),
                 StartupPairDecision::Failed => unreachable!("failure is returned as an error"),
                 StartupPairDecision::Pending => {}
             }
             if Instant::now() >= deadline {
-                return Err(self
-                    .recorder
-                    .as_mut()
-                    .expect("recorder was checked")
-                    .fail_startup_timeout());
+                return Err(match &mut self.recorder {
+                    ProgramRecording::Running(recorder) => recorder.fail_startup_timeout(),
+                    ProgramRecording::Off => unreachable!("recorder presence was checked"),
+                });
             }
             self.tick_if_due(control, server)?;
             thread::sleep(NATIVE_IO_POLL_INTERVAL);
@@ -2491,6 +2616,159 @@ impl NativeDaemon {
     /// boundary, mirroring [`Self::take_audio_meters`].
     fn take_stream_status(&mut self) -> Option<StreamStatusMessage> {
         self.pending_stream_status.take()
+    }
+
+    /// Schedules recording realization for an accepted RecordStart/RecordStop.
+    ///
+    /// A start opens the next segment immediately and holds the session until
+    /// the same bounded prime barrier used at startup confirms mux readiness;
+    /// durability and the engine commit have already settled, so a client is
+    /// merely delayed, never acknowledged for unrealized state. Failures latch
+    /// the attempt unavailable and are reported as a sanitized notice without
+    /// aborting the show.
+    ///
+    /// A stop retires the open segment off the hot path: the slot drops to
+    /// [`ProgramRecording::Off`] at once and finalization runs on a dedicated
+    /// worker, exactly like stinger retirement, with shutdown joining within
+    /// the recorder's own stop budget.
+    #[allow(clippy::too_many_arguments)]
+    fn observe_recording_command(
+        &mut self,
+        command: &CommandMessage,
+        result: &CommandResult,
+        stored: &StoredProject,
+        control: &mut ControlService<Policy>,
+        server: &ServerIdentity,
+        process_shutdown: Option<&ProcessShutdown>,
+    ) {
+        let active = match command.payload {
+            CommandPayload::RecordStart => true,
+            CommandPayload::RecordStop => false,
+            _ => return,
+        };
+        if !matches!(result, CommandResult::Accepted { .. }) {
+            return;
+        }
+        self.reap_finished_recording_finalizers();
+        if active {
+            self.open_pending_recording(stored, control, server, process_shutdown);
+        } else {
+            self.retire_running_recording();
+        }
+    }
+
+    /// Opens the next segment after an accepted `RecordStart`.
+    ///
+    /// Every failure here latches only THIS attempt unavailable and reports a
+    /// sanitized notice; the show keeps running, exactly like stream sink
+    /// failures. Engine errors surfaced by the prime barrier are treated the
+    /// same way: if the engine is genuinely broken, the next frame
+    /// realization fails loudly on its own.
+    fn open_pending_recording(
+        &mut self,
+        stored: &StoredProject,
+        control: &mut ControlService<Policy>,
+        server: &ServerIdentity,
+        process_shutdown: Option<&ProcessShutdown>,
+    ) {
+        if !self.recording_configured() || matches!(self.recorder, ProgramRecording::Running(_)) {
+            return;
+        }
+        let configured = self
+            .record_program
+            .as_ref()
+            .expect("recording was checked as configured");
+        let segment = match next_record_segment_path(configured, Path::exists) {
+            Ok(segment) => segment,
+            Err(error) => {
+                eprintln!(
+                    "{}",
+                    recorder_failure_notice(&format!("start:{error}"), false)
+                );
+                return;
+            }
+        };
+        if let Err(error) = self.start_recorder(stored, &segment) {
+            self.recorder = ProgramRecording::Off;
+            eprintln!(
+                "{}",
+                recorder_failure_notice(&format!("start:{error}"), false)
+            );
+            return;
+        }
+        match self.prime_recorder(control, server, process_shutdown) {
+            Ok(true | false) => {}
+            Err(error) => {
+                // The barrier failed; latch this attempt unavailable. The
+                // failure notice was already emitted by the capture policy or
+                // the timeout helper; cancel and report the partial segment.
+                let ProgramRecording::Running(mut recorder) =
+                    std::mem::replace(&mut self.recorder, ProgramRecording::Off)
+                else {
+                    return;
+                };
+                recorder.request_cancel();
+                let _ = recorder.stop_and_report();
+                eprintln!(
+                    "{}",
+                    recorder_failure_notice(&format!("startup:{error}"), false)
+                );
+            }
+        }
+    }
+
+    /// Retires an open segment off the render path after an accepted
+    /// `RecordStop`. The worker drains the sink cleanly (no cancellation), so
+    /// the finalized file keeps its full `FREEMIXD_RECORDER` report.
+    fn retire_running_recording(&mut self) {
+        let ProgramRecording::Running(recorder) =
+            std::mem::replace(&mut self.recorder, ProgramRecording::Off)
+        else {
+            return;
+        };
+        let mut recorder = recorder;
+        // The worker waits for its segment so a failed spawn leaves the
+        // recorder here for a synchronous bounded stop.
+        let (handoff_sender, handoff_receiver) =
+            mpsc::sync_channel::<Box<NativeProgramRecorder>>(1);
+        let (done_sender, done) = mpsc::sync_channel(1);
+        let spawned = thread::Builder::new()
+            .name("freemix-native-recording-finalizer".to_owned())
+            .spawn(move || {
+                let Ok(mut recorder) = handoff_receiver.recv() else {
+                    return;
+                };
+                let clean = recorder.stop_and_report().is_ok();
+                let _ = done_sender.send(clean);
+            });
+        match spawned {
+            Ok(worker) => {
+                let _ = handoff_sender.send(recorder);
+                self.recording_finalizers
+                    .push(ProgramRecordingFinalizer { done, worker });
+            }
+            Err(error) => {
+                // No worker available: fall back to a synchronous stop that
+                // stays within the same stop/kill budget constants the
+                // shutdown path uses.
+                eprintln!(
+                    "{}",
+                    recorder_failure_notice(&format!("finalize:{error}"), false)
+                );
+                let _ = recorder.stop_and_report();
+            }
+        }
+    }
+
+    /// Reaps detached finalizers that already reported, so repeated
+    /// record-stop/start cycles cannot accumulate workers.
+    fn reap_finished_recording_finalizers(&mut self) {
+        self.recording_finalizers.retain(|finalizer| {
+            !matches!(
+                finalizer.done.try_recv(),
+                Ok(_) | Err(mpsc::TryRecvError::Disconnected)
+            )
+        });
     }
 
     fn tick_if_due_collect(
@@ -2657,10 +2935,13 @@ impl NativeDaemon {
         } else {
             audio.clone()
         };
-        if let (Some(recorder), Some(output), Some(audio)) =
-            (&mut self.recorder, latest_program, audio)
-        {
-            recorder.capture(&self.runtime, output, audio);
+        match &mut self.recorder {
+            ProgramRecording::Running(recorder) => {
+                if let (Some(output), Some(audio)) = (latest_program, audio) {
+                    recorder.capture(&self.runtime, output, audio);
+                }
+            }
+            ProgramRecording::Off => {}
         }
         if let (Some(output), Some(audio)) = (latest_program, stream_audio) {
             for stream in &mut self.streams {
@@ -2690,17 +2971,47 @@ impl NativeDaemon {
         false
     }
 
-    fn recorder_active(&self) -> bool {
-        self.recorder.is_some()
-    }
-
+    /// Finalizes the open segment, if any, then joins every detached
+    /// finalizer within the recorder's own stop budget so each runtime-stopped
+    /// segment has emitted its `FREEMIXD_RECORDER` report before exit.
     fn finalize_recorder(&mut self) -> AppResult<()> {
-        let Some(mut recorder) = self.recorder.take() else {
-            return Ok(());
-        };
-        let result = recorder.stop_and_report();
-        self.telemetry.observe_recorder(&recorder);
-        result
+        let mut first_error = None;
+        for recorder in std::mem::take(&mut self.recording_finalizers) {
+            let result = match recorder
+                .done
+                .recv_timeout(PROGRAM_RECORDER_FINALIZE_JOIN_TIMEOUT)
+            {
+                Ok(clean) => {
+                    let ProgramRecordingFinalizer { worker, .. } = recorder;
+                    let _ = worker.join();
+                    if clean {
+                        Ok(())
+                    } else {
+                        Err(AppFailure("Program recording did not finalize cleanly".into()).into())
+                    }
+                }
+                Err(_) => {
+                    // The worker is still inside its bounded stop budget;
+                    // detach rather than block shutdown past the budget.
+                    Err(AppFailure("program recording finalization did not complete".into()).into())
+                }
+            };
+            if result.is_err() {
+                first_error.get_or_insert(result);
+            }
+        }
+        if let ProgramRecording::Running(mut recorder) =
+            std::mem::replace(&mut self.recorder, ProgramRecording::Off)
+        {
+            if let Err(error) = recorder.stop_and_report() {
+                first_error.get_or_insert(Err(error));
+            }
+            self.telemetry.observe_recorder(&recorder);
+        }
+        match first_error {
+            Some(result) => result,
+            None => Ok(()),
+        }
     }
 
     #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
@@ -2728,7 +3039,7 @@ impl NativeDaemon {
         if !self.camera_telemetry_frozen {
             self.telemetry.camera = aggregate_camera_telemetry(&self.cameras.source_telemetry());
         }
-        if let Some(recorder) = self.recorder.as_ref() {
+        if let ProgramRecording::Running(recorder) = &self.recorder {
             self.telemetry.observe_recorder(recorder);
         }
         let streams_enqueued = self
@@ -3092,13 +3403,16 @@ impl NativeDaemon {
         &mut self,
         _control: &mut ControlService<Policy>,
         _server: &ServerIdentity,
-        _shutdown: &ProcessShutdown,
+        _shutdown: Option<&ProcessShutdown>,
     ) -> AppResult<bool> {
         Ok(true)
     }
 
     #[allow(clippy::unused_self)]
-    fn recorder_active(&self) -> bool {
+    fn configure_recording(&mut self, _path: PathBuf) {}
+
+    #[allow(clippy::unused_self)]
+    fn recording_configured(&self) -> bool {
         false
     }
 
@@ -4292,27 +4606,41 @@ fn serve_inner(
         native
             .as_mut()
             .ok_or_else(|| AppFailure("--record-program requires --native-media".into()))?
-            .start_recorder(&durable, &path)?;
-        let primed = native
-            .as_mut()
-            .expect("recording requires native state")
-            .prime_recorder(&mut control.borrow_mut(), &authority, &process_shutdown);
-        match primed {
-            Ok(true) => {}
-            Ok(false) => {
-                checkpoint_native(&control, &journal, &mut durable)?;
-                native
-                    .as_mut()
-                    .expect("recording requires native state")
-                    .finalize_recorder()?;
-                return Ok(());
-            }
-            Err(error) => {
-                let _ = native
-                    .as_mut()
-                    .expect("recording requires native state")
-                    .finalize_recorder();
-                return Err(error);
+            .configure_recording(path.clone());
+        // Startup reconciliation is deliberate: a configured recorder only
+        // auto-starts when the restored project's desired flag says so. The
+        // capability digest below keeps advertising configured support either
+        // way; runtime RecordStart commands open segments later on demand.
+        if durable.project().recording_desired_active() {
+            native
+                .as_mut()
+                .expect("recording requires native state")
+                .start_recorder(&durable, &path)?;
+            let primed = native
+                .as_mut()
+                .expect("recording requires native state")
+                .prime_recorder(
+                    &mut control.borrow_mut(),
+                    &authority,
+                    Some(&process_shutdown),
+                );
+            match primed {
+                Ok(true) => {}
+                Ok(false) => {
+                    checkpoint_native(&control, &journal, &mut durable)?;
+                    native
+                        .as_mut()
+                        .expect("recording requires native state")
+                        .finalize_recorder()?;
+                    return Ok(());
+                }
+                Err(error) => {
+                    let _ = native
+                        .as_mut()
+                        .expect("recording requires native state")
+                        .finalize_recorder();
+                    return Err(error);
+                }
             }
         }
     }
@@ -4329,7 +4657,9 @@ fn serve_inner(
     let capabilities_digest = capabilities_digest(
         native.is_some(),
         fullscreen_active,
-        native.as_ref().is_some_and(NativeDaemon::recorder_active),
+        native
+            .as_ref()
+            .is_some_and(NativeDaemon::recording_configured),
     );
     let config = ServerConfig::new(
         ServerMode::Development,
@@ -4647,6 +4977,13 @@ fn restore_engine(project: &StoredProject) -> AppResult<Engine> {
         // realization itself is daemon-side runtime work, not engine history.
         realized.set_stream_running(target_id, true)?;
     }
+    // The recording flag is engine-owned desired state, so it is seeded into
+    // BOTH switchers: idle restore demands desired/realized agreement, while
+    // realization of the desire is daemon-side recorder work.
+    let recording_desired = canonical.recording_desired_active();
+    show.desired_switcher_mut()
+        .set_recording_desired(recording_desired)?;
+    realized.set_recording_desired(recording_desired)?;
     for config in canonical.stingers() {
         restore_stinger(&mut show, &mut realized, *config)?;
     }
@@ -5264,11 +5601,20 @@ fn execute_session_command(
                     },
                 )?
             };
-            // A live sink change is realized by the native runtime at the next
-            // frame boundary, after durability and acknowledgement have both
-            // settled.
+            // Live sink changes and recording segments are realized by the
+            // native runtime right here, after durability and the engine
+            // commit have settled but before the acknowledgement is queued.
             #[cfg(feature = "native-media")]
             native.observe_stream_command(command, &execution.submission.output.result);
+            #[cfg(feature = "native-media")]
+            native.observe_recording_command(
+                command,
+                &execution.submission.output.result,
+                durable,
+                &mut control,
+                server,
+                process_shutdown,
+            );
             execution
         } else {
             execute_durable_command(
@@ -5708,7 +6054,9 @@ fn command_ticks(
         | CommandPayload::CommitManualTransition
         | CommandPayload::CancelManualTransition
         | CommandPayload::StreamStart { .. }
-        | CommandPayload::StreamStop { .. } => 1,
+        | CommandPayload::StreamStop { .. }
+        | CommandPayload::RecordStart
+        | CommandPayload::RecordStop => 1,
     }
 }
 
@@ -5822,13 +6170,15 @@ fn stored_project_with_receipts(
     .map_err(Into::into)
 }
 
-/// Folds the desired stream running flags into the stored project.
+/// Folds the desired stream running flags and the desired recording flag into
+/// the stored project.
 ///
-/// StreamStart/StreamStop are engine commands, so the projected snapshot's
-/// desired switcher is the authority; mirroring it here makes an accepted
-/// command survive restart through journal replay and checkpoint, exactly as
-/// renames and audio strips do.
+/// StreamStart/StreamStop and RecordStart/RecordStop are engine commands, so
+/// the projected snapshot's desired switcher is the authority; mirroring them
+/// here makes an accepted command survive restart through journal replay and
+/// checkpoint, exactly as renames and audio strips do.
 fn sync_project_streams(project: &mut fm_model::Project, desired: &SwitcherState) -> AppResult<()> {
+    project.set_recording_desired_active(desired.recording_desired());
     let updates = project
         .stream_targets()
         .iter()
@@ -6500,7 +6850,7 @@ fn print_help() {
 Usage:\n  freemixd serve <show.freemix> [--listen 127.0.0.1:0] [--web-listen 127.0.0.1:0] [--status-listen 127.0.0.1:0] [--once] [--native-media [--camera-helper PATH]] [--record-program output.mp4] [--diagnostic-stop-after 10m] [--recover-to-checkpoint] [--fullscreen-program [--fullscreen-display 0]]\n  freemixd help\n  freemixd --version\n\n\
 Native media is opt-in; without it the daemon uses simulated frame realization.\n\
 --camera-helper overrides the developer AVFoundation helper path for exact macOS Device inputs; it never requests permission.\n\
-Program recording requires native media, an existing output parent, and a new final .mp4 file. Existing files are never overwritten.\n\
+Program recording requires native media and an existing output parent; segments are created exclusively, never overwritten. The first segment uses the configured path itself and later record-start segments use <stem>-<NNN>.mp4 names through 999.\n\
 Use --record-program=<path> when the output name begins with --. Recorder capability digests describe configured startup support; FREEMIXD_RECORDER reports runtime health.\n\
 macOS fullscreen display selection is a zero-based index ordered by physical position, then stable descriptive fields.\n\
 --diagnostic-stop-after schedules cooperative simulated or headless native shutdown after readiness; accepted units are ms, s, m, and h up to 24h.\n\
@@ -7768,6 +8118,100 @@ mod tests {
         assert_eq!(
             startup_pair_decision(RecorderState::Failed, 1, 1, true),
             StartupPairDecision::Failed
+        );
+    }
+
+    #[cfg(feature = "native-media")]
+    #[test]
+    fn next_record_segment_path_prefers_the_original_and_skips_existing_names() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = |name: &str| directory.path().join(name);
+        let exists = |path: &Path| path.exists();
+
+        // Segment 1 is the configured path itself.
+        assert_eq!(
+            next_record_segment_path(&base("show.mp4"), exists).unwrap(),
+            base("show.mp4")
+        );
+        std::fs::write(base("show.mp4"), b"").unwrap();
+        // Later segments are zero-padded `<stem>-<NNN>.mp4`, first free wins.
+        assert_eq!(
+            next_record_segment_path(&base("show.mp4"), exists).unwrap(),
+            base("show-002.mp4")
+        );
+        std::fs::write(base("show-002.mp4"), b"").unwrap();
+        assert_eq!(
+            next_record_segment_path(&base("show.mp4"), exists).unwrap(),
+            base("show-003.mp4")
+        );
+        // Gaps are filled by the first free name, not the last.
+        std::fs::create_dir_all(directory.path().join("nested")).unwrap();
+        let nested = |name: &str| directory.path().join("nested").join(name);
+        for name in ["take.mp4", "take-002.mp4", "take-004.mp4"] {
+            std::fs::write(nested(name), b"").unwrap();
+        }
+        assert_eq!(
+            next_record_segment_path(&nested("take.mp4"), exists).unwrap(),
+            nested("take-003.mp4")
+        );
+        // Compound stems keep everything before the final extension.
+        std::fs::write(base("a.b.mp4"), b"").unwrap();
+        assert_eq!(
+            next_record_segment_path(&base("a.b.mp4"), exists).unwrap(),
+            base("a.b-002.mp4")
+        );
+        // Non-.mp4 outputs and unnamed paths are refused outright.
+        for refused in ["show.mkv", "show", ".mp4"] {
+            assert!(
+                next_record_segment_path(&base(refused), exists).is_err(),
+                "{refused} must be refused"
+            );
+        }
+    }
+
+    #[cfg(feature = "native-media")]
+    #[test]
+    fn next_record_segment_path_refuses_exhaustion() {
+        const LAST: u32 = RECORD_SEGMENT_LAST_ORDINAL;
+        let directory = tempfile::tempdir().unwrap();
+        let base = directory.path().join("show.mp4");
+        std::fs::write(&base, b"").unwrap();
+        for ordinal in 2..=LAST {
+            std::fs::write(directory.path().join(format!("show-{ordinal:03}.mp4")), b"").unwrap();
+        }
+        let error = next_record_segment_path(&base, Path::exists).unwrap_err();
+        assert!(error.to_string().contains("exhausted"));
+    }
+
+    #[cfg(feature = "native-media")]
+    #[test]
+    fn stream_encoder_settings_carry_the_authored_video_bitrate() {
+        use fm_model::{StreamEndpoint, StreamKey, StreamProtocol, StreamTarget, StreamTargetId};
+
+        let target = StreamTarget::new(
+            StreamTargetId::new(NonZeroU128::new(7_100).unwrap()),
+            "Bitrate".to_owned(),
+            StreamProtocol::Rtmp,
+            StreamEndpoint::parse("ingest.example.com/live").unwrap(),
+            StreamKey::parse("unit-secret-key").unwrap(),
+            fm_types::OutputId::new(NonZeroU128::new(7_101).unwrap()),
+        )
+        .unwrap();
+        let authored = target.clone().with_video_bitrate(9_000).unwrap();
+        assert_ne!(authored.video_bitrate_kbps(), target.video_bitrate_kbps());
+        assert_eq!(
+            stream_encoder_settings(authored.video_bitrate_kbps()).video_bitrate_kbps,
+            9_000
+        );
+        // The model default maps onto the sink default unchanged.
+        let settings = stream_encoder_settings(target.video_bitrate_kbps());
+        assert_eq!(
+            settings.video_bitrate_kbps,
+            EncoderSettings::default().video_bitrate_kbps
+        );
+        assert_eq!(
+            settings.audio_bitrate_kbps,
+            EncoderSettings::default().audio_bitrate_kbps
         );
     }
 
@@ -10439,6 +10883,119 @@ mod tests {
         // stream state on restore.
         let restored = restore_engine(&durable).unwrap().snapshot().unwrap();
         assert_eq!(live_engine_snapshot(&mut control), restored);
+    }
+
+    /// A plain project whose authored desired recording flag is `active`.
+    fn test_project_with_recording(active: bool) -> StoredProject {
+        let baseline = test_project();
+        let mut project = baseline.project().clone();
+        project.set_recording_desired_active(active);
+        StoredProject::from_project(
+            project,
+            baseline.runtime_routing(),
+            baseline.position(),
+            baseline.idempotency_receipts().to_vec(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn restore_engine_seeds_recording_desired_into_both_switchers() {
+        for active in [true, false] {
+            let durable = test_project_with_recording(active);
+            let snapshot = restore_engine(&durable).unwrap().snapshot().unwrap();
+            // Idle restore demands desired/realized agreement, so BOTH
+            // switchers must carry the persisted flag or startup would fail.
+            let desired = snapshot.show().desired_switcher().recording_desired();
+            let realized = snapshot.realized_switcher().recording_desired();
+            assert_eq!(
+                (desired, realized),
+                (active, active),
+                "recording flag {active} was not seeded into both switchers"
+            );
+        }
+    }
+
+    #[test]
+    fn record_commands_persist_desired_active_across_replay_and_checkpoint() {
+        use journal::DurableJournal;
+
+        let directory = tempfile::tempdir().unwrap();
+        let project_path = directory.path().join("record-roundtrip.freemix");
+        let store = ProjectStore::new(&project_path).unwrap();
+        let durable = test_project_with_recording(true);
+        store.save(&durable).unwrap();
+
+        // An accepted RecordStop flips the durable flag to false and stays
+        // only in the journal: a crash right now must still restart stopped.
+        let mut control = test_control(&durable);
+        let server = test_server(&control);
+        let mut durable = durable;
+        {
+            let journal = DurableJournal::new(store.open_journal_writer().unwrap());
+            let stopped = execute_durable_command(
+                &mut control,
+                &journal,
+                &mut durable,
+                &operator(),
+                &server,
+                &test_command("rec-stop", "rec-stop-key", CommandPayload::RecordStop),
+                0,
+            )
+            .unwrap();
+            assert!(matches!(
+                stopped.submission.output.result,
+                CommandResult::Accepted { revision: 1, .. }
+            ));
+            assert!(!durable.project().recording_desired_active());
+        }
+        assert_eq!(store.load().unwrap().position().revision, 0);
+
+        // Journal replay alone reproduces the stopped state.
+        let reloaded = ProjectStore::new(&project_path).unwrap();
+        let manifest = reloaded.load().unwrap();
+        let scan = reloaded.scan_journal().unwrap();
+        assert_eq!(scan.batches().len(), 1);
+        let replayed = replay_journal(&manifest, scan.batches()).unwrap();
+        assert_eq!(replayed.position().revision, 1);
+        assert!(!replayed.project().recording_desired_active());
+
+        // A later RecordStart persists true and survives a full checkpoint;
+        // the restored engine matches the live one either way.
+        let mut control = test_control(&replayed);
+        let server = test_server(&control);
+        let mut durable = replayed;
+        {
+            let journal = DurableJournal::new(reloaded.open_journal_writer().unwrap());
+            let started = execute_durable_command(
+                &mut control,
+                &journal,
+                &mut durable,
+                &operator(),
+                &server,
+                &test_command("rec-start", "rec-start-key", CommandPayload::RecordStart),
+                0,
+            )
+            .unwrap();
+            assert!(matches!(
+                started.submission.output.result,
+                CommandResult::Accepted { revision: 2, .. }
+            ));
+            assert!(durable.project().recording_desired_active());
+            journal.settle(&durable).unwrap();
+        }
+        let checkpointed = ProjectStore::new(&project_path).unwrap();
+        let final_state = checkpointed.load().unwrap();
+        assert_eq!(final_state.position().revision, 2);
+        assert_eq!(
+            checkpointed.scan_journal().unwrap().batches().len(),
+            0,
+            "checkpoint must have compacted the journal"
+        );
+        assert!(final_state.project().recording_desired_active());
+        let restored = restore_engine(&final_state).unwrap().snapshot().unwrap();
+        assert_eq!(live_engine_snapshot(&mut control), restored);
+        assert!(restored.show().desired_switcher().recording_desired());
     }
 
     #[cfg(feature = "native-media")]
