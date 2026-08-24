@@ -1726,6 +1726,7 @@ dependencies = [
  "fm-gpu",
  "fm-io-api",
  "fm-io-macos",
+ "fm-io-network",
  "fm-model",
  "fm-observability",
  "fm-persistence",
