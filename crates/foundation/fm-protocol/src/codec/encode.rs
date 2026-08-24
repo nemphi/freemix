@@ -9,15 +9,17 @@ use crate::{
     MAX_AUDIO_METER_CHANNELS, ManualTransitionKind, ManualTransitionStatus, OverlayStatus,
     ResumeCursor, RuntimeEventMessage, RuntimeFailureDisposition, RuntimeLifecycleEvent,
     ServerIdentity, SnapshotMessage, SnapshotReason, StingerAudioPolicy,
-    StingerMissingMediaFallback, StingerReadiness, StingerStatus, StructuredError, WireMessage,
+    StingerMissingMediaFallback, StingerReadiness, StingerStatus, StreamStatusMessage,
+    StructuredError, WireMessage,
 };
 
 use super::value::{
-    client_type, durable_events, field_issues, input_ids, input_statuses, output_statuses, role,
-    runtime_domains, stream_statuses, string_list,
+    client_type, durable_events, escape_stream_failure, field_issues, input_ids, input_statuses,
+    output_statuses, role, runtime_domains, stream_realized_state, stream_statuses, string_list,
 };
 use super::{
-    CodecError, MAX_FIELD_VALUE_BYTES, MAX_LINE_BYTES, MAX_LIST_ITEMS, validate_request_id,
+    CodecError, MAX_FIELD_VALUE_BYTES, MAX_LINE_BYTES, MAX_LIST_ITEMS, MAX_STREAM_SAMPLES,
+    validate_request_id,
 };
 
 /// Encodes one message as a single newline-terminated record.
@@ -45,6 +47,7 @@ pub fn encode_line(message: &WireMessage) -> Result<String, CodecError> {
             encode_heartbeat_acknowledgement(&mut record, message)?;
         }
         WireMessage::AudioMeters(message) => encode_audio_meters(&mut record, message)?,
+        WireMessage::StreamStatus(message) => encode_stream_status(&mut record, message)?,
         WireMessage::CapabilityReport(message) => encode_capability_report(&mut record, message)?,
         WireMessage::DiagnosticsRequest(message) => {
             encode_diagnostics_request(&mut record, message)?;
@@ -985,6 +988,52 @@ fn encode_heartbeat_acknowledgement(
     encode_server_identity(record, &message.server)?;
     record.field("heartbeat_sequence", message.heartbeat_sequence)?;
     record.field("received_at_ms", message.received_at_ms)
+}
+
+fn encode_stream_status(
+    record: &mut Record,
+    message: &StreamStatusMessage,
+) -> Result<(), CodecError> {
+    if message.samples.is_empty() {
+        return Err(CodecError::InvalidField {
+            field: "samples",
+            value: "empty".to_owned(),
+        });
+    }
+    if message.samples.len() > MAX_STREAM_SAMPLES {
+        return Err(CodecError::TooManyItems("samples"));
+    }
+    let mut previous = None;
+    let samples = message
+        .samples
+        .iter()
+        .map(|sample| {
+            if previous.is_some_and(|id| sample.target.get() <= id) {
+                return Err(CodecError::InvalidField {
+                    field: "samples",
+                    value: sample.target.to_string(),
+                });
+            }
+            previous = Some(sample.target.get());
+            Ok(format!(
+                "{}:{}:{}:{}:{}:{}:{}",
+                sample.target,
+                stream_realized_state(sample.realized),
+                u8::from(sample.connected),
+                sample.muxed_bytes,
+                sample.enqueued_pairs,
+                sample.dropped_pairs,
+                match &sample.failure {
+                    Some(failure) => escape_stream_failure(failure)?,
+                    None => String::new(),
+                },
+            ))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    record.kind("stream_status");
+    encode_server_identity(record, &message.server)?;
+    record.field("sequence", message.sequence)?;
+    record.field_string("samples", samples.join(";"))
 }
 
 fn encode_audio_meters(

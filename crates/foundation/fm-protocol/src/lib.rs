@@ -6,8 +6,8 @@ mod version;
 
 pub use codec::{
     CodecError, LineDecoder, MAX_BATCH_EVENTS, MAX_FIELD_NAME_BYTES, MAX_FIELD_VALUE_BYTES,
-    MAX_FIELDS_PER_MESSAGE, MAX_LINE_BYTES, MAX_LIST_ITEMS, MAX_MESSAGES_PER_PUSH, decode_line,
-    encode_line,
+    MAX_FIELDS_PER_MESSAGE, MAX_LINE_BYTES, MAX_LIST_ITEMS, MAX_MESSAGES_PER_PUSH,
+    MAX_STREAM_SAMPLES, decode_line, encode_line,
 };
 pub use dto::{
     AUDIO_METER_LEVEL_SCALE, AudioMeterChannel, AudioMetersMessage, CapabilityReportMessage,
@@ -22,7 +22,8 @@ pub use dto::{
     RuntimeDomainBoundary, RuntimeEventMessage, RuntimeFailureDisposition, RuntimeLifecycleEvent,
     ServerHello, ServerIdentity, SnapshotMessage, SnapshotReason, StingerAudioPolicy,
     StingerMissingMediaFallback, StingerReadiness, StingerStatus, StreamRealizedState,
-    StreamStatus, StructuredError, WireInputId, WireMessage, WireOutputId, WireOverlayChannelId,
-    WireStingerSlotId, WireStreamTargetId, choose_handshake_outcome,
+    StreamStatus, StreamStatusMessage, StreamStatusSample, StructuredError, WireInputId,
+    WireMessage, WireOutputId, WireOverlayChannelId, WireStingerSlotId, WireStreamTargetId,
+    choose_handshake_outcome,
 };
 pub use version::{CURRENT_PROTOCOL_VERSION, ProtocolVersion};

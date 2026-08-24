@@ -875,6 +875,32 @@ pub struct AudioMetersMessage {
     pub inputs: Vec<InputAudioMeters>,
 }
 
+/// One lossy realized stream status sample for one configured target.
+///
+/// Counters are cumulative since the target's last start. `failure` carries a
+/// sanitized short code and never URL text or key material.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamStatusSample {
+    pub target: WireStreamTargetId,
+    pub realized: StreamRealizedState,
+    pub connected: bool,
+    pub muxed_bytes: u64,
+    pub enqueued_pairs: u64,
+    pub dropped_pairs: u64,
+    pub failure: Option<String>,
+}
+
+/// Lossy, non-resumable realized streaming status for every active target.
+///
+/// Like [`AudioMetersMessage`] this is latest-wins transport state: it is not
+/// durable, not resumable, and never part of snapshots or durable events.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamStatusMessage {
+    pub server: ServerIdentity,
+    pub sequence: u64,
+    pub samples: Vec<StreamStatusSample>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CapabilityReportSummary {
     pub digest: String,
@@ -925,6 +951,7 @@ pub enum WireMessage {
     Heartbeat(HeartbeatMessage),
     HeartbeatAcknowledgement(HeartbeatAcknowledgementMessage),
     AudioMeters(AudioMetersMessage),
+    StreamStatus(StreamStatusMessage),
     CapabilityReport(CapabilityReportMessage),
     DiagnosticsRequest(DiagnosticsRequest),
     DiagnosticsResponse(DiagnosticsResponse),

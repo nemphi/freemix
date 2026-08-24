@@ -159,8 +159,8 @@ fn snapshot(inputs: Vec<InputStatus>) -> WireMessage {
 }
 
 #[test]
-fn protocol_2_16_heartbeat_acknowledgement_codec_is_exact() {
-    assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(2, 16));
+fn protocol_2_17_heartbeat_acknowledgement_codec_is_exact() {
+    assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(2, 17));
     let acknowledgement = WireMessage::HeartbeatAcknowledgement(HeartbeatAcknowledgementMessage {
         server: server_identity(),
         heartbeat_sequence: 88,
@@ -1398,4 +1398,108 @@ fn phase_one_records_reject_malformed_and_unknown_required_fields() {
         decode_line(&unknown),
         Err(CodecError::UnknownField("future_required".to_owned()))
     );
+}
+
+#[test]
+fn stream_status_codec_is_lossy_bounded_and_exact() {
+    use fm_protocol::{MAX_STREAM_SAMPLES, StreamStatusMessage, StreamStatusSample};
+
+    let message = WireMessage::StreamStatus(StreamStatusMessage {
+        server: server_identity(),
+        sequence: 12,
+        samples: vec![
+            StreamStatusSample {
+                target: WireStreamTargetId::new(NonZeroU128::new(7).unwrap()),
+                realized: StreamRealizedState::Live,
+                connected: true,
+                muxed_bytes: 1_048_576,
+                enqueued_pairs: 900,
+                dropped_pairs: 3,
+                failure: None,
+            },
+            StreamStatusSample {
+                target: WireStreamTargetId::new(NonZeroU128::new(11).unwrap()),
+                realized: StreamRealizedState::WaitingToReconnect,
+                connected: false,
+                muxed_bytes: 0,
+                enqueued_pairs: 0,
+                dropped_pairs: 0,
+                failure: Some("connect:refused".to_owned()),
+            },
+        ],
+    });
+    let encoded = encode_line(&message).unwrap();
+    assert_eq!(
+        encoded,
+        "stream_status\tengine_id=engine-a\tproject_id=project-9\tstate_epoch=7\tlog_id=log-a\tsequence=12\tsamples=7%3Alive%3A1%3A1048576%3A900%3A3%3A%3B11%3Awaiting_to_reconnect%3A0%3A0%3A0%3A0%3Aconnect%253Arefused\n"
+    );
+    assert_eq!(decode_line(&encoded).unwrap(), message);
+
+    let empty = StreamStatusMessage {
+        server: server_identity(),
+        sequence: 13,
+        samples: Vec::new(),
+    };
+    assert!(matches!(
+        encode_line(&WireMessage::StreamStatus(empty)),
+        Err(CodecError::InvalidField {
+            field: "samples",
+            ..
+        })
+    ));
+
+    let mut overflowing = StreamStatusMessage {
+        server: server_identity(),
+        sequence: 14,
+        samples: Vec::new(),
+    };
+    for index in 0..=MAX_STREAM_SAMPLES {
+        overflowing.samples.push(StreamStatusSample {
+            target: WireStreamTargetId::new(
+                NonZeroU128::new(u128::try_from(index).unwrap() + 1).unwrap(),
+            ),
+            realized: StreamRealizedState::Stopped,
+            connected: false,
+            muxed_bytes: 0,
+            enqueued_pairs: 0,
+            dropped_pairs: 0,
+            failure: None,
+        });
+    }
+    assert!(matches!(
+        encode_line(&WireMessage::StreamStatus(overflowing)),
+        Err(CodecError::TooManyItems("samples"))
+    ));
+
+    let unordered = StreamStatusMessage {
+        server: server_identity(),
+        sequence: 15,
+        samples: vec![
+            StreamStatusSample {
+                target: WireStreamTargetId::new(NonZeroU128::new(9).unwrap()),
+                realized: StreamRealizedState::Live,
+                connected: true,
+                muxed_bytes: 1,
+                enqueued_pairs: 1,
+                dropped_pairs: 0,
+                failure: None,
+            },
+            StreamStatusSample {
+                target: WireStreamTargetId::new(NonZeroU128::new(9).unwrap()),
+                realized: StreamRealizedState::Stopped,
+                connected: false,
+                muxed_bytes: 0,
+                enqueued_pairs: 0,
+                dropped_pairs: 0,
+                failure: None,
+            },
+        ],
+    };
+    assert!(matches!(
+        encode_line(&WireMessage::StreamStatus(unordered)),
+        Err(CodecError::InvalidField {
+            field: "samples",
+            ..
+        })
+    ));
 }

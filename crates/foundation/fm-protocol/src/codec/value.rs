@@ -420,6 +420,11 @@ pub(super) fn parse_stream_realized_state(value: &str) -> Option<StreamRealizedS
         _ => None,
     }
 }
+/// Escapes one sanitized failure code for a `stream_status` sample.
+pub(super) fn escape_stream_failure(value: &str) -> Result<String, CodecError> {
+    escape_bounded(value)
+}
+
 pub(super) fn stream_statuses(values: &[StreamStatus]) -> Result<String, CodecError> {
     let mut seen = BTreeSet::new();
     for status in values {

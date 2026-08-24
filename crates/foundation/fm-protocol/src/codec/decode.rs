@@ -11,18 +11,19 @@ use crate::{
     ManualTransitionPosition, ManualTransitionState, ManualTransitionStatus, OverlayStatus,
     ResumeCursor, RuntimeEventMessage, RuntimeFailureDisposition, RuntimeLifecycleEvent,
     ServerIdentity, SnapshotMessage, SnapshotReason, StingerAudioPolicy,
-    StingerMissingMediaFallback, StingerReadiness, StingerStatus, StructuredError, WireInputId,
-    WireMessage, WireOutputId, WireOverlayChannelId, WireStingerSlotId, WireStreamTargetId,
+    StingerMissingMediaFallback, StingerReadiness, StingerStatus, StreamStatusMessage,
+    StreamStatusSample, StructuredError, WireInputId, WireMessage, WireOutputId,
+    WireOverlayChannelId, WireStingerSlotId, WireStreamTargetId,
 };
 
 use super::value::{
     parse_client_type, parse_durable_events, parse_field_issues, parse_input_ids,
     parse_input_statuses, parse_output_statuses, parse_role, parse_runtime_domains,
-    parse_stream_statuses, parse_string_list, parse_version, unescape,
+    parse_stream_realized_state, parse_stream_statuses, parse_string_list, parse_version, unescape,
 };
 use super::{
     MAX_FIELD_NAME_BYTES, MAX_FIELD_VALUE_BYTES, MAX_FIELDS_PER_MESSAGE, MAX_LINE_BYTES,
-    MAX_LIST_ITEMS, MAX_MESSAGES_PER_PUSH, validate_request_id,
+    MAX_LIST_ITEMS, MAX_MESSAGES_PER_PUSH, MAX_STREAM_SAMPLES, validate_request_id,
 };
 
 /// Decodes exactly one newline-terminated wire record.
@@ -68,6 +69,7 @@ pub fn decode_line(line: &str) -> Result<WireMessage, CodecError> {
             WireMessage::HeartbeatAcknowledgement(decode_heartbeat_acknowledgement(&mut fields)?)
         }
         "audio_meters" => WireMessage::AudioMeters(decode_audio_meters(&mut fields)?),
+        "stream_status" => WireMessage::StreamStatus(decode_stream_status(&mut fields)?),
         "capability_report" => {
             WireMessage::CapabilityReport(decode_capability_report(&mut fields)?)
         }
@@ -1283,6 +1285,84 @@ fn decode_heartbeat_acknowledgement(
         server: decode_server_identity(fields)?,
         heartbeat_sequence: fields.parse_required("heartbeat_sequence")?,
         received_at_ms: fields.parse_required("received_at_ms")?,
+    })
+}
+
+fn decode_stream_status(fields: &mut Fields) -> Result<StreamStatusMessage, CodecError> {
+    let server = decode_server_identity(fields)?;
+    let sequence = fields.parse_required("sequence")?;
+    let samples_value = fields.required("samples")?;
+    if samples_value.is_empty() {
+        return Err(CodecError::InvalidField {
+            field: "samples",
+            value: samples_value,
+        });
+    }
+    let entries: Vec<_> = samples_value.split(';').collect();
+    if entries.len() > MAX_STREAM_SAMPLES {
+        return Err(CodecError::TooManyItems("samples"));
+    }
+    let mut previous = None;
+    let samples = entries
+        .into_iter()
+        .map(|entry| {
+            let invalid = || CodecError::InvalidField {
+                field: "samples",
+                value: entry.to_owned(),
+            };
+            let parts = entry.split(':').collect::<Vec<_>>();
+            let [
+                target,
+                realized,
+                connected,
+                muxed_bytes,
+                enqueued_pairs,
+                dropped_pairs,
+                failure,
+            ] = parts.as_slice()
+            else {
+                return Err(invalid());
+            };
+            let target = target
+                .parse::<u128>()
+                .ok()
+                .and_then(NonZeroU128::new)
+                .map(WireStreamTargetId::new)
+                .ok_or_else(invalid)?;
+            if previous.is_some_and(|id| target.get() <= id) {
+                return Err(invalid());
+            }
+            previous = Some(target.get());
+            let realized = parse_stream_realized_state(realized).ok_or_else(invalid)?;
+            let connected = match *connected {
+                "0" => false,
+                "1" => true,
+                _ => return Err(invalid()),
+            };
+            let failure = if failure.is_empty() {
+                None
+            } else {
+                let failure = unescape(failure)?;
+                if failure.len() > super::MAX_STREAM_DETAIL_BYTES {
+                    return Err(invalid());
+                }
+                Some(failure)
+            };
+            Ok(StreamStatusSample {
+                target,
+                realized,
+                connected,
+                muxed_bytes: muxed_bytes.parse().map_err(|_| invalid())?,
+                enqueued_pairs: enqueued_pairs.parse().map_err(|_| invalid())?,
+                dropped_pairs: dropped_pairs.parse().map_err(|_| invalid())?,
+                failure,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(StreamStatusMessage {
+        server,
+        sequence,
+        samples,
     })
 }
 
