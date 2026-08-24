@@ -1241,8 +1241,6 @@ path, emits sanitized per-target `FREEMIXD_STREAM` finalization records, and
 adds enqueue/drop counters to telemetry; startup or feed failures latch
 per-target and degrade rather than abort the show. The CLI exposes local and
 remote `stream-start`/`stream-stop`, and status prints the validated roster.
-The snapshot's realized field is currently a fixed `Stopped` projection:
-per-target live realization state does not yet reach snapshots or events.
 There is no five-destination fan-out through `OutputSet`, no multi-bitrate
 rendition planning caller, no output-health UI, no live decoder acceptance of a
 recorded broadcast, and no hardware encoder, so item 1 and `OR-005` remain
@@ -1250,6 +1248,12 @@ planned. The model and sink now accept SRT alongside RTMP/RTMPS:
 `srt://host[:port]` endpoints compose `?streamid=` URLs with the same key
 redaction, the FFmpeg sink muxes MPEG-TS with its own channel-layout rules,
 and a real-ffmpeg integration receives an SRT broadcast and probes H.264/AAC.
+Protocol 2.17 adds the lossy latest-wins `stream_status` peer record beside
+audio meters: native `freemixd` publishes per-target realized state, counters,
+and sanitized failures from sink telemetry each frame interval; sessions
+validate identity and monotonic sequence with meter semantics and retain the
+latest record for operator status. Snapshots still project only desired state;
+the lossy record is transport state and never durable.
 
 Exit: a remote-controlled headless production can stream and record
 independently with tested recovery.

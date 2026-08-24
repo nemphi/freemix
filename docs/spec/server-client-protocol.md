@@ -34,7 +34,7 @@ into control messages.
    replacement, restore, log compaction, or engine identity change forces a
    snapshot and a new cursor.
 
-The current Protocol 2.16 implementation uses bounded newline-delimited raw TCP.
+The current Protocol 2.17 implementation uses bounded newline-delimited raw TCP.
 Studio keeps one expected heartbeat sequence and waits for its matching
 acknowledgement within the bounded peer wait. EOF, timeout, wrong server
 identity, or wrong sequence enters the existing reconnect backoff. The server
@@ -148,6 +148,15 @@ record and one latest replacement. Control records have priority unless a meter
 record has already started, in which case that newline-delimited record finishes
 first. The Master reading is after strip processing and mixer clipping but
 before clip-local Stinger audio and Fade-to-Black.
+
+Protocol 2.17 defines `stream_status` with the same lossy, non-resumable
+semantics: server identity, an independent strictly increasing sequence, and at
+most one sample set per frame interval carrying every active streaming target's
+realized state, connectivity, cumulative enqueue/drop counters, and a sanitized
+failure code in strict target order. Peers retain only the latest record;
+violations of identity or sequence disconnect the session exactly like meter
+violations. The record never advances or carries a durable revision, and native
+`freemixd` omits it entirely while no stream runtime is active.
 
 Each telemetry class has requested cadence, aggregation, and maximum bandwidth.
 Slow clients receive coalesced latest data, never unbounded queues.
