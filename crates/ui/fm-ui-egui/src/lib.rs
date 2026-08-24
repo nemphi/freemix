@@ -3,6 +3,7 @@
 //! This crate translates immutable client views into operator-facing controls
 //! and returns intents. It performs no command dispatch, persistence, or I/O.
 
+use core::num::NonZeroU128;
 use egui::{
     Button, Color32, DragValue, Event, Frame, Grid, Key, Label, Margin, Modifiers, RichText,
     ScrollArea, Stroke, Ui, Vec2,
@@ -10,11 +11,14 @@ use egui::{
 use fm_protocol::{
     AudioMeterChannel, AudioMetersMessage, ManualTransitionKind, ManualTransitionPosition,
     OverlayBorderPreset, OverlayPositionPreset, OverlayTransitionKind, StingerReadiness,
-    WireOverlayChannelId, WireStingerSlotId,
+    StreamRealizedState, StreamStatusMessage, StreamStatusSample, WireOverlayChannelId,
+    WireStingerSlotId,
 };
 use fm_types::MAX_INPUT_NAME_BYTES;
 use fm_types::{InputId, OutputId};
-use fm_ui_model::{BusSelection, ClientView, ManualTransitionStatus, StingerStatus, SwitcherState};
+use fm_ui_model::{
+    BusSelection, ClientView, ManualTransitionStatus, StingerStatus, StreamStatus, SwitcherState,
+};
 
 mod fade_to_black;
 mod overlay_status;
@@ -214,6 +218,8 @@ pub struct StudioUiState {
     pub error: Option<String>,
     pub terminal_uncertainties: Vec<TerminalUncertaintyNotice>,
     pub audio_meters: Option<AudioMetersMessage>,
+    pub streams: Vec<StreamStatus>,
+    pub stream_status: Option<StreamStatusMessage>,
 }
 
 impl StudioUiState {
@@ -233,6 +239,8 @@ impl StudioUiState {
             error: None,
             terminal_uncertainties: Vec::new(),
             audio_meters: None,
+            streams: Vec::new(),
+            stream_status: None,
         }
     }
 
@@ -842,6 +850,7 @@ impl StudioShell {
                 ui.add_space(8.0);
                 draw_input_audio_strips(ui, state, &mut intents);
                 draw_audio_meters(ui, state);
+                draw_streams(ui, state);
                 ui.add_space(8.0);
                 self.draw_inputs(ui, state, &mut intents);
             });
@@ -893,6 +902,91 @@ fn meter_group(ui: &mut Ui, label: &str, channels: &[AudioMeterChannel]) {
             );
         }
     });
+}
+
+const STREAMS_NONE_CONFIGURED: &str = "STREAMS | NONE CONFIGURED";
+
+fn draw_streams(ui: &mut Ui, state: &StudioUiState) {
+    if streams_show_none_configured(
+        state.connection_status,
+        state.view.is_some(),
+        &state.streams,
+    ) {
+        ui.label(RichText::new(STREAMS_NONE_CONFIGURED).small().color(MUTED));
+        return;
+    }
+    if state.streams.is_empty() {
+        return;
+    }
+    ui.vertical(|ui| {
+        ui.label(RichText::new("STREAMS").small().strong());
+        for stream in &state.streams {
+            let sample = latest_stream_sample(state.stream_status.as_ref(), stream.target);
+            ui.label(
+                RichText::new(stream_row_text(stream, sample))
+                    .small()
+                    .color(MUTED),
+            );
+        }
+    });
+}
+
+/// Pure placeholder decision: connected with a view but no configured streams.
+const fn streams_show_none_configured(
+    connection_status: StudioConnectionStatus,
+    has_view: bool,
+    streams: &[StreamStatus],
+) -> bool {
+    matches!(connection_status, StudioConnectionStatus::Ready) && has_view && streams.is_empty()
+}
+
+/// Finds the latest lossy status sample for one roster target, if any.
+fn latest_stream_sample(
+    status: Option<&StreamStatusMessage>,
+    target: NonZeroU128,
+) -> Option<&StreamStatusSample> {
+    status.and_then(|message| {
+        message
+            .samples
+            .iter()
+            .find(|sample| sample.target.get() == target)
+    })
+}
+
+/// Lowercase realized-state label matching the operator-facing protocol text.
+const fn stream_realized_name(state: StreamRealizedState) -> &'static str {
+    match state {
+        StreamRealizedState::Stopped => "stopped",
+        StreamRealizedState::Starting => "starting",
+        StreamRealizedState::Live => "live",
+        StreamRealizedState::WaitingToReconnect => "waiting-to-reconnect",
+        StreamRealizedState::Congested => "congested",
+        StreamRealizedState::Failed => "failed",
+        StreamRealizedState::Unavailable => "unavailable",
+    }
+}
+
+/// One compact roster row: canonical name plus desired flag and, when a latest
+/// sample exists for that target, the retained realized transport counters.
+/// Roster entries without samples show the desired flag only; samples without
+/// roster entries are ignored by the caller.
+fn stream_row_text(stream: &StreamStatus, sample: Option<&StreamStatusSample>) -> String {
+    use core::fmt::Write as _;
+    let mut row = format!("{} desired={}", stream.name, stream.desired_running);
+    let Some(sample) = sample else {
+        return row;
+    };
+    let _ = write!(
+        row,
+        " realized={} connected={} muxed_bytes={} enqueued_pairs={} dropped_pairs={} failure={}",
+        stream_realized_name(sample.realized),
+        sample.connected,
+        sample.muxed_bytes,
+        sample.enqueued_pairs,
+        sample.dropped_pairs,
+        sample.failure.as_deref().unwrap_or("none"),
+    );
+    row
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2425,6 +2519,120 @@ mod tests {
             Some(desired_active.desired_fade_to_black),
         );
         assert!(fade_to_black.to_black);
+    }
+
+    fn stream_roster_entry(value: u128, name: &str, desired_running: bool) -> StreamStatus {
+        StreamStatus {
+            target: NonZeroU128::new(value).unwrap(),
+            name: name.to_owned(),
+            desired_running,
+            realized: StreamRealizedState::Stopped,
+            detail: None,
+        }
+    }
+
+    fn stream_sample(target: u128, failure: Option<&str>) -> StreamStatusSample {
+        StreamStatusSample {
+            target: fm_protocol::WireStreamTargetId::new(NonZeroU128::new(target).unwrap()),
+            realized: StreamRealizedState::Live,
+            connected: true,
+            muxed_bytes: 2048,
+            enqueued_pairs: 12,
+            dropped_pairs: 3,
+            failure: failure.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn streams_placeholder_applies_only_when_ready_with_view_and_empty_roster() {
+        assert_eq!(STREAMS_NONE_CONFIGURED, "STREAMS | NONE CONFIGURED");
+        let empty: [StreamStatus; 0] = [];
+        assert!(streams_show_none_configured(
+            StudioConnectionStatus::Ready,
+            true,
+            &empty
+        ));
+        assert!(!streams_show_none_configured(
+            StudioConnectionStatus::Ready,
+            false,
+            &empty
+        ));
+        for status in [
+            StudioConnectionStatus::Launching,
+            StudioConnectionStatus::Connecting,
+            StudioConnectionStatus::Synchronizing,
+            StudioConnectionStatus::Backoff,
+            StudioConnectionStatus::Disconnected,
+            StudioConnectionStatus::Failed,
+            StudioConnectionStatus::ProtocolMismatch,
+        ] {
+            assert!(
+                !streams_show_none_configured(status, true, &empty),
+                "{status:?}"
+            );
+        }
+        let roster = [stream_roster_entry(40, "RTMP Primary", true)];
+        assert!(!streams_show_none_configured(
+            StudioConnectionStatus::Ready,
+            true,
+            &roster
+        ));
+    }
+
+    #[test]
+    fn stream_rows_report_desired_only_without_samples_and_counters_with_samples() {
+        for (state, expected) in [
+            (StreamRealizedState::Stopped, "stopped"),
+            (StreamRealizedState::Starting, "starting"),
+            (StreamRealizedState::Live, "live"),
+            (
+                StreamRealizedState::WaitingToReconnect,
+                "waiting-to-reconnect",
+            ),
+            (StreamRealizedState::Congested, "congested"),
+            (StreamRealizedState::Failed, "failed"),
+            (StreamRealizedState::Unavailable, "unavailable"),
+        ] {
+            assert_eq!(stream_realized_name(state), expected);
+        }
+
+        let idle = stream_roster_entry(40, "RTMP Primary", true);
+        assert_eq!(stream_row_text(&idle, None), "RTMP Primary desired=true");
+
+        let sample = stream_sample(40, Some("auth_rejected"));
+        assert_eq!(
+            stream_row_text(&idle, Some(&sample)),
+            "RTMP Primary desired=true realized=live connected=true muxed_bytes=2048 \
+             enqueued_pairs=12 dropped_pairs=3 failure=auth_rejected"
+        );
+
+        let clean = StreamStatusSample {
+            failure: None,
+            ..sample
+        };
+        assert!(stream_row_text(&idle, Some(&clean)).ends_with("failure=none"));
+
+        let stopped = stream_roster_entry(41, "Backup", false);
+        assert_eq!(stream_row_text(&stopped, None), "Backup desired=false");
+
+        // Samples for targets outside the roster never leak into other rows.
+        let status = StreamStatusMessage {
+            server: fm_protocol::ServerIdentity {
+                engine_id: "e".to_owned(),
+                project_id: "1".to_owned(),
+                state_epoch: 1,
+                log_id: "l".to_owned(),
+            },
+            sequence: 7,
+            samples: vec![stream_sample(99, None)],
+        };
+        assert_eq!(latest_stream_sample(Some(&status), idle.target), None);
+        assert_eq!(
+            latest_stream_sample(Some(&status), NonZeroU128::new(99).unwrap())
+                .map(|sample| sample.muxed_bytes),
+            Some(2048)
+        );
+        assert_eq!(latest_stream_sample(None, idle.target), None);
     }
 
     #[test]
