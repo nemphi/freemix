@@ -34,7 +34,7 @@ into control messages.
    replacement, restore, log compaction, or engine identity change forces a
    snapshot and a new cursor.
 
-The current Protocol 2.15 implementation uses bounded newline-delimited raw TCP.
+The current Protocol 2.16 implementation uses bounded newline-delimited raw TCP.
 Studio keeps one expected heartbeat sequence and waits for its matching
 acknowledgement within the bounded peer wait. EOF, timeout, wrong server
 identity, or wrong sequence enters the existing reconnect backoff. The server
@@ -46,7 +46,13 @@ Snapshots carry bounded project-order input and output catalogs as exact ID/name
 The canonical persisted name labels input tiles and mixer strips; clients do not
 invent ordinal display names. The `input_renamed` and `input_order_changed`
 events carry durable exact-current name and order edits. Add/remove catalog edits
-still require a fresh snapshot.
+still require a fresh snapshot. Protocol 2.16 additionally replicates one
+validated streaming-destination roster: every configured stream target with its
+canonical name, desired running flag, and last reported realized state.
+`stream_start` and `stream_stop` mutate exactly one target per command, are
+authorized as transition operations, and are acknowledged durably before any
+runtime realization; each acceptance emits one durable `streams_changed` event
+carrying the full bounded roster so clients resync from any cursor.
 
 ## 3. Command semantics
 

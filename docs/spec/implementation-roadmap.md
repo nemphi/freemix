@@ -1222,9 +1222,31 @@ priority when that recovery queue is full only with interframes. This recovery
 is transport-neutral queue policy; it does not request a keyframe. Backup
 failures do not alternate back to the primary, while a manual stop and start
 selects the primary again.
-Non-retryable failures remain terminal. No socket adapter, RTMP/RTMPS or SRT
-transport, runtime wiring, persistence, output-health UI, live decoder proof,
-or live acceptance exists, so item 1 and `OR-005` remain planned.
+Non-retryable failures remain terminal.
+
+Protocol 2.16 adds runtime control for configured streaming destinations. The
+engine owns bounded desired stream inventory (at most eight targets) with
+exact per-target start/stop commands authorized as transition operations, one
+durable `streams_changed` event per accepted command, replay-safe receipts,
+and idle-snapshot validation; schema 19 persists each target's desired running
+flag, so restarts restore desired state through journal replay, and the daemon
+mirrors engine desired state into the durable project before acknowledgement.
+Native `freemixd --native-media` compiles every configured RTMP/RTMPS target
+into its own readback owner and `fm-codec-ffmpeg` streamer at startup,
+reconciles desired-running targets whose startup policy is
+`ReconcileDesiredState`, feeds each from the Program capture site after the
+recorder with cloned audio and independent sequence ledgers, realizes live
+starts at the next frame boundary, retires stopped streams off the render
+path, emits sanitized per-target `FREEMIXD_STREAM` finalization records, and
+adds enqueue/drop counters to telemetry; startup or feed failures latch
+per-target and degrade rather than abort the show. The CLI exposes local and
+remote `stream-start`/`stream-stop`, and status prints the validated roster.
+The snapshot's realized field is currently a fixed `Stopped` projection:
+per-target live realization state does not yet reach snapshots or events.
+There is no SRT output transport (`fm-io-srt` remains a socket-free contract),
+no five-destination fan-out through `OutputSet`, no multi-bitrate rendition
+planning caller, no output-health UI, no live decoder acceptance of a recorded
+broadcast, and no hardware encoder, so item 1 and `OR-005` remain planned.
 
 Exit: a remote-controlled headless production can stream and record
 independently with tested recovery.
