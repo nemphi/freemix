@@ -115,8 +115,7 @@ fn planar_meter_length_errors_preserve_output_and_runtime_state() {
                 &[source],
                 &[],
                 &mut output,
-                &mut master_meters,
-                &mut input_meters,
+                (&mut master_meters, &mut input_meters),
             ),
             Err(AudioError::MeterCountMismatch {
                 expected: 2,
@@ -136,8 +135,10 @@ fn planar_meter_length_errors_preserve_output_and_runtime_state() {
             &[source],
             &[],
             &mut output,
-            &mut [ChannelMeter::default(); 2],
-            &mut [ChannelMeter::default(); 2],
+            (
+                &mut [ChannelMeter::default(); 2],
+                &mut [ChannelMeter::default(); 2],
+            ),
         )
         .unwrap();
     assert_eq!(output, [vec![0.0, 0.25], vec![0.0, 0.5]]);
@@ -243,6 +244,7 @@ fn mute_solo_and_follow_video_gate_input_meters() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn planar_meter_slices_match_allocating_reference_in_stable_order() {
     let format = stereo_format();
     let first = input(1);
@@ -335,8 +337,7 @@ fn planar_meter_slices_match_allocating_reference_in_stable_order() {
             &sources,
             &[first],
             &mut output,
-            &mut master_meters,
-            &mut input_meters,
+            (&mut master_meters, &mut input_meters),
         )
         .unwrap();
 
@@ -360,7 +361,7 @@ fn planar_meter_slices_match_allocating_reference_in_stable_order() {
     for (actual, expected) in input_meters.chunks_exact(2).zip(&expected.input_meters) {
         assert_eq!(actual, expected.meters.channels());
     }
-    assert_meter(input_meters[0], 0.125, (0.028_320_312_5_f32 / 4.0).sqrt());
+    assert_meter(input_meters[0], 0.125, (0.028_320_313_f32 / 4.0).sqrt());
     assert_meter(input_meters[1], 0.5, (0.453_125_f32 / 4.0).sqrt());
     assert_eq!(&input_meters[2..], &[ChannelMeter::default(); 8]);
 }

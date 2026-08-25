@@ -64,6 +64,7 @@ struct ProjectDto {
     outputs: Vec<Output>,
     stream_targets: Vec<StreamTarget>,
     main_mix: Option<MainMix>,
+    recording_desired_active: bool,
     stingers: Vec<StingerConfig>,
     restart_policy: RestartPolicy,
 }
@@ -94,6 +95,7 @@ impl ProjectDto {
                 parse_stream_target,
             )?,
             main_mix: parse_optional(object.take("main_mix")?, parse_main_mix)?,
+            recording_desired_active: object.boolean("recording_desired_active")?,
             stingers: parse_array(object.take("stingers")?, "stingers", parse_stinger)?,
             restart_policy: parse_restart_policy(object.take("restart_policy")?)?,
         };
@@ -150,6 +152,7 @@ impl ProjectDto {
         if let Some(main_mix) = self.main_mix {
             project.set_main_mix(main_mix);
         }
+        project.set_recording_desired_active(self.recording_desired_active);
         for stinger in self.stingers {
             project.add_stinger(stinger);
         }
@@ -581,14 +584,15 @@ fn parse_stream_target(value: Value) -> Result<StreamTarget, DecodeError> {
     let protocol = match object.string("protocol")?.as_str() {
         "rtmp" => StreamProtocol::Rtmp,
         "rtmps" => StreamProtocol::Rtmps,
+        "srt" => StreamProtocol::Srt,
         value => return Err(unknown_enum("stream target protocol", value)),
     };
-    let endpoint = StreamEndpoint::parse(&object.string("endpoint")?)
+    let endpoint = StreamEndpoint::parse_for(protocol, &object.string("endpoint")?)
         .map_err(|error| syntax(format!("field `endpoint` is invalid: {error}")))?;
     let backup_endpoint = object
         .optional_string("backup_endpoint")?
         .map(|text| {
-            StreamEndpoint::parse(&text)
+            StreamEndpoint::parse_for(protocol, &text)
                 .map_err(|error| syntax(format!("field `backup_endpoint` is invalid: {error}")))
         })
         .transpose()?;
@@ -600,11 +604,16 @@ fn parse_stream_target(value: Value) -> Result<StreamTarget, DecodeError> {
         value => return Err(unknown_enum("startup", value)),
     };
     let output = OutputId::new(object.nonzero_u128("output")?);
+    let running = object.boolean("running")?;
+    let video_bitrate_kbps = object.u32("video_bitrate_kbps")?;
     object.finish()?;
-    StreamTarget::new(id, name, protocol, endpoint, key, output)
+    let target = StreamTarget::new(id, name, protocol, endpoint, key, output)
         .and_then(|target| target.with_backup_endpoint(backup_endpoint))
-        .map(|target| target.with_startup(startup))
-        .map_err(|error| syntax(format!("stream target is invalid: {error}")))
+        .map_err(|error| syntax(format!("stream target is invalid: {error}")))?;
+    let target = target
+        .with_video_bitrate(video_bitrate_kbps)
+        .map_err(|error| syntax(format!("stream target video bitrate is invalid: {error}")))?;
+    Ok(target.with_startup(startup).set_running(running))
 }
 
 fn parse_main_mix(value: Value) -> Result<MainMix, DecodeError> {

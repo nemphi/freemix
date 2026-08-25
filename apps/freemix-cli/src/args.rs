@@ -1,6 +1,6 @@
 use std::{net::SocketAddr, path::PathBuf};
 
-use fm_model::StartupPolicy;
+use fm_model::{DEFAULT_VIDEO_BITRATE_KBPS, StartupPolicy};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ManualTransitionKind {
@@ -84,6 +84,7 @@ pub struct StreamSpec {
     pub name: String,
     pub backup_url: Option<String>,
     pub startup: StartupPolicy,
+    pub video_bitrate_kbps: u32,
 }
 
 impl std::fmt::Debug for StreamSpec {
@@ -97,6 +98,7 @@ impl std::fmt::Debug for StreamSpec {
             .field("name", &self.name)
             .field("backup_url", &self.backup_url)
             .field("startup", &self.startup)
+            .field("video_bitrate_kbps", &self.video_bitrate_kbps)
             .finish()
     }
 }
@@ -194,6 +196,20 @@ pub enum Command {
     StreamRemove {
         path: PathBuf,
         stream: u128,
+    },
+    StreamStart {
+        path: PathBuf,
+        stream: u128,
+    },
+    StreamStop {
+        path: PathBuf,
+        stream: u128,
+    },
+    RecordStart {
+        path: PathBuf,
+    },
+    RecordStop {
+        path: PathBuf,
     },
     Streams {
         path: PathBuf,
@@ -723,6 +739,28 @@ pub enum Command {
         key: Option<String>,
         expected_revision: Option<u64>,
     },
+    RemoteStreamStart {
+        address: SocketAddr,
+        stream: u128,
+        key: Option<String>,
+        expected_revision: Option<u64>,
+    },
+    RemoteStreamStop {
+        address: SocketAddr,
+        stream: u128,
+        key: Option<String>,
+        expected_revision: Option<u64>,
+    },
+    RemoteRecordStart {
+        address: SocketAddr,
+        key: Option<String>,
+        expected_revision: Option<u64>,
+    },
+    RemoteRecordStop {
+        address: SocketAddr,
+        key: Option<String>,
+        expected_revision: Option<u64>,
+    },
     Render {
         path: PathBuf,
         output: PathBuf,
@@ -789,6 +827,7 @@ impl core::fmt::Display for ArgsError {
 
 impl std::error::Error for ArgsError {}
 
+#[allow(clippy::too_many_lines)]
 pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, ArgsError> {
     let mut arguments = arguments.into_iter();
     let Some(command) = arguments.next() else {
@@ -816,6 +855,10 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
             parse_stream(arguments, |path, spec| Command::StreamUpdate { path, spec })
         }
         "stream-remove" => parse_stream_remove(arguments),
+        "stream-start" => parse_stream_running(arguments, true),
+        "stream-stop" => parse_stream_running(arguments, false),
+        "record-start" => parse_record_desired(arguments, true),
+        "record-stop" => parse_record_desired(arguments, false),
         "scene-input-add" => parse_scene_input_add(arguments),
         "scene-input-duplicate" => parse_scene_input_duplicate(arguments),
         "scene-input-audio-source" => parse_scene_input_audio_source(arguments),
@@ -949,6 +992,10 @@ pub fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Command, Arg
         | "remote-tbar-commit"
         | "remote-tbar-cancel" => parse_remote_t_bar(&command, arguments),
         "remote-ftb" => parse_remote_fade_to_black(arguments),
+        "remote-stream-start" => parse_remote_stream_running(arguments, true),
+        "remote-stream-stop" => parse_remote_stream_running(arguments, false),
+        "remote-record-start" => parse_remote_record_desired(arguments, true),
+        "remote-record-stop" => parse_remote_record_desired(arguments, false),
         "render" => {
             let path = required_path(&mut arguments, "project path")?;
             let output = required_path(&mut arguments, "output path")?;
@@ -1021,6 +1068,7 @@ fn parse_stream(
     let name = nonblank(&mut arguments, "stream name")?;
     let mut backup_url = None;
     let mut startup = StartupPolicy::Stopped;
+    let mut video_bitrate_kbps = DEFAULT_VIDEO_BITRATE_KBPS;
     while let Some(option) = arguments.next() {
         match option.as_str() {
             "--backup" => {
@@ -1028,6 +1076,12 @@ fn parse_stream(
             }
             "--startup" => {
                 startup = startup_policy(&required(&mut arguments, "startup policy")?)?;
+            }
+            "--video-bitrate-kbps" => {
+                video_bitrate_kbps = number(
+                    &required(&mut arguments, "video bitrate kbps")?,
+                    "video bitrate",
+                )?;
             }
             _ => return Err(ArgsError::UnknownOption(option)),
         }
@@ -1042,6 +1096,7 @@ fn parse_stream(
             name,
             backup_url,
             startup,
+            video_bitrate_kbps,
         },
     ))
 }
@@ -1051,6 +1106,78 @@ fn parse_stream_remove(mut arguments: impl Iterator<Item = String>) -> Result<Co
     let stream = number(&required(&mut arguments, "stream")?, "stream")?;
     reject_extra(&mut arguments)?;
     Ok(Command::StreamRemove { path, stream })
+}
+
+fn parse_stream_running(
+    mut arguments: impl Iterator<Item = String>,
+    running: bool,
+) -> Result<Command, ArgsError> {
+    let path = required_path(&mut arguments, "project path")?;
+    let stream = number(&required(&mut arguments, "stream")?, "stream")?;
+    reject_extra(&mut arguments)?;
+    Ok(if running {
+        Command::StreamStart { path, stream }
+    } else {
+        Command::StreamStop { path, stream }
+    })
+}
+
+fn parse_record_desired(
+    mut arguments: impl Iterator<Item = String>,
+    active: bool,
+) -> Result<Command, ArgsError> {
+    let path = required_path(&mut arguments, "project path")?;
+    reject_extra(&mut arguments)?;
+    Ok(if active {
+        Command::RecordStart { path }
+    } else {
+        Command::RecordStop { path }
+    })
+}
+
+fn parse_remote_stream_running(
+    mut arguments: impl Iterator<Item = String>,
+    running: bool,
+) -> Result<Command, ArgsError> {
+    let address = socket_address(&required(&mut arguments, "address")?)?;
+    let stream = number(&required(&mut arguments, "stream")?, "stream")?;
+    let (key, expected_revision) = command_options(arguments)?;
+    Ok(if running {
+        Command::RemoteStreamStart {
+            address,
+            stream,
+            key,
+            expected_revision,
+        }
+    } else {
+        Command::RemoteStreamStop {
+            address,
+            stream,
+            key,
+            expected_revision,
+        }
+    })
+}
+
+fn parse_remote_record_desired(
+    mut arguments: impl Iterator<Item = String>,
+    active: bool,
+) -> Result<Command, ArgsError> {
+    let address = socket_address(&required(&mut arguments, "address")?)?;
+    let (key, expected_revision) = command_options(arguments)?;
+    Ok(if active {
+        Command::RemoteRecordStart {
+            address,
+            key,
+            expected_revision,
+        }
+    } else {
+        Command::RemoteRecordStop {
+            address,
+            key,
+            expected_revision,
+        }
+    })
 }
 
 fn startup_policy(value: &str) -> Result<StartupPolicy, ArgsError> {
@@ -3166,6 +3293,43 @@ mod tests {
         assert_eq!(
             parse(strings(&["cut", "show.freemix", "--key", "  \t"])),
             Err(ArgsError::BlankValue("idempotency key"))
+        );
+    }
+
+    #[test]
+    fn parses_local_and_remote_record_desired_commands() {
+        assert_eq!(
+            parse(strings(&["record-start", "show.freemix"])),
+            Ok(Command::RecordStart {
+                path: "show.freemix".into(),
+            })
+        );
+        assert_eq!(
+            parse(strings(&["record-stop", "show.freemix", "extra"])),
+            Err(ArgsError::UnexpectedArgument("extra".into()))
+        );
+        assert_eq!(
+            parse(strings(&[
+                "remote-record-stop",
+                "127.0.0.1:9123",
+                "--key",
+                "remote-record-stop",
+                "--expect",
+                "4",
+            ])),
+            Ok(Command::RemoteRecordStop {
+                address: "127.0.0.1:9123".parse().unwrap(),
+                key: Some("remote-record-stop".into()),
+                expected_revision: Some(4),
+            })
+        );
+        assert_eq!(
+            parse(strings(&["remote-record-start", "127.0.0.1:9123"])),
+            Ok(Command::RemoteRecordStart {
+                address: "127.0.0.1:9123".parse().unwrap(),
+                key: None,
+                expected_revision: None,
+            })
         );
     }
 

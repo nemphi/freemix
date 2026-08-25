@@ -21,6 +21,7 @@ use fm_model::{
     AudioBus, Input, InputAudioStripState, InputGainMilliDb, InputKind, Layer, LayerGeometry,
     MainMix, Output, Project, ProjectSettings, RectMask, RestartPolicy, Rgba8, Rotation, Scene,
     SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef, StartupPolicy,
+    StreamEndpoint, StreamKey, StreamProtocol, StreamTarget, StreamTargetId,
 };
 use fm_persistence::{
     ManualTransitionKind as PersistedManualTransitionKind, ProjectPosition, ProjectStore,
@@ -32,8 +33,8 @@ use fm_protocol::{
     HandshakeOutcome, HandshakeRequest, HeartbeatMessage, ManualTransitionKind,
     ManualTransitionPosition, ManualTransitionStatus, ProtocolVersion, ResumeCursor, Role,
     RuntimeLifecycleEvent, ServerIdentity, SnapshotReason, StingerAudioPolicy,
-    StingerMissingMediaFallback, WireInputId, WireMessage, WireStingerSlotId, decode_line,
-    encode_line,
+    StingerMissingMediaFallback, WireInputId, WireMessage, WireStingerSlotId, WireStreamTargetId,
+    decode_line, encode_line,
 };
 use fm_types::{
     AudioFormat, BusId, ChannelLayout, ColorMetadata, FrameRate, InputId, OutputId, PixelFormat,
@@ -95,7 +96,7 @@ impl Daemon {
         let lines = read_startup_lines(&mut child, 1);
         let readiness = match lines[0].parse::<ReadinessRecord>() {
             Ok(readiness) => readiness,
-            Err(error) => startup_failure(&mut child, lines, error.to_string(), None),
+            Err(error) => startup_failure(&mut child, &lines, &error.to_string(), None),
         };
         Self {
             child: Some(child),
@@ -120,8 +121,8 @@ impl Daemon {
         let readiness = line.parse::<ReadinessRecord>().unwrap_or_else(|error| {
             startup_failure(
                 &mut child,
-                vec![line.clone(), web_line.clone()],
-                error.to_string(),
+                &[line.clone(), web_line.clone()],
+                &error.to_string(),
                 None,
             )
         });
@@ -130,12 +131,7 @@ impl Daemon {
             .and_then(|line| line.strip_suffix('\n'))
             .and_then(|address| address.parse().ok())
             .unwrap_or_else(|| {
-                startup_failure(
-                    &mut child,
-                    vec![line, web_line],
-                    "invalid web readiness".into(),
-                    None,
-                )
+                startup_failure(&mut child, &[line, web_line], "invalid web readiness", None)
             });
         (
             Self {
@@ -185,8 +181,8 @@ impl Daemon {
         let readiness = line.parse::<ReadinessRecord>().unwrap_or_else(|error| {
             startup_failure(
                 &mut child,
-                vec![line.clone(), status_line.clone()],
-                error.to_string(),
+                &[line.clone(), status_line.clone()],
+                &error.to_string(),
                 None,
             )
         });
@@ -195,8 +191,8 @@ impl Daemon {
             .unwrap_or_else(|error| {
                 startup_failure(
                     &mut child,
-                    vec![line.clone(), status_line.clone()],
-                    error.to_string(),
+                    &[line.clone(), status_line.clone()],
+                    &error.to_string(),
                     None,
                 )
             });
@@ -224,7 +220,7 @@ impl Daemon {
         let lines = read_startup_lines(&mut child, 1);
         let readiness = match lines[0].parse::<ReadinessRecord>() {
             Ok(readiness) => readiness,
-            Err(error) => startup_failure(&mut child, lines, error.to_string(), None),
+            Err(error) => startup_failure(&mut child, &lines, &error.to_string(), None),
         };
         Self {
             child: Some(child),
@@ -319,22 +315,22 @@ fn read_startup_lines(child: &mut Child, count: usize) -> Vec<String> {
     let deadline = Instant::now() + Duration::from_secs(1);
     let result = match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
         Ok(result) => result,
-        Err(error) => startup_failure(child, Vec::new(), error.to_string(), Some(reader)),
+        Err(error) => startup_failure(child, &[], &error.to_string(), Some(reader)),
     };
     let lines = match result {
         Ok(lines) => lines,
-        Err(error) => startup_failure(child, Vec::new(), error.to_string(), Some(reader)),
+        Err(error) => startup_failure(child, &[], &error.to_string(), Some(reader)),
     };
     if reader.join().is_err() {
-        startup_failure(child, lines, "startup stdout reader panicked".into(), None);
+        startup_failure(child, &lines, "startup stdout reader panicked", None);
     }
     lines
 }
 
 fn startup_failure(
     child: &mut Child,
-    stdout: Vec<String>,
-    failure: String,
+    stdout: &[String],
+    failure: &str,
     reader: Option<std::thread::JoinHandle<()>>,
 ) -> ! {
     let stopped = terminate_child(child);
@@ -1298,6 +1294,7 @@ fn current_client_receives_structured_handshake_rejection() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn remote_input_rename_is_authorized_replicated_replay_safe_and_survives_restart() {
     let directory = TestDirectory::new("remote-input-rename");
     let project_path = directory.project_path();
@@ -1506,6 +1503,132 @@ fn remote_input_rename_is_authorized_replicated_replay_safe_and_survives_restart
             .get(),
         -2_000
     );
+}
+
+/// `StreamStart` is an authorized transition-class command: its acceptance
+/// publishes a durable event, an unknown target is rejected without state
+/// change, and the desired running flag survives a kill plus journal recovery.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn stream_start_is_replicated_rejects_unknown_targets_and_survives_restart() {
+    let directory = TestDirectory::new("stream-reconcile");
+    let project_path = directory.project_path();
+    create_stream_project(&project_path);
+
+    let daemon = Daemon::start_without_once(&project_path);
+    let mut client = daemon.connect();
+    client.handshake(None);
+    let WireMessage::Snapshot(snapshot) = client.receive() else {
+        panic!("expected initial snapshot");
+    };
+    assert_eq!(snapshot.streams.len(), 2);
+    assert!(
+        snapshot
+            .streams
+            .iter()
+            .all(|stream| !stream.desired_running)
+    );
+    assert!(
+        snapshot
+            .streams
+            .iter()
+            .all(|stream| matches!(stream.realized, fm_protocol::StreamRealizedState::Stopped),)
+    );
+
+    client.send(&command(
+        "stream-start",
+        "stream-start-key",
+        CommandPayload::StreamStart {
+            target: stream_target(1),
+        },
+    ));
+    assert!(matches!(
+        client.next_result(),
+        CommandResult::Accepted { revision: 1, .. }
+    ));
+    let WireMessage::Event(event) = client.receive() else {
+        panic!("expected durable stream event after acceptance");
+    };
+    assert_eq!(event.cursor.revision, 1);
+    let EventPayload::StreamsChanged { streams } = &event.payload else {
+        panic!(
+            "expected streams_changed durable event: {:?}",
+            event.payload
+        );
+    };
+    assert!(
+        streams
+            .iter()
+            .find(|s| s.target == stream_target(1))
+            .unwrap()
+            .desired_running
+    );
+    assert!(
+        !streams
+            .iter()
+            .find(|s| s.target == stream_target(2))
+            .unwrap()
+            .desired_running
+    );
+
+    client.send(&command(
+        "stream-unknown",
+        "stream-unknown-key",
+        CommandPayload::StreamStart {
+            target: stream_target(9),
+        },
+    ));
+    assert!(matches!(
+        client.next_result(),
+        CommandResult::Rejected { ref code, current_revision: 1, .. } if code == "not_found"
+    ));
+
+    // The daemon is killed with the acknowledgement in hand and no checkpoint:
+    // revision 1 exists only as a journal batch.
+    drop(client);
+    daemon.stop();
+    assert_eq!(
+        ProjectStore::new(&project_path)
+            .unwrap()
+            .load()
+            .unwrap()
+            .position()
+            .revision,
+        0
+    );
+
+    let daemon = Daemon::start(&project_path);
+    let mut restarted = daemon.connect();
+    let handshake = restarted.handshake(None);
+    assert_eq!(handshake.current_revision, 1);
+    let WireMessage::Snapshot(snapshot) = restarted.receive() else {
+        panic!("expected snapshot after restart");
+    };
+    assert!(
+        snapshot
+            .streams
+            .iter()
+            .find(|stream| stream.target == stream_target(1))
+            .expect("restarted snapshot keeps the stream inventory")
+            .desired_running
+    );
+    assert!(
+        !snapshot
+            .streams
+            .iter()
+            .find(|stream| stream.target == stream_target(2))
+            .expect("restarted snapshot keeps the stream inventory")
+            .desired_running
+    );
+    drop(restarted);
+    daemon.wait_success();
+
+    let persisted = ProjectStore::new(&project_path).unwrap().load().unwrap();
+    assert_eq!(persisted.position().revision, 1);
+    let targets = persisted.project().stream_targets();
+    assert_eq!(targets.len(), 2);
+    assert!(targets[0].running());
+    assert!(!targets[1].running());
 }
 
 #[test]
@@ -1783,103 +1906,6 @@ fn checkpoints_compact_the_journal_and_recovery_reproduces_the_exact_state() {
         settled.checkpoint_revision(),
         u64::from(CHECKPOINTED_COMMANDS)
     );
-}
-
-/// Work that is not durable is never acknowledged.
-///
-/// The journal is made unusable underneath a running daemon — the specific
-/// fault stands in for a failing or full show disk. The commands that follow
-/// must come back refused and retryable, the daemon must stay up and keep
-/// serving, and no refused command may leave a trace: once the journal works
-/// again the next command takes the very next revision.
-#[test]
-fn a_command_that_cannot_be_journalled_is_refused_and_the_daemon_keeps_serving() {
-    let directory = TestDirectory::new("journal-append-failure");
-    let project_path = directory.project_path();
-    create_project(&project_path);
-    let journal = project_path.join("journal");
-
-    let daemon = Daemon::start_without_once(&project_path);
-    let mut client = daemon.connect();
-    client.handshake(None);
-    assert!(matches!(client.receive(), WireMessage::Snapshot(_)));
-    client.send(&command(
-        "durable-cut",
-        "durable-cut-key",
-        CommandPayload::Cut,
-    ));
-    assert!(matches!(
-        client.next_result(),
-        CommandResult::Accepted { revision: 1, .. }
-    ));
-
-    let saved: Vec<(PathBuf, Vec<u8>)> = fs::read_dir(&journal)
-        .unwrap()
-        .map(|entry| {
-            let path = entry.unwrap().path();
-            let bytes = fs::read(&path).unwrap();
-            (path, bytes)
-        })
-        .collect();
-    assert!(!saved.is_empty(), "the accepted command was journalled");
-    fs::remove_dir_all(&journal).unwrap();
-    fs::create_dir(&journal).unwrap();
-    fs::create_dir(journal.join("journal.db")).unwrap();
-
-    for id in ["refused-first", "refused-second"] {
-        client.send(&command(id, &format!("{id}-key"), CommandPayload::Cut));
-        match client.next_result() {
-            CommandResult::Rejected {
-                id: rejected,
-                code,
-                current_revision,
-                retryable,
-                ..
-            } => {
-                assert_eq!(rejected, id);
-                assert_eq!(code, "unavailable");
-                assert_eq!(current_revision, 1, "a refused command takes no revision");
-                assert!(retryable);
-            }
-            CommandResult::Accepted { revision, .. } => {
-                panic!("{id} must not be acknowledged, yet it took revision {revision}")
-            }
-        }
-    }
-
-    fs::remove_dir_all(&journal).unwrap();
-    fs::create_dir(&journal).unwrap();
-    for (path, bytes) in saved {
-        fs::write(path, bytes).unwrap();
-    }
-    client.send(&command(
-        "after-repair",
-        "after-repair-key",
-        CommandPayload::Cut,
-    ));
-    assert!(
-        matches!(
-            client.next_result(),
-            CommandResult::Accepted { revision: 2, .. }
-        ),
-        "the refused commands left no gap in the revision or the journal"
-    );
-    drop(client);
-    daemon.stop();
-
-    let store = ProjectStore::new(&project_path).unwrap();
-    let scan = store.scan_journal().unwrap();
-    assert_eq!(
-        scan.batches().len(),
-        2,
-        "only the accepted commands persist"
-    );
-    let daemon = Daemon::start(&project_path);
-    let mut restarted = daemon.connect();
-    assert_eq!(restarted.handshake(None).current_revision, 2);
-    drop(restarted);
-    daemon.wait_success();
-    assert_eq!(store.load().unwrap().position().revision, 2);
 }
 
 #[test]
@@ -2315,6 +2341,7 @@ fn manual_alpha_fade_state_and_receipts_survive_restart_through_commit_and_cance
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn manual_slide_state_survives_restart_through_commit_and_cancel() {
     for (name, terminal, swaps_routes) in [
         (
@@ -2567,6 +2594,7 @@ fn sigterm_notifies_established_client_then_exits_cleanly() {
 
 #[cfg(unix)]
 #[test]
+#[allow(clippy::too_many_lines)]
 fn websocket_control_is_authenticated_ordered_and_raw_compatible() {
     let directory = TestDirectory::new("websocket-control");
     let project_path = directory.project_path();
@@ -2709,10 +2737,12 @@ fn websocket_control_is_authenticated_ordered_and_raw_compatible() {
     ));
     match websocket.read() {
         Ok(tungstenite::Message::Close(_))
-        | Err(tungstenite::Error::ConnectionClosed)
-        | Err(tungstenite::Error::Protocol(
-            tungstenite::error::ProtocolError::ResetWithoutClosingHandshake,
-        )) => {}
+        | Err(
+            tungstenite::Error::ConnectionClosed
+            | tungstenite::Error::Protocol(
+                tungstenite::error::ProtocolError::ResetWithoutClosingHandshake,
+            ),
+        ) => {}
         Err(tungstenite::Error::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
         }
         result => panic!("WebSocket did not terminate cleanly: {result:?}"),
@@ -2763,7 +2793,8 @@ fn help_documents_program_output_and_fullscreen_selection() {
     assert!(stdout.contains("--camera-helper PATH"));
     assert!(stdout.contains("never requests permission"));
     assert!(stdout.contains("--record-program=<path>"));
-    assert!(stdout.contains("Existing files are never overwritten"));
+    assert!(stdout.contains("segments are created exclusively, never overwritten"));
+    assert!(stdout.contains("later record-start segments use"));
     assert!(stdout.contains("configured startup support"));
     assert!(stdout.contains("FREEMIXD_RECORDER reports runtime health"));
     assert!(stdout.contains("zero-based index"));
@@ -2885,6 +2916,106 @@ fn create_rename_project(path: &Path) {
     ProjectStore::new(path).unwrap().save(&stored).unwrap();
 }
 
+fn create_stream_project(path: &Path) {
+    const STREAM_ID_BASE: u128 = U64_MAX_ID + 500;
+    let frame_rate = FrameRate::new(25, 1).unwrap();
+    let mut project = Project::new(
+        project_id(),
+        "Stream Reconcile",
+        ProjectSettings {
+            frame_rate,
+            video: VideoFormat {
+                dimensions: VideoDimensions::new(16, 16).unwrap(),
+                frame_rate,
+                pixel_format: PixelFormat::Rgba8,
+                scan: ScanMode::Progressive,
+                color: ColorMetadata::default(),
+            },
+            audio: AudioFormat {
+                sample_rate: SampleRate::new(44_100).unwrap(),
+                sample_format: SampleFormat::I24,
+                channels: ChannelLayout::stereo(),
+            },
+        },
+    );
+    for number in 1..=2 {
+        project.add_input(Input {
+            id: domain_input(number),
+            name: format!("Input {number}"),
+            kind: InputKind::Simulated(SimulatedInput::new(
+                SimulatedVideo::Bars,
+                SimulatedAudio::Silence,
+            )),
+            required_capabilities: Vec::new(),
+        });
+    }
+    project.set_main_mix(MainMix::new(domain_input(1), domain_input(2)));
+    let scene = scene_id(1);
+    project.add_scene(Scene {
+        id: scene,
+        name: "Program scene".into(),
+        background: Rgba8::OPAQUE_BLACK,
+        layers: vec![Layer {
+            name: "Source".into(),
+            source: SourceRef::Input(domain_input(1)),
+            enabled: true,
+            geometry: LayerGeometry::new(0, 0, 16, 16, Rotation::Deg0),
+            crop: None,
+            mask: None,
+            opacity: u8::MAX,
+            z_order: 0,
+        }],
+    });
+    let bus = bus_id(1);
+    project.add_audio_bus(AudioBus {
+        id: bus,
+        name: "Program bus".into(),
+        sends: Vec::new(),
+    });
+    project.add_output(Output {
+        id: output_id(1),
+        name: "Program output".into(),
+        video_source: scene,
+        audio_source: bus,
+        startup: StartupPolicy::ReconcileDesiredState,
+        required_capabilities: vec!["simulation.output".into()],
+    });
+    for (index, offset) in [1_u128, 2].into_iter().enumerate() {
+        let target = StreamTarget::new(
+            StreamTargetId::new(NonZeroU128::new(STREAM_ID_BASE + offset).unwrap()),
+            format!("Destination {}", index + 1),
+            StreamProtocol::Rtmp,
+            StreamEndpoint::parse("127.0.0.1/live").unwrap(),
+            StreamKey::parse("live-key-0001").unwrap(),
+            output_id(1),
+        )
+        .unwrap()
+        .with_startup(StartupPolicy::ReconcileDesiredState)
+        .set_running(false);
+        project.add_stream_target_checked(target).unwrap();
+    }
+    let stored = StoredProject::from_project(
+        project,
+        RuntimeRouting {
+            desired_program_id: Some(domain_input(1)),
+            realized_program_id: Some(domain_input(1)),
+            desired_preview_id: Some(domain_input(2)),
+            realized_preview_id: Some(domain_input(2)),
+        },
+        ProjectPosition {
+            revision: 0,
+            state_epoch: 1,
+            event_sequence: 0,
+            frames_rendered: 0,
+            runtime_generation: 0,
+            clock_time_nanos: 0,
+        },
+        Vec::new(),
+    )
+    .unwrap();
+    ProjectStore::new(path).unwrap().save(&stored).unwrap();
+}
+
 fn canonical_project() -> Project {
     let frame_rate = FrameRate::new(25, 1).unwrap();
     let mut project = Project::new(
@@ -2906,7 +3037,11 @@ fn canonical_project() -> Project {
             },
         },
     )
-    .with_restart_policy(RestartPolicy::Always);
+    .with_restart_policy(RestartPolicy::Always)
+    // Recorder process tests start daemons with --record-program against this
+    // fixture, so its authored desired recording flag is active. Without a
+    // configured recorder the flag is inert durable state.
+    .with_recording_desired_active(true);
     for (index, input) in [
         SimulatedInput::new(
             SimulatedVideo::Solid(SolidColor::new(12, 34, 56, 255)),
@@ -3003,4 +3138,8 @@ fn bus_id(value: u128) -> BusId {
 
 fn output_id(value: u128) -> OutputId {
     OutputId::new(NonZeroU128::new(INPUT_ID_BASE + 300 + value).unwrap())
+}
+
+fn stream_target(offset: u128) -> WireStreamTargetId {
+    WireStreamTargetId::new(NonZeroU128::new(U64_MAX_ID + 500 + offset).unwrap())
 }

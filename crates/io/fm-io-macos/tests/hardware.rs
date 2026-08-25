@@ -1,3 +1,4 @@
+#[cfg(target_os = "macos")]
 use fm_io_macos::{MacosAudioAdapter, MacosCameraAdapter};
 
 #[cfg(target_os = "macos")]

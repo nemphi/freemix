@@ -129,6 +129,8 @@ fn snapshot(revision: u64) -> SnapshotMessage {
             position: FadeToBlackPosition::LIVE,
         },
         stingers: Vec::new(),
+        streams: Vec::new(),
+        record_desired_active: false,
         desired_overlays: OverlayStatus::empty_channels(),
         realized_overlays: OverlayStatus::empty_channels(),
     }
@@ -224,9 +226,10 @@ fn assert_web_child_success(mut child: Child, token: &str, deadline: Instant) {
         }
     };
     if let Some(failure) = failure {
-        if !terminate_child(&mut child) {
-            panic!("{failure}; cleanup_stopped=false");
-        }
+        assert!(
+            terminate_child(&mut child),
+            "{failure}; cleanup_stopped=false"
+        );
         let output = child.wait_with_output().unwrap_or_else(|error| {
             panic!("{failure}; cleanup_stopped=true; cannot collect WebSocket test output: {error}")
         });
@@ -692,6 +695,7 @@ fn assert_diagnose_success(output: Result<Output, String>) {
 }
 
 #[test]
+#[allow(clippy::result_large_err)] // tungstenite accept_hdr callback signature is fixed
 fn websocket_diagnose_uses_current_session_contract() {
     let token = "web-diagnostic-token-abcdefghijklmnopqrstuvwxyz-0123456789";
     let (address, server_thread) = spawn_server(move |listener| {
@@ -796,6 +800,8 @@ fn websocket_diagnose_uses_current_session_contract() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
+#[allow(clippy::result_large_err)] // tungstenite accept_hdr callback signature is fixed
 fn web_open_runtime_uses_websocket_transport() {
     let token = "web-open-token-abcdefghijklmnopqrstuvwxyz-0123456789";
     if std::env::var_os(WEB_OPEN_CHILD_MARKER).is_none() {
@@ -826,9 +832,10 @@ fn web_open_runtime_uses_websocket_transport() {
                 .get("authorization")
                 .and_then(|value| value.to_str().ok());
             let expected_authorization = format!("Bearer {token}");
-            if authorization != Some(expected_authorization.as_str()) {
-                panic!("authorization mismatch");
-            }
+            assert!(
+                authorization == Some(expected_authorization.as_str()),
+                "authorization mismatch"
+            );
             Ok(response)
         };
         let mut peer = accept_hdr(stream, callback).expect("WebSocket handshake failed");
@@ -876,100 +883,98 @@ fn web_open_runtime_uses_websocket_transport() {
         );
     });
 
-    let client = (|| -> Result<(), String> {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let Command::Open(config) = parse_args(
-                [
-                    "--web-connect",
-                    &address.to_string(),
-                    "--project-id",
-                    &PROJECT_VALUE.to_string(),
-                ]
-                .map(str::to_owned),
-            )
-            .unwrap() else {
-                panic!("expected normal Open command")
-            };
-            assert_eq!(config.transport, ControlTransport::WebSocket);
-            let mut runtime = StudioRuntime::new(config).unwrap();
-            assert_eq!(
-                runtime.connect(remaining(deadline)).unwrap(),
-                SessionEvent::Connected {
-                    mode: SyncMode::Snapshot,
-                }
-            );
-            let command = runtime
-                .queue_command(CommandPayload::Cut, "web-cut", Some(4), None)
-                .unwrap();
-            assert_eq!(runtime.flush().unwrap(), 1);
-            assert!(matches!(
-                runtime
-                    .receive_timeout(remaining(deadline))
-                    .unwrap()
-                    .unwrap_or_else(|| panic!("timed out waiting for command result")),
-                SessionEvent::CommandResult {
-                    intake: Intake::ResultReconciled,
-                    ..
-                }
-            ));
-            assert!(matches!(
-                runtime
-                    .session()
-                    .client()
-                    .command(&command.id)
-                    .unwrap()
-                    .status,
-                CommandStatus::Completed(CommandResult::Accepted { revision: 5, .. })
-            ));
-            assert!(matches!(
-                runtime
-                    .receive_timeout(remaining(deadline))
-                    .unwrap()
-                    .unwrap_or_else(|| panic!("timed out waiting for durable event")),
-                SessionEvent::Event {
-                    intake: Intake::EventApplied,
-                    ..
-                }
-            ));
-            assert_eq!(
-                runtime
-                    .session()
-                    .client()
-                    .last_applied_cursor()
-                    .unwrap()
-                    .revision,
-                5
-            );
-            assert_eq!(
-                runtime
-                    .session()
-                    .client()
-                    .model()
-                    .state()
-                    .unwrap()
-                    .switcher()
-                    .desired
-                    .program,
-                model_input(2)
-            );
-            assert!(matches!(
-                runtime
-                    .receive_timeout(remaining(deadline))
-                    .unwrap()
-                    .unwrap_or_else(|| panic!("timed out waiting for runtime event")),
-                SessionEvent::RuntimeEvent {
-                    intake: Intake::RuntimeEventObserved,
-                    ..
-                }
-            ));
-            assert!(runtime.session().is_connected());
-            assert!(
-                Instant::now() <= deadline,
-                "WebSocket scenario exceeded deadline"
-            );
-        }))
-        .map_err(|_| "WebSocket client failed".to_owned())
-    })();
+    let client = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Command::Open(config) = parse_args(
+            [
+                "--web-connect",
+                &address.to_string(),
+                "--project-id",
+                &PROJECT_VALUE.to_string(),
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap() else {
+            panic!("expected normal Open command")
+        };
+        assert_eq!(config.transport, ControlTransport::WebSocket);
+        let mut runtime = StudioRuntime::new(config).unwrap();
+        assert_eq!(
+            runtime.connect(remaining(deadline)).unwrap(),
+            SessionEvent::Connected {
+                mode: SyncMode::Snapshot,
+            }
+        );
+        let command = runtime
+            .queue_command(CommandPayload::Cut, "web-cut", Some(4), None)
+            .unwrap();
+        assert_eq!(runtime.flush().unwrap(), 1);
+        assert!(matches!(
+            runtime
+                .receive_timeout(remaining(deadline))
+                .unwrap()
+                .unwrap_or_else(|| panic!("timed out waiting for command result")),
+            SessionEvent::CommandResult {
+                intake: Intake::ResultReconciled,
+                ..
+            }
+        ));
+        assert!(matches!(
+            runtime
+                .session()
+                .client()
+                .command(&command.id)
+                .unwrap()
+                .status,
+            CommandStatus::Completed(CommandResult::Accepted { revision: 5, .. })
+        ));
+        assert!(matches!(
+            runtime
+                .receive_timeout(remaining(deadline))
+                .unwrap()
+                .unwrap_or_else(|| panic!("timed out waiting for durable event")),
+            SessionEvent::Event {
+                intake: Intake::EventApplied,
+                ..
+            }
+        ));
+        assert_eq!(
+            runtime
+                .session()
+                .client()
+                .last_applied_cursor()
+                .unwrap()
+                .revision,
+            5
+        );
+        assert_eq!(
+            runtime
+                .session()
+                .client()
+                .model()
+                .state()
+                .unwrap()
+                .switcher()
+                .desired
+                .program,
+            model_input(2)
+        );
+        assert!(matches!(
+            runtime
+                .receive_timeout(remaining(deadline))
+                .unwrap()
+                .unwrap_or_else(|| panic!("timed out waiting for runtime event")),
+            SessionEvent::RuntimeEvent {
+                intake: Intake::RuntimeEventObserved,
+                ..
+            }
+        ));
+        assert!(runtime.session().is_connected());
+        assert!(
+            Instant::now() <= deadline,
+            "WebSocket scenario exceeded deadline"
+        );
+    }))
+    .map_err(|_| "WebSocket client failed".to_owned());
     let server = server_thread
         .join()
         .map_err(|_| "WebSocket server failed".to_owned());

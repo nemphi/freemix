@@ -1821,3 +1821,252 @@ fn idle_engine_snapshot_preserves_engine_idle_checks() {
         Err(SnapshotError::WorkInFlight)
     );
 }
+
+fn streamed_service() -> ControlService {
+    let show = ShowState::new(
+        "stream show",
+        named_inputs([input(1), input(2), input(3)]),
+        input(1),
+        input(2),
+    )
+    .unwrap()
+    .with_streams([
+        (
+            fm_switcher::StreamTargetId::new(5).unwrap(),
+            "Twitch".into(),
+        ),
+        (
+            fm_switcher::StreamTargetId::new(9).unwrap(),
+            "YouTube".into(),
+        ),
+    ])
+    .unwrap();
+    ControlService::new(
+        Engine::new(
+            show,
+            FrameRate::new(60, 1).unwrap(),
+            ClockDomainId::new(NonZeroU128::new(1).unwrap()),
+        ),
+        Policy::production(),
+        "engine-a",
+        "log-a",
+        ControlLimits::default(),
+    )
+}
+
+fn wire_target(value: u128) -> fm_protocol::WireStreamTargetId {
+    fm_protocol::WireStreamTargetId::new(NonZeroU128::new(value).unwrap())
+}
+
+fn stream_status(target: u128, name: &str, desired_running: bool) -> StreamStatus {
+    StreamStatus {
+        target: wire_target(target),
+        name: name.to_owned(),
+        desired_running,
+        realized: StreamRealizedState::Stopped,
+        detail: None,
+    }
+}
+
+#[test]
+fn stream_commands_require_transition_permission_and_project_full_status() {
+    let mut control = streamed_service();
+    let denied = control
+        .submit(
+            &principal(Role::Viewer),
+            command(
+                "denied",
+                "denied-key",
+                CommandPayload::StreamStart {
+                    target: wire_target(9),
+                },
+            ),
+            0,
+        )
+        .unwrap();
+    assert!(matches!(
+        denied.output.result,
+        CommandResult::Rejected { ref code, .. } if code == "permission_denied"
+    ));
+    assert_eq!(control.diagnostics().current_revision, 0);
+    assert_eq!(
+        control.snapshot().snapshot.streams,
+        vec![
+            stream_status(5, "Twitch", false),
+            stream_status(9, "YouTube", false),
+        ]
+    );
+
+    let accepted = control
+        .submit(
+            &principal(Role::Operator),
+            command(
+                "stream-on",
+                "stream-on-key",
+                CommandPayload::StreamStart {
+                    target: wire_target(9),
+                },
+            ),
+            0,
+        )
+        .unwrap();
+    assert!(accepted.is_accepted());
+    assert_eq!(
+        accepted.output.events,
+        vec![EventMessage {
+            cursor: EventCursor {
+                engine: control.identity().clone(),
+                revision: 1,
+            },
+            payload: EventPayload::StreamsChanged {
+                streams: vec![
+                    stream_status(5, "Twitch", false),
+                    stream_status(9, "YouTube", true),
+                ],
+            },
+        }]
+    );
+
+    let replay = control
+        .submit(
+            &principal(Role::Operator),
+            command(
+                "again",
+                "stream-on-key",
+                CommandPayload::StreamStart {
+                    target: wire_target(9),
+                },
+            ),
+            0,
+        )
+        .unwrap();
+    assert!(replay.replayed);
+    assert!(replay.output.events.is_empty());
+}
+
+#[test]
+fn admin_can_stop_streams_and_snapshots_carry_the_desired_projection() {
+    let mut control = streamed_service();
+    control
+        .submit(
+            &principal(Role::Operator),
+            command(
+                "on",
+                "on-key",
+                CommandPayload::StreamStart {
+                    target: wire_target(5),
+                },
+            ),
+            0,
+        )
+        .unwrap();
+    control.tick(&server_identity()).unwrap();
+    assert_eq!(
+        control.snapshot().snapshot.streams,
+        vec![
+            stream_status(5, "Twitch", true),
+            stream_status(9, "YouTube", false),
+        ]
+    );
+
+    let stopped = control
+        .submit(
+            &principal(Role::Admin),
+            command(
+                "off",
+                "off-key",
+                CommandPayload::StreamStop {
+                    target: wire_target(5),
+                },
+            ),
+            0,
+        )
+        .unwrap();
+    assert!(stopped.is_accepted());
+    assert_eq!(
+        stopped.output.events[0].payload,
+        EventPayload::StreamsChanged {
+            streams: vec![
+                stream_status(5, "Twitch", false),
+                stream_status(9, "YouTube", false),
+            ],
+        }
+    );
+    control.tick(&server_identity()).unwrap();
+    assert!(!control.snapshot().snapshot.streams[0].desired_running);
+}
+
+#[test]
+fn record_commands_require_transition_permission_and_project_the_desired_flag() {
+    let mut control = streamed_service();
+    let denied = control
+        .submit(
+            &principal(Role::Viewer),
+            command("denied", "denied-key", CommandPayload::RecordStart),
+            0,
+        )
+        .unwrap();
+    assert!(matches!(
+        denied.output.result,
+        CommandResult::Rejected { ref code, .. } if code == "permission_denied"
+    ));
+    assert_eq!(control.diagnostics().current_revision, 0);
+    assert!(!control.snapshot().snapshot.record_desired_active);
+
+    let accepted = control
+        .submit(
+            &principal(Role::Operator),
+            command("rec-on", "rec-on-key", CommandPayload::RecordStart),
+            0,
+        )
+        .unwrap();
+    assert!(accepted.is_accepted());
+    assert_eq!(
+        accepted.output.events,
+        vec![EventMessage {
+            cursor: EventCursor {
+                engine: control.identity().clone(),
+                revision: 1,
+            },
+            payload: EventPayload::RecordingChanged { active: true },
+        }]
+    );
+    assert!(control.snapshot().snapshot.record_desired_active);
+
+    let replay = control
+        .submit(
+            &principal(Role::Operator),
+            command("again", "rec-on-key", CommandPayload::RecordStart),
+            0,
+        )
+        .unwrap();
+    assert!(replay.replayed);
+    assert!(replay.output.events.is_empty());
+
+    let stopped = control
+        .submit(
+            &principal(Role::Operator),
+            command("rec-off", "rec-off-key", CommandPayload::RecordStop),
+            0,
+        )
+        .unwrap();
+    assert!(stopped.is_accepted());
+    assert_eq!(
+        stopped.output.events[0].payload,
+        EventPayload::RecordingChanged { active: false }
+    );
+    control.tick(&server_identity()).unwrap();
+    assert!(!control.snapshot().snapshot.record_desired_active);
+
+    let viewer_denied_stop = control
+        .submit(
+            &principal(Role::Viewer),
+            command("viewer-off", "viewer-off-key", CommandPayload::RecordStop),
+            0,
+        )
+        .unwrap();
+    assert!(matches!(
+        viewer_denied_stop.output.result,
+        CommandResult::Rejected { ref code, .. } if code == "permission_denied"
+    ));
+}

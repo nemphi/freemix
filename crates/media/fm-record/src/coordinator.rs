@@ -370,6 +370,7 @@ impl RecorderCoordinator {
     /// # Errors
     ///
     /// A write or rotation error marks this recorder failed.
+    #[allow(clippy::too_many_lines)]
     pub fn flush(&mut self, id: RecorderId) -> Result<usize, RecorderError> {
         let state = self
             .recorders

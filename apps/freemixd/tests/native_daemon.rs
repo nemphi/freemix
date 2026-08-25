@@ -255,7 +255,12 @@ fn native_media_missing_asset_fails_before_readiness() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("missing-asset.freemix");
     let recording = directory.path().join("must-not-exist.mp4");
-    save_media_project(&path, "asset://missing-one.mkv", "asset://missing-two.mkv");
+    save_media_project(
+        &path,
+        "asset://missing-one.mkv",
+        "asset://missing-two.mkv",
+        false,
+    );
 
     let child = Command::new(env!("CARGO_BIN_EXE_freemixd"))
         .args(["serve"])
@@ -1185,6 +1190,186 @@ fn native_generator_program_recording_is_playable_and_checkpointed() {
 
     // Process-kill/playable-prefix evidence belongs to the codec boundary and
     // is covered by fm-codec-ffmpeg's `forced_child_kill_leaves_a_playable_fragmented_prefix`.
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn recording_desired_false_configures_support_without_recorder_activity() {
+    let _hardware_lock = NATIVE_MEDIA_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let directory = tempfile::tempdir().unwrap();
+    let project_path = directory.path().join("record-idle.freemix");
+    let output_path = directory.path().join("program-idle.mp4");
+    save_media_project(&project_path, "asset://one.mkv", "asset://two.mkv", false);
+
+    let Some(mut daemon) = require_native_recorder(NativeDaemonProcess::start_recording(
+        &project_path,
+        &output_path,
+    )) else {
+        return;
+    };
+    let mut client = StudioClient::connect(daemon.address);
+    let (capabilities_digest, initial) = client.handshake_with_digest();
+    // The digest reflects CONFIGURED support, not recording activity.
+    assert_eq!(
+        capabilities_digest,
+        "native-media-bounded-video-audio-master-camera-record-program-telemetry-v3"
+    );
+    assert!(!initial.record_desired_active);
+    thread::sleep(Duration::from_millis(1_000));
+    daemon.signal_terminate();
+
+    let output = daemon.wait_for(RECORDING_PROCESS_TIMEOUT);
+    drop(client);
+    assert!(
+        output.status.success(),
+        "idle recording daemon failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(
+        stderr.matches("FREEMIXD_RECORDER\t").count(),
+        0,
+        "no segment may open while the desired flag is false: {stderr}"
+    );
+    let telemetry = telemetry_diagnostic(&stderr);
+    assert_eq!(diagnostic_value(telemetry, "recorder_configured"), "false");
+    assert!(!output_path.exists(), "no recording file may be created");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires FFmpeg with libx264/AAC, ffprobe, and a native macOS Metal adapter"]
+fn protocol_record_commands_open_segments_and_persist_desired_state() {
+    const RESTORED_FRAME: u64 = 17;
+    let _hardware_lock = NATIVE_MEDIA_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let directory = tempfile::tempdir().unwrap();
+    if require_recording_tools().is_none() {
+        return;
+    }
+    let project_path = directory.path().join("record-segments.freemix");
+    let output_path = directory.path().join("program.mp4");
+    save_restored_generator_project(&project_path, RESTORED_FRAME);
+
+    let Some(mut daemon) = require_native_recorder(NativeDaemonProcess::start_recording(
+        &project_path,
+        &output_path,
+    )) else {
+        return;
+    };
+    let mut client = StudioClient::connect(daemon.address);
+    let (capabilities_digest, initial) = client.handshake_with_digest();
+    assert_eq!(
+        capabilities_digest,
+        "native-media-bounded-video-audio-master-camera-record-program-telemetry-v3"
+    );
+    assert!(initial.record_desired_active);
+    thread::sleep(Duration::from_millis(1_500));
+
+    let stopped = client.command(
+        "record-seg-stop",
+        "record-seg-stop-key",
+        CommandPayload::RecordStop,
+    );
+    assert_eq!(stopped.revision, 1);
+    // The finalizer drains within the recorder's stop budget; this wait only
+    // bounds when the file becomes decodable, correctness is asserted below.
+    thread::sleep(Duration::from_millis(2_000));
+
+    let video = ffprobe_stream(&output_path, "v:0").unwrap();
+    assert_eq!(probe_value(&video, "codec_name"), "h264");
+    assert!(probe_count(&video, "nb_read_frames") >= 30);
+    decode_recording(&output_path).unwrap();
+
+    // A fresh handshake observes the accepted stop: desired is false now.
+    drop(client);
+    let mut client = StudioClient::connect(daemon.address);
+    let (_, snapshot) = client.handshake_with_digest();
+    assert_eq!(snapshot.revision, 1);
+    assert!(!snapshot.record_desired_active);
+
+    // RecordStart opens the next deterministic segment.
+    let started = client.command(
+        "record-seg-start",
+        "record-seg-start-key",
+        CommandPayload::RecordStart,
+    );
+    assert_eq!(started.revision, 2);
+    thread::sleep(Duration::from_millis(1_500));
+    let second_segment = directory.path().join("program-002.mp4");
+    assert!(
+        second_segment.exists(),
+        "record-start must derive program-002.mp4 from the configured path"
+    );
+
+    let stopped_again = client.command(
+        "record-seg-stop-2",
+        "record-seg-stop-2-key",
+        CommandPayload::RecordStop,
+    );
+    assert_eq!(stopped_again.revision, 3);
+    // The detached finalizer drains within the recorder's own stop budget,
+    // so this bounded wait is what makes the segment decodable below.
+    thread::sleep(Duration::from_millis(2_000));
+    let second_audio = ffprobe_stream(&second_segment, "a:0").unwrap();
+    assert_eq!(probe_value(&second_audio, "codec_name"), "aac");
+    decode_recording(&second_segment).unwrap();
+    // The acknowledged stops live only in the journal so far: a SIGKILL must
+    // be recoverable by replay alone.
+    let persisted = ProjectStore::new(&project_path).unwrap().load().unwrap();
+    assert_eq!(persisted.position().revision, 0);
+
+    // SIGKILL right after the acknowledged stop: the restart below must
+    // honor desired=false purely through journal replay and never open a
+    // third segment.
+    let killed = daemon.kill_and_reap();
+    drop(client);
+    let stderr = String::from_utf8(killed.stderr).unwrap();
+    assert_eq!(stderr.matches("FREEMIXD_RECORDER\t").count(), 2);
+    for diagnostic in stderr
+        .lines()
+        .filter(|line| line.starts_with("FREEMIXD_RECORDER\t"))
+    {
+        assert!(diagnostic.contains("\tv=1\tstate=Stopped\toutcome=Clean\t"));
+        assert!(diagnostic.contains("\toutput_finalization=Synced\tcleanup=Complete\t"));
+    }
+
+    let Some(mut restarted) = require_native_recorder(NativeDaemonProcess::start_recording(
+        &project_path,
+        &output_path,
+    )) else {
+        return;
+    };
+    let mut client = StudioClient::connect(restarted.address);
+    let (digest, snapshot) = client.handshake_with_digest();
+    assert_eq!(
+        digest,
+        "native-media-bounded-video-audio-master-camera-record-program-telemetry-v3"
+    );
+    assert_eq!(snapshot.revision, 3);
+    assert!(!snapshot.record_desired_active);
+    thread::sleep(Duration::from_millis(1_000));
+    restarted.signal_terminate();
+
+    let output = restarted.wait_for(RECORDING_PROCESS_TIMEOUT);
+    drop(client);
+    assert!(
+        output.status.success(),
+        "restarted recording daemon failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(
+        stderr.matches("FREEMIXD_RECORDER\t").count(),
+        0,
+        "persisted desired=false must not open a third segment: {stderr}"
+    );
+    let telemetry = telemetry_diagnostic(&stderr);
+    assert_eq!(diagnostic_value(telemetry, "recorder_configured"), "false");
+    assert!(!directory.path().join("program-003.mp4").exists());
 }
 
 #[cfg(target_os = "macos")]
@@ -3493,7 +3678,12 @@ fn prepare_audible_stinger_project(project_path: &Path) -> Result<(), String> {
     generate_tone_video(&assets.join("program.mov"), "white", 440)?;
     generate_tone_video(&assets.join("preview.mov"), "black", 660)?;
     generate_audible_alpha_stinger(&assets.join("stinger.mov"))?;
-    save_media_project(project_path, "asset://program.mov", "asset://preview.mov");
+    save_media_project(
+        project_path,
+        "asset://program.mov",
+        "asset://preview.mov",
+        true,
+    );
 
     let store = ProjectStore::new(project_path).map_err(|error| error.to_string())?;
     let stored = store.load().map_err(|error| error.to_string())?;
@@ -3762,7 +3952,7 @@ fn prepare_native_project(project_path: &Path) -> bool {
             return false;
         }
     }
-    save_media_project(project_path, "asset://one.mkv", "asset://two.mkv");
+    save_media_project(project_path, "asset://one.mkv", "asset://two.mkv", true);
     true
 }
 
@@ -4244,7 +4434,7 @@ fn save_camera_project(path: &Path) {
     ProjectStore::new(path).unwrap().save(&stored).unwrap();
 }
 
-fn save_media_project(path: &Path, first_uri: &str, second_uri: &str) {
+fn save_media_project(path: &Path, first_uri: &str, second_uri: &str, recording_desired: bool) {
     let rate = FrameRate::new(25, 1).unwrap();
     let mut project = Project::new(
         ProjectId::new(NonZeroU128::new(7_001).unwrap()),
@@ -4276,6 +4466,10 @@ fn save_media_project(path: &Path, first_uri: &str, second_uri: &str) {
         });
     }
     project.set_main_mix(MainMix::new(input(1), input(2)));
+    // The authored desired recording flag decides whether a daemon started
+    // with --record-program auto-opens a segment; startup failures earlier
+    // than recorder priming are unaffected by it.
+    project.set_recording_desired_active(recording_desired);
     let stored = StoredProject::from_project(
         project,
         RuntimeRouting {
@@ -4408,6 +4602,9 @@ fn save_generator_project_with_sources_and_dimensions(
         });
     }
     project.set_main_mix(MainMix::new(input(1), input(2)));
+    // Recorder daemons start with --record-program against these generator
+    // fixtures, so their authored desired recording flag is active.
+    project.set_recording_desired_active(true);
     let stored = StoredProject::from_project(
         project,
         RuntimeRouting {

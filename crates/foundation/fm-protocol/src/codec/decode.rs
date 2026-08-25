@@ -11,18 +11,19 @@ use crate::{
     ManualTransitionPosition, ManualTransitionState, ManualTransitionStatus, OverlayStatus,
     ResumeCursor, RuntimeEventMessage, RuntimeFailureDisposition, RuntimeLifecycleEvent,
     ServerIdentity, SnapshotMessage, SnapshotReason, StingerAudioPolicy,
-    StingerMissingMediaFallback, StingerReadiness, StingerStatus, StructuredError, WireInputId,
-    WireMessage, WireOutputId, WireOverlayChannelId, WireStingerSlotId,
+    StingerMissingMediaFallback, StingerReadiness, StingerStatus, StreamStatusMessage,
+    StreamStatusSample, StructuredError, WireInputId, WireMessage, WireOutputId,
+    WireOverlayChannelId, WireStingerSlotId, WireStreamTargetId,
 };
 
 use super::value::{
     parse_client_type, parse_durable_events, parse_field_issues, parse_input_ids,
     parse_input_statuses, parse_output_statuses, parse_role, parse_runtime_domains,
-    parse_string_list, parse_version, unescape,
+    parse_stream_realized_state, parse_stream_statuses, parse_string_list, parse_version, unescape,
 };
 use super::{
     MAX_FIELD_NAME_BYTES, MAX_FIELD_VALUE_BYTES, MAX_FIELDS_PER_MESSAGE, MAX_LINE_BYTES,
-    MAX_LIST_ITEMS, MAX_MESSAGES_PER_PUSH, validate_request_id,
+    MAX_LIST_ITEMS, MAX_MESSAGES_PER_PUSH, MAX_STREAM_SAMPLES, validate_request_id,
 };
 
 /// Decodes exactly one newline-terminated wire record.
@@ -68,6 +69,7 @@ pub fn decode_line(line: &str) -> Result<WireMessage, CodecError> {
             WireMessage::HeartbeatAcknowledgement(decode_heartbeat_acknowledgement(&mut fields)?)
         }
         "audio_meters" => WireMessage::AudioMeters(decode_audio_meters(&mut fields)?),
+        "stream_status" => WireMessage::StreamStatus(decode_stream_status(&mut fields)?),
         "capability_report" => {
             WireMessage::CapabilityReport(decode_capability_report(&mut fields)?)
         }
@@ -312,6 +314,9 @@ fn decode_command_payload(
         overlay @ ("overlay_take" | "overlay_update" | "overlay_off" | "overlay_output"
         | "overlay_transition" | "overlay_appearance" | "overlay_queue"
         | "overlay_next") => decode_overlay_command(fields, overlay)?,
+        stream @ ("stream_start" | "stream_stop") => decode_stream_command(fields, stream)?,
+        "record_start" => CommandPayload::RecordStart,
+        "record_stop" => CommandPayload::RecordStop,
         "wipe" => CommandPayload::Wipe {
             duration_frames: fields.parse_required("duration_frames")?,
         },
@@ -468,6 +473,19 @@ fn decode_output(fields: &mut Fields, field: &'static str) -> Result<WireOutputI
     Ok(WireOutputId::new(id))
 }
 
+fn decode_stream_target(fields: &mut Fields) -> Result<WireStreamTargetId, CodecError> {
+    let value = fields.required("target")?;
+    let id = NonZeroU128::new(value.parse().map_err(|_| CodecError::InvalidField {
+        field: "target",
+        value: value.clone(),
+    })?)
+    .ok_or(CodecError::InvalidField {
+        field: "target",
+        value,
+    })?;
+    Ok(WireStreamTargetId::new(id))
+}
+
 fn decode_configure_stinger(fields: &mut Fields) -> Result<CommandPayload, CodecError> {
     let audio_policy = fields.required("audio_policy")?;
     let missing_media_fallback = fields.required("missing_media_fallback")?;
@@ -506,6 +524,15 @@ fn decode_stinger_slot(fields: &mut Fields) -> Result<WireStingerSlotId, CodecEr
     WireStingerSlotId::new(number).ok_or(CodecError::InvalidField {
         field: "slot",
         value: number.to_string(),
+    })
+}
+
+fn decode_stream_command(fields: &mut Fields, name: &str) -> Result<CommandPayload, CodecError> {
+    let target = decode_stream_target(fields)?;
+    Ok(match name {
+        "stream_start" => CommandPayload::StreamStart { target },
+        "stream_stop" => CommandPayload::StreamStop { target },
+        _ => unreachable!("only stream command names are delegated"),
     })
 }
 
@@ -553,6 +580,8 @@ fn decode_snapshot(fields: &mut Fields) -> Result<SnapshotMessage, CodecError> {
             FadeToBlackStateFields::Realized,
         )?,
         stingers: decode_stingers(fields)?,
+        streams: parse_stream_statuses(&fields.required("streams")?)?,
+        record_desired_active: fields.boolean("record_desired_active")?,
         desired_overlays: decode_overlays(fields, "desired_overlays")?,
         realized_overlays: decode_overlays(fields, "realized_overlays")?,
     })
@@ -717,28 +746,7 @@ fn decode_overlay_status(
     let position = decode_overlay_position((*position).to_owned(), field)?;
     let border = decode_overlay_border((*border).to_owned(), field)?;
     let queued_sources = decode_overlay_queue(queue, entry, field)?;
-    let included_outputs = if outputs.is_empty() {
-        Vec::new()
-    } else {
-        let included_outputs = outputs
-            .split(',')
-            .map(|output| NonZeroU128::new(output.parse().ok()?).map(WireOutputId::new))
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| CodecError::InvalidField {
-                field,
-                value: entry.to_owned(),
-            })?;
-        let mut output_ids = BTreeSet::new();
-        for output in &included_outputs {
-            if !output_ids.insert(output.to_domain().get()) {
-                return Err(CodecError::InvalidField {
-                    field,
-                    value: entry.to_owned(),
-                });
-            }
-        }
-        included_outputs
-    };
+    let included_outputs = decode_overlay_included_outputs(outputs, entry, field)?;
     Ok(OverlayStatus {
         channel,
         source,
@@ -751,6 +759,34 @@ fn decode_overlay_status(
         queued_sources,
         included_outputs,
     })
+}
+
+fn decode_overlay_included_outputs(
+    outputs: &str,
+    entry: &str,
+    field: &'static str,
+) -> Result<Vec<WireOutputId>, CodecError> {
+    if outputs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let included_outputs = outputs
+        .split(',')
+        .map(|output| NonZeroU128::new(output.parse().ok()?).map(WireOutputId::new))
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| CodecError::InvalidField {
+            field,
+            value: entry.to_owned(),
+        })?;
+    let mut output_ids = BTreeSet::new();
+    for output in &included_outputs {
+        if !output_ids.insert(output.to_domain().get()) {
+            return Err(CodecError::InvalidField {
+                field,
+                value: entry.to_owned(),
+            });
+        }
+    }
+    Ok(included_outputs)
 }
 
 fn decode_overlay_queue(
@@ -875,6 +911,12 @@ fn decode_event(fields: &mut Fields) -> Result<EventMessage, CodecError> {
             stingers: decode_stingers(fields)?,
             overlays: decode_overlays(fields, "overlays")?,
             input_audio_strips: decode_input_audio_strips(fields)?,
+        },
+        "streams_changed" => EventPayload::StreamsChanged {
+            streams: parse_stream_statuses(&fields.required("streams")?)?,
+        },
+        "recording_changed" => EventPayload::RecordingChanged {
+            active: fields.boolean("active")?,
         },
         _ => {
             return Err(CodecError::InvalidField {
@@ -1249,6 +1291,84 @@ fn decode_heartbeat_acknowledgement(
         server: decode_server_identity(fields)?,
         heartbeat_sequence: fields.parse_required("heartbeat_sequence")?,
         received_at_ms: fields.parse_required("received_at_ms")?,
+    })
+}
+
+fn decode_stream_status(fields: &mut Fields) -> Result<StreamStatusMessage, CodecError> {
+    let server = decode_server_identity(fields)?;
+    let sequence = fields.parse_required("sequence")?;
+    let samples_value = fields.required("samples")?;
+    if samples_value.is_empty() {
+        return Err(CodecError::InvalidField {
+            field: "samples",
+            value: samples_value,
+        });
+    }
+    let entries: Vec<_> = samples_value.split(';').collect();
+    if entries.len() > MAX_STREAM_SAMPLES {
+        return Err(CodecError::TooManyItems("samples"));
+    }
+    let mut previous = None;
+    let samples = entries
+        .into_iter()
+        .map(|entry| {
+            let invalid = || CodecError::InvalidField {
+                field: "samples",
+                value: entry.to_owned(),
+            };
+            let parts = entry.split(':').collect::<Vec<_>>();
+            let [
+                target,
+                realized,
+                connected,
+                muxed_bytes,
+                enqueued_pairs,
+                dropped_pairs,
+                failure,
+            ] = parts.as_slice()
+            else {
+                return Err(invalid());
+            };
+            let target = target
+                .parse::<u128>()
+                .ok()
+                .and_then(NonZeroU128::new)
+                .map(WireStreamTargetId::new)
+                .ok_or_else(invalid)?;
+            if previous.is_some_and(|id| target.get() <= id) {
+                return Err(invalid());
+            }
+            previous = Some(target.get());
+            let realized = parse_stream_realized_state(realized).ok_or_else(invalid)?;
+            let connected = match *connected {
+                "0" => false,
+                "1" => true,
+                _ => return Err(invalid()),
+            };
+            let failure = if failure.is_empty() {
+                None
+            } else {
+                let failure = unescape(failure)?;
+                if failure.len() > super::MAX_STREAM_DETAIL_BYTES {
+                    return Err(invalid());
+                }
+                Some(failure)
+            };
+            Ok(StreamStatusSample {
+                target,
+                realized,
+                connected,
+                muxed_bytes: muxed_bytes.parse().map_err(|_| invalid())?,
+                enqueued_pairs: enqueued_pairs.parse().map_err(|_| invalid())?,
+                dropped_pairs: dropped_pairs.parse().map_err(|_| invalid())?,
+                failure,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(StreamStatusMessage {
+        server,
+        sequence,
+        samples,
     })
 }
 

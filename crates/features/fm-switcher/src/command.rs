@@ -3,7 +3,7 @@ use fm_types::{InputId, OutputId};
 use crate::{
     FadeToBlackPosition, FadeToBlackTarget, MissingMediaFallback, OverlayBorderPreset,
     OverlayChannelId, OverlayPositionPreset, OverlayTransitionKind, StingerPreloadState,
-    StingerSlotId, TBarPosition, TransitionKind,
+    StingerSlotId, StreamTargetId, TBarPosition, TransitionKind,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -52,6 +52,11 @@ pub enum SwitcherCommand {
         output: OutputId,
         included: bool,
     },
+    SetStreamRunning {
+        target: StreamTargetId,
+        running: bool,
+    },
+    SetRecordingDesired(bool),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -145,6 +150,13 @@ pub enum SwitcherEvent {
         slot: StingerSlotId,
         fallback: MissingMediaFallback,
     },
+    StreamRunningChanged {
+        target: StreamTargetId,
+        running: bool,
+    },
+    RecordingDesiredChanged {
+        active: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -168,6 +180,13 @@ pub enum SwitcherError {
         slot: StingerSlotId,
         cut_point_frames: u32,
         duration_frames: u32,
+    },
+    UnknownStreamTarget(StreamTargetId),
+    DuplicateStreamTarget(StreamTargetId),
+    InvalidStreamName,
+    TooManyStreams {
+        requested: usize,
+        maximum: usize,
     },
 }
 
@@ -218,6 +237,19 @@ impl core::fmt::Display for SwitcherError {
                 formatter,
                 "stinger slot {} cut point {cut_point_frames} exceeds duration {duration_frames}",
                 slot.number()
+            ),
+            Self::UnknownStreamTarget(target) => {
+                write!(formatter, "stream target {target} is not part of this mix")
+            }
+            Self::DuplicateStreamTarget(target) => {
+                write!(formatter, "stream target {target} occurs more than once")
+            }
+            Self::InvalidStreamName => {
+                formatter.write_str("stream name must be nonblank and within the byte limit")
+            }
+            Self::TooManyStreams { requested, maximum } => write!(
+                formatter,
+                "stream inventory requests {requested} targets; maximum is {maximum}"
             ),
         }
     }

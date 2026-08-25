@@ -879,8 +879,8 @@ impl WriterState {
             )));
         }
         let applied = sequence - self.checkpoint.sequence;
-        let removed_records =
-            usize::try_from(applied).map_err(|_| StoreError::Journal(JournalError::SequenceOverflow))?;
+        let removed_records = usize::try_from(applied)
+            .map_err(|_| StoreError::Journal(JournalError::SequenceOverflow))?;
         Ok(AppliedCheckpoint {
             revision: self
                 .checkpoint

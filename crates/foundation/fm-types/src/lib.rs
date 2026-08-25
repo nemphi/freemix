@@ -58,6 +58,16 @@ impl core::fmt::Display for InputOrderError {
 
 impl std::error::Error for InputOrderError {}
 
+/// Validates a complete reordered input vector against the current order.
+///
+/// The requested order must contain exactly the current inputs, once each.
+///
+/// # Errors
+///
+/// Returns [`InputOrderError::EmptyOrder`] for an empty request,
+/// [`InputOrderError::WrongLength`] on a length mismatch,
+/// [`InputOrderError::UnknownInput`] for an input outside the current set,
+/// and [`InputOrderError::DuplicateInput`] when an input repeats.
 pub fn validate_input_order(
     current: &[InputId],
     requested: &[InputId],
@@ -102,6 +112,14 @@ impl core::fmt::Display for RenameInputError {
 
 impl std::error::Error for RenameInputError {}
 
+/// Validates an input name against the bounded rename contract.
+///
+/// # Errors
+///
+/// Returns [`RenameInputError::EmptyName`] for a blank name,
+/// [`RenameInputError::NameTooLong`] when the UTF-8 name exceeds
+/// [`MAX_INPUT_NAME_BYTES`], and [`RenameInputError::DuplicateName`] is
+/// reserved for callers that compare against existing inputs.
 pub fn validate_input_name(name: &str) -> Result<(), RenameInputError> {
     if name.trim().is_empty() {
         Err(RenameInputError::EmptyName)

@@ -45,6 +45,7 @@ impl ProtocolError {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) const fn is_malformed(&self) -> bool {
         self.malformed
     }

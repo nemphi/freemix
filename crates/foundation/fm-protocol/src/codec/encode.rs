@@ -9,15 +9,17 @@ use crate::{
     MAX_AUDIO_METER_CHANNELS, ManualTransitionKind, ManualTransitionStatus, OverlayStatus,
     ResumeCursor, RuntimeEventMessage, RuntimeFailureDisposition, RuntimeLifecycleEvent,
     ServerIdentity, SnapshotMessage, SnapshotReason, StingerAudioPolicy,
-    StingerMissingMediaFallback, StingerReadiness, StingerStatus, StructuredError, WireMessage,
+    StingerMissingMediaFallback, StingerReadiness, StingerStatus, StreamStatusMessage,
+    StructuredError, WireMessage,
 };
 
 use super::value::{
-    client_type, durable_events, field_issues, input_ids, input_statuses, output_statuses, role,
-    runtime_domains, string_list,
+    client_type, durable_events, escape_stream_failure, field_issues, input_ids, input_statuses,
+    output_statuses, role, runtime_domains, stream_realized_state, stream_statuses, string_list,
 };
 use super::{
-    CodecError, MAX_FIELD_VALUE_BYTES, MAX_LINE_BYTES, MAX_LIST_ITEMS, validate_request_id,
+    CodecError, MAX_FIELD_VALUE_BYTES, MAX_LINE_BYTES, MAX_LIST_ITEMS, MAX_STREAM_SAMPLES,
+    validate_request_id,
 };
 
 /// Encodes one message as a single newline-terminated record.
@@ -45,12 +47,13 @@ pub fn encode_line(message: &WireMessage) -> Result<String, CodecError> {
             encode_heartbeat_acknowledgement(&mut record, message)?;
         }
         WireMessage::AudioMeters(message) => encode_audio_meters(&mut record, message)?,
+        WireMessage::StreamStatus(message) => encode_stream_status(&mut record, message)?,
         WireMessage::CapabilityReport(message) => encode_capability_report(&mut record, message)?,
         WireMessage::DiagnosticsRequest(message) => {
-            encode_diagnostics_request(&mut record, message)?
+            encode_diagnostics_request(&mut record, message)?;
         }
         WireMessage::DiagnosticsResponse(message) => {
-            encode_diagnostics_response(&mut record, message)?
+            encode_diagnostics_response(&mut record, message)?;
         }
         WireMessage::Error(message) => encode_error_message(&mut record, message)?,
     }
@@ -208,6 +211,11 @@ fn encode_command(record: &mut Record, message: &CommandMessage) -> Result<(), C
         | CommandPayload::TakeNextOverlay { .. }) => {
             encode_overlay_command(record, payload)?;
         }
+        payload @ (CommandPayload::StreamStart { .. } | CommandPayload::StreamStop { .. }) => {
+            encode_stream_command(record, payload)?;
+        }
+        CommandPayload::RecordStart => record.field("payload", "record_start")?,
+        CommandPayload::RecordStop => record.field("payload", "record_stop")?,
         CommandPayload::Wipe { duration_frames } => {
             record.field("payload", "wipe")?;
             record.field("duration_frames", duration_frames)?;
@@ -236,12 +244,8 @@ fn encode_command(record: &mut Record, message: &CommandMessage) -> Result<(), C
             record.field("payload", "manual_position")?;
             record.field("position_basis_points", position.basis_points())?;
         }
-        CommandPayload::CommitManualTransition => {
-            record.field("payload", "manual_commit")?;
-        }
-        CommandPayload::CancelManualTransition => {
-            record.field("payload", "manual_cancel")?;
-        }
+        CommandPayload::CommitManualTransition => record.field("payload", "manual_commit")?,
+        CommandPayload::CancelManualTransition => record.field("payload", "manual_cancel")?,
     }
     Ok(())
 }
@@ -382,6 +386,16 @@ fn encode_stinger_mutation(
     )
 }
 
+fn encode_stream_command(record: &mut Record, payload: &CommandPayload) -> Result<(), CodecError> {
+    let (name, target) = match payload {
+        CommandPayload::StreamStart { target } => ("stream_start", target),
+        CommandPayload::StreamStop { target } => ("stream_stop", target),
+        _ => unreachable!("only stream commands are delegated"),
+    };
+    record.field("payload", name)?;
+    record.field("target", *target)
+}
+
 fn encode_result(record: &mut Record, message: &CommandResult) -> Result<(), CodecError> {
     record.kind("command_result");
     match message {
@@ -448,6 +462,11 @@ fn encode_snapshot(record: &mut Record, message: &SnapshotMessage) -> Result<(),
         FadeToBlackStateFields::Realized,
     )?;
     encode_stingers(record, &message.stingers)?;
+    record.field_string("streams", stream_statuses(&message.streams)?)?;
+    record.field(
+        "record_desired_active",
+        u8::from(message.record_desired_active),
+    )?;
     encode_overlays(record, "desired_overlays", &message.desired_overlays)?;
     encode_overlays(record, "realized_overlays", &message.realized_overlays)
 }
@@ -680,6 +699,14 @@ fn encode_event(record: &mut Record, message: &EventMessage) -> Result<(), Codec
             encode_stingers(record, stingers)?;
             encode_overlays(record, "overlays", overlays)?;
             encode_input_audio_strips(record, input_audio_strips)?;
+        }
+        EventPayload::StreamsChanged { streams } => {
+            record.field("event", "streams_changed")?;
+            record.field_string("streams", stream_statuses(streams)?)?;
+        }
+        EventPayload::RecordingChanged { active } => {
+            record.field("event", "recording_changed")?;
+            record.field("active", u8::from(*active))?;
         }
     }
     Ok(())
@@ -967,6 +994,52 @@ fn encode_heartbeat_acknowledgement(
     encode_server_identity(record, &message.server)?;
     record.field("heartbeat_sequence", message.heartbeat_sequence)?;
     record.field("received_at_ms", message.received_at_ms)
+}
+
+fn encode_stream_status(
+    record: &mut Record,
+    message: &StreamStatusMessage,
+) -> Result<(), CodecError> {
+    if message.samples.is_empty() {
+        return Err(CodecError::InvalidField {
+            field: "samples",
+            value: "empty".to_owned(),
+        });
+    }
+    if message.samples.len() > MAX_STREAM_SAMPLES {
+        return Err(CodecError::TooManyItems("samples"));
+    }
+    let mut previous = None;
+    let samples = message
+        .samples
+        .iter()
+        .map(|sample| {
+            if previous.is_some_and(|id| sample.target.get() <= id) {
+                return Err(CodecError::InvalidField {
+                    field: "samples",
+                    value: sample.target.to_string(),
+                });
+            }
+            previous = Some(sample.target.get());
+            Ok(format!(
+                "{}:{}:{}:{}:{}:{}:{}",
+                sample.target,
+                stream_realized_state(sample.realized),
+                u8::from(sample.connected),
+                sample.muxed_bytes,
+                sample.enqueued_pairs,
+                sample.dropped_pairs,
+                match &sample.failure {
+                    Some(failure) => escape_stream_failure(failure)?,
+                    None => String::new(),
+                },
+            ))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    record.kind("stream_status");
+    encode_server_identity(record, &message.server)?;
+    record.field("sequence", message.sequence)?;
+    record.field_string("samples", samples.join(";"))
 }
 
 fn encode_audio_meters(

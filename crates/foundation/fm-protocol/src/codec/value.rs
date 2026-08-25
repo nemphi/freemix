@@ -2,10 +2,13 @@ use std::collections::BTreeSet;
 
 use crate::{
     ClientType, CodecError, DurableEvent, FieldIssue, InputStatus, OutputStatus, ProtocolVersion,
-    Role, RuntimeDomainBoundary,
+    Role, RuntimeDomainBoundary, StreamRealizedState, StreamStatus,
 };
 
-use super::{MAX_BATCH_EVENTS, MAX_FIELD_VALUE_BYTES, MAX_LIST_ITEMS};
+use super::{
+    MAX_BATCH_EVENTS, MAX_FIELD_VALUE_BYTES, MAX_LIST_ITEMS, MAX_STREAM_DETAIL_BYTES,
+    MAX_STREAM_NAME_BYTES,
+};
 
 pub(super) fn unescape(value: &str) -> Result<String, CodecError> {
     let bytes = value.as_bytes();
@@ -391,6 +394,146 @@ pub(super) fn parse_runtime_domains(value: &str) -> Result<Vec<RuntimeDomainBoun
             })
         })
         .collect()
+}
+
+pub(super) const fn stream_realized_state(state: StreamRealizedState) -> &'static str {
+    match state {
+        StreamRealizedState::Stopped => "stopped",
+        StreamRealizedState::Starting => "starting",
+        StreamRealizedState::Live => "live",
+        StreamRealizedState::WaitingToReconnect => "waiting_to_reconnect",
+        StreamRealizedState::Congested => "congested",
+        StreamRealizedState::Failed => "failed",
+        StreamRealizedState::Unavailable => "unavailable",
+    }
+}
+
+pub(super) fn parse_stream_realized_state(value: &str) -> Option<StreamRealizedState> {
+    match value {
+        "stopped" => Some(StreamRealizedState::Stopped),
+        "starting" => Some(StreamRealizedState::Starting),
+        "live" => Some(StreamRealizedState::Live),
+        "waiting_to_reconnect" => Some(StreamRealizedState::WaitingToReconnect),
+        "congested" => Some(StreamRealizedState::Congested),
+        "failed" => Some(StreamRealizedState::Failed),
+        "unavailable" => Some(StreamRealizedState::Unavailable),
+        _ => None,
+    }
+}
+/// Escapes one sanitized failure code for a `stream_status` sample.
+pub(super) fn escape_stream_failure(value: &str) -> Result<String, CodecError> {
+    escape_bounded(value)
+}
+
+pub(super) fn stream_statuses(values: &[StreamStatus]) -> Result<String, CodecError> {
+    let mut seen = BTreeSet::new();
+    for status in values {
+        if !seen.insert(status.target.get()) {
+            return Err(CodecError::InvalidField {
+                field: "streams",
+                value: status.target.to_string(),
+            });
+        }
+        validate_stream_text(&status.name, status.detail.as_deref())?;
+    }
+    bounded_join(values, MAX_LIST_ITEMS, "streams", |status| {
+        Ok(format!(
+            "{}:{}:{}:{}:{}",
+            status.target,
+            escape_bounded(&status.name)?,
+            u8::from(status.desired_running),
+            stream_realized_state(status.realized),
+            match &status.detail {
+                Some(detail) => escape_bounded(detail)?,
+                None => String::new(),
+            },
+        ))
+    })
+}
+
+fn validate_stream_text(name: &str, detail: Option<&str>) -> Result<(), CodecError> {
+    let invalid = || CodecError::InvalidField {
+        field: "streams",
+        value: name.to_owned(),
+    };
+    if name.trim().is_empty() || name.len() > MAX_STREAM_NAME_BYTES {
+        return Err(invalid());
+    }
+    if let Some(detail) = detail
+        && (detail.is_empty() || detail.len() > MAX_STREAM_DETAIL_BYTES)
+    {
+        return Err(CodecError::InvalidField {
+            field: "streams",
+            value: detail.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+pub(super) fn parse_stream_statuses(value: &str) -> Result<Vec<StreamStatus>, CodecError> {
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+    check_items(value, ',', MAX_LIST_ITEMS, "streams")?;
+    let mut seen = BTreeSet::new();
+    value
+        .split(',')
+        .map(|entry| parse_stream_status(entry, &mut seen))
+        .collect()
+}
+
+fn parse_stream_status(
+    entry: &str,
+    seen: &mut BTreeSet<core::num::NonZeroU128>,
+) -> Result<StreamStatus, CodecError> {
+    let invalid = || CodecError::InvalidField {
+        field: "streams",
+        value: entry.to_owned(),
+    };
+    let parts = entry.split(':').collect::<Vec<_>>();
+    let [target, name, desired_running, realized, detail] = parts.as_slice() else {
+        return Err(invalid());
+    };
+    let target = target
+        .parse::<u128>()
+        .ok()
+        .and_then(core::num::NonZeroU128::new);
+    let target = crate::WireStreamTargetId::new(target.ok_or_else(invalid)?);
+    if !seen.insert(target.get()) {
+        return Err(invalid());
+    }
+    let name = unescape(name)?;
+    if name.trim().is_empty() || name.len() > MAX_STREAM_NAME_BYTES {
+        return Err(invalid());
+    }
+    let desired_running = match *desired_running {
+        "0" => false,
+        "1" => true,
+        _ => return Err(invalid()),
+    };
+    let realized = parse_stream_realized_state(realized).ok_or_else(invalid)?;
+    let detail = parse_stream_detail(detail)?;
+    Ok(StreamStatus {
+        target,
+        name,
+        desired_running,
+        realized,
+        detail,
+    })
+}
+
+fn parse_stream_detail(detail: &str) -> Result<Option<String>, CodecError> {
+    if detail.is_empty() {
+        return Ok(None);
+    }
+    let detail = unescape(detail)?;
+    if detail.is_empty() || detail.len() > MAX_STREAM_DETAIL_BYTES {
+        return Err(CodecError::InvalidField {
+            field: "streams",
+            value: detail,
+        });
+    }
+    Ok(Some(detail))
 }
 
 fn check_items(

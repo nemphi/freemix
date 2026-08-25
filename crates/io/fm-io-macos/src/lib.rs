@@ -607,6 +607,7 @@ struct CaptureFailure {
 }
 
 impl CaptureFailure {
+    #[allow(dead_code)]
     fn runtime(detail: impl Into<String>) -> Self {
         Self {
             detail: detail.into(),
@@ -614,6 +615,7 @@ impl CaptureFailure {
         }
     }
 
+    #[allow(dead_code)]
     fn contract(detail: impl Into<String>) -> Self {
         Self {
             detail: detail.into(),
@@ -636,6 +638,7 @@ struct RecoveryContinuity {
 }
 
 impl QueueState {
+    #[allow(dead_code)]
     fn push(&mut self, frame: CpuVideoFrame, native_dropped_total: u64) {
         self.telemetry.received = self.telemetry.received.saturating_add(1);
         self.telemetry.native_dropped = self
@@ -656,6 +659,7 @@ impl QueueState {
         frame
     }
 
+    #[allow(dead_code)]
     fn push_from_worker(&mut self, frame: CpuVideoFrame, native_dropped_total: u64) -> bool {
         if !self.accepting_frames {
             return false;
@@ -666,6 +670,7 @@ impl QueueState {
         true
     }
 
+    #[allow(dead_code)]
     fn fail(&mut self, failure: CaptureFailure) {
         if self.sticky_failure.is_none() {
             self.sticky_failure = Some(failure);
@@ -1145,12 +1150,14 @@ impl CameraVideoSource {
     }
 
     #[cfg(not(target_os = "macos"))]
+    #[allow(clippy::unused_self)]
     fn spawn_capture(&self) -> Result<(), IoError> {
         Err(adapter_failure(
             "AVFoundation camera capture is available only on macOS",
         ))
     }
 
+    #[allow(clippy::unnecessary_wraps)]
     fn shutdown(&mut self) -> Result<(), IoError> {
         self.state
             .lock()

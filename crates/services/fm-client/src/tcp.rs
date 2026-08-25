@@ -8,7 +8,7 @@ use fm_protocol::{
     AudioMetersMessage, CURRENT_PROTOCOL_VERSION, CodecError, CommandPayload, CommandResult,
     DiagnosticsRequest, DiagnosticsResponse, DurableGap, ErrorMessage, EventMessage,
     HandshakeOutcome, HeartbeatAcknowledgementMessage, LineDecoder, RuntimeEventMessage,
-    WireMessage, encode_line,
+    StreamStatusMessage, WireMessage, encode_line,
 };
 
 #[cfg(feature = "std-websocket")]
@@ -363,6 +363,9 @@ pub enum SessionEvent {
     AudioMeters {
         meters: AudioMetersMessage,
     },
+    StreamStatus {
+        status: StreamStatusMessage,
+    },
     DiagnosticsResponse {
         response: DiagnosticsResponse,
     },
@@ -453,6 +456,8 @@ pub struct TcpSession {
     pending_diagnostics: Option<String>,
     last_audio_meter_sequence: Option<u64>,
     latest_audio_meters: Option<AudioMetersMessage>,
+    last_stream_status_sequence: Option<u64>,
+    latest_stream_status: Option<StreamStatusMessage>,
 }
 
 #[derive(Debug)]
@@ -561,6 +566,8 @@ impl TcpSession {
             pending_diagnostics: None,
             last_audio_meter_sequence: None,
             latest_audio_meters: None,
+            last_stream_status_sequence: None,
+            latest_stream_status: None,
         }
     }
 
@@ -598,6 +605,11 @@ impl TcpSession {
     }
 
     #[must_use]
+    pub const fn latest_stream_status(&self) -> Option<&StreamStatusMessage> {
+        self.latest_stream_status.as_ref()
+    }
+
+    #[must_use]
     pub fn reconnect_backoff(&self) -> Option<ReconnectBackoff> {
         match self.client.state() {
             crate::ConnectionState::Backoff(backoff) => Some(*backoff),
@@ -628,6 +640,14 @@ impl TcpSession {
         self.finish_connect(Transport::Tcp(connection), None)
     }
 
+    /// Connects over WebSocket while polling for caller-requested cancellation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an already connected session, an invalid
+    /// WebSocket address or bearer token, or the same errors as
+    /// [`Self::connect`], and returns [`TcpSessionError::Cancelled`] when
+    /// `cancelled` returns `true`.
     #[cfg(feature = "std-websocket")]
     pub fn connect_websocket_cancellable(
         &mut self,
@@ -870,6 +890,12 @@ impl TcpSession {
     }
 
     /// Waits for one event, returning `None` when the receive timeout elapsed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when not connected, on I/O or decoding failure
+    /// other than the timeout itself, or when the owned client rejects a
+    /// received record.
     pub fn receive_timeout(
         &mut self,
         timeout: Duration,
@@ -924,6 +950,12 @@ impl TcpSession {
 
     /// Sends one diagnostics request and waits for its matching response.
     /// Valid durable and runtime events may arrive while waiting.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when not connected, another diagnostics request is
+    /// already pending, the request ID is invalid, `cancelled` returns
+    /// `true`, or the request, response wait, or response validation fails.
     pub fn send_diagnostics_cancellable(
         &mut self,
         request_id: impl Into<String>,
@@ -993,6 +1025,9 @@ impl TcpSession {
                     WireMessage::AudioMeters(meters) => {
                         self.validate_audio_meters(&meters)?;
                     }
+                    WireMessage::StreamStatus(status) => {
+                        self.validate_stream_status(&status)?;
+                    }
                     _ => {
                         self.transition_disconnect();
                         return Err(TcpSessionError::UnexpectedMessage);
@@ -1043,6 +1078,10 @@ impl TcpSession {
             WireMessage::AudioMeters(meters) => {
                 self.validate_audio_meters(&meters)?;
                 Ok(SessionEvent::AudioMeters { meters })
+            }
+            WireMessage::StreamStatus(status) => {
+                self.validate_stream_status(&status)?;
+                Ok(SessionEvent::StreamStatus { status })
             }
             WireMessage::DurableGap(gap) => {
                 let result = self.client.intake(WireMessage::DurableGap(gap.clone()));
@@ -1290,6 +1329,8 @@ impl TcpSession {
         self.pending_diagnostics = None;
         self.last_audio_meter_sequence = None;
         self.latest_audio_meters = None;
+        self.last_stream_status_sequence = None;
+        self.latest_stream_status = None;
         self.connection.take();
         self.client.transport_disconnected()
     }
@@ -1311,6 +1352,26 @@ impl TcpSession {
         }
         self.last_audio_meter_sequence = Some(meters.sequence);
         self.latest_audio_meters = Some(meters.clone());
+        Ok(())
+    }
+
+    fn validate_stream_status(
+        &mut self,
+        status: &StreamStatusMessage,
+    ) -> Result<(), TcpSessionError> {
+        let valid_identity = self
+            .client
+            .session()
+            .is_some_and(|session| session.server == status.server);
+        let valid_sequence = self
+            .last_stream_status_sequence
+            .is_none_or(|sequence| status.sequence > sequence);
+        if !valid_identity || !valid_sequence {
+            self.transition_disconnect();
+            return Err(TcpSessionError::UnexpectedMessage);
+        }
+        self.last_stream_status_sequence = Some(status.sequence);
+        self.latest_stream_status = Some(status.clone());
         Ok(())
     }
 }

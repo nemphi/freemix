@@ -63,7 +63,7 @@ fn diagnose(config: freemix_studio::StudioConfig) -> Result<(), io::Error> {
         {
             SessionEvent::HeartbeatAcknowledged { acknowledgement } => {
                 if Instant::now() >= deadline {
-                    return Err(diagnostic_failure("deadline exceeded").into());
+                    return Err(diagnostic_failure("deadline exceeded"));
                 }
                 println!(
                     "liveness=ok sequence={} received_at_ms={}",
@@ -83,7 +83,7 @@ fn diagnose(config: freemix_studio::StudioConfig) -> Result<(), io::Error> {
                     })
                     .map_err(diagnostic_failure)?
                 else {
-                    return Err(diagnostic_failure("unexpected diagnostics event").into());
+                    return Err(diagnostic_failure("unexpected diagnostics event"));
                 };
                 println_diagnostics(&response);
                 break;
@@ -97,12 +97,12 @@ fn diagnose(config: freemix_studio::StudioConfig) -> Result<(), io::Error> {
                 ..
             } => {}
             SessionEvent::Disconnected { .. } => {
-                return Err(diagnostic_failure("EOF").into());
+                return Err(diagnostic_failure("EOF"));
             }
             SessionEvent::ServerError(_) => {
-                return Err(diagnostic_failure("server error").into());
+                return Err(diagnostic_failure("server error"));
             }
-            _ => return Err(diagnostic_failure("unexpected session event").into()),
+            _ => return Err(diagnostic_failure("unexpected session event")),
         }
     }
     Ok(())

@@ -564,6 +564,7 @@ struct AudioQueueState {
 }
 
 impl AudioQueueState {
+    #[allow(dead_code)]
     fn push(&mut self, block: AudioBlock, native_dropped_total: u64) {
         self.telemetry.received = self.telemetry.received.saturating_add(1);
         self.telemetry.native_dropped = native_dropped_total;
@@ -584,6 +585,7 @@ impl AudioQueueState {
         block
     }
 
+    #[allow(dead_code)]
     fn fail(&mut self, detail: impl Into<String>) {
         if self.sticky_failure.is_none() {
             self.sticky_failure = Some(detail.into());
@@ -838,6 +840,7 @@ impl MacosAudioSource {
     }
 
     #[cfg(not(target_os = "macos"))]
+    #[allow(clippy::unused_self)]
     fn spawn_capture(&self) -> Result<(), IoError> {
         Err(adapter_failure(
             "AVFoundation audio capture is available only on macOS",
@@ -903,6 +906,7 @@ impl MacosAudioSource {
         })
     }
 
+    #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
     fn shutdown(&mut self) -> Result<(), IoError> {
         #[cfg(target_os = "macos")]
         {

@@ -17,7 +17,7 @@ use fm_persistence::StoredProject;
 use fm_protocol::{
     AudioMetersMessage, ClientType, ErrorMessage, HandshakeOutcome as ProtocolHandshakeOutcome,
     HandshakeResponse, HeartbeatAcknowledgementMessage, LineDecoder, ServerIdentity,
-    StructuredError, WireMessage, encode_line,
+    StreamStatusMessage, StructuredError, WireMessage, encode_line,
 };
 use fm_server::{Server, Session, SyncPayload};
 
@@ -52,6 +52,7 @@ enum Accounting {
     Session,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 struct Outbound {
     write: OutboundWrite,
     accounting: Accounting,
@@ -106,6 +107,8 @@ struct Peer {
     outbound: VecDeque<Outbound>,
     audio_meters: bool,
     latest_meter: LatestRecord,
+    stream_status: bool,
+    latest_stream_status: LatestRecord,
 }
 
 impl Peer {
@@ -132,6 +135,8 @@ impl Peer {
             outbound: VecDeque::new(),
             audio_meters: false,
             latest_meter: LatestRecord::default(),
+            stream_status: false,
+            latest_stream_status: LatestRecord::default(),
         })
     }
 
@@ -187,6 +192,14 @@ impl Peer {
         }
     }
 
+    /// Coalesces the latest stream status independently of the meter slot so
+    /// neither lossy record can evict the other.
+    fn replace_stream_status(&mut self, bytes: Vec<u8>) {
+        if self.stream_status && self.phase == Phase::Active {
+            self.latest_stream_status.replace(bytes);
+        }
+    }
+
     fn replace_outbound_for_shutdown(&mut self) {
         let retained = usize::from(self.outbound.front().is_some_and(|record| {
             record.channel_sent
@@ -222,20 +235,22 @@ impl Peer {
     }
 
     fn discard_outbound(&mut self, index: usize) {
-        if let Some(record) = self.outbound.remove(index) {
-            if record.accounted && matches!(record.accounting, Accounting::Session) {
-                let _ = self
-                    .session
-                    .as_mut()
-                    .and_then(|session| session.discard_outbound(index).ok());
-            }
+        if let Some(record) = self.outbound.remove(index)
+            && record.accounted
+            && matches!(record.accounting, Accounting::Session)
+        {
+            let _ = self
+                .session
+                .as_mut()
+                .and_then(|session| session.discard_outbound(index).ok());
         }
     }
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 pub(super) fn run(
-    listener: TcpListener,
+    listener: &TcpListener,
     server: &Server<ControlHandle>,
     control: &SharedControl,
     store: &dyn DurableStore,
@@ -268,10 +283,8 @@ pub(super) fn run(
 
         if let Some(web) = web {
             loop {
-                let event = match web.try_event() {
-                    Ok(Some(event)) => event,
-                    Ok(None) => break,
-                    Err(()) => break,
+                let Ok(Some(event)) = web.try_event() else {
+                    break;
                 };
                 match event {
                     WebEvent::Connected(connection)
@@ -344,10 +357,10 @@ pub(super) fn run(
             if !close[index] && peer.phase == Phase::AwaitHandshake {
                 close[index] = Instant::now() >= peer.handshake_deadline;
             }
-            if !close[index] && peer.session.is_some() {
-                close[index] =
-                    !super::session_heartbeat_active(peer.session.as_mut().expect("checked above"))
-                        .unwrap_or(false);
+            if !close[index]
+                && let Some(session) = peer.session.as_mut()
+            {
+                close[index] = !super::session_heartbeat_active(session).unwrap_or(false);
             }
             if !close[index]
                 && peer
@@ -376,7 +389,7 @@ pub(super) fn run(
                 Ok(()) => {}
                 Err(DispatchError::Peer) => close[index] = true,
                 Err(DispatchError::Daemon(error)) => {
-                    shutdown_peers(&mut peers, control, ShutdownQueue::Replace);
+                    shutdown_peers(&mut peers, control, &ShutdownQueue::Replace);
                     return Err(error);
                 }
             }
@@ -386,11 +399,14 @@ pub(super) fn run(
         }
         if let Some(native) = native.as_deref_mut() {
             if let Err(error) = native.tick_if_due(&mut control.borrow_mut(), authority) {
-                shutdown_peers(&mut peers, control, ShutdownQueue::Replace);
+                shutdown_peers(&mut peers, control, &ShutdownQueue::Replace);
                 return Err(error);
             }
             if let Some(meters) = native.take_audio_meters() {
                 publish_audio_meters(&mut peers, meters);
+            }
+            if let Some(status) = native.take_stream_status() {
+                publish_stream_status(&mut peers, status);
             }
         }
         if let Some(reason) = requested_daemon_shutdown(native.as_deref(), Some(process_shutdown)) {
@@ -691,6 +707,7 @@ impl Runtime<'_> {
         peer.identity = Some(identity);
         peer.subscription = Some(subscription);
         peer.audio_meters = !peer.transport.is_web() && request.client_type == ClientType::Studio;
+        peer.stream_status = peer.audio_meters;
         if peer
             .queue(
                 &WireMessage::HandshakeResponse(response),
@@ -792,15 +809,22 @@ fn write_peer(peer: &mut Peer) -> WriteOutcome {
                 record.channel_sent = true;
                 WriteOutcome::Pending
             }
-            Err(TrySendError::Full(_)) => WriteOutcome::Failed,
-            Err(TrySendError::Disconnected(_)) => WriteOutcome::Failed,
+            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => WriteOutcome::Failed,
         }
     } else {
+        // Continue any in-flight lossy record before touching the queue.
         if peer.latest_meter.started() {
             return write_meter(peer);
         }
+        if peer.latest_stream_status.started() {
+            return write_stream_status(peer);
+        }
         let Some(record) = peer.outbound.front_mut() else {
-            return write_meter(peer);
+            let outcome = write_meter(peer);
+            if matches!(outcome, WriteOutcome::Failed) {
+                return outcome;
+            }
+            return write_stream_status(peer);
         };
         let Transport::Raw(stream) = &mut peer.transport else {
             unreachable!("raw transport checked above")
@@ -847,10 +871,29 @@ fn finish_outbound(peer: &mut Peer) -> WriteOutcome {
 }
 
 fn write_meter(peer: &mut Peer) -> WriteOutcome {
-    let Transport::Raw(stream) = &mut peer.transport else {
+    write_lossy(peer, LossySlot::Meter)
+}
+
+fn write_stream_status(peer: &mut Peer) -> WriteOutcome {
+    write_lossy(peer, LossySlot::StreamStatus)
+}
+
+/// Which independent lossy side-channel slot to drain.
+#[derive(Clone, Copy)]
+enum LossySlot {
+    Meter,
+    StreamStatus,
+}
+
+fn write_lossy(peer: &mut Peer, slot: LossySlot) -> WriteOutcome {
+    let (record, transport) = match slot {
+        LossySlot::Meter => (&mut peer.latest_meter, &mut peer.transport),
+        LossySlot::StreamStatus => (&mut peer.latest_stream_status, &mut peer.transport),
+    };
+    let Transport::Raw(stream) = transport else {
         return WriteOutcome::Failed;
     };
-    match peer.latest_meter.write_once(stream) {
+    match record.write_once(stream) {
         Ok(()) => WriteOutcome::Pending,
         Err(error)
             if matches!(
@@ -873,12 +916,28 @@ fn publish_audio_meters(peers: &mut [Peer], meters: AudioMetersMessage) {
     }
 }
 
+fn publish_stream_status(peers: &mut [Peer], status: StreamStatusMessage) {
+    let Ok(bytes) = encode_line(&WireMessage::StreamStatus(status)).map(String::into_bytes) else {
+        return;
+    };
+    for peer in peers {
+        peer.replace_stream_status(bytes.clone());
+    }
+}
+
+/// Drops lossy records that never reached the wire so shutdown cannot flush
+/// stale telemetry after its goodbye; in-flight records keep draining.
+fn discard_unstarted_lossy_records(peer: &mut Peer) {
+    peer.latest_meter.discard_unstarted();
+    peer.latest_stream_status.discard_unstarted();
+}
+
 enum ShutdownQueue {
     Replace,
     PreserveCommandResult,
 }
 
-fn shutdown_peers(peers: &mut Vec<Peer>, control: &SharedControl, queue: ShutdownQueue) {
+fn shutdown_peers(peers: &mut Vec<Peer>, control: &SharedControl, queue: &ShutdownQueue) {
     for index in (0..peers.len()).rev() {
         if peers[index].session.is_none() || !peers[index].handshake_written {
             close_peer(peers.swap_remove(index), control);
@@ -888,7 +947,7 @@ fn shutdown_peers(peers: &mut Vec<Peer>, control: &SharedControl, queue: Shutdow
         return;
     }
     for peer in peers.iter_mut() {
-        peer.latest_meter.discard_unstarted();
+        discard_unstarted_lossy_records(peer);
         if matches!(queue, ShutdownQueue::Replace) {
             peer.replace_outbound_for_shutdown();
         } else {
@@ -944,7 +1003,7 @@ fn shutdown_for_reason(
             } else {
                 ShutdownQueue::Replace
             };
-            shutdown_peers(peers, control, queue)
+            shutdown_peers(peers, control, &queue);
         }
         DaemonShutdownReason::ProgramSurface => close_all(peers, control),
         DaemonShutdownReason::Once => unreachable!("once is handled below"),
@@ -955,5 +1014,192 @@ fn shutdown_for_reason(
 fn close_peer(mut peer: Peer, control: &SharedControl) {
     if let Some(subscription) = peer.subscription.take() {
         control.borrow_mut().unsubscribe(subscription.id());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU128;
+    use std::sync::mpsc;
+
+    use fm_auth::{Role, SessionId, UserId};
+    use fm_protocol::{
+        AudioMeterChannel, StreamRealizedState, StreamStatusMessage, StreamStatusSample,
+        WireStreamTargetId,
+    };
+
+    use super::*;
+
+    fn identity() -> ServerIdentity {
+        ServerIdentity {
+            engine_id: "engine".to_owned(),
+            project_id: "project".to_owned(),
+            state_epoch: 1,
+            log_id: "log".to_owned(),
+        }
+    }
+
+    fn meters_message() -> AudioMetersMessage {
+        AudioMetersMessage {
+            server: identity(),
+            sequence: 7,
+            frame: 9,
+            start_sample: 100,
+            end_sample: 200,
+            master: vec![AudioMeterChannel {
+                peak_millionths: 500_000,
+                rms_millionths: 250_000,
+            }],
+            inputs: Vec::new(),
+        }
+    }
+
+    fn status_message() -> StreamStatusMessage {
+        StreamStatusMessage {
+            server: identity(),
+            sequence: 1,
+            samples: vec![StreamStatusSample {
+                target: WireStreamTargetId::new(NonZeroU128::new(5).unwrap()),
+                realized: StreamRealizedState::Live,
+                connected: true,
+                muxed_bytes: 2_048,
+                enqueued_pairs: 12,
+                dropped_pairs: 1,
+                failure: None,
+            }],
+        }
+    }
+
+    /// An eligible active raw peer plus the far end of its transport.
+    fn raw_peer() -> (Peer, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        stream.set_nonblocking(true).unwrap();
+        let principal = Principal::authenticated(
+            UserId::new("user").unwrap(),
+            SessionId::new("session").unwrap(),
+            [Role::Admin],
+        );
+        let peer = Peer::new(0, Transport::Raw(stream), principal, Duration::from_secs(5)).unwrap();
+        (peer, client)
+    }
+
+    fn active_eligible_peer() -> (Peer, TcpStream) {
+        let (mut peer, client) = raw_peer();
+        peer.phase = Phase::Active;
+        peer.audio_meters = true;
+        peer.stream_status = true;
+        (peer, client)
+    }
+
+    fn read_exact(client: &mut TcpStream, length: usize) -> Vec<u8> {
+        let mut buffer = vec![0_u8; length];
+        client.read_exact(&mut buffer).unwrap();
+        buffer
+    }
+
+    #[test]
+    fn stream_status_and_meter_records_coexist_and_drain_independently() {
+        let (mut peer, mut client) = active_eligible_peer();
+
+        publish_audio_meters(std::slice::from_mut(&mut peer), meters_message());
+        publish_stream_status(std::slice::from_mut(&mut peer), status_message());
+        // Both slots hold their own encoded record; neither evicted the other.
+        assert!(!peer.latest_meter.is_empty());
+        assert!(!peer.latest_stream_status.is_empty());
+
+        // A newer stream status replaces only the stream status slot.
+        publish_stream_status(std::slice::from_mut(&mut peer), status_message());
+        assert!(!peer.latest_meter.is_empty());
+        assert!(!peer.latest_stream_status.is_empty());
+
+        let expected_meters = encode_line(&WireMessage::AudioMeters(meters_message()))
+            .unwrap()
+            .into_bytes();
+        let expected_status = encode_line(&WireMessage::StreamStatus(status_message()))
+            .unwrap()
+            .into_bytes();
+
+        while !peer.latest_meter.is_empty() || !peer.latest_stream_status.is_empty() {
+            assert!(!matches!(write_peer(&mut peer), WriteOutcome::Failed));
+        }
+        assert_eq!(
+            read_exact(&mut client, expected_meters.len()),
+            expected_meters
+        );
+        assert_eq!(
+            read_exact(&mut client, expected_status.len()),
+            expected_status
+        );
+
+        // The drained line is a well-formed stream_status record.
+        let decoded = LineDecoder::new().push(&expected_status).unwrap().remove(0);
+        assert!(matches!(decoded, WireMessage::StreamStatus(_)));
+    }
+
+    #[test]
+    fn ineligible_peers_never_store_or_write_stream_status() {
+        // A raw peer that did not opt in keeps both lossy slots empty.
+        let (mut peer, mut client) = raw_peer();
+        peer.phase = Phase::Active;
+        peer.audio_meters = false;
+        peer.stream_status = false;
+        publish_stream_status(std::slice::from_mut(&mut peer), status_message());
+        assert!(peer.latest_stream_status.is_empty());
+        write_peer(&mut peer);
+        client.set_nonblocking(true).unwrap();
+        let mut probe = [0_u8; 16];
+        assert!(matches!(
+            client.read(&mut probe),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+
+        // Web transports are excluded from the lossy side channel entirely.
+        let (inbound_sender, inbound) = mpsc::channel();
+        let (outbound_sender, _outbound) = mpsc::sync_channel(8);
+        let (_acknowledgement_sender, acknowledgements) = mpsc::channel();
+        drop(inbound_sender);
+        let web_peer = Peer::new(
+            1,
+            Transport::Web(WebTransport {
+                inbound,
+                outbound: outbound_sender,
+                acknowledgements,
+                cancel: Arc::new(AtomicBool::new(false)),
+            }),
+            Principal::authenticated(
+                UserId::new("user").unwrap(),
+                SessionId::new("session").unwrap(),
+                [Role::Admin],
+            ),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let mut web_peer = web_peer;
+        web_peer.phase = Phase::Active;
+        // Eligibility is derived once at handshake, exactly as in `handshake`.
+        let client_type = ClientType::Studio;
+        web_peer.audio_meters = !web_peer.transport.is_web() && client_type == ClientType::Studio;
+        web_peer.stream_status = web_peer.audio_meters;
+        assert!(
+            !web_peer.stream_status,
+            "web peers are not lossy-record eligible"
+        );
+        publish_stream_status(std::slice::from_mut(&mut web_peer), status_message());
+        assert!(web_peer.latest_stream_status.is_empty());
+    }
+
+    #[test]
+    fn unstarted_lossy_records_are_discarded_for_shutdown_together() {
+        let (mut peer, _client) = active_eligible_peer();
+        publish_audio_meters(std::slice::from_mut(&mut peer), meters_message());
+        publish_stream_status(std::slice::from_mut(&mut peer), status_message());
+        assert!(!peer.latest_meter.is_empty());
+        assert!(!peer.latest_stream_status.is_empty());
+
+        discard_unstarted_lossy_records(&mut peer);
+        assert!(peer.latest_meter.is_empty());
+        assert!(peer.latest_stream_status.is_empty());
     }
 }

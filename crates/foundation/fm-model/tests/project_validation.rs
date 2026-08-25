@@ -2,15 +2,16 @@ use std::num::NonZeroU128;
 
 use fm_model::{
     AddInputError, AddSceneInputError, AddSceneLayerError, AddStreamTargetError, AudioBus, BusSend,
-    CURRENT_SCHEMA_VERSION, CropRect, DuplicateSceneInputError, EntityRef, Input,
-    InputAudioStripState, InputBalanceBasisPoints, InputDelaySamples, InputGainMilliDb, InputKind,
-    Layer, LayerGeometry, MainMix, Output, OutputFormat, Project, ProjectSettings, RectMask,
+    CURRENT_SCHEMA_VERSION, CropRect, DEFAULT_VIDEO_BITRATE_KBPS, DuplicateSceneInputError,
+    EntityRef, Input, InputAudioStripState, InputBalanceBasisPoints, InputDelaySamples,
+    InputGainMilliDb, InputKind, Layer, LayerGeometry, MAX_VIDEO_BITRATE_KBPS,
+    MIN_VIDEO_BITRATE_KBPS, MainMix, Output, OutputFormat, Project, ProjectSettings, RectMask,
     RemoveAudioBusError, RemoveInputError, RemoveOutputError, RemoveSceneError, RenameSceneError,
     RestartPolicy, Rgba8, Rotation, Scene, SceneLayerError, SetStingerError, SimulatedAudio,
     SimulatedInput, SimulatedVideo, SolidColor, SourceRef, StartupPolicy, StingerAudioPolicy,
     StingerConfig, StingerMissingMediaFallback, StingerSlotNumber, StreamEndpoint,
     StreamEndpointError, StreamKey, StreamKeyError, StreamProtocol, StreamTarget, StreamTargetId,
-    ValidationError, ValidationErrorKind,
+    StreamVideoBitrateError, ValidationError, ValidationErrorKind,
 };
 use fm_types::{
     AudioFormat, BusId, ChannelLayout, ColorMetadata, FrameRate, InputId, MAX_INPUT_NAME_BYTES,
@@ -410,7 +411,7 @@ fn duplicate_scene_input_is_atomic_and_preserves_layer_fields() {
     assert!(project.inputs()[1].required_capabilities.is_empty());
     assert_eq!(
         project.input_audio_strip(input_id(2)),
-        Some(Default::default())
+        Some(InputAudioStripState::default())
     );
 
     let mut reject = |source: SceneId,
@@ -472,7 +473,7 @@ fn add_scene_input_is_atomic_and_uses_current_name_contract() {
     assert!(project.inputs()[1].required_capabilities.is_empty());
     assert_eq!(
         project.input_audio_strip(input_id(2)),
-        Some(Default::default())
+        Some(InputAudioStripState::default())
     );
 
     let mut reject = |scene: SceneId, input: InputId, scene_name: &str, input_name: &str, error| {
@@ -561,6 +562,7 @@ fn complete_simulated_production_is_valid() {
 
 #[test]
 fn remove_input_removes_pair_and_rejects_domain_references() {
+    type Mutation = Box<dyn FnOnce(&mut Project)>;
     let mut base = Project::new(project_id(70), "Remove", settings());
     for id in [1, 2, 3] {
         base.add_input(Input {
@@ -583,7 +585,7 @@ fn remove_input_removes_pair_and_rejects_domain_references() {
             .any(|strip| strip.input == input_id(3))
     );
 
-    let mut cases: Vec<Box<dyn FnOnce(&mut Project)>> = vec![
+    let mut cases: Vec<Mutation> = vec![
         Box::new(|project| project.set_main_mix(MainMix::new(input_id(3), input_id(1)))),
         Box::new(|project| {
             project.add_stinger(StingerConfig::new(
@@ -593,7 +595,7 @@ fn remove_input_removes_pair_and_rejects_domain_references() {
                 0,
                 StingerAudioPolicy::Muted,
                 StingerMissingMediaFallback::Cut,
-            ))
+            ));
         }),
         Box::new(|project| {
             project.add_scene(Scene {
@@ -601,7 +603,7 @@ fn remove_input_removes_pair_and_rejects_domain_references() {
                 name: "Scene".into(),
                 background: Rgba8::OPAQUE_BLACK,
                 layers: vec![layer("Input", SourceRef::Input(input_id(3)))],
-            })
+            });
         }),
         Box::new(|project| {
             project.add_input(Input {
@@ -612,7 +614,7 @@ fn remove_input_removes_pair_and_rejects_domain_references() {
                     audio_source: Some(input_id(3)),
                 },
                 required_capabilities: Vec::new(),
-            })
+            });
         }),
     ];
     for configure in cases.drain(..) {
@@ -643,7 +645,7 @@ fn add_input_checked_is_atomic_and_preserves_exact_name() {
     assert_eq!(project.inputs()[1].name, "Exact  name  ");
     assert_eq!(
         project.input_audio_strip(input_id(2)),
-        Some(Default::default())
+        Some(InputAudioStripState::default())
     );
     assert_eq!(
         project
@@ -673,6 +675,7 @@ fn add_input_checked_is_atomic_and_preserves_exact_name() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn remove_outputs_and_audio_buses_preserves_order_and_rejects_references() {
     let mut base = valid_project();
     base.add_audio_bus(AudioBus {
@@ -908,10 +911,6 @@ fn stream_destinations_refuse_bad_urls_credentials_duplicate_ids_and_dangling_ou
             StreamEndpointError::UnsupportedScheme,
         ),
         (
-            "srt://ingest.example/live",
-            StreamEndpointError::UnsupportedScheme,
-        ),
-        (
             "ingest.example/live",
             StreamEndpointError::UnsupportedScheme,
         ),
@@ -991,6 +990,120 @@ fn stream_destinations_refuse_bad_urls_credentials_duplicate_ids_and_dangling_ou
 }
 
 #[test]
+fn srt_endpoints_take_host_port_only_and_recompose_through_a_streamid_query() {
+    const KEY: &str = "srt-live-9f3c-key";
+
+    // The port is optional and the endpoint is stored scheme-free.
+    assert_eq!(
+        StreamEndpoint::parse_url("srt://ingest.example.test:9710").unwrap(),
+        (
+            StreamProtocol::Srt,
+            StreamEndpoint::parse_for(StreamProtocol::Srt, "ingest.example.test:9710").unwrap()
+        )
+    );
+    assert_eq!(
+        StreamEndpoint::parse_url("srt://ingest.example.test")
+            .unwrap()
+            .1
+            .as_str(),
+        "ingest.example.test"
+    );
+
+    for (endpoint, expected) in [
+        (
+            "ingest.example.test:9710/live",
+            StreamEndpointError::PathNotAllowed,
+        ),
+        ("ingest.example.test/", StreamEndpointError::PathNotAllowed),
+        (
+            "ingest.example.test?streamid=abcdef",
+            StreamEndpointError::QueryOrFragment,
+        ),
+        (
+            "ingest.example.test#fragment",
+            StreamEndpointError::QueryOrFragment,
+        ),
+        (
+            "operator:hunter2@ingest.example.test:9710",
+            StreamEndpointError::EmbeddedCredentials,
+        ),
+        (":9710", StreamEndpointError::MissingHost),
+        ("", StreamEndpointError::Empty),
+        (
+            "ingest.example.test:9710 li",
+            StreamEndpointError::InvalidCharacter,
+        ),
+    ] {
+        assert_eq!(
+            StreamEndpoint::parse_for(StreamProtocol::Srt, endpoint),
+            Err(expected),
+            "{endpoint} must be refused"
+        );
+    }
+
+    // A full URL dispatches on its scheme: paths stay legal for RTMP but not
+    // for SRT, and unknown schemes are still refused outright.
+    assert_eq!(
+        StreamEndpoint::parse_url("srt://ingest.example.test/live"),
+        Err(StreamEndpointError::PathNotAllowed)
+    );
+    assert_eq!(
+        StreamEndpoint::parse_url("rtmps://ingest.example.test/live"),
+        Ok((
+            StreamProtocol::Rtmps,
+            StreamEndpoint::parse("ingest.example.test/live").unwrap()
+        ))
+    );
+    assert_eq!(
+        StreamEndpoint::parse_url("udp://ingest.example.test:9710"),
+        Err(StreamEndpointError::UnsupportedScheme)
+    );
+
+    // Recomposition puts the key into the stream id query, and redaction
+    // scrubs it there too.
+    let target = StreamTarget::new(
+        stream_target_id(7),
+        "SRT relay".to_owned(),
+        StreamProtocol::Srt,
+        StreamEndpoint::parse_url("srt://ingest.example.test:9710")
+            .unwrap()
+            .1,
+        StreamKey::parse(KEY).unwrap(),
+        output_id(1),
+    )
+    .unwrap()
+    .with_backup_endpoint(Some(
+        StreamEndpoint::parse_url("srt://backup.example.test")
+            .unwrap()
+            .1,
+    ))
+    .unwrap();
+    assert_eq!(
+        target.expose_url(),
+        format!("srt://ingest.example.test:9710?streamid={KEY}")
+    );
+    assert_eq!(
+        target.expose_backup_url(),
+        Some(format!("srt://backup.example.test?streamid={KEY}"))
+    );
+    assert_eq!(
+        target.redacted_url(),
+        "srt://ingest.example.test:9710?streamid=****"
+    );
+    assert_eq!(
+        target.redacted_backup_url().as_deref(),
+        Some("srt://backup.example.test?streamid=****")
+    );
+
+    // The strict RTMP-style entry point still demands an application path,
+    // so a bare host:port stays an authoring error there.
+    assert_eq!(
+        StreamEndpoint::parse("ingest.example.test:9710"),
+        Err(StreamEndpointError::MissingApplicationPath)
+    );
+}
+
+#[test]
 fn stream_key_never_appears_in_debug_display_or_errors() {
     const SECRET: &str = "live-9f3c-secret-key";
     let target = StreamTarget::new(
@@ -1040,6 +1153,69 @@ fn stream_key_never_appears_in_debug_display_or_errors() {
         target.expose_url(),
         format!("rtmps://ingest.example:443/live/{SECRET}")
     );
+}
+
+#[test]
+fn stream_destinations_author_desired_running_state_off_by_default() {
+    let stopped = stream_target(1, "Stopped", output_id(1));
+    assert!(!stopped.running());
+
+    let running = stopped.clone().set_running(true);
+    assert!(running.running());
+    // The setter is builder-style: the original is untouched.
+    assert!(!stopped.running());
+}
+
+#[test]
+fn stream_destinations_author_a_bounded_video_bitrate_with_a_default() {
+    // Destinations authored without naming a bitrate assume the default.
+    let target = stream_target(1, "Primary", output_id(1));
+    assert_eq!(target.video_bitrate_kbps(), DEFAULT_VIDEO_BITRATE_KBPS);
+    assert_eq!(DEFAULT_VIDEO_BITRATE_KBPS, 4_500);
+
+    // The bounds are inclusive on both ends.
+    let low = target
+        .clone()
+        .with_video_bitrate(MIN_VIDEO_BITRATE_KBPS)
+        .unwrap();
+    assert_eq!(low.video_bitrate_kbps(), MIN_VIDEO_BITRATE_KBPS);
+    let high = target
+        .clone()
+        .with_video_bitrate(MAX_VIDEO_BITRATE_KBPS)
+        .unwrap();
+    assert_eq!(high.video_bitrate_kbps(), MAX_VIDEO_BITRATE_KBPS);
+
+    // Anything outside the bound is refused with a typed error.
+    assert_eq!(
+        target
+            .clone()
+            .with_video_bitrate(MIN_VIDEO_BITRATE_KBPS - 1),
+        Err(StreamVideoBitrateError::TooLow)
+    );
+    assert_eq!(
+        target.clone().with_video_bitrate(0),
+        Err(StreamVideoBitrateError::TooLow)
+    );
+    assert_eq!(
+        target
+            .clone()
+            .with_video_bitrate(MAX_VIDEO_BITRATE_KBPS + 1),
+        Err(StreamVideoBitrateError::TooHigh)
+    );
+    // The builder setter leaves the original untouched when it refuses.
+    assert_eq!(target.video_bitrate_kbps(), DEFAULT_VIDEO_BITRATE_KBPS);
+}
+
+#[test]
+fn projects_author_recording_desired_active_off_by_default() {
+    let project = valid_project();
+    assert!(!project.recording_desired_active());
+
+    let mut recording =
+        Project::new(project_id(9), "Recording", settings()).with_recording_desired_active(true);
+    assert!(recording.recording_desired_active());
+    recording.set_recording_desired_active(false);
+    assert!(!recording.recording_desired_active());
 }
 
 #[test]

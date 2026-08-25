@@ -113,6 +113,8 @@ fn snapshot(revision: u64) -> SnapshotMessage {
         desired_fade_to_black: live_fade_to_black(),
         realized_fade_to_black: live_fade_to_black(),
         stingers: Vec::new(),
+        streams: Vec::new(),
+        record_desired_active: false,
         desired_overlays: fm_protocol::OverlayStatus::empty_channels(),
         realized_overlays: fm_protocol::OverlayStatus::empty_channels(),
     }
@@ -1001,4 +1003,123 @@ fn outbound_queue_rejects_overflow_without_consuming_an_id() {
         .unwrap();
     assert_eq!(command.id, "diagnostic-a:1");
     assert_eq!(client.outbound_len(), 1);
+}
+
+fn wire_target(value: u128) -> fm_protocol::WireStreamTargetId {
+    fm_protocol::WireStreamTargetId::new(NonZeroU128::new(value).unwrap())
+}
+
+fn protocol_stream(value: u128, name: &str, desired_running: bool) -> fm_protocol::StreamStatus {
+    fm_protocol::StreamStatus {
+        target: wire_target(value),
+        name: name.to_owned(),
+        desired_running,
+        realized: fm_protocol::StreamRealizedState::Stopped,
+        detail: None,
+    }
+}
+
+fn snapshot_with_streams(
+    revision: u64,
+    streams: Vec<fm_protocol::StreamStatus>,
+) -> SnapshotMessage {
+    let mut message = snapshot(revision);
+    message.streams = streams;
+    message
+}
+
+#[test]
+fn snapshot_streams_are_validated_through_the_replicated_model() {
+    let mut client = Client::new(config(4)).unwrap();
+    client.start_connect().unwrap();
+    client.transport_connected().unwrap();
+    client.accept_handshake(handshake(4, None)).unwrap();
+
+    let duplicate = snapshot_with_streams(
+        4,
+        vec![
+            protocol_stream(5, "Twitch", false),
+            protocol_stream(5, "Again", true),
+        ],
+    );
+    assert_eq!(
+        client.apply_snapshot(duplicate).unwrap_err(),
+        ClientError::Model(fm_ui_model::ModelError::DuplicateStreamTarget(
+            NonZeroU128::new(5).unwrap()
+        ))
+    );
+}
+
+#[test]
+fn streams_changed_events_retain_the_latest_projection() {
+    let mut client = Client::new(config(4)).unwrap();
+    connect_snapshot(&mut client, 4);
+
+    client
+        .apply_event(EventMessage {
+            cursor: EventCursor {
+                engine: engine(),
+                revision: 5,
+            },
+            payload: EventPayload::StreamsChanged {
+                streams: vec![
+                    protocol_stream(5, "Twitch", true),
+                    protocol_stream(9, "YouTube", false),
+                ],
+            },
+        })
+        .unwrap();
+    let state = client.model().state().unwrap();
+    assert_eq!(state.streams().len(), 2);
+    assert_eq!(state.streams()[0].name, "Twitch");
+    assert!(state.streams()[0].desired_running);
+    assert_eq!(state.streams()[1].target.get(), 9);
+    assert!(!state.streams()[1].desired_running);
+}
+
+#[test]
+fn snapshots_intake_the_record_desired_projection() {
+    let mut client = Client::new(config(4)).unwrap();
+    client.start_connect().unwrap();
+    client.transport_connected().unwrap();
+    client.accept_handshake(handshake(4, None)).unwrap();
+
+    let mut message = snapshot_with_streams(4, Vec::new());
+    message.record_desired_active = true;
+    client.apply_snapshot(message).unwrap();
+    assert!(client.model().state().unwrap().record_desired_active());
+}
+
+#[test]
+fn recording_changed_events_retain_the_latest_desired_flag() {
+    let mut client = Client::new(config(4)).unwrap();
+    connect_snapshot(&mut client, 4);
+
+    client
+        .apply_event(EventMessage {
+            cursor: EventCursor {
+                engine: engine(),
+                revision: 5,
+            },
+            payload: EventPayload::RecordingChanged { active: true },
+        })
+        .unwrap();
+    assert!(client.model().state().unwrap().record_desired_active());
+
+    let command = client
+        .queue_command(CommandPayload::RecordStop, "rec-off", None, None)
+        .unwrap();
+    assert_eq!(command.payload, CommandPayload::RecordStop);
+    assert_eq!(client.model().pending_commands().len(), 1);
+
+    client
+        .apply_event(EventMessage {
+            cursor: EventCursor {
+                engine: engine(),
+                revision: 6,
+            },
+            payload: EventPayload::RecordingChanged { active: false },
+        })
+        .unwrap();
+    assert!(!client.model().state().unwrap().record_desired_active());
 }

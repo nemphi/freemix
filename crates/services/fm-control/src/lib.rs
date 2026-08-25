@@ -41,13 +41,14 @@ use fm_protocol::{
     OverlayTransitionKind as ProtocolOverlayTransition, RuntimeEventMessage, RuntimeLifecycleEvent,
     ServerIdentity, SnapshotMessage, StingerAudioPolicy as ProtocolStingerAudioPolicy,
     StingerMissingMediaFallback as ProtocolStingerFallback, StingerReadiness, StingerStatus,
-    WireInputId, WireMessage, WireOutputId, WireOverlayChannelId, WireStingerSlotId,
+    StreamRealizedState, StreamStatus, WireInputId, WireMessage, WireOutputId,
+    WireOverlayChannelId, WireStingerSlotId, WireStreamTargetId,
 };
 use fm_switcher::{
     MissingMediaFallback, OverlayBorderPreset as SwitcherOverlayBorder, OverlayChannelId,
     OverlayChannelState, OverlayPositionPreset as SwitcherOverlayPosition,
     OverlayTransitionKind as SwitcherOverlayTransition, StingerAudioPolicy, StingerDescriptor,
-    StingerPreloadState, StingerSlotId,
+    StingerPreloadState, StingerSlotId, StreamTargetId,
 };
 
 /// Target-free authorization called before an engine command is constructed or validated.
@@ -1109,7 +1110,11 @@ const fn command_class(payload: &CommandPayload) -> CommandClass {
         | CommandPayload::StartManualTransition { .. }
         | CommandPayload::SetManualTransitionPosition { .. }
         | CommandPayload::CommitManualTransition
-        | CommandPayload::CancelManualTransition => CommandClass::Transition,
+        | CommandPayload::CancelManualTransition
+        | CommandPayload::StreamStart { .. }
+        | CommandPayload::StreamStop { .. }
+        | CommandPayload::RecordStart
+        | CommandPayload::RecordStop => CommandClass::Transition,
     }
 }
 
@@ -1191,7 +1196,19 @@ fn engine_command(payload: &CommandPayload) -> EngineCommand {
         }
         CommandPayload::CommitManualTransition => EngineCommand::CommitManualTransition,
         CommandPayload::CancelManualTransition => EngineCommand::CancelManualTransition,
+        CommandPayload::StreamStart { target } => EngineCommand::StreamStart {
+            target: domain_stream_target(*target),
+        },
+        CommandPayload::StreamStop { target } => EngineCommand::StreamStop {
+            target: domain_stream_target(*target),
+        },
+        CommandPayload::RecordStart => EngineCommand::RecordStart,
+        CommandPayload::RecordStop => EngineCommand::RecordStop,
     }
+}
+
+fn domain_stream_target(target: WireStreamTargetId) -> StreamTargetId {
+    StreamTargetId::from_non_zero(target.get())
 }
 
 fn stinger_engine_command(payload: &CommandPayload) -> EngineCommand {
@@ -1365,73 +1382,12 @@ fn engine_submission(
 ) -> CommandSubmission {
     let result = command_result(&outcome.receipt);
     let events = if !outcome.replayed && outcome.receipt.accepted().is_some() {
-        let payload = if let Some((input, name)) = outcome.events.iter().find_map(|event| {
-            let EngineEvent::InputRenamed { input, name } = &event.payload else {
-                return None;
-            };
-            Some((*input, name))
-        }) {
-            EventPayload::InputRenamed {
-                input: WireInputId::from_domain(input),
-                name: name.clone(),
-            }
-        } else {
-            let input_order_changed = outcome.events.iter().find_map(|event| {
-                let EngineEvent::InputOrderChanged { inputs } = &event.payload else {
-                    return None;
-                };
-                Some(EventPayload::InputOrderChanged {
-                    inputs: inputs
-                        .iter()
-                        .copied()
-                        .map(WireInputId::from_domain)
-                        .collect(),
-                })
-            });
-            let stinger_slots_changed = outcome.events.iter().any(|event| {
-                matches!(
-                    &event.payload,
-                    EngineEvent::DesiredSwitcherChanged(
-                        EngineCommand::ConfigureStinger { .. }
-                            | EngineCommand::RemoveStinger { .. }
-                    )
-                )
-            });
-            let program = WireInputId::from_domain(engine.show().desired_switcher().program());
-            let preview = WireInputId::from_domain(engine.show().desired_switcher().preview());
-            let manual_transition = protocol_manual_status(engine.desired_manual_transition());
-            let fade_to_black = protocol_fade_to_black_state(engine.desired_fade_to_black());
-            let overlays = protocol_overlays(engine.show().desired_switcher().overlays());
-            let input_audio_strips = protocol_input_audio_strips(engine);
-            if stinger_slots_changed {
-                EventPayload::StingerSlotsChanged {
-                    program,
-                    preview,
-                    manual_transition,
-                    fade_to_black,
-                    stingers: protocol_desired_stingers(engine),
-                    overlays,
-                    input_audio_strips,
-                }
-            } else if let Some(payload) = input_order_changed {
-                payload
-            } else {
-                EventPayload::DesiredSwitcher {
-                    program,
-                    preview,
-                    manual_transition,
-                    fade_to_black,
-                    overlays,
-                    input_audio_strips,
-                }
-            }
-        };
         vec![EventMessage {
             cursor: EventCursor {
                 engine: identity.clone(),
                 revision: engine.revision().get(),
             },
-            payload,
+            payload: accepted_event_payload(engine, outcome),
         }]
     } else {
         Vec::new()
@@ -1450,6 +1406,87 @@ fn engine_submission(
         replayed: outcome.replayed,
         accepted,
         subscriber_failures: Vec::new(),
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn accepted_event_payload(engine: &Engine, outcome: &EngineCommandOutcome) -> EventPayload {
+    let streams_changed = outcome
+        .events
+        .iter()
+        .any(|event| matches!(&event.payload, EngineEvent::StreamsChanged { .. }));
+    let recording_changed = outcome
+        .events
+        .iter()
+        .any(|event| matches!(&event.payload, EngineEvent::RecordingChanged { .. }));
+    if streams_changed {
+        return EventPayload::StreamsChanged {
+            streams: protocol_streams(engine),
+        };
+    }
+    if recording_changed {
+        return EventPayload::RecordingChanged {
+            active: engine.show().desired_switcher().recording_desired(),
+        };
+    }
+    if let Some((input, name)) = outcome.events.iter().find_map(|event| {
+        let EngineEvent::InputRenamed { input, name } = &event.payload else {
+            return None;
+        };
+        Some((*input, name))
+    }) {
+        return EventPayload::InputRenamed {
+            input: WireInputId::from_domain(input),
+            name: name.clone(),
+        };
+    }
+    let input_order_changed = outcome.events.iter().find_map(|event| {
+        let EngineEvent::InputOrderChanged { inputs } = &event.payload else {
+            return None;
+        };
+        Some(EventPayload::InputOrderChanged {
+            inputs: inputs
+                .iter()
+                .copied()
+                .map(WireInputId::from_domain)
+                .collect(),
+        })
+    });
+    let stinger_slots_changed = outcome.events.iter().any(|event| {
+        matches!(
+            &event.payload,
+            EngineEvent::DesiredSwitcherChanged(
+                EngineCommand::ConfigureStinger { .. } | EngineCommand::RemoveStinger { .. }
+            )
+        )
+    });
+    let program = WireInputId::from_domain(engine.show().desired_switcher().program());
+    let preview = WireInputId::from_domain(engine.show().desired_switcher().preview());
+    let manual_transition = protocol_manual_status(engine.desired_manual_transition());
+    let fade_to_black = protocol_fade_to_black_state(engine.desired_fade_to_black());
+    let overlays = protocol_overlays(engine.show().desired_switcher().overlays());
+    let input_audio_strips = protocol_input_audio_strips(engine);
+    if stinger_slots_changed {
+        EventPayload::StingerSlotsChanged {
+            program,
+            preview,
+            manual_transition,
+            fade_to_black,
+            stingers: protocol_desired_stingers(engine),
+            overlays,
+            input_audio_strips,
+        }
+    } else if let Some(payload) = input_order_changed {
+        payload
+    } else {
+        EventPayload::DesiredSwitcher {
+            program,
+            preview,
+            manual_transition,
+            fade_to_black,
+            overlays,
+            input_audio_strips,
+        }
     }
 }
 
@@ -1496,6 +1533,8 @@ fn snapshot_record(engine: &Engine, identity: &EngineIdentity) -> SnapshotRecord
         desired_fade_to_black: protocol_fade_to_black_state(engine.desired_fade_to_black()),
         realized_fade_to_black: protocol_fade_to_black_state(engine.realized_fade_to_black()),
         stingers: protocol_stingers(engine),
+        streams: protocol_streams(engine),
+        record_desired_active: engine.show().desired_switcher().recording_desired(),
         desired_overlays: protocol_overlays(engine.show().desired_switcher().overlays()),
         realized_overlays: protocol_overlays(engine.realized_switcher().overlays()),
     };
@@ -1637,6 +1676,23 @@ fn protocol_desired_stingers(engine: &Engine) -> Vec<StingerStatus> {
                 descriptor,
                 desired.preload_state(),
             ))
+        })
+        .collect()
+}
+
+fn protocol_streams(engine: &Engine) -> Vec<StreamStatus> {
+    let desired = engine.show().desired_switcher();
+    desired
+        .streams()
+        .iter()
+        .map(|stream| StreamStatus {
+            target: WireStreamTargetId::new(stream.id().get()),
+            name: stream.name().to_owned(),
+            desired_running: desired
+                .stream_running(stream.id())
+                .expect("inventoried stream has a desired flag"),
+            realized: StreamRealizedState::Stopped,
+            detail: None,
         })
         .collect()
 }

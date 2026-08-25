@@ -34,7 +34,7 @@ into control messages.
    replacement, restore, log compaction, or engine identity change forces a
    snapshot and a new cursor.
 
-The current Protocol 2.15 implementation uses bounded newline-delimited raw TCP.
+The current Protocol 2.18 implementation uses bounded newline-delimited raw TCP.
 Studio keeps one expected heartbeat sequence and waits for its matching
 acknowledgement within the bounded peer wait. EOF, timeout, wrong server
 identity, or wrong sequence enters the existing reconnect backoff. The server
@@ -46,7 +46,13 @@ Snapshots carry bounded project-order input and output catalogs as exact ID/name
 The canonical persisted name labels input tiles and mixer strips; clients do not
 invent ordinal display names. The `input_renamed` and `input_order_changed`
 events carry durable exact-current name and order edits. Add/remove catalog edits
-still require a fresh snapshot.
+still require a fresh snapshot. Protocol 2.16 additionally replicates one
+validated streaming-destination roster: every configured stream target with its
+canonical name, desired running flag, and last reported realized state.
+`stream_start` and `stream_stop` mutate exactly one target per command, are
+authorized as transition operations, and are acknowledged durably before any
+runtime realization; each acceptance emits one durable `streams_changed` event
+carrying the full bounded roster so clients resync from any cursor.
 
 ## 3. Command semantics
 
@@ -142,6 +148,24 @@ record and one latest replacement. Control records have priority unless a meter
 record has already started, in which case that newline-delimited record finishes
 first. The Master reading is after strip processing and mixer clipping but
 before clip-local Stinger audio and Fade-to-Black.
+
+Protocol 2.17 defines `stream_status` with the same lossy, non-resumable
+semantics: server identity, an independent strictly increasing sequence, and at
+most one sample set per frame interval carrying every active streaming target's
+realized state, connectivity, cumulative enqueue/drop counters, and a sanitized
+failure code in strict target order. Peers retain only the latest record;
+violations of identity or sequence disconnect the session exactly like meter
+violations. The record never advances or carries a durable revision, and native
+`freemixd` omits it entirely while no stream runtime is active.
+
+Protocol 2.18 adds field-free `record_start` and `record_stop` commands
+authorized as transition operations. The engine owns the desired recording
+flag, snapshots project `record_desired_active`, and each acceptance that
+changes the flag emits one durable `recording_changed` event; idempotent
+replays return the original receipt without a new event. Realization is
+daemon-side: a configured recorder reconciles at readiness against the
+persisted intent, live stops drain the current segment before its final
+report, and live starts open deterministically derived segment files.
 
 Each telemetry class has requested cadence, aggregation, and maximum bandwidth.
 Slow clients receive coalesced latest data, never unbounded queues.

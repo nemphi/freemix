@@ -340,10 +340,10 @@ impl StudioApp {
 
 impl eframe::App for StudioApp {
     fn logic(&mut self, _context: &egui::Context, _frame: &mut eframe::Frame) {
-        if let Some(updates) = &self.updates {
-            if let Some(state) = updates.try_recv() {
-                self.state = state;
-            }
+        if let Some(updates) = &self.updates
+            && let Some(state) = updates.try_recv()
+        {
+            self.state = state;
         }
         self.check_worker_health();
         self.drain_osc();
@@ -782,6 +782,7 @@ fn initialize_worker(
     Some((runtime, recovery))
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_worker(
     config: StudioConfig,
     requests: &Receiver<WorkerRequest>,
@@ -830,7 +831,8 @@ fn run_worker(
                 Ok(Some(
                     SessionEvent::Event { .. }
                     | SessionEvent::RuntimeEvent { .. }
-                    | SessionEvent::AudioMeters { .. },
+                    | SessionEvent::AudioMeters { .. }
+                    | SessionEvent::StreamStatus { .. },
                 )) => true,
                 Ok(Some(SessionEvent::Disconnected { cause, .. })) => {
                     recovery.visible_error = Some(format!("Disconnected while idle: {cause:?}"));
@@ -1194,8 +1196,9 @@ fn handle_heartbeat_timeout(
                     if matches!(
                         event,
                         SessionEvent::AudioMeters { .. }
-                            | SessionEvent::Event { .. }
                             | SessionEvent::RuntimeEvent { .. }
+                            | SessionEvent::Event { .. }
+                            | SessionEvent::StreamStatus { .. }
                     ) {
                         if !publish_recovery_runtime(runtime, publisher, recovery) {
                             return Err(WorkerFailure::Fatal("Studio UI disconnected".to_owned()));
@@ -1319,10 +1322,10 @@ fn resolve_input_move(
     })
 }
 
-fn desired_overlay<'view>(
-    view: Option<&'view ClientView>,
+fn desired_overlay(
+    view: Option<&ClientView>,
     channel: fm_protocol::WireOverlayChannelId,
-) -> Result<&'view fm_ui_model::OverlayStatus, String> {
+) -> Result<&fm_ui_model::OverlayStatus, String> {
     let view =
         view.ok_or_else(|| "Cannot edit overlay before project state is synchronized".to_owned())?;
     let overlay = view
@@ -1351,6 +1354,7 @@ fn desired_overlay_output_included(
     Ok(overlay.included_outputs.contains(&output))
 }
 
+#[allow(clippy::too_many_lines)]
 fn consume_command_sequence(
     runtime: &mut StudioRuntime,
     command_id: &str,
@@ -1374,7 +1378,7 @@ fn consume_command_sequence(
             &mut consumed,
         )? {
             SessionEvent::CommandResult { result, intake } => break (result, intake),
-            SessionEvent::Event { .. } | SessionEvent::RuntimeEvent { .. } => continue,
+            SessionEvent::Event { .. } | SessionEvent::RuntimeEvent { .. } => {}
             other => return Err(unexpected_failure("command result", &other)),
         }
     };
@@ -1422,16 +1426,14 @@ fn consume_command_sequence(
             SessionEvent::Event { event, .. } if event.cursor.revision == accepted_revision => {
                 break;
             }
-            SessionEvent::Event { event, .. } if event.cursor.revision < accepted_revision => {
-                continue;
-            }
+            SessionEvent::Event { event, .. } if event.cursor.revision < accepted_revision => {}
             SessionEvent::Event { event, .. } => {
                 return Err(WorkerFailure::Fatal(format!(
                     "Unexpected durable event revision {}; expected {accepted_revision}",
                     event.cursor.revision
                 )));
             }
-            SessionEvent::RuntimeEvent { .. } => continue,
+            SessionEvent::RuntimeEvent { .. } => {}
             other => return Err(unexpected_failure("durable event", &other)),
         }
     }
@@ -1450,16 +1452,14 @@ fn consume_command_sequence(
             SessionEvent::RuntimeEvent { event, .. } if event.revision == accepted_revision => {
                 break;
             }
-            SessionEvent::RuntimeEvent { event, .. } if event.revision < accepted_revision => {
-                continue;
-            }
+            SessionEvent::RuntimeEvent { event, .. } if event.revision < accepted_revision => {}
             SessionEvent::RuntimeEvent { event, .. } => {
                 return Err(WorkerFailure::Fatal(format!(
                     "Unexpected runtime event revision {}; expected {accepted_revision}",
                     event.revision
                 )));
             }
-            SessionEvent::Event { .. } => continue,
+            SessionEvent::Event { .. } => {}
             other => return Err(unexpected_failure("runtime event", &other)),
         }
     }
@@ -1543,7 +1543,10 @@ fn receive_command_event(
             return Err(WorkerFailure::Shutdown);
         }
         let event = result.map_err(|error| worker_error("Command response failed", &error))?;
-        if matches!(event, SessionEvent::AudioMeters { .. }) {
+        if matches!(
+            event,
+            SessionEvent::AudioMeters { .. } | SessionEvent::StreamStatus { .. }
+        ) {
             publication.update(runtime, *deferred_rejections)?;
             continue;
         }
@@ -1665,6 +1668,7 @@ fn result_id(result: &CommandResult) -> &str {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn intent_payload(
     intent: StudioIntent,
     view: Option<&ClientView>,
@@ -1830,10 +1834,15 @@ fn runtime_state(runtime: &mut StudioRuntime, error: Option<String>) -> StudioUi
         .with_audio_permission(can_control_audio)
         .with_edit_project_permission(can_edit_project);
     if connection_status == StudioConnectionStatus::Ready {
-        state.view = client.model().view();
-        if state.view.is_some() {
+        let view = client.model().view();
+        state.streams = view
+            .as_ref()
+            .map_or_else(Vec::new, |render| render.streams.clone());
+        if view.is_some() {
             state.audio_meters = runtime.session().latest_audio_meters().cloned();
+            state.stream_status = runtime.session().latest_stream_status().cloned();
         }
+        state.view = view;
     }
     state.pending_commands = client.model().pending_commands().len();
     state.error = error.or(lifecycle_error);
@@ -1921,11 +1930,13 @@ mod tests {
     use std::{fs, path::PathBuf, process::Command};
 
     use fm_protocol::{
-        CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, EngineIdentity, FadeToBlackPosition,
-        FadeToBlackState, HandshakeOutcome, HandshakeResponse, HeartbeatAcknowledgementMessage,
-        InputAudioStripStatus, InputStatus, ManualTransitionPosition, ManualTransitionStatus,
-        OutputStatus, OverlayBorderPreset, OverlayPositionPreset, OverlayStatus, Role,
-        ServerIdentity, SnapshotMessage, SnapshotReason, WireMessage, WireOutputId, decode_line,
+        CURRENT_PROTOCOL_VERSION, CapabilityReportSummary, EngineIdentity, EventCursor,
+        EventMessage, EventPayload, FadeToBlackPosition, FadeToBlackState, HandshakeOutcome,
+        HandshakeResponse, HeartbeatAcknowledgementMessage, InputAudioStripStatus, InputStatus,
+        ManualTransitionPosition, ManualTransitionStatus, OutputStatus, OverlayBorderPreset,
+        OverlayPositionPreset, OverlayStatus, Role, RuntimeEventMessage, RuntimeLifecycleEvent,
+        ServerIdentity, SnapshotMessage, SnapshotReason, StreamRealizedState, StreamStatusMessage,
+        StreamStatusSample, WireMessage, WireOutputId, WireStreamTargetId, decode_line,
         encode_line,
     };
     use fm_types::ProjectId;
@@ -2005,6 +2016,31 @@ mod tests {
                 ));
             }
         }
+
+        /// Answers every heartbeat with one stream-status record ahead of its
+        /// acknowledgement, so the worker's acknowledgement wait must swallow
+        /// the lossy record before matching the pending heartbeat.
+        fn acknowledge_heartbeats_with_stream_status_until_eof(&mut self) {
+            let mut sequence = 0;
+            loop {
+                let mut line = String::new();
+                if self.reader.read_line(&mut line).unwrap() == 0 {
+                    return;
+                }
+                let WireMessage::Heartbeat(heartbeat) = decode_line(&line).unwrap() else {
+                    panic!("expected heartbeat");
+                };
+                sequence += 1;
+                self.send(&WireMessage::StreamStatus(stream_status_message(sequence)));
+                self.send(&WireMessage::HeartbeatAcknowledgement(
+                    HeartbeatAcknowledgementMessage {
+                        server: heartbeat.server,
+                        heartbeat_sequence: heartbeat.sequence,
+                        received_at_ms: heartbeat.sent_at_ms,
+                    },
+                ));
+            }
+        }
     }
 
     fn heartbeat_handshake(outcome: HandshakeOutcome) -> HandshakeResponse {
@@ -2069,11 +2105,89 @@ mod tests {
                 position: FadeToBlackPosition::LIVE,
             },
             stingers: Vec::new(),
+            streams: vec![fm_protocol::StreamStatus {
+                target: WireStreamTargetId::new(NonZeroU128::new(40).unwrap()),
+                name: "rtmp-primary".into(),
+                desired_running: true,
+                realized: StreamRealizedState::Starting,
+                detail: None,
+            }],
+            record_desired_active: false,
             desired_overlays: OverlayStatus::empty_channels(),
             realized_overlays: OverlayStatus::empty_channels(),
         }
     }
 
+    fn stream_status_message(sequence: u64) -> StreamStatusMessage {
+        StreamStatusMessage {
+            server: ServerIdentity {
+                engine_id: "e".into(),
+                project_id: "1".into(),
+                state_epoch: 1,
+                log_id: "l".into(),
+            },
+            sequence,
+            samples: vec![StreamStatusSample {
+                target: WireStreamTargetId::new(NonZeroU128::new(40).unwrap()),
+                realized: StreamRealizedState::Live,
+                connected: true,
+                muxed_bytes: 2048,
+                enqueued_pairs: 12,
+                dropped_pairs: 3,
+                failure: None,
+            }],
+        }
+    }
+
+    fn command_event(revision: u64) -> EventMessage {
+        let snapshot = heartbeat_snapshot();
+        let input = snapshot.inputs[0].input;
+        EventMessage {
+            cursor: EventCursor {
+                engine: EngineIdentity {
+                    engine_id: "e".into(),
+                    state_epoch: 1,
+                    log_id: "l".into(),
+                },
+                revision,
+            },
+            payload: EventPayload::DesiredSwitcher {
+                program: input,
+                preview: input,
+                manual_transition: ManualTransitionStatus::Inactive,
+                fade_to_black: FadeToBlackState {
+                    target_active: false,
+                    position: FadeToBlackPosition::LIVE,
+                },
+                overlays: OverlayStatus::empty_channels(),
+                input_audio_strips: snapshot.input_audio_strips,
+            },
+        }
+    }
+
+    fn command_runtime_event(revision: u64) -> RuntimeEventMessage {
+        RuntimeEventMessage {
+            server: ServerIdentity {
+                engine_id: "e".into(),
+                project_id: "1".into(),
+                state_epoch: 1,
+                log_id: "l".into(),
+            },
+            revision,
+            generation: 1,
+            sequence: 1,
+            event: RuntimeLifecycleEvent::Realized {
+                domain: "switcher".to_owned(),
+                manual_transition: ManualTransitionStatus::Inactive,
+                fade_to_black: FadeToBlackState {
+                    target_active: false,
+                    position: FadeToBlackPosition::LIVE,
+                },
+            },
+        }
+    }
+
+    #[allow(clippy::needless_pass_by_value)] // ownership moves into the spawned server thread
     fn serve_worker_recovery(listener: TcpListener) {
         let mut first = HeartbeatPeer::accept(&listener);
         first.handshake_request();
@@ -2186,6 +2300,32 @@ mod tests {
         }
     }
 
+    /// Mirrors [`receive_meter_state`] for the lossy stream-status roster:
+    /// returns the first publication that hydrated a latest status sample.
+    fn receive_stream_status_state(updates: &StateUpdates) -> StudioUiState {
+        loop {
+            updates
+                .receiver
+                .recv_timeout(HEARTBEAT_TEST_TIMEOUT)
+                .unwrap();
+            let state = updates
+                .latest
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+                .unwrap();
+            if state.stream_status.is_some() {
+                assert_eq!(state.connection_status, StudioConnectionStatus::Ready);
+                assert!(
+                    state.error.is_none(),
+                    "stream status publication carried an error: {:?}",
+                    state.error
+                );
+                return state;
+            }
+        }
+    }
+
     #[test]
     fn state_mailbox_keeps_latest_state_when_notification_is_full() {
         let (publisher, updates) = state_mailbox(egui::Context::default());
@@ -2277,7 +2417,7 @@ mod tests {
             &publisher,
             &recovery
         ));
-        let _ = updates
+        updates
             .receiver
             .recv_timeout(HEARTBEAT_TEST_TIMEOUT)
             .unwrap();
@@ -2326,6 +2466,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)] // values bounded by REQUEST_CAPACITY
     fn pending_intents_coalesce_adjacent_audio_updates_without_crossing_boundaries() {
         let input = WireInputId::new(NonZeroU128::new(2).unwrap()).to_domain();
         let other_input = WireInputId::new(NonZeroU128::new(3).unwrap()).to_domain();
@@ -2463,6 +2604,203 @@ mod tests {
                 .count(),
             2
         );
+
+        request_sender.send(WorkerRequest::Shutdown).unwrap();
+        worker.join().unwrap();
+        server.join().unwrap();
+    }
+
+    /// Spawns the real worker loop against a scripted TCP peer.
+    fn spawn_existing_worker(
+        address: std::net::SocketAddr,
+        client_id: &'static str,
+    ) -> (
+        std::sync::mpsc::SyncSender<WorkerRequest>,
+        StateUpdates,
+        thread::JoinHandle<()>,
+    ) {
+        let (request_sender, request_receiver) = sync_channel(REQUEST_CAPACITY);
+        let (publisher, updates) = state_mailbox(egui::Context::default());
+        let worker = thread::spawn(move || {
+            run_worker(
+                StudioConfig {
+                    connection: ConnectionConfig::Existing(ExistingConfig {
+                        address,
+                        expected_project_id: ProjectId::new(NonZeroU128::new(1).unwrap()),
+                    }),
+                    client_id: client_id.to_owned(),
+                    desired_role: Role::Operator,
+                    restart_policy: RestartPolicy {
+                        maximum_restarts: 0,
+                    },
+                    osc_listen: None,
+                    transport: crate::ControlTransport::Tcp,
+                },
+                &request_receiver,
+                &publisher,
+            );
+        });
+        (request_sender, updates, worker)
+    }
+
+    #[test]
+    fn idle_worker_swallows_stream_status_records_like_meters() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut peer = HeartbeatPeer::accept(&listener);
+            peer.handshake_request();
+            peer.send(&WireMessage::HandshakeResponse(heartbeat_handshake(
+                HandshakeOutcome::Snapshot {
+                    reason: SnapshotReason::NoCursor,
+                },
+            )));
+            peer.send(&WireMessage::Snapshot(heartbeat_snapshot()));
+            // Unsolicited lossy record while idle; it must never surface as an
+            // "Unexpected idle response" failure.
+            peer.send(&WireMessage::StreamStatus(stream_status_message(1)));
+            peer.acknowledge_heartbeats_until_eof();
+        });
+        let (request_sender, updates, worker) =
+            spawn_existing_worker(address, "stream-status-idle-test");
+
+        receive_connection_state(&updates, StudioConnectionStatus::Ready);
+        let state = receive_stream_status_state(&updates);
+        assert_eq!(state.streams.len(), 1);
+        assert_eq!(state.streams[0].name, "rtmp-primary");
+        assert!(state.streams[0].desired_running);
+        assert_eq!(
+            state.stream_status.as_ref().unwrap().samples[0].muxed_bytes,
+            2048
+        );
+
+        request_sender.send(WorkerRequest::Shutdown).unwrap();
+        worker.join().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn heartbeat_ack_wait_swallows_stream_status_records() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut peer = HeartbeatPeer::accept(&listener);
+            peer.handshake_request();
+            peer.send(&WireMessage::HandshakeResponse(heartbeat_handshake(
+                HandshakeOutcome::Snapshot {
+                    reason: SnapshotReason::NoCursor,
+                },
+            )));
+            peer.send(&WireMessage::Snapshot(heartbeat_snapshot()));
+            peer.acknowledge_heartbeats_with_stream_status_until_eof();
+        });
+        let (request_sender, updates, worker) =
+            spawn_existing_worker(address, "stream-status-heartbeat-test");
+
+        receive_connection_state(&updates, StudioConnectionStatus::Ready);
+        // The record sits between each heartbeat and its acknowledgement, so a
+        // failed swallow would abort the wait with an unexpected-event error.
+        for _ in 0..4 {
+            let state = receive_stream_status_state(&updates);
+            assert_eq!(
+                state.streams.len(),
+                1,
+                "snapshot roster must hydrate beside meters"
+            );
+        }
+
+        request_sender.send(WorkerRequest::Shutdown).unwrap();
+        worker.join().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn command_wait_swallows_stream_status_without_returning_it_as_a_result() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut peer = HeartbeatPeer::accept(&listener);
+            peer.handshake_request();
+            peer.send(&WireMessage::HandshakeResponse(heartbeat_handshake(
+                HandshakeOutcome::Snapshot {
+                    reason: SnapshotReason::NoCursor,
+                },
+            )));
+            peer.send(&WireMessage::Snapshot(heartbeat_snapshot()));
+            let mut command_seen = false;
+            loop {
+                let mut line = String::new();
+                if peer.reader.read_line(&mut line).unwrap() == 0 {
+                    return;
+                }
+                match decode_line(&line).unwrap() {
+                    WireMessage::Heartbeat(heartbeat) => {
+                        peer.send(&WireMessage::HeartbeatAcknowledgement(
+                            HeartbeatAcknowledgementMessage {
+                                server: heartbeat.server,
+                                heartbeat_sequence: heartbeat.sequence,
+                                received_at_ms: heartbeat.sent_at_ms,
+                            },
+                        ));
+                    }
+                    WireMessage::Command(command) => {
+                        assert!(!command_seen, "worker retried the command unexpectedly");
+                        command_seen = true;
+                        let accepted_revision = heartbeat_snapshot().revision + 1;
+                        // The lossy record arrives mid-command-wait and must be
+                        // consumed as status, not mistaken for the result.
+                        peer.send(&WireMessage::StreamStatus(stream_status_message(1)));
+                        peer.send(&WireMessage::CommandResult(CommandResult::Accepted {
+                            id: command.id,
+                            revision: accepted_revision,
+                            scheduled_frame: None,
+                        }));
+                        peer.send(&WireMessage::Event(command_event(accepted_revision)));
+                        peer.send(&WireMessage::RuntimeEvent(command_runtime_event(
+                            accepted_revision,
+                        )));
+                    }
+                    other => panic!("unexpected peer message: {other:?}"),
+                }
+            }
+        });
+        let (request_sender, updates, worker) =
+            spawn_existing_worker(address, "stream-status-command-test");
+
+        receive_connection_state(&updates, StudioConnectionStatus::Ready);
+        request_sender
+            .send(WorkerRequest::Intent(StudioIntent::Cut))
+            .unwrap();
+        let deadline = Instant::now() + HEARTBEAT_TEST_TIMEOUT;
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "command sequence did not complete"
+            );
+            updates
+                .receiver
+                .recv_timeout(HEARTBEAT_TEST_TIMEOUT)
+                .unwrap();
+            let state = updates
+                .latest
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+                .unwrap();
+            assert_eq!(state.connection_status, StudioConnectionStatus::Ready);
+            assert!(
+                state.error.is_none(),
+                "command publication carried an error: {:?}",
+                state.error
+            );
+            if state.pending_commands == 0
+                && let Some(status) = &state.stream_status
+            {
+                assert_eq!(state.streams.len(), 1);
+                assert_eq!(status.samples[0].muxed_bytes, 2048);
+                break;
+            }
+        }
 
         request_sender.send(WorkerRequest::Shutdown).unwrap();
         worker.join().unwrap();
@@ -2607,6 +2945,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn osc_ingress_obeys_limits_gates_and_worker_order() {
         let address = UdpSocket::bind("127.0.0.1:0")
             .unwrap()
@@ -2916,6 +3255,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn queued_overlay_actions_resolve_from_the_latest_confirmed_channel() {
         let project = ProjectId::new(NonZeroU128::new(7).unwrap());
         let output = WireOutputId::new(NonZeroU128::new(9).unwrap());

@@ -159,6 +159,63 @@ impl TransportSink for FakeSink {
     }
 }
 
+fn protocol_config(
+    id: u8,
+    protocol: OutputProtocol,
+    tls: Option<TlsConfig>,
+    credential: Option<CredentialReference>,
+) -> Result<DestinationConfig, ConfigError> {
+    DestinationConfig::new(
+        destination_id(id),
+        protocol,
+        Endpoint::new("stream.example.test", 9_710, "/live").unwrap(),
+        None,
+        tls,
+        credential,
+        QueueCapacity::new(4).unwrap(),
+        ReconnectPolicy::new(100, 800, 2, Some(4)).unwrap(),
+    )
+}
+
+/// SRT follows the plain-RTMP TLS and credential matrices exactly: TLS
+/// configuration is refused outright, a bare configuration is accepted, and an
+/// optional credential reference is accepted like any other protocol's.
+#[test]
+fn srt_config_rejects_tls_and_mirrors_the_rtmp_matrices() {
+    let tls = Some(TlsConfig::system_roots(Some("stream.example.test".to_owned())).unwrap());
+    for protocol in [OutputProtocol::Rtmp, OutputProtocol::Srt] {
+        assert_eq!(
+            protocol_config(1, protocol, tls.clone(), None)
+                .expect_err("plain protocols must refuse TLS"),
+            ConfigError::TlsNotSupported,
+            "{protocol:?}"
+        );
+        assert!(
+            protocol_config(1, protocol, None, None).is_ok(),
+            "{protocol:?}"
+        );
+        assert!(
+            protocol_config(
+                1,
+                protocol,
+                None,
+                Some(CredentialReference::new("secret://stream-key").unwrap()),
+            )
+            .is_ok(),
+            "{protocol:?} accepts a resolved credential reference"
+        );
+    }
+    // RTMPS keeps its opposite rule: it requires the TLS configuration.
+    assert_eq!(
+        protocol_config(1, OutputProtocol::Rtmps, None, None).err(),
+        Some(ConfigError::TlsRequired)
+    );
+    assert!(
+        protocol_config(1, OutputProtocol::Rtmps, tls, None).is_ok(),
+        "RTMPS with TLS stays valid"
+    );
+}
+
 #[test]
 fn five_outputs_share_one_exact_rendition_and_payload() {
     let shared_profile = profile(1_920, 1_080, 6_000_000);

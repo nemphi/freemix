@@ -8,16 +8,16 @@ use fm_command::{
 use fm_engine::{
     Engine, EngineCommand, EngineError, EngineEvent, EngineInputAudioStripState,
     EngineManualTransitionKind, EngineManualTransitionPosition, EnginePrepareOutcome,
-    EngineRestoreState, EngineSnapshot, MAX_INPUT_AUDIO_BALANCE_BASIS_POINTS,
+    EngineRestoreState, EngineSnapshot, EngineStreamStatus, MAX_INPUT_AUDIO_BALANCE_BASIS_POINTS,
     MAX_INPUT_AUDIO_DELAY_SAMPLES, MAX_INPUT_AUDIO_GAIN_MILLIDB, ShowError, ShowState,
     SnapshotError,
 };
 use fm_scheduler::FrameNumber;
 use fm_switcher::{
-    FadeToBlackPosition, FadeToBlackTarget, MissingMediaFallback, OverlayBorderPreset,
-    OverlayChannelId, OverlayPositionPreset, OverlayTransitionKind, StingerAudioPolicy,
-    StingerDescriptor, StingerSlotId, SwitcherEvent, SwitcherState, TBarPosition, TBarState,
-    TransitionKind,
+    FadeToBlackPosition, FadeToBlackTarget, MAX_STREAM_COUNT, MissingMediaFallback,
+    OverlayBorderPreset, OverlayChannelId, OverlayPositionPreset, OverlayTransitionKind,
+    StingerAudioPolicy, StingerDescriptor, StingerSlotId, StreamTargetId, SwitcherError,
+    SwitcherEvent, SwitcherState, TBarPosition, TBarState, TransitionKind,
 };
 use fm_types::{
     FrameRate, InputId, InputOrderError, MAX_INPUT_NAME_BYTES, OutputId, validate_input_order,
@@ -273,6 +273,7 @@ fn rename_input_is_bounded_unique_and_replay_safe() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn reorder_inputs_preserves_id_references_and_rejects_invalid_orders_atomically() {
     let mut engine = engine();
     let current = [input(1), input(2), input(3)];
@@ -2251,5 +2252,356 @@ fn persisted_restore_directly_restores_a_very_large_valid_cursor() {
     assert_eq!(
         next.deadline,
         ClockTime::from_nanos(CURSOR * FRAME_DURATION_NS)
+    );
+}
+
+fn target(value: u128) -> StreamTargetId {
+    StreamTargetId::new(value).unwrap()
+}
+
+fn streamed_engine() -> Engine {
+    Engine::new(
+        ShowState::new(
+            "stream show",
+            named_inputs([input(1), input(2), input(3)]),
+            input(1),
+            input(2),
+        )
+        .unwrap()
+        .with_streams([
+            (target(5), "Twitch".to_owned()),
+            (target(9), "YouTube".to_owned()),
+        ])
+        .unwrap(),
+        FrameRate::new(25, 1).unwrap(),
+        domain(),
+    )
+}
+
+fn expected_streams(running: [(u128, bool); 2]) -> Vec<EngineStreamStatus> {
+    let flags = |value: u128| running.iter().copied().find(|(id, _)| *id == value);
+    [(target(5), "Twitch"), (target(9), "YouTube")]
+        .into_iter()
+        .map(|(target_id, name)| EngineStreamStatus {
+            target: target_id,
+            name: name.to_owned(),
+            desired_running: flags(target_id.get().get()).is_some_and(|(_, running)| running),
+        })
+        .collect()
+}
+
+#[test]
+fn show_stream_inventory_rejects_overflow_duplicates_and_invalid_names() {
+    let base = ShowState::new(
+        "streams",
+        named_inputs([input(1), input(2)]),
+        input(1),
+        input(2),
+    )
+    .unwrap();
+    let maximum = u128::try_from(MAX_STREAM_COUNT).unwrap();
+    let full: Vec<_> = (1..=maximum)
+        .map(|index| (target(index + 10), format!("S{index}")))
+        .collect();
+    assert_eq!(
+        base.clone().with_streams(full).unwrap().streams().len(),
+        MAX_STREAM_COUNT
+    );
+    let overflow: Vec<_> = (0..=maximum)
+        .map(|index| (target(index + 10), format!("S{index}")))
+        .collect();
+    assert_eq!(
+        base.clone().with_streams(overflow).unwrap_err(),
+        ShowError::Switcher(SwitcherError::TooManyStreams {
+            requested: usize::try_from(maximum + 1).unwrap(),
+            maximum: MAX_STREAM_COUNT,
+        })
+    );
+    assert_eq!(
+        base.clone()
+            .with_streams([(target(5), "A".into()), (target(5), "B".into())])
+            .unwrap_err(),
+        ShowError::Switcher(SwitcherError::DuplicateStreamTarget(target(5)))
+    );
+    assert_eq!(
+        base.with_streams([(target(5), String::new())]).unwrap_err(),
+        ShowError::Switcher(SwitcherError::InvalidStreamName)
+    );
+}
+
+#[test]
+fn stream_start_and_stop_apply_desired_state_and_emit_the_full_status_list() {
+    let mut engine = streamed_engine();
+    let started = engine
+        .execute(
+            envelope(
+                "stream-on",
+                EngineCommand::StreamStart { target: target(9) },
+            ),
+            0,
+        )
+        .unwrap();
+    assert!(started.receipt.accepted().is_some());
+    assert_eq!(
+        started.events[0].payload,
+        EngineEvent::StreamsChanged {
+            streams: expected_streams([(5, false), (9, true)]),
+        }
+    );
+    assert_eq!(engine.show().stream_running(target(9)), Some(true));
+    assert_eq!(engine.show().stream_running(target(5)), Some(false));
+
+    engine.tick().unwrap();
+    assert_eq!(
+        engine.realized_switcher().stream_running(target(9)),
+        Some(true)
+    );
+
+    let stopped = engine
+        .execute(
+            envelope(
+                "stream-off",
+                EngineCommand::StreamStop { target: target(9) },
+            ),
+            0,
+        )
+        .unwrap();
+    assert_eq!(
+        stopped.events[0].payload,
+        EngineEvent::StreamsChanged {
+            streams: expected_streams([(5, false), (9, false)]),
+        }
+    );
+    assert_eq!(engine.show().stream_running(target(9)), Some(false));
+    engine.tick().unwrap();
+    assert_eq!(
+        engine.realized_switcher().stream_running(target(9)),
+        Some(false)
+    );
+}
+
+#[test]
+fn stream_commands_replay_receipts_and_reject_unknown_targets_atomically() {
+    let mut engine = streamed_engine();
+    let command = envelope(
+        "stream-key",
+        EngineCommand::StreamStart { target: target(5) },
+    );
+    let first = engine.execute(command.clone(), 0).unwrap();
+    assert_eq!(engine.revision(), Revision::new(1));
+
+    let replay = engine.execute(command, 0).unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.receipt, first.receipt);
+    assert!(replay.events.is_empty());
+    assert_eq!(engine.revision(), Revision::new(1));
+    assert_eq!(engine.event_sequence(), EventSequence::new(1));
+
+    let rejected = engine
+        .execute(
+            envelope("unknown", EngineCommand::StreamStart { target: target(42) }),
+            0,
+        )
+        .unwrap();
+    assert_eq!(
+        rejected.receipt.rejected().unwrap().rejection.code,
+        RejectionCode::NotFound
+    );
+    assert_eq!(
+        rejected.receipt.rejected().unwrap().rejection.message,
+        format!("stream target {} is not part of this mix", target(42))
+    );
+    assert_eq!(engine.revision(), Revision::new(1));
+    assert_eq!(engine.show().stream_running(target(5)), Some(true));
+}
+
+#[test]
+fn stream_commands_are_instant_and_skip_transition_conflict_gating() {
+    let mut engine = streamed_engine();
+    engine
+        .execute(
+            envelope("fade", EngineCommand::Fade { duration_frames: 4 }),
+            0,
+        )
+        .unwrap();
+    let accepted = engine
+        .execute(
+            envelope("stream", EngineCommand::StreamStart { target: target(5) }),
+            0,
+        )
+        .unwrap();
+    assert!(accepted.receipt.accepted().is_some());
+    assert_eq!(
+        accepted.events[0].payload,
+        EngineEvent::StreamsChanged {
+            streams: expected_streams([(5, true), (9, false)]),
+        }
+    );
+    assert_eq!(engine.snapshot(), Err(SnapshotError::WorkInFlight));
+}
+
+#[test]
+fn snapshot_and_restore_preserve_desired_stream_running_state_exactly() {
+    let mut engine = streamed_engine();
+    engine
+        .execute(
+            envelope(
+                "stream-on",
+                EngineCommand::StreamStart { target: target(9) },
+            ),
+            0,
+        )
+        .unwrap();
+    engine.tick().unwrap();
+
+    let snapshot = engine.snapshot().unwrap();
+    assert_eq!(snapshot.show().stream_running(target(9)), Some(true));
+    let mut restored = Engine::restore(snapshot.clone()).unwrap();
+    assert_eq!(restored.show().stream_running(target(9)), Some(true));
+    assert_eq!(
+        restored.realized_switcher().running_stream_targets(),
+        restored.show().desired_switcher().running_stream_targets()
+    );
+    let replay = restored.execute(
+        envelope(
+            "stream-on",
+            EngineCommand::StreamStart { target: target(9) },
+        ),
+        0,
+    );
+    assert!(replay.unwrap().replayed);
+    let next = restored
+        .execute(
+            envelope(
+                "stream-off",
+                EngineCommand::StreamStop { target: target(9) },
+            ),
+            0,
+        )
+        .unwrap();
+    assert_eq!(
+        next.receipt.accepted().unwrap().result.target_frame,
+        FrameNumber::new(1)
+    );
+}
+
+#[test]
+fn record_start_and_stop_emit_changed_events_only_on_transitions() {
+    let mut engine = streamed_engine();
+    let started = engine
+        .execute(envelope("rec-on", EngineCommand::RecordStart), 0)
+        .unwrap();
+    assert!(started.receipt.accepted().is_some());
+    assert_eq!(
+        started.events[0].payload,
+        EngineEvent::RecordingChanged { active: true }
+    );
+    assert!(engine.show().desired_switcher().recording_desired());
+    engine.tick().unwrap();
+    assert!(engine.realized_switcher().recording_desired());
+
+    let repeated = engine
+        .execute(envelope("rec-on-again", EngineCommand::RecordStart), 0)
+        .unwrap();
+    assert!(repeated.receipt.accepted().is_some());
+    assert!(repeated.events.is_empty());
+    assert_eq!(engine.event_sequence(), EventSequence::new(1));
+
+    let stopped = engine
+        .execute(envelope("rec-off", EngineCommand::RecordStop), 0)
+        .unwrap();
+    assert_eq!(
+        stopped.events[0].payload,
+        EngineEvent::RecordingChanged { active: false }
+    );
+    assert!(!engine.show().desired_switcher().recording_desired());
+}
+
+#[test]
+fn record_commands_are_instant_and_replay_receipts_atomically() {
+    let mut engine = streamed_engine();
+    engine
+        .execute(
+            envelope("fade", EngineCommand::Fade { duration_frames: 4 }),
+            0,
+        )
+        .unwrap();
+    let accepted = engine
+        .execute(envelope("rec", EngineCommand::RecordStart), 0)
+        .unwrap();
+    assert!(accepted.receipt.accepted().is_some());
+    assert_eq!(engine.snapshot(), Err(SnapshotError::WorkInFlight));
+    while engine.snapshot().is_err() {
+        engine.tick().unwrap();
+    }
+
+    let replay = engine
+        .execute(envelope("rec", EngineCommand::RecordStart), 0)
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.receipt, accepted.receipt);
+    assert!(replay.events.is_empty());
+    assert_eq!(engine.revision(), Revision::new(2));
+}
+
+#[test]
+fn snapshot_and_restore_preserve_recording_desired_exactly() {
+    let mut engine = streamed_engine();
+    engine
+        .execute(envelope("rec-on", EngineCommand::RecordStart), 0)
+        .unwrap();
+    engine.tick().unwrap();
+
+    let snapshot = engine.snapshot().unwrap();
+    assert!(snapshot.show().desired_switcher().recording_desired());
+    let mut restored = Engine::restore(snapshot.clone()).unwrap();
+    assert!(restored.show().desired_switcher().recording_desired());
+    assert_eq!(
+        restored.realized_switcher().recording_desired(),
+        restored.show().desired_switcher().recording_desired()
+    );
+    let next = restored
+        .execute(envelope("rec-off", EngineCommand::RecordStop), 0)
+        .unwrap();
+    assert_eq!(
+        next.receipt.accepted().unwrap().result.target_frame,
+        FrameNumber::new(1)
+    );
+    assert_eq!(
+        next.events[0].payload,
+        EngineEvent::RecordingChanged { active: false }
+    );
+}
+
+#[test]
+fn idle_restore_rejects_divergent_desired_and_realized_recording_flags() {
+    let mut engine = streamed_engine();
+    engine
+        .execute(envelope("rec-on", EngineCommand::RecordStart), 0)
+        .unwrap();
+    engine.tick().unwrap();
+    let snapshot = engine.snapshot().unwrap();
+
+    let pristine_realized = streamed_engine().realized_switcher().clone();
+    assert!(!pristine_realized.recording_desired());
+    let restore_state = EngineRestoreState {
+        state_epoch: snapshot.state_epoch(),
+        revision: snapshot.revision(),
+        event_sequence: snapshot.event_sequence(),
+        runtime_generation: snapshot.runtime_generation(),
+        clock_time: snapshot.clock_time(),
+        frame_cursor: FrameNumber::new(snapshot.frames_rendered()),
+        receipts: snapshot.receipts().to_vec(),
+    };
+    assert_eq!(
+        Engine::restore_persisted(
+            snapshot.show().clone(),
+            pristine_realized,
+            snapshot.frame_rate(),
+            snapshot.clock_domain(),
+            restore_state,
+        )
+        .unwrap_err(),
+        SnapshotError::MismatchedSwitcherRouting
     );
 }

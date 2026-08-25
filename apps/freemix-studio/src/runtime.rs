@@ -417,6 +417,10 @@ impl StudioRuntime {
     }
 
     /// Waits for one event, returning `None` on timeout.
+    ///
+    /// # Errors
+    ///
+    /// Propagates transport, codec, and client intake errors.
     pub fn receive_timeout(
         &mut self,
         timeout: Duration,
@@ -438,6 +442,10 @@ impl StudioRuntime {
     }
 
     /// Sends one diagnostics request and waits for its validated response.
+    ///
+    /// # Errors
+    ///
+    /// Propagates transport, codec, client intake, and cancellation errors.
     pub fn send_diagnostics_cancellable(
         &mut self,
         request_id: impl Into<String>,

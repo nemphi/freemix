@@ -7,7 +7,8 @@ use std::{
 
 use fm_model::{Input, InputKind, Project, ProjectSettings};
 use fm_persistence::{
-    AssetAuditIssue, AssetAuditReason, AssetResolveError, ProjectStore, StoredProject,
+    AssetAuditIssue, AssetAuditReason, AssetResolveError, ProjectPosition, ProjectStore,
+    RuntimeRouting, StoredProject,
 };
 use fm_types::{
     AudioFormat, ChannelLayout, ColorMetadata, FrameRate, InputId, PixelFormat, ProjectId,
@@ -94,8 +95,13 @@ fn stored_project(
             required_capabilities: Vec::new(),
         });
     }
-    StoredProject::from_project(project, Default::default(), Default::default(), Vec::new())
-        .unwrap()
+    StoredProject::from_project(
+        project,
+        RuntimeRouting::default(),
+        ProjectPosition::default(),
+        Vec::new(),
+    )
+    .unwrap()
 }
 
 #[test]

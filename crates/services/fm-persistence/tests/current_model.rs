@@ -181,7 +181,10 @@ fn rich_stream_target(high: u128) -> StreamTarget {
         StreamEndpoint::parse("backup.example.test/live/eu").unwrap(),
     ))
     .unwrap()
+    .with_video_bitrate(9_000)
+    .unwrap()
     .with_startup(StartupPolicy::ReconcileDesiredState)
+    .set_running(true)
 }
 
 fn rich_project() -> Project {
@@ -280,9 +283,16 @@ fn rich_project() -> Project {
 }
 
 fn stored_rich_project() -> StoredProject {
+    stored_rich_project_with_running_target(true)
+}
+
+fn stored_rich_project_with_running_target(running: bool) -> StoredProject {
     let high = u128::from(u64::MAX) + 101;
+    let mut project = rich_project();
+    let target = project.stream_targets()[0].clone().set_running(running);
+    project.replace_stream_target(target).unwrap();
     StoredProject::from_project(
-        rich_project(),
+        project,
         RuntimeRouting {
             desired_program_id: Some(input_id(high)),
             realized_program_id: Some(input_id(high + 1)),
@@ -435,6 +445,7 @@ fn stream_destination_round_trips_at_the_current_schema_and_keeps_its_key_off_ev
     );
     assert_eq!(target.key().expose_secret(), RICH_STREAM_KEY);
     assert_eq!(target.startup(), StartupPolicy::ReconcileDesiredState);
+    assert!(target.running());
     assert_eq!(
         target.expose_url(),
         format!("rtmps://ingest.example.test:443/live/{RICH_STREAM_KEY}")
@@ -464,6 +475,189 @@ fn stream_destination_round_trips_at_the_current_schema_and_keeps_its_key_off_ev
 }
 
 #[test]
+fn srt_stream_destination_round_trips_at_the_current_schema() {
+    const KEY: &str = "srt-4e7a-roundtrip-key";
+    let high = u128::from(u64::MAX) + 101;
+    let temp = TestDirectory::new("stream-target-srt");
+    let store = temp.store("show");
+
+    let mut project = rich_project();
+    let target = StreamTarget::new(
+        stream_target_id(high + 40),
+        "SRT relay".into(),
+        StreamProtocol::Srt,
+        StreamEndpoint::parse_for(StreamProtocol::Srt, "relay.example.test:9710").unwrap(),
+        StreamKey::parse(KEY).unwrap(),
+        output_id(high + 30),
+    )
+    .unwrap()
+    .with_backup_endpoint(Some(
+        StreamEndpoint::parse_for(StreamProtocol::Srt, "fallback.example.test").unwrap(),
+    ))
+    .unwrap();
+    project.replace_stream_target(target).unwrap();
+    let expected = StoredProject::from_project(
+        project,
+        RuntimeRouting::default(),
+        ProjectPosition::default(),
+        Vec::new(),
+    )
+    .unwrap();
+
+    store.save(&expected).unwrap();
+    let encoded = fs::read_to_string(store.manifest_path()).unwrap();
+    assert!(encoded.contains("\"protocol\": \"srt\""));
+    assert!(encoded.contains("\"endpoint\": \"relay.example.test:9710\""));
+
+    let loaded = store.load().unwrap();
+    assert_eq!(loaded, expected);
+    let target = &loaded.project().stream_targets()[0];
+    assert_eq!(target.protocol(), StreamProtocol::Srt);
+    assert_eq!(target.endpoint().as_str(), "relay.example.test:9710");
+    assert_eq!(
+        target.backup_endpoint().map(StreamEndpoint::as_str),
+        Some("fallback.example.test")
+    );
+    assert_eq!(
+        target.expose_url(),
+        format!("srt://relay.example.test:9710?streamid={KEY}")
+    );
+    assert_eq!(
+        target.redacted_url(),
+        "srt://relay.example.test:9710?streamid=****"
+    );
+}
+
+#[test]
+fn stream_target_running_state_round_trips_and_is_required_at_the_current_schema() {
+    let temp = TestDirectory::new("stream-target-running");
+    let store = temp.store("show");
+
+    // Both authored desired states survive a full save/load cycle unchanged.
+    for running in [true, false] {
+        let expected = stored_rich_project_with_running_target(running);
+        store.save(&expected).unwrap();
+        let encoded = fs::read_to_string(store.manifest_path()).unwrap();
+        assert!(encoded.contains(&format!("\"running\": {running}")));
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded, expected);
+        assert_eq!(loaded.project().stream_targets()[0].running(), running);
+    }
+
+    // The field is part of the current contract: it must be present with a
+    // boolean value and the manifest must carry the current schema version.
+    store.save(&stored_rich_project()).unwrap();
+    let valid = fs::read_to_string(store.manifest_path()).unwrap();
+    assert!(valid.contains("\"schema_version\": 20"));
+    for malformed in [
+        valid.replacen(",\n        \"running\": true", "", 1),
+        valid.replacen("\"running\": true", "\"running\": \"true\"", 1),
+        valid.replacen("\"running\": true", "\"running\": 1", 1),
+    ] {
+        fs::write(store.manifest_path(), malformed).unwrap();
+        assert!(matches!(
+            store.load(),
+            Err(StoreError::MalformedManifest { .. })
+        ));
+    }
+
+    // An older manifest is refused outright; no migration path exists.
+    fs::write(
+        store.manifest_path(),
+        valid.replacen("\"schema_version\": 20", "\"schema_version\": 19", 1),
+    )
+    .unwrap();
+    let error = store.load().unwrap_err();
+    assert!(matches!(error, StoreError::Validation(_)), "got {error:?}");
+}
+
+#[test]
+fn recording_intent_and_video_bitrate_round_trip_at_the_current_schema() {
+    let temp = TestDirectory::new("recording-bitrate");
+    let store = temp.store("show");
+
+    for recording_desired_active in [true, false] {
+        let mut project = rich_project();
+        project.set_recording_desired_active(recording_desired_active);
+        let expected = StoredProject::from_project(
+            project,
+            RuntimeRouting::default(),
+            ProjectPosition::default(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        store.save(&expected).unwrap();
+        let encoded = fs::read_to_string(store.manifest_path()).unwrap();
+        assert!(encoded.contains(&format!(
+            "\"recording_desired_active\": {recording_desired_active}"
+        )));
+        assert!(
+            encoded.contains("\"video_bitrate_kbps\": 9000"),
+            "authored video bitrate must be written verbatim"
+        );
+
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded, expected);
+        assert_eq!(
+            loaded.project().recording_desired_active(),
+            recording_desired_active
+        );
+        assert_eq!(
+            loaded.project().stream_targets()[0].video_bitrate_kbps(),
+            9_000
+        );
+    }
+
+    // Both fields belong to the current contract: missing or wrong-typed
+    // values are refused as malformed manifests.
+    store.save(&stored_rich_project()).unwrap();
+    let valid = fs::read_to_string(store.manifest_path()).unwrap();
+    for malformed in [
+        valid.replacen(",\n    \"recording_desired_active\": false", "", 1),
+        valid.replacen(
+            "\"recording_desired_active\": false",
+            "\"recording_desired_active\": \"false\"",
+            1,
+        ),
+        valid.replacen(
+            "\"recording_desired_active\": false",
+            "\"recording_desired_active\": 0",
+            1,
+        ),
+        valid.replacen(",\n        \"video_bitrate_kbps\": 9000", "", 1),
+        valid.replacen(
+            "\"video_bitrate_kbps\": 9000",
+            "\"video_bitrate_kbps\": \"9000\"",
+            1,
+        ),
+    ] {
+        fs::write(store.manifest_path(), malformed).unwrap();
+        assert!(matches!(
+            store.load(),
+            Err(StoreError::MalformedManifest { .. })
+        ));
+    }
+
+    // The bitrate bound is enforced at decode through the model constructor.
+    for out_of_range in ["999", "100001", "0"] {
+        fs::write(
+            store.manifest_path(),
+            valid.replacen(
+                "\"video_bitrate_kbps\": 9000",
+                &format!("\"video_bitrate_kbps\": {out_of_range}"),
+                1,
+            ),
+        )
+        .unwrap();
+        assert!(matches!(
+            store.load(),
+            Err(StoreError::MalformedManifest { .. })
+        ));
+    }
+}
+
+#[test]
 fn strict_stream_destination_parser_rejects_missing_wrong_typed_and_out_of_contract_fields() {
     let temp = TestDirectory::new("strict-stream-destination");
     let store = temp.store("show");
@@ -474,6 +668,8 @@ fn strict_stream_destination_parser_rejects_missing_wrong_typed_and_out_of_contr
         // Missing, wrong-typed, unknown and duplicated fields.
         valid.replacen("\"protocol\": \"rtmps\",\n        ", "", 1),
         valid.replacen("\"protocol\": \"rtmps\"", "\"protocol\": 443", 1),
+        valid.replacen(",\n        \"running\": true", "", 1),
+        valid.replacen("\"running\": true", "\"running\": \"true\"", 1),
         valid.replacen(
             "\"backup_endpoint\":",
             "\"future_field\": 1,\n        \"backup_endpoint\":",

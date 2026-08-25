@@ -106,6 +106,11 @@ pub enum AssetAuditReason {
 }
 
 /// Validates the strict syntax of a project `asset://` URI without filesystem access.
+///
+/// # Errors
+///
+/// Returns [`AssetResolveError::InvalidUri`] when `uri` does not use the
+/// supported strict `asset://` syntax.
 pub fn validate_asset_uri(uri: &str) -> Result<(), AssetResolveError> {
     asset_uri_key(uri).map(|_| ())
 }

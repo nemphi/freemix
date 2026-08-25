@@ -2,11 +2,12 @@ use std::num::NonZeroU128;
 
 use fm_switcher::{
     FADE_TO_BLACK_POSITION_DENOMINATOR, FadeToBlackError, FadeToBlackPosition, FadeToBlackTarget,
-    MAX_FADE_TO_BLACK_DURATION_FRAMES, MissingMediaFallback, OVERLAY_CHANNEL_COUNT,
-    OverlayBorderPreset, OverlayChannelId, OverlayPositionPreset, OverlayTransitionKind,
-    STINGER_SLOT_COUNT, StingerAudioPolicy, StingerDescriptor, StingerPlaybackDecision,
-    StingerPreloadState, StingerSlotId, SwitcherCommand, SwitcherError, SwitcherEvent,
-    SwitcherState, TBarPosition, TBarState, TransitionKind,
+    MAX_FADE_TO_BLACK_DURATION_FRAMES, MAX_STREAM_COUNT, MAX_STREAM_NAME_BYTES,
+    MissingMediaFallback, OVERLAY_CHANNEL_COUNT, OverlayBorderPreset, OverlayChannelId,
+    OverlayPositionPreset, OverlayTransitionKind, STINGER_SLOT_COUNT, StingerAudioPolicy,
+    StingerDescriptor, StingerPlaybackDecision, StingerPreloadState, StingerSlotId, StreamTargetId,
+    SwitcherCommand, SwitcherError, SwitcherEvent, SwitcherState, TBarPosition, TBarState,
+    TransitionKind,
 };
 use fm_types::{InputId, OutputId};
 
@@ -928,4 +929,132 @@ fn timed_transition_reports_completion() {
             },
         ]
     );
+}
+
+fn target(value: u128) -> StreamTargetId {
+    StreamTargetId::new(value).unwrap()
+}
+
+fn streamed_switcher() -> SwitcherState {
+    state()
+        .with_streams([
+            (target(5), "Twitch".to_owned()),
+            (target(9), "YouTube".to_owned()),
+        ])
+        .unwrap()
+}
+
+#[test]
+fn stream_inventory_is_bounded_unique_and_name_checked() {
+    let streams: Vec<_> = (1..=MAX_STREAM_COUNT)
+        .map(|value| (target(value as u128 + 10), format!("Stream {value}")))
+        .collect();
+    assert_eq!(state().with_streams(streams).unwrap().streams().len(), 5);
+    let overflow: Vec<_> = (0..=MAX_STREAM_COUNT)
+        .map(|value| (target(value as u128 + 10), format!("Stream {value}")))
+        .collect();
+    assert_eq!(
+        state().with_streams(overflow),
+        Err(SwitcherError::TooManyStreams {
+            requested: MAX_STREAM_COUNT + 1,
+            maximum: MAX_STREAM_COUNT,
+        })
+    );
+    assert_eq!(
+        state().with_streams([(target(5), "Twitch".into()), (target(5), "Again".into())]),
+        Err(SwitcherError::DuplicateStreamTarget(target(5)))
+    );
+    assert_eq!(
+        state().with_streams([(target(5), "   ".into())]),
+        Err(SwitcherError::InvalidStreamName)
+    );
+    assert_eq!(
+        state().with_streams([(target(5), "x".repeat(MAX_STREAM_NAME_BYTES + 1))]),
+        Err(SwitcherError::InvalidStreamName)
+    );
+}
+
+#[test]
+fn stream_running_flags_validate_targets_and_preserve_insertion_order() {
+    let mut switcher = streamed_switcher();
+    assert_eq!(
+        switcher
+            .streams()
+            .iter()
+            .map(|stream| (stream.id(), stream.name()))
+            .collect::<Vec<_>>(),
+        [(target(5), "Twitch"), (target(9), "YouTube")]
+    );
+    assert_eq!(switcher.stream_running(target(5)), Some(false));
+    assert_eq!(switcher.stream_running(target(6)), None);
+    assert_eq!(
+        switcher.apply(SwitcherCommand::SetStreamRunning {
+            target: target(9),
+            running: true,
+        }),
+        Ok(vec![SwitcherEvent::StreamRunningChanged {
+            target: target(9),
+            running: true,
+        }])
+    );
+    assert_eq!(switcher.stream_running(target(9)), Some(true));
+    assert_eq!(switcher.stream_running(target(5)), Some(false));
+    assert_eq!(
+        (
+            switcher.running_stream_targets().contains(&target(9)),
+            switcher.running_stream_targets().contains(&target(5)),
+        ),
+        (true, false)
+    );
+    assert_eq!(
+        switcher.apply(SwitcherCommand::SetStreamRunning {
+            target: target(99),
+            running: true,
+        }),
+        Err(SwitcherError::UnknownStreamTarget(target(99)))
+    );
+}
+
+#[test]
+fn recording_desired_flags_emit_only_on_transition_and_apply_through_commands() {
+    let mut switcher = state();
+    assert!(!switcher.recording_desired());
+    assert_eq!(
+        switcher.set_recording_desired(true),
+        Ok(vec![SwitcherEvent::RecordingDesiredChanged {
+            active: true
+        }])
+    );
+    assert!(switcher.recording_desired());
+
+    assert_eq!(
+        switcher.set_recording_desired(true),
+        Ok(Vec::<SwitcherEvent>::new())
+    );
+    assert_eq!(
+        switcher.apply(SwitcherCommand::SetRecordingDesired(false)),
+        Ok(vec![SwitcherEvent::RecordingDesiredChanged {
+            active: false
+        }])
+    );
+    assert!(!switcher.recording_desired());
+    assert_eq!(
+        switcher.apply(SwitcherCommand::SetRecordingDesired(false)),
+        Ok(Vec::<SwitcherEvent>::new())
+    );
+
+    let mut mid_transition = streamed_switcher();
+    mid_transition
+        .apply(SwitcherCommand::Transition {
+            kind: TransitionKind::Fade,
+            duration_frames: 4,
+        })
+        .unwrap();
+    assert_eq!(
+        mid_transition.apply(SwitcherCommand::SetRecordingDesired(true)),
+        Ok(vec![SwitcherEvent::RecordingDesiredChanged {
+            active: true
+        }])
+    );
+    assert!(mid_transition.recording_desired());
 }

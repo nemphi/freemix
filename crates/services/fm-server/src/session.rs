@@ -195,7 +195,11 @@ impl Session {
             | CommandPayload::StartManualTransition { .. }
             | CommandPayload::SetManualTransitionPosition { .. }
             | CommandPayload::CommitManualTransition
-            | CommandPayload::CancelManualTransition => CommandClass::Transition,
+            | CommandPayload::CancelManualTransition
+            | CommandPayload::StreamStart { .. }
+            | CommandPayload::StreamStop { .. }
+            | CommandPayload::RecordStart
+            | CommandPayload::RecordStop => CommandClass::Transition,
         };
         self.policy.authorize(&self.principal, class)?;
 
@@ -231,6 +235,11 @@ impl Session {
     }
 
     /// Authorizes and accounts for one read-only diagnostics query.
+    ///
+    /// # Errors
+    ///
+    /// Returns a session, authorization, protocol, size, or rate error when
+    /// the diagnostics query cannot be admitted.
     pub fn admit_diagnostics(
         &mut self,
         request: &DiagnosticsRequest,

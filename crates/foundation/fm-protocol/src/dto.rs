@@ -217,6 +217,38 @@ impl fmt::Display for WireOutputId {
     }
 }
 
+/// Stable identity of one configurable stream target carried on the wire.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct WireStreamTargetId(NonZeroU128);
+
+impl WireStreamTargetId {
+    #[must_use]
+    pub const fn new(value: NonZeroU128) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> NonZeroU128 {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn from_domain(value: OutputId) -> Self {
+        Self(value.get())
+    }
+
+    #[must_use]
+    pub const fn to_domain(self) -> OutputId {
+        OutputId::new(self.0)
+    }
+}
+
+impl fmt::Display for WireStreamTargetId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
 /// Stable one-based downstream overlay channel number carried on the wire.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct WireOverlayChannelId(u8);
@@ -445,6 +477,30 @@ impl OverlayStatus {
     }
 }
 
+/// Realized runtime state of one stream target at one frame boundary.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum StreamRealizedState {
+    #[default]
+    Stopped,
+    Starting,
+    Live,
+    WaitingToReconnect,
+    Congested,
+    Failed,
+    Unavailable,
+}
+
+/// One canonical stream target exposed to clients with its desired and
+/// realized runtime state. `detail` is a short redacted human string.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamStatus {
+    pub target: WireStreamTargetId,
+    pub name: String,
+    pub desired_running: bool,
+    pub realized: StreamRealizedState,
+    pub detail: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CommandPayload {
     ReorderInputs {
@@ -542,6 +598,14 @@ pub enum CommandPayload {
     },
     CommitManualTransition,
     CancelManualTransition,
+    StreamStart {
+        target: WireStreamTargetId,
+    },
+    StreamStop {
+        target: WireStreamTargetId,
+    },
+    RecordStart,
+    RecordStop,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -652,6 +716,8 @@ pub struct SnapshotMessage {
     pub desired_fade_to_black: FadeToBlackState,
     pub realized_fade_to_black: FadeToBlackState,
     pub stingers: Vec<StingerStatus>,
+    pub streams: Vec<StreamStatus>,
+    pub record_desired_active: bool,
     pub desired_overlays: Vec<OverlayStatus>,
     pub realized_overlays: Vec<OverlayStatus>,
 }
@@ -682,6 +748,12 @@ pub enum EventPayload {
         stingers: Vec<StingerStatus>,
         overlays: Vec<OverlayStatus>,
         input_audio_strips: Vec<InputAudioStripStatus>,
+    },
+    StreamsChanged {
+        streams: Vec<StreamStatus>,
+    },
+    RecordingChanged {
+        active: bool,
     },
 }
 
@@ -809,6 +881,32 @@ pub struct AudioMetersMessage {
     pub inputs: Vec<InputAudioMeters>,
 }
 
+/// One lossy realized stream status sample for one configured target.
+///
+/// Counters are cumulative since the target's last start. `failure` carries a
+/// sanitized short code and never URL text or key material.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamStatusSample {
+    pub target: WireStreamTargetId,
+    pub realized: StreamRealizedState,
+    pub connected: bool,
+    pub muxed_bytes: u64,
+    pub enqueued_pairs: u64,
+    pub dropped_pairs: u64,
+    pub failure: Option<String>,
+}
+
+/// Lossy, non-resumable realized streaming status for every active target.
+///
+/// Like [`AudioMetersMessage`] this is latest-wins transport state: it is not
+/// durable, not resumable, and never part of snapshots or durable events.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamStatusMessage {
+    pub server: ServerIdentity,
+    pub sequence: u64,
+    pub samples: Vec<StreamStatusSample>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CapabilityReportSummary {
     pub digest: String,
@@ -859,6 +957,7 @@ pub enum WireMessage {
     Heartbeat(HeartbeatMessage),
     HeartbeatAcknowledgement(HeartbeatAcknowledgementMessage),
     AudioMeters(AudioMetersMessage),
+    StreamStatus(StreamStatusMessage),
     CapabilityReport(CapabilityReportMessage),
     DiagnosticsRequest(DiagnosticsRequest),
     DiagnosticsResponse(DiagnosticsResponse),

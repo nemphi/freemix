@@ -1,11 +1,12 @@
-//! A real RTMP/RTMPS transport for [`OutputSet`](crate::OutputSet), one bounded
+//! A real RTMP/RTMPS/SRT transport for [`OutputSet`](crate::OutputSet), one bounded
 //! `FFmpeg` child per connection attempt.
 //!
 //! [`OutputSet`](crate::OutputSet) owns retry budgets, backoff, backup-endpoint rotation, the
-//! recovery queue, and failure isolation. [`Streamer`] owns one live RTMP
+//! recovery queue, and failure isolation. [`Streamer`] owns one live output
 //! session: an `FFmpeg` child fed raw video and audio over authenticated
-//! loopback inputs, muxing `-f flv` to one destination, with automatic
-//! reconnection explicitly left to its caller. This module is that caller.
+//! loopback inputs, muxing `-f flv` to one `rtmp://` or `rtmps://` destination
+//! or `-f mpegts` to one `srt://` destination, with automatic reconnection
+//! explicitly left to its caller. This module is that caller.
 //!
 //! # The mapping, including where it is imperfect
 //!
@@ -105,10 +106,12 @@
 //!
 //! # Not covered
 //!
-//! SRT, HLS, and LAN outputs; TLS certificate policy (`rtmps://` uses the
-//! child's default trust configuration); credential resolution (this sink is
-//! handed an already-resolved stream key); adaptive bitrate; hardware encoders;
-//! and any wiring into the daemon or a per-output audio bus.
+//! HLS and LAN outputs; TLS certificate policy (`rtmps://` uses the
+//! child's default trust configuration); SRT encryption and passphrase policy
+//! (`srt://` likewise uses the child's default configuration and carries the
+//! caller's stream id verbatim); credential resolution (this sink is handed an
+//! already-resolved stream key); adaptive bitrate; hardware encoders; and any
+//! wiring into the daemon or a per-output audio bus.
 
 use core::fmt;
 use std::num::NonZeroU128;
@@ -485,9 +488,41 @@ impl FfmpegRtmpSink {
         config: &DestinationConfig,
         endpoint: &Endpoint,
     ) -> Result<StreamDestination, SinkError> {
-        let scheme = match config.protocol() {
-            OutputProtocol::Rtmp => "rtmp",
-            OutputProtocol::Rtmps => "rtmps",
+        // One composition per protocol, then one `StreamDestination::parse`:
+        // the codec parser stays the single validity source for every URL
+        // this transport opens. The endpoint's explicit port is always
+        // rendered because [`Endpoint`] cannot exist without one.
+        let url = match config.protocol() {
+            OutputProtocol::Rtmp | OutputProtocol::Rtmps => {
+                let scheme = match config.protocol() {
+                    OutputProtocol::Rtmp => "rtmp",
+                    _ => "rtmps",
+                };
+                let mut url = format!(
+                    "{scheme}://{}:{}{}",
+                    endpoint.host(),
+                    endpoint.port(),
+                    endpoint.path()
+                );
+                if let Some(key) = &self.config.stream_key {
+                    if !url.ends_with('/') {
+                        url.push('/');
+                    }
+                    url.push_str(&key.0);
+                }
+                url
+            }
+            // An SRT URL has no path component: the key is the single
+            // `streamid` query parameter, and the endpoint's path — which the
+            // [`Endpoint`] shape forces to exist — is deliberately ignored.
+            OutputProtocol::Srt => {
+                let mut url = format!("srt://{}:{}", endpoint.host(), endpoint.port());
+                if let Some(key) = &self.config.stream_key {
+                    url.push_str("?streamid=");
+                    url.push_str(&key.0);
+                }
+                url
+            }
             other => {
                 return Err(SinkError::new(
                     FailureStage::Protocol,
@@ -497,18 +532,6 @@ impl FfmpegRtmpSink {
                 ));
             }
         };
-        let mut url = format!(
-            "{scheme}://{}:{}{}",
-            endpoint.host(),
-            endpoint.port(),
-            endpoint.path()
-        );
-        if let Some(key) = &self.config.stream_key {
-            if !url.ends_with('/') {
-                url.push('/');
-            }
-            url.push_str(&key.0);
-        }
         // The typed error carries no URL text, and neither does this message.
         StreamDestination::parse(&url).map_err(|error| {
             SinkError::new(

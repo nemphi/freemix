@@ -91,6 +91,8 @@ fn control() -> FakeControl {
             position: FadeToBlackPosition::LIVE,
         },
         stingers: Vec::new(),
+        streams: Vec::new(),
+        record_desired_active: false,
         desired_overlays: fm_protocol::OverlayStatus::empty_channels(),
         realized_overlays: fm_protocol::OverlayStatus::empty_channels(),
     };

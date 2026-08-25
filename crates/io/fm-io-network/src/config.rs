@@ -38,6 +38,11 @@ impl fmt::Display for DestinationId {
 pub enum OutputProtocol {
     Rtmp,
     Rtmps,
+    /// `srt://` carried as MPEG-TS. Like plain RTMP it rejects TLS
+    /// configuration, its endpoints always name an explicit port because an
+    /// [`Endpoint`] cannot be built without one, and credentials follow the
+    /// same rules as RTMP: one resolved stream key, never embedded userinfo.
+    Srt,
     Hls,
     LiveLan,
 }
@@ -309,7 +314,8 @@ impl DestinationConfig {
     ///
     /// # Errors
     ///
-    /// RTMPS requires TLS and plain RTMP rejects contradictory TLS configuration.
+    /// RTMPS requires TLS; plain RTMP and SRT reject contradictory TLS
+    /// configuration.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: DestinationId,
@@ -324,7 +330,7 @@ impl DestinationConfig {
         if protocol.requires_tls() && tls.is_none() {
             return Err(ConfigError::TlsRequired);
         }
-        if protocol == OutputProtocol::Rtmp && tls.is_some() {
+        if matches!(protocol, OutputProtocol::Rtmp | OutputProtocol::Srt) && tls.is_some() {
             return Err(ConfigError::TlsNotSupported);
         }
         Ok(Self {

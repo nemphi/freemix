@@ -20,8 +20,10 @@ pub use project::{
     UpdateStreamTargetError,
 };
 pub use stream::{
-    MAX_STREAM_ENDPOINT_BYTES, MAX_STREAM_KEY_BYTES, MAX_STREAM_TARGET_NAME_BYTES,
-    MIN_STREAM_KEY_BYTES, REDACTED_STREAM_KEY, StreamEndpoint, StreamEndpointError, StreamKey,
+    DEFAULT_VIDEO_BITRATE_KBPS, MAX_STREAM_ENDPOINT_BYTES, MAX_STREAM_KEY_BYTES,
+    MAX_STREAM_TARGET_NAME_BYTES, MAX_VIDEO_BITRATE_KBPS, MIN_STREAM_KEY_BYTES,
+    MIN_VIDEO_BITRATE_KBPS, REDACTED_STREAM_KEY, StreamEndpoint, StreamEndpointError, StreamKey,
     StreamKeyError, StreamProtocol, StreamTarget, StreamTargetError, StreamTargetId,
+    StreamVideoBitrateError,
 };
 pub use validation::{EntityRef, ValidationError, ValidationErrorKind};

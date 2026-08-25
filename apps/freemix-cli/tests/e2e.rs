@@ -11,8 +11,9 @@ use std::{
 };
 
 use fm_model::{
-    AudioBus, BusSend, Input, InputKind, Layer, LayerGeometry, RectMask, Rgba8, Rotation, Scene,
-    SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef, StartupPolicy,
+    AudioBus, BusSend, Input, InputAudioStripState, InputKind, Layer, LayerGeometry, RectMask,
+    Rgba8, Rotation, Scene, SimulatedAudio, SimulatedInput, SimulatedVideo, SolidColor, SourceRef,
+    StartupPolicy,
 };
 use fm_persistence::{MutationBatch, ProjectStore, StoredProject};
 use fm_protocol::{
@@ -140,6 +141,20 @@ impl FakeRemoteServer {
         Self { address, worker }
     }
 
+    fn start_stream_start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || serve_stream_start(&listener));
+        Self { address, worker }
+    }
+
+    fn start_record_start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || serve_record_start(&listener));
+        Self { address, worker }
+    }
+
     fn start_manual_position() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -226,14 +241,14 @@ fn serve_remote_sessions(listener: &TcpListener) {
         match session {
             1 => assert_command(
                 &command,
-                CommandPayload::SelectPreview { input: input(1) },
+                &CommandPayload::SelectPreview { input: input(1) },
                 "remote-preview",
                 0,
             ),
-            2 => assert_command(&command, CommandPayload::Cut, "remote-cut", 1),
+            2 => assert_command(&command, &CommandPayload::Cut, "remote-cut", 1),
             3 => assert_command(
                 &command,
-                CommandPayload::Fade { duration_frames: 4 },
+                &CommandPayload::Fade { duration_frames: 4 },
                 "remote-fade",
                 2,
             ),
@@ -251,7 +266,7 @@ fn serve_remote_sessions(listener: &TcpListener) {
             &mut writer,
             &engine,
             revision,
-            command.payload,
+            &command.payload,
             input(1),
             input(1),
         );
@@ -345,7 +360,7 @@ fn serve_peer_event_interleave(listener: &TcpListener) {
         &mut writer,
         &engine,
         1,
-        CommandPayload::Cut,
+        &CommandPayload::Cut,
         input(2),
         input(1),
     );
@@ -474,8 +489,218 @@ fn serve_alpha_fade(listener: &TcpListener) {
     serve_automatic_transition(
         listener,
         fm_protocol::CURRENT_PROTOCOL_VERSION,
-        CommandPayload::AlphaFade { duration_frames: 3 },
+        &CommandPayload::AlphaFade { duration_frames: 3 },
         "remote-alpha-fade",
+    );
+}
+
+/// Serves one Operator `StreamStart` command session followed by one Viewer
+/// session whose snapshot carries the durable streams roster.
+fn serve_stream_start(listener: &TcpListener) {
+    let engine = EngineIdentity {
+        engine_id: "project-42".into(),
+        state_epoch: 1,
+        log_id: "fake-remote-log".into(),
+    };
+    let target = fm_protocol::WireStreamTargetId::new(NonZeroU128::new(40).unwrap());
+    let (stream, _) = listener.accept().unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(stream);
+    assert_handshake_request(read_message(&mut reader));
+    write_handshake_role(&mut writer, &engine, 0, Role::Operator);
+
+    let WireMessage::Command(command) = read_message(&mut reader) else {
+        panic!("expected remote stream command");
+    };
+    assert_command(
+        &command,
+        &CommandPayload::StreamStart { target },
+        "remote-stream-start",
+        0,
+    );
+    write_message(
+        &mut writer,
+        &WireMessage::CommandResult(CommandResult::Accepted {
+            id: command.id,
+            revision: 1,
+            scheduled_frame: None,
+        }),
+    );
+    write_message(
+        &mut writer,
+        &WireMessage::StreamStatus(fm_protocol::StreamStatusMessage {
+            server: server_identity(&engine),
+            sequence: 1,
+            samples: vec![fm_protocol::StreamStatusSample {
+                target,
+                realized: fm_protocol::StreamRealizedState::Starting,
+                connected: false,
+                muxed_bytes: 2048,
+                enqueued_pairs: 12,
+                dropped_pairs: 3,
+                failure: None,
+            }],
+        }),
+    );
+    write_message(
+        &mut writer,
+        &WireMessage::Event(EventMessage {
+            cursor: EventCursor {
+                engine: engine.clone(),
+                revision: 1,
+            },
+            payload: EventPayload::StreamsChanged {
+                streams: vec![fm_protocol::StreamStatus {
+                    target,
+                    name: "Main ingest".into(),
+                    desired_running: true,
+                    realized: fm_protocol::StreamRealizedState::Starting,
+                    detail: Some("connecting to ingest".into()),
+                }],
+            },
+        }),
+    );
+    write_message(
+        &mut writer,
+        &WireMessage::RuntimeEvent(RuntimeEventMessage {
+            server: server_identity(&engine),
+            revision: 1,
+            generation: 1,
+            sequence: 1,
+            event: RuntimeLifecycleEvent::Realized {
+                domain: "switcher".into(),
+                manual_transition: fm_protocol::ManualTransitionStatus::Inactive,
+                fade_to_black: live_fade_to_black(),
+            },
+        }),
+    );
+    serve_streams_snapshot_peer(
+        listener,
+        &engine,
+        vec![fm_protocol::StreamStatus {
+            target,
+            name: "Main ingest".into(),
+            desired_running: true,
+            realized: fm_protocol::StreamRealizedState::Live,
+            detail: None,
+        }],
+        false,
+    );
+}
+
+/// Serves one Operator `RecordStart` command session followed by one Viewer
+/// session whose snapshot carries the durable recording flag.
+fn serve_record_start(listener: &TcpListener) {
+    let engine = EngineIdentity {
+        engine_id: "project-42".into(),
+        state_epoch: 1,
+        log_id: "fake-remote-log".into(),
+    };
+    let (stream, _) = listener.accept().unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(stream);
+    assert_handshake_request(read_message(&mut reader));
+    write_handshake_role(&mut writer, &engine, 0, Role::Operator);
+
+    let WireMessage::Command(command) = read_message(&mut reader) else {
+        panic!("expected remote record command");
+    };
+    assert_command(
+        &command,
+        &CommandPayload::RecordStart,
+        "remote-record-start",
+        0,
+    );
+    write_message(
+        &mut writer,
+        &WireMessage::CommandResult(CommandResult::Accepted {
+            id: command.id,
+            revision: 1,
+            scheduled_frame: None,
+        }),
+    );
+    write_message(
+        &mut writer,
+        &WireMessage::Event(EventMessage {
+            cursor: EventCursor {
+                engine: engine.clone(),
+                revision: 1,
+            },
+            payload: EventPayload::RecordingChanged { active: true },
+        }),
+    );
+    write_message(
+        &mut writer,
+        &WireMessage::RuntimeEvent(RuntimeEventMessage {
+            server: server_identity(&engine),
+            revision: 1,
+            generation: 1,
+            sequence: 1,
+            event: RuntimeLifecycleEvent::Realized {
+                domain: "switcher".into(),
+                manual_transition: fm_protocol::ManualTransitionStatus::Inactive,
+                fade_to_black: live_fade_to_black(),
+            },
+        }),
+    );
+    serve_streams_snapshot_peer(listener, &engine, Vec::new(), true);
+}
+
+/// Serves a Viewer session whose initial snapshot reports the durable streams
+/// roster and recording flag.
+fn serve_streams_snapshot_peer(
+    listener: &TcpListener,
+    engine: &EngineIdentity,
+    streams: Vec<fm_protocol::StreamStatus>,
+    record_desired_active: bool,
+) {
+    let (stream, _) = listener.accept().unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(stream);
+    assert_handshake_request_viewer(read_message(&mut reader));
+    write_message(
+        &mut writer,
+        &WireMessage::HandshakeResponse(HandshakeResponse {
+            protocol: CURRENT_PROTOCOL_VERSION,
+            granted_role: Role::Viewer,
+            permissions: handshake_permissions(Role::Viewer),
+            capabilities: CapabilityReportSummary {
+                digest: "fake-capabilities".into(),
+                total: 0,
+                available: 0,
+                degraded: 0,
+                unavailable: 0,
+            },
+            server: server_identity(engine),
+            current_revision: 1,
+            outcome: HandshakeOutcome::Snapshot {
+                reason: SnapshotReason::NoCursor,
+            },
+        }),
+    );
+    write_message(
+        &mut writer,
+        &WireMessage::Snapshot(SnapshotMessage {
+            engine: engine.clone(),
+            revision: 1,
+            show_name: "Remote Contract".into(),
+            inputs: input_statuses(),
+            outputs: output_statuses(),
+            input_audio_strips: input_audio_strips(),
+            desired_program: input(1),
+            desired_preview: input(2),
+            realized_program: input(1),
+            realized_preview: input(2),
+            desired_manual_transition: fm_protocol::ManualTransitionStatus::Inactive,
+            realized_manual_transition: fm_protocol::ManualTransitionStatus::Inactive,
+            desired_fade_to_black: live_fade_to_black(),
+            realized_fade_to_black: live_fade_to_black(),
+            stingers: Vec::new(),
+            streams,
+            record_desired_active,
+            desired_overlays: OverlayStatus::empty_channels(),
+            realized_overlays: OverlayStatus::empty_channels(),
+        }),
     );
 }
 
@@ -483,7 +708,7 @@ fn serve_slide(listener: &TcpListener) {
     serve_automatic_transition(
         listener,
         fm_protocol::CURRENT_PROTOCOL_VERSION,
-        CommandPayload::Slide { duration_frames: 3 },
+        &CommandPayload::Slide { duration_frames: 3 },
         "remote-slide",
     );
 }
@@ -492,7 +717,7 @@ fn serve_zoom(listener: &TcpListener) {
     serve_automatic_transition(
         listener,
         fm_protocol::CURRENT_PROTOCOL_VERSION,
-        CommandPayload::Zoom { duration_frames: 3 },
+        &CommandPayload::Zoom { duration_frames: 3 },
         "remote-zoom",
     );
 }
@@ -514,7 +739,7 @@ fn serve_audio_strip(listener: &TcpListener) {
     };
     assert_command(
         &command,
-        CommandPayload::SetInputAudioStrip {
+        &CommandPayload::SetInputAudioStrip {
             input: input(2),
             gain_millidb: -6_000,
             balance_basis_points: 2_500,
@@ -590,7 +815,7 @@ fn serve_stinger(listener: &TcpListener) {
     serve_automatic_transition(
         listener,
         fm_protocol::CURRENT_PROTOCOL_VERSION,
-        CommandPayload::Stinger {
+        &CommandPayload::Stinger {
             slot: fm_protocol::WireStingerSlotId::new(8).unwrap(),
             duration_frames: 3,
         },
@@ -629,7 +854,7 @@ fn serve_stinger_configuration(listener: &TcpListener) {
         };
         assert_command(
             &command,
-            expected_payload,
+            &expected_payload,
             if index == 0 {
                 "configure-stinger"
             } else {
@@ -685,7 +910,7 @@ fn serve_stinger_configuration(listener: &TcpListener) {
 fn serve_automatic_transition(
     listener: &TcpListener,
     protocol: ProtocolVersion,
-    expected_payload: CommandPayload,
+    expected_payload: &CommandPayload,
     expected_key: &str,
 ) {
     let engine = EngineIdentity {
@@ -709,7 +934,7 @@ fn serve_automatic_transition(
         panic!("expected remote automatic transition command");
     };
     assert_eq!(command.protocol, protocol);
-    assert_eq!(command.payload, expected_payload);
+    assert_eq!(&command.payload, expected_payload);
     assert_eq!(command.idempotency_key, expected_key);
     assert_eq!(command.expected_revision, Some(0));
     write_message(
@@ -1013,6 +1238,8 @@ fn write_handshake_version_with_manual(
             desired_fade_to_black: live_fade_to_black(),
             realized_fade_to_black: live_fade_to_black(),
             stingers: Vec::new(),
+            streams: Vec::new(),
+            record_desired_active: false,
             desired_overlays: OverlayStatus::empty_channels(),
             realized_overlays: OverlayStatus::empty_channels(),
         }),
@@ -1086,6 +1313,8 @@ fn write_handshake_version_with_fade_to_black(
             desired_overlays: OverlayStatus::empty_channels(),
             realized_overlays: OverlayStatus::empty_channels(),
             stingers: Vec::new(),
+            streams: Vec::new(),
+            record_desired_active: false,
         }),
     );
 }
@@ -1099,7 +1328,7 @@ fn live_fade_to_black() -> fm_protocol::FadeToBlackState {
 
 fn assert_command(
     command: &CommandMessage,
-    payload: CommandPayload,
+    payload: &CommandPayload,
     key: &str,
     expected_revision: u64,
 ) {
@@ -1107,14 +1336,14 @@ fn assert_command(
     assert_eq!(command.idempotency_key, key);
     assert_eq!(command.expected_revision, Some(expected_revision));
     assert_eq!(command.deadline_ms, None);
-    assert_eq!(command.payload, payload);
+    assert_eq!(&command.payload, payload);
 }
 
 fn write_command_events(
     writer: &mut TcpStream,
     engine: &EngineIdentity,
     revision: u64,
-    payload: CommandPayload,
+    payload: &CommandPayload,
     program: WireInputId,
     preview: WireInputId,
 ) {
@@ -1140,7 +1369,7 @@ fn write_command_events(
     let mut sequence = 1;
     if matches!(
         payload,
-        CommandPayload::Fade { duration_frames } if duration_frames > 1
+        CommandPayload::Fade { duration_frames } if *duration_frames > 1
     ) {
         write_message(
             writer,
@@ -1873,7 +2102,7 @@ fn local_input_add_persists_default_simulated_strip() {
     ));
     assert_eq!(
         stored.project().input_audio_strip(input.id).unwrap(),
-        Default::default()
+        InputAudioStripState::default()
     );
 
     assert_success(&invoke(&[
@@ -1935,7 +2164,7 @@ fn local_simulated_solid_input_add_persists_exact_rgba() {
     ));
     assert_eq!(
         after.project().input_audio_strip(input.id).unwrap(),
-        Default::default()
+        InputAudioStripState::default()
     );
     assert_eq!(after.position(), before.position());
     assert_eq!(after.runtime_routing(), before.runtime_routing());
@@ -2000,7 +2229,7 @@ fn local_media_input_add_persists_offline_asset_contract() {
     assert!(input.required_capabilities.is_empty());
     assert_eq!(
         after.project().input_audio_strip(input.id).unwrap(),
-        Default::default()
+        InputAudioStripState::default()
     );
     assert_eq!(after.position(), before.position());
     assert_eq!(after.runtime_routing(), before.runtime_routing());
@@ -2064,6 +2293,7 @@ fn local_media_input_add_persists_offline_asset_contract() {
     fs::remove_dir_all(context.root).unwrap();
 }
 
+#[allow(clippy::too_many_lines)]
 #[test]
 fn local_media_input_relink_preserves_identity_and_runtime() {
     let context = ContractContext::new();
@@ -2332,6 +2562,7 @@ fn author_stream_destination(context: &ContractContext) {
 
 /// Every authoring refusal must be reported and must leave the bundle
 /// byte-identical, including the one that protects a published output.
+#[allow(clippy::too_many_lines)]
 fn assert_stream_authoring_refusals_are_atomic(context: &ContractContext) {
     let unchanged = fs::read(context.project.join("project.json")).unwrap();
     for (arguments, expected) in [
@@ -2385,6 +2616,34 @@ fn assert_stream_authoring_refusals_are_atomic(context: &ContractContext) {
         ),
         (
             vec![
+                "stream-add",
+                context.project_path(),
+                "41",
+                "30",
+                "rtmps://ingest.example.test/live",
+                STREAM_KEY,
+                "Second",
+                "--video-bitrate-kbps",
+                "999",
+            ],
+            "video bitrate must be at least 1000 kbps",
+        ),
+        (
+            vec![
+                "stream-add",
+                context.project_path(),
+                "41",
+                "30",
+                "rtmps://ingest.example.test/live",
+                STREAM_KEY,
+                "Second",
+                "--video-bitrate-kbps",
+                "100001",
+            ],
+            "video bitrate must not exceed 100000 kbps",
+        ),
+        (
+            vec![
                 "stream-update",
                 context.project_path(),
                 "999",
@@ -2421,6 +2680,13 @@ fn local_stream_destinations_are_authored_offline_and_never_print_the_stream_key
     assert_eq!(target.name(), "Main ingest");
     assert_eq!(target.key().expose_secret(), KEY);
     assert_eq!(target.startup(), StartupPolicy::ReconcileDesiredState);
+    // Destinations authored without naming a bitrate assume the default.
+    assert_eq!(target.video_bitrate_kbps(), 4_500);
+    assert!(
+        fs::read_to_string(context.project.join("project.json"))
+            .unwrap()
+            .contains("\"video_bitrate_kbps\": 4500")
+    );
 
     // The inventory line is the operator-facing surface. It must carry enough
     // to identify the destination and none of the secret.
@@ -2432,7 +2698,7 @@ fn local_stream_destinations_are_authored_offline_and_never_print_the_stream_key
             "stream id=40 name=\"Main ingest\" protocol=rtmps ",
             "url=\"rtmps://ingest.example.test:443/live/****\" ",
             "backup_url=\"rtmps://backup.example.test/live/****\" ",
-            "output=30 output_name=\"Primary\" startup=reconcile-desired-state"
+            "output=30 output_name=\"Primary\" startup=reconcile-desired-state running=false"
         )
     );
 
@@ -2484,6 +2750,8 @@ fn local_stream_destinations_are_authored_offline_and_never_print_the_stream_key
         "rtmp://relay.example.test/live",
         "rotated-key-0001",
         "Main ingest",
+        "--video-bitrate-kbps",
+        "8000",
     ]));
     let updated = store.load().unwrap();
     let target = &updated.project().stream_targets()[0];
@@ -2491,6 +2759,7 @@ fn local_stream_destinations_are_authored_offline_and_never_print_the_stream_key
     assert_eq!(target.redacted_url(), "rtmp://relay.example.test/live/****");
     assert_eq!(target.backup_endpoint(), None);
     assert_eq!(target.startup(), StartupPolicy::Stopped);
+    assert_eq!(target.video_bitrate_kbps(), 8_000);
 
     assert_success(&invoke_bounded(&[
         "stream-remove",
@@ -2502,12 +2771,227 @@ fn local_stream_destinations_are_authored_offline_and_never_print_the_stream_key
         stdout(&invoke_bounded(&["streams", context.project_path()])),
         ""
     );
+
+    // An srt:// destination authors through the same surface, persists the
+    // canonical scheme spelling, and redacts its key into the stream id.
+    author_srt_stream_destination(&context);
+
     assert_success(&invoke_bounded(&[
         "output-remove",
         context.project_path(),
         "30",
     ]));
     fs::remove_dir_all(context.root).unwrap();
+}
+
+/// Authors and removes one `srt://` destination on the existing output,
+/// asserting the persisted scheme spelling and the redacted inventory line.
+fn author_srt_stream_destination(context: &ContractContext) {
+    assert_success(&invoke_bounded(&[
+        "stream-add",
+        context.project_path(),
+        "41",
+        "30",
+        "srt://relay.example.test:9710",
+        STREAM_KEY,
+        "SRT relay",
+    ]));
+    let srt_manifest = fs::read_to_string(context.project.join("project.json")).unwrap();
+    assert!(srt_manifest.contains("\"protocol\": \"srt\""));
+    assert_eq!(
+        stdout(&invoke_bounded(&["streams", context.project_path()])),
+        concat!(
+            "stream id=41 name=\"SRT relay\" protocol=srt ",
+            "url=\"srt://relay.example.test:9710?streamid=****\" ",
+            "backup_url=\"none\" ",
+            "output=30 output_name=\"Primary\" startup=stopped running=false"
+        )
+    );
+    assert_success(&invoke_bounded(&[
+        "stream-remove",
+        context.project_path(),
+        "41",
+    ]));
+}
+
+#[test]
+fn local_stream_start_stop_round_trip_persists_desired_running() {
+    let context = ContractContext::new();
+    author_stream_destination(&context);
+    let store = ProjectStore::new(&context.project).unwrap();
+    assert_eq!(
+        json_number(&manifest(&context.project), "schema_version"),
+        20
+    );
+
+    let started = invoke_bounded(&["stream-start", context.project_path(), "40"]);
+    assert_success(&started);
+    let started_manifest = manifest(&context.project);
+    assert_eq!(json_number(&started_manifest, "schema_version"), 20);
+    assert!(started_manifest.contains("\"running\": true"));
+    let loaded = store.load().unwrap();
+    let target = &loaded.project().stream_targets()[0];
+    assert_eq!(target.id().to_string(), "40");
+    assert!(target.running());
+    let streams_after_start = invoke_bounded(&["streams", context.project_path()]);
+    assert_success(&streams_after_start);
+    assert!(stdout(&streams_after_start).ends_with("running=true"));
+
+    let stopped = invoke_bounded(&["stream-stop", context.project_path(), "40"]);
+    assert_success(&stopped);
+    let stopped_manifest = manifest(&context.project);
+    assert_eq!(json_number(&stopped_manifest, "schema_version"), 20);
+    assert!(stopped_manifest.contains("\"running\": false"));
+    assert!(!stopped_manifest.contains("\"running\": true"));
+    assert!(!store.load().unwrap().project().stream_targets()[0].running());
+    let streams_after_stop = invoke_bounded(&["streams", context.project_path()]);
+    assert_success(&streams_after_stop);
+    assert!(stdout(&streams_after_stop).ends_with("running=false"));
+
+    // A mistyped or zero id must fail cleanly and leave the bundle untouched.
+    for (arguments, expected) in [
+        (
+            vec!["stream-stop", context.project_path(), "99"],
+            "unknown stream destination 99",
+        ),
+        (
+            vec!["stream-start", context.project_path(), "0"],
+            "stream destination ID must be nonzero",
+        ),
+    ] {
+        let manifest_before_failure = fs::read(context.project.join("project.json")).unwrap();
+        let journal_before = journal_bytes(&store);
+        let failure = invoke_bounded(&arguments);
+        assert_failure_contains(&failure, expected);
+        assert_eq!(
+            fs::read(context.project.join("project.json")).unwrap(),
+            manifest_before_failure
+        );
+        assert_eq!(journal_bytes(&store), journal_before);
+    }
+
+    fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
+fn remote_stream_start_is_accepted_and_replicates_the_streams_roster() {
+    let server = FakeRemoteServer::start_stream_start();
+    let address = server.address();
+    let output = invoke_bounded(&[
+        "remote-stream-start",
+        &address,
+        "40",
+        "--key",
+        "remote-stream-start",
+        "--expect",
+        "0",
+    ]);
+    assert_success(&output);
+    let status = stdout(&output);
+    assert_remote_status(&status, 1, 1, 1, 2, 2);
+    assert!(status.contains(
+        r#"Streams=[40:"Main ingest":desired=true:realized=starting:detail=connecting to ingest]"#
+    ));
+    assert!(
+        status.contains(
+            "StreamStatus(target=40, realized=starting, connected=false, muxed_bytes=2048, enqueued_pairs=12, dropped_pairs=3, failure=none)"
+        ),
+        "status output should surface the validated stream-status sample: {status}"
+    );
+
+    // A second client reconnecting to the daemon observes the durable roster.
+    let observed = invoke_bounded(&["remote-status", &address]);
+    assert_success(&observed);
+    assert!(
+        stdout(&observed)
+            .contains(r#"Streams=[40:"Main ingest":desired=true:realized=live:detail=none]"#)
+    );
+    server.finish();
+}
+
+#[test]
+fn local_record_start_stop_round_trip_persists_recording_desired_active() {
+    let context = ContractContext::new();
+    assert_success(&invoke_bounded(&["new", context.project_path()]));
+    let store = ProjectStore::new(&context.project).unwrap();
+    assert_eq!(
+        json_number(&manifest(&context.project), "schema_version"),
+        20
+    );
+    assert!(manifest(&context.project).contains("\"recording_desired_active\": false"));
+
+    let started = invoke_bounded(&["record-start", context.project_path()]);
+    assert_success(&started);
+    let started_manifest = manifest(&context.project);
+    assert_eq!(json_number(&started_manifest, "schema_version"), 20);
+    assert!(started_manifest.contains("\"recording_desired_active\": true"));
+    assert!(!started_manifest.contains("\"recording_desired_active\": false"));
+    assert!(stdout(&started).contains("recording_desired=true"));
+    assert_eq!(status(&context.project), stdout(&started));
+
+    let stopped = invoke_bounded(&["record-stop", context.project_path()]);
+    assert_success(&stopped);
+    let stopped_manifest = manifest(&context.project);
+    assert_eq!(json_number(&stopped_manifest, "schema_version"), 20);
+    assert!(stopped_manifest.contains("\"recording_desired_active\": false"));
+    assert!(!stopped_manifest.contains("\"recording_desired_active\": true"));
+    assert!(stdout(&stopped).contains("recording_desired=false"));
+    assert_eq!(status(&context.project), stdout(&stopped));
+
+    // A refusal must leave both the manifest and the journal byte-identical.
+    store
+        .append_batch(&MutationBatch::new(1, 2, 3, b"unapplied".to_vec()))
+        .unwrap();
+    let manifest_before_failure = fs::read(context.project.join("project.json")).unwrap();
+    let journal_before = journal_bytes(&store);
+    for arguments in [
+        vec!["record-start", context.project_path()],
+        vec!["record-stop", context.project_path()],
+    ] {
+        let failure = invoke_bounded(&arguments);
+        assert_failure_contains(
+            &failure,
+            "project has unapplied journal batches that freemix-cli cannot safely interpret",
+        );
+        assert_eq!(
+            fs::read(context.project.join("project.json")).unwrap(),
+            manifest_before_failure
+        );
+        assert_eq!(journal_bytes(&store), journal_before);
+    }
+
+    fs::remove_dir_all(context.root).unwrap();
+}
+
+#[test]
+fn remote_record_start_is_accepted_and_replicates_the_recording_flag() {
+    let server = FakeRemoteServer::start_record_start();
+    let address = server.address();
+    let output = invoke_bounded(&[
+        "remote-record-start",
+        &address,
+        "--key",
+        "remote-record-start",
+        "--expect",
+        "0",
+    ]);
+    assert_success(&output);
+    let status = stdout(&output);
+    assert_remote_status(&status, 1, 1, 1, 2, 2);
+    assert!(
+        status.contains("Recording=desired=true"),
+        "status output should surface the durable recording flag: {status}"
+    );
+
+    // A second Viewer client reconnecting to the daemon observes the flag.
+    let observed = invoke_bounded(&["remote-status", &address]);
+    assert_success(&observed);
+    let observed_status = stdout(&observed);
+    assert!(
+        observed_status.contains("Recording=desired=true"),
+        "reconnecting viewer should see the replicated recording flag: {observed_status}"
+    );
+    server.finish();
 }
 
 #[test]
@@ -2578,6 +3062,7 @@ fn local_output_startup_persists_selected_policy_and_rejects_unknown_output() {
     fs::remove_dir_all(context.root).unwrap();
 }
 
+#[allow(clippy::too_many_lines)]
 #[test]
 fn local_output_editing_persists_routes_and_names_and_rejects_unknown_references() {
     let context = ContractContext::new();
@@ -3220,6 +3705,7 @@ fn local_inputs_reports_ordered_inventory() {
     fs::remove_dir_all(context.root).unwrap();
 }
 
+#[allow(clippy::too_many_lines)]
 #[test]
 fn local_scene_input_add_persists_empty_scene_without_routing() {
     let context = ContractContext::new();
@@ -3272,7 +3758,7 @@ fn local_scene_input_add_persists_empty_scene_without_routing() {
     );
     assert_eq!(
         after.project().input_audio_strip(input.id).unwrap(),
-        Default::default()
+        InputAudioStripState::default()
     );
     assert_eq!(
         after
@@ -3379,7 +3865,7 @@ fn local_scene_input_duplicate_persists_scene_pair_and_default_strip() {
     ));
     assert_eq!(
         after.project().input_audio_strip(copied_input.id),
-        Some(Default::default())
+        Some(InputAudioStripState::default())
     );
     assert_eq!(after.runtime_routing(), before.runtime_routing());
     assert_eq!(
@@ -3422,6 +3908,7 @@ fn local_scene_input_duplicate_persists_scene_pair_and_default_strip() {
     fs::remove_dir_all(context.root).unwrap();
 }
 
+#[allow(clippy::too_many_lines)]
 #[test]
 fn scene_rename_persists_exact_name_and_failures_preserve_manifest() {
     let context = ContractContext::new();
@@ -3582,6 +4069,7 @@ fn scene_rename_persists_exact_name_and_failures_preserve_manifest() {
     fs::remove_dir_all(context.root).unwrap();
 }
 
+#[allow(clippy::too_many_lines)]
 #[test]
 fn local_scene_input_remove_is_atomic_across_input_and_scene() {
     let context = ContractContext::new();
@@ -3640,7 +4128,7 @@ fn local_scene_input_remove_is_atomic_across_input_and_scene() {
             .input_audio_strips()
             .iter()
             .filter(|strip| strip.input != removed_input)
-            .cloned()
+            .copied()
             .collect::<Vec<_>>()
     );
     assert_eq!(
@@ -3718,6 +4206,7 @@ fn local_scene_input_remove_is_atomic_across_input_and_scene() {
     fs::remove_dir_all(context.root).unwrap();
 }
 
+#[allow(clippy::too_many_lines)]
 #[test]
 fn local_scene_removal_preserves_runtime_and_rejects_references() {
     fn prepare(reference: Option<&str>) -> ContractContext {
@@ -3976,6 +4465,7 @@ fn local_scene_input_audio_source() {
     fs::remove_dir_all(context.root).unwrap();
 }
 
+#[allow(clippy::too_many_lines)]
 #[test]
 fn local_scene_background() {
     let context = ContractContext::new();
@@ -4266,6 +4756,7 @@ fn local_scene_layer_add_rejects_missing_input_without_manifest_or_journal_chang
     fs::remove_dir_all(context.root).unwrap();
 }
 
+#[allow(clippy::too_many_lines)]
 #[test]
 fn local_scene_layer_rename_persists_exact_name_and_rejects_invalid_target() {
     let context = ContractContext::new();
@@ -4610,6 +5101,7 @@ fn local_scene_layer_move_changes_only_stable_tie_order() {
     fs::remove_dir_all(context.root).unwrap();
 }
 
+#[allow(clippy::too_many_lines)]
 #[test]
 fn local_scene_layer_source_reassignment() {
     let context = ContractContext::new();
@@ -4751,7 +5243,7 @@ fn local_scene_layer_remove_preserves_remaining_order() {
         "9",
         "Second",
     ]));
-    let before = ProjectStore::new(&context.project_path())
+    let before = ProjectStore::new(context.project_path())
         .unwrap()
         .load()
         .unwrap();
@@ -4761,7 +5253,7 @@ fn local_scene_layer_remove_preserves_remaining_order() {
         "7",
         "0",
     ]));
-    let after = ProjectStore::new(&context.project_path())
+    let after = ProjectStore::new(context.project_path())
         .unwrap()
         .load()
         .unwrap();
@@ -4827,7 +5319,7 @@ fn local_scene_layer_appearance_preserves_layer_identity() {
             name,
         ]));
     }
-    let before = ProjectStore::new(&context.project_path())
+    let before = ProjectStore::new(context.project_path())
         .unwrap()
         .load()
         .unwrap();
@@ -4840,7 +5332,7 @@ fn local_scene_layer_appearance_preserves_layer_identity() {
         "off",
         "96",
     ]));
-    let after = ProjectStore::new(&context.project_path())
+    let after = ProjectStore::new(context.project_path())
         .unwrap()
         .load()
         .unwrap();
@@ -4903,7 +5395,7 @@ fn local_scene_layer_geometry_rejects_invalid_values_without_persistence() {
             name,
         ]));
     }
-    let before = ProjectStore::new(&context.project_path())
+    let before = ProjectStore::new(context.project_path())
         .unwrap()
         .load()
         .unwrap();
@@ -4942,7 +5434,7 @@ fn local_scene_layer_geometry_rejects_invalid_values_without_persistence() {
         "480",
         "270",
     ]));
-    let after = ProjectStore::new(&context.project_path())
+    let after = ProjectStore::new(context.project_path())
         .unwrap()
         .load()
         .unwrap();
@@ -4993,7 +5485,7 @@ fn local_scene_layer_z_order_preserves_vector_and_runtime() {
             name,
         ]));
     }
-    let before = ProjectStore::new(&context.project_path())
+    let before = ProjectStore::new(context.project_path())
         .unwrap()
         .load()
         .unwrap();
@@ -5013,7 +5505,7 @@ fn local_scene_layer_z_order_preserves_vector_and_runtime() {
         "1",
         &i32::MIN.to_string(),
     ]));
-    let after = ProjectStore::new(&context.project_path())
+    let after = ProjectStore::new(context.project_path())
         .unwrap()
         .load()
         .unwrap();
@@ -5040,7 +5532,7 @@ fn local_scene_layer_z_order_preserves_vector_and_runtime() {
         "1",
         "4",
     ]));
-    let repeated = ProjectStore::new(&context.project_path())
+    let repeated = ProjectStore::new(context.project_path())
         .unwrap()
         .load()
         .unwrap();
@@ -5088,7 +5580,7 @@ fn local_scene_layer_crop_checked_preserves_manifest_and_journal() {
         "5",
         "Other layer",
     ]));
-    let before = ProjectStore::new(&context.project_path())
+    let before = ProjectStore::new(context.project_path())
         .unwrap()
         .load()
         .unwrap();
@@ -5102,7 +5594,7 @@ fn local_scene_layer_crop_checked_preserves_manifest_and_journal() {
         "640",
         "480",
     ]));
-    let cropped = ProjectStore::new(&context.project_path())
+    let cropped = ProjectStore::new(context.project_path())
         .unwrap()
         .load()
         .unwrap();
@@ -5134,7 +5626,7 @@ fn local_scene_layer_crop_checked_preserves_manifest_and_journal() {
         "7",
         "0",
     ]));
-    let cleared = ProjectStore::new(&context.project_path())
+    let cleared = ProjectStore::new(context.project_path())
         .unwrap()
         .load()
         .unwrap();
@@ -5144,7 +5636,7 @@ fn local_scene_layer_crop_checked_preserves_manifest_and_journal() {
     );
 
     let before_invalid = manifest(&context.project);
-    let store = ProjectStore::new(&context.project_path()).unwrap();
+    let store = ProjectStore::new(context.project_path()).unwrap();
     let journal_before_invalid = journal_bytes(&store);
     assert_failure_contains(
         &invoke(&[
@@ -5164,6 +5656,7 @@ fn local_scene_layer_crop_checked_preserves_manifest_and_journal() {
     fs::remove_dir_all(context.root).unwrap();
 }
 
+#[allow(clippy::too_many_lines)]
 #[test]
 fn local_scene_layer_mask_checked_preserves_manifest_and_journal() {
     let context = ContractContext::new();
@@ -5201,7 +5694,7 @@ fn local_scene_layer_mask_checked_preserves_manifest_and_journal() {
         "640",
         "480",
     ]));
-    let before = ProjectStore::new(&context.project_path())
+    let before = ProjectStore::new(context.project_path())
         .unwrap()
         .load()
         .unwrap();
@@ -5216,7 +5709,7 @@ fn local_scene_layer_mask_checked_preserves_manifest_and_journal() {
         "400",
         "inverted",
     ]));
-    let masked = ProjectStore::new(&context.project_path())
+    let masked = ProjectStore::new(context.project_path())
         .unwrap()
         .load()
         .unwrap();
@@ -5248,7 +5741,7 @@ fn local_scene_layer_mask_checked_preserves_manifest_and_journal() {
         "7",
         "0",
     ]));
-    let cleared = ProjectStore::new(&context.project_path())
+    let cleared = ProjectStore::new(context.project_path())
         .unwrap()
         .load()
         .unwrap();
@@ -5258,7 +5751,7 @@ fn local_scene_layer_mask_checked_preserves_manifest_and_journal() {
     );
 
     let before_invalid = manifest(&context.project);
-    let store = ProjectStore::new(&context.project_path()).unwrap();
+    let store = ProjectStore::new(context.project_path()).unwrap();
     let journal_before_invalid = journal_bytes(&store);
     assert_failure_contains(
         &invoke(&[
@@ -5395,6 +5888,7 @@ fn local_input_replace_simulated_preserves_identity_and_runtime() {
     fs::remove_dir_all(context.root).unwrap();
 }
 
+#[allow(clippy::too_many_lines)]
 #[test]
 fn local_input_replace_solid_preserves_identity_and_runtime() {
     let context = ContractContext::new();
@@ -5536,6 +6030,7 @@ fn local_input_replace_solid_preserves_identity_and_runtime() {
     fs::remove_dir_all(context.root).unwrap();
 }
 
+#[allow(clippy::too_many_lines)]
 #[test]
 fn local_input_replace_media_preserves_identity_and_runtime() {
     let context = ContractContext::new();
@@ -5677,6 +6172,7 @@ fn local_input_replace_media_preserves_identity_and_runtime() {
     fs::remove_dir_all(context.root).unwrap();
 }
 
+#[allow(clippy::too_many_lines)]
 #[test]
 fn local_input_replace_scene_preserves_identity_and_rejects_cycle() {
     let context = ContractContext::new();

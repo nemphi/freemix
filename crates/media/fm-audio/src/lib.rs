@@ -1384,10 +1384,10 @@ impl MasterMixer {
 
     /// Mixes borrowed planar sources and writes meters into caller-owned slices.
     ///
-    /// `master_meters` uses Master channel-layout order. `input_meters` is flat,
-    /// ordered first by [`InputId`] and then by Master channel-layout order.
-    /// Both slices must have their exact required length. All structural
-    /// validation completes before output or runtime state changes.
+    /// `meters.0` uses Master channel-layout order. `meters.1` is flat, ordered
+    /// first by [`InputId`] and then by Master channel-layout order. Both
+    /// slices must have their exact required length. All structural validation
+    /// completes before output or runtime state changes.
     ///
     /// # Errors
     ///
@@ -1400,8 +1400,7 @@ impl MasterMixer {
         sources: &[PlanarAudioSource<'_>],
         active_video_inputs: &[InputId],
         output: &mut [Vec<f32>],
-        master_meters: &mut [ChannelMeter],
-        input_meters: &mut [ChannelMeter],
+        meters: (&mut [ChannelMeter], &mut [ChannelMeter]),
     ) -> Result<(), AudioError> {
         validate_sample_count(samples)?;
         validate_canonical_output(&self.format, samples)?;
@@ -1412,7 +1411,7 @@ impl MasterMixer {
             active_video_inputs,
             output,
             false,
-            Some((master_meters, input_meters)),
+            Some(meters),
         )
         .map(drop)
     }
@@ -1471,53 +1470,9 @@ impl MasterMixer {
         mut meter_output: Option<(&mut [ChannelMeter], &mut [ChannelMeter])>,
     ) -> Result<Option<RenderMeters>, AudioError> {
         validate_sample_count(samples)?;
-        for (index, submission) in blocks.iter().enumerate() {
-            let id = submission.input();
-            let block = submission.block();
-            if blocks[..index]
-                .iter()
-                .any(|previous| previous.input() == id)
-            {
-                return Err(AudioError::DuplicateInput(id));
-            }
-            let strip = self.inputs.get(&id).ok_or(AudioError::UnknownInput(id))?;
-            if block.sample_rate() != strip.format.sample_rate
-                || block.channel_layout() != &strip.format.channels
-            {
-                return Err(AudioError::FormatMismatch);
-            }
-            if block.sample_count() != samples {
-                return Err(AudioError::SampleCountMismatch {
-                    expected: samples,
-                    actual: block.sample_count(),
-                });
-            }
-            let expected_planes = strip.format.channels.channels().len();
-            if block.planes().len() != expected_planes {
-                return Err(AudioError::PlaneCountMismatch {
-                    expected: expected_planes,
-                    actual: block.planes().len(),
-                });
-            }
-            validate_finite_sample_prefix(block.planes(), samples)?;
-        }
-
+        validate_mixer_submissions(samples, blocks, &self.inputs)?;
         let channels = self.format.channels.channels().len();
-        if output.len() != channels {
-            return Err(AudioError::PlaneCountMismatch {
-                expected: channels,
-                actual: output.len(),
-            });
-        }
-        for (plane, values) in output.iter().enumerate() {
-            if values.len() < samples {
-                return Err(AudioError::PlaneLengthMismatch {
-                    plane,
-                    expected: samples,
-                    actual: values.len(),
-                });
-            }
-        }
+        validate_mixer_output_planes(samples, channels, output)?;
         if let Some((master_meters, input_meters)) = &meter_output {
             for (expected, actual) in [
                 (channels, master_meters.len()),
@@ -1547,46 +1502,17 @@ impl MasterMixer {
             let mut meter_channels =
                 metering.then(|| [ChannelMeterAccumulator::default(); MAX_CHANNELS]);
             if audible {
-                let source_gain = block.map_or(SourceGain::UNITY, |(_, source_gain)| source_gain);
-                for sample in 0..samples {
-                    if let Some(meter_channels) = &mut meter_channels {
-                        for meter in meter_channels[..channels].iter_mut() {
-                            meter.begin_sample();
-                        }
-                    }
-                    let strip_gain = ramp.next();
-                    let balance = balance_ramp.next();
-                    let source_gain = source_gain.at_sample(sample, samples);
-                    for (source, destination, coefficient) in strip.mapping.compiled_routes() {
-                        let input = block.map(|(block, _)| block.planes()[source].as_slice());
-                        let delayed = strip.delay.preview_sample(source, sample, input);
-                        let balance_gain =
-                            balance_gain(balance, self.format.channels.channels()[destination]);
-                        let contribution =
-                            delayed * strip_gain * balance_gain * source_gain * coefficient;
-                        let mapped = output[destination][sample] + contribution;
-                        if !mapped.is_finite() {
-                            return Err(AudioError::NonFiniteSample {
-                                channel: destination,
-                                sample,
-                            });
-                        }
-                        output[destination][sample] = mapped;
-                        if let Some(meter_channels) = &mut meter_channels
-                            && !meter_channels[destination].add(contribution)
-                        {
-                            return Err(AudioError::NonFiniteSample {
-                                channel: destination,
-                                sample,
-                            });
-                        }
-                    }
-                    if let Some(meter_channels) = &mut meter_channels {
-                        for meter in meter_channels[..channels].iter_mut() {
-                            meter.end_sample();
-                        }
-                    }
-                }
+                mix_audible_strip_samples(
+                    samples,
+                    &self.format.channels,
+                    block,
+                    strip,
+                    &mut (&mut ramp, &mut balance_ramp),
+                    meter_channels
+                        .as_mut()
+                        .map(|meters| &mut meters[..channels]),
+                    output,
+                )?;
             } else {
                 for _ in 0..samples {
                     ramp.next();
@@ -1669,6 +1595,143 @@ fn balance_gain(balance: f32, destination: fm_types::Channel) -> f32 {
         fm_types::Channel::Right => 1.0 + balance.min(0.0),
         _ => 1.0,
     }
+}
+
+/// Validates every submitted block against its configured strip and `samples`.
+///
+/// # Errors
+///
+/// Returns [`AudioError::DuplicateInput`] for a repeated input,
+/// [`AudioError::UnknownInput`] for an unconfigured strip,
+/// [`AudioError::FormatMismatch`] or [`AudioError::PlaneCountMismatch`] on a
+/// layout disagreement, [`AudioError::SampleCountMismatch`] on a length
+/// disagreement, and non-finite sample errors from the prefix validation.
+fn validate_mixer_submissions<B: MixerBlockView, S: MixerSubmission<B>>(
+    samples: usize,
+    blocks: &[S],
+    inputs: &BTreeMap<InputId, InputStrip>,
+) -> Result<(), AudioError> {
+    for (index, submission) in blocks.iter().enumerate() {
+        let id = submission.input();
+        let block = submission.block();
+        if blocks[..index]
+            .iter()
+            .any(|previous| previous.input() == id)
+        {
+            return Err(AudioError::DuplicateInput(id));
+        }
+        let strip = inputs.get(&id).ok_or(AudioError::UnknownInput(id))?;
+        if block.sample_rate() != strip.format.sample_rate
+            || block.channel_layout() != &strip.format.channels
+        {
+            return Err(AudioError::FormatMismatch);
+        }
+        if block.sample_count() != samples {
+            return Err(AudioError::SampleCountMismatch {
+                expected: samples,
+                actual: block.sample_count(),
+            });
+        }
+        let expected_planes = strip.format.channels.channels().len();
+        if block.planes().len() != expected_planes {
+            return Err(AudioError::PlaneCountMismatch {
+                expected: expected_planes,
+                actual: block.planes().len(),
+            });
+        }
+        validate_finite_sample_prefix(block.planes(), samples)?;
+    }
+    Ok(())
+}
+
+/// Validates that `output` has one plane per Master channel of at least
+/// `samples` samples.
+///
+/// # Errors
+///
+/// Returns [`AudioError::PlaneCountMismatch`] and
+/// [`AudioError::PlaneLengthMismatch`].
+fn validate_mixer_output_planes(
+    samples: usize,
+    channels: usize,
+    output: &[Vec<f32>],
+) -> Result<(), AudioError> {
+    if output.len() != channels {
+        return Err(AudioError::PlaneCountMismatch {
+            expected: channels,
+            actual: output.len(),
+        });
+    }
+    for (plane, values) in output.iter().enumerate() {
+        if values.len() < samples {
+            return Err(AudioError::PlaneLengthMismatch {
+                plane,
+                expected: samples,
+                actual: values.len(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Mixes one audible strip into the Master planes while stepping its ramps.
+///
+/// Advances `ramp` and `balance_ramp` exactly once per sample, mirroring the
+/// inaudible path so later strips observe identical ramp positions.
+///
+/// # Errors
+///
+/// Returns [`AudioError::NonFiniteSample`] when a contribution or metered
+/// accumulation is not finite.
+#[allow(clippy::needless_range_loop)]
+fn mix_audible_strip_samples<B: MixerBlockView>(
+    samples: usize,
+    master_layout: &ChannelLayout,
+    block: Option<(&B, SourceGain)>,
+    strip: &InputStrip,
+    ramps: &mut (&mut GainRamp, &mut BalanceRamp),
+    mut meter_channels: Option<&mut [ChannelMeterAccumulator]>,
+    output: &mut [Vec<f32>],
+) -> Result<(), AudioError> {
+    let source_gain = block.map_or(SourceGain::UNITY, |(_, source_gain)| source_gain);
+    for sample in 0..samples {
+        if let Some(meter_channels) = &mut meter_channels {
+            for meter in &mut meter_channels[..master_layout.channels().len()] {
+                meter.begin_sample();
+            }
+        }
+        let strip_gain = ramps.0.next();
+        let balance = ramps.1.next();
+        let source_gain = source_gain.at_sample(sample, samples);
+        for (source, destination, coefficient) in strip.mapping.compiled_routes() {
+            let input = block.map(|(block, _)| block.planes()[source].as_slice());
+            let delayed = strip.delay.preview_sample(source, sample, input);
+            let balance_gain = balance_gain(balance, master_layout.channels()[destination]);
+            let contribution = delayed * strip_gain * balance_gain * source_gain * coefficient;
+            let mapped = output[destination][sample] + contribution;
+            if !mapped.is_finite() {
+                return Err(AudioError::NonFiniteSample {
+                    channel: destination,
+                    sample,
+                });
+            }
+            output[destination][sample] = mapped;
+            if let Some(meter_channels) = &mut meter_channels
+                && !meter_channels[destination].add(contribution)
+            {
+                return Err(AudioError::NonFiniteSample {
+                    channel: destination,
+                    sample,
+                });
+            }
+        }
+        if let Some(meter_channels) = &mut meter_channels {
+            for meter in &mut meter_channels[..master_layout.channels().len()] {
+                meter.end_sample();
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Measures sample peak and unweighted RMS independently for each channel.
